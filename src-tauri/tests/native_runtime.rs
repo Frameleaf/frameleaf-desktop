@@ -138,10 +138,15 @@ fn main(){
         .args(["--edition=2021"])
         .arg(&source)
         .arg("-o")
-        .arg(root.0.join(executable))
+        .arg(source.parent().unwrap().join(executable))
         .status()
         .unwrap()
         .success());
+    fs::copy(
+        source.parent().unwrap().join(executable),
+        root.0.join(executable),
+    )
+    .unwrap();
     let bytes = fs::read(root.0.join(executable)).unwrap();
     let mut spec: serde_json::Value = serde_json::from_slice(&root.manifest()).unwrap();
     spec["python"] = json!(executable);
@@ -246,10 +251,15 @@ fn main(){{
         .arg("--edition=2021")
         .arg(&source)
         .arg("-o")
-        .arg(root.0.join(executable))
+        .arg(source.parent().unwrap().join(executable))
         .status()
         .unwrap()
         .success());
+    fs::copy(
+        source.parent().unwrap().join(executable),
+        root.0.join(executable),
+    )
+    .unwrap();
     let bytes = fs::read(root.0.join(executable)).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_slice(&root.manifest()).unwrap();
     manifest["python"] = json!(executable);
