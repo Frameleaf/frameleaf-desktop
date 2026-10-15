@@ -142,3 +142,58 @@ class RuntimeBuilderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeFailureReceiptTests(unittest.TestCase):
+    def test_inventory_reports_the_exact_case_collision(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import stat
+
+        root = Path("fixture")
+        with (
+            patch.object(
+                Path, "rglob", return_value=[root / "Python.h", root / "python.h"]
+            ),
+            patch.object(
+                builder,
+                "regular",
+                return_value=SimpleNamespace(st_mode=stat.S_IFREG, st_size=1),
+            ),
+            patch.object(builder, "sha256", return_value="a" * 64),
+        ):
+            with self.assertRaisesRegex(
+                builder.BuildError, "runtime_case_collision.*python.h"
+            ):
+                builder.inventory(root)
+
+    def test_private_headless_python_omits_terminal_database_but_keeps_licences(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            (source / "share" / "terminfo" / "E").mkdir(parents=True)
+            (source / "share" / "terminfo" / "E" / "Eterm").write_bytes(b"terminal")
+            (source / "share" / "doc").mkdir()
+            (source / "share" / "doc" / "LICENSE").write_bytes(b"licence")
+            (source / "python").write_bytes(b"interpreter")
+            builder.copy_python(source, root / "copy")
+            self.assertFalse((root / "copy" / "share" / "terminfo").exists())
+            self.assertEqual(
+                (root / "copy" / "share" / "doc" / "LICENSE").read_bytes(), b"licence"
+            )
+            self.assertEqual((root / "copy" / "python").read_bytes(), b"interpreter")
+
+    def test_dependency_sources_match_the_locked_platform_markers(self):
+        self.assertIn(
+            "https://download.pytorch.org/whl/cpu",
+            builder.dependency_indexes("linux", "x86_64"),
+        )
+        for system, architecture in [
+            ("windows", "x86_64"),
+            ("macos", "aarch64"),
+            ("linux", "aarch64"),
+        ]:
+            self.assertEqual(
+                builder.dependency_indexes(system, architecture),
+                ["--default-index", "https://pypi.org/simple"],
+            )

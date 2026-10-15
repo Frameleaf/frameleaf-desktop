@@ -62,12 +62,10 @@ def inventory(root: Path) -> dict[str, dict[str, str | int]]:
             raise BuildError("runtime_special_file_forbidden")
         name = relative(path.relative_to(root).as_posix())
         total += info.st_size
-        if (
-            name.lower() in folded
-            or info.st_size > 16 * 1024**3
-            or total > 64 * 1024**3
-        ):
-            raise BuildError("runtime_inventory_invalid")
+        if name.lower() in folded:
+            raise BuildError(f"runtime_case_collision:{name[:256]}")
+        if info.st_size > 16 * 1024**3 or total > 64 * 1024**3:
+            raise BuildError("runtime_inventory_size_invalid")
         folded.add(name.lower())
         files[name] = {"sha256": sha256(path), "bytes": info.st_size}
     if not files:
@@ -84,7 +82,15 @@ def copy_python(source: Path, destination: Path) -> None:
             or not path.resolve().is_file()
         ):
             raise BuildError("runtime_python_link_escape")
-    shutil.copytree(source, destination, symlinks=False)
+    # Linux terminfo contains E/Eterm and e/eterm; this fixed-module headless runtime never uses it.
+    shutil.copytree(
+        source,
+        destination,
+        symlinks=False,
+        ignore=lambda directory, _names: (
+            {"terminfo"} if Path(directory) == source / "share" else set()
+        ),
+    )
 
 
 def downloaded_python(root: Path) -> Path:
@@ -234,6 +240,19 @@ def requirement_block(text: str, name: str) -> str:
     if "--hash=sha256:" not in block:
         raise BuildError("runtime_build_tool_not_pinned")
     return block
+
+
+def dependency_indexes(system: str, architecture: str) -> list[str]:
+    # The lock selects +cpu only on Linux x86; PEP 440 otherwise prefers an unapproved Windows +cpu wheel.
+    indexes = ["--default-index", "https://pypi.org/simple"]
+    if system == "linux" and architecture == "x86_64":
+        indexes += [
+            "--index",
+            "https://download.pytorch.org/whl/cpu",
+            "--index-strategy",
+            "unsafe-best-match",
+        ]
+    return indexes
 
 
 def build(
@@ -401,10 +420,7 @@ def build(
                 "antlr4-python3-runtime",
                 "--no-build-isolation-package",
                 "antlr4-python3-runtime",
-                "--index",
-                "https://download.pytorch.org/whl/cpu",
-                "--index-strategy",
-                "unsafe-best-match",
+                *dependency_indexes(system, architecture),
                 "-r",
                 requirements,
             ],

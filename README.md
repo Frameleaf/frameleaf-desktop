@@ -111,3 +111,5 @@ FRAMELEAF_NATIVE_TEST_SPEC=/private/approved-fixture.json \
 ```
 
 That test's temporary signing key is fixture-only and never becomes application trust.
+
+Native prediction now requires `start_qualified_sidecar` with the sealed qualification from the same signed runtime. An unqualified sidecar exposes authenticated health only. Each prediction must use the qualified entries and input kind; the private runtime rechecks artifact hashes, preprocessing, available memory and driver/runtime identity before and after inference, refusing changed inputs before returning a result. NAS model admission and the automatic worker loop remain pending.

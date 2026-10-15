@@ -331,7 +331,33 @@ impl VerifiedRuntime {
         if port < 1024 {
             return Err("runtime_port_invalid".into());
         }
-        self.launch(cache, private_root, Invocation::Serve(port))
+        self.launch(
+            cache,
+            private_root,
+            Invocation::Serve {
+                port,
+                qualified: None,
+            },
+        )
+    }
+    pub fn start_qualified_sidecar(
+        &self,
+        qualified: &QualifiedRuntime,
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<NativeSidecar, String> {
+        if qualified.manifest_sha256 != self.manifest_sha256 || port < 1024 {
+            return Err("runtime_qualification_binding_invalid".into());
+        }
+        self.launch(
+            cache,
+            private_root,
+            Invocation::Serve {
+                port,
+                qualified: Some(qualified),
+            },
+        )
     }
     fn launch(
         &self,
@@ -369,7 +395,21 @@ impl VerifiedRuntime {
         );
         zeroize::Zeroize::zeroize(&mut secret);
         let module = match &invocation {
-            Invocation::Serve(_) => "immich_ml.native_runtime",
+            Invocation::Serve { qualified, .. } => {
+                if let Some(qualified) = qualified {
+                    let write = || -> Result<(), String> {
+                        write_private(&scratch.join("qualification.json"), &qualified.spec)?;
+                        let report = serde_json::to_vec(&qualified.report)
+                            .map_err(|_| "runtime_qualification_report_invalid")?;
+                        write_private(&scratch.join("report.json"), &report)
+                    };
+                    if let Err(error) = write() {
+                        let _ = fs::remove_dir_all(&scratch);
+                        return Err(error);
+                    }
+                }
+                "immich_ml.native_runtime"
+            }
             Invocation::Qualify {
                 spec,
                 fixture,
@@ -413,7 +453,14 @@ impl VerifiedRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match invocation {
-            Invocation::Serve(port) => {
+            Invocation::Serve { port, qualified } => {
+                if qualified.is_some() {
+                    command
+                        .arg("--spec")
+                        .arg(scratch.join("qualification.json"))
+                        .arg("--qualification-report")
+                        .arg(scratch.join("report.json"));
+                }
                 command
                     .arg("--port")
                     .arg(port.to_string())
@@ -477,7 +524,10 @@ impl VerifiedRuntime {
 }
 
 enum Invocation<'a> {
-    Serve(u16),
+    Serve {
+        port: u16,
+        qualified: Option<&'a QualifiedRuntime>,
+    },
     Qualify {
         spec: &'a [u8],
         fixture: &'a [u8],
@@ -500,6 +550,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 pub struct QualifiedRuntime {
+    spec: Vec<u8>,
     report: serde_json::Value,
     manifest_sha256: String,
 }
@@ -604,6 +655,7 @@ impl VerifiedRuntime {
         validate_report(&report, &value, &format!("{:x}", Sha256::digest(spec)))?;
         self.check_files()?;
         Ok(QualifiedRuntime {
+            spec: spec.to_vec(),
             report,
             manifest_sha256: self.manifest_sha256.clone(),
         })
@@ -691,6 +743,35 @@ fn validate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_cannot_start_a_different_runtime_manifest() {
+        let runtime = VerifiedRuntime {
+            root: PathBuf::new(),
+            manifest: serde_json::from_value(serde_json::json!({
+                "schemaVersion":1,"protocolVersion":1,"epoch":1,
+                "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
+                "provider":"CPUExecutionProvider","python":"python", "sourceRevision":"a".repeat(40),"files":{}
+            })).unwrap(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let qualified = QualifiedRuntime {
+            spec: vec![],
+            report: serde_json::Value::Null,
+            manifest_sha256: "b".repeat(64),
+        };
+        assert_eq!(
+            runtime
+                .start_qualified_sidecar(
+                    &qualified,
+                    Path::new("missing"),
+                    Path::new("missing"),
+                    19999
+                )
+                .err()
+                .unwrap(),
+            "runtime_qualification_binding_invalid"
+        );
+    }
     #[test]
     fn python_gate_registers_the_executed_main_module() {
         use std::{

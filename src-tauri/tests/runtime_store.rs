@@ -160,7 +160,9 @@ fn installed_private_cpu_pack_runs_production_qualification_and_inference() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let mut child = installed.start_sidecar(&cache, &workspace.0, port).unwrap();
+    let mut child = installed
+        .start_qualified_sidecar(&qualified, &cache, &workspace.0, port)
+        .unwrap();
     drop(installed);
     assert!(store
         .install_and_activate(&pack.join("payload"), &raw, &key.sign(&raw).to_bytes())
@@ -207,6 +209,16 @@ fn installed_private_cpu_pack_runs_production_qualification_and_inference() {
         let status = response.status();
         response.bytes().await.unwrap();
         assert_eq!(status, 404);
+        let response = client
+            .post(format!("{base}/predict"))
+            .bearer_auth(child.authorization())
+            .form(&[("entries", "{}"), ("text", "unqualified configuration")])
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        response.bytes().await.unwrap();
+        assert_eq!(status, 409);
         let response = client
             .post(format!("{base}/predict"))
             .bearer_auth(child.authorization())

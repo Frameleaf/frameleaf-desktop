@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: f687b914d1004ed3809b34a3ffa9dc0cfc0b377d
+          ref: fc1a63223ccfe43f5f9d8dd4e27c9d977f5c9176
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -43,7 +43,7 @@ jobs:
       - name: Builder regression checks
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
-        run: python desktop/tools/build_runtime.py --source server --output candidate --revision f687b914d1004ed3809b34a3ffa9dc0cfc0b377d --epoch 1
+        run: python desktop/tools/build_runtime.py --source server --output candidate --revision fc1a63223ccfe43f5f9d8dd4e27c9d977f5c9176 --epoch 2
       - name: Retain private validation receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -55,3 +55,12 @@ jobs:
             candidate/payload/build-requirements.txt
           retention-days: 7
           if-no-files-found: error
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-failure-${{ runner.os }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3
