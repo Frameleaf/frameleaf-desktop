@@ -5,6 +5,7 @@ pub mod ml_transport;
 pub mod native_predictor;
 pub mod native_runtime;
 mod process_tree;
+pub mod release_policy;
 pub mod runtime_store;
 mod transport;
 pub mod worker;
