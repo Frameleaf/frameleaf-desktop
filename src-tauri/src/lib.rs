@@ -2,6 +2,7 @@ pub mod connection;
 mod credentials;
 pub mod lifecycle;
 mod transport;
+pub mod worker;
 
 use connection::{normalize_server, ConnectionView, Features, SavedConnection};
 use serde::Deserialize;
@@ -32,6 +33,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
     let unavailable = Features {
         enrollment: false,
         worker: false,
+        worker_session: false,
         sources: false,
         native_host: false,
     };
@@ -64,6 +66,27 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
                             "credential-store-unavailable".into(),
                             caps.features,
                         );
+                    }
+                    if caps.features.worker_session && enrollment.state == "preparing" {
+                        // A new photo association must never reuse an earlier worker grant.
+                        if credentials::delete("worker-session").is_err() {
+                            return ConnectionView::new(
+                                saved,
+                                "credential-store-unavailable".into(),
+                                caps.features,
+                            );
+                        }
+                        let issued = transport::issue_worker_session(&client, saved).await;
+                        if issued
+                            .and_then(|worker| credentials::save("worker-session", &worker))
+                            .is_err()
+                        {
+                            return ConnectionView::new(
+                                saved,
+                                "worker-setup-failed".into(),
+                                caps.features,
+                            );
+                        }
                     }
                     ConnectionView::new(saved, enrollment.state, caps.features)
                 }
@@ -181,7 +204,11 @@ async fn sign_out(
         .or(credentials::load::<SavedConnection>("connection")?);
     *current = None;
     Ok(lifecycle::finish_sign_out(
-        async { credentials::delete("connection").is_ok() },
+        async {
+            let worker = credentials::delete("worker-session").is_ok();
+            let connection = credentials::delete("connection").is_ok();
+            worker && connection
+        },
         async {
             if let Some(photos) = app.get_webview_window("photos") {
                 let cleared = photos.clear_all_browsing_data().is_ok();

@@ -14,3 +14,7 @@ test('enrollment never implies qualified inference', () => {
   assert.equal(workerStatus({ state:'preparing', workerSupported:true }), 'Preparing this computer');
   assert.equal(workerStatus({ state:'incompatible', workerSupported:true }), 'This computer is not compatible with the selected models');
 });
+
+test('worker credential setup failure stays visible before model qualification', () => {
+  assert.equal(workerStatus({ state: 'worker-setup-failed', workerSupported: false }), 'Computer setup needs attention');
+});

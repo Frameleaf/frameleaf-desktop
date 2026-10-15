@@ -63,6 +63,13 @@ pub struct DeviceIdentity {
     secret: [u8; 32],
 }
 impl DeviceIdentity {
+    pub fn sign(&self, message: &str) -> String {
+        STANDARD.encode(
+            SigningKey::from_bytes(&self.secret)
+                .sign(message.as_bytes())
+                .to_bytes(),
+        )
+    }
     pub fn generate() -> Self {
         let mut secret = [0; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
@@ -138,6 +145,8 @@ pub struct SavedConnection {
 pub struct Features {
     pub enrollment: bool,
     pub worker: bool,
+    #[serde(default)]
+    pub worker_session: bool,
     pub sources: bool,
     pub native_host: bool,
 }

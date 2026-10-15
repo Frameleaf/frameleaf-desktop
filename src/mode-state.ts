@@ -3,6 +3,7 @@ export function safeMode(value: unknown): DesktopMode | null {
   return value === 'local-server' || value === 'client-worker' ? value : null;
 }
 export function workerStatus({ state, workerSupported }: { state: string; workerSupported: boolean }): string {
+  if (state === 'worker-setup-failed' || state === 'credential-store-unavailable') return 'Computer setup needs attention';
   if (state === 'awaiting-approval') return 'Waiting for administrator approval';
   if (state === 'revoked') return 'This computer’s access was revoked';
   if (!workerSupported) return 'Your server needs a desktop-worker update';

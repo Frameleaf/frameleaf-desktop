@@ -72,3 +72,28 @@ pub async fn enroll(client: &Client, saved: &SavedConnection) -> Result<Enrollme
     )
     .await
 }
+
+pub async fn issue_worker_session(
+    client: &Client,
+    saved: &SavedConnection,
+) -> Result<crate::worker::SavedWorker, String> {
+    let identity = credentials::identity()?;
+    let device = saved
+        .device_id
+        .as_ref()
+        .ok_or("desktop_enrollment_required")?;
+    let dto =
+        crate::worker::session_request(&identity, &saved.server_id, &saved.account_id, device)?;
+    let base = normalize_server(&saved.server)?;
+    let response: crate::worker::SessionResponse = json(
+        client
+            .post(base.join("api/desktop/devices/session").unwrap())
+            .bearer_auth(&saved.token)
+            .json(&dto)
+            .send()
+            .await
+            .map_err(|_| "worker_session_setup_interrupted")?,
+    )
+    .await?;
+    crate::worker::bind_session(saved, &response)
+}
