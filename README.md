@@ -41,3 +41,28 @@ Connect using the HTTPS origin of a Frameleaf server. This candidate supports pa
 The setup window has narrow native commands; remote Photos windows have no native capabilities. Session credentials and the Ed25519 installation key are stored only in the OS credential store. Sign-out invalidates the active association; permanent device revocation remains separate.
 
 The app symbol is reused from frameleaf-app at the pinned integration baseline. Inherited Frameleaf source/assets retain AGPL-3.0 obligations; see LICENSE. Detailed architecture and execution plans remain in Confluence.
+
+## Private inference supervision
+
+The native Rust supervisor accepts an installed runtime only after verifying its
+Ed25519 signature against application-trusted keys, release epoch, OS/architecture,
+protocol, and complete SHA-256 file inventory. The signed manifest identifies the
+private Python executable, selected provider and exact Frameleaf server source revision.
+Links, unexpected files, changed bytes and ambiguous paths are refused. Runtime files
+are checked again before launch and after qualification. The manifest and detached
+signature are stored outside the pack inventory.
+
+Sidecars launch fixed Frameleaf modules through isolated Python, with bytecode writes
+disabled and no inherited photo, cloud or worker credentials. A fresh loopback token,
+private scratch/cache settings and offline model policy are supplied explicitly.
+A startup pipe gates execution until OS process ownership is installed; closing that
+pipe also terminates the runtime after an owner crash. Windows uses an unnamed Job
+Object; macOS/Linux use a private process group. Process output is not exposed to the
+webview. Cancellation, failed exits, deadlines and invalid/oversized qualification
+reports cannot produce a qualified model. The report binds the exact approved fixture
+spec and is returned with its verified runtime manifest identity.
+
+These supervisor APIs are native-only and are not yet wired to a background worker.
+Release signing keys, packaged runtime installation, NAS model approval and automatic
+processing remain required before enabling worker readiness. CI exercises the process
+owner on all three OS builds; installed hardware acceptance remains separate.

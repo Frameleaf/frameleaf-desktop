@@ -2,6 +2,8 @@ pub mod connection;
 mod credentials;
 pub mod lifecycle;
 pub mod ml_transport;
+pub mod native_runtime;
+mod process_tree;
 mod transport;
 pub mod worker;
 
