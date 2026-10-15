@@ -69,7 +69,7 @@ fn no_link(path: &Path) -> Result<fs::Metadata, String> {
     }
     Ok(meta)
 }
-fn absolute_directory(path: &Path) -> Result<(), String> {
+pub(crate) fn absolute_directory(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("runtime_root_invalid".into());
     }
@@ -171,6 +171,37 @@ impl VerifiedRuntime {
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
     }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.manifest.epoch
+    }
+    pub(crate) fn copy_payload(&self, destination: &Path) -> Result<(), String> {
+        self.check_files()?;
+        for (name, artifact) in &self.manifest.files {
+            let source = self.root.join(relative(name)?);
+            let target = destination.join(relative(name)?);
+            fs::create_dir_all(target.parent().ok_or("runtime_path_invalid")?)
+                .map_err(|_| "runtime_copy_failed")?;
+            let metadata = no_link(&source)?;
+            let input = File::open(source).map_err(|_| "runtime_copy_failed")?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(&target).map_err(|_| "runtime_copy_failed")?;
+            let copied = std::io::copy(&mut input.take(artifact.bytes + 1), &mut output)
+                .map_err(|_| "runtime_copy_failed")?;
+            if copied != artifact.bytes {
+                return Err("runtime_artifact_changed".into());
+            }
+            output.sync_all().map_err(|_| "runtime_copy_failed")?;
+            fs::set_permissions(target, metadata.permissions())
+                .map_err(|_| "runtime_copy_failed")?;
+        }
+        self.check_files()
+    }
     pub fn provider(&self) -> &str {
         &self.manifest.provider
     }
@@ -234,7 +265,7 @@ def lost_parent():
     os._exit(125)
 threading.Thread(target=lost_parent,daemon=True).start()
 sys.argv=sys.argv[1:]
-runpy.run_module(sys.argv[0],run_name='__main__')
+runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
 "#;
 
 pub struct NativeSidecar {
@@ -244,8 +275,12 @@ pub struct NativeSidecar {
     token: zeroize::Zeroizing<String>,
     stopped: bool,
     exit_status: Option<std::process::ExitStatus>,
+    lease: Option<std::sync::Arc<File>>,
 }
 impl NativeSidecar {
+    pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
+        self.lease = Some(lease);
+    }
     pub fn working_dir(&self) -> &Path {
         &self.scratch
     }
@@ -313,7 +348,9 @@ impl VerifiedRuntime {
         absolute_directory(cache)?;
         absolute_directory(private_root)?;
         let scratch = private_root.join(format!("inference-{}", uuid::Uuid::new_v4()));
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -426,6 +463,7 @@ impl VerifiedRuntime {
             token,
             stopped: false,
             exit_status: None,
+            lease: None,
         };
         owner
             .child
@@ -654,6 +692,47 @@ fn validate_report(
 mod tests {
     use super::*;
     #[test]
+    fn python_gate_registers_the_executed_main_module() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-gate-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("test_identity.py"),"import sys,unittest\nclass Identity(unittest.TestCase):\n def test_main(self):\n  self.assertEqual(sys.modules['__main__'].__spec__.name,'unittest.__main__')\n").unwrap();
+        let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+        command
+            .args(["-I", "-B", "-c", GATE, "unittest", "discover", "-s"])
+            .arg(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(START).unwrap();
+        let status = child.wait().unwrap();
+        drop(pipe);
+        let mut errors = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .take(4096)
+            .read_to_string(&mut errors)
+            .unwrap();
+        tree.terminate();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            status.success(),
+            "executed module was not registered as __main__: {errors}"
+        );
+    }
+    #[test]
     fn python_gate_allows_normal_qualification_process_exit() {
         use std::{
             io::Write,
@@ -728,7 +807,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            // macOS can complete the explicit exit before delivering this process's group SIGKILL.
+            assert!(status.signal() == Some(libc::SIGKILL) || status.code() == Some(125));
         }
         #[cfg(windows)]
         assert_eq!(status.code(), Some(125));

@@ -66,3 +66,48 @@ These supervisor APIs are native-only and are not yet wired to a background work
 Release signing keys, packaged runtime installation, NAS model approval and automatic
 processing remain required before enabling worker readiness. CI exercises the process
 owner on all three OS builds; installed hardware acceptance remains separate.
+
+## Constructing a runtime candidate
+
+Use Python 3.12 and uv 0.11.2 on the target OS. The builder reads immutable Git
+blobs from a clean, explicitly pinned Frameleaf server checkout, exports the frozen
+ML dependency lock with hashes, and installs private standalone Python 3.12.13.
+Dependencies remain hash checked; the source-only ANTLR 4.9.3 package builds with the
+lockfile's hash-checked setuptools. Other source builds are refused. Model weights
+are acquired separately through approved staging and never included implicitly.
+
+```sh
+python tools/build_runtime.py --source /path/to/frameleaf-app \
+  --output /new/private/runtime-candidate --revision FULL_SERVER_COMMIT \
+  --epoch 1 --profile cpu-ort
+```
+
+The output contains `payload/` plus an unsigned `manifest.json`. The builder tests
+relocation and imports before publishing that candidate directory. Windows checkout
+line endings cannot alter the source/preprocessing identity. Python/dependency
+licences and sanitized acquisition provenance are retained. Release signing must use
+an application-trusted key; the builder never generates a production signing key.
+The separate CPU workflow builds all three OS candidates and retains small private
+validation receipts. These builds do not prove GPU execution or installed release
+acceptance. CUDA/CoreML/OpenVINO/AMD packs remain required.
+
+`RuntimeStore` verifies and copies signed candidates into immutable release folders,
+reverifies the copy and atomically switches its active pointer. Old releases remain
+available; lower epochs and conflicting reuse of an epoch are refused. A shared OS
+file lease held by an installed runtime and its child prevents activation until they
+are dropped. Partial staging is never adopted. The release authority still needs its
+OS-keystore trust/floor policy, download/extraction/update orchestration and GUI wiring.
+Power-loss and installed-platform acceptance remain release gates.
+
+A dedicated real-model test is deliberately excluded from ordinary CI. Supply only
+synthetic fixtures and a dedicated approved model cache:
+
+```sh
+FRAMELEAF_NATIVE_TEST_PACK=/private/runtime-candidate \
+FRAMELEAF_NATIVE_TEST_CACHE=/private/model-cache \
+FRAMELEAF_NATIVE_TEST_SPEC=/private/approved-fixture.json \
+  cargo test --manifest-path src-tauri/Cargo.toml --test runtime_store \
+  installed_private_cpu_pack -- --ignored --nocapture
+```
+
+That test's temporary signing key is fixture-only and never becomes application trust.

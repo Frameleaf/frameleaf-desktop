@@ -34,3 +34,11 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# Large signed-pack verification must stay practical in unsigned development builds.
+[profile.dev.package.frameleaf-desktop]
+opt-level = 1
+debug-assertions = true
+
+[profile.dev.package.sha2]
+opt-level = 3

@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod ml_transport;
 pub mod native_runtime;
 mod process_tree;
+pub mod runtime_store;
 mod transport;
 pub mod worker;
 
