@@ -2,6 +2,7 @@ pub mod connection;
 mod credentials;
 pub mod lifecycle;
 pub mod ml_transport;
+pub mod model_catalogue;
 pub mod native_predictor;
 pub mod native_runtime;
 mod process_tree;
