@@ -1,0 +1,106 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { workerStatus } from './mode-state';
+  import mark from './mark.svg';
+
+  type Connection = { server: string; name: string; mode: string; state: string; features: { worker: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean } };
+  let mode = $state<'client-worker' | 'local-server'>('client-worker');
+  let connection = $state<Connection | null>(null);
+  let server = $state('');
+  let email = $state('');
+  let password = $state('');
+  let deviceName = $state('My computer');
+  let busy = $state(false);
+  let notice = $state('');
+  let failure = $state('');
+  const native = isTauri();
+  const errors: Record<string, string> = {
+    server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
+    server_address_invalid: 'Enter a valid HTTPS server address.',
+    server_identity_not_confirmed: 'Sign in again to confirm this server’s identity. Clear the saved sign-in first.',
+    server_unreachable_or_certificate_invalid: 'Could not securely connect. Check the server address, network and certificate.',
+    server_http_401: 'Sign-in expired or the email and password are incorrect. Sign out and try again.',
+    server_http_403: 'Your server did not permit this sign-in.',
+    credential_store_locked_or_unavailable: 'Unlock your computer’s credential store, then try again.',
+    credential_store_unavailable: 'The secure credential store is unavailable on this computer.',
+    sign_out_before_switching_servers: 'Sign out before connecting to another server.',
+    account_identity_changed: 'This session no longer matches the saved account. Sign out before continuing.',
+    device_details_invalid: 'Enter a computer name between 1 and 128 characters.',
+  };
+  function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check your connection and try again.'; }
+  onMount(async () => {
+    if (!native) return;
+    busy = true;
+    try { connection = await invoke<Connection | null>('restore_connection'); }
+    catch (error) { failure = explain(error); }
+    finally { busy = false; }
+  });
+  async function connect(event: SubmitEvent) {
+    event.preventDefault(); busy = true; failure = ''; notice = '';
+    const secret = password; password = '';
+    try { connection = await invoke<Connection>('connect_server', { server, email, password: secret, deviceName }); }
+    catch (error) { failure = explain(error); }
+    finally { busy = false; }
+  }
+  async function photos() {
+    failure = '';
+    try { await invoke('open_photos'); } catch (error) { failure = explain(error); }
+  }
+  async function signOut() {
+    busy = true; failure = '';
+    try {
+      const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out'); connection = null;
+      notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
+    } catch (error) { failure = explain(error); }
+    finally { busy = false; }
+  }
+</script>
+
+<svelte:head><title>Frameleaf</title></svelte:head>
+<div class="app">
+  <aside>
+    <div class="brand"><img src={mark} alt="" /><span>Frameleaf</span></div>
+    <div class="rail-label">On your computer</div>
+    <div class="rail-item active">{connection ? 'My computer' : 'Get started'}</div>
+    <div class="rail-footer">Your photos.<br />Your server.<br />A little more power.</div>
+  </aside>
+  <main>
+    {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
+    {#if failure}<div class="message error" role="alert">{failure}<button class="text-button" disabled={busy || !native} onclick={signOut}>Clear saved sign-in</button></div>{/if}
+    {#if notice}<p class="message" role="status">{notice}</p>{/if}
+    {#if connection}
+      <p class="eyebrow">Connected to {connection.server}</p>
+      <h1>Welcome back,<br />{connection.name}.</h1>
+      <p class="intro">Your photos and server are right here. This computer’s processing status stays visible below.</p>
+      <section class="status-panel" aria-label="Computer processing status">
+        <div class="status-heading"><span class="status-dot"></span><h2>{connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : workerStatus({ state: connection.state, workerSupported: connection.features.worker })}</h2></div>
+        <p>{connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : 'AI processing starts only after the server supports desktop workers and the selected models pass qualification.'}</p>
+        <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>Not running</strong></div></div>
+      </section>
+      <div class="actions"><button class="primary" onclick={photos} disabled={busy || connection.state === 'identity-changed'}>Open Frameleaf Photos</button><button class="secondary" onclick={signOut} disabled={busy}>Sign out</button></div>
+      <p class="footnote">Server administration uses your existing Frameleaf permissions inside Photos. Host controls require a separately paired Manager.</p>
+    {:else}
+      <p class="eyebrow">Frameleaf Desktop</p>
+      <h1>Make yourself<br />at home.</h1>
+      <p class="intro">Keep everything on this computer, or connect to your server and put your computer to work.</p>
+      <fieldset class="modes" disabled={busy}>
+        <legend>How would you like to use Frameleaf?</legend>
+        <label class:selected={mode === 'client-worker'}><input type="radio" bind:group={mode} value="client-worker" /><span><strong>Connect to my server</strong><small>Photos, server management and help with AI processing.</small></span></label>
+        <label class:selected={mode === 'local-server'}><input type="radio" bind:group={mode} value="local-server" /><span><strong>Run Frameleaf here</strong><small>Host your photo library on this computer.</small></span></label>
+      </fieldset>
+      {#if mode === 'local-server'}
+        <section class="message"><h2>Local hosting is being prepared</h2><p>This preview does not include the native server runtime yet. Connect to an existing server to use the desktop client.</p></section>
+      {:else}
+        <form onsubmit={connect}>
+          <label for="server">Server address</label><input id="server" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={busy} autocomplete="url" />
+          <div class="form-row"><div><label for="email">Email</label><input id="email" type="email" bind:value={email} required disabled={busy} autocomplete="username" /></div><div><label for="password">Password</label><input id="password" type="password" bind:value={password} required disabled={busy} autocomplete="current-password" /></div></div>
+          <label for="computer">Computer name</label><input id="computer" bind:value={deviceName} required maxlength="128" disabled={busy} autocomplete="off" />
+          <p class="consent">Signing in sets up this computer to help your server process photos when compatible workers are available. Local photo folders are connected separately.</p>
+          <button class="primary" type="submit" disabled={busy || !native}>{busy ? 'Connecting…' : 'Connect to Frameleaf'}</button>
+          <p class="footnote">Your password is used to sign in and is never saved. The session and device key stay in your computer’s secure credential store.</p>
+        </form>
+      {/if}
+    {/if}
+  </main>
+</div>
