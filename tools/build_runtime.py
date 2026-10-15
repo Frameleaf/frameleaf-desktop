@@ -158,9 +158,13 @@ def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
         "HF_HOME": str(work / "huggingface"),
         "HF_HUB_DISABLE_TELEMETRY": "1",
     }
-    if os.name == "nt" and "SystemRoot" in inherited:
-        env["SystemRoot"] = inherited["SystemRoot"]
-        env["PATH"] = str(Path(inherited["SystemRoot"]) / "System32")
+    # Python normalizes Windows environment keys to uppercase.
+    system_root = next(
+        (value for key, value in inherited.items() if key.upper() == "SYSTEMROOT"), None
+    )
+    if os.name == "nt" and system_root:
+        env["SystemRoot"] = system_root
+        env["PATH"] = str(Path(system_root) / "System32")
     return env
 
 

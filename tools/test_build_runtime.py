@@ -197,3 +197,24 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 builder.dependency_indexes(system, architecture),
                 ["--default-index", "https://pypi.org/simple"],
             )
+
+    def test_windows_system_root_survives_uppercase_environment_keys(self):
+        import os
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system = str(root / "Windows")
+            with patch.object(
+                builder, "os", SimpleNamespace(name="nt", defpath=os.defpath)
+            ):
+                for key in ("SYSTEMROOT", "SystemRoot"):
+                    environment = builder.build_environment(
+                        root, {key: system, "AWS_SECRET_ACCESS_KEY": "secret"}
+                    )
+                    self.assertEqual(environment["SystemRoot"], system)
+                    self.assertEqual(
+                        environment["PATH"], str(Path(system) / "System32")
+                    )
+                    self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)

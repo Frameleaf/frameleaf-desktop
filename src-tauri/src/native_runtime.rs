@@ -555,6 +555,9 @@ pub struct QualifiedRuntime {
     manifest_sha256: String,
 }
 impl QualifiedRuntime {
+    pub(crate) fn specification(&self) -> &[u8] {
+        &self.spec
+    }
     pub fn report(&self) -> &serde_json::Value {
         &self.report
     }
