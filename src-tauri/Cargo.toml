@@ -24,6 +24,7 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
+time = { version = "0.3", features = ["parsing"] }
 
 tauri-plugin-single-instance = "2"

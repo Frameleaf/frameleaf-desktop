@@ -12,7 +12,13 @@ pub fn client() -> Result<Client, String> {
         .build()
         .map_err(|_| "network_client_unavailable".into())
 }
-pub async fn json<T: DeserializeOwned>(mut response: Response) -> Result<T, String> {
+pub async fn json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
+    json_limit(response, 65_536).await
+}
+pub(crate) async fn json_limit<T: DeserializeOwned>(
+    mut response: Response,
+    limit: usize,
+) -> Result<T, String> {
     if !response.status().is_success() {
         return Err(format!("server_http_{}", response.status().as_u16()));
     }
@@ -22,7 +28,7 @@ pub async fn json<T: DeserializeOwned>(mut response: Response) -> Result<T, Stri
         .await
         .map_err(|_| "server_response_interrupted")?
     {
-        if bytes.len() + chunk.len() > 65_536 {
+        if bytes.len() + chunk.len() > limit {
             return Err("server_response_too_large".into());
         }
         bytes.extend_from_slice(&chunk);
@@ -96,4 +102,76 @@ pub async fn issue_worker_session(
     )
     .await?;
     crate::worker::bind_session(saved, &response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    fn reply(body: String, status: u16) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            let response=format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",body.len());
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (url, handle)
+    }
+    #[test]
+    fn keeps_photo_json_small_and_accepts_only_explicit_bounded_worker_replies() {
+        tauri::async_runtime::block_on(async {
+            let body = serde_json::json!({"value":"x".repeat(70_000)}).to_string();
+            let (url, server) = reply(body.clone(), 200);
+            let response = client().unwrap().get(url).send().await.unwrap();
+            assert_eq!(
+                json::<serde_json::Value>(response).await.unwrap_err(),
+                "server_response_too_large"
+            );
+            server.join().unwrap();
+            let (url, server) = reply(body, 200);
+            let response = client().unwrap().get(url).send().await.unwrap();
+            assert_eq!(
+                json_limit::<serde_json::Value>(response, 256 * 1024)
+                    .await
+                    .unwrap()["value"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                70_000
+            );
+            server.join().unwrap();
+            let (url, server) = reply(
+                serde_json::json!({"value":"x".repeat(256*1024)}).to_string(),
+                200,
+            );
+            let response = client().unwrap().get(url).send().await.unwrap();
+            assert_eq!(
+                json_limit::<serde_json::Value>(response, 256 * 1024)
+                    .await
+                    .unwrap_err(),
+                "server_response_too_large"
+            );
+            server.join().unwrap();
+            let (url, server) = reply("private server diagnostic".into(), 401);
+            let response = client().unwrap().get(url).send().await.unwrap();
+            assert_eq!(
+                json::<serde_json::Value>(response).await.unwrap_err(),
+                "server_http_401"
+            );
+            server.join().unwrap();
+        });
+    }
 }

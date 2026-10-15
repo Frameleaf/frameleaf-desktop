@@ -73,7 +73,7 @@ pub fn worker_message(
     .join("\n")
 }
 
-#[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedWorker {
     pub server_id: String,
@@ -131,19 +131,8 @@ pub struct SessionResponse {
     pub scopes: Vec<String>,
 }
 
-pub fn bind_session(
-    saved: &crate::connection::SavedConnection,
-    response: &SessionResponse,
-) -> Result<SavedWorker, String> {
-    let device = saved
-        .device_id
-        .as_ref()
-        .ok_or("desktop_enrollment_required")?;
-    if saved.server_id.is_empty()
-        || saved.account_id.is_empty()
-        || saved.mode != "client-worker"
-        || uuid::Uuid::parse_str(device).is_err()
-        || uuid::Uuid::parse_str(&response.session_id).is_err()
+fn validate_response(response: &SessionResponse) -> Result<(), String> {
+    if Uuid::parse_str(&response.session_id).is_err()
         || response.authorization_epoch == 0
         || response.worker_token.len() != 64
         || !response
@@ -156,6 +145,25 @@ pub fn bind_session(
     {
         return Err("worker_session_response_invalid".into());
     }
+    Ok(())
+}
+
+pub fn bind_session(
+    saved: &crate::connection::SavedConnection,
+    response: &SessionResponse,
+) -> Result<SavedWorker, String> {
+    let device = saved
+        .device_id
+        .as_ref()
+        .ok_or("desktop_enrollment_required")?;
+    if saved.server_id.is_empty()
+        || saved.account_id.is_empty()
+        || saved.mode != "client-worker"
+        || Uuid::parse_str(device).is_err()
+    {
+        return Err("worker_session_response_invalid".into());
+    }
+    validate_response(response)?;
     Ok(SavedWorker {
         server_id: saved.server_id.clone(),
         account_id: saved.account_id.clone(),
@@ -166,4 +174,38 @@ pub fn bind_session(
         expires_at: response.expires_at.clone(),
         next_sequence: 1,
     })
+}
+
+pub fn bind_renewal(
+    saved: &SavedWorker,
+    response: &SessionResponse,
+) -> Result<SavedWorker, String> {
+    validate_response(response)?;
+    if response.session_id != saved.session_id
+        || response.authorization_epoch != saved.authorization_epoch
+    {
+        return Err("worker_association_changed".into());
+    }
+    Ok(SavedWorker {
+        server_id: saved.server_id.clone(),
+        account_id: saved.account_id.clone(),
+        device_id: saved.device_id.clone(),
+        session_id: response.session_id.clone(),
+        authorization_epoch: response.authorization_epoch,
+        worker_token: response.worker_token.clone(),
+        expires_at: response.expires_at.clone(),
+        next_sequence: 1,
+    })
+}
+
+pub fn persist_checkpoint(
+    current: Option<&SavedWorker>,
+    expected: &SavedWorker,
+    next: &SavedWorker,
+    save: impl FnOnce(&SavedWorker) -> Result<(), String>,
+) -> Result<(), String> {
+    if current != Some(expected) {
+        return Err("worker_association_changed".into());
+    }
+    save(next)
 }

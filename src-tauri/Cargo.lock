@@ -1219,6 +1219,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "time",
  "tokio",
  "url",
  "uuid",

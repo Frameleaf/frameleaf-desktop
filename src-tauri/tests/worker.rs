@@ -109,3 +109,39 @@ fn worker_session_response_is_bound_locally_and_cannot_expand_scope() {
     response.worker_token = "photo-token".into();
     assert!(bind_session(&saved, &response).is_err());
 }
+
+#[test]
+fn renewal_and_persistence_cannot_restore_a_signed_out_or_replaced_grant() {
+    use frameleaf_desktop::worker::{
+        bind_renewal, persist_checkpoint, SavedWorker, SessionResponse,
+    };
+    let saved = SavedWorker {
+        server_id: "server".into(),
+        account_id: "account".into(),
+        device_id: "445bc2b6-f4cd-439e-b8bb-7e84d7ee0550".into(),
+        session_id: "1117c1ca-0495-46e9-b579-f321520c2b1a".into(),
+        authorization_epoch: 2,
+        worker_token: "a".repeat(64),
+        expires_at: "2026-10-15T21:00:00Z".into(),
+        next_sequence: 2,
+    };
+    let mut response: SessionResponse=serde_json::from_value(serde_json::json!({"sessionId":saved.session_id,"authorizationEpoch":2,"workerToken":"b".repeat(64),"expiresAt":"2026-10-15T22:00:00Z","scopes":["library-inference"]})).unwrap();
+    let next = bind_renewal(&saved, &response).unwrap();
+    assert_eq!(next.next_sequence, 1);
+    assert_eq!(next.worker_token, "b".repeat(64));
+    assert!(persist_checkpoint(None, &saved, &next, |_| panic!(
+        "must not save after sign-out"
+    ))
+    .is_err());
+    assert!(persist_checkpoint(Some(&next), &saved, &next, |_| panic!(
+        "must not overwrite a replacement"
+    ))
+    .is_err());
+    assert!(persist_checkpoint(Some(&saved), &saved, &next, |value| {
+        assert_eq!(value.worker_token, "b".repeat(64));
+        Ok(())
+    })
+    .is_ok());
+    response.authorization_epoch = 3;
+    assert!(bind_renewal(&saved, &response).is_err());
+}

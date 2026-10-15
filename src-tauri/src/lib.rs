@@ -1,6 +1,7 @@
 pub mod connection;
 mod credentials;
 pub mod lifecycle;
+pub mod ml_transport;
 mod transport;
 pub mod worker;
 
