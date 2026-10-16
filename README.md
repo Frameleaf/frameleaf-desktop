@@ -404,3 +404,17 @@ python3 tools/build_host_media.py \
 ```
 
 The receipt records source fixture hashes, Node and binding hashes, codec pins, platform and qualification scope, and always declares `redistributable: false`. The pinned macOS candidate passed 38/38 HDR tests; a stock-library control passed 27 and failed 11. The JPEG include path must come from package metadata to avoid stock HEIF headers shadowing the patched headers. This closes one native-host feasibility gap; it does not establish RAW/Studio parity, a portable dependency bundle, private PostgreSQL, Manager hosting, signing or installed three-platform acceptance.
+
+### Native host database feasibility
+
+`tools/build_host_database.py` builds PostgreSQL and pgvector under a fresh private macOS output directory. The lock in `runtime/host-database.json` must match the selected Frameleaf revision's database image, extension version and source digest. Downloaded source archives must match their SHA-256 pins before extraction.
+
+```sh
+python3 tools/build_host_database.py \
+  --source /absolute/path/to/frameleaf-app \
+  --revision <reviewed-40-character-source-commit> \
+  --dependency-prefix /opt/homebrew \
+  --output /absolute/path/to/a-new-database-feasibility-directory
+```
+
+This developer fixture requires macOS build tools and dependency libraries. It initializes fresh data with checksums, uses a private Unix socket with TCP disabled, and checks cube, earthdistance, vector/HNSW, logical dump/restore, restart and physical checksums. Local trust authentication is restricted to that disposable fixture; it is not the product authentication design. The receipt records source/binary/backup hashes and always declares `redistributable: false`; the lock remains `certified: false`. PostgreSQL 19 beta 4 with pgvector 0.8.7 passed this fixture on macOS ARM64. Full application migrations, server startup, portable dependency packaging and installed Windows/Linux acceptance remain separate gates.
