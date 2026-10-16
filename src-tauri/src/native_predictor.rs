@@ -143,6 +143,27 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
         }
     }
 }
+async fn worker_jobs(
+    mut execute: impl AsyncFnMut(watch::Receiver<bool>) -> Result<bool, String>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    loop {
+        let execution_cancel = cancel.clone();
+        let completed = tokio::select! {
+            biased;
+            _ = cancelled(cancel) => return Err("worker_cancelled".into()),
+            result = execute(execution_cancel) => result?,
+        };
+        if !completed {
+            // A server may answer an empty long-poll immediately; do not spin against it.
+            tokio::select! {
+                biased;
+                _ = cancelled(cancel) => return Err("worker_cancelled".into()),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
+        }
+    }
+}
 async fn race_prediction<T>(
     prediction: impl Future<Output = Result<T, String>>,
     lease: impl Future<Output = Result<(), String>>,
@@ -176,6 +197,24 @@ impl Drop for ActiveExecution<'_> {
     }
 }
 impl NativePredictor {
+    /// Own the process for a serial, cancellable association; errors require fresh orchestration.
+    pub async fn run(
+        mut self,
+        transport: &WorkerTransport,
+        qualification: &AcceptedQualification,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        let outcome = worker_jobs(
+            async |mut execution_cancel| {
+                self.execute_next(transport, qualification, &mut execution_cancel)
+                    .await
+            },
+            cancel,
+        )
+        .await;
+        self.stop()?;
+        outcome
+    }
     /// The sealed qualification and installed runtime must have the same signed manifest identity.
     pub fn start(
         installed: &InstalledRuntime,
@@ -222,7 +261,7 @@ impl NativePredictor {
         )
         .await
     }
-    /// No background loop or server admission is implied: empty NAS model grants cannot claim work.
+    /// Execute one admitted job; empty NAS model grants cannot claim work.
     pub async fn execute_next(
         &mut self,
         transport: &WorkerTransport,
@@ -324,6 +363,80 @@ mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[tokio::test]
+    async fn worker_loop_runs_serially_and_stops_on_first_failure() {
+        let (_sender, mut cancel) = watch::channel(false);
+        let calls = std::cell::Cell::new(0);
+        let result = worker_jobs(
+            async |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    Err("worker_lease_lost".into())
+                } else {
+                    Ok(true)
+                }
+            },
+            &mut cancel,
+        )
+        .await;
+        assert_eq!(calls.get(), 3);
+        assert_eq!(result, Err("worker_lease_lost".into()));
+    }
+
+    #[tokio::test]
+    async fn worker_loop_cancels_a_pending_claim_and_drops_it() {
+        struct Guard<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let (sender, mut cancel) = watch::channel(false);
+        let dropped = std::cell::Cell::new(false);
+        let run = worker_jobs(
+            async |_| {
+                let _guard = Guard(&dropped);
+                sender.send(true).unwrap();
+                std::future::pending::<Result<bool, String>>().await
+            },
+            &mut cancel,
+        );
+        assert_eq!(run.await, Err("worker_cancelled".into()));
+        assert!(dropped.get());
+    }
+
+    #[tokio::test]
+    async fn worker_loop_throttles_immediate_empty_responses() {
+        let (sender, mut cancel) = watch::channel(false);
+        let calls = std::cell::Cell::new(0);
+        let run = worker_jobs(
+            async |_| {
+                calls.set(calls.get() + 1);
+                Ok(false)
+            },
+            &mut cancel,
+        );
+        tokio::pin!(run);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut run)
+            .await
+            .is_err());
+        assert_eq!(calls.get(), 1);
+        sender.send(true).unwrap();
+        assert_eq!(run.await, Err("worker_cancelled".into()));
+    }
+
+    #[tokio::test]
+    async fn worker_loop_never_claims_after_control_is_closed() {
+        let (sender, mut cancel) = watch::channel(false);
+        drop(sender);
+        let result = worker_jobs(
+            async |_| panic!("claim after owner disappeared"),
+            &mut cancel,
+        )
+        .await;
+        assert_eq!(result, Err("worker_cancelled".into()));
+    }
 
     fn stamp(offset: i64) -> String {
         let d = time::OffsetDateTime::now_utc() + time::Duration::seconds(offset);
@@ -619,13 +732,17 @@ mod tests {
             qualification_id: "fixture".into(),
         };
         assert!(predictor.child.is_running().unwrap());
-        let mut future = Box::pin(async {
-            let _active = ActiveExecution {
-                predictor: &mut predictor,
-                retain: false,
-            };
-            std::future::pending::<()>().await;
-        });
+        let (_sender, mut cancel) = watch::channel(false);
+        let mut future = Box::pin(worker_jobs(
+            async |_| {
+                let _active = ActiveExecution {
+                    predictor: &mut predictor,
+                    retain: false,
+                };
+                std::future::pending::<Result<bool, String>>().await
+            },
+            &mut cancel,
+        ));
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
         drop(future);
