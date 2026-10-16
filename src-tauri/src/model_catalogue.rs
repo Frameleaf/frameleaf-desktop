@@ -1125,6 +1125,32 @@ mod tests {
         assert!(parse_catalogue(&value.to_string()).is_err());
     }
     #[test]
+    fn pr274_profiles_preserve_every_legacy_profile_and_use_distinct_new_identities() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        assert_eq!(profiles.len(), 16);
+        let legacy = Value::Array(profiles[..11].to_vec());
+        assert_eq!(
+            digest(&serde_json_canonicalizer::to_vec(&legacy).unwrap()),
+            "f09d6ae3ddf26a5c6cc0b92b9b0db056d567092c709b8aeb807161aefed870b5"
+        );
+        let source = "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4";
+        let old_keys: BTreeSet<_> = profiles[..11]
+            .iter()
+            .map(|p| p["modelKey"].as_str().unwrap())
+            .collect();
+        for profile in &profiles[11..] {
+            assert_eq!(profile["runtimeSourceRevision"], source);
+            assert!(!old_keys.contains(profile["modelKey"].as_str().unwrap()));
+        }
+        assert_eq!(
+            setup_profiles("ViT-B-16-SigLIP-384__webli", source, "CPUExecutionProvider")
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+    #[test]
     fn matches_nas_challenge_digest_for_every_approved_profile() {
         let expected = [
             "667244e2f6254b58c290a62f4b82cc5f82f5957f394813e015e1f8cf4454527a",
@@ -1138,6 +1164,11 @@ mod tests {
             "4756b97c88cdafaf134d234d96f49b64c9ec16294e6966c3eb9d94d4a60b66fa",
             "314c297749e23952b8541b47000e191dbccbac1556c5710b8f23a03d5d21391f",
             "10a83ae85fa830c3097abaa4117a6adf6542b7ac3fbddb998599f3ef6382cc9d",
+            "8259538dd53d4729b01115092f4709964592011cd2b5c819385b9ba9ebbc295a",
+            "3642a6d2195bb7cdb3205bb65b9416462079150ab73c53c7d0bb71a48bd19a20",
+            "24f6500b8b91a7203c4b91f56fbbdfe3b51666e653d7c576fe065f9fe6709d2e",
+            "fb3d5c5410ea666f34496fd324fc4c88678f3685d4a145c38811a7609355a5ab",
+            "b9f58507b2f76a79c90a4cdc49155f162a086c502966a1280d0cb3a02bb86510",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());

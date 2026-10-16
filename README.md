@@ -191,6 +191,14 @@ administrator approval in the account’s Security tab. The member then selects 
 re-enroll. Removing approval invalidates existing worker sessions and grants;
 automatic administrator consent does not become member permission after demotion.
 
+The catalogue also retains five CPU profiles for the reconciled PR274 runtime:
+three SigLIP roles, the OCR pair and the face pair. Their preprocessing identities
+and model keys are distinct from the historical profiles, which remain unchanged.
+The newer OCR confidence and face embeddings require the matching NAS producer;
+they do not reuse an old qualification. Catalogue membership does not install a
+runtime or change the bundled source pin. The new pack still needs factory signing,
+release packaging and installed-platform acceptance.
+
 ### CoreML candidate packs
 
 The runtime builder accepts `--profile coreml-ort` for native Apple-silicon macOS
