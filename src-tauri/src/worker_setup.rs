@@ -427,6 +427,68 @@ async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), 
     let value = task.await.map_err(|_| "runtime_qualification_failed")?;
     Ok((value, reason))
 }
+fn selected_profiles(
+    config: &serde_json::Value,
+    source: &str,
+    provider: &str,
+) -> Result<Vec<crate::model_catalogue::ApprovedProfile>, String> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Config {
+        machine_learning: Ml,
+    }
+    #[derive(Deserialize)]
+    struct Ml {
+        enabled: bool,
+        clip: Clip,
+        ocr: Option<Ocr>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Clip {
+        enabled: bool,
+        model_name: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Ocr {
+        enabled: bool,
+        model_name: String,
+        min_detection_score: f64,
+        min_recognition_score: f64,
+        max_resolution: u64,
+    }
+    let config: Config =
+        serde_json::from_value(config.clone()).map_err(|_| "server_model_configuration_invalid")?;
+    if !config.machine_learning.enabled {
+        return Err("server_model_disabled".into());
+    }
+    let mut profiles = Vec::new();
+    let clip = config.machine_learning.clip;
+    if clip.enabled {
+        let selected = crate::model_catalogue::setup_profiles(&clip.model_name, source, provider)?;
+        if selected.is_empty() {
+            return Err("server_model_not_supported".into());
+        }
+        profiles.extend(selected);
+    }
+    if let Some(ocr) = config.machine_learning.ocr.filter(|ocr| ocr.enabled) {
+        let entries = serde_json::json!({"ocr": {
+            "detection": {"modelName": ocr.model_name, "options": {"minScore": ocr.min_detection_score, "maxResolution": ocr.max_resolution}},
+            "recognition": {"modelName": ocr.model_name, "options": {"minScore": ocr.min_recognition_score}}
+        }});
+        profiles.push(
+            crate::model_catalogue::approved_profile(&ocr.model_name, &entries, source, provider)?
+                .ok_or("server_model_not_supported")?,
+        );
+    }
+    if profiles.is_empty() {
+        return Err("server_model_disabled".into());
+    }
+    Ok(profiles)
+}
+
 async fn prepare(
     saved: SavedConnection,
     paths: SetupPaths,
@@ -435,12 +497,10 @@ async fn prepare(
 ) -> Result<(), String> {
     use crate::{
         ml_transport::WorkerTransport,
-        model_catalogue::setup_profiles,
         release_policy::open_runtime_store,
         runtime_store::{private_directory, read_bounded},
         transport,
     };
-    use serde::Deserialize;
     progress.set("preparing-runtime", None);
     let cancelled = progress.cancelled.clone();
     let data = paths.data.clone();
@@ -490,23 +550,7 @@ async fn prepare(
     if !caps.features.worker_session {
         return Err("desktop_worker_session_unavailable".into());
     }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Config {
-        machine_learning: Ml,
-    }
-    #[derive(Deserialize)]
-    struct Ml {
-        enabled: bool,
-        clip: Clip,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Clip {
-        enabled: bool,
-        model_name: String,
-    }
-    let config: Config = cancellable(
+    let config: serde_json::Value = cancellable(
         async {
             let base = crate::connection::normalize_server(&saved.server)?;
             let response = client
@@ -523,17 +567,7 @@ async fn prepare(
         &progress.cancelled,
     )
     .await?;
-    if !config.machine_learning.enabled || !config.machine_learning.clip.enabled {
-        return Err("server_model_disabled".into());
-    }
-    let profiles = setup_profiles(
-        &config.machine_learning.clip.model_name,
-        installed.source_revision(),
-        installed.provider(),
-    )?;
-    if profiles.is_empty() {
-        return Err("server_model_not_supported".into());
-    }
+    let profiles = selected_profiles(&config, installed.source_revision(), installed.provider())?;
     let worker = WorkerTransport::load(&saved)?;
     let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
         .await
@@ -565,18 +599,21 @@ async fn prepare(
         .await?;
         caches.push(cache);
     }
-    let cache = caches
-        .first()
-        .ok_or("worker_model_binding_invalid")?
-        .clone();
-    if caches.iter().any(|path| path != &cache) {
-        return Err("worker_shared_cache_required".into());
+    let selected = profiles.clone();
+    let prepared_caches = caches.clone();
+    let combined = paths.data.join("model-sets");
+    let cancelled = progress.cancelled.clone();
+    let cache = tauri::async_runtime::spawn_blocking(move || {
+        crate::model_catalogue::shared_cache(&selected, &prepared_caches, &combined, &cancelled)
+    })
+    .await
+    .map_err(|_| "worker_cache_publish_failed")??;
+    let mut memory_by_cache = std::collections::BTreeMap::new();
+    for (profile, cache) in profiles.iter().zip(&caches) {
+        let memory = memory_by_cache.entry(cache).or_insert(0u64);
+        *memory = (*memory).max(profile.minimum_memory());
     }
-    let required_memory = profiles
-        .iter()
-        .map(|profile| profile.minimum_memory())
-        .max()
-        .unwrap();
+    let required_memory = memory_by_cache.values().sum();
     'qualification: loop {
         let mut prepared = Vec::new();
         for (profile, cache) in profiles.iter().zip(caches.iter().cloned()) {
@@ -753,6 +790,31 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn selects_ocr_independently_and_requires_all_inference_options() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut config = serde_json::json!({"machineLearning": {"enabled":true,
+            "clip":{"enabled":false,"modelName":"unused"},
+            "ocr":{"enabled":true,"modelName":"PP-OCRv5_mobile", "minDetectionScore":0.5,"minRecognitionScore":0.8,"maxResolution":736}
+        }});
+        let profiles = selected_profiles(&config, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].model_key().starts_with("ocr:"));
+        config["machineLearning"]["ocr"]["minDetectionScore"] = serde_json::json!(0.6);
+        assert_eq!(
+            selected_profiles(&config, source, "CPUExecutionProvider")
+                .err()
+                .unwrap(),
+            "server_model_not_supported"
+        );
+        config["machineLearning"]["ocr"]["enabled"] = serde_json::json!(false);
+        assert_eq!(
+            selected_profiles(&config, source, "CPUExecutionProvider")
+                .err()
+                .unwrap(),
+            "server_model_disabled"
+        );
+    }
     #[tokio::test]
     async fn reconnect_retries_a_dropped_http_connection_and_requires_reauthorization() {
         use std::{

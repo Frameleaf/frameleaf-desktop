@@ -21,7 +21,8 @@ struct ProfileData {
     workload: String,
     runtime_source_revision: String,
     model_snapshot_revision: String,
-    embedding_dimensions: usize,
+    #[serde(default)]
+    embedding_dimensions: Option<usize>,
     spec: Value,
     fixture_base64: String,
     artifact_bytes: BTreeMap<String, u64>,
@@ -44,7 +45,7 @@ impl ApprovedProfile {
             .as_str()
             .expect("validated model provider")
     }
-    pub fn embedding_dimensions(&self) -> usize {
+    pub fn embedding_dimensions(&self) -> Option<usize> {
         self.0.embedding_dimensions()
     }
     pub(crate) fn minimum_memory(&self) -> u64 {
@@ -64,6 +65,9 @@ impl ApprovedProfile {
     ) -> Result<std::path::PathBuf, String> {
         crate::model_cache::prepare(
             crate::model_cache::CachePlan {
+                task: self.0.spec["models"][0]["task"]
+                    .as_str()
+                    .ok_or_else(invalid)?,
                 name: &self.0.model_name,
                 revision: &self.0.model_snapshot_revision,
                 hashes: self.0.spec["models"][0]["artifacts"]
@@ -111,7 +115,7 @@ impl ProfileData {
     pub fn model_key(&self) -> &str {
         &self.model_key
     }
-    pub fn embedding_dimensions(&self) -> usize {
+    pub fn embedding_dimensions(&self) -> Option<usize> {
         self.embedding_dimensions
     }
     fn fixture(&self) -> Result<Vec<u8>, String> {
@@ -167,11 +171,21 @@ impl ProfileData {
         .into_iter()
         .collect();
         if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != fields
-            || self.workload != "clip"
+            || !matches!(self.workload.as_str(), "clip" | "ocr")
             || !is_digest(&self.runtime_source_revision, 40)
             || self.spec["protocolVersion"] != 1
             || self.spec["modelKey"] != self.model_key
-            || !(1..=65536).contains(&self.embedding_dimensions)
+            || (self.workload == "clip"
+                && !self
+                    .embedding_dimensions
+                    .is_some_and(|n| (1..=65536).contains(&n)))
+            || (self.workload == "ocr" && self.embedding_dimensions.is_some())
+            || self.model_name.is_empty()
+            || self.model_name.len() > 128
+            || !self
+                .model_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
             || !self.spec["entries"].is_object()
             || !matches!(
                 self.spec["provider"].as_str(),
@@ -204,29 +218,41 @@ impl ProfileData {
         }
         let models = self.spec["models"]
             .as_array()
-            .filter(|v| v.len() == 1)
+            .filter(|v| v.len() == if self.workload == "clip" { 1 } else { 2 })
             .ok_or_else(invalid)?;
         let model = &models[0];
         let kind = self.spec["fixtureKind"].as_str().ok_or_else(invalid)?;
-        let model_type = match kind {
-            "text" => "textual",
-            "image" => "visual",
-            _ => return Err(invalid()),
-        };
-        if model["name"] != self.model_name
-            || model["task"] != "clip"
-            || model["type"] != model_type
-        {
-            return Err(invalid());
+        if self.workload == "clip" {
+            let model_type = match kind {
+                "text" => "textual",
+                "image" => "visual",
+                _ => return Err(invalid()),
+            };
+            if model["name"] != self.model_name
+                || model["task"] != "clip"
+                || model["type"] != model_type
+            {
+                return Err(invalid());
+            }
+            let entries = self.spec["entries"].as_object().ok_or_else(invalid)?;
+            let clip = self.spec["entries"]["clip"]
+                .as_object()
+                .ok_or_else(invalid)?;
+            if entries.len() != 1
+                || clip.len() != 1
+                || self.spec["entries"]["clip"][model_type]["modelName"] != self.model_name
+            {
+                return Err(invalid());
+            }
+        } else {
+            validate_ocr_entries(models, &self.spec["entries"], &self.model_name, kind)?;
         }
-        let entries = self.spec["entries"].as_object().ok_or_else(invalid)?;
-        let clip = self.spec["entries"]["clip"]
-            .as_object()
-            .ok_or_else(invalid)?;
-        if entries.len() != 1
-            || clip.len() != 1
-            || self.spec["entries"]["clip"][model_type]["modelName"] != self.model_name
-        {
+        if models.iter().any(|m| {
+            m.as_object().is_none_or(|o| o.len() != 4)
+                || m["name"] != self.model_name
+                || m["task"] != self.workload
+                || m["artifacts"] != model["artifacts"]
+        }) {
             return Err(invalid());
         }
         let artifacts = model["artifacts"]
@@ -263,20 +289,27 @@ impl ProfileData {
         let identity = json!({"protocolVersion":1,"entries":self.spec["entries"],"models":self.spec["models"],"preprocessingSha256":self.spec["preprocessingSha256"]});
         if self.model_key
             != format!(
-                "clip:{}",
+                "{}:{}",
+                self.workload,
                 digest(&serde_json::to_vec(&identity).map_err(|_| invalid())?)
             )
         {
             return Err(invalid());
         }
-        let vector: Vec<f64> = serde_json::from_str(
-            self.spec["expectedOutput"]["clip"]
-                .as_str()
-                .ok_or_else(invalid)?,
-        )
-        .map_err(|_| invalid())?;
-        if vector.len() != self.embedding_dimensions || vector.iter().any(|v| !v.is_finite()) {
-            return Err(invalid());
+        if self.workload == "clip" {
+            let vector: Vec<f64> = serde_json::from_str(
+                self.spec["expectedOutput"]["clip"]
+                    .as_str()
+                    .ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?;
+            if Some(vector.len()) != self.embedding_dimensions
+                || vector.iter().any(|v| !v.is_finite())
+            {
+                return Err(invalid());
+            }
+        } else {
+            validate_ocr_output(&self.spec["expectedOutput"])?;
         }
         let fixture = self.fixture()?;
         let output = self.spec["expectedOutput"]
@@ -298,6 +331,97 @@ impl ProfileData {
         }
         Ok(())
     }
+}
+fn validate_ocr_entries(
+    models: &[Value],
+    entries: &Value,
+    name: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let ocr = entries["ocr"].as_object().ok_or_else(invalid)?;
+    if kind != "image"
+        || entries.as_object().is_none_or(|v| v.len() != 1)
+        || ocr.len() != 2
+        || models
+            .iter()
+            .map(|m| m["type"].as_str().unwrap_or(""))
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from(["detection", "recognition"])
+    {
+        return Err(invalid());
+    }
+    for role in ["detection", "recognition"] {
+        let entry = ocr
+            .get(role)
+            .and_then(Value::as_object)
+            .ok_or_else(invalid)?;
+        let options = entry
+            .get("options")
+            .and_then(Value::as_object)
+            .ok_or_else(invalid)?;
+        if entry.len() != 2
+            || entry.get("modelName") != Some(&json!(name))
+            || options.len() != if role == "detection" { 2 } else { 1 }
+            || !options
+                .get("minScore")
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v.is_finite() && (0.1..=1.0).contains(&v))
+            || (role == "detection"
+                && !options
+                    .get("maxResolution")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+fn validate_ocr_output(output: &Value) -> Result<(), String> {
+    let width = output["imageWidth"]
+        .as_u64()
+        .filter(|v| (1..=65_536).contains(v))
+        .ok_or_else(invalid)?;
+    let height = output["imageHeight"]
+        .as_u64()
+        .filter(|v| (1..=65_536).contains(v))
+        .ok_or_else(invalid)?;
+    if width * height > 16 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    let ocr = output["ocr"]
+        .as_object()
+        .filter(|v| v.len() == 4)
+        .ok_or_else(invalid)?;
+    let text = ocr
+        .get("text")
+        .and_then(Value::as_array)
+        .filter(|v| !v.is_empty() && v.len() <= 4096)
+        .ok_or_else(invalid)?;
+    if text.iter().any(|s| {
+        !s.as_str()
+            .is_some_and(|s| !s.is_empty() && s.encode_utf16().count() <= 16_384)
+    }) {
+        return Err(invalid());
+    }
+    for (name, count) in [
+        ("box", text.len() * 8),
+        ("boxScore", text.len()),
+        ("textScore", text.len()),
+    ] {
+        let values = ocr
+            .get(name)
+            .and_then(Value::as_array)
+            .filter(|v| v.len() == count)
+            .ok_or_else(invalid)?;
+        if values.iter().any(|v| {
+            !v.as_f64()
+                .is_some_and(|n| n.is_finite() && (0.0..=1.0).contains(&n))
+        }) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     let catalogue: Catalogue = serde_json::from_str(raw).map_err(|_| invalid())?;
@@ -354,9 +478,256 @@ pub(crate) fn setup_profiles(
         .collect())
 }
 
+pub(crate) fn shared_cache(
+    profiles: &[ApprovedProfile],
+    caches: &[std::path::PathBuf],
+    root: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<std::path::PathBuf, String> {
+    use crate::{
+        model_cache::{check_cancel, verify_file},
+        runtime_store::private_directory,
+    };
+    use std::{fs, path::PathBuf};
+    if profiles.is_empty() || profiles.len() != caches.len() {
+        return Err("worker_model_binding_invalid".into());
+    }
+    if caches.iter().all(|cache| cache == &caches[0]) {
+        return Ok(caches[0].clone());
+    }
+    let mut files: BTreeMap<PathBuf, (PathBuf, u64, String)> = BTreeMap::new();
+    for (profile, cache) in profiles.iter().zip(caches) {
+        let profile = &profile.0;
+        profile.validate()?;
+        let prefix = PathBuf::from(&profile.workload).join(&profile.model_name);
+        let hashes = profile.spec["models"][0]["artifacts"]
+            .as_object()
+            .ok_or_else(invalid)?;
+        let receipt = serde_json::to_vec(hashes).map_err(|_| invalid())?;
+        let mut add = |name: &str, bytes: u64, hash: String| -> Result<(), String> {
+            let relative = prefix.join(name);
+            if let Some((_, old_bytes, old_hash)) = files.get(&relative) {
+                if *old_bytes != bytes || *old_hash != hash {
+                    return Err("worker_cache_conflict".into());
+                }
+            } else {
+                files.insert(relative.clone(), (cache.join(relative), bytes, hash));
+            }
+            Ok(())
+        };
+        for (name, bytes) in &profile.artifact_bytes {
+            add(
+                name,
+                *bytes,
+                hashes[name].as_str().ok_or_else(invalid)?.into(),
+            )?;
+        }
+        add(
+            ".frameleaf-staged.json",
+            receipt.len() as u64,
+            digest(&receipt),
+        )?;
+    }
+    let identity: Vec<_> = files
+        .iter()
+        .map(|(path, (_, bytes, hash))| (path, bytes, hash))
+        .collect();
+    let scope = digest(&serde_json::to_vec(&identity).map_err(|_| invalid())?);
+    let active = root.join(scope);
+    private_directory(root)?;
+    if active.exists() {
+        for (relative, (_, bytes, hash)) in &files {
+            verify_file(&active.join(relative), *bytes, hash, cancel)?;
+        }
+        return Ok(active);
+    }
+    struct Staging(PathBuf);
+    impl Drop for Staging {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let staging = Staging(root.join(format!(".composition-{}", Uuid::new_v4())));
+    private_directory(&staging.0)?;
+    for (relative, (source, bytes, hash)) in &files {
+        check_cancel(cancel)?;
+        verify_file(source, *bytes, hash, cancel)?;
+        let mut parent = staging.0.clone();
+        for part in relative.parent().ok_or_else(invalid)?.components() {
+            parent.push(part);
+            private_directory(&parent)?;
+        }
+        let target = staging.0.join(relative);
+        // App-owned immutable weights share disk blocks; verify the published inode again before use.
+        fs::hard_link(source, &target).map_err(|_| "worker_cache_publish_failed")?;
+        verify_file(&target, *bytes, hash, cancel)?;
+    }
+    check_cancel(cancel)?;
+    fs::rename(&staging.0, &active).map_err(|_| "worker_cache_publish_failed")?;
+    Ok(active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-cache-set-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut profiles = Vec::new();
+        let mut caches = Vec::new();
+        for (index, name) in ["PP-OCRv5_mobile", "FixtureOCR"].into_iter().enumerate() {
+            let mut raw: Value =
+                serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+            let bytes = format!("fixture weights {index}");
+            let revision = raw["modelSnapshotRevision"].as_str().unwrap().to_owned();
+            let reference = format!("models--frameleaf--{name}/refs/main");
+            let hashes = json!({"detection/model.onnx":digest(bytes.as_bytes()),"recognition/model.onnx":digest(bytes.as_bytes()),reference.clone():digest(revision.as_bytes())});
+            raw["modelName"] = json!(name);
+            raw["artifactBytes"] = json!({"detection/model.onnx":bytes.len(),"recognition/model.onnx":bytes.len(),reference.clone():revision.len()});
+            for model in raw["spec"]["models"].as_array_mut().unwrap() {
+                model["name"] = json!(name);
+                model["artifacts"] = hashes.clone();
+            }
+            for role in ["detection", "recognition"] {
+                raw["spec"]["entries"]["ocr"][role]["modelName"] = json!(name);
+            }
+            let identity = json!({"protocolVersion":1,"entries":raw["spec"]["entries"],"models":raw["spec"]["models"],"preprocessingSha256":raw["spec"]["preprocessingSha256"]});
+            let key = format!("ocr:{}", digest(&serde_json::to_vec(&identity).unwrap()));
+            raw["modelKey"] = json!(key);
+            raw["spec"]["modelKey"] = json!(key);
+            let profile: ProfileData = serde_json::from_value(raw).unwrap();
+            profile.validate().unwrap();
+            let cache = root.join(format!("source-{index}"));
+            let model = cache.join("ocr").join(name);
+            for role in ["detection", "recognition"] {
+                std::fs::create_dir_all(model.join(role)).unwrap();
+                std::fs::write(model.join(role).join("model.onnx"), &bytes).unwrap();
+            }
+            std::fs::create_dir_all(model.join(&reference).parent().unwrap()).unwrap();
+            std::fs::write(model.join(&reference), revision).unwrap();
+            std::fs::write(
+                model.join(".frameleaf-staged.json"),
+                serde_json::to_vec(&hashes).unwrap(),
+            )
+            .unwrap();
+            profiles.push(ApprovedProfile(profile));
+            caches.push(cache);
+        }
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let active = shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        for name in ["PP-OCRv5_mobile", "FixtureOCR"] {
+            assert!(active
+                .join("ocr")
+                .join(name)
+                .join("detection/model.onnx")
+                .is_file());
+        }
+        assert_eq!(
+            shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap(),
+            active
+        );
+        std::fs::write(
+            active.join("ocr/FixtureOCR/detection/model.onnx"),
+            b"changed",
+        )
+        .unwrap();
+        assert_eq!(
+            shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap_err(),
+            "model_file_changed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn restores_a_verified_ocr_cache_from_its_own_family() {
+        let mut profile: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+        let weights = b"fixture weights";
+        let reference = profile["modelSnapshotRevision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ref_path = "models--frameleaf--PP-OCRv5_mobile/refs/main";
+        let hashes = json!({"detection/model.onnx":digest(weights),"recognition/model.onnx":digest(weights),ref_path:digest(reference.as_bytes())});
+        profile["artifactBytes"] = json!({"detection/model.onnx":weights.len(),"recognition/model.onnx":weights.len(),ref_path:reference.len()});
+        for model in profile["spec"]["models"].as_array_mut().unwrap() {
+            model["artifacts"] = hashes.clone();
+        }
+        let identity = json!({"protocolVersion":1,"entries":profile["spec"]["entries"],"models":profile["spec"]["models"],"preprocessingSha256":profile["spec"]["preprocessingSha256"]});
+        let key = format!("ocr:{}", digest(&serde_json::to_vec(&identity).unwrap()));
+        profile["modelKey"] = json!(key);
+        profile["spec"]["modelKey"] = json!(key);
+        let profile: ProfileData = serde_json::from_value(profile).unwrap();
+        profile.validate().unwrap();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-ocr-cache-{}", Uuid::new_v4()));
+        let model = root.join(&reference).join("ocr/PP-OCRv5_mobile");
+        std::fs::create_dir_all(model.join("detection")).unwrap();
+        std::fs::create_dir_all(model.join("recognition")).unwrap();
+        std::fs::create_dir_all(model.join("models--frameleaf--PP-OCRv5_mobile/refs")).unwrap();
+        std::fs::write(model.join("detection/model.onnx"), weights).unwrap();
+        std::fs::write(model.join("recognition/model.onnx"), weights).unwrap();
+        std::fs::write(model.join(ref_path), reference.as_bytes()).unwrap();
+        std::fs::write(
+            model.join(".frameleaf-staged.json"),
+            serde_json::to_vec(&hashes).unwrap(),
+        )
+        .unwrap();
+        let result = ApprovedProfile(profile)
+            .prepare_cache(
+                &root,
+                &crate::transport::client().unwrap(),
+                &std::sync::atomic::AtomicBool::new(false),
+                false,
+            )
+            .await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result.unwrap(), root.join(reference));
+    }
+    #[test]
+    fn refuses_ocr_engine_and_output_changes_even_with_a_recomputed_identity() {
+        let original: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+        let changes: [fn(&mut Value); 7] = [
+            |v| {
+                v["spec"]["models"].as_array_mut().unwrap().pop();
+            },
+            |v| v["spec"]["models"][1]["task"] = json!("clip"),
+            |v| v["spec"]["models"][1]["type"] = json!("detection"),
+            |v| {
+                v["spec"]["models"][1]["artifacts"]["recognition/model.onnx"] =
+                    json!("0".repeat(64))
+            },
+            |v| v["embeddingDimensions"] = json!(768),
+            |v| v["spec"]["expectedOutput"]["ocr"]["box"][0] = json!(1.1),
+            |v| v["spec"]["expectedOutput"]["ocr"]["textScore"] = json!([]),
+        ];
+        for change in changes {
+            let mut value = original.clone();
+            change(&mut value);
+            let identity = json!({"protocolVersion":1,"entries":value["spec"]["entries"],"models":value["spec"]["models"],"preprocessingSha256":value["spec"]["preprocessingSha256"]});
+            let key = format!("ocr:{}", digest(&serde_json::to_vec(&identity).unwrap()));
+            value["modelKey"] = json!(key);
+            value["spec"]["modelKey"] = json!(key);
+            let profile: ProfileData = serde_json::from_value(value).unwrap();
+            assert!(profile.validate().is_err());
+        }
+    }
+    #[test]
+    fn accepts_an_ocr_pair_without_embedding_dimensions() {
+        let profile: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+        let catalogue = serde_json::json!({"schemaVersion":1,"epoch":4,"profiles":[profile]});
+        let parsed = parse_catalogue(&catalogue.to_string()).unwrap();
+        assert_eq!(parsed[0].workload, "ocr");
+        assert_eq!(parsed[0].spec["models"].as_array().unwrap().len(), 2);
+    }
+
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     #[tokio::test]
@@ -516,6 +887,7 @@ mod tests {
             "c53ede795fb9a86ecba813f1e4f279ee4fa16e9109ed245db5ae8f1d144cd2c5",
             "a14a99cad4f9e208fd8729680a37211dd09ed13b9e34462559c13f9dd35826a3",
             "4756b97c88cdafaf134d234d96f49b64c9ec16294e6966c3eb9d94d4a60b66fa",
+            "314c297749e23952b8541b47000e191dbccbac1556c5710b8f23a03d5d21391f",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());

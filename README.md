@@ -22,7 +22,7 @@ Local photo-source work includes OneDrive folders and Apple Photos/iCloud throug
 
 This private repository owns the desktop shell, supervisor, native adapters, packaging and desktop tests. Proposed `desktop/...` paths in the planning documents map here. Backend, Manager, shared web and ML contract changes remain in `Frameleaf/frameleaf-app`. Shared UI, SDK and runtime artifacts must be pinned to reviewed versions; do not fork the photo application.
 
-Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7ea`. PR #140 remains draft/open and unmerged. The foundation candidate contains a Tauri desktop shell, secure native password sign-in, OS-keystore session/device identity, automatic signed enrollment and an unprivileged window for the existing Frameleaf photo interface. Native inference and signed worker transport are implemented; serial multi-role scheduling is connected; actual NAS job acceptance, native full hosting, Manager pairing and local photo-source integrations remain unfinished. Installed-device release acceptance remains pending.
+Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7ea`. PR #140 remains draft/open and unmerged. The foundation candidate contains a Tauri desktop shell, secure native password sign-in, OS-keystore session/device identity, automatic signed enrollment and an unprivileged window for the existing Frameleaf photo interface. Native inference and signed worker transport are implemented; serial multi-role scheduling is connected; Local macOS CPU fixtures have accepted actual NAS CLIP and OCR library jobs through the signed native runtime, including stale-source publication refusal. OCR runs without a NAS inference backend. Native full hosting, Manager pairing and local photo-source integrations remain unfinished. Installed-device release acceptance remains pending.
 
 
 ## Development
@@ -67,7 +67,7 @@ before claiming work, and serializes matching jobs through it. It refreshes expi
 qualifications and stops inference on cancellation or unsuitable power, network cost
 or available memory. Multi-role launches use an explicit flag rejected by older runtimes.
 The default installer build requires a signed runtime resource; actual NAS library-job
-acceptance remains required before enabling worker readiness. CI exercises the process
+acceptance on installed Windows, macOS and Linux devices remains required before enabling release readiness. CI exercises the process
 owner on all three OS builds; installed hardware acceptance remains separate.
 
 ## Constructing a runtime candidate
@@ -167,3 +167,11 @@ Tauri maps only `manifest.json`, `manifest.sig` and the verified `payload/` tree
 installed app verifies that signed resource again before copying it into its private
 runtime store. macOS app/DMG packaging has been exercised locally; OS release signing,
 notarization and installed Windows/Linux acceptance remain separate gates.
+
+The approved CPU catalog includes the default `PP-OCRv5_mobile` detection and recognition
+engines with exact pinned weights and inference options. OCR qualification does not change
+CLIP index membership or model identities. Each workload retains its own live worker grant;
+NAS policy, default route, full OCR configuration, source and job authority are checked before
+input disclosure and result publication. Automatic setup combines verified model snapshots
+for one runtime and budgets the distinct model groups together. Other OCR models/options
+require their own approved qualification profile.

@@ -158,6 +158,7 @@ pub(crate) async fn acquire_file(
 }
 
 pub(crate) struct CachePlan<'a> {
+    pub task: &'a str,
     pub name: &'a str,
     pub revision: &'a str,
     pub hashes: &'a serde_json::Map<String, serde_json::Value>,
@@ -172,6 +173,9 @@ pub(crate) async fn prepare(
 ) -> Result<PathBuf, String> {
     use crate::{native_runtime::absolute_directory, runtime_store::private_directory};
     use std::collections::BTreeSet;
+    if !matches!(plan.task, "clip" | "ocr") {
+        return Err("model_plan_invalid".into());
+    }
     absolute_directory(root)?;
     check_cancel(cancel)?;
     let active = root.join(plan.revision);
@@ -186,9 +190,9 @@ pub(crate) async fn prepare(
     } else {
         private_directory(&candidate)?;
     }
-    let model = candidate.join("clip").join(plan.name);
+    let model = candidate.join(plan.task).join(plan.name);
     if !complete {
-        private_directory(&candidate.join("clip"))?;
+        private_directory(&candidate.join(plan.task))?;
         private_directory(&model)?;
     }
     let reference = format!("models--frameleaf--{}/refs/main", plan.name);
@@ -422,6 +426,7 @@ mod tests {
         let sizes = std::collections::BTreeMap::from([("visual/model.onnx".into(), 7)]);
         let result = prepare(
             CachePlan {
+                task: "clip",
                 name: "test",
                 revision: &"1".repeat(40),
                 hashes: hashes.as_object().unwrap(),
@@ -497,6 +502,7 @@ mod tests {
             ("models--frameleaf--test/refs/main".into(), 40),
         ]);
         let plan = || CachePlan {
+            task: "clip",
             name: "test",
             revision: &reference,
             hashes: hashes.as_object().unwrap(),

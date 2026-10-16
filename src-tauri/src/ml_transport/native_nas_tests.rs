@@ -163,6 +163,9 @@ fn actual_native_nas_library_jobs() {
     fs::create_dir(&configuration.work_root).unwrap();
     let root = OwnedRoot(configuration.work_root.clone());
     let pack = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
+    let workload =
+        std::env::var("FRAMELEAF_FACTORY_TEST_WORKLOAD").unwrap_or_else(|_| "clip".into());
+    assert!(matches!(workload.as_str(), "clip" | "ocr"));
     let cache = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
     let store = crate::release_policy::open_runtime_store(&root.0.join("store")).unwrap();
     let raw = fs::read(pack.join("manifest.json")).unwrap();
@@ -181,7 +184,9 @@ fn actual_native_nas_library_jobs() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|p| p["runtimeSourceRevision"] == installed.source_revision())
+        .filter(|p| {
+            p["runtimeSourceRevision"] == installed.source_revision() && p["workload"] == workload
+        })
         .map(|p| {
             approved_profile(
                 p["modelName"].as_str().unwrap(),
@@ -193,7 +198,7 @@ fn actual_native_nas_library_jobs() {
             .unwrap()
         })
         .collect();
-    assert_eq!(profiles.len(), 3);
+    assert_eq!(profiles.len(), if workload == "ocr" { 1 } else { 3 });
     tauri::async_runtime::block_on(async {
         let mut prepared = Vec::new();
         for profile in &profiles {
@@ -229,7 +234,7 @@ fn actual_native_nas_library_jobs() {
             .collect();
         let mut predictor =
             NativePredictor::start_many(&installed, &bindings, &cache, &root.0, port).unwrap();
-        println!("NATIVE_QUALIFIED {{\"roles\":3}}");
+        println!("NATIVE_QUALIFIED {{\"roles\":{}}}", profiles.len());
         std::io::stdout().flush().unwrap();
         let (_sender, mut cancel) = tokio::sync::watch::channel(false);
         let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
