@@ -168,6 +168,38 @@ async fn resource_loss(required_memory: u64) -> String {
         }
     }
 }
+async fn preparation_interrupt<F: Future<Output = Result<(), String>>>(
+    required_memory: u64,
+    mut maintain: impl FnMut() -> F,
+) -> String {
+    tokio::select! {
+        reason = resource_loss(required_memory) => format!("resource_{reason}"),
+        reason = async {
+            loop {
+                if let Err(reason) = maintain().await { return reason; }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        } => reason,
+    }
+}
+async fn monitored_preparation<T: Send + 'static>(
+    work: impl FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
+    interrupt: impl Future<Output = String>,
+    cancelled: &AtomicBool,
+) -> Result<(T, Option<String>), String> {
+    check_cancel(cancelled)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let request = stop.clone();
+    let mut task = tauri::async_runtime::spawn_blocking(move || work(request));
+    let reason = tokio::select! {
+        result = &mut task => return result.map(|value| (value, None)).map_err(|_| "runtime_qualification_failed".into()),
+        reason = cancellable(async { Ok(interrupt.await) }, cancelled) => Some(reason.unwrap_or_else(|error| error)),
+    };
+    stop.store(true, Ordering::Release);
+    // Dropping a blocking task leaves it running; join before resuming or signing out.
+    let value = task.await.map_err(|_| "runtime_qualification_failed")?;
+    Ok((value, reason))
+}
 async fn prepare(
     saved: SavedConnection,
     paths: SetupPaths,
@@ -328,18 +360,28 @@ async fn prepare(
             .await?;
             let spec = challenge.specification().to_vec();
             let fixture = challenge.fixture().to_vec();
-            let cancel = progress.cancelled.clone();
             let scratch = paths.data.join("scratch");
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel)?;
-                Ok::<_, String>((installed, qualified))
-            })
-            .await
-            .map_err(|_| "runtime_qualification_failed")??;
-            installed = result.0;
+            let ((runtime, qualified), interrupted) = monitored_preparation(
+                move |cancel| {
+                    let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
+                    (installed, qualified)
+                },
+                preparation_interrupt(profile.minimum_memory(), || worker.maintain_session()),
+                &progress.cancelled,
+            )
+            .await?;
+            installed = runtime;
             check_cancel(&progress.cancelled)?;
+            if let Some(reason) = interrupted {
+                if let Some(reason) = reason.strip_prefix("resource_") {
+                    progress.set("paused", Some(reason.into()));
+                    continue 'qualification;
+                }
+                return Err(reason);
+            }
+            let qualified = qualified?;
             if !cancellable(
-                worker.submit_qualification(&challenge, &result.1),
+                worker.submit_qualification(&challenge, &qualified),
                 &progress.cancelled,
             )
             .await?
@@ -347,11 +389,11 @@ async fn prepare(
                 return Err("worker_qualification_refused".into());
             }
             let accepted = cancellable(
-                worker.read_accepted_qualification(profile, &result.1, challenge.id()),
+                worker.read_accepted_qualification(profile, &qualified, challenge.id()),
                 &progress.cancelled,
             )
             .await?;
-            prepared.push((result.1, accepted));
+            prepared.push((qualified, accepted));
         }
 
         loop {
@@ -449,6 +491,68 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn interrupted_preparation_is_joined_before_returning_owned_runtime() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let proof = cleaned.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (owned, reason) = monitored_preparation(
+            move |stop| {
+                tx.send(()).unwrap();
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                proof.store(true, Ordering::Release);
+                42
+            },
+            async {
+                rx.await.unwrap();
+                "resource_on_battery".into()
+            },
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(owned, 42);
+        assert_eq!(reason.as_deref(), Some("resource_on_battery"));
+        assert!(cleaned.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn sign_out_joins_preparation_even_when_the_monitor_is_waiting() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let request = cancelled.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let proof = cleaned.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let trigger = tokio::spawn(async move {
+            rx.await.unwrap();
+            request.store(true, Ordering::Release);
+        });
+        let (_, reason) = monitored_preparation(
+            move |stop| {
+                tx.send(()).unwrap();
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                proof.store(true, Ordering::Release);
+            },
+            std::future::pending(),
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        trigger.await.unwrap();
+        assert_eq!(reason.as_deref(), Some("worker_setup_cancelled"));
+        assert!(cleaned.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn preparation_maintenance_failure_interrupts_work() {
+        assert_eq!(
+            preparation_interrupt(0, || async { Err("worker_session_revoked".into()) }).await,
+            "worker_session_revoked"
+        );
+    }
     #[tokio::test]
     async fn resource_refusal_prevents_work_and_remains_cancellable() {
         let setup = WorkerSetup::default();
