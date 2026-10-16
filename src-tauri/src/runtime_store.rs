@@ -45,7 +45,7 @@ impl Drop for Staging {
     }
 }
 
-fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     let meta = fs::symlink_metadata(path).map_err(|_| "runtime_store_read_failed")?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > max {
         return Err("runtime_store_file_invalid".into());
@@ -81,7 +81,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .and_then(|_| file.sync_all())
         .map_err(|_| "runtime_store_write_failed".into())
 }
-fn private_directory(path: &Path) -> Result<(), String> {
+pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
     absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
     if !path.exists() {
         let builder = fs::DirBuilder::new();
@@ -324,6 +324,9 @@ impl RuntimeStore {
     }
 }
 impl InstalledRuntime {
+    pub fn source_revision(&self) -> &str {
+        self.runtime.source_revision()
+    }
     pub fn manifest_sha256(&self) -> &str {
         self.runtime.manifest_sha256()
     }

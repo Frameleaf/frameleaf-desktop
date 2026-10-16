@@ -2,6 +2,7 @@ pub mod connection;
 mod credentials;
 pub mod lifecycle;
 pub mod ml_transport;
+mod model_cache;
 pub mod model_catalogue;
 pub mod native_predictor;
 pub mod native_runtime;
@@ -10,10 +11,11 @@ pub mod release_policy;
 pub mod runtime_store;
 mod transport;
 pub mod worker;
+mod worker_setup;
 
 use connection::{normalize_server, ConnectionView, Features, SavedConnection};
 use serde::Deserialize;
-use tauri::{Manager, State, WebviewUrl, WebviewWindow};
+use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindow};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
@@ -117,6 +119,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
 #[tauri::command]
 async fn connect_server(
     window: WebviewWindow,
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     server: String,
     email: String,
@@ -159,7 +162,13 @@ async fn connect_server(
             .await;
         return Err(error);
     }
-    let view = prepare(&mut saved).await;
+    let mut view = prepare(&mut saved).await;
+    if view.state == "preparing"
+        && view.features.worker_session
+        && start_worker_setup(&app, &saved, false).await.is_err()
+    {
+        view.state = "worker-setup-failed".into();
+    }
     *current = Some(saved);
     Ok(view)
 }
@@ -167,10 +176,12 @@ async fn connect_server(
 #[tauri::command]
 async fn restore_connection(
     window: WebviewWindow,
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load::<SavedConnection>("connection")? else {
         return Ok(None);
     };
@@ -193,7 +204,13 @@ async fn restore_connection(
     if user.id != saved.account_id {
         return Err("account_identity_changed".into());
     }
-    let view = prepare(&mut saved).await;
+    let mut view = prepare(&mut saved).await;
+    if view.state == "preparing"
+        && view.features.worker_session
+        && start_worker_setup(&app, &saved, false).await.is_err()
+    {
+        view.state = "worker-setup-failed".into();
+    }
     *current = Some(saved);
     Ok(Some(view))
 }
@@ -206,6 +223,7 @@ async fn sign_out(
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<worker_setup::WorkerSetup>().stop().await;
     let saved = current
         .clone()
         .or(credentials::load::<SavedConnection>("connection")?);
@@ -323,12 +341,71 @@ pub fn run() {
             }
         }))
         .manage(DesktopState::default())
+        .manage(worker_setup::WorkerSetup::default())
         .invoke_handler(tauri::generate_handler![
             connect_server,
             restore_connection,
             sign_out,
-            open_photos
+            open_photos,
+            worker_setup_status,
+            prepare_models
         ])
         .run(tauri::generate_context!())
         .expect("Frameleaf desktop failed to start");
+}
+
+async fn start_worker_setup(
+    app: &tauri::AppHandle,
+    saved: &SavedConnection,
+    allow_download: bool,
+) -> Result<(), String> {
+    let paths = worker_setup::SetupPaths {
+        data: app
+            .path()
+            .app_local_data_dir()
+            .map_err(|_| "app_data_directory_unavailable")?
+            .join("worker"),
+        bundle: app
+            .path()
+            .resource_dir()
+            .map_err(|_| "app_resources_unavailable")?
+            .join("native-runtime"),
+    };
+    let handle = app.clone();
+    app.state::<worker_setup::WorkerSetup>()
+        .start(
+            saved.clone(),
+            paths,
+            allow_download,
+            std::sync::Arc::new(move |status| {
+                let _ = handle.emit_to("main", "worker-setup", status);
+            }),
+        )
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn worker_setup_status(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<worker_setup::SetupStatus, String> {
+    require_local(&window)?;
+    Ok(app.state::<worker_setup::WorkerSetup>().status())
+}
+
+#[tauri::command]
+async fn prepare_models(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    allow_download: bool,
+) -> Result<(), String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    if saved.mode != "client-worker" || saved.server_id.is_empty() || saved.device_id.is_none() {
+        return Err("desktop_enrollment_required".into());
+    }
+    start_worker_setup(&app, saved, allow_download).await
 }

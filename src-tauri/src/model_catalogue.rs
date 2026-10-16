@@ -50,6 +50,29 @@ impl ApprovedProfile {
     pub fn challenge(&self, id: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         self.0.challenge(id)
     }
+    pub(crate) async fn prepare_cache(
+        &self,
+        root: &std::path::Path,
+        client: &reqwest::Client,
+        cancel: &std::sync::atomic::AtomicBool,
+        allow_download: bool,
+    ) -> Result<std::path::PathBuf, String> {
+        crate::model_cache::prepare(
+            crate::model_cache::CachePlan {
+                name: &self.0.model_name,
+                revision: &self.0.model_snapshot_revision,
+                hashes: self.0.spec["models"][0]["artifacts"]
+                    .as_object()
+                    .ok_or_else(invalid)?,
+                sizes: &self.0.artifact_bytes,
+            },
+            root,
+            client,
+            cancel,
+            allow_download,
+        )
+        .await
+    }
 }
 fn invalid() -> String {
     "model_catalogue_invalid".into()
@@ -310,11 +333,91 @@ pub fn approved_profile(
         .map(ApprovedProfile))
 }
 
+pub(crate) fn setup_profiles(
+    name: &str,
+    source: &str,
+    provider: &str,
+) -> Result<Vec<ApprovedProfile>, String> {
+    Ok(parse_catalogue(DATA)?
+        .into_iter()
+        .filter(|profile| {
+            profile.model_name == name
+                && profile.runtime_source_revision == source
+                && profile.spec["provider"] == provider
+        })
+        .map(ApprovedProfile)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
+    #[tokio::test]
+    #[ignore = "requires explicit test-network model download and an owned preparation directory"]
+    async fn fresh_preparation_acquires_the_released_default_snapshot() {
+        let root =
+            std::path::PathBuf::from(std::env::var("FRAMELEAF_PREPARATION_TEST_ROOT").unwrap());
+        let profiles = setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            "f60b8f30da46d2750ac2eb811d36cd290c411a3e",
+            "CPUExecutionProvider",
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 3);
+        let client = crate::transport::client().unwrap();
+        for profile in profiles {
+            let path = profile
+                .prepare_cache(
+                    &root,
+                    &client,
+                    &std::sync::atomic::AtomicBool::new(false),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                path.file_name().unwrap(),
+                "77dda0dfc7afd494b918ec174cddca24854a73d1"
+            );
+            assert!(path
+                .join("clip/ViT-B-16-SigLIP-384__webli/.frameleaf-staged.json")
+                .is_file());
+        }
+    }
+    #[test]
+    fn setup_selects_every_paired_role_only_for_the_current_model_runtime_and_provider() {
+        let source = "f60b8f30da46d2750ac2eb811d36cd290c411a3e";
+        let profiles =
+            setup_profiles("ViT-B-16-SigLIP-384__webli", source, "CPUExecutionProvider").unwrap();
+        assert_eq!(profiles.len(), 3);
+        let roles: Vec<_> = profiles
+            .iter()
+            .map(|p| p.0.spec["fixtureKind"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles.iter().filter(|role| **role == "image").count(), 1);
+        assert_eq!(roles.iter().filter(|role| **role == "text").count(), 2);
+        assert!(
+            setup_profiles("ViT-B-32__openai", source, "CPUExecutionProvider")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            &"0".repeat(40),
+            "CPUExecutionProvider"
+        )
+        .unwrap()
+        .is_empty());
+        assert!(setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            source,
+            "CUDAExecutionProvider"
+        )
+        .unwrap()
+        .is_empty());
+    }
     #[test]
     fn only_exact_built_in_model_configuration_runtime_and_provider_can_be_selected() {
         let catalogue: Value =

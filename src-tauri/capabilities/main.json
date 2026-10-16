@@ -4,5 +4,5 @@
   "description": "Packaged setup can connect to one server. Remote photo windows receive no native capabilities.",
   "local": true,
   "windows": ["main"],
-  "permissions": ["core:default", "allow-connect-server", "allow-restore-connection", "allow-sign-out", "allow-open-photos"]
+  "permissions": ["core:default", "allow-connect-server", "allow-restore-connection", "allow-sign-out", "allow-open-photos", "allow-worker-setup-status", "allow-prepare-models"]
 }

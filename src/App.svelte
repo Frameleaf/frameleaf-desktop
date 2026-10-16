@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { workerStatus } from './mode-state';
   import mark from './mark.svg';
 
@@ -14,6 +15,23 @@
   let busy = $state(false);
   let notice = $state('');
   let failure = $state('');
+  type SetupStatus = { state: string; code: string | null };
+  let setup = $state<SetupStatus | null>(null);
+  const setupState = $derived(setup?.state || connection?.state || '');
+  const setupDetail = $derived(setup?.code === 'runtime_pack_unavailable'
+    ? 'This build does not include a signed AI runtime yet. Photos remain available.'
+    : setup?.state === 'model-download-required'
+    ? 'The selected models need downloading. Network cost could not be checked, so downloading waits for your permission.'
+    : setup?.state === 'qualified'
+    ? 'The selected models passed this computer’s checks. Automatic job scheduling is not included in this build yet.'
+    : setup?.state === 'qualifying'
+    ? 'Running the selected models locally and checking the results with your server.'
+    : setup?.state === 'preparing-models'
+    ? 'Verifying the selected model files. You can keep using Photos while this runs.'
+    : setup?.state === 'preparing-runtime'
+    ? 'Checking the signed runtime included with this app.'
+    : setup?.state === 'setup-needs-attention'
+    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : '');
   const native = isTauri();
   const errors: Record<string, string> = {
     server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
@@ -29,16 +47,25 @@
     device_details_invalid: 'Enter a computer name between 1 and 128 characters.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check your connection and try again.'; }
-  onMount(async () => {
+  onMount(() => {
     if (!native) return;
-    busy = true;
-    try { connection = await invoke<Connection | null>('restore_connection'); }
-    catch (error) { failure = explain(error); }
-    finally { busy = false; }
+    let disposed = false;
+    let unlisten: UnlistenFn | undefined;
+    void (async () => {
+      busy = true;
+      try {
+        unlisten = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
+        if (disposed) { unlisten(); return; }
+        connection = await invoke<Connection | null>('restore_connection');
+        setup = await invoke<SetupStatus>('worker_setup_status');
+      } catch (error) { failure = explain(error); }
+      finally { busy = false; }
+    })();
+    return () => { disposed = true; unlisten?.(); };
   });
   async function connect(event: SubmitEvent) {
     event.preventDefault(); busy = true; failure = ''; notice = '';
-    const secret = password; password = '';
+    const secret = password; password = ''; setup = null;
     try { connection = await invoke<Connection>('connect_server', { server, email, password: secret, deviceName }); }
     catch (error) { failure = explain(error); }
     finally { busy = false; }
@@ -50,9 +77,15 @@
   async function signOut() {
     busy = true; failure = '';
     try {
-      const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out'); connection = null;
+      const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out'); connection = null; setup = null;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
     } catch (error) { failure = explain(error); }
+    finally { busy = false; }
+  }
+  async function prepareModels(allowDownload: boolean) {
+    busy = true; failure = '';
+    try { await invoke('prepare_models', { allowDownload }); }
+    catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
 </script>
@@ -74,8 +107,10 @@
       <h1>Welcome back,<br />{connection.name}.</h1>
       <p class="intro">Your photos and server are right here. This computer’s processing status stays visible below.</p>
       <section class="status-panel" aria-label="Computer processing status">
-        <div class="status-heading"><span class="status-dot"></span><h2>{connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : workerStatus({ state: connection.state, workerSupported: connection.features.worker })}</h2></div>
-        <p>{connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : 'AI processing starts only after the server supports desktop workers and the selected models pass qualification.'}</p>
+        <div class="status-heading"><span class="status-dot"></span><h2>{connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : workerStatus({ state: setupState, workerSupported: connection.features.worker })}</h2></div>
+        <p>{setupDetail || (connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : 'AI processing starts only after the server supports desktop workers and the selected models pass qualification.')}</p>
+        {#if setup?.state === 'model-download-required'}<button class="secondary" disabled={busy} onclick={() => prepareModels(true)}>Download selected AI models</button>{/if}
+        {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
         <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>Not running</strong></div></div>
       </section>
       <div class="actions"><button class="primary" onclick={photos} disabled={busy || connection.state === 'identity-changed'}>Open Frameleaf Photos</button><button class="secondary" onclick={signOut} disabled={busy}>Sign out</button></div>

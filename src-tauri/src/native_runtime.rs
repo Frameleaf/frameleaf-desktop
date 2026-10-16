@@ -205,6 +205,9 @@ impl VerifiedRuntime {
     pub fn provider(&self) -> &str {
         &self.manifest.provider
     }
+    pub fn source_revision(&self) -> &str {
+        &self.manifest.source_revision
+    }
     fn check_files(&self) -> Result<(), String> {
         absolute_directory(&self.root)?;
         let mut folded = BTreeSet::new();

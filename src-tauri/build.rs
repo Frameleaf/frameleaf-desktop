@@ -5,6 +5,8 @@ fn main() {
             "restore_connection",
             "sign_out",
             "open_photos",
+            "worker_setup_status",
+            "prepare_models",
         ]),
     ))
     .expect("build desktop ACL");

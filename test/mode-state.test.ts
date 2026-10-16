@@ -18,3 +18,14 @@ test('enrollment never implies qualified inference', () => {
 test('worker credential setup failure stays visible before model qualification', () => {
   assert.equal(workerStatus({ state: 'worker-setup-failed', workerSupported: false }), 'Computer setup needs attention');
 });
+
+test('automatic runtime and model qualification never claim active processing', () => {
+  for (const [state, expected] of [
+    ['preparing-runtime', 'Preparing the AI runtime'],
+    ['preparing-models', 'Preparing selected models'],
+    ['model-download-required', 'Selected models need downloading'],
+    ['qualifying', 'Checking this computer’s models'],
+    ['qualified', 'Models qualified'],
+    ['setup-needs-attention', 'Computer setup needs attention'],
+  ]) assert.equal(workerStatus({ state: state!, workerSupported: false }), expected);
+});
