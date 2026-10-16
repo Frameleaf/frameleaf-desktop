@@ -389,3 +389,18 @@ These hints do not reserve hydration storage or measure provider network traffic
 Each prepared folder copy starts with an original-payload upload allowance of twice its planned size, displayed before copying. Every chunk is charged in the signed local progress journal before sending; failed or uncertain sends are not refunded. Restarting or resuming keeps the used allowance. Exhaustion pauses the copy and retains its staged originals. The user can explicitly approve another allowance of twice the remaining originals, then resume. Older saved runs and missing-progress recovery require this explicit approval before sending more originals; lost historical usage cannot be reconstructed, so recovery starts a new accounting record. This bounds original upload payloads, not HTTP/TLS overhead or cloud-provider hydration/download traffic; provider download accounting remains unfinished.
 
 Windows source versions bind the opened file's volume and full 128-bit file ID in addition to metadata. Identity snapshots use metadata-only, no-recall handles; content handles and the source path are checked before staged publication. Filesystems that cannot return this identity are refused rather than identified only by timestamps ([Microsoft file identity contract](https://learn.microsoft.com/en-us/windows/desktop/api/winbase/ns-winbase-file_id_info)). Existing Unix version strings and signed staged receipts remain compatible. Windows cloud-placeholder hydration is still unfinished.
+
+### Native host media feasibility
+
+`tools/build_host_media.py` builds a disposable **macOS HDR-only feasibility candidate**, using the selected Frameleaf revision's exact libheif/libultrahdr Git and patch pins. It snapshots the native module and existing HDR fixtures, builds the codecs under a new private output directory, and runs every ISO/HDR fixture with ISO tests enabled. It requires developer CMake/pkg-config and a dependency prefix; it does not install system libraries.
+
+```sh
+python3 tools/build_host_media.py \
+  --source /absolute/path/to/frameleaf-app \
+  --revision <reviewed-40-character-source-commit> \
+  --node-root /absolute/path/to/the-source-pinned-node \
+  --dependency-prefix /opt/homebrew \
+  --output /absolute/path/to/a-new-feasibility-directory
+```
+
+The receipt records source fixture hashes, Node and binding hashes, codec pins, platform and qualification scope, and always declares `redistributable: false`. The pinned macOS candidate passed 38/38 HDR tests; a stock-library control passed 27 and failed 11. The JPEG include path must come from package metadata to avoid stock HEIF headers shadowing the patched headers. This closes one native-host feasibility gap; it does not establish RAW/Studio parity, a portable dependency bundle, private PostgreSQL, Manager hosting, signing or installed three-platform acceptance.
