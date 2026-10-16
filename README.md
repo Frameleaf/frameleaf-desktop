@@ -127,3 +127,12 @@ exact signed manifest as canonical gzip/base64. The NAS uses its own matching
 public release authority, with 2 MiB compressed and 8 MiB decompressed limits.
 This establishes release identity only; qualification, session-bound admission
 and model grants remain separate requirements.
+
+The native worker transport can request/read NAS qualification challenges and
+submit sealed runtime reports over its signed outbound connection. Returned
+specifications and fixtures must exactly match the app-compiled profile, and
+the manifest binding must match the locally verified runtime. Challenges also bind
+the server, account, device, session and credential generation. Report submission
+refuses an expired challenge or a different nonce/runtime. An accepted report is
+stored evidence; automatic orchestration and NAS inference admission remain
+pending.

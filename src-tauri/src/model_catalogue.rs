@@ -36,6 +36,14 @@ impl ApprovedProfile {
     pub fn model_key(&self) -> &str {
         self.0.model_key()
     }
+    pub fn runtime_source_revision(&self) -> &str {
+        &self.0.runtime_source_revision
+    }
+    pub fn provider(&self) -> &str {
+        self.0.spec["provider"]
+            .as_str()
+            .expect("validated model provider")
+    }
     pub fn embedding_dimensions(&self) -> usize {
         self.0.embedding_dimensions()
     }

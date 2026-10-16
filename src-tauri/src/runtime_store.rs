@@ -28,8 +28,15 @@ pub struct InstalledRuntime {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeAttestation {
+    #[serde(skip_serializing)]
+    manifest_sha256: String,
     manifest_gzip_base64: String,
     signature_base64: String,
+}
+impl RuntimeAttestation {
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
 }
 struct Staging(PathBuf);
 impl Drop for Staging {
@@ -240,6 +247,7 @@ impl RuntimeStore {
             return Err("runtime_attestation_too_large".into());
         }
         Ok(RuntimeAttestation {
+            manifest_sha256: id.to_owned(),
             manifest_gzip_base64: STANDARD.encode(compressed),
             signature_base64: STANDARD.encode(signature),
         })

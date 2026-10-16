@@ -13,6 +13,151 @@ use tokio::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
 
+use crate::{
+    model_catalogue::ApprovedProfile, native_runtime::QualifiedRuntime,
+    runtime_store::RuntimeAttestation,
+};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChallengeResponse {
+    id: String,
+    model_key: String,
+    spec_json: String,
+    binding_sha256: String,
+    fixture_base64: String,
+    manifest_sha256: String,
+    expires_at: String,
+    report_sha256: Option<String>,
+}
+
+struct ChallengeAuthority {
+    server_id: String,
+    account_id: String,
+    device_id: String,
+    session_id: String,
+    authorization_epoch: u32,
+    credential_sha256: String,
+}
+impl ChallengeAuthority {
+    fn from_worker(worker: &SavedWorker) -> Self {
+        Self {
+            server_id: worker.server_id.clone(),
+            account_id: worker.account_id.clone(),
+            device_id: worker.device_id.clone(),
+            session_id: worker.session_id.clone(),
+            authorization_epoch: worker.authorization_epoch,
+            credential_sha256: hash(worker.worker_token.as_bytes()),
+        }
+    }
+    fn matches(&self, worker: &SavedWorker) -> bool {
+        self.server_id == worker.server_id
+            && self.account_id == worker.account_id
+            && self.device_id == worker.device_id
+            && self.session_id == worker.session_id
+            && self.authorization_epoch == worker.authorization_epoch
+            && self.credential_sha256 == hash(worker.worker_token.as_bytes())
+    }
+}
+
+/// Bound to a compiled profile and a locally verified signed runtime; no NAS-selected code or fixture.
+/// ```compile_fail
+/// let _: frameleaf_desktop::ml_transport::QualificationChallenge = serde_json::from_str("{}").unwrap();
+/// ```
+pub struct QualificationChallenge {
+    authority: ChallengeAuthority,
+    id: String,
+    spec: Vec<u8>,
+    fixture: Vec<u8>,
+    binding_sha256: String,
+    manifest_sha256: String,
+    expires_at: i64,
+    report_sha256: Option<String>,
+}
+impl QualificationChallenge {
+    pub fn bind(
+        worker: &SavedWorker,
+        profile: &ApprovedProfile,
+        attestation: &RuntimeAttestation,
+        raw: &[u8],
+        at: i64,
+    ) -> Result<Self, String> {
+        if raw.is_empty() || raw.len() > 4 * 1024 * 1024 {
+            return Err("worker_challenge_invalid".into());
+        }
+        let response: ChallengeResponse =
+            serde_json::from_slice(raw).map_err(|_| "worker_challenge_invalid")?;
+        let (spec, fixture) = profile.challenge(&response.id)?;
+        let expires_at = millis(&response.expires_at)?;
+        let digest_valid = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if response.model_key != profile.model_key()
+            || response.spec_json.as_bytes() != spec
+            || response.binding_sha256 != hash(&spec)
+            || response.manifest_sha256 != attestation.manifest_sha256()
+            || response.fixture_base64 != STANDARD.encode(&fixture)
+            || response
+                .report_sha256
+                .as_ref()
+                .is_some_and(|value| !digest_valid(value))
+            || expires_at <= at
+            || expires_at > at + 720_000
+            || expires_at > millis(&worker.expires_at)?
+        {
+            return Err("worker_challenge_invalid".into());
+        }
+        Ok(Self {
+            authority: ChallengeAuthority::from_worker(worker),
+            id: response.id,
+            spec,
+            fixture,
+            binding_sha256: response.binding_sha256,
+            manifest_sha256: response.manifest_sha256,
+            expires_at,
+            report_sha256: response.report_sha256,
+        })
+    }
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn specification(&self) -> &[u8] {
+        &self.spec
+    }
+    pub fn fixture(&self) -> &[u8] {
+        &self.fixture
+    }
+    pub fn report_sha256(&self) -> Option<&str> {
+        self.report_sha256.as_deref()
+    }
+    pub fn validate_authority(&self, worker: &SavedWorker) -> Result<(), String> {
+        if !self.authority.matches(worker) {
+            return Err("worker_challenge_association_changed".into());
+        }
+        Ok(())
+    }
+    pub fn validate_submission(
+        &self,
+        worker: &SavedWorker,
+        qualified: &QualifiedRuntime,
+        at: i64,
+    ) -> Result<(), String> {
+        self.validate_authority(worker)?;
+        if at >= self.expires_at
+            || millis(&worker.expires_at)? <= at
+            || qualified.manifest_sha256() != self.manifest_sha256
+            || qualified.specification() != self.spec
+            || qualified.report()["bindingSha256"] != self.binding_sha256
+        {
+            return Err("worker_qualification_changed_or_expired".into());
+        }
+        Ok(())
+    }
+}
+
 const MAX_INPUT: usize = 16 * 1024 * 1024;
 fn millis(value: &str) -> Result<i64, String> {
     OffsetDateTime::parse(value, &Rfc3339)
@@ -202,6 +347,81 @@ impl WorkerTransport {
             identity,
         })))
     }
+    pub async fn request_qualification(
+        &self,
+        profile: &ApprovedProfile,
+        attestation: &RuntimeAttestation,
+        request_id: &str,
+    ) -> Result<QualificationChallenge, String> {
+        let id = Uuid::parse_str(request_id).map_err(|_| "worker_challenge_request_invalid")?;
+        if id.get_version_num() != 4 || id.to_string() != request_id {
+            return Err("worker_challenge_request_invalid".into());
+        }
+        let payload = serde_json::json!({ "requestId":request_id, "modelKey":profile.model_key(),
+            "provider":profile.provider(), "runtimeSourceRevision":profile.runtime_source_revision(), "runtime":attestation }).to_string();
+        if payload.len() > 4 * 1024 * 1024 {
+            return Err("worker_payload_invalid".into());
+        }
+        let mut connection = self.0.lock().await;
+        let response = connection
+            .request(
+                Method::POST,
+                "api/desktop/worker/challenges",
+                "challenge",
+                &payload,
+            )
+            .await?;
+        let value: serde_json::Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
+        let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
+        QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)
+    }
+    pub async fn read_qualification(
+        &self,
+        profile: &ApprovedProfile,
+        attestation: &RuntimeAttestation,
+        id: &str,
+    ) -> Result<QualificationChallenge, String> {
+        profile.challenge(id)?;
+        let mut connection = self.0.lock().await;
+        let response = connection
+            .request(
+                Method::GET,
+                &format!("api/desktop/worker/challenges/{id}"),
+                &format!("challenge:{id}"),
+                "",
+            )
+            .await?;
+        let value: serde_json::Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
+        let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
+        let challenge =
+            QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)?;
+        if challenge.id() != id {
+            return Err("worker_challenge_invalid".into());
+        }
+        Ok(challenge)
+    }
+    pub async fn submit_qualification(
+        &self,
+        challenge: &QualificationChallenge,
+        qualified: &QualifiedRuntime,
+    ) -> Result<bool, String> {
+        let mut connection = self.0.lock().await;
+        challenge.validate_submission(&connection.worker, qualified, now()?)?;
+        let payload = serde_json::json!({"report":qualified.report()}).to_string();
+        if payload.len() > 4 * 1024 * 1024 {
+            return Err("worker_payload_invalid".into());
+        }
+        let response = connection
+            .request(
+                Method::POST,
+                &format!("api/desktop/worker/challenges/{}/report", challenge.id()),
+                &format!("qualification:{}", challenge.id()),
+                &payload,
+            )
+            .await?;
+        Ok(transport::json::<Ack>(response).await?.accepted)
+    }
+
     pub async fn claim(&self, qualified: &[String]) -> Result<Option<ClaimedTask>, String> {
         if qualified.len() > 64 || qualified.iter().any(|m| m.is_empty() || m.len() > 256) {
             return Err("worker_model_scope_invalid".into());
