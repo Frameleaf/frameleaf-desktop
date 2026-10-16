@@ -143,8 +143,10 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
         }
     }
 }
-async fn worker_jobs(
-    mut execute: impl AsyncFnMut(watch::Receiver<bool>) -> Result<bool, String>,
+type WorkerStep<'a> = std::pin::Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
+async fn worker_jobs<T>(
+    state: &mut T,
+    mut execute: impl for<'a> FnMut(&'a mut T, watch::Receiver<bool>) -> WorkerStep<'a>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     loop {
@@ -152,7 +154,7 @@ async fn worker_jobs(
         let completed = tokio::select! {
             biased;
             _ = cancelled(cancel) => return Err("worker_cancelled".into()),
-            result = execute(execution_cancel) => result?,
+            result = execute(state, execution_cancel) => result?,
         };
         if !completed {
             // A server may answer an empty long-poll immediately; do not spin against it.
@@ -199,20 +201,26 @@ impl Drop for ActiveExecution<'_> {
 impl NativePredictor {
     /// Own the process for a serial, cancellable association; errors require fresh orchestration.
     pub async fn run(
-        mut self,
-        transport: &WorkerTransport,
-        qualification: &AcceptedQualification,
-        cancel: &mut watch::Receiver<bool>,
+        self,
+        transport: WorkerTransport,
+        qualification: AcceptedQualification,
+        mut cancel: watch::Receiver<bool>,
     ) -> Result<(), String> {
+        let mut state = (self, transport, qualification);
         let outcome = worker_jobs(
-            async |mut execution_cancel| {
-                self.execute_next(transport, qualification, &mut execution_cancel)
-                    .await
+            &mut state,
+            |state, mut execution_cancel| {
+                Box::pin(async move {
+                    state
+                        .0
+                        .execute_next(&state.1, &state.2, &mut execution_cancel)
+                        .await
+                })
             },
-            cancel,
+            &mut cancel,
         )
         .await;
-        self.stop()?;
+        state.0.stop()?;
         outcome
     }
     /// The sealed qualification and installed runtime must have the same signed manifest identity.
@@ -364,18 +372,36 @@ mod tests {
         thread,
     };
 
+    #[test]
+    fn worker_loop_can_run_on_the_background_executor() {
+        fn check(
+            predictor: NativePredictor,
+            transport: WorkerTransport,
+            qualification: AcceptedQualification,
+            cancel: watch::Receiver<bool>,
+        ) {
+            let future: std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>> =
+                Box::pin(predictor.run(transport, qualification, cancel));
+            drop(future);
+        }
+        let _ = check;
+    }
+
     #[tokio::test]
     async fn worker_loop_runs_serially_and_stops_on_first_failure() {
         let (_sender, mut cancel) = watch::channel(false);
-        let calls = std::cell::Cell::new(0);
+        let mut calls = std::cell::Cell::new(0);
         let result = worker_jobs(
-            async |_| {
-                calls.set(calls.get() + 1);
-                if calls.get() == 3 {
-                    Err("worker_lease_lost".into())
-                } else {
-                    Ok(true)
-                }
+            &mut calls,
+            |calls, _| {
+                Box::pin(async move {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 3 {
+                        Err("worker_lease_lost".into())
+                    } else {
+                        Ok(true)
+                    }
+                })
             },
             &mut cancel,
         )
@@ -386,34 +412,42 @@ mod tests {
 
     #[tokio::test]
     async fn worker_loop_cancels_a_pending_claim_and_drops_it() {
-        struct Guard<'a>(&'a std::cell::Cell<bool>);
+        struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
-                self.0.set(true);
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let (sender, mut cancel) = watch::channel(false);
-        let dropped = std::cell::Cell::new(false);
+        let mut dropped = std::sync::atomic::AtomicBool::new(false);
         let run = worker_jobs(
-            async |_| {
-                let _guard = Guard(&dropped);
-                sender.send(true).unwrap();
-                std::future::pending::<Result<bool, String>>().await
+            &mut dropped,
+            |dropped, _| {
+                let sender = sender.clone();
+                Box::pin(async move {
+                    let _guard = Guard(dropped);
+                    sender.send(true).unwrap();
+                    std::future::pending::<Result<bool, String>>().await
+                })
             },
             &mut cancel,
         );
         assert_eq!(run.await, Err("worker_cancelled".into()));
-        assert!(dropped.get());
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]
     async fn worker_loop_throttles_immediate_empty_responses() {
         let (sender, mut cancel) = watch::channel(false);
-        let calls = std::cell::Cell::new(0);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let mut state = &calls;
         let run = worker_jobs(
-            async |_| {
-                calls.set(calls.get() + 1);
-                Ok(false)
+            &mut state,
+            |calls, _| {
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(false)
+                })
             },
             &mut cancel,
         );
@@ -421,7 +455,7 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(30), &mut run)
             .await
             .is_err());
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         sender.send(true).unwrap();
         assert_eq!(run.await, Err("worker_cancelled".into()));
     }
@@ -431,7 +465,8 @@ mod tests {
         let (sender, mut cancel) = watch::channel(false);
         drop(sender);
         let result = worker_jobs(
-            async |_| panic!("claim after owner disappeared"),
+            &mut (),
+            |_, _| Box::pin(async { panic!("claim after owner disappeared") }),
             &mut cancel,
         )
         .await;
@@ -734,12 +769,15 @@ mod tests {
         assert!(predictor.child.is_running().unwrap());
         let (_sender, mut cancel) = watch::channel(false);
         let mut future = Box::pin(worker_jobs(
-            async |_| {
-                let _active = ActiveExecution {
-                    predictor: &mut predictor,
-                    retain: false,
-                };
-                std::future::pending::<Result<bool, String>>().await
+            &mut predictor,
+            |predictor, _| {
+                Box::pin(async move {
+                    let _active = ActiveExecution {
+                        predictor,
+                        retain: false,
+                    };
+                    std::future::pending::<Result<bool, String>>().await
+                })
             },
             &mut cancel,
         ));
