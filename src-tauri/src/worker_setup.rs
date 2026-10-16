@@ -443,6 +443,8 @@ fn selected_profiles(
         enabled: bool,
         clip: Clip,
         ocr: Option<Ocr>,
+        #[serde(rename = "facialRecognition")]
+        face: Option<Face>,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -458,6 +460,13 @@ fn selected_profiles(
         min_detection_score: f64,
         min_recognition_score: f64,
         max_resolution: u64,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Face {
+        enabled: bool,
+        model_name: String,
+        min_score: f64,
     }
     let config: Config =
         serde_json::from_value(config.clone()).map_err(|_| "server_model_configuration_invalid")?;
@@ -480,6 +489,16 @@ fn selected_profiles(
         }});
         profiles.push(
             crate::model_catalogue::approved_profile(&ocr.model_name, &entries, source, provider)?
+                .ok_or("server_model_not_supported")?,
+        );
+    }
+    if let Some(face) = config.machine_learning.face.filter(|face| face.enabled) {
+        let entries = serde_json::json!({"facial-recognition":{
+            "detection":{"modelName":face.model_name,"options":{"minScore":face.min_score}},
+            "recognition":{"modelName":face.model_name}
+        }});
+        profiles.push(
+            crate::model_catalogue::approved_profile(&face.model_name, &entries, source, provider)?
                 .ok_or("server_model_not_supported")?,
         );
     }
@@ -790,6 +809,23 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn selects_face_without_clip_or_a_model_substitution() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut config = serde_json::json!({"machineLearning":{"enabled":true,
+            "clip":{"enabled":false,"modelName":"unused"},
+            "facialRecognition":{"enabled":true,"modelName":"buffalo_l","minScore":0.7}}});
+        let profiles = selected_profiles(&config, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].model_key().starts_with("face:"));
+        config["machineLearning"]["facialRecognition"]["minScore"] = serde_json::json!(0.8);
+        assert_eq!(
+            selected_profiles(&config, source, "CPUExecutionProvider")
+                .err()
+                .unwrap(),
+            "server_model_not_supported"
+        );
+    }
     #[test]
     fn selects_ocr_independently_and_requires_all_inference_options() {
         let source = "25b22c16e47a27a2eb50017d838497abce850d11";

@@ -165,7 +165,7 @@ fn actual_native_nas_library_jobs() {
     let pack = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
     let workload =
         std::env::var("FRAMELEAF_FACTORY_TEST_WORKLOAD").unwrap_or_else(|_| "clip".into());
-    assert!(matches!(workload.as_str(), "clip" | "ocr"));
+    assert!(matches!(workload.as_str(), "clip" | "ocr" | "face"));
     let cache = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
     let store = crate::release_policy::open_runtime_store(&root.0.join("store")).unwrap();
     let raw = fs::read(pack.join("manifest.json")).unwrap();
@@ -198,7 +198,7 @@ fn actual_native_nas_library_jobs() {
             .unwrap()
         })
         .collect();
-    assert_eq!(profiles.len(), if workload == "ocr" { 1 } else { 3 });
+    assert_eq!(profiles.len(), if workload == "clip" { 3 } else { 1 });
     tauri::async_runtime::block_on(async {
         let mut prepared = Vec::new();
         for profile in &profiles {

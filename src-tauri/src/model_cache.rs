@@ -173,7 +173,7 @@ pub(crate) async fn prepare(
 ) -> Result<PathBuf, String> {
     use crate::{native_runtime::absolute_directory, runtime_store::private_directory};
     use std::collections::BTreeSet;
-    if !matches!(plan.task, "clip" | "ocr") {
+    if !matches!(plan.task, "clip" | "ocr" | "facial-recognition") {
         return Err("model_plan_invalid".into());
     }
     absolute_directory(root)?;

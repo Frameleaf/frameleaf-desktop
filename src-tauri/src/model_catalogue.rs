@@ -171,7 +171,7 @@ impl ProfileData {
         .into_iter()
         .collect();
         if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != fields
-            || !matches!(self.workload.as_str(), "clip" | "ocr")
+            || !matches!(self.workload.as_str(), "clip" | "ocr" | "face")
             || !is_digest(&self.runtime_source_revision, 40)
             || self.spec["protocolVersion"] != 1
             || self.spec["modelKey"] != self.model_key
@@ -180,6 +180,7 @@ impl ProfileData {
                     .embedding_dimensions
                     .is_some_and(|n| (1..=65536).contains(&n)))
             || (self.workload == "ocr" && self.embedding_dimensions.is_some())
+            || (self.workload == "face" && self.embedding_dimensions != Some(512))
             || self.model_name.is_empty()
             || self.model_name.len() > 128
             || !self
@@ -222,6 +223,11 @@ impl ProfileData {
             .ok_or_else(invalid)?;
         let model = &models[0];
         let kind = self.spec["fixtureKind"].as_str().ok_or_else(invalid)?;
+        let family = if self.workload == "face" {
+            "facial-recognition"
+        } else {
+            &self.workload
+        };
         if self.workload == "clip" {
             let model_type = match kind {
                 "text" => "textual",
@@ -244,13 +250,24 @@ impl ProfileData {
             {
                 return Err(invalid());
             }
+        } else if self.workload == "face" {
+            validate_face_entries(&self.spec["entries"], &self.model_name, kind)?;
         } else {
             validate_ocr_entries(models, &self.spec["entries"], &self.model_name, kind)?;
+        }
+        if self.workload == "face"
+            && models
+                .iter()
+                .map(|model| model["type"].as_str().unwrap_or(""))
+                .collect::<BTreeSet<_>>()
+                != BTreeSet::from(["detection", "recognition"])
+        {
+            return Err(invalid());
         }
         if models.iter().any(|m| {
             m.as_object().is_none_or(|o| o.len() != 4)
                 || m["name"] != self.model_name
-                || m["task"] != self.workload
+                || m["task"] != family
                 || m["artifacts"] != model["artifacts"]
         }) {
             return Err(invalid());
@@ -308,6 +325,8 @@ impl ProfileData {
             {
                 return Err(invalid());
             }
+        } else if self.workload == "face" {
+            validate_face_output(&self.spec["expectedOutput"])?;
         } else {
             validate_ocr_output(&self.spec["expectedOutput"])?;
         }
@@ -332,6 +351,99 @@ impl ProfileData {
         Ok(())
     }
 }
+fn validate_face_entries(entries: &Value, name: &str, kind: &str) -> Result<(), String> {
+    let group = entries["facial-recognition"]
+        .as_object()
+        .ok_or_else(invalid)?;
+    if kind != "image"
+        || entries.as_object().is_none_or(|value| value.len() != 1)
+        || group.len() != 2
+    {
+        return Err(invalid());
+    }
+    let detection = group
+        .get("detection")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let recognition = group
+        .get("recognition")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let options = entries["facial-recognition"]["detection"]["options"]
+        .as_object()
+        .ok_or_else(invalid)?;
+    if detection.len() != 2
+        || detection.get("modelName") != Some(&json!(name))
+        || recognition.len() != 1
+        || recognition.get("modelName") != Some(&json!(name))
+        || options.len() != 1
+        || !options
+            .get("minScore")
+            .and_then(Value::as_f64)
+            .is_some_and(|v| v.is_finite() && (0.1..=1.0).contains(&v))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+fn validate_face_output(output: &Value) -> Result<(), String> {
+    let width = output["imageWidth"]
+        .as_u64()
+        .filter(|v| *v > 0 && *v <= 65536)
+        .ok_or_else(invalid)? as f64;
+    let height = output["imageHeight"]
+        .as_u64()
+        .filter(|v| *v > 0 && *v <= 65536)
+        .ok_or_else(invalid)? as f64;
+    let faces = output["facial-recognition"]
+        .as_array()
+        .filter(|v| !v.is_empty() && v.len() <= 4096)
+        .ok_or_else(invalid)?;
+    if width * height > 16.0 * 1024.0 * 1024.0 {
+        return Err(invalid());
+    }
+    for face in faces {
+        let object = face
+            .as_object()
+            .filter(|v| v.len() == 3)
+            .ok_or_else(invalid)?;
+        let bbox = face["boundingBox"]
+            .as_object()
+            .filter(|v| v.len() == 4)
+            .ok_or_else(invalid)?;
+        let number = |key: &str| {
+            bbox.get(key)
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .ok_or_else(invalid)
+        };
+        let (x1, x2, y1, y2) = (number("x1")?, number("x2")?, number("y1")?, number("y2")?);
+        if !(-width <= x1
+            && x1 < x2
+            && x2 <= width * 2.0
+            && -height <= y1
+            && y1 < y2
+            && y2 <= height * 2.0
+            && object
+                .get("score")
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v)))
+        {
+            return Err(invalid());
+        }
+        let encoded = object
+            .get("embedding")
+            .and_then(Value::as_str)
+            .filter(|v| v.len() <= 65536)
+            .ok_or_else(invalid)?;
+        let vector: Vec<f64> = serde_json::from_str(encoded).map_err(|_| invalid())?;
+        if vector.len() != 512 || vector.iter().any(|v| !v.is_finite()) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 fn validate_ocr_entries(
     models: &[Value],
     entries: &Value,
@@ -499,7 +611,12 @@ pub(crate) fn shared_cache(
     for (profile, cache) in profiles.iter().zip(caches) {
         let profile = &profile.0;
         profile.validate()?;
-        let prefix = PathBuf::from(&profile.workload).join(&profile.model_name);
+        let prefix = PathBuf::from(
+            profile.spec["models"][0]["task"]
+                .as_str()
+                .ok_or_else(invalid)?,
+        )
+        .join(&profile.model_name);
         let hashes = profile.spec["models"][0]["artifacts"]
             .as_object()
             .ok_or_else(invalid)?;
@@ -571,6 +688,24 @@ pub(crate) fn shared_cache(
 mod tests {
     use super::*;
     #[test]
+    fn admits_the_qualified_face_detector_and_512_value_recognizer() {
+        let profile: ProfileData =
+            serde_json::from_str(include_str!("../tests/fixtures/face-profile.json")).unwrap();
+        profile.validate().unwrap();
+        assert_eq!(profile.embedding_dimensions(), Some(512));
+        let (spec, fixture) = profile
+            .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
+            .unwrap();
+        assert_eq!(fixture.len(), 791555);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&spec).unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    #[test]
     fn composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering() {
         let root = std::env::temp_dir()
             .canonicalize()
@@ -579,9 +714,24 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let mut profiles = Vec::new();
         let mut caches = Vec::new();
-        for (index, name) in ["PP-OCRv5_mobile", "FixtureOCR"].into_iter().enumerate() {
-            let mut raw: Value =
-                serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+        for (index, (workload, family, name, fixture)) in [
+            (
+                "ocr",
+                "ocr",
+                "PP-OCRv5_mobile",
+                include_str!("../tests/fixtures/ocr-profile.json"),
+            ),
+            (
+                "face",
+                "facial-recognition",
+                "buffalo_l",
+                include_str!("../tests/fixtures/face-profile.json"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut raw: Value = serde_json::from_str(fixture).unwrap();
             let bytes = format!("fixture weights {index}");
             let revision = raw["modelSnapshotRevision"].as_str().unwrap().to_owned();
             let reference = format!("models--frameleaf--{name}/refs/main");
@@ -593,16 +743,19 @@ mod tests {
                 model["artifacts"] = hashes.clone();
             }
             for role in ["detection", "recognition"] {
-                raw["spec"]["entries"]["ocr"][role]["modelName"] = json!(name);
+                raw["spec"]["entries"][family][role]["modelName"] = json!(name);
             }
             let identity = json!({"protocolVersion":1,"entries":raw["spec"]["entries"],"models":raw["spec"]["models"],"preprocessingSha256":raw["spec"]["preprocessingSha256"]});
-            let key = format!("ocr:{}", digest(&serde_json::to_vec(&identity).unwrap()));
+            let key = format!(
+                "{workload}:{}",
+                digest(&serde_json::to_vec(&identity).unwrap())
+            );
             raw["modelKey"] = json!(key);
             raw["spec"]["modelKey"] = json!(key);
             let profile: ProfileData = serde_json::from_value(raw).unwrap();
             profile.validate().unwrap();
             let cache = root.join(format!("source-{index}"));
-            let model = cache.join("ocr").join(name);
+            let model = cache.join(family).join(name);
             for role in ["detection", "recognition"] {
                 std::fs::create_dir_all(model.join(role)).unwrap();
                 std::fs::write(model.join(role).join("model.onnx"), &bytes).unwrap();
@@ -619,9 +772,12 @@ mod tests {
         }
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let active = shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
-        for name in ["PP-OCRv5_mobile", "FixtureOCR"] {
+        for (family, name) in [
+            ("ocr", "PP-OCRv5_mobile"),
+            ("facial-recognition", "buffalo_l"),
+        ] {
             assert!(active
-                .join("ocr")
+                .join(family)
                 .join(name)
                 .join("detection/model.onnx")
                 .is_file());
@@ -631,7 +787,7 @@ mod tests {
             active
         );
         std::fs::write(
-            active.join("ocr/FixtureOCR/detection/model.onnx"),
+            active.join("facial-recognition/buffalo_l/detection/model.onnx"),
             b"changed",
         )
         .unwrap();
@@ -643,51 +799,109 @@ mod tests {
     }
     #[tokio::test]
     async fn restores_a_verified_ocr_cache_from_its_own_family() {
-        let mut profile: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
-        let weights = b"fixture weights";
-        let reference = profile["modelSnapshotRevision"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let ref_path = "models--frameleaf--PP-OCRv5_mobile/refs/main";
-        let hashes = json!({"detection/model.onnx":digest(weights),"recognition/model.onnx":digest(weights),ref_path:digest(reference.as_bytes())});
-        profile["artifactBytes"] = json!({"detection/model.onnx":weights.len(),"recognition/model.onnx":weights.len(),ref_path:reference.len()});
-        for model in profile["spec"]["models"].as_array_mut().unwrap() {
-            model["artifacts"] = hashes.clone();
-        }
-        let identity = json!({"protocolVersion":1,"entries":profile["spec"]["entries"],"models":profile["spec"]["models"],"preprocessingSha256":profile["spec"]["preprocessingSha256"]});
-        let key = format!("ocr:{}", digest(&serde_json::to_vec(&identity).unwrap()));
-        profile["modelKey"] = json!(key);
-        profile["spec"]["modelKey"] = json!(key);
-        let profile: ProfileData = serde_json::from_value(profile).unwrap();
-        profile.validate().unwrap();
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("frameleaf-ocr-cache-{}", Uuid::new_v4()));
-        let model = root.join(&reference).join("ocr/PP-OCRv5_mobile");
-        std::fs::create_dir_all(model.join("detection")).unwrap();
-        std::fs::create_dir_all(model.join("recognition")).unwrap();
-        std::fs::create_dir_all(model.join("models--frameleaf--PP-OCRv5_mobile/refs")).unwrap();
-        std::fs::write(model.join("detection/model.onnx"), weights).unwrap();
-        std::fs::write(model.join("recognition/model.onnx"), weights).unwrap();
-        std::fs::write(model.join(ref_path), reference.as_bytes()).unwrap();
-        std::fs::write(
-            model.join(".frameleaf-staged.json"),
-            serde_json::to_vec(&hashes).unwrap(),
-        )
-        .unwrap();
-        let result = ApprovedProfile(profile)
-            .prepare_cache(
-                &root,
-                &crate::transport::client().unwrap(),
-                &std::sync::atomic::AtomicBool::new(false),
-                false,
+        for (workload, family, name, fixture) in [
+            (
+                "ocr",
+                "ocr",
+                "PP-OCRv5_mobile",
+                include_str!("../tests/fixtures/ocr-profile.json"),
+            ),
+            (
+                "face",
+                "facial-recognition",
+                "buffalo_l",
+                include_str!("../tests/fixtures/face-profile.json"),
+            ),
+        ] {
+            let mut profile: Value = serde_json::from_str(fixture).unwrap();
+            let weights = b"fixture weights";
+            let reference = profile["modelSnapshotRevision"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let ref_path = format!("models--frameleaf--{name}/refs/main");
+            let hashes = json!({"detection/model.onnx":digest(weights),"recognition/model.onnx":digest(weights),ref_path.clone():digest(reference.as_bytes())});
+            profile["artifactBytes"] = json!({"detection/model.onnx":weights.len(),"recognition/model.onnx":weights.len(),ref_path.clone():reference.len()});
+            for model in profile["spec"]["models"].as_array_mut().unwrap() {
+                model["artifacts"] = hashes.clone();
+            }
+            let identity = json!({"protocolVersion":1,"entries":profile["spec"]["entries"],"models":profile["spec"]["models"],"preprocessingSha256":profile["spec"]["preprocessingSha256"]});
+            let key = format!(
+                "{workload}:{}",
+                digest(&serde_json::to_vec(&identity).unwrap())
+            );
+            profile["modelKey"] = json!(key);
+            profile["spec"]["modelKey"] = json!(key);
+            let profile: ProfileData = serde_json::from_value(profile).unwrap();
+            profile.validate().unwrap();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-ocr-cache-{}", Uuid::new_v4()));
+            let model = root.join(&reference).join(family).join(name);
+            std::fs::create_dir_all(model.join("detection")).unwrap();
+            std::fs::create_dir_all(model.join("recognition")).unwrap();
+            std::fs::create_dir_all(model.join(&ref_path).parent().unwrap()).unwrap();
+            std::fs::write(model.join("detection/model.onnx"), weights).unwrap();
+            std::fs::write(model.join("recognition/model.onnx"), weights).unwrap();
+            std::fs::write(model.join(&ref_path), reference.as_bytes()).unwrap();
+            std::fs::write(
+                model.join(".frameleaf-staged.json"),
+                serde_json::to_vec(&hashes).unwrap(),
             )
-            .await;
-        std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result.unwrap(), root.join(reference));
+            .unwrap();
+            let result = ApprovedProfile(profile)
+                .prepare_cache(
+                    &root,
+                    &crate::transport::client().unwrap(),
+                    &std::sync::atomic::AtomicBool::new(false),
+                    false,
+                )
+                .await;
+            std::fs::remove_dir_all(&root).unwrap();
+            assert_eq!(result.unwrap(), root.join(reference));
+        }
+    }
+    #[test]
+    fn refuses_face_engine_vector_and_output_changes_with_a_recomputed_identity() {
+        let original: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/face-profile.json")).unwrap();
+        let changes: [fn(&mut Value); 11] = [
+            |v| {
+                v["spec"]["models"].as_array_mut().unwrap().pop();
+            },
+            |v| v["spec"]["models"][1]["task"] = json!("ocr"),
+            |v| v["spec"]["models"][1]["type"] = json!("detection"),
+            |v| {
+                v["spec"]["models"][1]["artifacts"]["recognition/model.onnx"] =
+                    json!("0".repeat(64))
+            },
+            |v| v["embeddingDimensions"] = json!(768),
+            |v| {
+                v["spec"]["entries"]["facial-recognition"]["detection"]["options"]["extra"] =
+                    json!(true)
+            },
+            |v| {
+                v["spec"]["expectedOutput"]["facial-recognition"][0]["embedding"] = json!("[1,2,3]")
+            },
+            |v| v["spec"]["expectedOutput"]["facial-recognition"][0]["embedding"] = json!("[NaN]"),
+            |v| {
+                v["spec"]["expectedOutput"]["facial-recognition"][0]["boundingBox"]["x2"] =
+                    json!(-1024)
+            },
+            |v| v["spec"]["expectedOutput"]["facial-recognition"][0]["score"] = json!(1.1),
+            |v| v["spec"]["expectedOutput"]["facial-recognition"] = json!([]),
+        ];
+        for change in changes {
+            let mut value = original.clone();
+            change(&mut value);
+            let identity = json!({"protocolVersion":1,"entries":value["spec"]["entries"],"models":value["spec"]["models"],"preprocessingSha256":value["spec"]["preprocessingSha256"]});
+            let key = format!("face:{}", digest(&serde_json::to_vec(&identity).unwrap()));
+            value["modelKey"] = json!(key);
+            value["spec"]["modelKey"] = json!(key);
+            let profile: ProfileData = serde_json::from_value(value).unwrap();
+            assert!(profile.validate().is_err());
+        }
     }
     #[test]
     fn refuses_ocr_engine_and_output_changes_even_with_a_recomputed_identity() {
@@ -888,6 +1102,7 @@ mod tests {
             "a14a99cad4f9e208fd8729680a37211dd09ed13b9e34462559c13f9dd35826a3",
             "4756b97c88cdafaf134d234d96f49b64c9ec16294e6966c3eb9d94d4a60b66fa",
             "314c297749e23952b8541b47000e191dbccbac1556c5710b8f23a03d5d21391f",
+            "10a83ae85fa830c3097abaa4117a6adf6542b7ac3fbddb998599f3ef6382cc9d",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
