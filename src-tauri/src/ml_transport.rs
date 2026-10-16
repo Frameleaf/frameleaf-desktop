@@ -1034,4 +1034,4 @@ mod renewal_tests {
 }
 
 #[cfg(test)]
-mod native_nas_tests;
+pub(crate) mod native_nas_tests;

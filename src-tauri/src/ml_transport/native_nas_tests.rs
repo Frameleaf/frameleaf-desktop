@@ -82,7 +82,7 @@ impl keyring::credential::CredentialBuilderApi for MemoryCredentials {
         keyring::credential::CredentialPersistence::ProcessOnly
     }
 }
-fn install_test_keyring() {
+pub(crate) fn install_test_keyring() {
     keyring::set_default_credential_builder(Box::<MemoryCredentials>::default());
 }
 
@@ -101,7 +101,7 @@ impl Drop for OwnedRoot {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-fn read_fixture_message(reader: &mut impl std::io::BufRead) -> serde_json::Value {
+pub(crate) fn read_fixture_message(reader: &mut impl std::io::BufRead) -> serde_json::Value {
     use std::io::BufRead;
     let mut line = Vec::new();
     std::io::Read::take(reader, 65537)

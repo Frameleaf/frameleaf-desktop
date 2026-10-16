@@ -309,3 +309,24 @@ The app never removes source files. Protocol fixtures exercise real loopback HTT
 requests with synthetic media; actual NAS HTTPS transfer, provider hydration and
 installed-device acceptance remain unqualified. External references and PhotoKit are
 separate unfinished integrations.
+
+### Native folder-copy NAS integration fixture
+
+From the companion server checkout's `server` directory, run:
+
+```sh
+FRAMELEAF_NATIVE_DESKTOP_ROOT=/absolute/path/to/frameleaf-desktop \
+  pnpm exec vitest run --config test/vitest.config.medium.mjs \
+  test/medium/specs/services/photo-source-upload.spec.ts
+```
+
+This builds the consuming Rust test and starts an owned HTTPS/Nest/PostgreSQL
+fixture with canonical migrations. Generated photo-session credentials travel only
+through the child process's stdin; its credential store is process-only. The test
+uses real authentication, signed enrollment, source/run/item APIs, chunked upload,
+managed publication and stored-byte verification. It loses a receipt reply, damages
+the NAS copy, verifies that resume retains staging, then repairs and completes with
+the same upload. Source bytes remain unchanged. Ordinary tests skip this fixture.
+
+Job/event dispatch is mocked: this does not prove background decoding, thumbnails,
+OS credential storage, provider hydration or installed-device acceptance.

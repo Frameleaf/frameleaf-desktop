@@ -1286,3 +1286,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod native_nas_tests;
