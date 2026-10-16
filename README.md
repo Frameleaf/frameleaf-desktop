@@ -183,6 +183,7 @@ and legacy routes stay on their chosen destinations. Unsupported models and
 unavailable NAS producers appear separately for each workload; eligible workloads
 can continue. Smart search requires its complete three-role qualification group.
 Credential failures, runtime tampering and interrupted connections stop preparation
-or enter the existing reconnect path. Desktop enrollment still requires an
-administrator session in this candidate; policy-permitted member enrollment remains
-an implementation gate.
+or enter the existing reconnect path. Member desktop processing requires explicit
+administrator approval in the account’s Security tab. The member then selects Check approval in Desktop to securely
+re-enroll. Removing approval invalidates existing worker sessions and grants;
+automatic administrator consent does not become member permission after demotion.

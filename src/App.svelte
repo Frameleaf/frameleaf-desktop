@@ -112,6 +112,14 @@
     catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
+  async function checkApproval() {
+    busy = true; failure = '';
+    try {
+      connection = await invoke<Connection | null>('restore_connection');
+      setup = await invoke<SetupStatus>('worker_setup_status');
+    } catch (error) { failure = explain(error); }
+    finally { busy = false; }
+  }
 </script>
 
 <svelte:head><title>Frameleaf</title></svelte:head>
@@ -143,6 +151,7 @@
           </ul>
         {/if}
         {#if setup?.state === 'model-download-required'}<button class="secondary" disabled={busy} onclick={() => prepareModels(true)}>Download selected AI models</button>{/if}
+        {#if connection.state === 'awaiting-approval'}<button class="secondary" disabled={busy || !native} onclick={checkApproval}>Check approval</button>{/if}
         {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
         {#if connection.mode === 'client-worker' && connection.features.workerSession}
           <div class="actions" aria-label="AI worker controls">
