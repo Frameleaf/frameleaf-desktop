@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { signCandidate } from "./sign_runtime.mjs";
 
 async function fixture(t) {
@@ -153,5 +154,103 @@ test("does not sign an unsupported platform/profile combination", async (t) => {
   await assert.rejects(
     signCandidate(f.root, join(f.root, "manifest.sig"), f.privatePem, f.policy),
     /profile_unapproved/,
+  );
+});
+
+test("verifies a signed runtime without private key access and refuses altered or foreign signatures", async (t) => {
+  const { verifySignedCandidate } = await import("./sign_runtime.mjs");
+  const f = await fixture(t);
+  await signCandidate(
+    f.root,
+    join(f.root, "manifest.sig"),
+    f.privatePem,
+    f.policy,
+  );
+  const checked = await verifySignedCandidate(f.root, f.policy);
+  assert.equal(checked.manifest.sourceRevision, f.manifest.sourceRevision);
+  assert.equal(checked.keyId, "fixture");
+  await writeFile(join(f.root, "manifest.sig"), Buffer.alloc(64));
+  await assert.rejects(
+    verifySignedCandidate(f.root, f.policy),
+    /runtime_signature_invalid/,
+  );
+});
+
+test("packaging maps the approved runtime into the native resource location and refuses stale sources", async (t) => {
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  const profile = JSON.parse(
+    await readFile(
+      new URL("../runtime/profiles.json", import.meta.url),
+      "utf8",
+    ),
+  ).profiles["cpu-ort"];
+  const f = await fixture(t);
+  await signCandidate(
+    f.root,
+    join(f.root, "manifest.sig"),
+    f.privatePem,
+    f.policy,
+  );
+  await assert.rejects(
+    packageConfiguration(f.root, f.policy),
+    /runtime_bundle_source_unapproved/,
+  );
+  const provenance = JSON.parse(
+    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
+  );
+  provenance.sourceRevision = profile.sourceRevision;
+  const bytes = Buffer.from(JSON.stringify(provenance));
+  f.manifest.sourceRevision = profile.sourceRevision;
+  f.manifest.files["provenance.json"] = {
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+  await writeFile(join(f.root, "payload/provenance.json"), bytes);
+  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+  await rm(join(f.root, "manifest.sig"));
+  await signCandidate(
+    f.root,
+    join(f.root, "manifest.sig"),
+    f.privatePem,
+    f.policy,
+  );
+  const config = await packageConfiguration(f.root, f.policy);
+  assert.deepEqual(config.bundle.resources, {
+    [join(f.root, "manifest.json")]: "native-runtime/manifest.json",
+    [join(f.root, "manifest.sig")]: "native-runtime/manifest.sig",
+    [join(f.root, "payload")]: "native-runtime/payload",
+  });
+  await writeFile(join(f.root, "payload/python"), "changed");
+  await assert.rejects(
+    packageConfiguration(f.root, f.policy),
+    /artifact_changed/,
+  );
+});
+
+test("desktop packaging refuses missing runtime input before invoking the app builder", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("./package_desktop.mjs", import.meta.url))],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /usage: --runtime SIGNED_PACK/);
+});
+
+test("packaging refuses a correctly signed runtime for another operating system", async (t) => {
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  const f = await fixture(t);
+  f.manifest.platform = f.manifest.platform === "linux" ? "macos" : "linux";
+  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+  await signCandidate(
+    f.root,
+    join(f.root, "manifest.sig"),
+    f.privatePem,
+    f.policy,
+  );
+  await assert.rejects(
+    packageConfiguration(f.root, f.policy),
+    /runtime_bundle_target_mismatch/,
   );
 });

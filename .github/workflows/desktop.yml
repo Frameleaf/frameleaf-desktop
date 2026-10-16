@@ -40,12 +40,12 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - name: Build unsigned development candidate
-        run: npm run desktop:build -- --debug
+      - name: Build unsigned shell smoke-test candidate
+        run: npm run desktop:build:shell -- --debug
       - name: Retain private candidate artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: frameleaf-desktop-${{ runner.os }}
+          name: frameleaf-desktop-shell-${{ runner.os }}
           path: src-tauri/target/debug/bundle/
           retention-days: 7
           if-no-files-found: error

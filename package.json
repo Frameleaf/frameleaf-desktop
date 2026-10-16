@@ -13,7 +13,8 @@
     "test": "node --test test/*.test.ts tools/test_*.mjs",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "node tools/package_desktop.mjs",
+    "desktop:build:shell": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.4",

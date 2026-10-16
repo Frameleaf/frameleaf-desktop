@@ -6,7 +6,14 @@
       "uv": "0.11.2",
       "extra": "cpu",
       "provider": "CPUExecutionProvider",
-      "targets": ["macos-aarch64", "macos-x86_64", "windows-x86_64", "linux-x86_64", "linux-aarch64"]
+      "targets": [
+        "macos-aarch64",
+        "macos-x86_64",
+        "windows-x86_64",
+        "linux-x86_64",
+        "linux-aarch64"
+      ],
+      "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11"
     }
   }
 }

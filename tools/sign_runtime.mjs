@@ -4,6 +4,7 @@ import {
   createPrivateKey,
   createPublicKey,
   sign,
+  verify,
 } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
@@ -126,12 +127,7 @@ async function verifyPayload(payload, files) {
       fail("runtime_artifact_changed");
   }
 }
-export async function signCandidate(
-  candidate,
-  signaturePath,
-  privatePem,
-  policy,
-) {
+async function releasePolicy(policy) {
   const trust =
     policy ?? JSON.parse(await boundedFile(fileURLToPath(trustPath), 16384));
   if (
@@ -143,16 +139,10 @@ export async function signCandidate(
     trust.keys.length > 16
   )
     fail("release_policy_invalid");
-  const key = createPrivateKey(privatePem);
-  if (key.asymmetricKeyType !== "ed25519") fail("release_key_untrusted");
-  const publicHex = createPublicKey(key)
-    .export({ format: "der", type: "spki" })
-    .subarray(-32)
-    .toString("hex");
-  const authority = trust.keys.find((key) => key.publicKeyHex === publicHex);
-  if (!authority) fail("release_key_untrusted");
+  return trust;
+}
+async function checkedCandidate(candidate, trust, signature) {
   candidate = resolve(candidate);
-  signaturePath = resolve(signaturePath);
   for (let path = candidate; ; path = dirname(path)) {
     await directory(path);
     if (dirname(path) === path) break;
@@ -161,6 +151,27 @@ export async function signCandidate(
     join(candidate, "manifest.json"),
     8 * 1024 * 1024,
   );
+  let authority;
+  if (signature) {
+    authority = trust.keys.find(
+      ({ publicKeyHex }) =>
+        /^[a-f0-9]{64}$/.test(publicKeyHex) &&
+        verify(
+          null,
+          raw,
+          createPublicKey({
+            key: Buffer.concat([
+              Buffer.from("302a300506032b6570032100", "hex"),
+              Buffer.from(publicKeyHex, "hex"),
+            ]),
+            format: "der",
+            type: "spki",
+          }),
+          signature,
+        ),
+    );
+    if (!authority) fail("runtime_signature_invalid");
+  }
   const manifest = JSON.parse(raw);
   const fields = [
     "schemaVersion",
@@ -215,6 +226,36 @@ export async function signCandidate(
     provenance.python !== profile.python
   )
     fail("runtime_provenance_invalid");
+  return { raw, manifest, keyId: authority?.id };
+}
+export async function verifySignedCandidate(candidate, policy) {
+  const trust = await releasePolicy(policy);
+  const signature = await boundedFile(join(candidate, "manifest.sig"), 64);
+  if (signature.length !== 64) fail("runtime_signature_invalid");
+  const checked = await checkedCandidate(candidate, trust, signature);
+  return {
+    manifest: checked.manifest,
+    keyId: checked.keyId,
+    manifestSha256: digest(checked.raw),
+  };
+}
+export async function signCandidate(
+  candidate,
+  signaturePath,
+  privatePem,
+  policy,
+) {
+  const trust = await releasePolicy(policy);
+  const key = createPrivateKey(privatePem);
+  if (key.asymmetricKeyType !== "ed25519") fail("release_key_untrusted");
+  const publicHex = createPublicKey(key)
+    .export({ format: "der", type: "spki" })
+    .subarray(-32)
+    .toString("hex");
+  const authority = trust.keys.find((key) => key.publicKeyHex === publicHex);
+  if (!authority) fail("release_key_untrusted");
+  signaturePath = resolve(signaturePath);
+  const { raw, manifest } = await checkedCandidate(candidate, trust);
   await directory(dirname(signaturePath));
   const signature = sign(null, raw, key);
   let output;

@@ -34,7 +34,7 @@ npm ci
 npm run desktop:dev
 ```
 
-Run `npm test`, `npm run check`, and `cargo test --manifest-path src-tauri/Cargo.toml`. Build with `npm run desktop:build`. Debug builds are unsigned development candidates.
+Run `npm test`, `npm run check`, and `cargo test --manifest-path src-tauri/Cargo.toml`. Build a desktop installer with `npm run desktop:build -- --runtime /absolute/path/to/factory-signed-pack` (add `--debug` for an unsigned development candidate). The command verifies the release signature, complete payload, target platform and current bundle source before invoking Tauri. It includes the runtime at the resource path used by automatic worker setup. Shell smoke tests can use `npm run desktop:build:shell -- --debug`; those candidates deliberately omit the ML runtime.
 
 Connect using the HTTPS origin of a Frameleaf server. This candidate supports password sign-in; external-browser OAuth/OIDC is not implemented. PR #140 needs the additive desktop-device API before automatic enrollment is available. Existing servers can still open their photo interface after sign-in, with an explicit worker-upgrade status. A server without an established identity requires a new sign-in after restart.
 
@@ -66,7 +66,7 @@ The native background worker retains accepted per-role evidence, starts one warm
 before claiming work, and serializes matching jobs through it. It refreshes expiring
 qualifications and stops inference on cancellation or unsuitable power, network cost
 or available memory. Multi-role launches use an explicit flag rejected by older runtimes.
-The ordinary installer still needs its signed runtime resource; actual NAS library-job
+The default installer build requires a signed runtime resource; actual NAS library-job
 acceptance remains required before enabling worker readiness. CI exercises the process
 owner on all three OS builds; installed hardware acceptance remains separate.
 
@@ -153,3 +153,17 @@ pending.
 Accepted runtime evidence is read through the signed worker API and sealed against the compiled profile, local qualified runtime, NAS-canonical report digest, connection association and absolute expiry. Token renewal preserves that association; a new sign-in changes it. Claims now require the exact accepted qualification ID and expiry, and all input/heartbeat/result/failure requests retain that binding. Native startup and execution stop at qualification expiry. Accepted evidence does not by itself enable NAS processing scope.
 
 The qualified predictor provides a continuous, serial job loop. It retains the accepted qualification and connection binding for every claim, input, heartbeat and result. Empty long-polls have a minimum idle delay; the first execution/authority failure stops the loop and owned process. Cancellation, a closed control channel, or dropping the loop future terminates in-flight work. The loop does not enable processing scope or automatically replace expired qualification evidence. Qualification refresh, resource/network policy and consumption by the sign-in supervisor remain required before the app can report active NAS assistance.
+
+### Building a desktop installer
+
+The `cpu-ort` profile’s `sourceRevision` selects the runtime source for a new desktop
+bundle. This authoring pin is separate from the NAS catalogue, which retains older
+approved qualification identities. A pack for another OS/architecture, a stale source,
+an untrusted signature or changed files stops the build. No private signing key is
+needed during desktop packaging.
+
+Tauri maps only `manifest.json`, `manifest.sig` and the verified `payload/` tree into
+`native-runtime/`. Build intermediates and release-authoring files are excluded. The
+installed app verifies that signed resource again before copying it into its private
+runtime store. macOS app/DMG packaging has been exercised locally; OS release signing,
+notarization and installed Windows/Linux acceptance remain separate gates.
