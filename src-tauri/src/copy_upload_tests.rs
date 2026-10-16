@@ -201,7 +201,7 @@ impl Fixture {
         &self,
         server: &Server,
         journal: &mut Option<UploadSession>,
-        persist: impl FnMut(&UploadSession) -> Result<(), String>,
+        mut persist: impl FnMut(&UploadSession) -> Result<(), String>,
     ) -> Result<UploadOutcome, String> {
         transfer(
             &crate::transport::client().unwrap(),
@@ -212,7 +212,7 @@ impl Fixture {
             &self.binding(),
             &self.root.join("stage"),
             journal,
-            persist,
+            |session, _| persist(session),
             &AtomicBool::new(false),
             &|| Ok(()),
         )

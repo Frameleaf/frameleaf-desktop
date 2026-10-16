@@ -16,6 +16,8 @@ pub fn client() -> Result<Client, String> {
 
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Retry only through our durable coordinators, so payload attempts cannot evade admission.
+        .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
         .build()

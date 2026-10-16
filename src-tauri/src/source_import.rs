@@ -34,9 +34,17 @@ struct Active {
     receipt: Option<serde_json::Value>,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadBudget {
+    used: u64,
+    limit: u64,
+}
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Cursor {
     manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_budget: Option<UploadBudget>,
     position: usize,
     active: Option<Active>,
     state: String,
@@ -56,13 +64,40 @@ impl Cursor {
     fn new(manifest: &Manifest) -> Result<Self, String> {
         Ok(Self {
             manifest_hash: digest(manifest)?,
+            upload_budget: Some(UploadBudget {
+                used: 0,
+                limit: manifest
+                    .total_bytes
+                    .checked_mul(2)
+                    .ok_or("source_copy_budget_exceeded")?,
+            }),
             position: 0,
             active: None,
             state: "ready".into(),
         })
     }
+    fn approve_upload(&mut self, manifest: &Manifest) -> Result<(), String> {
+        if matches!(self.state.as_str(), "complete" | "cancelled") {
+            return Err("source_run_terminal".into());
+        }
+        let additional = view(manifest, self, "paused", None).additional_upload_allowance;
+        let used = self.upload_budget.as_ref().map_or(0, |budget| budget.used);
+        let limit = self
+            .upload_budget
+            .as_ref()
+            .map_or(0, |budget| budget.limit)
+            .checked_add(additional)
+            .ok_or("source_upload_budget_exhausted")?;
+        self.upload_budget = Some(UploadBudget { used, limit });
+        self.state = "paused".into();
+        Ok(())
+    }
     fn validate(&self, manifest: &Manifest) -> Result<(), String> {
-        if self.manifest_hash != digest(manifest)?
+        if self
+            .upload_budget
+            .as_ref()
+            .is_some_and(|budget| budget.used > budget.limit)
+            || self.manifest_hash != digest(manifest)?
             || self.position > manifest.files.len()
             || !matches!(
                 self.state.as_str(),
@@ -193,6 +228,8 @@ pub struct ImportView {
     pub total: usize,
     pub completed: usize,
     pub logical_bytes: u64,
+    pub upload_remaining: Option<u64>,
+    pub additional_upload_allowance: u64,
     pub skipped: u64,
     pub code: Option<String>,
     pub availability: Option<crate::source_metadata::AvailabilitySummary>,
@@ -204,6 +241,15 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
         total: manifest.files.len(),
         completed: cursor.position,
         logical_bytes: manifest.total_bytes,
+        upload_remaining: cursor
+            .upload_budget
+            .as_ref()
+            .map(|budget| budget.limit - budget.used),
+        additional_upload_allowance: manifest.files[cursor.position..]
+            .iter()
+            .map(|file| file.bytes)
+            .sum::<u64>()
+            .saturating_mul(2),
         skipped: manifest.skipped,
         availability: manifest.availability.clone(),
         code,
@@ -276,7 +322,7 @@ fn load(
     }
     let cursor: Cursor = match fs::symlink_metadata(journal.root.join("cursor.json")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Atomic cursor replacement never removes an old checkpoint; only an empty initial journal can recover.
+            // Empty staging cannot prove that no earlier uploads occurred; recovery needs a new allowance.
             if fs::read_dir(journal.root.join("stage"))
                 .map_err(|_| "source_journal_invalid")?
                 .next()
@@ -284,7 +330,8 @@ fn load(
             {
                 return Err("source_journal_invalid".into());
             }
-            let cursor = Cursor::new(&manifest)?;
+            let mut cursor = Cursor::new(&manifest)?;
+            cursor.upload_budget = None;
             journal.write("cursor.json", &cursor, identity)?;
             cursor
         }
@@ -554,9 +601,17 @@ async fn execute(
                         &binding,
                         &journal.root.join("stage"),
                         &mut upload,
-                        |session| {
+                        |session, bytes| {
+                            let budget = cursor
+                                .upload_budget
+                                .as_mut()
+                                .ok_or("source_upload_budget_required")?;
+                            budget.used =
+                                crate::upload_budget::reserve(budget.used, bytes, budget.limit)?;
                             cursor.active.as_mut().unwrap().upload = Some(session.clone());
-                            journal.write("cursor.json", &cursor, identity)
+                            journal.write("cursor.json", &cursor, identity)?;
+                            notify(view(&manifest, &cursor, "copying", None));
+                            Ok(())
                         },
                         cancel,
                         gate,
@@ -799,6 +854,26 @@ impl SourceJobs {
         *self.running.lock().await = Some(Running { cancel, task });
         Ok(value)
     }
+    pub async fn approve_upload(
+        &self,
+        base: &Path,
+        saved: &SavedConnection,
+    ) -> Result<ImportView, String> {
+        self.stop().await;
+        let identity = credentials::identity()?;
+        let consent =
+            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+        let journal = Journal::new(base, consent.source_id())?;
+        let (manifest, mut cursor) = load(&journal, &identity, &consent, saved)?;
+        cursor.approve_upload(&manifest)?;
+        journal.write("cursor.json", &cursor, &identity)?;
+        let value = view(&manifest, &cursor, "paused", None);
+        *self
+            .status
+            .lock()
+            .map_err(|_| "source_status_unavailable")? = value.clone();
+        Ok(value)
+    }
     pub async fn control(
         &self,
         base: &Path,
@@ -853,6 +928,158 @@ impl SourceJobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn payload_allowance_survives_restart_and_refuses_sends_before_http() {
+        tauri::async_runtime::block_on(async {
+            for acknowledged in [true, false] {
+                let f = Fixture::new();
+                let mut cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                cursor.upload_budget = Some(UploadBudget { used: 0, limit: 4 });
+                f.journal
+                    .write("cursor.json", &cursor, &f.identity)
+                    .unwrap();
+                let mut replies = f.replies(f.receipt(), false, false);
+                replies.truncate(10);
+                if !acknowledged {
+                    replies[9] = protocol(503, "", "{}");
+                }
+                let server = Server::new(replies);
+                let error = f.run(&server, &|| Ok(())).await.unwrap_err();
+                assert_eq!(
+                    error,
+                    if acknowledged {
+                        "source_upload_budget_exhausted"
+                    } else {
+                        "source_upload_http_503"
+                    }
+                );
+                let patches: Vec<_> = server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(headers, _)| headers.starts_with("PATCH /api/assets/uploads/"))
+                    .cloned()
+                    .collect();
+                assert_eq!(patches.len(), 1);
+                assert_eq!(patches[0].1, b"abcd");
+                let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 4);
+                assert_eq!(cursor.position, 0);
+                assert!(cursor.active.as_ref().unwrap().copy.is_some());
+                let mut replies = vec![
+                    preflight()[0].clone(),
+                    f.run_ack("open"),
+                    f.state_ack("open"),
+                    f.plan_ack("planned"),
+                ];
+                replies.extend(preflight());
+                replies.push(protocol(
+                    204,
+                    &format!(
+                        "Upload-Offset: {}\r\nUpload-Complete: ?0\r\n",
+                        if acknowledged { 4 } else { 0 }
+                    ),
+                    "",
+                ));
+                let restarted = Server::new(replies);
+                assert_eq!(
+                    f.run(&restarted, &|| Ok(())).await.unwrap_err(),
+                    "source_upload_budget_exhausted"
+                );
+                assert!(!restarted
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(headers, _)| headers.starts_with("PATCH /api/assets/uploads/")));
+                let mut cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 4);
+                cursor.approve_upload(&f.manifest).unwrap();
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 4);
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().limit, 24);
+                f.journal
+                    .write("cursor.json", &cursor, &f.identity)
+                    .unwrap();
+                let restored: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(
+                    view(&f.manifest, &restored, "paused", None).upload_remaining,
+                    Some(20)
+                );
+                assert_eq!(
+                    fs::read(f.base.join("source/photo.jpg")).unwrap(),
+                    b"abcdefghij"
+                );
+                let mut replies = vec![
+                    preflight()[0].clone(),
+                    f.run_ack("open"),
+                    f.state_ack("open"),
+                    f.plan_ack("planned"),
+                ];
+                replies.extend(preflight());
+                replies.push(protocol(
+                    204,
+                    &format!(
+                        "Upload-Offset: {}\r\nUpload-Complete: ?0\r\n",
+                        if acknowledged { 4 } else { 0 }
+                    ),
+                    "",
+                ));
+                for offset in if acknowledged {
+                    vec![8, 10]
+                } else {
+                    vec![4, 8, 10]
+                } {
+                    replies.push(protocol(
+                        204,
+                        &format!("Upload-Offset: {offset}\r\nUpload-Complete: ?0\r\n"),
+                        "",
+                    ));
+                }
+                replies.push(protocol(
+                    200,
+                    "",
+                    &json!({"id":ASSET,"status":"created","sha256":f.probe.sha256}).to_string(),
+                ));
+                replies.push(protocol(200, "", &f.receipt().to_string()));
+                replies.push(f.state_ack("complete"));
+                let renewed = Server::new(replies);
+                f.run(&renewed, &|| Ok(())).await.unwrap();
+                let final_cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(final_cursor.state, "complete");
+                assert_eq!(
+                    final_cursor.upload_budget.unwrap().used,
+                    if acknowledged { 10 } else { 14 }
+                );
+                assert!(!f.journal.root.join("stage").join(&f.stage).exists());
+            }
+        });
+    }
+    #[test]
+    fn legacy_cursor_needs_explicit_allowance_without_changing_its_signed_shape() {
+        let f = Fixture::new();
+        let mut legacy = serde_json::to_value(Cursor::new(&f.manifest).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("uploadBudget");
+        let mut cursor: Cursor = serde_json::from_value(legacy.clone()).unwrap();
+        cursor.validate(&f.manifest).unwrap();
+        assert_eq!(digest(&cursor).unwrap(), digest(&legacy).unwrap());
+        assert_eq!(
+            view(&f.manifest, &cursor, "paused", None).upload_remaining,
+            None
+        );
+        cursor.approve_upload(&f.manifest).unwrap();
+        assert_eq!(
+            view(&f.manifest, &cursor, "paused", None).upload_remaining,
+            Some(20)
+        );
+        cursor.upload_budget.as_mut().unwrap().used = 21;
+        assert!(cursor.validate(&f.manifest).is_err());
+        cursor.state = "cancelled".into();
+        assert_eq!(
+            cursor.approve_upload(&f.manifest).unwrap_err(),
+            "source_run_terminal"
+        );
+    }
     #[test]
     fn durable_import_journals_reject_tampering_other_installations_and_unacknowledged_progress() {
         let base = std::fs::canonicalize(std::env::temp_dir())
@@ -1234,6 +1461,10 @@ mod tests {
         assert_eq!(cursor.position, 0);
         assert_eq!(cursor.state, "ready");
         assert!(cursor.active.is_none());
+        assert!(
+            cursor.upload_budget.is_none(),
+            "missing accounting must not mint an allowance"
+        );
         fs::write(f.journal.root.join("cursor.json"), b"corrupt").unwrap();
         assert!(load(&f.journal, &f.identity, &f.consent, &f.saved).is_err());
         assert_eq!(

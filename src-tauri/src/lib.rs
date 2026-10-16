@@ -17,6 +17,7 @@ mod source_consent;
 mod source_import;
 mod source_metadata;
 mod transport;
+mod upload_budget;
 pub mod worker;
 mod worker_control;
 mod worker_setup;
@@ -685,6 +686,11 @@ async fn control_photo_import(
         "resume" => {
             app.state::<source_import::SourceJobs>()
                 .start(app.clone(), base, saved.clone())
+                .await
+        }
+        "approve-upload" => {
+            app.state::<source_import::SourceJobs>()
+                .approve_upload(&base, saved)
                 .await
         }
         "pause" | "cancel" => {

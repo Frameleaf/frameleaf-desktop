@@ -250,7 +250,7 @@ pub async fn upload(
     binding: &FolderUploadBinding,
     staging: &Path,
     session: &mut Option<UploadSession>,
-    persist: impl FnMut(&UploadSession) -> Result<(), String>,
+    mut persist: impl FnMut(&UploadSession) -> Result<(), String>,
     cancelled: &AtomicBool,
     gate: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<UploadOutcome, String> {
@@ -263,7 +263,7 @@ pub async fn upload(
         binding,
         staging,
         session,
-        persist,
+        |session, _| persist(session),
         cancelled,
         gate,
     )
@@ -279,7 +279,7 @@ pub(crate) async fn transfer(
     binding: &FolderUploadBinding,
     staging: &Path,
     session: &mut Option<UploadSession>,
-    mut persist: impl FnMut(&UploadSession) -> Result<(), String>,
+    mut persist: impl FnMut(&UploadSession, u64) -> Result<(), String>,
     cancelled: &AtomicBool,
     gate: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<UploadOutcome, String> {
@@ -301,7 +301,7 @@ pub(crate) async fn transfer(
         {
             return Err("source_upload_journal_invalid".into());
         }
-        persist(current)?;
+        persist(current, 0)?;
     }
     // Recheck the live server and photo owner before revealing filenames or media.
     let request = |method: Method, path: &str| {
@@ -392,7 +392,7 @@ pub(crate) async fn transfer(
             stage_id: copy.id.clone(),
             binding: binding.clone(),
         });
-        persist(session.as_ref().unwrap())?;
+        persist(session.as_ref().unwrap(), 0)?;
         initial
     };
     let path = format!(
@@ -411,6 +411,8 @@ pub(crate) async fn transfer(
             file.read_exact(&mut bytes)
                 .map_err(|_| "source_stage_changed")?;
             let expected = durable + count as u64;
+            // Persist admission before a send; a lost response or cancellation never refunds it.
+            persist(session.as_ref().unwrap(), count as u64)?;
             let response = send(
                 request(Method::PATCH, &path)
                     .header("Upload-Draft-Interop-Version", "9")

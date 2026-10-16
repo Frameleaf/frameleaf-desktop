@@ -383,3 +383,7 @@ file before staging. Actual macOS tests cover hidden-file/directory exclusion an
 hiding a file after approval. Windows provider probes and placeholder copies still
 need installed-provider qualification; existing copy-time reparse refusals remain.
 These hints do not reserve hydration storage or measure provider network traffic.
+
+### Photo-copy upload allowance
+
+Each prepared folder copy starts with an original-payload upload allowance of twice its planned size, displayed before copying. Every chunk is charged in the signed local progress journal before sending; failed or uncertain sends are not refunded. Restarting or resuming keeps the used allowance. Exhaustion pauses the copy and retains its staged originals. The user can explicitly approve another allowance of twice the remaining originals, then resume. Older saved runs and missing-progress recovery require this explicit approval before sending more originals; lost historical usage cannot be reconstructed, so recovery starts a new accounting record. This bounds original upload payloads, not HTTP/TLS overhead or cloud-provider hydration/download traffic; provider download accounting remains unfinished.

@@ -8,7 +8,7 @@
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
@@ -40,6 +40,8 @@
     source_journal_write_failed: 'Copy progress could not be saved. Check local disk space and access before resuming; staged originals are retained.',
     source_stop_confirmation_pending: 'Copying stopped on this computer. The server could not confirm its stop yet; existing server copies are kept.',
     source_cache_cleanup_pending: 'The verified copy is on your server, but its local staging cache could not be cleared. Check local file access before resuming.',
+    source_upload_budget_required: 'This saved copy needs an upload allowance before it can send original data. Approve the displayed amount, then resume.',
+    source_upload_budget_exhausted: 'This copy reached its upload allowance. Staged originals are kept. Approve more upload data to retry.',
     source_copy_cancelled: 'Copying is paused. Resume when you are ready.',
     metered_network: 'Copying is paused on this metered connection. Resume on an unmetered network.',
     network_unknown: 'Network cost could not be determined. Resume when an unmetered connection is available.',
@@ -105,7 +107,7 @@
     catch (error) { message = explain(error); }
     finally { busy = false; }
   }
-  async function controlCopy(action: 'resume' | 'pause' | 'cancel') {
+  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload') {
     busy = true; message = '';
     try { job = await invoke<CopyJob>('control_photo_import', { action }); }
     catch (error) { message = explain(error); }
@@ -177,10 +179,14 @@
           <p role="status">{job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'}: {job.completed.toLocaleString()} of {job.total.toLocaleString()} copies confirmed.</p>
           <progress max={Math.max(1, job.total)} value={job.completed} aria-label="Copies verified on your server"></progress>
           <p class="footnote">Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
+          <p class="footnote">{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
+          {#if !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted')}
+            <button class="secondary" disabled={busy} onclick={() => controlCopy('approve-upload')}>Approve {size(job.additionalUploadAllowance)} more upload data</button>
+          {/if}
           {#if job.availability}<p class="footnote" aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
           {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
           {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
-            <button class="secondary" disabled={busy} onclick={() => controlCopy('resume')}>{job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
+            <button class="secondary" disabled={busy || job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
           {/if}
           {#if job.state === 'copying'}<button class="secondary" disabled={busy} onclick={() => controlCopy('pause')}>Pause copy</button>{/if}
           {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}
