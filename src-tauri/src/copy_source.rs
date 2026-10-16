@@ -282,7 +282,9 @@ impl CopyApproval {
         }
         let id = Uuid::new_v4().to_string();
         let path = destination.join(&id);
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
