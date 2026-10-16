@@ -196,8 +196,12 @@ pub(crate) fn open_preview_root(path: &Path) -> Result<Dir, String> {
         // Only the OS volume/share anchor is opened ambiently; every named child is handle-relative.
         let mut anchor = std::path::PathBuf::from(prefix.as_os_str());
         anchor.push(std::path::MAIN_SEPARATOR_STR);
-        let mut dir = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())
-            .map_err(|_| "source_folder_unavailable")?;
+        let mut dir =
+            Dir::open_ambient_dir(anchor, cap_std::ambient_authority()).map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("source_preview_anchor_open_os={:?}", _error.raw_os_error());
+                "source_folder_unavailable"
+            })?;
         for part in parts {
             if !matches!(part, Component::Normal(_)) {
                 return Err("source_folder_invalid".into());
@@ -245,9 +249,14 @@ pub(crate) fn open_preview_child(dir: &Dir, name: &Path) -> Result<Dir, String> 
             .share_mode(3)
             .custom_flags(flags);
         // Attribute access cannot read an original if a file replaces the directory during traversal.
-        let file = dir
-            .open_with(name, &options)
-            .map_err(|_| "source_folder_unavailable")?;
+        let file = dir.open_with(name, &options).map_err(|_error| {
+            #[cfg(test)]
+            eprintln!(
+                "source_preview_attribute_open_os={:?}",
+                _error.raw_os_error()
+            );
+            "source_folder_unavailable"
+        })?;
         let candidate = Dir::from_std_file(file.into_std());
         let meta = candidate
             .dir_metadata()
@@ -266,6 +275,11 @@ pub(crate) fn open_preview_child(dir: &Dir, name: &Path) -> Result<Dir, String> 
             )
         };
         if handle == INVALID_HANDLE_VALUE {
+            #[cfg(test)]
+            eprintln!(
+                "source_preview_reopen_os={:?}",
+                std::io::Error::last_os_error().raw_os_error()
+            );
             return Err("source_folder_unavailable".into());
         }
         Ok(Dir::from_std_file(unsafe {
