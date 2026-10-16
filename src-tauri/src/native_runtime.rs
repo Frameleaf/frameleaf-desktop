@@ -339,7 +339,7 @@ impl VerifiedRuntime {
             private_root,
             Invocation::Serve {
                 port,
-                qualified: None,
+                qualified: &[],
             },
         )
     }
@@ -350,17 +350,24 @@ impl VerifiedRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        if qualified.manifest_sha256 != self.manifest_sha256 || port < 1024 {
+        self.start_bound_sidecar(&[qualified], cache, private_root, port)
+    }
+    pub fn start_bound_sidecar(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<NativeSidecar, String> {
+        if !(1..=64).contains(&qualified.len())
+            || port < 1024
+            || qualified
+                .iter()
+                .any(|item| item.manifest_sha256 != self.manifest_sha256)
+        {
             return Err("runtime_qualification_binding_invalid".into());
         }
-        self.launch(
-            cache,
-            private_root,
-            Invocation::Serve {
-                port,
-                qualified: Some(qualified),
-            },
-        )
+        self.launch(cache, private_root, Invocation::Serve { port, qualified })
     }
     fn launch(
         &self,
@@ -399,17 +406,21 @@ impl VerifiedRuntime {
         zeroize::Zeroize::zeroize(&mut secret);
         let module = match &invocation {
             Invocation::Serve { qualified, .. } => {
-                if let Some(qualified) = qualified {
-                    let write = || -> Result<(), String> {
-                        write_private(&scratch.join("qualification.json"), &qualified.spec)?;
-                        let report = serde_json::to_vec(&qualified.report)
+                let write = || -> Result<(), String> {
+                    for (index, item) in qualified.iter().enumerate() {
+                        write_private(
+                            &scratch.join(format!("qualification-{index}.json")),
+                            &item.spec,
+                        )?;
+                        let report = serde_json::to_vec(&item.report)
                             .map_err(|_| "runtime_qualification_report_invalid")?;
-                        write_private(&scratch.join("report.json"), &report)
-                    };
-                    if let Err(error) = write() {
-                        let _ = fs::remove_dir_all(&scratch);
-                        return Err(error);
+                        write_private(&scratch.join(format!("report-{index}.json")), &report)?;
                     }
+                    Ok(())
+                };
+                if let Err(error) = write() {
+                    let _ = fs::remove_dir_all(&scratch);
+                    return Err(error);
                 }
                 "immich_ml.native_runtime"
             }
@@ -460,12 +471,16 @@ impl VerifiedRuntime {
             .stderr(Stdio::null());
         match invocation {
             Invocation::Serve { port, qualified } => {
-                if qualified.is_some() {
+                if qualified.len() > 1 {
+                    // Older signed runtimes must reject this invocation rather than use only the last pair.
+                    command.arg("--binding-set");
+                }
+                for index in 0..qualified.len() {
                     command
                         .arg("--spec")
-                        .arg(scratch.join("qualification.json"))
+                        .arg(scratch.join(format!("qualification-{index}.json")))
                         .arg("--qualification-report")
-                        .arg(scratch.join("report.json"));
+                        .arg(scratch.join(format!("report-{index}.json")));
                 }
                 command
                     .arg("--port")
@@ -532,7 +547,7 @@ impl VerifiedRuntime {
 enum Invocation<'a> {
     Serve {
         port: u16,
-        qualified: Option<&'a QualifiedRuntime>,
+        qualified: &'a [&'a QualifiedRuntime],
     },
     Qualify {
         spec: &'a [u8],
@@ -780,6 +795,20 @@ mod tests {
                 .unwrap(),
             "runtime_qualification_binding_invalid"
         );
+        for bindings in [vec![], vec![&qualified], vec![&qualified; 65]] {
+            assert_eq!(
+                runtime
+                    .start_bound_sidecar(
+                        &bindings,
+                        Path::new("missing"),
+                        Path::new("missing"),
+                        19999
+                    )
+                    .err()
+                    .unwrap(),
+                "runtime_qualification_binding_invalid"
+            );
+        }
     }
     #[test]
     fn python_gate_registers_the_executed_main_module() {

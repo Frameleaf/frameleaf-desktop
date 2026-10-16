@@ -22,7 +22,7 @@ Local photo-source work includes OneDrive folders and Apple Photos/iCloud throug
 
 This private repository owns the desktop shell, supervisor, native adapters, packaging and desktop tests. Proposed `desktop/...` paths in the planning documents map here. Backend, Manager, shared web and ML contract changes remain in `Frameleaf/frameleaf-app`. Shared UI, SDK and runtime artifacts must be pinned to reviewed versions; do not fork the photo application.
 
-Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7ea`. PR #140 remains draft/open and unmerged. The foundation candidate contains a Tauri desktop shell, secure native password sign-in, OS-keystore session/device identity, automatic signed enrollment and an unprivileged window for the existing Frameleaf photo interface. Native inference and signed worker transport are implemented; automatic job scheduling, native full hosting, Manager pairing and local photo-source integrations remain unfinished. Installed-device release acceptance remains pending.
+Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7ea`. PR #140 remains draft/open and unmerged. The foundation candidate contains a Tauri desktop shell, secure native password sign-in, OS-keystore session/device identity, automatic signed enrollment and an unprivileged window for the existing Frameleaf photo interface. Native inference and signed worker transport are implemented; serial multi-role scheduling is connected; actual NAS job acceptance, native full hosting, Manager pairing and local photo-source integrations remain unfinished. Installed-device release acceptance remains pending.
 
 
 ## Development
@@ -62,9 +62,12 @@ webview. Cancellation, failed exits, deadlines and invalid/oversized qualificati
 reports cannot produce a qualified model. The report binds the exact approved fixture
 spec and is returned with its verified runtime manifest identity.
 
-These supervisor APIs are native-only and are not yet wired to a background worker.
-Release signing keys, packaged runtime installation, NAS model approval and automatic
-processing remain required before enabling worker readiness. CI exercises the process
+The native background worker retains accepted per-role evidence, starts one warm process
+before claiming work, and serializes matching jobs through it. It refreshes expiring
+qualifications and stops inference on cancellation or unsuitable power, network cost
+or available memory. Multi-role launches use an explicit flag rejected by older runtimes.
+The ordinary installer still needs its signed runtime resource; actual NAS library-job
+acceptance remains required before enabling worker readiness. CI exercises the process
 owner on all three OS builds; installed hardware acceptance remains separate.
 
 ## Constructing a runtime candidate

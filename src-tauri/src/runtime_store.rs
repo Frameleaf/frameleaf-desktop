@@ -356,6 +356,19 @@ impl InstalledRuntime {
         child.hold_lease(self.lease.clone());
         Ok(child)
     }
+    pub fn start_bound_sidecar(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<NativeSidecar, String> {
+        let mut child = self
+            .runtime
+            .start_bound_sidecar(qualified, cache, private_root, port)?;
+        child.hold_lease(self.lease.clone());
+        Ok(child)
+    }
     pub fn qualify(
         &self,
         cache: &Path,

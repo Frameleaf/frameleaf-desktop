@@ -184,6 +184,9 @@ async fn race_prediction<T>(
 
 pub struct NativePredictor {
     child: NativeSidecar,
+    roles: Vec<BoundRole>,
+}
+struct BoundRole {
     client: BoundClient,
     qualification_id: String,
 }
@@ -232,19 +235,55 @@ impl NativePredictor {
         private_root: &Path,
         port: u16,
     ) -> Result<Self, String> {
-        qualification.validate_runtime(
-            qualified,
-            (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
-        )?;
-        let spec: Value = serde_json::from_slice(qualified.specification())
-            .map_err(|_| "worker_model_binding_invalid")?;
-        let child = installed.start_qualified_sidecar(qualified, cache, private_root, port)?;
-        let client = BoundClient::new(port, child.authorization().into(), &spec)?;
-        Ok(Self {
-            child,
-            client,
-            qualification_id: qualification.id().into(),
-        })
+        Self::start_many(
+            installed,
+            &[(qualified, qualification)],
+            cache,
+            private_root,
+            port,
+        )
+    }
+    pub fn start_many(
+        installed: &InstalledRuntime,
+        bindings: &[(&QualifiedRuntime, &AcceptedQualification)],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<Self, String> {
+        if !(1..=64).contains(&bindings.len()) {
+            return Err("worker_model_binding_invalid".into());
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for (qualified, accepted) in bindings {
+            accepted.validate_runtime(
+                qualified,
+                (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
+            )?;
+            let spec: Value = serde_json::from_slice(qualified.specification())
+                .map_err(|_| "worker_model_binding_invalid")?;
+            if !keys.insert(
+                spec["modelKey"]
+                    .as_str()
+                    .ok_or("worker_model_binding_invalid")?
+                    .to_owned(),
+            ) {
+                return Err("worker_model_binding_invalid".into());
+            }
+        }
+        let proofs: Vec<_> = bindings.iter().map(|(qualified, _)| *qualified).collect();
+        let child = installed.start_bound_sidecar(&proofs, cache, private_root, port)?;
+        let roles = bindings
+            .iter()
+            .map(|(qualified, accepted)| {
+                let spec: Value = serde_json::from_slice(qualified.specification())
+                    .map_err(|_| "worker_model_binding_invalid")?;
+                Ok(BoundRole {
+                    client: BoundClient::new(port, child.authorization().into(), &spec)?,
+                    qualification_id: accepted.id().into(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { child, roles })
     }
     pub fn stop(&mut self) -> Result<(), String> {
         self.child.stop()
@@ -255,7 +294,7 @@ impl NativePredictor {
                 if !self.child.is_running()? {
                     return Err("runtime_process_stopped".into());
                 }
-                if self.client.health().await.unwrap_or(false) {
+                if self.roles[0].client.health().await.unwrap_or(false) {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -276,13 +315,22 @@ impl NativePredictor {
         qualification: &AcceptedQualification,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
+        self.execute_next_many(transport, &[qualification], cancel)
+            .await
+    }
+    pub async fn execute_next_many(
+        &mut self,
+        transport: &WorkerTransport,
+        qualifications: &[&AcceptedQualification],
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<bool, String> {
         let mut active = ActiveExecution {
             predictor: self,
             retain: false,
         };
         let outcome = active
             .predictor
-            .execute(transport, qualification, cancel)
+            .execute(transport, qualifications, cancel)
             .await;
         if outcome.is_err() {
             active.predictor.stop()?;
@@ -293,23 +341,30 @@ impl NativePredictor {
     async fn execute(
         &mut self,
         transport: &WorkerTransport,
-        qualification: &AcceptedQualification,
+        qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
-        if self.qualification_id != qualification.id() {
+        if self.roles.len() != qualifications.len()
+            || self
+                .roles
+                .iter()
+                .zip(qualifications)
+                .any(|(role, accepted)| role.qualification_id != accepted.id())
+        {
             return Err("worker_predictor_qualification_changed".into());
         }
         self.ready(cancel).await?;
         let task = race_prediction(
-            transport.claim(qualification),
+            transport.claim_many(qualifications),
             std::future::pending(),
             cancel,
             Duration::from_secs(30),
         )
         .await?;
-        let Some(task) = task else {
+        let Some((index, task)) = task else {
             return Ok(false);
         };
+        let qualification = qualifications[index];
         let result = async {
             let input = race_prediction(
                 transport.input(&task, qualification),
@@ -328,7 +383,7 @@ impl NativePredictor {
                 }
             };
             let value = race_prediction(
-                self.client.predict(&task, &input),
+                self.roles[index].client.predict(&task, &input),
                 lease,
                 cancel,
                 execution_duration(&task)?,
@@ -763,8 +818,10 @@ mod tests {
             .unwrap();
         let mut predictor = NativePredictor {
             child,
-            client: client(19998),
-            qualification_id: "fixture".into(),
+            roles: vec![BoundRole {
+                client: client(19998),
+                qualification_id: "fixture".into(),
+            }],
         };
         assert!(predictor.child.is_running().unwrap());
         let (_sender, mut cancel) = watch::channel(false);

@@ -30,3 +30,9 @@ test('automatic runtime and model qualification never claim active processing', 
     ['setup-needs-attention', 'Computer setup needs attention'],
   ]) assert.equal(workerStatus({ state: state!, workerSupported: false }), expected);
 });
+
+test('serial worker reports startup and waiting without claiming active inference', () => {
+  assert.equal(workerStatus({ state: 'starting-worker', workerSupported: false }), 'Starting this computer’s AI worker');
+  assert.equal(workerStatus({ state: 'working', workerSupported: false }), 'Checking for AI work');
+  assert.equal(workerStatus({ state: 'waiting-for-work', workerSupported: false }), 'Waiting for AI work');
+});

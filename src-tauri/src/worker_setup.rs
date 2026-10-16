@@ -155,6 +155,19 @@ async fn wait_for_capacity<F: Future<Output = Result<(), String>>>(
         .await?;
     }
 }
+async fn resource_loss(required_memory: u64) -> String {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        match tauri::async_runtime::spawn_blocking(crate::resource_policy::sample).await {
+            Ok(status) => {
+                if let Some(reason) = status.refusal(required_memory) {
+                    return reason.into();
+                }
+            }
+            Err(_) => return "status_unavailable".into(),
+        }
+    }
+}
 async fn prepare(
     saved: SavedConnection,
     paths: SetupPaths,
@@ -283,46 +296,153 @@ async fn prepare(
         .await?;
         caches.push(cache);
     }
-    for (profile, cache) in profiles.iter().zip(caches) {
-        check_cancel(&progress.cancelled)?;
-        wait_for_capacity(profile.minimum_memory(), &progress, || {
-            worker.maintain_session()
-        })
-        .await?;
-        progress.set("qualifying", None);
-        let challenge = cancellable(
-            worker.request_qualification(profile, &attestation, &uuid::Uuid::new_v4().to_string()),
-            &progress.cancelled,
-        )
-        .await?;
-        let spec = challenge.specification().to_vec();
-        let fixture = challenge.fixture().to_vec();
-        let cancel = progress.cancelled.clone();
-        let scratch = paths.data.join("scratch");
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel)?;
-            Ok::<_, String>((installed, qualified))
-        })
-        .await
-        .map_err(|_| "runtime_qualification_failed")??;
-        installed = result.0;
-        check_cancel(&progress.cancelled)?;
-        if !cancellable(
-            worker.submit_qualification(&challenge, &result.1),
-            &progress.cancelled,
-        )
-        .await?
-        {
-            return Err("worker_qualification_refused".into());
-        }
-        cancellable(
-            worker.read_accepted_qualification(profile, &result.1, challenge.id()),
-            &progress.cancelled,
-        )
-        .await?;
+    let cache = caches
+        .first()
+        .ok_or("worker_model_binding_invalid")?
+        .clone();
+    if caches.iter().any(|path| path != &cache) {
+        return Err("worker_shared_cache_required".into());
     }
-    // shortcut: qualification is reported separately until resource-aware job scheduling is wired.
-    Ok(())
+    let required_memory = profiles
+        .iter()
+        .map(|profile| profile.minimum_memory())
+        .max()
+        .unwrap();
+    'qualification: loop {
+        let mut prepared = Vec::new();
+        for (profile, cache) in profiles.iter().zip(caches.iter().cloned()) {
+            check_cancel(&progress.cancelled)?;
+            wait_for_capacity(profile.minimum_memory(), &progress, || {
+                worker.maintain_session()
+            })
+            .await?;
+            progress.set("qualifying", None);
+            let challenge = cancellable(
+                worker.request_qualification(
+                    profile,
+                    &attestation,
+                    &uuid::Uuid::new_v4().to_string(),
+                ),
+                &progress.cancelled,
+            )
+            .await?;
+            let spec = challenge.specification().to_vec();
+            let fixture = challenge.fixture().to_vec();
+            let cancel = progress.cancelled.clone();
+            let scratch = paths.data.join("scratch");
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel)?;
+                Ok::<_, String>((installed, qualified))
+            })
+            .await
+            .map_err(|_| "runtime_qualification_failed")??;
+            installed = result.0;
+            check_cancel(&progress.cancelled)?;
+            if !cancellable(
+                worker.submit_qualification(&challenge, &result.1),
+                &progress.cancelled,
+            )
+            .await?
+            {
+                return Err("worker_qualification_refused".into());
+            }
+            let accepted = cancellable(
+                worker.read_accepted_qualification(profile, &result.1, challenge.id()),
+                &progress.cancelled,
+            )
+            .await?;
+            prepared.push((result.1, accepted));
+        }
+
+        loop {
+            wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
+            let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+            if prepared
+                .iter()
+                .any(|(proof, accepted)| accepted.validate_runtime(proof, now + 60_000).is_err())
+            {
+                continue 'qualification;
+            }
+            progress.set("starting-worker", None);
+            let scratch = paths.data.join("scratch");
+            let cache = cache.clone();
+            let (runtime, proofs, mut predictor) =
+                tauri::async_runtime::spawn_blocking(move || {
+                    let reservation =
+                        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                            .map_err(|_| "runtime_port_unavailable")?;
+                    let port = reservation
+                        .local_addr()
+                        .map_err(|_| "runtime_port_unavailable")?
+                        .port();
+                    drop(reservation);
+                    let bindings: Vec<_> = prepared
+                        .iter()
+                        .map(|(proof, accepted)| (proof, accepted))
+                        .collect();
+                    let predictor = crate::native_predictor::NativePredictor::start_many(
+                        &installed, &bindings, &cache, &scratch, port,
+                    )?;
+                    Ok::<_, String>((installed, prepared, predictor))
+                })
+                .await
+                .map_err(|_| "runtime_start_failed")??;
+            installed = runtime;
+            prepared = proofs;
+            check_cancel(&progress.cancelled)?;
+            let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+            loop {
+                cancellable(worker.maintain_session(), &progress.cancelled).await?;
+                let resources =
+                    tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                        .await
+                        .map_err(|_| "resource_status_unavailable")?;
+                check_cancel(&progress.cancelled)?;
+                if let Some(reason) = resources.refusal(required_memory) {
+                    // Release model memory before waiting, otherwise the warm process can prevent recovery.
+                    predictor.stop()?;
+                    progress.set("paused", Some(reason.into()));
+                    break;
+                }
+                let now =
+                    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+                if prepared.iter().any(|(proof, accepted)| {
+                    accepted.validate_runtime(proof, now + 60_000).is_err()
+                }) {
+                    continue 'qualification;
+                }
+                progress.set("working", None);
+                let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
+                let completed = cancellable(async {
+                    tokio::select! {
+                        biased;
+                        reason = resource_loss(required_memory) => Err(format!("resource_{reason}")),
+                        result = predictor.execute_next_many(&worker, &accepted, &mut cancel) => result,
+                    }
+                }, &progress.cancelled).await;
+                match completed {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        progress.set("waiting-for-work", None);
+                        cancellable(
+                            async {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                Ok(())
+                            },
+                            &progress.cancelled,
+                        )
+                        .await?;
+                    }
+                    Err(reason) if reason.starts_with("resource_") => {
+                        predictor.stop()?;
+                        progress.set("paused", Some(reason[9..].into()));
+                        break;
+                    }
+                    Err(reason) => return Err(reason),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

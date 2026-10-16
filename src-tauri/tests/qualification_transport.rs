@@ -289,3 +289,146 @@ fn refuses_a_challenge_on_another_connection_or_credential_generation() {
         assert!(challenge.validate_authority(&changed).is_err(), "{field}");
     }
 }
+
+#[test]
+#[ignore = "requires a private factory-signed multi-binding CPU pack and approved model cache"]
+fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
+    use reqwest::multipart::{Form, Part};
+    use std::{
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("frameleaf-three-roles-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let pack = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
+    let cache = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
+    let store = frameleaf_desktop::release_policy::open_runtime_store(&root.join("store")).unwrap();
+    let raw = fs::read(pack.join("manifest.json")).unwrap();
+    let signature: [u8; 64] = fs::read(pack.join("manifest.sig"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    store
+        .install_and_activate(&pack.join("payload"), &raw, &signature)
+        .unwrap();
+    let installed = store.load_active().unwrap().unwrap();
+    let f = Fixture {
+        root,
+        store,
+        installed,
+    };
+    let catalogue: Value =
+        serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+    let mut profiles = Vec::new();
+    let mut proofs = Vec::new();
+    for profile in catalogue["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["runtimeSourceRevision"] == f.installed.source_revision())
+    {
+        let p = approved_profile(
+            profile["modelName"].as_str().unwrap(),
+            &profile["spec"]["entries"],
+            f.installed.source_revision(),
+            f.installed.provider(),
+        )
+        .unwrap()
+        .unwrap();
+        let (spec, fixture) = p.challenge(&Uuid::new_v4().to_string()).unwrap();
+        proofs.push(
+            f.installed
+                .qualify(&cache, &f.root, &spec, &fixture, &AtomicBool::new(false))
+                .unwrap(),
+        );
+        profiles.push((profile.clone(), fixture));
+    }
+    assert_eq!(proofs.len(), 3);
+    let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let refs: Vec<_> = proofs.iter().collect();
+    let mut sidecar = f
+        .installed
+        .start_bound_sidecar(&refs, &cache, &f.root, port)
+        .unwrap();
+    let scratch = sidecar.working_dir().to_owned();
+    tauri::async_runtime::block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            assert!(
+                sidecar.is_running().unwrap(),
+                "multi-binding process exited before ready"
+            );
+            if client
+                .get(format!("{base}/ping"))
+                .bearer_auth(sidecar.authorization())
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "multi-binding startup timed out");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for index in [0, 1, 2, 0] {
+            let (profile, fixture) = &profiles[index];
+            let spec = &profile["spec"];
+            let form = Form::new().text("entries", spec["entries"].to_string());
+            let form = if spec["fixtureKind"] == "image" {
+                form.part(
+                    "image",
+                    Part::bytes(fixture.clone()).file_name("fixture.png"),
+                )
+            } else {
+                form.text("text", String::from_utf8(fixture.clone()).unwrap())
+            };
+            let response = client
+                .post(format!("{base}/predict"))
+                .bearer_auth(sidecar.authorization())
+                .multipart(form)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "role {index} returned {}",
+                response.status()
+            );
+            let output: Value = response.json().await.unwrap();
+            let vector: Vec<f64> = serde_json::from_str(output["clip"].as_str().unwrap()).unwrap();
+            let expected: Vec<f64> =
+                serde_json::from_str(spec["expectedOutput"]["clip"].as_str().unwrap()).unwrap();
+            assert_eq!(vector.len(), 768);
+            assert!(vector
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.is_finite() && (actual - expected).abs() < 0.002));
+            assert!(sidecar.is_running().unwrap());
+        }
+        let response = client
+            .post(format!("{base}/predict"))
+            .bearer_auth(sidecar.authorization())
+            .multipart(Form::new().text("entries", "{}").text("text", "fixture"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+    });
+    sidecar.stop().unwrap();
+    drop(sidecar);
+    assert!(!scratch.exists());
+    eprintln!("PASS: one installed factory-signed process served default text, English text, visual and default text again; unknown config refused; owned process/scratch removed");
+}
