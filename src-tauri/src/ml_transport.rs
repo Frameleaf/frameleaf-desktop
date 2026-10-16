@@ -939,3 +939,6 @@ mod renewal_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod native_nas_tests;
