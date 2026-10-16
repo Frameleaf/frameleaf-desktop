@@ -244,6 +244,14 @@ impl CopyApproval {
         normalize_server(&saved.server)?;
         // Reuse the preview's broad-root and package refusals, without opening media.
         crate::photo_sources::inventory(root, 1)?;
+        #[cfg(windows)]
+        crate::native_runtime::absolute_directory(root).map_err(|code| {
+            if code == "runtime_link_forbidden" {
+                "source_cloud_copy_pending".into()
+            } else {
+                code
+            }
+        })?;
         if saved.server_id.is_empty()
             || saved.account_id.is_empty()
             || saved.device_id.as_deref().is_none_or(str::is_empty)

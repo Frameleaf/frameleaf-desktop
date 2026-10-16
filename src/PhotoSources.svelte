@@ -30,6 +30,7 @@
     source_copy_budget_exceeded: 'This copy exceeds the server’s current size limits. Choose a smaller subfolder or remove unsupported large files from the selected scope.',
     source_staging_overlap: 'Choose a photo folder outside the app’s own data folder.',
     source_item_changed: 'A selected file changed after the scan. This copy is paused; the original and staged data are kept.',
+    source_cloud_copy_pending: 'This Windows cloud folder can be previewed, but copying its placeholders is still being implemented. Export originals to an ordinary local folder for now.',
     source_capacity_unavailable: 'Available storage space could not be checked. Reconnect the photo-source and app-storage volumes, then resume.',
     source_capacity_insufficient: 'There is not enough free space for this original and its staged copy. Free space on the photo-source and app-storage volumes, then resume.',
     source_run_paused: 'Your server paused this copy before another original was staged. Resume explicitly when ready.',

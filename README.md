@@ -345,7 +345,16 @@ OS credential storage, provider hydration or installed-device acceptance.
 ### Source availability and exclusions
 
 Windows metadata probes request attributes only, bypass reparse processing and
-request no recall. Cloud Files states distinguish available placeholders, missing
+request no recall. Windows preview roots and named child directories now use a
+source-specific opener: only disk/share anchors are ambient, named components
+open relative to the parent handle, and directory type plus Cloud Files
+classification are checked before listing rights are requested through ReOpenFile.
+Junctions, symbolic links and unknown reparse types remain excluded. Runtime and
+private staging roots retain their original strict path checks. Windows cloud-root
+copy approval still refuses explicitly until hydration-aware source-version checks
+are implemented; this change enables the preview path, not placeholder copies.
+Windows compilation and actual provider enumeration still need qualification.
+Cloud Files states distinguish available placeholders, missing
 local data, and provider-not-ready data (which may already be downloaded). Pinning
 intent is counted separately. Unknown or invalid states never become proof of local
 residency. Unknown reparse points and Hidden/System entries are excluded.

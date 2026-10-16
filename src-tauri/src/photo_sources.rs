@@ -1,4 +1,3 @@
-use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, path::Path};
 
@@ -43,7 +42,6 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
     }) {
         return Err("source_package_requires_provider".into());
     }
-    crate::native_runtime::absolute_directory(root)?;
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
     if home
         .as_ref()
@@ -51,8 +49,7 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
     {
         return Err("source_choose_photo_subfolder".into());
     }
-    let dir = Dir::open_ambient_dir(root, ambient_authority())
-        .map_err(|_| "source_folder_unavailable")?;
+    let dir = crate::source_metadata::open_preview_root(root)?;
     let root_meta = dir
         .dir_metadata()
         .map_err(|_| "source_folder_unavailable")?;
@@ -146,7 +143,7 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
                     result.skipped += 1;
                     continue;
                 }
-                match dir.open_dir(name) {
+                match crate::source_metadata::open_preview_child(&dir, Path::new(name)) {
                     Ok(child) => pending.push_back((child, relative.join(name), depth + 1)),
                     Err(_) => {
                         unreadable += 1;
@@ -210,7 +207,7 @@ pub fn known_onedrive_roots(home: &Path, supplied: &[std::path::PathBuf]) -> Vec
         if result.len() == 16 {
             break;
         }
-        if !path.is_absolute() || crate::native_runtime::absolute_directory(&path).is_err() {
+        if !path.is_absolute() || crate::source_metadata::open_preview_root(&path).is_err() {
             continue;
         }
         if result
