@@ -463,6 +463,12 @@ struct Connection {
     identity: DeviceIdentity,
 }
 impl Connection {
+    async fn ensure_current(&mut self) -> Result<(), String> {
+        if renewal_due(&self.worker, now()?)? {
+            self.renew().await?;
+        }
+        Ok(())
+    }
     async fn renew(&mut self) -> Result<(), String> {
         let response = self
             .request(Method::POST, "api/desktop/worker/session", "renew", "{}")
@@ -509,7 +515,43 @@ impl Connection {
 }
 
 pub struct WorkerTransport(Mutex<Connection>);
+fn claim_models(
+    qualifications: &[&AcceptedQualification],
+    worker: &SavedWorker,
+    at: i64,
+) -> Result<Vec<String>, String> {
+    if qualifications.is_empty() || qualifications.len() > 64 {
+        return Err("worker_models_unavailable".into());
+    }
+    let mut keys = Vec::new();
+    for qualification in qualifications {
+        qualification.validate_authority(worker, at)?;
+        if keys.contains(&qualification.model_key) {
+            return Err("worker_models_ambiguous".into());
+        }
+        keys.push(qualification.model_key.clone());
+    }
+    Ok(keys)
+}
+fn bind_claim(
+    qualifications: &[&AcceptedQualification],
+    task: &ClaimedTask,
+    worker: &SavedWorker,
+    at: i64,
+) -> Result<usize, String> {
+    let keys = claim_models(qualifications, worker, at)?;
+    task.validate_at(worker, &keys, at)?;
+    let index = qualifications
+        .iter()
+        .position(|q| q.model_key == task.model_key && q.id == task.qualification_id)
+        .ok_or("worker_task_qualification_changed")?;
+    qualifications[index].validate_task(worker, task, at)?;
+    Ok(index)
+}
 impl WorkerTransport {
+    pub(crate) async fn maintain_session(&self) -> Result<(), String> {
+        self.0.lock().await.ensure_current().await
+    }
     pub fn load(saved: &SavedConnection) -> Result<Self, String> {
         let worker: SavedWorker =
             credentials::load("worker-session")?.ok_or("worker_session_required")?;
@@ -544,6 +586,7 @@ impl WorkerTransport {
             return Err("worker_payload_invalid".into());
         }
         let mut connection = self.0.lock().await;
+        connection.ensure_current().await?;
         let response = connection
             .request(
                 Method::POST,
@@ -633,28 +676,34 @@ impl WorkerTransport {
         &self,
         qualification: &AcceptedQualification,
     ) -> Result<Option<ClaimedTask>, String> {
-        let payload =
-            serde_json::json!({"modelKeys":[qualification.model_key],"waitMs":20000}).to_string();
+        Ok(self
+            .claim_many(&[qualification])
+            .await?
+            .map(|(_, task)| task))
+    }
+    pub async fn claim_many(
+        &self,
+        qualifications: &[&AcceptedQualification],
+    ) -> Result<Option<(usize, ClaimedTask)>, String> {
         let mut connection = self.0.lock().await;
         let at = now()?;
-        qualification.validate_authority(&connection.worker, at)?;
-        if renewal_due(&connection.worker, at)? {
-            connection.renew().await?;
-            qualification.validate_authority(&connection.worker, now()?)?;
-        }
+        let keys = claim_models(qualifications, &connection.worker, at)?;
+        connection.ensure_current().await?;
+        claim_models(qualifications, &connection.worker, now()?)?;
+        let payload = serde_json::json!({"modelKeys":keys,"waitMs":20000}).to_string();
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
             .await?;
         let claim: ClaimResponse = transport::json_limit(response, 256 * 1024).await?;
-        if let Some(task) = &claim.task {
-            qualification.validate_task(&connection.worker, task, now()?)?;
-            task.validate_at(
-                &connection.worker,
-                std::slice::from_ref(&qualification.model_key),
-                now()?,
-            )?;
-        }
-        Ok(claim.task)
+        claim
+            .task
+            .map(|task| {
+                Ok((
+                    bind_claim(qualifications, &task, &connection.worker, now()?)?,
+                    task,
+                ))
+            })
+            .transpose()
     }
     pub async fn input(
         &self,
@@ -797,6 +846,37 @@ mod renewal_tests {
     use serde_json::json;
 
     const AT: i64 = 1_792_094_400_000;
+    #[test]
+    fn multi_model_claim_selects_only_its_exact_qualification_and_rechecks_every_association() {
+        let worker = worker();
+        let accepted = |key: &str, id: &str| AcceptedQualification {
+            authority: ChallengeAuthority::from_worker(&worker),
+            id: id.into(),
+            model_key: key.into(),
+            config_sha256: hash(b"{}"),
+            input_kind: InputKind::Text,
+            binding_sha256: "a".repeat(64),
+            manifest_sha256: "b".repeat(64),
+            runtime_fingerprint: "c".repeat(64),
+            report_sha256: "d".repeat(64),
+            expires_at: AT + 600000,
+        };
+        let first = accepted("first", "c1a52b82-60da-4fa2-8814-e028a088206f");
+        let mut second = accepted("second", "c4d607b0-20de-4c68-bb05-c68cc5bfecb9");
+        let task:ClaimedTask=serde_json::from_value(json!({"id":"a793f54d-394c-49be-af87-509cceddfdd9","taskId":"15ee79b9-c6ab-4d34-bade-67f654136396","deviceId":worker.device_id,"sessionId":worker.session_id,"authorizationEpoch":2,"generation":1,"qualificationId":second.id,"qualificationExpiresAt":"2026-10-15T20:10:00Z","modelKey":"second","configJson":"{}","configSha256":hash(b"{}"),"inputSha256":"e".repeat(64),"inputKind":"text","maxInputBytes":1024,"expiresAt":"2026-10-15T20:01:00Z","executionDeadline":"2026-10-15T20:02:00Z"})).unwrap();
+        assert_eq!(
+            bind_claim(&[&first, &second], &task, &worker, AT).unwrap(),
+            1
+        );
+        let mut changed = task.clone();
+        changed.qualification_id = first.id.clone();
+        assert!(bind_claim(&[&first, &second], &changed, &worker, AT).is_err());
+        second.authority.account_id = "other".into();
+        assert!(bind_claim(&[&first, &second], &task, &worker, AT).is_err());
+        assert!(claim_models(&[], &worker, AT).is_err());
+        assert!(claim_models(&[&first, &first], &worker, AT).is_err());
+        assert!(claim_models(&[&first], &worker, AT + 600000).is_err());
+    }
     fn worker() -> SavedWorker {
         serde_json::from_value(
             json!({"serverId":"server","accountId":"account","deviceId":"device",

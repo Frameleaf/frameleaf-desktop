@@ -31,7 +31,12 @@ impl Progress {
             state: state.into(),
             code,
         };
-        *self.status.lock().unwrap() = status.clone();
+        let mut current = self.status.lock().unwrap();
+        if *current == status {
+            return;
+        }
+        *current = status.clone();
+        drop(current);
         (self.notify)(status);
     }
 }
@@ -122,6 +127,32 @@ async fn cancellable<T>(
     tokio::select! {
         result = future => result,
         _ = async { loop { if cancel.load(Ordering::Acquire) { break; } tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("worker_setup_cancelled".into())
+    }
+}
+async fn wait_for_capacity<F: Future<Output = Result<(), String>>>(
+    required_memory: u64,
+    progress: &Progress,
+    mut maintain: impl FnMut() -> F,
+) -> Result<(), String> {
+    loop {
+        check_cancel(&progress.cancelled)?;
+        cancellable(maintain(), &progress.cancelled).await?;
+        let status = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+            .await
+            .map_err(|_| "resource_status_unavailable")?;
+        check_cancel(&progress.cancelled)?;
+        let Some(reason) = status.refusal(required_memory) else {
+            return Ok(());
+        };
+        progress.set("paused", Some(reason.into()));
+        cancellable(
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            },
+            &progress.cancelled,
+        )
+        .await?;
     }
 }
 async fn prepare(
@@ -232,6 +263,10 @@ async fn prepare(
         return Err("server_model_not_supported".into());
     }
     let worker = WorkerTransport::load(&saved)?;
+    let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+        .await
+        .map_err(|_| "resource_status_unavailable")?;
+    let allow_download = allow_download || network.unmetered == Some(true);
     progress.set("preparing-models", None);
     // Complete acquisition before requesting short-lived nonces.
     let mut caches = Vec::new();
@@ -250,6 +285,10 @@ async fn prepare(
     }
     for (profile, cache) in profiles.iter().zip(caches) {
         check_cancel(&progress.cancelled)?;
+        wait_for_capacity(profile.minimum_memory(), &progress, || {
+            worker.maintain_session()
+        })
+        .await?;
         progress.set("qualifying", None);
         let challenge = cancellable(
             worker.request_qualification(profile, &attestation, &uuid::Uuid::new_v4().to_string()),
@@ -290,6 +329,40 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn resource_refusal_prevents_work_and_remains_cancellable() {
+        let setup = WorkerSetup::default();
+        let touched = Arc::new(AtomicBool::new(false));
+        let proof = touched.clone();
+        let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renewed = renewals.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                move |progress| async move {
+                    wait_for_capacity(u64::MAX, &progress, || async {
+                        renewed.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    })
+                    .await?;
+                    proof.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await;
+        let status = tokio::time::timeout(Duration::from_secs(7), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "paused");
+        setup.stop().await;
+        assert!(!touched.load(Ordering::Acquire));
+        assert!(renewals.load(Ordering::Acquire) > 0);
+        assert_eq!(setup.status(), SetupStatus::default());
+    }
     #[tokio::test]
     async fn fresh_nested_app_directory_reports_missing_pack_without_touching_server_credentials() {
         let root = std::env::temp_dir()

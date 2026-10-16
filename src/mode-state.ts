@@ -8,6 +8,7 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
   if (state === 'model-download-required') return 'Selected models need downloading';
   if (state === 'qualifying') return 'Checking this computer’s models';
   if (state === 'qualified') return 'Models qualified';
+  if (state === 'paused') return 'AI processing paused';
   if (state === 'setup-needs-attention') return 'Computer setup needs attention';
   if (state === 'worker-setup-failed' || state === 'credential-store-unavailable') return 'Computer setup needs attention';
   if (state === 'awaiting-approval') return 'Waiting for administrator approval';

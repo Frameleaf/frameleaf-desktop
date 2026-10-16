@@ -452,6 +452,9 @@ impl VerifiedRuntime {
             .env("OMP_NUM_THREADS", "1")
             .env("OPENBLAS_NUM_THREADS", "1")
             .env("MKL_NUM_THREADS", "1")
+            .env("MACHINE_LEARNING_MODEL_INTRA_OP_THREADS", "4")
+            .env("MACHINE_LEARNING_MODEL_INTER_OP_THREADS", "1")
+            .env("MACHINE_LEARNING_REQUEST_THREADS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

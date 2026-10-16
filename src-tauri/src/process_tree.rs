@@ -11,11 +11,25 @@ pub fn configure(command: &mut Command) {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        // A single bounded ML job must yield CPU time to foreground applications.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::getpriority(libc::PRIO_PROCESS, 0) >= 10
+                    || libc::setpriority(libc::PRIO_PROCESS, 0, 10) == 0
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+        command.creation_flags(
+            0x08000000 | windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS,
+        );
     }
 }
 impl ProcessTree {

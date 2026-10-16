@@ -47,6 +47,11 @@ impl ApprovedProfile {
     pub fn embedding_dimensions(&self) -> usize {
         self.0.embedding_dimensions()
     }
+    pub(crate) fn minimum_memory(&self) -> u64 {
+        self.0.spec["minMemoryBytes"]
+            .as_u64()
+            .expect("validated model memory envelope")
+    }
     pub fn challenge(&self, id: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         self.0.challenge(id)
     }

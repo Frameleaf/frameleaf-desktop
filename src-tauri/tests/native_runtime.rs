@@ -126,6 +126,11 @@ fn main(){
  let args:Vec<_>=env::args().collect();assert_eq!(args[1],"-I");assert_eq!(args[2],"-B");assert_eq!(args[3],"-c");assert_eq!(args[5],"immich_ml.native_runtime");
  let token=env::var("FRAMELEAF_ML_AUTH_TOKEN").unwrap();assert_eq!(token.len(),64);
  assert!(env::var("HOME").is_err());assert!(env::var("PYTHONPATH").is_err());assert!(env::var("AWS_SECRET_ACCESS_KEY").is_err());
+ assert_eq!(env::var("MACHINE_LEARNING_MODEL_INTRA_OP_THREADS").unwrap(),"4");
+ assert_eq!(env::var("MACHINE_LEARNING_MODEL_INTER_OP_THREADS").unwrap(),"1");
+ assert_eq!(env::var("MACHINE_LEARNING_REQUEST_THREADS").unwrap(),"1");
+ #[cfg(unix)] unsafe { unsafe extern "C" { fn getpriority(which:i32,who:u32)->i32; } assert!(getpriority(0,0)>=10); }
+ #[cfg(windows)] unsafe { #[link(name="kernel32")] unsafe extern "system" { fn GetCurrentProcess()->*mut std::ffi::c_void; fn GetPriorityClass(process:*mut std::ffi::c_void)->u32; } assert_eq!(GetPriorityClass(GetCurrentProcess()),0x4000); }
  fs::write("ready",b"ready").unwrap();loop{thread::sleep(Duration::from_millis(20));}
 }
 "#).unwrap();
