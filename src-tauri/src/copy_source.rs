@@ -782,6 +782,8 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
             _ => return Err("source_stage_invalid".into()),
         }
     }
+    // Windows directory handles deny deletion until closed.
+    drop(dir);
     root.remove_dir(id)
         .map_err(|_| "source_cache_cleanup_pending")?;
     #[cfg(unix)]
@@ -796,6 +798,29 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stage_release_removes_only_owned_files_and_is_retryable() {
+        let path = std::env::temp_dir().join(format!("frameleaf-release-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let cleanup = Partial(Some(path.clone()));
+        let path = fs::canonicalize(path).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let stage = path.join(&id);
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("original"), b"staged original").unwrap();
+        fs::write(stage.join("receipt.json"), b"receipt").unwrap();
+        fs::write(stage.join("unexpected"), b"retain").unwrap();
+        assert_eq!(
+            release_stage(&path, &id).err().as_deref(),
+            Some("source_cache_cleanup_pending")
+        );
+        assert_eq!(fs::read(stage.join("unexpected")).unwrap(), b"retain");
+        fs::remove_file(stage.join("unexpected")).unwrap();
+        release_stage(&path, &id).unwrap();
+        assert!(!stage.exists());
+        release_stage(&path, &id).unwrap();
+        drop(cleanup);
+    }
     #[test]
     fn capacity_accounts_for_original_and_stage_on_shared_volume() {
         const RESERVE: u64 = 256 * 1024 * 1024;

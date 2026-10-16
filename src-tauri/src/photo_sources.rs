@@ -384,7 +384,10 @@ mod root_tests {
         std::fs::write(root.join("notes.txt"), b"excluded").unwrap();
         let scan = super::scan(&root, 100).unwrap();
         assert_eq!(scan.files.len(), 1);
-        assert_eq!(scan.files[0].relative, "nested/photo.jpg");
+        assert_eq!(
+            super::Path::new(&scan.files[0].relative),
+            super::Path::new("nested/photo.jpg")
+        );
         assert_eq!(scan.files[0].bytes, 8);
         assert_eq!(scan.unreadable, 0);
         assert!(super::scan(&root, 1).unwrap().inventory.truncated);
