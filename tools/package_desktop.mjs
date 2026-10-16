@@ -21,7 +21,13 @@ export async function packageConfiguration(candidate, policy) {
   const approved = Object.values(profiles.profiles ?? {}).filter(
     (profile) =>
       profile.provider === manifest.provider &&
-      profile.sourceRevision === manifest.sourceRevision &&
+      (profile.sourceRevision === manifest.sourceRevision ||
+        (Array.isArray(
+          profile.additionalSources?.[`${platform}-${architecture}`],
+        ) &&
+          profile.additionalSources[`${platform}-${architecture}`].includes(
+            manifest.sourceRevision,
+          ))) &&
       profile.targets?.includes(`${platform}-${architecture}`),
   );
   if (profiles.schemaVersion !== 1 || approved.length !== 1)

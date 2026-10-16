@@ -344,3 +344,57 @@ for (const namespace of ["immich_ml", "frameleaf_ml", "foreign", null]) {
     else await assert.rejects(signing, /runtime_manifest_invalid/);
   });
 }
+
+test("PR274 CPU source is packageable only through its qualified macOS ARM64 approval", async (t) => {
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  const profiles = JSON.parse(
+    await readFile(
+      new URL("../runtime/profiles.json", import.meta.url),
+      "utf8",
+    ),
+  ).profiles;
+  const source = "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4";
+  assert.equal(
+    profiles["cpu-ort"].sourceRevision,
+    "25b22c16e47a27a2eb50017d838497abce850d11",
+  );
+  assert.deepEqual(profiles["cpu-ort"].additionalSources, {
+    "macos-aarch64": [source],
+  });
+  assert.equal(
+    profiles["coreml-ort"].sourceRevision,
+    "25b22c16e47a27a2eb50017d838497abce850d11",
+  );
+  const f = await fixture(t);
+  const provenance = JSON.parse(
+    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
+  );
+  provenance.sourceRevision = source;
+  const bytes = Buffer.from(JSON.stringify(provenance));
+  f.manifest.sourceRevision = source;
+  f.manifest.moduleNamespace = "frameleaf_ml";
+  f.manifest.files["provenance.json"] = {
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+  await writeFile(join(f.root, "payload/provenance.json"), bytes);
+  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+  await signCandidate(
+    f.root,
+    join(f.root, "manifest.sig"),
+    f.privatePem,
+    f.policy,
+  );
+  if (process.platform !== "darwin" || process.arch !== "arm64") {
+    await assert.rejects(
+      packageConfiguration(f.root, f.policy),
+      /runtime_bundle_source_unapproved/,
+    );
+    return;
+  }
+  const config = await packageConfiguration(f.root, f.policy);
+  assert.equal(
+    config.bundle.resources[join(f.root, "payload")],
+    "native-runtime/payload",
+  );
+});

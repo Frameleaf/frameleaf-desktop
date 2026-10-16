@@ -196,8 +196,11 @@ three SigLIP roles, the OCR pair and the face pair. Their preprocessing identiti
 and model keys are distinct from the historical profiles, which remain unchanged.
 The newer OCR confidence and face embeddings require the matching NAS producer;
 they do not reuse an old qualification. Catalogue membership does not install a
-runtime or change the bundled source pin. The new pack still needs factory signing,
-release packaging and installed-platform acceptance.
+runtime or change the default bundled source pin. The PR274 CPU pack has passed
+all five model profiles on macOS ARM64 and received a verified factory signature.
+Packaging also permits this source on that target only; other targets retain the
+historical source. Hosted rebuilding of the new source and installed-platform
+acceptance remain pending.
 
 ### CoreML candidate packs
 

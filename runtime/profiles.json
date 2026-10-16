@@ -13,7 +13,10 @@
         "linux-x86_64",
         "linux-aarch64"
       ],
-      "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11"
+      "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11",
+      "additionalSources": {
+        "macos-aarch64": ["1ca4d52e2b8158d89d8de8b17e1e6535e17691f4"]
+      }
     },
     "coreml-ort": {
       "python": "3.12.13",
