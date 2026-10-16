@@ -11,9 +11,9 @@ use std::{
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Artifact {
-    sha256: String,
-    bytes: u64,
+pub(crate) struct Artifact {
+    pub(crate) sha256: String,
+    pub(crate) bytes: u64,
 }
 #[derive(Clone, Copy, Default, Deserialize)]
 enum ModuleNamespace {
@@ -48,13 +48,13 @@ struct Manifest {
     files: BTreeMap<String, Artifact>,
 }
 
-fn digest_valid(value: &str, length: usize) -> bool {
+pub(crate) fn digest_valid(value: &str, length: usize) -> bool {
     value.len() == length
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn relative(value: &str) -> Result<PathBuf, String> {
+pub(crate) fn relative(value: &str) -> Result<PathBuf, String> {
     if value.is_empty() || value.len() > 4096 || value.contains(['\\', ':']) {
         return Err("runtime_path_invalid".into());
     }
@@ -228,52 +228,56 @@ impl VerifiedRuntime {
         &self.manifest.source_revision
     }
     fn check_files(&self) -> Result<(), String> {
-        absolute_directory(&self.root)?;
-        let mut folded = BTreeSet::new();
-        let mut total = 0u64;
-        for (name, artifact) in &self.manifest.files {
-            relative(name)?;
-            total = total
-                .checked_add(artifact.bytes)
-                .ok_or("runtime_size_invalid")?;
-            if !folded.insert(name.to_lowercase())
-                || !digest_valid(&artifact.sha256, 64)
-                || artifact.bytes > 16 * 1024 * 1024 * 1024
-                || total > 64 * 1024 * 1024 * 1024
-            {
-                return Err("runtime_artifact_invalid".into());
-            }
-        }
-        if inventory(&self.root)? != self.manifest.files.keys().cloned().collect() {
-            return Err("runtime_inventory_mismatch".into());
-        }
-        for (name, artifact) in &self.manifest.files {
-            let path = self.root.join(relative(name)?);
-            let meta = no_link(&path)?;
-            if !meta.is_file() || meta.len() != artifact.bytes {
-                return Err("runtime_artifact_changed".into());
-            }
-            let mut file = File::open(path).map_err(|_| "runtime_file_unavailable")?;
-            let mut hasher = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            let mut read = 0;
-            loop {
-                let count = file.read(&mut buffer).map_err(|_| "runtime_read_failed")?;
-                if count == 0 {
-                    break;
-                }
-                read += count as u64;
-                if read > artifact.bytes {
-                    return Err("runtime_artifact_changed".into());
-                }
-                hasher.update(&buffer[..count]);
-            }
-            if read != artifact.bytes || format!("{:x}", hasher.finalize()) != artifact.sha256 {
-                return Err("runtime_artifact_changed".into());
-            }
-        }
-        Ok(())
+        verify_files(&self.root, &self.manifest.files)
     }
+}
+
+pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> Result<(), String> {
+    absolute_directory(root)?;
+    let mut folded = BTreeSet::new();
+    let mut total = 0u64;
+    for (name, artifact) in files {
+        relative(name)?;
+        total = total
+            .checked_add(artifact.bytes)
+            .ok_or("runtime_size_invalid")?;
+        if !folded.insert(name.to_lowercase())
+            || !digest_valid(&artifact.sha256, 64)
+            || artifact.bytes > 16 * 1024 * 1024 * 1024
+            || total > 64 * 1024 * 1024 * 1024
+        {
+            return Err("runtime_artifact_invalid".into());
+        }
+    }
+    if inventory(root)? != files.keys().cloned().collect() {
+        return Err("runtime_inventory_mismatch".into());
+    }
+    for (name, artifact) in files {
+        let path = root.join(relative(name)?);
+        let meta = no_link(&path)?;
+        if !meta.is_file() || meta.len() != artifact.bytes {
+            return Err("runtime_artifact_changed".into());
+        }
+        let mut file = File::open(path).map_err(|_| "runtime_file_unavailable")?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        let mut read = 0;
+        loop {
+            let count = file.read(&mut buffer).map_err(|_| "runtime_read_failed")?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            if read > artifact.bytes {
+                return Err("runtime_artifact_changed".into());
+            }
+            hasher.update(&buffer[..count]);
+        }
+        if read != artifact.bytes || format!("{:x}", hasher.finalize()) != artifact.sha256 {
+            return Err("runtime_artifact_changed".into());
+        }
+    }
+    Ok(())
 }
 
 const START: &[u8] = b"frameleaf-native-start\n";

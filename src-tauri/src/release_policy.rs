@@ -61,6 +61,15 @@ pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
     let (floor, keys) = parse_policy(POLICY)?;
     RuntimeStore::new(root, keys, floor)
 }
+
+pub fn verify_host_runtime(
+    root: &Path,
+    manifest: &[u8],
+    signature: &[u8; 64],
+) -> Result<crate::host_runtime::VerifiedHostRuntime, String> {
+    let (floor, keys) = parse_policy(POLICY)?;
+    crate::host_runtime::VerifiedHostRuntime::verify(root, manifest, signature, &keys, floor)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
