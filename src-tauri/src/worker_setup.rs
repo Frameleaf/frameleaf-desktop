@@ -168,32 +168,88 @@ async fn resource_loss(required_memory: u64) -> String {
         }
     }
 }
-async fn preparation_interrupt<F: Future<Output = Result<(), String>>>(
-    required_memory: u64,
+async fn maintained<T, F: Future<Output = Result<(), String>>>(
+    work: impl Future<Output = Result<T, String>>,
+    interrupt: impl Future<Output = String>,
     mut maintain: impl FnMut() -> F,
-) -> String {
-    tokio::select! {
-        reason = resource_loss(required_memory) => format!("resource_{reason}"),
-        reason = async {
-            loop {
-                if let Err(reason) = maintain().await { return reason; }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-        } => reason,
+    cancelled: &AtomicBool,
+) -> Result<T, String> {
+    tokio::pin!(work, interrupt);
+    loop {
+        check_cancel(cancelled)?;
+        // A renewal can rotate the server token; finish saving it even if work or sign-out completes.
+        maintain().await?;
+        check_cancel(cancelled)?;
+        let completed = cancellable(
+            async {
+                Ok(tokio::select! {
+                    biased;
+                    result = &mut work => Some(result),
+                    reason = &mut interrupt => Some(Err(reason)),
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => None,
+                })
+            },
+            cancelled,
+        )
+        .await?;
+        if let Some(result) = completed {
+            return result;
+        }
     }
 }
-async fn monitored_preparation<T: Send + 'static>(
+async fn download_network_loss<F: Future<Output = Option<bool>>>(mut sample: impl FnMut() -> F) {
+    loop {
+        if sample().await != Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+async fn acquisition<T, F: Future<Output = Result<(), String>>>(
+    work: impl Future<Output = Result<T, String>>,
+    explicit_permission: bool,
+    maintain: impl FnMut() -> F,
+    network_loss: impl Future<Output = ()>,
+    cancelled: &AtomicBool,
+) -> Result<T, String> {
+    maintained(
+        work,
+        async {
+            if explicit_permission {
+                std::future::pending::<()>().await;
+            }
+            network_loss.await;
+            "model_download_permission_required".into()
+        },
+        maintain,
+        cancelled,
+    )
+    .await
+}
+async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), String>>>(
     work: impl FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
     interrupt: impl Future<Output = String>,
+    maintain: impl FnMut() -> F,
     cancelled: &AtomicBool,
 ) -> Result<(T, Option<String>), String> {
     check_cancel(cancelled)?;
     let stop = Arc::new(AtomicBool::new(false));
     let request = stop.clone();
     let mut task = tauri::async_runtime::spawn_blocking(move || work(request));
-    let reason = tokio::select! {
-        result = &mut task => return result.map(|value| (value, None)).map_err(|_| "runtime_qualification_failed".into()),
-        reason = cancellable(async { Ok(interrupt.await) }, cancelled) => Some(reason.unwrap_or_else(|error| error)),
+    let reason = match maintained(
+        async { Ok((&mut task).await) },
+        interrupt,
+        maintain,
+        cancelled,
+    )
+    .await
+    {
+        Ok(result) => {
+            return result
+                .map(|value| (value, None))
+                .map_err(|_| "runtime_qualification_failed".into())
+        }
+        Err(reason) => Some(reason),
     };
     stop.store(true, Ordering::Release);
     // Dropping a blocking task leaves it running; join before resuming or signing out.
@@ -311,18 +367,27 @@ async fn prepare(
     let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
         .await
         .map_err(|_| "resource_status_unavailable")?;
-    let allow_download = allow_download || network.unmetered == Some(true);
+    let explicit_permission = allow_download;
+    let allow_download = explicit_permission || network.unmetered == Some(true);
     progress.set("preparing-models", None);
     // Complete acquisition before requesting short-lived nonces.
     let mut caches = Vec::new();
     for profile in &profiles {
-        let cache = cancellable(
+        let cache = acquisition(
             profile.prepare_cache(
                 &paths.data.join("models"),
                 &client,
                 &progress.cancelled,
                 allow_download,
             ),
+            explicit_permission,
+            || worker.maintain_session(),
+            download_network_loss(|| async {
+                tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                    .await
+                    .ok()
+                    .and_then(|status| status.unmetered)
+            }),
             &progress.cancelled,
         )
         .await?;
@@ -366,7 +431,8 @@ async fn prepare(
                     let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
                     (installed, qualified)
                 },
-                preparation_interrupt(profile.minimum_memory(), || worker.maintain_session()),
+                async { format!("resource_{}", resource_loss(profile.minimum_memory()).await) },
+                || worker.maintain_session(),
                 &progress.cancelled,
             )
             .await?;
@@ -492,6 +558,192 @@ mod tests {
     use super::*;
     use std::time::Duration;
     #[tokio::test]
+    async fn completed_acquisition_waits_for_inflight_token_rotation_checkpoint() {
+        for sign_out in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let request = cancelled.clone();
+            let (entered_tx, entered) = tokio::sync::oneshot::channel();
+            let (work_tx, work) = tokio::sync::oneshot::channel();
+            let (release_tx, release) = tokio::sync::oneshot::channel();
+            let saved = Arc::new(AtomicBool::new(false));
+            let checkpoint = saved.clone();
+            let task = tokio::spawn(async move {
+                let mut entered_tx = Some(entered_tx);
+                let mut release = Some(release);
+                acquisition(
+                    async {
+                        work.await.unwrap();
+                        Ok(42)
+                    },
+                    false,
+                    || {
+                        let entered_tx = entered_tx.take().unwrap();
+                        let release = release.take().unwrap();
+                        let checkpoint = checkpoint.clone();
+                        async move {
+                            entered_tx.send(()).unwrap();
+                            release.await.unwrap();
+                            checkpoint.store(true, Ordering::Release);
+                            Ok(())
+                        }
+                    },
+                    std::future::pending(),
+                    &cancelled,
+                )
+                .await
+            });
+            entered.await.unwrap();
+            work_tx.send(()).unwrap();
+            if sign_out {
+                request.store(true, Ordering::Release);
+            }
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "finishing a download must not discard an in-flight token rotation"
+            );
+            release_tx.send(()).unwrap();
+            let result = task.await.unwrap();
+            if sign_out {
+                assert_eq!(result.unwrap_err(), "worker_setup_cancelled");
+            } else {
+                assert_eq!(result.unwrap(), 42);
+            }
+            assert!(saved.load(Ordering::Acquire));
+        }
+    }
+    #[tokio::test]
+    async fn interrupted_http_acquisition_removes_partial_weights() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-acquire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("model.onnx");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model", listener.local_addr().unwrap());
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nwei")
+                .unwrap();
+            started_tx.send(()).unwrap();
+            let _ = stop.recv_timeout(Duration::from_secs(10));
+        });
+        let client = crate::transport::client().unwrap();
+        let cancel = AtomicBool::new(false);
+        let result = acquisition(
+            crate::model_cache::acquire_file(
+                &client,
+                &url,
+                &path,
+                7,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                &cancel,
+            ),
+            false,
+            || async { Ok(()) },
+            async {
+                started.await.unwrap();
+                let samples = std::sync::atomic::AtomicUsize::new(0);
+                download_network_loss(|| {
+                    let unmetered = samples.fetch_add(1, Ordering::AcqRel) == 0;
+                    async move { Some(unmetered) }
+                })
+                .await;
+                assert_eq!(samples.load(Ordering::Acquire), 2);
+            },
+            &cancel,
+        )
+        .await;
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        let files = std::fs::read_dir(&root).unwrap().count();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap_err(), "model_download_permission_required");
+        assert_eq!(
+            files, 0,
+            "interrupted model must not leave partial or published weights"
+        );
+    }
+    #[tokio::test]
+    async fn explicit_download_permission_does_not_bypass_worker_revocation() {
+        let result: Result<(), String> = acquisition(
+            std::future::pending(),
+            true,
+            || async { Err("worker_session_revoked".into()) },
+            async {},
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "worker_session_revoked");
+        assert_eq!(
+            acquisition(
+                async { Ok(42) },
+                true,
+                || async { Ok(()) },
+                async {},
+                &AtomicBool::new(false)
+            )
+            .await
+            .unwrap(),
+            42
+        );
+    }
+    #[tokio::test]
+    async fn verified_cached_weights_do_not_require_network_permission() {
+        use sha2::{Digest, Sha256};
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-offline-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("model.onnx");
+        std::fs::write(&path, b"weights").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"weights"));
+        let cancel = AtomicBool::new(false);
+        let client = crate::transport::client().unwrap();
+        let result = acquisition(
+            crate::model_cache::acquire_file(
+                &client,
+                "http://127.0.0.1:1",
+                &path,
+                7,
+                &hash,
+                &cancel,
+            ),
+            false,
+            || async { Ok(()) },
+            async {},
+            &cancel,
+        )
+        .await;
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+    #[tokio::test]
+    async fn automatic_download_waits_for_permission_on_unknown_or_metered_network() {
+        for state in [None, Some(false)] {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                download_network_loss(|| async { state }),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    #[tokio::test]
     async fn interrupted_preparation_is_joined_before_returning_owned_runtime() {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cleaned = Arc::new(AtomicBool::new(false));
@@ -510,6 +762,7 @@ mod tests {
                 rx.await.unwrap();
                 "resource_on_battery".into()
             },
+            || async { Ok(()) },
             &cancelled,
         )
         .await
@@ -538,6 +791,7 @@ mod tests {
                 proof.store(true, Ordering::Release);
             },
             std::future::pending(),
+            || async { Ok(()) },
             &cancelled,
         )
         .await
@@ -549,7 +803,14 @@ mod tests {
     #[tokio::test]
     async fn preparation_maintenance_failure_interrupts_work() {
         assert_eq!(
-            preparation_interrupt(0, || async { Err("worker_session_revoked".into()) }).await,
+            maintained::<(), _>(
+                std::future::pending(),
+                std::future::pending(),
+                || async { Err("worker_session_revoked".into()) },
+                &AtomicBool::new(false)
+            )
+            .await
+            .unwrap_err(),
             "worker_session_revoked"
         );
     }
