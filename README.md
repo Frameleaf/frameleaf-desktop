@@ -265,8 +265,24 @@ A staged copy survives source eviction; changed bytes, journal tampering or a di
 account/server/device are refused.
 
 This engine is not exposed through UI commands yet. Persistent consent storage and
-revocation, whole-run capacity/network budgets, durable item dispositions, resumable
+revocation, whole-run capacity/network budgets, durable item dispositions, application
 NAS upload integration, source provenance and healthy managed-copy reconciliation
 remain required before the app can offer copy imports. A verified local stage is not
 a completed Frameleaf import or an external-reference grant. Real OneDrive hydration
 and installed Windows/Linux file behavior remain unqualified.
+
+### Resumable source transfer
+
+The internal native uploader consumes signed staged originals through the existing
+NAS resumable-upload API. It checks the live server identity and photo account
+before sharing filenames or bytes, negotiates current size limits, and creates an
+empty resource before requesting a durable signed journal checkpoint. Restarts use
+HEAD offsets on that same resource. Appends are bounded to 1 MiB, preserve source
+filesystem dates, send a whole-file SHA-256 digest, and support request cancellation.
+Redirects and foreign, ambiguous or noncanonical resource locations are refused.
+
+A matching ingestion response is not proof of a healthy independent managed copy.
+The folder-source provenance/receipt contract, persistent consent and journal store,
+job lifecycle and UI remain to be connected before imports can be offered. Protocol
+fixtures exercise real loopback HTTP requests with synthetic media; actual NAS HTTPS
+transfer and installed-device acceptance remain unqualified.

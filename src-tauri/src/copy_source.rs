@@ -387,6 +387,13 @@ impl Drop for Partial {
     }
 }
 impl StagedCopy {
+    pub(crate) fn filename(&self) -> Result<&str, String> {
+        relative_path(&self.relative)?
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "source_item_invalid".into())
+    }
+
     pub fn restore(
         saved: &SavedConnection,
         identity: &DeviceIdentity,
