@@ -152,13 +152,26 @@ impl WorkerSetup {
         allow_download: bool,
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
     ) {
-        self.start_work(notify, move |progress| {
-            prepare(saved, paths, allow_download, progress)
+        self.start_work(notify, move |progress| async move {
+            reconnect(&progress, |refresh| {
+                let saved = saved.clone();
+                let paths = paths.clone();
+                let progress = progress.clone();
+                async move {
+                    if refresh {
+                        refresh_session(&saved).await?;
+                        check_cancel(&progress.cancelled)?;
+                    }
+                    prepare(saved, paths, allow_download, progress).await
+                }
+            })
+            .await
         })
         .await;
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SetupPaths {
     pub data: PathBuf,
     pub bundle: PathBuf,
@@ -219,9 +232,103 @@ async fn wait_for_capacity<F: Future<Output = Result<(), String>>>(
         .await?;
     }
 }
-async fn resource_loss(required_memory: u64) -> String {
+fn wake_gap(previous: std::time::SystemTime, current: std::time::SystemTime) -> bool {
+    current
+        .duration_since(previous)
+        .map_or(true, |gap| gap > Duration::from_secs(30))
+}
+#[derive(Clone)]
+struct WakeClock(Arc<Mutex<std::time::SystemTime>>);
+impl WakeClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(std::time::SystemTime::now())))
+    }
+    fn observe(&self, current: std::time::SystemTime) -> bool {
+        let mut previous = self.0.lock().unwrap();
+        let resumed = wake_gap(*previous, current);
+        *previous = current;
+        resumed
+    }
+}
+fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
+    let base = (1u64 << attempt.min(5)).min(30) * 1000;
+    Duration::from_millis(base + entropy % (base + 1))
+}
+fn retryable(error: &str) -> bool {
+    matches!(
+        error,
+        "worker_request_interrupted"
+            | "server_response_interrupted"
+            | "server_unreachable_or_certificate_invalid"
+            | "worker_session_setup_interrupted"
+            | "model_download_unavailable"
+            | "model_download_interrupted"
+            | "worker_session_renewal_required"
+            | "worker_lease_expired"
+            | "worker_lease_lost"
+            | "worker_execution_deadline"
+            | "runtime_process_stopped"
+            | "runtime_not_ready"
+            | "runtime_prediction_interrupted"
+            | "server_http_408"
+            | "server_http_429"
+            | "server_http_502"
+            | "server_http_503"
+            | "server_http_504"
+    )
+}
+async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String>>>(
+    progress: &Progress,
+    mut attempt: F,
+) -> Result<(), String> {
+    let mut retries = 0u32;
+    let mut refresh = false;
+    loop {
+        wait_for_user(progress, || async { Ok(()) }).await?;
+        let error = match attempt(refresh).await {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable(&error) => error,
+            Err(error) => return Err(error),
+        };
+        check_cancel(&progress.cancelled)?;
+        if matches!(
+            progress.status.lock().unwrap().state.as_str(),
+            "working" | "waiting-for-work"
+        ) {
+            retries = 0;
+        }
+        progress.set("reconnecting", Some(error));
+        let delay = reconnect_delay(retries, rand::random());
+        retries = retries.saturating_add(1);
+        refresh = true;
+        cancellable(
+            async {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            },
+            &progress.cancelled,
+        )
+        .await?;
+    }
+}
+async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
+    let client = crate::transport::client()?;
+    let capabilities = crate::transport::capabilities(&client, saved)
+        .await?
+        .ok_or("desktop_protocol_unsupported")?;
+    if !capabilities.features.worker_session {
+        return Err("desktop_worker_session_unavailable".into());
+    }
+    // Issue rechecks the existing device and photo session; recovery must never re-enroll a revoked device.
+    let worker = crate::transport::issue_worker_session(&client, saved).await?;
+    crate::credentials::save("worker-session", &worker)
+}
+async fn resource_loss(required_memory: u64, clock: &WakeClock) -> String {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
+        if clock.observe(std::time::SystemTime::now()) {
+            return "system_resumed".into();
+        }
         match tauri::async_runtime::spawn_blocking(crate::resource_policy::sample).await {
             Ok(status) => {
                 if let Some(reason) = status.refusal(required_memory) {
@@ -491,18 +598,28 @@ async fn prepare(
             let spec = challenge.specification().to_vec();
             let fixture = challenge.fixture().to_vec();
             let scratch = paths.data.join("scratch");
+            let clock = WakeClock::new();
             let ((runtime, qualified), interrupted) = monitored_preparation(
                 move |cancel| {
                     let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
                     (installed, qualified)
                 },
-                async { format!("resource_{}", resource_loss(profile.minimum_memory()).await) },
+                async {
+                    format!(
+                        "resource_{}",
+                        resource_loss(profile.minimum_memory(), &clock).await
+                    )
+                },
                 || worker.maintain_session(),
                 &progress.cancelled,
             )
             .await?;
             installed = runtime;
             check_cancel(&progress.cancelled)?;
+            if clock.observe(std::time::SystemTime::now()) {
+                progress.set("paused", Some("system_resumed".into()));
+                continue 'qualification;
+            }
             if let Some(reason) = interrupted {
                 if let Some(reason) = reason.strip_prefix("resource_") {
                     progress.set("paused", Some(reason.into()));
@@ -564,6 +681,7 @@ async fn prepare(
             prepared = proofs;
             check_cancel(&progress.cancelled)?;
             let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+            let clock = WakeClock::new();
             loop {
                 worker.maintain_session().await?;
                 let resources =
@@ -571,6 +689,11 @@ async fn prepare(
                         .await
                         .map_err(|_| "resource_status_unavailable")?;
                 check_cancel(&progress.cancelled)?;
+                if clock.observe(std::time::SystemTime::now()) {
+                    predictor.stop()?;
+                    progress.set("paused", Some("system_resumed".into()));
+                    continue 'qualification;
+                }
                 if progress.user_paused.load(Ordering::Acquire) {
                     predictor.stop()?;
                     progress.set("paused", Some("user_paused".into()));
@@ -594,7 +717,7 @@ async fn prepare(
                 let completed = cancellable(async {
                     tokio::select! {
                         biased;
-                        reason = resource_loss(required_memory) => Err(format!("resource_{reason}")),
+                        reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
                         result = predictor.execute_next_many(&worker, &accepted, &mut cancel) => result,
                     }
                 }, &progress.cancelled).await;
@@ -614,6 +737,9 @@ async fn prepare(
                     Err(reason) if reason.starts_with("resource_") => {
                         predictor.stop()?;
                         progress.set("paused", Some(reason[9..].into()));
+                        if reason == "resource_system_resumed" {
+                            continue 'qualification;
+                        }
                         break;
                     }
                     Err(reason) => return Err(reason),
@@ -627,6 +753,162 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn reconnect_retries_a_dropped_http_connection_and_requires_reauthorization() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                if attempt == 1 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        let progress = Progress {
+            user_paused: Arc::default(),
+            cancelled: Arc::default(),
+            status: Arc::default(),
+            notify: Arc::new(|_| {}),
+        };
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let client = crate::transport::client().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reconnect(&progress, |refresh| {
+                let number = attempts.fetch_add(1, Ordering::AcqRel);
+                assert_eq!(refresh, number != 0);
+                let request = client.get(&url);
+                async move {
+                    request
+                        .send()
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| "worker_request_interrupted".into())
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+    #[tokio::test]
+    async fn authorization_identity_and_binding_failures_are_not_retried() {
+        let progress = Progress {
+            user_paused: Arc::default(),
+            cancelled: Arc::default(),
+            status: Arc::default(),
+            notify: Arc::new(|_| {}),
+        };
+        for error in [
+            "server_http_401",
+            "server_http_403",
+            "server_identity_changed",
+            "account_identity_changed",
+            "worker_association_changed",
+            "worker_qualification_refused",
+            "runtime_signature_invalid",
+            "server_model_not_supported",
+        ] {
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            let result = reconnect(&progress, |_| {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                async { Err(error.into()) }
+            })
+            .await;
+            assert_eq!(result.unwrap_err(), error);
+            assert_eq!(attempts.load(Ordering::Acquire), 1);
+        }
+    }
+    #[tokio::test]
+    async fn stopping_reconnect_backoff_prevents_late_attempts() {
+        let setup = WorkerSetup::default();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = count.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |value| {
+                    let _ = tx.send(value);
+                }),
+                move |progress| async move {
+                    reconnect(&progress, |_| {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        async { Err("worker_request_interrupted".into()) }
+                    })
+                    .await
+                },
+            )
+            .await;
+        assert_eq!(rx.recv().await.unwrap().state, "reconnecting");
+        setup.stop().await;
+        assert_eq!(count.load(Ordering::Acquire), 1);
+    }
+    #[tokio::test]
+    async fn pausing_reconnect_prevents_reauthorization_after_backoff() {
+        let setup = WorkerSetup::default();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = count.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |value| {
+                    let _ = tx.send(value);
+                }),
+                move |progress| async move {
+                    reconnect(&progress, |_| {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        async { Err("worker_request_interrupted".into()) }
+                    })
+                    .await
+                },
+            )
+            .await;
+        assert_eq!(rx.recv().await.unwrap().state, "reconnecting");
+        setup.pause();
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        setup.stop().await;
+        assert_eq!(count.load(Ordering::Acquire), 1);
+    }
+    #[test]
+    fn wake_observation_survives_completed_futures_and_is_shared_with_the_claim_gate() {
+        let clock = WakeClock::new();
+        let gate = clock.clone();
+        let before = *clock.0.lock().unwrap();
+        assert!(!clock.observe(before + Duration::from_secs(5)));
+        assert!(!gate.observe(before + Duration::from_secs(10)));
+        assert!(gate.observe(before + Duration::from_secs(41)));
+        assert!(!clock.observe(before + Duration::from_secs(46)));
+    }
+    #[test]
+    fn reconnect_backoff_is_jittered_bounded_and_wake_gaps_invalidate_work() {
+        for attempt in [0, 1, 4, 5, 20, u32::MAX] {
+            let a = reconnect_delay(attempt, 0);
+            let b = reconnect_delay(attempt, u64::MAX);
+            assert!(a >= Duration::from_secs(1) && b >= Duration::from_secs(1));
+            assert!(a <= Duration::from_secs(60) && b <= Duration::from_secs(60));
+            assert_ne!(a, b);
+        }
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1000);
+        assert!(!wake_gap(now, now + Duration::from_secs(5)));
+        assert!(wake_gap(now, now + Duration::from_secs(31)));
+        assert!(wake_gap(now, now - Duration::from_secs(1)));
+    }
     #[tokio::test]
     async fn user_pause_drains_current_work_and_prevents_the_next_task() {
         let setup = WorkerSetup::default();

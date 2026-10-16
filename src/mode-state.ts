@@ -11,6 +11,7 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
   if (state === 'starting-worker') return 'Starting this computer’s AI worker';
   if (state === 'working') return 'Checking for AI work';
   if (state === 'waiting-for-work') return 'Waiting for AI work';
+  if (state === 'reconnecting') return 'Reconnecting to your server';
   if (state === 'pausing') return 'Finishing the current task';
   if (state === 'stopped') return 'AI processing stopped';
   if (state === 'paused') return 'AI processing paused';

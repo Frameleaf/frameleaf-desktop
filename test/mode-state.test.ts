@@ -42,3 +42,8 @@ test('user drain and immediate stop remain visible without claiming processing',
   assert.equal(workerStatus({ state: 'pausing', workerSupported: false }), 'Finishing the current task');
   assert.equal(workerStatus({ state: 'stopped', workerSupported: false }), 'AI processing stopped');
 });
+
+
+test('reconnection is visible without claiming current inference or acceleration', () => {
+  assert.equal(workerStatus({ state: 'reconnecting', workerSupported: false }), 'Reconnecting to your server');
+});
