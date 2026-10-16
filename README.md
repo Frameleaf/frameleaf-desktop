@@ -175,3 +175,14 @@ NAS policy, default route, full OCR configuration, source and job authority are 
 input disclosure and result publication. Automatic setup combines verified model snapshots
 for one runtime and budgets the distinct model groups together. Other OCR models/options
 require their own approved qualification profile.
+
+Automatic preparation reads a narrow installation-signed model inventory, without
+requesting administrator settings. The inventory is advisory: qualification and
+live NAS policy, route and source checks still grant processing authority. Pinned
+and legacy routes stay on their chosen destinations. Unsupported models and
+unavailable NAS producers appear separately for each workload; eligible workloads
+can continue. Smart search requires its complete three-role qualification group.
+Credential failures, runtime tampering and interrupted connections stop preparation
+or enter the existing reconnect path. Desktop enrollment still requires an
+administrator session in this candidate; policy-permitted member enrollment remains
+an implementation gate.

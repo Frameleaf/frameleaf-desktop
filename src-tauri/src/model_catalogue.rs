@@ -590,6 +590,41 @@ pub(crate) fn setup_profiles(
         .collect())
 }
 
+pub(crate) fn inventory_group(
+    workload: &str,
+    keys: &[String],
+    source: &str,
+    provider: &str,
+) -> Result<Vec<ApprovedProfile>, String> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let profiles: Vec<_> = parse_catalogue(DATA)?
+        .into_iter()
+        .filter(|profile| {
+            profile.workload == workload
+                && keys.contains(&profile.model_key)
+                && profile.runtime_source_revision == source
+                && profile.spec["provider"] == provider
+        })
+        .map(ApprovedProfile)
+        .collect();
+    if profiles.len() != keys.len() {
+        return Ok(Vec::new());
+    }
+    if workload == "clip" {
+        let expected = setup_profiles(&profiles[0].0.model_name, source, provider)?;
+        if expected.len() != 3
+            || expected
+                .iter()
+                .any(|profile| !keys.iter().any(|key| key == profile.model_key()))
+        {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(profiles)
+}
+
 pub(crate) fn shared_cache(
     profiles: &[ApprovedProfile],
     caches: &[std::path::PathBuf],

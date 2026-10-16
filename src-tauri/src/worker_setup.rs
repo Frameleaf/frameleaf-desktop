@@ -16,6 +16,15 @@ pub(crate) struct SetupStatus {
     pub state: String,
     pub code: Option<String>,
     pub control: crate::worker_control::WorkerControl,
+    pub workloads: Vec<WorkloadStatus>,
+}
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkloadStatus {
+    pub workload: String,
+    pub state: String,
+    pub model_names: Vec<String>,
+    pub code: Option<String>,
 }
 #[derive(Clone)]
 struct Progress {
@@ -29,6 +38,7 @@ impl Progress {
         if self.cancelled.load(Ordering::Acquire) {
             return;
         }
+        let mut current = self.status.lock().unwrap();
         let status = SetupStatus {
             state: state.into(),
             code,
@@ -37,14 +47,32 @@ impl Progress {
             } else {
                 crate::worker_control::WorkerControl::Running
             },
+            workloads: current.workloads.clone(),
         };
-        let mut current = self.status.lock().unwrap();
         if *current == status {
             return;
         }
         *current = status.clone();
         drop(current);
         (self.notify)(status);
+    }
+    fn workloads(&self, workloads: Vec<WorkloadStatus>) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let mut status = self.status.lock().unwrap();
+        status.workloads = workloads;
+        let snapshot = status.clone();
+        drop(status);
+        (self.notify)(snapshot);
+    }
+    fn workload(&self, workload: &str, state: &str, code: Option<String>) {
+        let mut statuses = self.status.lock().unwrap().workloads.clone();
+        if let Some(item) = statuses.iter_mut().find(|item| item.workload == workload) {
+            item.state = state.into();
+            item.code = code;
+        }
+        self.workloads(statuses);
     }
 }
 struct Running {
@@ -91,6 +119,7 @@ impl WorkerSetup {
             .into(),
             code: None,
             control,
+            workloads: Vec::new(),
         };
         *self.status.lock().unwrap() = status.clone();
         status
@@ -427,85 +456,112 @@ async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), 
     let value = task.await.map_err(|_| "runtime_qualification_failed")?;
     Ok((value, reason))
 }
-fn selected_profiles(
-    config: &serde_json::Value,
+pub(crate) fn inventory_profiles(
+    value: &serde_json::Value,
     source: &str,
     provider: &str,
-) -> Result<Vec<crate::model_catalogue::ApprovedProfile>, String> {
+) -> Result<
+    (
+        Vec<Vec<crate::model_catalogue::ApprovedProfile>>,
+        Vec<WorkloadStatus>,
+    ),
+    String,
+> {
     use serde::Deserialize;
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Config {
-        machine_learning: Ml,
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Inventory {
+        protocol_version: u32,
+        provider: String,
+        runtime_source_revision: String,
+        workloads: Vec<Entry>,
     }
     #[derive(Deserialize)]
-    struct Ml {
-        enabled: bool,
-        clip: Clip,
-        ocr: Option<Ocr>,
-        #[serde(rename = "facialRecognition")]
-        face: Option<Face>,
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Entry {
+        workload: String,
+        state: String,
+        model_names: Vec<String>,
+        model_keys: Vec<String>,
     }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Clip {
-        enabled: bool,
-        model_name: String,
+    let invalid = || "worker_model_inventory_invalid".to_string();
+    let inventory: Inventory = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+    if inventory.protocol_version != 1
+        || inventory.provider != provider
+        || inventory.runtime_source_revision != source
+        || inventory.workloads.len() != 4
+    {
+        return Err(invalid());
     }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Ocr {
-        enabled: bool,
-        model_name: String,
-        min_detection_score: f64,
-        min_recognition_score: f64,
-        max_resolution: u64,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Face {
-        enabled: bool,
-        model_name: String,
-        min_score: f64,
-    }
-    let config: Config =
-        serde_json::from_value(config.clone()).map_err(|_| "server_model_configuration_invalid")?;
-    if !config.machine_learning.enabled {
-        return Err("server_model_disabled".into());
-    }
-    let mut profiles = Vec::new();
-    let clip = config.machine_learning.clip;
-    if clip.enabled {
-        let selected = crate::model_catalogue::setup_profiles(&clip.model_name, source, provider)?;
-        if selected.is_empty() {
-            return Err("server_model_not_supported".into());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut groups = Vec::new();
+    let mut statuses = Vec::new();
+    for entry in inventory.workloads {
+        if !["clip", "ocr", "face", "enrichment"].contains(&entry.workload.as_str())
+            || !seen.insert(entry.workload.clone())
+            || ![
+                "eligible",
+                "disabled",
+                "pinned",
+                "legacy",
+                "unavailable",
+                "unsupported",
+            ]
+            .contains(&entry.state.as_str())
+            || entry.model_names.len() > 8
+            || entry
+                .model_names
+                .iter()
+                .any(|name| name.is_empty() || name.len() > 2048)
+        {
+            return Err(invalid());
         }
-        profiles.extend(selected);
+        let mut state = entry.state;
+        if state == "eligible" {
+            let expected = match entry.workload.as_str() {
+                "clip" => 3,
+                "ocr" | "face" => 1,
+                _ => return Err(invalid()),
+            };
+            if entry.model_keys.len() != expected
+                || entry
+                    .model_keys
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != expected
+                || entry.model_keys.iter().any(|key| {
+                    !key.starts_with(&(entry.workload.clone() + ":"))
+                        || key.len() != entry.workload.len() + 65
+                        || !key[entry.workload.len() + 1..]
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            {
+                return Err(invalid());
+            }
+            let profiles = crate::model_catalogue::inventory_group(
+                &entry.workload,
+                &entry.model_keys,
+                source,
+                provider,
+            )?;
+            if profiles.is_empty() {
+                state = "unsupported".into();
+            } else {
+                groups.push(profiles);
+            }
+        } else if !entry.model_keys.is_empty() {
+            return Err(invalid());
+        }
+        statuses.push(WorkloadStatus {
+            workload: entry.workload,
+            state,
+            model_names: entry.model_names,
+            code: None,
+        });
     }
-    if let Some(ocr) = config.machine_learning.ocr.filter(|ocr| ocr.enabled) {
-        let entries = serde_json::json!({"ocr": {
-            "detection": {"modelName": ocr.model_name, "options": {"minScore": ocr.min_detection_score, "maxResolution": ocr.max_resolution}},
-            "recognition": {"modelName": ocr.model_name, "options": {"minScore": ocr.min_recognition_score}}
-        }});
-        profiles.push(
-            crate::model_catalogue::approved_profile(&ocr.model_name, &entries, source, provider)?
-                .ok_or("server_model_not_supported")?,
-        );
-    }
-    if let Some(face) = config.machine_learning.face.filter(|face| face.enabled) {
-        let entries = serde_json::json!({"facial-recognition":{
-            "detection":{"modelName":face.model_name,"options":{"minScore":face.min_score}},
-            "recognition":{"modelName":face.model_name}
-        }});
-        profiles.push(
-            crate::model_catalogue::approved_profile(&face.model_name, &entries, source, provider)?
-                .ok_or("server_model_not_supported")?,
-        );
-    }
-    if profiles.is_empty() {
-        return Err("server_model_disabled".into());
-    }
-    Ok(profiles)
+    Ok((groups, statuses))
 }
 
 async fn prepare(
@@ -569,25 +625,22 @@ async fn prepare(
     if !caps.features.worker_session {
         return Err("desktop_worker_session_unavailable".into());
     }
-    let config: serde_json::Value = cancellable(
-        async {
-            let base = crate::connection::normalize_server(&saved.server)?;
-            let response = client
-                .get(
-                    base.join("api/system-config")
-                        .map_err(|_| "server_address_invalid")?,
-                )
-                .bearer_auth(&saved.token)
-                .send()
-                .await
-                .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-            transport::json_limit(response, 2 * 1024 * 1024).await
-        },
+    let worker = WorkerTransport::load(&saved)?;
+    let inventory = cancellable(
+        worker.model_inventory(installed.source_revision(), installed.provider()),
         &progress.cancelled,
     )
     .await?;
-    let profiles = selected_profiles(&config, installed.source_revision(), installed.provider())?;
-    let worker = WorkerTransport::load(&saved)?;
+    let (groups, statuses) = inventory_profiles(
+        &inventory,
+        installed.source_revision(),
+        installed.provider(),
+    )?;
+    progress.workloads(statuses);
+    if groups.is_empty() {
+        return Err("worker_no_eligible_workloads".into());
+    }
+    let profiles: Vec<_> = groups.iter().flatten().cloned().collect();
     let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
         .await
         .map_err(|_| "resource_status_unavailable")?;
@@ -618,88 +671,159 @@ async fn prepare(
         .await?;
         caches.push(cache);
     }
-    let selected = profiles.clone();
-    let prepared_caches = caches.clone();
-    let combined = paths.data.join("model-sets");
-    let cancelled = progress.cancelled.clone();
-    let cache = tauri::async_runtime::spawn_blocking(move || {
-        crate::model_catalogue::shared_cache(&selected, &prepared_caches, &combined, &cancelled)
-    })
-    .await
-    .map_err(|_| "worker_cache_publish_failed")??;
-    let mut memory_by_cache = std::collections::BTreeMap::new();
-    for (profile, cache) in profiles.iter().zip(&caches) {
-        let memory = memory_by_cache.entry(cache).or_insert(0u64);
-        *memory = (*memory).max(profile.minimum_memory());
-    }
-    let required_memory = memory_by_cache.values().sum();
     'qualification: loop {
         let mut prepared = Vec::new();
-        for (profile, cache) in profiles.iter().zip(caches.iter().cloned()) {
-            check_cancel(&progress.cancelled)?;
-            wait_for_capacity(profile.minimum_memory(), &progress, || {
-                worker.maintain_session()
-            })
-            .await?;
-            progress.set("qualifying", None);
-            let challenge = cancellable(
-                worker.request_qualification(
-                    profile,
-                    &attestation,
-                    &uuid::Uuid::new_v4().to_string(),
-                ),
-                &progress.cancelled,
-            )
-            .await?;
-            let spec = challenge.specification().to_vec();
-            let fixture = challenge.fixture().to_vec();
-            let scratch = paths.data.join("scratch");
-            let clock = WakeClock::new();
-            let ((runtime, qualified), interrupted) = monitored_preparation(
-                move |cancel| {
-                    let qualified = installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
-                    (installed, qualified)
-                },
-                async {
-                    format!(
-                        "resource_{}",
-                        resource_loss(profile.minimum_memory(), &clock).await
-                    )
-                },
-                || worker.maintain_session(),
-                &progress.cancelled,
-            )
-            .await?;
-            installed = runtime;
-            check_cancel(&progress.cancelled)?;
-            if clock.observe(std::time::SystemTime::now()) {
-                progress.set("paused", Some("system_resumed".into()));
-                continue 'qualification;
-            }
-            if let Some(reason) = interrupted {
-                if let Some(reason) = reason.strip_prefix("resource_") {
-                    progress.set("paused", Some(reason.into()));
+        let mut accepted_profiles = Vec::new();
+        let mut accepted_caches = Vec::new();
+        'workload: for group in &groups {
+            let workload = group[0]
+                .model_key()
+                .split(':')
+                .next()
+                .ok_or("worker_model_inventory_invalid")?;
+            progress.workload(workload, "qualifying", None);
+            let mut group_prepared = Vec::new();
+            let mut group_caches = Vec::new();
+            for profile in group {
+                let index = profiles
+                    .iter()
+                    .position(|item| item.model_key() == profile.model_key())
+                    .ok_or("worker_model_binding_invalid")?;
+                let cache = caches[index].clone();
+                group_caches.push(cache.clone());
+                check_cancel(&progress.cancelled)?;
+                wait_for_capacity(profile.minimum_memory(), &progress, || {
+                    worker.maintain_session()
+                })
+                .await?;
+                progress.set("qualifying", None);
+                let challenge = match cancellable(
+                    worker.request_qualification(
+                        profile,
+                        &attestation,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                    &progress.cancelled,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(code) if code.starts_with("workload_desktop_") => {
+                        progress.workload(workload, "unavailable", Some(code));
+                        continue 'workload;
+                    }
+                    Err(code) => return Err(code),
+                };
+                let spec = challenge.specification().to_vec();
+                let fixture = challenge.fixture().to_vec();
+                let scratch = paths.data.join("scratch");
+                let clock = WakeClock::new();
+                let ((runtime, qualified), interrupted) = monitored_preparation(
+                    move |cancel| {
+                        let qualified =
+                            installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
+                        (installed, qualified)
+                    },
+                    async {
+                        format!(
+                            "resource_{}",
+                            resource_loss(profile.minimum_memory(), &clock).await
+                        )
+                    },
+                    || worker.maintain_session(),
+                    &progress.cancelled,
+                )
+                .await?;
+                installed = runtime;
+                check_cancel(&progress.cancelled)?;
+                if clock.observe(std::time::SystemTime::now()) {
+                    progress.set("paused", Some("system_resumed".into()));
                     continue 'qualification;
                 }
-                return Err(reason);
+                if let Some(reason) = interrupted {
+                    if let Some(reason) = reason.strip_prefix("resource_") {
+                        progress.set("paused", Some(reason.into()));
+                        continue 'qualification;
+                    }
+                    return Err(reason);
+                }
+                let qualified = match qualified {
+                    Ok(value) => value,
+                    Err(code)
+                        if matches!(
+                            code.as_str(),
+                            "runtime_qualification_failed"
+                                | "runtime_qualification_timeout"
+                                | "runtime_qualification_report_invalid"
+                        ) =>
+                    {
+                        progress.workload(workload, "unavailable", Some(code));
+                        continue 'workload;
+                    }
+                    Err(code) => return Err(code),
+                };
+                match cancellable(
+                    worker.submit_qualification(&challenge, &qualified),
+                    &progress.cancelled,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        progress.workload(
+                            workload,
+                            "unavailable",
+                            Some("worker_qualification_refused".into()),
+                        );
+                        continue 'workload;
+                    }
+                    Err(code) if code.starts_with("workload_desktop_") => {
+                        progress.workload(workload, "unavailable", Some(code));
+                        continue 'workload;
+                    }
+                    Err(code) => return Err(code),
+                }
+                let accepted = match cancellable(
+                    worker.read_accepted_qualification(profile, &qualified, challenge.id()),
+                    &progress.cancelled,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(code) if code.starts_with("workload_desktop_") => {
+                        progress.workload(workload, "unavailable", Some(code));
+                        continue 'workload;
+                    }
+                    Err(code) => return Err(code),
+                };
+                group_prepared.push((qualified, accepted));
             }
-            let qualified = qualified?;
-            if !cancellable(
-                worker.submit_qualification(&challenge, &qualified),
-                &progress.cancelled,
-            )
-            .await?
-            {
-                return Err("worker_qualification_refused".into());
-            }
-            let accepted = cancellable(
-                worker.read_accepted_qualification(profile, &qualified, challenge.id()),
-                &progress.cancelled,
-            )
-            .await?;
-            prepared.push((qualified, accepted));
+            prepared.extend(group_prepared);
+            accepted_profiles.extend(group.iter().cloned());
+            accepted_caches.extend(group_caches);
+            progress.workload(workload, "ready", None);
         }
-
+        if prepared.is_empty() {
+            return Err("worker_no_eligible_workloads".into());
+        }
+        let mut memory_by_cache = std::collections::BTreeMap::new();
+        for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
+            let memory = memory_by_cache.entry(cache).or_insert(0u64);
+            *memory = (*memory).max(profile.minimum_memory());
+        }
+        let required_memory = memory_by_cache.values().sum();
+        let combined = paths.data.join("model-sets");
+        let cancelled = progress.cancelled.clone();
+        let cache = tauri::async_runtime::spawn_blocking(move || {
+            crate::model_catalogue::shared_cache(
+                &accepted_profiles,
+                &accepted_caches,
+                &combined,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| "worker_cache_publish_failed")??;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
@@ -810,46 +934,87 @@ mod tests {
     use super::*;
     use std::time::Duration;
     #[test]
-    fn selects_face_without_clip_or_a_model_substitution() {
-        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
-        let mut config = serde_json::json!({"machineLearning":{"enabled":true,
-            "clip":{"enabled":false,"modelName":"unused"},
-            "facialRecognition":{"enabled":true,"modelName":"buffalo_l","minScore":0.7}}});
-        let profiles = selected_profiles(&config, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert!(profiles[0].model_key().starts_with("face:"));
-        config["machineLearning"]["facialRecognition"]["minScore"] = serde_json::json!(0.8);
-        assert_eq!(
-            selected_profiles(&config, source, "CPUExecutionProvider")
-                .err()
-                .unwrap(),
-            "server_model_not_supported"
+    fn global_progress_preserves_independent_workload_results() {
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(SetupStatus::default())),
+            notify: Arc::new(|_| {}),
+        };
+        progress.workloads(vec![
+            WorkloadStatus {
+                workload: "ocr".into(),
+                state: "ready".into(),
+                model_names: vec!["PP-OCRv5_mobile".into()],
+                code: None,
+            },
+            WorkloadStatus {
+                workload: "face".into(),
+                state: "eligible".into(),
+                model_names: vec!["buffalo_l".into()],
+                code: None,
+            },
+        ]);
+        progress.workload(
+            "face",
+            "unavailable",
+            Some("workload_desktop_nas_face_producer_unavailable".into()),
         );
+        progress.set("working", None);
+        let status = progress.status.lock().unwrap().clone();
+        assert_eq!(status.workloads[0].state, "ready");
+        assert_eq!(status.workloads[1].state, "unavailable");
+        progress.cancelled.store(true, Ordering::Release);
+        progress.workload("face", "ready", None);
+        assert_eq!(*progress.status.lock().unwrap(), status);
+    }
+    fn inventory_fixture() -> serde_json::Value {
+        let catalogue: serde_json::Value =
+            serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+        let workloads = ["clip", "ocr", "face", "enrichment"].map(|workload| {
+            let profiles: Vec<_> = catalogue["profiles"].as_array().unwrap().iter().filter(|p|
+                p["workload"] == workload && p["spec"]["provider"] == "CPUExecutionProvider" &&
+                p["runtimeSourceRevision"] == "25b22c16e47a27a2eb50017d838497abce850d11").collect();
+            serde_json::json!({"workload":workload,"state":if workload == "enrichment" {"unsupported"} else {"eligible"},
+                "modelNames":profiles.first().map(|p| vec![p["modelName"].clone()]).unwrap_or_default(),
+                "modelKeys":profiles.iter().map(|p|p["modelKey"].clone()).collect::<Vec<_>>()})
+        });
+        serde_json::json!({"protocolVersion":1,"provider":"CPUExecutionProvider",
+            "runtimeSourceRevision":"25b22c16e47a27a2eb50017d838497abce850d11","workloads":workloads})
     }
     #[test]
-    fn selects_ocr_independently_and_requires_all_inference_options() {
+    fn inventory_keeps_eligible_workloads_when_another_is_pinned_or_unknown() {
         let source = "25b22c16e47a27a2eb50017d838497abce850d11";
-        let mut config = serde_json::json!({"machineLearning": {"enabled":true,
-            "clip":{"enabled":false,"modelName":"unused"},
-            "ocr":{"enabled":true,"modelName":"PP-OCRv5_mobile", "minDetectionScore":0.5,"minRecognitionScore":0.8,"maxResolution":736}
-        }});
-        let profiles = selected_profiles(&config, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert!(profiles[0].model_key().starts_with("ocr:"));
-        config["machineLearning"]["ocr"]["minDetectionScore"] = serde_json::json!(0.6);
-        assert_eq!(
-            selected_profiles(&config, source, "CPUExecutionProvider")
-                .err()
-                .unwrap(),
-            "server_model_not_supported"
-        );
-        config["machineLearning"]["ocr"]["enabled"] = serde_json::json!(false);
-        assert_eq!(
-            selected_profiles(&config, source, "CPUExecutionProvider")
-                .err()
-                .unwrap(),
-            "server_model_disabled"
-        );
+        let mut value = inventory_fixture();
+        value["workloads"][2]["state"] = serde_json::json!("pinned");
+        value["workloads"][2]["modelKeys"] = serde_json::json!([]);
+        let (groups, statuses) =
+            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
+        assert_eq!(statuses[2].state, "pinned");
+        value["workloads"][1]["modelKeys"][0] =
+            serde_json::json!(format!("ocr:{}", "0".repeat(64)));
+        let (groups, statuses) =
+            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(statuses[1].state, "unsupported");
+        assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
+    }
+    #[test]
+    fn inventory_rejects_partial_clip_groups_and_invalid_authority_shapes() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut value = inventory_fixture();
+        value["workloads"][0]["modelKeys"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+        let mut value = inventory_fixture();
+        value["workloads"][0]["url"] = serde_json::json!("https://untrusted");
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+        let mut value = inventory_fixture();
+        value["workloads"][2] = value["workloads"][1].clone();
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
     }
     #[tokio::test]
     async fn reconnect_retries_a_dropped_http_connection_and_requires_reauthorization() {

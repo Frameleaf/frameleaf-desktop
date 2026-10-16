@@ -116,7 +116,7 @@ fn read_fixture_message(reader: &mut impl std::io::BufRead) -> serde_json::Value
 #[test]
 #[ignore = "requires the owned HTTPS/PostgreSQL fixture, factory CPU pack and approved model cache"]
 fn actual_native_nas_library_jobs() {
-    use crate::{model_catalogue::approved_profile, native_predictor::NativePredictor};
+    use crate::native_predictor::NativePredictor;
     use std::{
         fs,
         io::Write,
@@ -178,28 +178,42 @@ fn actual_native_nas_library_jobs() {
         .unwrap();
     let installed = store.load_active().unwrap().unwrap();
     let attestation = store.attestation(&installed).unwrap();
-    let catalogue: serde_json::Value =
-        serde_json::from_str(include_str!("../../../runtime/model-catalogue.json")).unwrap();
-    let profiles: Vec<_> = catalogue["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|p| {
-            p["runtimeSourceRevision"] == installed.source_revision() && p["workload"] == workload
-        })
-        .map(|p| {
-            approved_profile(
-                p["modelName"].as_str().unwrap(),
-                &p["spec"]["entries"],
-                installed.source_revision(),
-                installed.provider(),
-            )
-            .unwrap()
-            .unwrap()
-        })
-        .collect();
-    assert_eq!(profiles.len(), if workload == "clip" { 3 } else { 1 });
     tauri::async_runtime::block_on(async {
+        let inventory = worker
+            .model_inventory(installed.source_revision(), installed.provider())
+            .await
+            .unwrap();
+        let (groups, statuses) = crate::worker_setup::inventory_profiles(
+            &inventory,
+            installed.source_revision(),
+            installed.provider(),
+        )
+        .unwrap();
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|item| item.workload == workload)
+                .unwrap()
+                .state,
+            "eligible"
+        );
+        if workload == "ocr" {
+            let face = groups
+                .iter()
+                .find(|group| group[0].model_key().starts_with("face:"))
+                .expect("eligible Face inventory");
+            let refusal = worker
+                .request_qualification(&face[0], &attestation, &Uuid::new_v4().to_string())
+                .await
+                .err()
+                .expect("unavailable NAS Face producer");
+            assert!(refusal.starts_with("workload_desktop_"), "{refusal}");
+        }
+        let profiles = groups
+            .into_iter()
+            .find(|group| group[0].model_key().starts_with(&(workload.clone() + ":")))
+            .unwrap();
+        assert_eq!(profiles.len(), if workload == "clip" { 3 } else { 1 });
         let mut prepared = Vec::new();
         for profile in &profiles {
             let challenge = worker

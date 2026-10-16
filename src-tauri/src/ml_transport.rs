@@ -515,6 +515,80 @@ impl Connection {
 }
 
 pub struct WorkerTransport(Mutex<Connection>);
+
+fn qualification_refusal(status: u16, message: &str) -> Option<String> {
+    if status == 409
+        && matches!(
+            message,
+            "desktop_nas_producer_unavailable"
+                | "desktop_nas_face_producer_unavailable"
+                | "desktop_nas_fixture_mismatch"
+                | "desktop_nas_model_unavailable"
+                | "desktop_nas_producer_changed"
+                | "desktop_nas_producer_expired"
+                | "desktop_model_profile_unavailable"
+                | "desktop_model_profile_changed"
+                | "desktop_clip_profile_unavailable"
+                | "desktop_face_profile_unavailable"
+                | "desktop_clip_space_unavailable"
+                | "desktop_clip_index_changed"
+                | "desktop_clip_index_dimensions"
+                | "desktop_clip_index_incompatible"
+                | "desktop_clip_index_invalid"
+                | "desktop_pool_config_changed"
+                | "desktop_pool_destination_changed"
+                | "desktop_pool_model_unavailable"
+                | "desktop_pool_route_changed"
+                | "desktop_route_review_required"
+        )
+    {
+        Some(format!("workload_{message}"))
+    } else {
+        None
+    }
+}
+#[test]
+fn scopes_only_explicit_model_refusals_to_one_workload() {
+    assert_eq!(
+        qualification_refusal(409, "desktop_nas_face_producer_unavailable").as_deref(),
+        Some("workload_desktop_nas_face_producer_unavailable")
+    );
+    for (status, message) in [
+        (401, "desktop_nas_face_producer_unavailable"),
+        (403, "desktop_pool_policy_required"),
+        (409, "desktop_pool_policy_changed"),
+        (409, "desktop_worker_activation_invalid"),
+        (409, "desktop_runtime_attestation_invalid"),
+        (500, "desktop_nas_face_producer_unavailable"),
+    ] {
+        assert!(qualification_refusal(status, message).is_none());
+    }
+}
+async fn qualification_json<T: serde::de::DeserializeOwned>(
+    mut response: Response,
+    limit: usize,
+) -> Result<T, String> {
+    if response.status().as_u16() == 409 {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "server_response_interrupted")?
+        {
+            if bytes.len() + chunk.len() > 4096 {
+                return Err("server_response_too_large".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "server_response_invalid")?;
+        return Err(
+            qualification_refusal(409, value["message"].as_str().unwrap_or(""))
+                .unwrap_or("server_http_409".into()),
+        );
+    }
+    transport::json_limit(response, limit).await
+}
 fn claim_models(
     qualifications: &[&AcceptedQualification],
     worker: &SavedWorker,
@@ -549,6 +623,25 @@ fn bind_claim(
     Ok(index)
 }
 impl WorkerTransport {
+    pub(crate) async fn model_inventory(
+        &self,
+        source: &str,
+        provider: &str,
+    ) -> Result<serde_json::Value, String> {
+        let mut connection = self.0.lock().await;
+        connection.ensure_current().await?;
+        let payload =
+            serde_json::json!({"runtimeSourceRevision":source,"provider":provider}).to_string();
+        let response = connection
+            .request(
+                Method::POST,
+                "api/desktop/worker/models",
+                "models",
+                &payload,
+            )
+            .await?;
+        transport::json_limit(response, 65_536).await
+    }
     pub(crate) async fn maintain_session(&self) -> Result<(), String> {
         self.0.lock().await.ensure_current().await
     }
@@ -595,7 +688,7 @@ impl WorkerTransport {
                 &payload,
             )
             .await?;
-        let value: serde_json::Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
+        let value: serde_json::Value = qualification_json(response, 4 * 1024 * 1024).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
         QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)
     }
@@ -643,7 +736,7 @@ impl WorkerTransport {
                 &payload,
             )
             .await?;
-        Ok(transport::json::<Ack>(response).await?.accepted)
+        Ok(qualification_json::<Ack>(response, 65_536).await?.accepted)
     }
 
     pub async fn read_accepted_qualification(
@@ -662,7 +755,7 @@ impl WorkerTransport {
                 "",
             )
             .await?;
-        let value: serde_json::Value = transport::json_limit(response, 65_536).await?;
+        let value: serde_json::Value = qualification_json(response, 65_536).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_qualification_invalid")?;
         let accepted =
             AcceptedQualification::bind(&connection.worker, profile, qualified, &raw, now()?)?;

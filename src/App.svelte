@@ -15,7 +15,7 @@
   let busy = $state(false);
   let notice = $state('');
   let failure = $state('');
-  type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped' };
+  type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: { workload: string; state: string; modelNames: string[]; code: string | null }[] };
   let setup = $state<SetupStatus | null>(null);
   const setupState = $derived(setup?.state || connection?.state || '');
   const setupDetail = $derived(setup?.code === 'runtime_pack_unavailable'
@@ -133,6 +133,15 @@
       <section class="status-panel" aria-label="Computer processing status">
         <div class="status-heading"><span class="status-dot"></span><h2>{connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : workerStatus({ state: setupState, workerSupported: connection.features.worker })}</h2></div>
         <p>{setupDetail || (connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : 'AI processing starts only after the server supports desktop workers and the selected models pass qualification.')}</p>
+        {#if setup?.workloads?.length}
+          <ul aria-label="AI processing by task">
+            {#each setup.workloads as workload (workload.workload)}
+              <li><strong>{{ clip: 'Smart search', ocr: 'Text recognition', face: 'Face recognition', enrichment: 'Photo descriptions and safety' }[workload.workload] || workload.workload}:</strong>
+                {{ eligible: 'Waiting for qualification', qualifying: 'Checking this computer', ready: 'Ready to help', disabled: 'Disabled on your server', pinned: 'Uses your chosen server destination', legacy: 'Uses your existing server destination', unavailable: 'Unavailable on this computer; other tasks can continue', unsupported: 'Selected model is not supported on this computer yet' }[workload.state] || workload.state}
+              </li>
+            {/each}
+          </ul>
+        {/if}
         {#if setup?.state === 'model-download-required'}<button class="secondary" disabled={busy} onclick={() => prepareModels(true)}>Download selected AI models</button>{/if}
         {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
         {#if connection.mode === 'client-worker' && connection.features.workerSession}
