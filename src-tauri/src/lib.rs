@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod copy_source;
 mod credentials;
 pub mod lifecycle;
 pub mod ml_transport;

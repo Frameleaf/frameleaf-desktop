@@ -235,7 +235,7 @@ Linux uses ordinary selected folders without claiming OneDrive placeholder suppo
 
 After the user chooses a folder, the preview counts photo/video filenames and
 logical sizes using metadata only. Capability-relative directory access confines
-traversal; links, hidden entries and application/Photos packages are excluded.
+traversal; links, dot-prefixed entries and application/Photos packages are excluded.
 The scan stops at 10,000 entries, 16 levels or 256 pending directories and reports
 partial/skipped results. It refuses the whole home folder or filesystem root.
 Cloud residency, required downloads and cloud-account completeness remain unknown.
@@ -247,3 +247,26 @@ advertised by the NAS. No source bytes are uploaded or changed by this preview.
 The native picker uses the [Tauri dialog plugin](https://v2.tauri.app/plugin/dialog/)
 through local-only Rust commands; remote Photos windows receive no dialog or
 filesystem capabilities.
+
+### Verified copy staging foundation
+
+The Rust copy engine binds a signed folder approval to the current server origin,
+server/account/device IDs, installation identity, root identity, per-file size cap
+and explicit download permission. It rejects other document types, traversal,
+linked ancestors/files and replaced roots. Directory handles constrain reads to the
+approved root; every item is checked before and after reading. A native free-space
+check retains 256 MiB beyond the file size, and incomplete staging is cleaned up.
+
+An immutable private staging directory holds independent original bytes and a signed
+SHA-256 receipt, with the source version and original filesystem dates. Creation time
+falls back to modification time when unavailable. Restore checks the approval,
+receipt and bytes before returning a read-only handle positioned at the beginning.
+A staged copy survives source eviction; changed bytes, journal tampering or a different
+account/server/device are refused.
+
+This engine is not exposed through UI commands yet. Persistent consent storage and
+revocation, whole-run capacity/network budgets, durable item dispositions, resumable
+NAS upload integration, source provenance and healthy managed-copy reconciliation
+remain required before the app can offer copy imports. A verified local stage is not
+a completed Frameleaf import or an external-reference grant. Real OneDrive hydration
+and installed Windows/Linux file behavior remain unqualified.

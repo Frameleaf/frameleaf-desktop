@@ -29,7 +29,7 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
     if home
         .as_ref()
-        .is_some_and(|home| Path::new(home).starts_with(root))
+        .is_some_and(|home| covers_home(root, Path::new(home)))
     {
         return Err("source_choose_photo_subfolder".into());
     }
@@ -100,34 +100,7 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
                     Ok(child) => pending.push_back((child, depth + 1)),
                     Err(_) => result.skipped += 1,
                 }
-            } else if meta.is_file()
-                && matches!(
-                    lower.rsplit('.').next(),
-                    Some(
-                        "jpg"
-                            | "jpeg"
-                            | "heic"
-                            | "heif"
-                            | "png"
-                            | "gif"
-                            | "webp"
-                            | "avif"
-                            | "tif"
-                            | "tiff"
-                            | "dng"
-                            | "cr2"
-                            | "cr3"
-                            | "nef"
-                            | "arw"
-                            | "raf"
-                            | "orf"
-                            | "rw2"
-                            | "mp4"
-                            | "mov"
-                            | "m4v"
-                    )
-                )
-            {
+            } else if meta.is_file() && is_media_filename(name) {
                 result.photos += 1;
                 result.logical_bytes = result
                     .logical_bytes
@@ -185,4 +158,56 @@ pub fn known_onedrive_roots(home: &Path, supplied: &[std::path::PathBuf]) -> Vec
         }
     }
     result
+}
+
+pub(crate) fn is_media_filename(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().rsplit('.').next(),
+        Some(
+            "jpg"
+                | "jpeg"
+                | "heic"
+                | "heif"
+                | "png"
+                | "gif"
+                | "webp"
+                | "avif"
+                | "tif"
+                | "tiff"
+                | "dng"
+                | "cr2"
+                | "cr3"
+                | "nef"
+                | "arw"
+                | "raf"
+                | "orf"
+                | "rw2"
+                | "mp4"
+                | "mov"
+                | "m4v"
+        )
+    )
+}
+
+fn covers_home(root: &Path, home: &Path) -> bool {
+    home.starts_with(root) || std::fs::canonicalize(home).is_ok_and(|home| home.starts_with(root))
+}
+
+#[cfg(test)]
+mod root_tests {
+    #[cfg(unix)]
+    #[test]
+    fn home_directory_alias_does_not_allow_a_whole_home_scan() {
+        let parent =
+            std::env::temp_dir().join(format!("frameleaf-home-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let actual = parent.join("actual-home");
+        std::fs::create_dir(&actual).unwrap();
+        let actual = std::fs::canonicalize(actual).unwrap();
+        let alias = parent.join("home-alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        assert!(super::covers_home(&actual, &alias));
+        assert!(!super::covers_home(&actual.join("Photos"), &alias));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 }
