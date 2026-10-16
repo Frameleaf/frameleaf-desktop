@@ -105,13 +105,11 @@ impl SourceConsent {
             2 * 1024 * 1024 * 1024,
             allow_download,
         )?;
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("source_folder_name_invalid")?
-            .chars()
-            .take(128)
-            .collect();
+        let name = source_label(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("source_folder_name_invalid")?,
+        );
         let consent = Consent {
             approval,
             session_signature: session_signature(saved, identity),
@@ -124,6 +122,24 @@ impl SourceConsent {
         Ok(consent)
     }
 }
+// Match the server's trimmed, control-free 128 UTF-16-unit label without changing the root path.
+fn source_label(raw: &str) -> String {
+    let mut units = 0;
+    let name: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= 128
+        })
+        .collect();
+    let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if name.is_empty() {
+        "Photo folder".into()
+    } else {
+        name.into()
+    }
+}
 fn session_signature(saved: &SavedConnection, identity: &DeviceIdentity) -> String {
     identity.sign(&format!(
         "frameleaf-desktop/photo-source-session/v1\n{}",
@@ -131,6 +147,20 @@ fn session_signature(saved: &SavedConnection, identity: &DeviceIdentity) -> Stri
     ))
 }
 impl Consent {
+    pub(crate) fn approval(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<&CopyApproval, String> {
+        self.require(saved, identity)?;
+        if !self.registered || !self.allow_download {
+            return Err("source_approval_required".into());
+        }
+        Ok(&self.approval)
+    }
+    pub(crate) fn source_id(&self) -> &str {
+        self.approval.source_id()
+    }
     pub fn require(
         &self,
         saved: &SavedConnection,
@@ -152,7 +182,7 @@ impl Consent {
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
-        json!({"id":self.approval.source_id(),"deviceId":saved.device_id,"kind":"folder","mode":"copy","name":self.name,"scopeFingerprint":self.approval.fingerprint()})
+        json!({"id":self.approval.source_id(),"deviceId":saved.device_id,"kind":"folder","mode":"copy","name":source_label(&self.name),"scopeFingerprint":self.approval.fingerprint()})
     }
     fn accept(&self, saved: &SavedConnection, ack: &Value) -> Result<(), String> {
         let request = self.request(saved);
@@ -187,6 +217,7 @@ impl Consent {
             .map_err(|_| "source_registration_unavailable")?;
         let ack: Value = transport::json(response).await?;
         self.accept(saved, &ack)?;
+        self.name = source_label(&self.name);
         self.registered = true;
         Ok(())
     }
@@ -321,5 +352,34 @@ mod tests {
         ack["revokedAt"] = serde_json::json!("2026-10-16T00:00:00Z");
         assert!(consent.accept(&saved(), &ack).is_err());
         std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn folder_labels_match_the_servers_trimmed_bounded_name_contract() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-label-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(base.join(" Photos ")).unwrap();
+        let root = std::fs::canonicalize(base.join(" Photos ")).unwrap();
+        let identity = DeviceIdentity::generate();
+        let state = SourceConsent::default();
+        let selected = state.select(state.generation().unwrap(), root).unwrap();
+        let consent = state
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(consent.request(&saved())["name"], "Photos");
+        assert_eq!(source_label("\u{0001} Photos \n"), "Photos");
+        assert_eq!(source_label(&"📷".repeat(100)).encode_utf16().count(), 128);
+        assert_eq!(source_label("   "), "Photo folder");
+        let mut legacy = consent;
+        legacy.name = " Photos ".into();
+        assert_eq!(legacy.request(&saved())["name"], "Photos");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -14,6 +14,7 @@ pub mod release_policy;
 mod resource_policy;
 pub mod runtime_store;
 mod source_consent;
+mod source_import;
 mod transport;
 pub mod worker;
 mod worker_control;
@@ -212,6 +213,7 @@ async fn restore_connection(
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<source_import::SourceJobs>().stop().await;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load::<SavedConnection>("connection")? else {
         return Ok(None);
@@ -254,6 +256,7 @@ async fn sign_out(
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<source_import::SourceJobs>().stop().await;
     app.state::<source_consent::SourceConsent>().clear()?;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let saved = current
@@ -377,6 +380,7 @@ pub fn run() {
         .manage(DesktopState::default())
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
+        .manage(source_import::SourceJobs::default())
         .invoke_handler(tauri::generate_handler![
             connect_server,
             restore_connection,
@@ -389,7 +393,10 @@ pub fn run() {
             choose_photo_folder,
             approve_photo_folder,
             photo_source_status,
-            revoke_photo_source
+            revoke_photo_source,
+            photo_import_status,
+            prepare_photo_import,
+            control_photo_import
         ])
         .run(tauri::generate_context!())
         .expect("Frameleaf desktop failed to start");
@@ -605,6 +612,7 @@ async fn revoke_photo_source(
 ) -> Result<bool, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
+    app.state::<source_import::SourceJobs>().stop().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
     // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
@@ -619,5 +627,70 @@ async fn revoke_photo_source(
         }
         Ok(None) => Ok(true),
         Err(_) => Ok(false),
+    }
+}
+
+fn import_base(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|_| "source_storage_unavailable")?;
+    if !base.exists() {
+        runtime_store::private_directory(&base)?;
+    }
+    native_runtime::absolute_directory(&base)?;
+    Ok(base)
+}
+#[tauri::command]
+async fn photo_import_status(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Option<source_import::ImportView>, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    if credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?.is_none() {
+        return Ok(None);
+    }
+    app.state::<source_import::SourceJobs>()
+        .status(&import_base(&app)?, saved)
+}
+#[tauri::command]
+async fn prepare_photo_import(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<source_import::ImportView, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    app.state::<source_import::SourceJobs>()
+        .prepare(&import_base(&app)?, saved)
+        .await
+}
+#[tauri::command]
+async fn control_photo_import(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    action: String,
+) -> Result<source_import::ImportView, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let base = import_base(&app)?;
+    match action.as_str() {
+        "resume" => {
+            app.state::<source_import::SourceJobs>()
+                .start(app.clone(), base, saved.clone())
+                .await
+        }
+        "pause" | "cancel" => {
+            app.state::<source_import::SourceJobs>()
+                .control(&base, saved, action == "cancel")
+                .await
+        }
+        _ => Err("source_control_invalid".into()),
     }
 }

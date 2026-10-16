@@ -248,8 +248,8 @@ the selection retryable, and a failed registration keeps the same source identit
 Removing permission clears local authority before contacting the NAS; offline or
 unconfirmed server revocation remains visible. Sign-out invalidates pending picker
 handles and removes the permission; a different photo sign-in cannot reuse it.
-Copy/import reconciliation, provider-aware hydration, external references and
-PhotoKit integration remain required before sources are advertised by the NAS.
+Provider-aware hydration, external references and PhotoKit integration remain
+required before full source capabilities are advertised by the NAS.
 Approval does not begin a copy.
 The native picker uses the [Tauri dialog plugin](https://v2.tauri.app/plugin/dialog/)
 through local-only Rust commands; remote Photos windows receive no dialog or
@@ -271,11 +271,11 @@ receipt and bytes before returning a read-only handle positioned at the beginnin
 A staged copy survives source eviction; changed bytes, journal tampering or a different
 account/server/device are refused.
 
-The UI manages folder consent but does not start this engine yet. Whole-run
-capacity/network budgets, durable item dispositions, application
-NAS upload integration, source provenance and healthy managed-copy reconciliation
-remain required before the app can offer copy imports. A verified local stage is not
-a completed Frameleaf import or an external-reference grant. Real OneDrive hydration
+The UI prepares a metadata-only copy plan, shows its original count and logical size,
+and requires a separate start action. It refuses incomplete scans and stages one
+original at a time while checking current consent, connection and unmetered-network
+policy. Logical run limits and per-file free-space checks do not reserve provider
+hydration space or account for all provider network traffic. Real OneDrive hydration
 and installed Windows/Linux file behavior remain unqualified.
 
 ### Resumable source transfer
@@ -291,8 +291,16 @@ changed bindings and legacy unbound journals are refused before network use.
 Redirects and foreign, ambiguous or noncanonical resource locations are refused.
 
 A matching ingestion response is not proof of a healthy independent managed copy.
-The server source/receipt contract and local consent are implemented. The durable
-run/item journal, consent checks during jobs, verified managed-copy reconciliation,
-job lifecycle and import UI remain to be connected before imports can be offered. Protocol
-fixtures exercise real loopback HTTP requests with synthetic media; actual NAS HTTPS
-transfer and installed-device acceptance remain unqualified.
+The native job stores a device-signed manifest and atomic progress checkpoints before
+reading or uploading bytes. Pause, explicit resume and cancellation retain existing
+server copies and unconfirmed staged originals. Sign-out and permission removal stop
+the active job before clearing credentials. Lost replies recover the existing upload
+and item identities rather than creating another upload.
+
+Only a bound NAS receipt, produced after hashing the independent managed original,
+permits cache release. A saved receipt is revalidated on restart before release.
+Foreign receipts, unhealthy NAS originals and failed checkpoints retain local staging.
+The app never removes source files. Protocol fixtures exercise real loopback HTTP
+requests with synthetic media; actual NAS HTTPS transfer, provider hydration and
+installed-device acceptance remain unqualified. External references and PhotoKit are
+separate unfinished integrations.

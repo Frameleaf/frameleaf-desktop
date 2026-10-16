@@ -27,6 +27,11 @@ pub struct FolderUploadBinding {
     run_id: String,
     item_id: String,
 }
+impl UploadSession {
+    pub(crate) fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+}
 impl FolderUploadBinding {
     pub fn new(copy: &StagedCopy, run: &str, item: &str) -> Result<Self, String> {
         let value = Self {
@@ -155,7 +160,7 @@ fn check_cancel(cancelled: &AtomicBool) -> Result<(), String> {
         Ok(())
     }
 }
-async fn send(
+pub(crate) async fn send(
     request: reqwest::RequestBuilder,
     cancelled: &AtomicBool,
 ) -> Result<Response, String> {
@@ -247,6 +252,7 @@ pub async fn upload(
     session: &mut Option<UploadSession>,
     persist: impl FnMut(&UploadSession) -> Result<(), String>,
     cancelled: &AtomicBool,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<UploadOutcome, String> {
     transfer(
         &transport::client()?,
@@ -259,11 +265,12 @@ pub async fn upload(
         session,
         persist,
         cancelled,
+        gate,
     )
     .await
 }
 #[allow(clippy::too_many_arguments)]
-async fn transfer(
+pub(crate) async fn transfer(
     client: &Client,
     base: &Url,
     saved: &SavedConnection,
@@ -274,8 +281,10 @@ async fn transfer(
     session: &mut Option<UploadSession>,
     mut persist: impl FnMut(&UploadSession) -> Result<(), String>,
     cancelled: &AtomicBool,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<UploadOutcome, String> {
     check_cancel(cancelled)?;
+    gate()?;
     binding.validate(copy)?;
     let mut file = copy.verify(saved, identity, staging)?;
     let filename = copy.filename()?;
@@ -311,15 +320,18 @@ async fn transfer(
     struct Owner {
         id: String,
     }
+    gate()?;
     let owner: Owner =
         transport::json(send(request(Method::GET, "api/users/me"), cancelled).await?).await?;
     if owner.id != saved.account_id {
         return Err("account_identity_changed".into());
     }
+    gate()?;
     let response = send(request(Method::OPTIONS, "api/assets/uploads"), cancelled).await?;
     success(&response, &[204])?;
     protocol(&response)?;
     let chunk_size = limits(&response, copy.bytes)?;
+    gate()?;
     let (mut durable, complete) = if let Some(current) = session.as_ref() {
         let response = send(
             request(
@@ -393,6 +405,7 @@ async fn transfer(
         // An empty completion retries ingestion when all bytes were acknowledged before interruption.
         loop {
             check_cancel(cancelled)?;
+            gate()?;
             let count = (copy.bytes - durable).min(chunk_size as u64) as usize;
             let mut bytes = vec![0; count];
             file.read_exact(&mut bytes)
@@ -423,6 +436,7 @@ async fn transfer(
             }
         }
     }
+    gate()?;
     let response = send(request(Method::GET, &format!("{path}/result")), cancelled).await?;
     success(&response, &[200, 202])?;
     protocol(&response)?;
@@ -452,4 +466,4 @@ async fn transfer(
 
 #[cfg(test)]
 #[path = "copy_upload_tests.rs"]
-mod tests;
+pub(crate) mod tests;

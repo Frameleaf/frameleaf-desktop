@@ -1,5 +1,5 @@
 use cap_std::{ambient_authority, fs::Dir};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, path::Path};
 
 #[derive(Debug, Serialize)]
@@ -12,8 +12,23 @@ pub struct FolderInventory {
     pub truncated: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SourceFile {
+    pub relative: String,
+    pub bytes: u64,
+}
+pub(crate) struct FolderScan {
+    pub inventory: FolderInventory,
+    pub files: Vec<SourceFile>,
+    pub unreadable: u64,
+}
+
 /// A bounded metadata preview, never a content read or a persistent source grant.
 pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
+    scan(root, limit).map(|scan| scan.inventory)
+}
+pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
     if !root.is_absolute() || root.parent().is_none() || limit == 0 || limit > 10_000 {
         return Err("source_folder_invalid".into());
     }
@@ -42,12 +57,15 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
         skipped: 0,
         truncated: false,
     };
-    let mut pending = VecDeque::from([(dir, 0usize)]);
+    let mut files = Vec::new();
+    let mut unreadable = 0;
+    let mut pending = VecDeque::from([(dir, std::path::PathBuf::new(), 0usize)]);
     let mut visited = 0;
-    while let Some((dir, depth)) = pending.pop_front() {
+    while let Some((dir, relative, depth)) = pending.pop_front() {
         let entries = match dir.entries() {
             Ok(entries) => entries,
             Err(_) => {
+                unreadable += 1;
                 result.skipped += 1;
                 continue;
             }
@@ -55,18 +73,24 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
         for entry in entries {
             if visited == limit {
                 result.truncated = true;
-                return Ok(result);
+                return Ok(FolderScan {
+                    inventory: result,
+                    files,
+                    unreadable,
+                });
             }
             visited += 1;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
+                    unreadable += 1;
                     result.skipped += 1;
                     continue;
                 }
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
+                unreadable += 1;
                 result.skipped += 1;
                 continue;
             };
@@ -82,6 +106,7 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
             let meta = match dir.symlink_metadata(name) {
                 Ok(meta) => meta,
                 Err(_) => {
+                    unreadable += 1;
                     result.skipped += 1;
                     continue;
                 }
@@ -97,10 +122,21 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
                     continue;
                 }
                 match dir.open_dir(name) {
-                    Ok(child) => pending.push_back((child, depth + 1)),
-                    Err(_) => result.skipped += 1,
+                    Ok(child) => pending.push_back((child, relative.join(name), depth + 1)),
+                    Err(_) => {
+                        unreadable += 1;
+                        result.skipped += 1;
+                    }
                 }
             } else if meta.is_file() && is_media_filename(name) {
+                files.push(SourceFile {
+                    relative: relative
+                        .join(name)
+                        .to_str()
+                        .ok_or("source_item_invalid")?
+                        .into(),
+                    bytes: meta.len(),
+                });
                 result.photos += 1;
                 result.logical_bytes = result
                     .logical_bytes
@@ -109,7 +145,12 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
             }
         }
     }
-    Ok(result)
+    files.sort_by(|a, b| a.relative.cmp(&b.relative));
+    Ok(FolderScan {
+        inventory: result,
+        files,
+        unreadable,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +236,23 @@ fn covers_home(root: &Path, home: &Path) -> bool {
 
 #[cfg(test)]
 mod root_tests {
+    #[test]
+    fn copy_manifest_reuses_bounded_metadata_traversal_and_records_only_relative_media_names() {
+        let parent =
+            std::env::temp_dir().join(format!("frameleaf-manifest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(parent.join("nested")).unwrap();
+        let root = std::fs::canonicalize(&parent).unwrap();
+        std::fs::write(root.join("nested/photo.jpg"), b"original").unwrap();
+        std::fs::write(root.join("notes.txt"), b"excluded").unwrap();
+        let scan = super::scan(&root, 100).unwrap();
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].relative, "nested/photo.jpg");
+        assert_eq!(scan.files[0].bytes, 8);
+        assert_eq!(scan.unreadable, 0);
+        assert!(super::scan(&root, 1).unwrap().inventory.truncated);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn home_directory_alias_does_not_allow_a_whole_home_scan() {

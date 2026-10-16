@@ -13,6 +13,9 @@ fn main() {
             "approve_photo_folder",
             "photo_source_status",
             "revoke_photo_source",
+            "photo_import_status",
+            "prepare_photo_import",
+            "control_photo_import",
         ]),
     ))
     .expect("build desktop ACL");

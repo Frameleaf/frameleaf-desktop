@@ -49,14 +49,14 @@ use std::{
 };
 const RESOURCE: &str = "11111111-1111-4111-8111-111111111111";
 type CapturedRequests = Vec<(String, Vec<u8>)>;
-struct Server {
-    base: url::Url,
-    requests: Arc<Mutex<CapturedRequests>>,
+pub(crate) struct Server {
+    pub(crate) base: url::Url,
+    pub(crate) requests: Arc<Mutex<CapturedRequests>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 impl Server {
-    fn new(replies: Vec<String>) -> Self {
+    pub(crate) fn new(replies: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
@@ -122,14 +122,14 @@ fn reply(status: u16, headers: &str, body: &str) -> String {
         body.len()
     )
 }
-fn protocol(status: u16, extra: &str, body: &str) -> String {
+pub(crate) fn protocol(status: u16, extra: &str, body: &str) -> String {
     reply(
         status,
         &format!("Upload-Draft-Interop-Version: 9\r\n{extra}"),
         body,
     )
 }
-fn preflight() -> Vec<String> {
+pub(crate) fn preflight() -> Vec<String> {
     vec![
         reply(
             200,
@@ -214,6 +214,7 @@ impl Fixture {
             journal,
             persist,
             &AtomicBool::new(false),
+            &|| Ok(()),
         )
         .await
     }

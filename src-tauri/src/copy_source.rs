@@ -35,7 +35,7 @@ pub struct CopyApproval {
     scope: CopyScope,
     signature: String,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StagedCopy {
     pub id: String,
@@ -256,6 +256,33 @@ impl CopyApproval {
         destination: &Path,
         cancelled: &AtomicBool,
     ) -> Result<StagedCopy, String> {
+        self.stage_to(
+            saved,
+            identity,
+            relative,
+            destination,
+            &Uuid::new_v4().to_string(),
+            None,
+            cancelled,
+            &|| Ok(()),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_to(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        relative: &str,
+        destination: &Path,
+        stage_id: &str,
+        expected_bytes: Option<u64>,
+        cancelled: &AtomicBool,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<StagedCopy, String> {
+        if !Uuid::parse_str(stage_id).is_ok_and(|id| !id.is_nil() && id.to_string() == stage_id) {
+            return Err("source_stage_invalid".into());
+        }
+        gate()?;
         self.validate(saved, identity)?;
         cancel(cancelled)?;
         if !self.scope.allow_download {
@@ -281,6 +308,9 @@ impl CopyApproval {
         if !before.is_file() || link(&before) || before.len() == 0 {
             return Err("source_item_invalid".into());
         }
+        if expected_bytes.is_some_and(|bytes| bytes != before.len()) {
+            return Err("source_item_changed".into());
+        }
         if before.len() > self.scope.max_item_bytes {
             return Err("source_copy_budget_exceeded".into());
         }
@@ -296,7 +326,7 @@ impl CopyApproval {
         if !opened.is_file() || link(&opened) || stamp(&opened)? != source_stamp {
             return Err("source_item_changed".into());
         }
-        let id = Uuid::new_v4().to_string();
+        let id = stage_id.to_string();
         let path = destination.join(&id);
         let builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -324,8 +354,13 @@ impl CopyApproval {
         let mut bytes = 0u64;
         let mut hash = Sha256::new();
         let mut buffer = [0u8; 65536];
+        let mut next_check = 0;
         loop {
             cancel(cancelled)?;
+            if bytes >= next_check {
+                gate()?;
+                next_check = bytes + 1024 * 1024;
+            }
             let count = source
                 .read(&mut buffer)
                 .map_err(|_| "source_copy_interrupted")?;
@@ -342,6 +377,7 @@ impl CopyApproval {
             hash.update(&buffer[..count]);
         }
         cancel(cancelled)?;
+        gate()?;
         unchanged(
             &dir,
             relative_path,
@@ -405,6 +441,35 @@ impl Drop for Partial {
     }
 }
 impl StagedCopy {
+    pub(crate) fn matches_entry(&self, relative: &str, bytes: u64) -> bool {
+        self.relative == relative && self.bytes == bytes
+    }
+    pub(crate) fn resource_key(&self) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{}\n{}", self.source_signature, self.relative).as_bytes())
+        )
+    }
+    pub(crate) fn version(&self) -> String {
+        format!("{:x}", Sha256::digest(self.source_stamp.as_bytes()))
+    }
+    pub(crate) fn release(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        destination: &Path,
+    ) -> Result<(), String> {
+        self.approval.validate(saved, identity)?;
+        if self.signature != self.sign(identity)?
+            || Uuid::parse_str(&self.id)
+                .map_err(|_| "source_stage_invalid")?
+                .to_string()
+                != self.id
+        {
+            return Err("source_stage_invalid".into());
+        }
+        release_stage(destination, &self.id)
+    }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()
     }
@@ -616,6 +681,40 @@ fn milliseconds(value: std::time::SystemTime) -> Result<i64, String> {
         return Err("source_identity_unavailable".into());
     }
     i64::try_from(value).map_err(|_| "source_identity_unavailable".into())
+}
+
+/// Only app-owned named files are removed; unexpected data or links are retained for attention.
+pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> {
+    if !Uuid::parse_str(id).is_ok_and(|value| !value.is_nil() && value.to_string() == id) {
+        return Err("source_stage_invalid".into());
+    }
+    crate::native_runtime::absolute_directory(destination)?;
+    let root = Dir::open_ambient_dir(destination, ambient_authority())
+        .map_err(|_| "source_stage_unavailable")?;
+    match root.symlink_metadata(id) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(meta) if meta.is_dir() && !link(&meta) => {}
+        _ => return Err("source_stage_invalid".into()),
+    }
+    let dir = root.open_dir(id).map_err(|_| "source_stage_unavailable")?;
+    for name in ["original", "receipt.json"] {
+        match dir.symlink_metadata(name) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(meta) if meta.is_file() && !link(&meta) => dir
+                .remove_file(name)
+                .map_err(|_| "source_cache_cleanup_pending")?,
+            _ => return Err("source_stage_invalid".into()),
+        }
+    }
+    root.remove_dir(id)
+        .map_err(|_| "source_cache_cleanup_pending")?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "source_cache_cleanup_pending")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,11 +1,14 @@
 <script lang="ts">
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   type Hint = { label: string; path: string };
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null };
+  let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowReads = $state(false);
@@ -14,6 +17,25 @@
   let message = $state('');
   const native = isTauri();
   const errors: Record<string, string> = {
+    source_inventory_partial: 'The scan reached its safety limit. Choose a smaller photo subfolder for this copy.',
+    source_inventory_unreadable: 'Some entries could not be inspected. Check folder and drive access before preparing the copy again.',
+    source_no_media: 'No supported photo or video files were found in this folder.',
+    source_copy_budget_exceeded: 'This copy exceeds the server’s current size limits. Choose a smaller subfolder or remove unsupported large files from the selected scope.',
+    source_staging_overlap: 'Choose a photo folder outside the app’s own data folder.',
+    source_item_changed: 'A selected file changed after the scan. This copy is paused; the original and staged data are kept.',
+    source_capacity_insufficient: 'There is not enough free space to stage this original safely. Free local space, then resume.',
+    source_run_paused: 'Your server paused this copy before another original was staged. Resume explicitly when ready.',
+    source_server_processing: 'Your server is still finishing this photo. Its staged original is retained; resume the copy when the server is ready.',
+    source_receipt_invalid: 'The server did not confirm the expected healthy original. Copying stopped and the staged original was retained.',
+    source_journal_invalid: 'Saved copy progress could not be verified. Staged originals are retained; do not remove them while investigating.',
+    source_journal_write_failed: 'Copy progress could not be saved. Check local disk space and access before resuming; staged originals are retained.',
+    source_stop_confirmation_pending: 'Copying stopped on this computer. The server could not confirm its stop yet; existing server copies are kept.',
+    source_cache_cleanup_pending: 'The verified copy is on your server, but its local staging cache could not be cleared. Check local file access before resuming.',
+    source_copy_cancelled: 'Copying is paused. Resume when you are ready.',
+    metered_network: 'Copying is paused on this metered connection. Resume on an unmetered network.',
+    network_unknown: 'Network cost could not be determined. Resume when an unmetered connection is available.',
+    server_http_409: 'The server refused this copy. Check its source permission and original-file health before resuming; staged data is kept.',
+
     source_selection_changed: 'The folder selection expired. Choose the folder again.',
     source_remove_previous_approval: 'Remove the existing folder permission before choosing another folder.',
     source_photo_session_changed: 'This folder permission belongs to an earlier sign-in. Remove it and approve the folder again.',
@@ -45,9 +67,38 @@
     }
   }
   onMount(() => {
-    if (native) void loadConsent();
-    return () => { alive = false; };
+    let unlisten: UnlistenFn | undefined;
+    if (native) void (async () => {
+      try {
+        unlisten = await listen<CopyJob>('photo-import', event => { if (alive && event.payload.sourceId === consent?.id) job = event.payload; });
+        if (!alive) { unlisten(); return; }
+        await loadConsent();
+        if (consent?.registered) {
+          const current = await invoke<CopyJob | null>('photo_import_status');
+          if (alive) job = current;
+        }
+      } catch (error) { if (alive) message = explain(error); }
+    })();
+    return () => { alive = false; unlisten?.(); };
   });
+  function size(bytes: number) {
+    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+    if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} kB`;
+    return `${bytes} bytes`;
+  }
+  async function prepareCopy() {
+    busy = true; message = '';
+    try { job = await invoke<CopyJob>('prepare_photo_import'); }
+    catch (error) { message = explain(error); }
+    finally { busy = false; }
+  }
+  async function controlCopy(action: 'resume' | 'pause' | 'cancel') {
+    busy = true; message = '';
+    try { job = await invoke<CopyJob>('control_photo_import', { action }); }
+    catch (error) { message = explain(error); }
+    finally { busy = false; }
+  }
   async function approve(retry = false) {
     if (!retry && (!folder || !allowReads)) return;
     busy = true; message = '';
@@ -61,7 +112,7 @@
     busy = true; message = '';
     try {
       const confirmed = await invoke<boolean>('revoke_photo_source');
-      consent = null; blockedConsent = false; folder = null; allowReads = false;
+      consent = null; job = null; blockedConsent = false; folder = null; allowReads = false;
       message = confirmed ? 'Folder permission removed. Existing server copies are kept.' : 'Local folder permission removed. The server could not confirm revocation; check it when connected.';
     } catch (error) { message = explain(error); }
     finally { busy = false; }
@@ -98,13 +149,31 @@
       {/each}
     </ul>
   {/if}
-  {#if busy}<p role="status">Waiting for folder selection or checking file metadata…</p>{/if}
+  {#if busy}<p role="status">Waiting for the folder or server operation to finish…</p>{/if}
   {#if message}<p role="status">{message}</p>{/if}
   {#if consent}
     <div class="folder-preview" aria-label="Approved photo folder">
       <strong>{consent.name}</strong><p>{consent.path}</p>
-      <p>{consent.registered ? 'Folder permission saved and registered with your server. Copying has not started.' : 'Folder permission saved locally. Server registration still needs to finish.'}</p>
+      <p>{consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</p>
       {#if !consent.registered}<button class="secondary" disabled={busy} onclick={() => approve(true)}>Retry server registration</button>{/if}
+      {#if consent.registered && !job}
+        <p>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</p>
+        <button class="secondary" disabled={busy} onclick={prepareCopy}>Prepare copy</button>
+      {/if}
+      {#if job}
+        <div class="copy-job" aria-label="Photo copy progress">
+          <p role="status">{job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'}: {job.completed.toLocaleString()} of {job.total.toLocaleString()} copies confirmed.</p>
+          <progress max={Math.max(1, job.total)} value={job.completed} aria-label="Copies verified on your server"></progress>
+          <p class="footnote">Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
+          {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
+          {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
+            <button class="secondary" disabled={busy} onclick={() => controlCopy('resume')}>{job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
+          {/if}
+          {#if job.state === 'copying'}<button class="secondary" disabled={busy} onclick={() => controlCopy('pause')}>Pause copy</button>{/if}
+          {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}
+          {#if job.state === 'cancelled'}<p class="footnote">Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</p>{/if}
+        </div>
+      {/if}
       <button class="text-button" disabled={busy} onclick={revoke}>Remove folder permission</button>
     </div>
   {:else if blockedConsent}
@@ -120,7 +189,7 @@
       <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; }}>Clear preview</button>
     </div>
   {/if}
-  <p class="footnote">This build previews folders and manages folder permission. Copy imports and external-library connections are still being implemented. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
+  <p class="footnote">Copy jobs require explicit folder approval and an unmetered connection. Cloud-only files may download while staging an approved original. External-library connections are still being implemented. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
 </section>
 
 <style>
@@ -129,6 +198,8 @@
   .actions { flex-wrap: wrap; margin-top: 16px; }
   ul { padding: 0; list-style: none; }
   li, .folder-preview { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); overflow-wrap: anywhere; }
+  .copy-job { margin: 16px 0; border-top: 1px solid var(--border); padding-top: 12px; }
+  progress { width: 100%; accent-color: var(--accent); }
   .source-consent { display: flex; align-items: start; gap: 10px; margin: 16px 0; color: var(--muted); line-height: 1.6; }
   .source-consent input { margin-top: 5px; flex-shrink: 0; }
   small { display: block; color: var(--muted); margin: 6px 0; }
