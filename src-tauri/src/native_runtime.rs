@@ -15,6 +15,23 @@ struct Artifact {
     sha256: String,
     bytes: u64,
 }
+#[derive(Clone, Copy, Default, Deserialize)]
+enum ModuleNamespace {
+    #[default]
+    #[serde(rename = "immich_ml")]
+    Immich,
+    #[serde(rename = "frameleaf_ml")]
+    Frameleaf,
+}
+impl ModuleNamespace {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Immich => "immich_ml",
+            Self::Frameleaf => "frameleaf_ml",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
@@ -26,6 +43,8 @@ struct Manifest {
     provider: String,
     python: String,
     source_revision: String,
+    #[serde(default)]
+    module_namespace: ModuleNamespace,
     files: BTreeMap<String, Artifact>,
 }
 
@@ -422,7 +441,7 @@ impl VerifiedRuntime {
                     let _ = fs::remove_dir_all(&scratch);
                     return Err(error);
                 }
-                "immich_ml.native_runtime"
+                "native_runtime"
             }
             Invocation::Qualify {
                 spec,
@@ -437,7 +456,7 @@ impl VerifiedRuntime {
                     let _ = fs::remove_dir_all(&scratch);
                     return Err(error);
                 }
-                "immich_ml.native_qualification"
+                "native_qualification"
             }
         };
         let mut command = Command::new(self.root.join(relative(&self.manifest.python)?));
@@ -447,7 +466,10 @@ impl VerifiedRuntime {
             .arg("-B")
             .arg("-c")
             .arg(GATE)
-            .arg(module)
+            .arg(format!(
+                "{}.{module}",
+                self.manifest.module_namespace.prefix()
+            ))
             .arg("--cache-dir")
             .arg(cache)
             .current_dir(&scratch)

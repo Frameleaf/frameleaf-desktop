@@ -328,3 +328,19 @@ test("packaging refuses a correctly signed runtime for another operating system"
     /runtime_bundle_target_mismatch/,
   );
 });
+
+for (const namespace of ["immich_ml", "frameleaf_ml", "foreign", null]) {
+  test(`runtime signing restricts module namespace ${namespace}`, async (t) => {
+    const f = await fixture(t);
+    f.manifest.moduleNamespace = namespace;
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    const signing = signCandidate(
+      f.root,
+      join(f.root, "manifest.sig"),
+      f.privatePem,
+      f.policy,
+    );
+    if (["immich_ml", "frameleaf_ml"].includes(namespace)) await signing;
+    else await assert.rejects(signing, /runtime_manifest_invalid/);
+  });
+}

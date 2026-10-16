@@ -183,11 +183,13 @@ async function checkedCandidate(candidate, trust, signature) {
     "python",
     "sourceRevision",
     "files",
-  ]
-    .sort()
-    .join(",");
+  ];
+  if (Object.hasOwn(manifest, "moduleNamespace"))
+    fields.push("moduleNamespace");
   if (
-    Object.keys(manifest).sort().join(",") !== fields ||
+    Object.keys(manifest).sort().join(",") !== fields.sort().join(",") ||
+    (Object.hasOwn(manifest, "moduleNamespace") &&
+      !["immich_ml", "frameleaf_ml"].includes(manifest.moduleNamespace)) ||
     manifest.schemaVersion !== 1 ||
     manifest.protocolVersion !== 1 ||
     !Number.isSafeInteger(manifest.epoch) ||

@@ -107,6 +107,22 @@ def downloaded_python(root: Path) -> Path:
     return prefixes[0]
 
 
+def source_package(tracked: list[str]) -> str:
+    namespaces = {
+        name.split("/")[1] for name in tracked if name.startswith("machine-learning/")
+    }
+    if len(namespaces) != 1 or not namespaces <= {"immich_ml", "frameleaf_ml"}:
+        raise BuildError("runtime_source_package_invalid")
+    namespace = next(iter(namespaces))
+    required = {
+        f"machine-learning/{namespace}/{name}"
+        for name in ["__init__.py", "native_runtime.py", "native_qualification.py"]
+    }
+    if not required <= set(tracked):
+        raise BuildError("runtime_source_package_invalid")
+    return namespace
+
+
 def manifest(
     root: Path,
     python: str,
@@ -115,11 +131,13 @@ def manifest(
     system: str,
     architecture: str,
     provider: str,
+    module_namespace: str = "immich_ml",
 ) -> dict:
     relative(python)
     if (
         not re.fullmatch(r"[a-f0-9]{40}", revision)
         or not 1 <= epoch < 2**63
+        or module_namespace not in {"immich_ml", "frameleaf_ml"}
         or system not in {"macos", "windows", "linux"}
         or architecture not in {"aarch64", "x86_64"}
         or not (
@@ -144,6 +162,11 @@ def manifest(
         "provider": provider,
         "python": python,
         "sourceRevision": revision,
+        **(
+            {"moduleNamespace": module_namespace}
+            if module_namespace == "frameleaf_ml"
+            else {}
+        ),
         "files": files,
     }
 
@@ -253,6 +276,16 @@ def requirement_block(text: str, name: str) -> str:
     return block
 
 
+def source_build_requirements(text: str) -> str:
+    if not re.search(r"^antlr4-python3-runtime==", text, re.MULTILINE):
+        return ""
+    if not requirement_block(text, "antlr4-python3-runtime").startswith(
+        "antlr4-python3-runtime==4.9.3 "
+    ):
+        raise BuildError("runtime_source_build_not_approved")
+    return requirement_block(text, "setuptools")
+
+
 def dependency_indexes(system: str, architecture: str) -> list[str]:
     # The lock selects +cpu only on Linux x86; PEP 440 otherwise prefers an unapproved Windows +cpu wheel.
     indexes = ["--default-index", "https://pypi.org/simple"]
@@ -328,6 +361,21 @@ def build(
             env=env,
         ):
             raise BuildError("runtime_source_dirty")
+        tracked = run(
+            [
+                git,
+                "ls-tree",
+                "-r",
+                "--name-only",
+                revision,
+                "--",
+                "machine-learning/immich_ml",
+                "machine-learning/frameleaf_ml",
+            ],
+            cwd=source,
+            env=env,
+        ).splitlines()
+        module_namespace = source_package(tracked)
         uv_version = run([uv, "--version"], cwd=work, env=env)
         if uv_version.split()[1] != profile["uv"]:
             raise BuildError("runtime_uv_version_mismatch")
@@ -387,14 +435,28 @@ def build(
             else f"bin/python{'.'.join(profile['python'].split('.')[:2])}"
         )
         build_tools = payload / "build-requirements.txt"
-        build_tools.write_text(
-            requirement_block(requirements.read_text(), "setuptools")
-        )
-        # Only this source-only, lock-hashed package may execute its build backend.
-        if not requirement_block(
-            requirements.read_text(), "antlr4-python3-runtime"
-        ).startswith("antlr4-python3-runtime==4.9.3 "):
-            raise BuildError("runtime_source_build_not_approved")
+        build_tools.write_text(source_build_requirements(requirements.read_text()))
+        # Only the legacy lock-hashed ANTLR dependency may execute a source backend.
+        if build_tools.stat().st_size:
+            run(
+                [
+                    uv,
+                    "--no-config",
+                    "pip",
+                    "install",
+                    "--python",
+                    executable,
+                    "--break-system-packages",
+                    "--require-hashes",
+                    "--no-deps",
+                    "--only-binary",
+                    ":all:",
+                    "-r",
+                    build_tools,
+                ],
+                cwd=work,
+                env=env,
+            )
         run(
             [
                 uv,
@@ -408,29 +470,16 @@ def build(
                 "--no-deps",
                 "--only-binary",
                 ":all:",
-                "-r",
-                build_tools,
-            ],
-            cwd=work,
-            env=env,
-        )
-        run(
-            [
-                uv,
-                "--no-config",
-                "pip",
-                "install",
-                "--python",
-                executable,
-                "--break-system-packages",
-                "--require-hashes",
-                "--no-deps",
-                "--only-binary",
-                ":all:",
-                "--no-binary",
-                "antlr4-python3-runtime",
-                "--no-build-isolation-package",
-                "antlr4-python3-runtime",
+                *(
+                    [
+                        "--no-binary",
+                        "antlr4-python3-runtime",
+                        "--no-build-isolation-package",
+                        "antlr4-python3-runtime",
+                    ]
+                    if build_tools.stat().st_size
+                    else []
+                ),
                 *dependency_indexes(system, architecture),
                 "-r",
                 requirements,
@@ -464,19 +513,6 @@ def build(
         ).resolve().is_relative_to(prefix.resolve()):
             raise BuildError("runtime_python_prefix_escape")
         site = Path(paths["site"])
-        tracked = run(
-            [
-                git,
-                "ls-tree",
-                "-r",
-                "--name-only",
-                revision,
-                "--",
-                "machine-learning/immich_ml",
-            ],
-            cwd=source,
-            env=env,
-        ).splitlines()
         for name in tracked:
             relative(name)
             target = site / Path(name).relative_to("machine-learning")
@@ -504,7 +540,9 @@ def build(
             "projectSha256": sha256(ml / "pyproject.toml"),
             "requirementsSha256": sha256(requirements),
             "buildRequirementsSha256": sha256(build_tools),
-            "sourceBuildAllowlist": ["antlr4-python3-runtime==4.9.3"],
+            "sourceBuildAllowlist": ["antlr4-python3-runtime==4.9.3"]
+            if build_tools.stat().st_size
+            else [],
         }
         (payload / "provenance.json").write_text(
             json.dumps(receipt, sort_keys=True) + "\n"
@@ -523,7 +561,9 @@ def build(
                     "-I",
                     "-B",
                     "-c",
-                    "import json,sys,onnxruntime; import immich_ml.native_runtime,immich_ml.native_qualification; print(json.dumps({'prefix':sys.prefix,'providers':onnxruntime.get_available_providers()}))",
+                    "import json,sys,onnxruntime; "
+                    f"import {module_namespace}.native_runtime,{module_namespace}.native_qualification; "
+                    "print(json.dumps({'prefix':sys.prefix,'providers':onnxruntime.get_available_providers()}))",
                 ],
                 cwd=work,
                 env=smoke_env,
@@ -542,6 +582,7 @@ def build(
             system,
             architecture,
             profile["provider"],
+            module_namespace,
         )
         (bundle / "manifest.json").write_text(
             json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"

@@ -65,6 +65,35 @@ fn only_trusted_current_platform_signed_complete_packs_are_accepted() {
 }
 
 #[test]
+fn signed_module_namespaces_are_closed_and_bound_to_manifest_bytes() {
+    let root = Fixture::new();
+    fs::write(root.0.join("python"), b"fixture").unwrap();
+    let signing = key();
+    for namespace in [
+        json!("immich_ml"),
+        json!("frameleaf_ml"),
+        json!("foreign"),
+        json!(null),
+    ] {
+        let mut spec: serde_json::Value = serde_json::from_slice(&root.manifest()).unwrap();
+        spec["moduleNamespace"] = namespace.clone();
+        let raw = serde_json::to_vec(&spec).unwrap();
+        let accepted = VerifiedRuntime::verify(
+            &root.0,
+            &raw,
+            &signing.sign(&raw).to_bytes(),
+            &[signing.verifying_key()],
+            7,
+        )
+        .is_ok();
+        assert_eq!(
+            accepted,
+            namespace == "immich_ml" || namespace == "frameleaf_ml"
+        );
+    }
+}
+
+#[test]
 fn signed_manifest_cannot_traverse_or_select_wrong_platform_or_protocol() {
     let root = Fixture::new();
     fs::write(root.0.join("python"), b"fixture").unwrap();
@@ -123,7 +152,7 @@ fn owned_runtime_clears_ambient_credentials_and_stops_on_drop() {
 use std::{env,fs,io::{self,Read},thread,time::Duration};
 fn main(){
  let mut gate=[0;23];io::stdin().read_exact(&mut gate).unwrap();assert_eq!(&gate,b"frameleaf-native-start\n");
- let args:Vec<_>=env::args().collect();assert_eq!(args[1],"-I");assert_eq!(args[2],"-B");assert_eq!(args[3],"-c");assert_eq!(args[5],"immich_ml.native_runtime");
+ let args:Vec<_>=env::args().collect();assert_eq!(args[1],"-I");assert_eq!(args[2],"-B");assert_eq!(args[3],"-c");assert!(["immich_ml.native_runtime","frameleaf_ml.native_runtime"].contains(&args[5].as_str()));
  let token=env::var("FRAMELEAF_ML_AUTH_TOKEN").unwrap();assert_eq!(token.len(),64);
  assert!(env::var("HOME").is_err());assert!(env::var("PYTHONPATH").is_err());assert!(env::var("AWS_SECRET_ACCESS_KEY").is_err());
  assert_eq!(env::var("MACHINE_LEARNING_MODEL_INTRA_OP_THREADS").unwrap(),"4");
@@ -131,7 +160,7 @@ fn main(){
  assert_eq!(env::var("MACHINE_LEARNING_REQUEST_THREADS").unwrap(),"1");
  #[cfg(unix)] unsafe { unsafe extern "C" { fn getpriority(which:i32,who:u32)->i32; } assert!(getpriority(0,0)>=10); }
  #[cfg(windows)] unsafe { #[link(name="kernel32")] unsafe extern "system" { fn GetCurrentProcess()->*mut std::ffi::c_void; fn GetPriorityClass(process:*mut std::ffi::c_void)->u32; } assert_eq!(GetPriorityClass(GetCurrentProcess()),0x4000); }
- fs::write("ready",b"ready").unwrap();loop{thread::sleep(Duration::from_millis(20));}
+ fs::write("ready",args[5].as_bytes()).unwrap();loop{thread::sleep(Duration::from_millis(20));}
 }
 "#).unwrap();
     let executable = if cfg!(windows) {
@@ -157,30 +186,42 @@ fn main(){
     spec["python"] = json!(executable);
     spec["files"] =
         json!({executable:{"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}});
-    let raw = serde_json::to_vec(&spec).unwrap();
-    let signing = key();
-    let pack = VerifiedRuntime::verify(
-        &root.0,
-        &raw,
-        &signing.sign(&raw).to_bytes(),
-        &[signing.verifying_key()],
-        7,
-    )
-    .unwrap();
-    let mut runtime = pack.start_sidecar(&cache.0, &workspace.0, 19999).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !runtime.working_dir().join("ready").is_file() {
-        assert!(Instant::now() < deadline);
-        assert!(runtime.is_running().unwrap());
-        std::thread::sleep(Duration::from_millis(10));
+    for namespace in [None, Some("immich_ml"), Some("frameleaf_ml")] {
+        if let Some(namespace) = namespace {
+            spec["moduleNamespace"] = json!(namespace);
+        } else {
+            spec.as_object_mut().unwrap().remove("moduleNamespace");
+        }
+        let raw = serde_json::to_vec(&spec).unwrap();
+        let signing = key();
+        let pack = VerifiedRuntime::verify(
+            &root.0,
+            &raw,
+            &signing.sign(&raw).to_bytes(),
+            &[signing.verifying_key()],
+            7,
+        )
+        .unwrap();
+        let mut runtime = pack.start_sidecar(&cache.0, &workspace.0, 19999).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runtime.working_dir().join("ready").is_file() {
+            assert!(Instant::now() < deadline);
+            assert!(runtime.is_running().unwrap());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(runtime.working_dir().join("ready")).unwrap(),
+            format!("{}.native_runtime", namespace.unwrap_or("immich_ml"))
+        );
+        let scratch = runtime.working_dir().to_path_buf();
+        runtime.stop().unwrap();
+        assert!(!runtime.is_running().unwrap());
+        drop(runtime);
+        assert!(!scratch.exists());
+        fs::write(root.0.join(executable), b"tampered").unwrap();
+        assert!(pack.start_sidecar(&cache.0, &workspace.0, 19999).is_err());
+        fs::write(root.0.join(executable), &bytes).unwrap();
     }
-    let scratch = runtime.working_dir().to_path_buf();
-    runtime.stop().unwrap();
-    assert!(!runtime.is_running().unwrap());
-    drop(runtime);
-    assert!(!scratch.exists());
-    fs::write(root.0.join(executable), b"tampered").unwrap();
-    assert!(pack.start_sidecar(&cache.0, &workspace.0, 19999).is_err());
 }
 
 #[test]
@@ -237,8 +278,9 @@ fn qualifier_checks_exit_report_binding_deadline_and_cancellation() {
 use std::{{env,fs,io::{{self,Read}},thread,time::Duration}};
 fn main(){{
  let mut gate=[0;23];io::stdin().read_exact(&mut gate).unwrap();assert_eq!(&gate,b"frameleaf-native-start\n");
- let args:Vec<_>=env::args().collect();assert_eq!(args[5],"immich_ml.native_qualification");
+ let args:Vec<_>=env::args().collect();assert!(["immich_ml.native_qualification","frameleaf_ml.native_qualification"].contains(&args[5].as_str()));
  let argument=|name:&str|args[args.iter().position(|v|v==name).unwrap()+1].clone();
+ fs::write(std::path::Path::new(&argument("--cache-dir")).join("module"),&args[5]).unwrap();
  let mode=fs::read_to_string(std::path::Path::new(&argument("--cache-dir")).join("mode")).unwrap_or_default();
  let report={report:?};
  if mode=="block"{{thread::sleep(Duration::from_secs(10));}}
@@ -291,6 +333,35 @@ fn main(){{
         .unwrap();
     assert_eq!(result.report()["bindingSha256"], binding);
     assert_eq!(result.manifest_sha256(), pack.manifest_sha256());
+    assert_eq!(
+        fs::read_to_string(cache.0.join("module")).unwrap(),
+        "immich_ml.native_qualification"
+    );
+    for namespace in ["immich_ml", "frameleaf_ml"] {
+        manifest["moduleNamespace"] = json!(namespace);
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        let namespaced = VerifiedRuntime::verify(
+            &root.0,
+            &raw,
+            &signing.sign(&raw).to_bytes(),
+            &[signing.verifying_key()],
+            7,
+        )
+        .unwrap();
+        namespaced
+            .qualify(
+                &cache.0,
+                &work.0,
+                &spec,
+                b"fixture",
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(cache.0.join("module")).unwrap(),
+            format!("{namespace}.native_qualification")
+        );
+    }
     for mode in ["wrong", "oversize", "exit", "block"] {
         fs::write(cache.0.join("mode"), mode).unwrap();
         assert!(

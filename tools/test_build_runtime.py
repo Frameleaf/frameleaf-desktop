@@ -11,6 +11,70 @@ spec.loader.exec_module(builder)
 
 
 class RuntimeBuilderTests(unittest.TestCase):
+    def test_source_build_exception_is_only_used_by_the_locked_legacy_dependency(self):
+        setuptools = "setuptools==80.9.0 --hash=sha256:" + "a" * 64 + "\n"
+        antlr = "antlr4-python3-runtime==4.9.3 --hash=sha256:" + "b" * 64 + "\n"
+        self.assertEqual(builder.source_build_requirements(setuptools), "")
+        self.assertEqual(
+            builder.source_build_requirements(antlr + setuptools), setuptools
+        )
+        for invalid in [antlr, antlr.replace("4.9.3", "4.9.4") + setuptools]:
+            with self.assertRaises(builder.BuildError):
+                builder.source_build_requirements(invalid)
+
+    def test_source_package_is_exact_complete_and_never_ambiguous(self):
+        def files(namespace):
+            return [
+                f"machine-learning/{namespace}/{name}"
+                for name in [
+                    "__init__.py",
+                    "native_runtime.py",
+                    "native_qualification.py",
+                ]
+            ]
+
+        for namespace in ["immich_ml", "frameleaf_ml"]:
+            self.assertEqual(builder.source_package(files(namespace)), namespace)
+        for invalid in [
+            [],
+            files("foreign"),
+            files("frameleaf_ml")[:-1],
+            files("frameleaf_ml") + files("immich_ml"),
+        ]:
+            with self.assertRaises(builder.BuildError):
+                builder.source_package(invalid)
+
+    def test_manifest_binds_only_supported_module_namespaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "python").write_bytes(b"fixture")
+            for namespace in ["immich_ml", "frameleaf_ml"]:
+                result = builder.manifest(
+                    root,
+                    "python",
+                    "a" * 40,
+                    7,
+                    "macos",
+                    "aarch64",
+                    "CPUExecutionProvider",
+                    namespace,
+                )
+                self.assertEqual(result.get("moduleNamespace", "immich_ml"), namespace)
+                self.assertEqual(
+                    "moduleNamespace" in result, namespace == "frameleaf_ml"
+                )
+            with self.assertRaises(builder.BuildError):
+                builder.manifest(
+                    root,
+                    "python",
+                    "a" * 40,
+                    7,
+                    "macos",
+                    "aarch64",
+                    "CPUExecutionProvider",
+                    "foreign",
+                )
+
     def test_coreml_manifest_is_limited_to_apple_silicon_macos(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

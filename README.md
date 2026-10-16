@@ -48,6 +48,9 @@ The native Rust supervisor accepts an installed runtime only after verifying its
 Ed25519 signature against application-trusted keys, release epoch, OS/architecture,
 protocol, and complete SHA-256 file inventory. The signed manifest identifies the
 private Python executable, selected provider and exact Frameleaf server source revision.
+New packs also bind `moduleNamespace` to `frameleaf_ml` or `immich_ml`. Older manifests
+retain the `immich_ml` default. The builder reads exactly one complete package from
+the pinned source revision and checks both native entry points after relocation.
 Links, unexpected files, changed bytes and ambiguous paths are refused. Runtime files
 are checked again before launch and after qualification. The manifest and detached
 signature are stored outside the pack inventory.
