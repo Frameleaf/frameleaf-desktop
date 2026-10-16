@@ -898,3 +898,137 @@ mod tests {
         assert_eq!(status.code(), Some(125));
     }
 }
+
+#[cfg(test)]
+mod accepted_qualification_tests {
+    use super::*;
+    use crate::{
+        ml_transport::AcceptedQualification, model_catalogue::approved_profile, worker::SavedWorker,
+    };
+    use serde_json::{json, Value};
+    const AT: i64 = 1_792_094_400_000;
+    fn fixture() -> (
+        crate::model_catalogue::ApprovedProfile,
+        QualifiedRuntime,
+        Value,
+        SavedWorker,
+    ) {
+        let catalogue: Value =
+            serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+        let p = &catalogue["profiles"][0];
+        let profile = approved_profile(
+            p["modelName"].as_str().unwrap(),
+            &p["spec"]["entries"],
+            p["runtimeSourceRevision"].as_str().unwrap(),
+            p["spec"]["provider"].as_str().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let data: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/accepted-qualification.json"
+        ))
+        .unwrap();
+        let response = data["response"].clone();
+        let mut report = data["report"].clone();
+        report["coldMilliseconds"] = json!(120.0);
+        let qualified = QualifiedRuntime {
+            spec: profile
+                .challenge(response["id"].as_str().unwrap())
+                .unwrap()
+                .0,
+            report,
+            manifest_sha256: "a".repeat(64),
+        };
+        let worker: SavedWorker = serde_json::from_value(json!({"serverId":"server","accountId":"account","deviceId":"445bc2b6-f4cd-439e-b8bb-7e84d7ee0550","sessionId":"1117c1ca-0495-46e9-b579-f321520c2b1a","authorizationEpoch":2,"workerToken":"a".repeat(64),"expiresAt":"2026-10-15T22:00:00Z","nextSequence":1})).unwrap();
+        (profile, qualified, response, worker)
+    }
+    #[test]
+    fn accepted_evidence_binds_local_runtime_and_survives_only_ordinary_token_renewal() {
+        let (profile, qualified, response, mut worker) = fixture();
+        let grant = AcceptedQualification::bind(
+            &worker,
+            &profile,
+            &qualified,
+            &serde_json::to_vec(&response).unwrap(),
+            AT,
+        )
+        .unwrap();
+        assert_eq!(grant.id(), response["id"].as_str().unwrap());
+        worker.worker_token = "b".repeat(64);
+        worker.next_sequence = 9;
+        assert!(grant.validate_authority(&worker, AT).is_ok());
+        for (field, value) in [
+            ("serverId", json!("other")),
+            ("accountId", json!("other")),
+            ("deviceId", json!("other")),
+            ("sessionId", json!("other")),
+            ("authorizationEpoch", json!(3)),
+        ] {
+            let mut changed = serde_json::to_value(&worker).unwrap();
+            changed[field] = value;
+            assert!(grant
+                .validate_authority(&serde_json::from_value(changed).unwrap(), AT)
+                .is_err());
+        }
+        assert!(grant.validate_authority(&worker, AT + 3_600_000).is_err());
+        assert!(grant.validate_runtime(&qualified, AT).is_ok());
+        let config: Value = serde_json::from_slice(qualified.specification()).unwrap();
+        let task_wire = json!({"id":"ff8f1290-3c1d-4695-8696-af493be01fe0","taskId":"c39d4385-84f8-4c37-a643-1b98fc12df93",
+            "deviceId":worker.device_id,"sessionId":worker.session_id,"authorizationEpoch":2,"generation":1,
+            "qualificationId":response["id"],"qualificationExpiresAt":response["expiresAt"],"modelKey":response["modelKey"],
+            "configJson":serde_json::to_string(&config["entries"]).unwrap(),"configSha256":response["configSha256"],
+            "inputSha256":"b".repeat(64),"inputKind":"text","maxInputBytes":1024,"expiresAt":"2026-10-15T20:01:00Z","executionDeadline":"2026-10-15T20:03:00Z"});
+        let task = serde_json::from_value(task_wire.clone()).unwrap();
+        assert!(grant.validate_task(&worker, &task, AT).is_ok());
+        for (field, value) in [
+            (
+                "qualificationId",
+                json!("c39d4385-84f8-4c37-a643-1b98fc12df93"),
+            ),
+            ("qualificationExpiresAt", json!("2026-10-15T21:00:01Z")),
+            ("inputKind", json!("image")),
+            ("configSha256", json!("c".repeat(64))),
+        ] {
+            let mut changed = task_wire.clone();
+            changed[field] = value;
+            assert!(grant
+                .validate_task(&worker, &serde_json::from_value(changed).unwrap(), AT)
+                .is_err());
+        }
+    }
+    #[test]
+    fn accepted_evidence_rejects_altered_runtime_report_model_association_and_lifetime() {
+        let (profile, qualified, response, worker) = fixture();
+        for (field, value) in [
+            ("id", json!("ff8f1290-3c1d-4695-8696-af493be01fe0")),
+            ("modelKey", json!("other")),
+            ("configSha256", json!("b".repeat(64))),
+            ("bindingSha256", json!("b".repeat(64))),
+            ("manifestSha256", json!("b".repeat(64))),
+            ("runtimeFingerprint", json!("b".repeat(64))),
+            ("reportSha256", json!("b".repeat(64))),
+            ("inputKind", json!("image")),
+            ("deviceId", json!("other")),
+            ("sessionId", json!("other")),
+            ("authorizationEpoch", json!(3)),
+            ("qualifiedAt", json!("2026-10-15T20:05:00Z")),
+            ("expiresAt", json!("2026-10-15T21:00:01Z")),
+            ("expiresAt", json!("2026-10-15T19:00:00Z")),
+            ("extra", json!(true)),
+        ] {
+            let mut changed = response.clone();
+            changed[field] = value;
+            assert!(
+                AcceptedQualification::bind(
+                    &worker,
+                    &profile,
+                    &qualified,
+                    &serde_json::to_vec(&changed).unwrap(),
+                    AT
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+}

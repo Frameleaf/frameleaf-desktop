@@ -136,3 +136,5 @@ the server, account, device, session and credential generation. Report submissio
 refuses an expired challenge or a different nonce/runtime. An accepted report is
 stored evidence; automatic orchestration and NAS inference admission remain
 pending.
+
+Accepted runtime evidence is read through the signed worker API and sealed against the compiled profile, local qualified runtime, NAS-canonical report digest, connection association and absolute expiry. Token renewal preserves that association; a new sign-in changes it. Claims now require the exact accepted qualification ID and expiry, and all input/heartbeat/result/failure requests retain that binding. Native startup and execution stop at qualification expiry. Accepted evidence does not by itself enable NAS processing scope.

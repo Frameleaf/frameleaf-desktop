@@ -1,6 +1,6 @@
 //! One scoped NAS job at a time; the owned qualified process is stopped on any execution failure.
 use crate::{
-    ml_transport::{ClaimedTask, InputKind, WorkerFailure, WorkerTransport},
+    ml_transport::{AcceptedQualification, ClaimedTask, InputKind, WorkerFailure, WorkerTransport},
     native_runtime::{NativeSidecar, QualifiedRuntime},
     runtime_store::InstalledRuntime,
     transport,
@@ -31,7 +31,7 @@ fn execution_duration(task: &ClaimedTask) -> Result<Duration, String> {
             .map_err(|_| "worker_deadline_invalid".into())
     };
     let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    let deadline = parse(&task.execution_deadline)?;
+    let deadline = parse(&task.execution_deadline)?.min(parse(&task.qualification_expires_at)?);
     let lease = parse(&task.expires_at)?;
     let remaining = deadline - now;
     if lease <= now || lease > deadline || remaining <= 0 || remaining > 600_000_000_000 {
@@ -162,6 +162,7 @@ async fn race_prediction<T>(
 pub struct NativePredictor {
     child: NativeSidecar,
     client: BoundClient,
+    qualification_id: String,
 }
 struct ActiveExecution<'a> {
     predictor: &'a mut NativePredictor,
@@ -179,15 +180,24 @@ impl NativePredictor {
     pub fn start(
         installed: &InstalledRuntime,
         qualified: &QualifiedRuntime,
+        qualification: &AcceptedQualification,
         cache: &Path,
         private_root: &Path,
         port: u16,
     ) -> Result<Self, String> {
+        qualification.validate_runtime(
+            qualified,
+            (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
+        )?;
         let spec: Value = serde_json::from_slice(qualified.specification())
             .map_err(|_| "worker_model_binding_invalid")?;
         let child = installed.start_qualified_sidecar(qualified, cache, private_root, port)?;
         let client = BoundClient::new(port, child.authorization().into(), &spec)?;
-        Ok(Self { child, client })
+        Ok(Self {
+            child,
+            client,
+            qualification_id: qualification.id().into(),
+        })
     }
     pub fn stop(&mut self) -> Result<(), String> {
         self.child.stop()
@@ -216,13 +226,17 @@ impl NativePredictor {
     pub async fn execute_next(
         &mut self,
         transport: &WorkerTransport,
+        qualification: &AcceptedQualification,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
         let mut active = ActiveExecution {
             predictor: self,
             retain: false,
         };
-        let outcome = active.predictor.execute(transport, cancel).await;
+        let outcome = active
+            .predictor
+            .execute(transport, qualification, cancel)
+            .await;
         if outcome.is_err() {
             active.predictor.stop()?;
         }
@@ -232,11 +246,15 @@ impl NativePredictor {
     async fn execute(
         &mut self,
         transport: &WorkerTransport,
+        qualification: &AcceptedQualification,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
+        if self.qualification_id != qualification.id() {
+            return Err("worker_predictor_qualification_changed".into());
+        }
         self.ready(cancel).await?;
         let task = race_prediction(
-            transport.claim(std::slice::from_ref(&self.client.model_key)),
+            transport.claim(qualification),
             std::future::pending(),
             cancel,
             Duration::from_secs(30),
@@ -247,7 +265,7 @@ impl NativePredictor {
         };
         let result = async {
             let input = race_prediction(
-                transport.input(&task),
+                transport.input(&task, qualification),
                 std::future::pending(),
                 cancel,
                 execution_duration(&task)?,
@@ -257,7 +275,7 @@ impl NativePredictor {
             let lease = async {
                 loop {
                     tokio::time::sleep(Duration::from_secs(20)).await;
-                    if !transport.heartbeat(&mut renewed).await? {
+                    if !transport.heartbeat(&mut renewed, qualification).await? {
                         return Err("worker_lease_lost".into());
                     }
                 }
@@ -273,7 +291,7 @@ impl NativePredictor {
                 return Err("runtime_process_stopped".into());
             }
             let accepted = race_prediction(
-                transport.complete(&task, &value),
+                transport.complete(&task, &value, qualification),
                 std::future::pending(),
                 cancel,
                 Duration::from_secs(30),
@@ -288,7 +306,9 @@ impl NativePredictor {
         if result.is_err() {
             // Terminate inference before waiting for a failed/cancelled lease acknowledgement.
             self.stop()?;
-            let _ = transport.fail(&task, WorkerFailure::InferenceFailed).await;
+            let _ = transport
+                .fail(&task, WorkerFailure::InferenceFailed, qualification)
+                .await;
         }
         result
     }
@@ -319,8 +339,18 @@ mod tests {
     }
     fn task() -> ClaimedTask {
         let config = json!({"clip":{"textual":{"modelName":"fixture"}}}).to_string();
-        serde_json::from_value(json!({"id":"d621bd72-ad35-4199-95ab-76300756a38e","taskId":"c39d4385-84f8-4c37-a643-1b98fc12df93","deviceId":"445bc2b6-f4cd-439e-b8bb-7e84d7ee0550","sessionId":"1117c1ca-0495-46e9-b579-f321520c2b1a","authorizationEpoch":1,"generation":1,"modelKey":"fixture-key","configSha256":format!("{:x}",Sha256::digest(config.as_bytes())),"configJson":config,"inputSha256":format!("{:x}",Sha256::digest("été".as_bytes())),"inputKind":"text","maxInputBytes":1024,"expiresAt":stamp(30),"executionDeadline":stamp(60)})).unwrap()
+        serde_json::from_value(json!({"id":"d621bd72-ad35-4199-95ab-76300756a38e","taskId":"c39d4385-84f8-4c37-a643-1b98fc12df93","deviceId":"445bc2b6-f4cd-439e-b8bb-7e84d7ee0550","sessionId":"1117c1ca-0495-46e9-b579-f321520c2b1a","authorizationEpoch":1,"generation":1,"modelKey":"fixture-key","configSha256":format!("{:x}",Sha256::digest(config.as_bytes())),"configJson":config,"inputSha256":format!("{:x}",Sha256::digest("été".as_bytes())),"inputKind":"text","maxInputBytes":1024,"expiresAt":stamp(30),"qualificationId":"ff8f1290-3c1d-4695-8696-af493be01fe0","qualificationExpiresAt":stamp(120),"executionDeadline":stamp(60)})).unwrap()
     }
+    #[test]
+    fn execution_stops_at_qualification_expiry_even_with_a_later_task_deadline() {
+        let mut task = task();
+        task.qualification_expires_at = stamp(5);
+        task.expires_at = stamp(2);
+        assert!(execution_duration(&task).unwrap() <= Duration::from_secs(5));
+        task.qualification_expires_at = stamp(-1);
+        assert!(execution_duration(&task).is_err());
+    }
+
     fn client(port: u16) -> BoundClient {
         BoundClient::new(port, "a".repeat(64), &json!({"modelKey":"fixture-key","entries":{"clip":{"textual":{"modelName":"fixture"}}},"fixtureKind":"text"})).unwrap()
     }
@@ -586,6 +616,7 @@ mod tests {
         let mut predictor = NativePredictor {
             child,
             client: client(19998),
+            qualification_id: "fixture".into(),
         };
         assert!(predictor.child.is_running().unwrap());
         let mut future = Box::pin(async {

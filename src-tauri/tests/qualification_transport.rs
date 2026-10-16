@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::{
-    ml_transport::QualificationChallenge,
+    ml_transport::{AcceptedQualification, QualificationChallenge},
     model_catalogue::{approved_profile, ApprovedProfile},
     runtime_store::{InstalledRuntime, RuntimeStore},
 };
@@ -201,6 +201,41 @@ fn actual_factory_runtime_qualifies_the_bound_challenge_and_refuses_nonce_replay
         .validate_submission(&worker(), &qualified, clock())
         .unwrap();
     assert_eq!(qualified.report()["state"], "ready-cpu");
+    let accepted_at = time::OffsetDateTime::now_utc();
+    let expiry = accepted_at + time::Duration::hours(1);
+    let stamp = |date: time::OffsetDateTime| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            date.year(),
+            date.month() as u8,
+            date.day(),
+            date.hour(),
+            date.minute(),
+            date.second()
+        )
+    };
+    let spec: Value = serde_json::from_slice(&spec).unwrap();
+    let accepted = json!({"id":id,"deviceId":worker().device_id,"sessionId":worker().session_id,"authorizationEpoch":2,
+        "modelKey":p.model_key(),"configSha256":format!("{:x}",Sha256::digest(serde_json_canonicalizer::to_vec(&spec["entries"]).unwrap())),
+        "inputKind":"text","bindingSha256":wire["bindingSha256"],"manifestSha256":attestation.manifest_sha256(),
+        "runtimeFingerprint":qualified.report()["runtimeFingerprint"],"reportSha256":format!("{:x}",Sha256::digest(serde_json_canonicalizer::to_vec(qualified.report()).unwrap())),
+        "qualifiedAt":stamp(accepted_at),"expiresAt":stamp(expiry)});
+    let accepted = AcceptedQualification::bind(
+        &worker(),
+        &p,
+        &qualified,
+        &serde_json::to_vec(&accepted).unwrap(),
+        clock(),
+    )
+    .unwrap();
+    accepted.validate_runtime(&qualified, clock()).unwrap();
+    let mut renewed = worker();
+    renewed.worker_token = "b".repeat(64);
+    accepted.validate_authority(&renewed, clock()).unwrap();
+    assert!(accepted
+        .validate_runtime(&qualified, clock() + 3_600_000)
+        .is_err());
+
     let mut other = wire;
     let id2 = Uuid::new_v4().to_string();
     let (spec2, _) = p.challenge(&id2).unwrap();

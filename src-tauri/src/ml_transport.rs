@@ -50,12 +50,15 @@ impl ChallengeAuthority {
             credential_sha256: hash(worker.worker_token.as_bytes()),
         }
     }
-    fn matches(&self, worker: &SavedWorker) -> bool {
+    fn matches_association(&self, worker: &SavedWorker) -> bool {
         self.server_id == worker.server_id
             && self.account_id == worker.account_id
             && self.device_id == worker.device_id
             && self.session_id == worker.session_id
             && self.authorization_epoch == worker.authorization_epoch
+    }
+    fn matches(&self, worker: &SavedWorker) -> bool {
+        self.matches_association(worker)
             && self.credential_sha256 == hash(worker.worker_token.as_bytes())
     }
 }
@@ -158,6 +161,140 @@ impl QualificationChallenge {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcceptedResponse {
+    id: String,
+    device_id: String,
+    session_id: String,
+    authorization_epoch: u32,
+    model_key: String,
+    config_sha256: String,
+    input_kind: InputKind,
+    binding_sha256: String,
+    manifest_sha256: String,
+    runtime_fingerprint: String,
+    report_sha256: String,
+    qualified_at: String,
+    expires_at: String,
+}
+fn canonical_hash(value: &serde_json::Value) -> Result<String, String> {
+    serde_json_canonicalizer::to_vec(value)
+        .map(|bytes| hash(&bytes))
+        .map_err(|_| "worker_qualification_invalid".into())
+}
+/// Accepted runtime evidence, never a renderer-supplied grant or a promise of processing scope.
+/// ```compile_fail
+/// let _: frameleaf_desktop::ml_transport::AcceptedQualification = serde_json::from_str("{}").unwrap();
+/// ```
+pub struct AcceptedQualification {
+    authority: ChallengeAuthority,
+    id: String,
+    model_key: String,
+    config_sha256: String,
+    input_kind: InputKind,
+    binding_sha256: String,
+    manifest_sha256: String,
+    runtime_fingerprint: String,
+    report_sha256: String,
+    expires_at: i64,
+}
+impl AcceptedQualification {
+    pub fn bind(
+        worker: &SavedWorker,
+        profile: &ApprovedProfile,
+        qualified: &QualifiedRuntime,
+        raw: &[u8],
+        at: i64,
+    ) -> Result<Self, String> {
+        if raw.is_empty() || raw.len() > 65_536 {
+            return Err("worker_qualification_invalid".into());
+        }
+        let response: AcceptedResponse =
+            serde_json::from_slice(raw).map_err(|_| "worker_qualification_invalid")?;
+        let (spec, _) = profile.challenge(&response.id)?;
+        let specification: serde_json::Value =
+            serde_json::from_slice(&spec).map_err(|_| "worker_qualification_invalid")?;
+        let expires_at = millis(&response.expires_at)?;
+        let qualified_at = millis(&response.qualified_at)?;
+        if response.device_id != worker.device_id
+            || response.session_id != worker.session_id
+            || response.authorization_epoch != worker.authorization_epoch
+            || response.model_key != profile.model_key()
+            || spec != qualified.specification()
+            || response.config_sha256 != canonical_hash(&specification["entries"])?
+            || serde_json::to_value(&response.input_kind)
+                .map_err(|_| "worker_qualification_invalid")?
+                != specification["fixtureKind"]
+            || response.binding_sha256 != hash(&spec)
+            || response.manifest_sha256 != qualified.manifest_sha256()
+            || qualified.report()["runtimeFingerprint"] != response.runtime_fingerprint
+            || response.report_sha256 != canonical_hash(qualified.report())?
+            || qualified_at > at + 120_000
+            || expires_at <= at
+            || expires_at <= qualified_at
+            || expires_at > qualified_at + 3_600_000
+        {
+            return Err("worker_qualification_invalid".into());
+        }
+        let accepted = Self {
+            authority: ChallengeAuthority::from_worker(worker),
+            id: response.id,
+            model_key: response.model_key,
+            config_sha256: response.config_sha256,
+            input_kind: response.input_kind,
+            binding_sha256: response.binding_sha256,
+            manifest_sha256: response.manifest_sha256,
+            runtime_fingerprint: response.runtime_fingerprint,
+            report_sha256: response.report_sha256,
+            expires_at,
+        };
+        accepted.validate_authority(worker, at)?;
+        Ok(accepted)
+    }
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn validate_authority(&self, worker: &SavedWorker, at: i64) -> Result<(), String> {
+        // Accepted evidence survives token renewal; a new sign-in replaces the session UUID.
+        if !self.authority.matches_association(worker)
+            || at >= self.expires_at
+            || millis(&worker.expires_at)? <= at
+        {
+            return Err("worker_qualification_association_changed_or_expired".into());
+        }
+        Ok(())
+    }
+    pub fn validate_runtime(&self, qualified: &QualifiedRuntime, at: i64) -> Result<(), String> {
+        if at >= self.expires_at
+            || qualified.manifest_sha256() != self.manifest_sha256
+            || hash(qualified.specification()) != self.binding_sha256
+            || qualified.report()["runtimeFingerprint"] != self.runtime_fingerprint
+            || canonical_hash(qualified.report())? != self.report_sha256
+        {
+            return Err("worker_qualified_runtime_changed_or_expired".into());
+        }
+        Ok(())
+    }
+    pub fn validate_task(
+        &self,
+        worker: &SavedWorker,
+        task: &ClaimedTask,
+        at: i64,
+    ) -> Result<(), String> {
+        self.validate_authority(worker, at)?;
+        task.validate_result_at(worker, std::slice::from_ref(&self.model_key), at)?;
+        if task.qualification_id != self.id
+            || millis(&task.qualification_expires_at)? != self.expires_at
+            || task.config_sha256 != self.config_sha256
+            || task.input_kind != self.input_kind
+        {
+            return Err("worker_task_qualification_changed".into());
+        }
+        Ok(())
+    }
+}
+
 const MAX_INPUT: usize = 16 * 1024 * 1024;
 fn millis(value: &str) -> Result<i64, String> {
     OffsetDateTime::parse(value, &Rfc3339)
@@ -183,6 +320,8 @@ pub struct ClaimedTask {
     pub session_id: String,
     pub authorization_epoch: u32,
     pub generation: u32,
+    pub qualification_id: String,
+    pub qualification_expires_at: String,
     pub model_key: String,
     pub config_json: String,
     pub config_sha256: String,
@@ -192,7 +331,7 @@ pub struct ClaimedTask {
     pub expires_at: String,
     pub execution_deadline: String,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InputKind {
     Text,
@@ -219,6 +358,7 @@ impl ClaimedTask {
     ) -> Result<(), String> {
         let expires = millis(&self.expires_at)?;
         let deadline = millis(&self.execution_deadline)?;
+        let qualification_expiry = millis(&self.qualification_expires_at)?;
         let config: serde_json::Value =
             serde_json::from_str(&self.config_json).map_err(|_| "worker_config_invalid")?;
         if self.device_id != saved.device_id
@@ -226,6 +366,9 @@ impl ClaimedTask {
             || self.authorization_epoch != saved.authorization_epoch
             || Uuid::parse_str(&self.id).is_err()
             || Uuid::parse_str(&self.task_id).is_err()
+            || Uuid::parse_str(&self.qualification_id).is_err()
+            || qualification_expiry <= now
+            || qualification_expiry < expires
             || self.generation == 0
             || self.generation > 2_147_483_647
             || self.model_key.len() > 256
@@ -250,7 +393,10 @@ impl ClaimedTask {
     }
     pub fn renew_lease(&mut self, expires_at: &str, now: i64) -> Result<(), String> {
         let expires = millis(expires_at)?;
-        if expires <= now || expires > millis(&self.execution_deadline)? {
+        if expires <= now
+            || expires > millis(&self.execution_deadline)?
+            || expires > millis(&self.qualification_expires_at)?
+        {
             return Err("worker_lease_invalid".into());
         }
         self.expires_at = expires_at.into();
@@ -422,25 +568,61 @@ impl WorkerTransport {
         Ok(transport::json::<Ack>(response).await?.accepted)
     }
 
-    pub async fn claim(&self, qualified: &[String]) -> Result<Option<ClaimedTask>, String> {
-        if qualified.len() > 64 || qualified.iter().any(|m| m.is_empty() || m.len() > 256) {
-            return Err("worker_model_scope_invalid".into());
-        }
-        let payload =
-            serde_json::to_string(&serde_json::json!({"modelKeys":qualified,"waitMs":20000}))
-                .map_err(|_| "worker_payload_invalid")?;
+    pub async fn read_accepted_qualification(
+        &self,
+        profile: &ApprovedProfile,
+        qualified: &QualifiedRuntime,
+        id: &str,
+    ) -> Result<AcceptedQualification, String> {
+        profile.challenge(id)?;
         let mut connection = self.0.lock().await;
+        let response = connection
+            .request(
+                Method::GET,
+                &format!("api/desktop/worker/qualifications/{id}"),
+                &format!("accepted-qualification:{id}"),
+                "",
+            )
+            .await?;
+        let value: serde_json::Value = transport::json_limit(response, 65_536).await?;
+        let raw = serde_json::to_vec(&value).map_err(|_| "worker_qualification_invalid")?;
+        let accepted =
+            AcceptedQualification::bind(&connection.worker, profile, qualified, &raw, now()?)?;
+        if accepted.id() != id {
+            return Err("worker_qualification_invalid".into());
+        }
+        Ok(accepted)
+    }
+
+    pub async fn claim(
+        &self,
+        qualification: &AcceptedQualification,
+    ) -> Result<Option<ClaimedTask>, String> {
+        let payload =
+            serde_json::json!({"modelKeys":[qualification.model_key],"waitMs":20000}).to_string();
+        let mut connection = self.0.lock().await;
+        qualification.validate_authority(&connection.worker, now()?)?;
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
             .await?;
         let claim: ClaimResponse = transport::json_limit(response, 256 * 1024).await?;
         if let Some(task) = &claim.task {
-            task.validate_at(&connection.worker, qualified, now()?)?;
+            qualification.validate_task(&connection.worker, task, now()?)?;
+            task.validate_at(
+                &connection.worker,
+                std::slice::from_ref(&qualification.model_key),
+                now()?,
+            )?;
         }
         Ok(claim.task)
     }
-    pub async fn input(&self, task: &ClaimedTask) -> Result<Vec<u8>, String> {
+    pub async fn input(
+        &self,
+        task: &ClaimedTask,
+        qualification: &AcceptedQualification,
+    ) -> Result<Vec<u8>, String> {
         let mut connection = self.0.lock().await;
+        qualification.validate_task(&connection.worker, task, now()?)?;
         task.validate_at(
             &connection.worker,
             std::slice::from_ref(&task.model_key),
@@ -480,6 +662,7 @@ impl WorkerTransport {
     async fn acknowledge(
         &self,
         task: &ClaimedTask,
+        qualification: &AcceptedQualification,
         path: &str,
         operation: &str,
         payload: String,
@@ -488,6 +671,7 @@ impl WorkerTransport {
             return Err("worker_result_too_large".into());
         }
         let mut connection = self.0.lock().await;
+        qualification.validate_task(&connection.worker, task, now()?)?;
         task.validate_result_at(
             &connection.worker,
             std::slice::from_ref(&task.model_key),
@@ -498,10 +682,15 @@ impl WorkerTransport {
             .await?;
         transport::json::<Ack>(response).await
     }
-    pub async fn heartbeat(&self, task: &mut ClaimedTask) -> Result<bool, String> {
+    pub async fn heartbeat(
+        &self,
+        task: &mut ClaimedTask,
+        qualification: &AcceptedQualification,
+    ) -> Result<bool, String> {
         let ack = self
             .acknowledge(
                 task,
+                qualification,
                 "api/desktop/worker/heartbeat",
                 "heartbeat",
                 serde_json::json!({"id":task.id}).to_string(),
@@ -519,12 +708,14 @@ impl WorkerTransport {
         &self,
         task: &ClaimedTask,
         result: &serde_json::Value,
+        qualification: &AcceptedQualification,
     ) -> Result<bool, String> {
         if !result.is_object() {
             return Err("worker_result_invalid".into());
         }
         self.acknowledge(
             task,
+            qualification,
             &format!("api/desktop/tasks/{}/result", task.id),
             &format!("result:{}", task.id),
             serde_json::json!({"result":result}).to_string(),
@@ -532,9 +723,15 @@ impl WorkerTransport {
         .await
         .map(|ack| ack.accepted)
     }
-    pub async fn fail(&self, task: &ClaimedTask, code: WorkerFailure) -> Result<bool, String> {
+    pub async fn fail(
+        &self,
+        task: &ClaimedTask,
+        code: WorkerFailure,
+        qualification: &AcceptedQualification,
+    ) -> Result<bool, String> {
         self.acknowledge(
             task,
+            qualification,
             &format!("api/desktop/tasks/{}/fail", task.id),
             &format!("fail:{}", task.id),
             serde_json::json!({"code":code}).to_string(),
