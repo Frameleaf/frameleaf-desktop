@@ -95,6 +95,78 @@ fn stamp(meta: &Metadata) -> Result<String, String> {
     };
     Ok(format!("{}:{modified}:{extra}", meta.len()))
 }
+fn opened_stamp(file: &cap_std::fs::File) -> Result<String, String> {
+    let value = stamp(&file.metadata().map_err(|_| "source_identity_unavailable")?)?;
+    #[cfg(unix)]
+    {
+        Ok(value)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        };
+        // ReFS identity needs all 128 bits; a legacy 64-bit file index can collide.
+        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::zeroed();
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err("source_identity_unavailable".into());
+        }
+        let info = unsafe { info.assume_init() };
+        let id: String = info
+            .FileId
+            .Identifier
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(format!(
+            "{value}:file-id-v2:{}:{id}",
+            info.VolumeSerialNumber
+        ))
+    }
+}
+fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        let _ = (dir, relative);
+        stamp(expected)
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES,
+        };
+        // Capture identity without reading or recalling original data before capacity admission.
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(7)
+            .custom_flags(
+                FILE_FLAG_OPEN_NO_RECALL
+                    | FILE_FLAG_OPEN_REPARSE_POINT
+                    | FILE_FLAG_BACKUP_SEMANTICS,
+            );
+        let file = dir
+            .open_with(relative, &options)
+            .map_err(|_| "source_identity_unavailable")?;
+        let meta = file.metadata().map_err(|_| "source_identity_unavailable")?;
+        if !meta.is_file() || link(&meta) || stamp(&meta)? != stamp(expected)? {
+            return Err("source_item_changed".into());
+        }
+        opened_stamp(&file)
+    }
+}
 fn root_identity(dir: &Dir) -> Result<String, String> {
     #[cfg(unix)]
     {
@@ -368,6 +440,7 @@ impl CopyApproval {
         if before.len() > self.scope.max_item_bytes {
             return Err("source_copy_budget_exceeded".into());
         }
+        let source_stamp = path_stamp(&dir, relative_path, &before)?;
         let staging = Dir::open_ambient_dir(destination, ambient_authority())
             .map_err(|_| "source_stage_unavailable")?;
         // Unknown residency reserves a full original; pinning and allocated blocks are not proof.
@@ -391,9 +464,8 @@ impl CopyApproval {
         let mut source = dir
             .open_with(relative_path, &options)
             .map_err(|_| "source_item_unavailable")?;
-        let source_stamp = stamp(&before)?;
         let opened = source.metadata().map_err(|_| "source_item_unavailable")?;
-        if !opened.is_file() || link(&opened) || stamp(&opened)? != source_stamp {
+        if !opened.is_file() || link(&opened) || opened_stamp(&source)? != source_stamp {
             return Err("source_item_changed".into());
         }
         let id = stage_id.to_string();
@@ -735,8 +807,10 @@ fn unchanged(
     copied: u64,
 ) -> Result<(), String> {
     if copied != expected
-        || stamp(&source.metadata().map_err(|_| "source_item_changed")?)? != before
-        || stamp(
+        || opened_stamp(source)? != before
+        || path_stamp(
+            dir,
+            relative,
             &dir.symlink_metadata(relative)
                 .map_err(|_| "source_item_changed")?,
         )? != before
@@ -798,6 +872,70 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opened_source_identity_survives_reopen_and_distinguishes_another_file() {
+        let path = std::env::temp_dir().join(format!("frameleaf-identity-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let cleanup = Partial(Some(path.clone()));
+        fs::write(path.join("first.jpg"), b"original").unwrap();
+        fs::write(path.join("second.jpg"), b"replaced").unwrap();
+        let dir = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
+        let first = dir.open("first.jpg").unwrap();
+        let second = dir.open("second.jpg").unwrap();
+        #[cfg(windows)]
+        {
+            use cap_std::fs::MetadataExt;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{Foundation::FILETIME, Storage::FileSystem::SetFileTime};
+            let meta = first.metadata().unwrap();
+            let time = |value: u64| FILETIME {
+                dwLowDateTime: value as u32,
+                dwHighDateTime: (value >> 32) as u32,
+            };
+            let writable = fs::OpenOptions::new()
+                .write(true)
+                .open(path.join("second.jpg"))
+                .unwrap();
+            assert_ne!(
+                unsafe {
+                    SetFileTime(
+                        writable.as_raw_handle(),
+                        &time(meta.creation_time()),
+                        std::ptr::null(),
+                        &time(meta.last_write_time()),
+                    )
+                },
+                0
+            );
+            drop(writable);
+            assert_eq!(
+                stamp(&first.metadata().unwrap()).unwrap(),
+                stamp(&second.metadata().unwrap()).unwrap()
+            );
+        }
+        let before = opened_stamp(&first).unwrap();
+        assert_eq!(
+            before,
+            path_stamp(&dir, Path::new("first.jpg"), &first.metadata().unwrap()).unwrap()
+        );
+        unchanged(&dir, Path::new("first.jpg"), &first, &before, 8, 8).unwrap();
+        assert_eq!(
+            before,
+            opened_stamp(&dir.open("first.jpg").unwrap()).unwrap()
+        );
+        assert_ne!(before, opened_stamp(&second).unwrap());
+        #[cfg(unix)]
+        assert_eq!(before, stamp(&first.metadata().unwrap()).unwrap());
+        fs::rename(path.join("second.jpg"), path.join("first.jpg")).unwrap();
+        assert_eq!(
+            unchanged(&dir, Path::new("first.jpg"), &first, &before, 8, 8).unwrap_err(),
+            "source_item_changed"
+        );
+        drop(first);
+        drop(second);
+        drop(dir);
+        drop(cleanup);
+    }
     #[test]
     fn stage_release_removes_only_owned_files_and_is_retryable() {
         let path = std::env::temp_dir().join(format!("frameleaf-release-{}", Uuid::new_v4()));
