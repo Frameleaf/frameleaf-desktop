@@ -122,7 +122,14 @@ def manifest(
         or not 1 <= epoch < 2**63
         or system not in {"macos", "windows", "linux"}
         or architecture not in {"aarch64", "x86_64"}
-        or provider != "CPUExecutionProvider"
+        or not (
+            provider == "CPUExecutionProvider"
+            or (
+                provider == "CoreMLExecutionProvider"
+                and system == "macos"
+                and architecture == "aarch64"
+            )
+        )
     ):
         raise BuildError("runtime_manifest_invalid")
     files = inventory(root)

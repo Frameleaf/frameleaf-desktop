@@ -18,9 +18,13 @@ export async function packageConfiguration(candidate, policy) {
   const profiles = JSON.parse(
     await readFile(join(root, "runtime/profiles.json"), "utf8"),
   );
-  if (
-    manifest.sourceRevision !== profiles.profiles?.["cpu-ort"]?.sourceRevision
-  )
+  const approved = Object.values(profiles.profiles ?? {}).filter(
+    (profile) =>
+      profile.provider === manifest.provider &&
+      profile.sourceRevision === manifest.sourceRevision &&
+      profile.targets?.includes(`${platform}-${architecture}`),
+  );
+  if (profiles.schemaVersion !== 1 || approved.length !== 1)
     throw new Error("runtime_bundle_source_unapproved");
   return {
     bundle: {

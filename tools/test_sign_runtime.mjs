@@ -96,6 +96,80 @@ test("signs exact verified manifest bytes with only the configured release autho
   );
 });
 
+test("signs only the declared CoreML Apple-silicon profile and binds its provenance", async (t) => {
+  const f = await fixture(t);
+  const provenance = JSON.parse(
+    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
+  );
+  provenance.profile = "coreml-ort";
+  const authored = JSON.parse(
+    await readFile(
+      new URL("../runtime/profiles.json", import.meta.url),
+      "utf8",
+    ),
+  ).profiles["coreml-ort"];
+  provenance.sourceRevision = authored.sourceRevision;
+  const bytes = Buffer.from(JSON.stringify(provenance));
+  await writeFile(join(f.root, "payload/provenance.json"), bytes);
+  f.manifest.files["provenance.json"] = {
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+  Object.assign(f.manifest, {
+    provider: "CoreMLExecutionProvider",
+    platform: "macos",
+    architecture: "aarch64",
+    sourceRevision: authored.sourceRevision,
+  });
+  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+  await signCandidate(
+    f.root,
+    join(f.root, "manifest.sig"),
+    f.privatePem,
+    f.policy,
+  );
+  assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    const config = await packageConfiguration(f.root, f.policy);
+    assert.equal(
+      config.bundle.resources[join(f.root, "payload")],
+      "native-runtime/payload",
+    );
+  } else {
+    await assert.rejects(
+      packageConfiguration(f.root, f.policy),
+      /runtime_bundle_target_mismatch/,
+    );
+  }
+});
+
+test("rejects CoreML on other targets and mismatched CPU provenance", async (t) => {
+  for (const [platform, architecture] of [
+    ["windows", "x86_64"],
+    ["linux", "aarch64"],
+    ["macos", "x86_64"],
+    ["macos", "aarch64"],
+  ]) {
+    const f = await fixture(t);
+    Object.assign(f.manifest, {
+      provider: "CoreMLExecutionProvider",
+      platform,
+      architecture,
+    });
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    await assert.rejects(
+      signCandidate(
+        f.root,
+        join(f.root, "manifest.sig"),
+        f.privatePem,
+        f.policy,
+      ),
+      /runtime_(manifest|profile|provenance)_/,
+    );
+  }
+});
+
 test("changed payload, wrong key, extra files and rollback never receive a signature", async (t) => {
   const f = await fixture(t);
   const output = join(f.root, "manifest.sig");

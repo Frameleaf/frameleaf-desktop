@@ -194,7 +194,6 @@ async function checkedCandidate(candidate, trust, signature) {
     manifest.epoch < trust.minimumRuntimeEpoch ||
     !["macos", "linux", "windows"].includes(manifest.platform) ||
     !["aarch64", "x86_64"].includes(manifest.architecture) ||
-    manifest.provider !== "CPUExecutionProvider" ||
     !/^[a-f0-9]{40}$/.test(manifest.sourceRevision) ||
     !manifest.files ||
     Array.isArray(manifest.files)
@@ -203,14 +202,15 @@ async function checkedCandidate(candidate, trust, signature) {
   const profiles = JSON.parse(
     await boundedFile(fileURLToPath(profilesPath), 16384),
   );
-  const profile = profiles.profiles?.["cpu-ort"];
-  if (
-    profiles.schemaVersion !== 1 ||
-    !profile ||
-    profile.provider !== manifest.provider ||
-    !profile.targets.includes(`${manifest.platform}-${manifest.architecture}`)
-  )
+  const matches = Object.entries(profiles.profiles ?? {}).filter(
+    ([, profile]) =>
+      profile.provider === manifest.provider &&
+      Array.isArray(profile.targets) &&
+      profile.targets.includes(`${manifest.platform}-${manifest.architecture}`),
+  );
+  if (profiles.schemaVersion !== 1 || matches.length !== 1)
     fail("runtime_profile_unapproved");
+  const [profileName, profile] = matches[0];
   relative(manifest.python);
   if (!Object.hasOwn(manifest.files, manifest.python))
     fail("runtime_manifest_invalid");
@@ -222,7 +222,7 @@ async function checkedCandidate(candidate, trust, signature) {
     provenance.schemaVersion !== 1 ||
     provenance.sourceRepository !== "Frameleaf/frameleaf-app" ||
     provenance.sourceRevision !== manifest.sourceRevision ||
-    provenance.profile !== "cpu-ort" ||
+    provenance.profile !== profileName ||
     provenance.python !== profile.python
   )
     fail("runtime_provenance_invalid");

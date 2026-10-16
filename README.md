@@ -187,3 +187,18 @@ or enter the existing reconnect path. Member desktop processing requires explici
 administrator approval in the account’s Security tab. The member then selects Check approval in Desktop to securely
 re-enroll. Removing approval invalidates existing worker sessions and grants;
 automatic administrator consent does not become member permission after demotion.
+
+### CoreML candidate packs
+
+The runtime builder accepts `--profile coreml-ort` for native Apple-silicon macOS
+authoring. The profile uses the pinned ONNX Runtime macOS package and source
+revision. Signing binds the declared profile to its provider, target and payload
+provenance; packaging also checks its approved source revision. CPU remains the
+default profile.
+
+CoreML model processing remains gated on output conformance, actual device
+execution and measured benefit. The approved model catalogue and runtime report
+validators retain that gate. CoreML can choose CPU, GPU or Neural Engine execution;
+provider registration and a compute plan alone cannot establish acceleration.
+See the [ONNX Runtime CoreML provider options](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html)
+and [Apple's runtime performance instruments](https://developer.apple.com/documentation/CoreAI/analyzing-model-runtime-performance-with-instruments).

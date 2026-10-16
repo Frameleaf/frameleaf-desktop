@@ -11,6 +11,36 @@ spec.loader.exec_module(builder)
 
 
 class RuntimeBuilderTests(unittest.TestCase):
+    def test_coreml_manifest_is_limited_to_apple_silicon_macos(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "python").write_bytes(b"fixture")
+            value = builder.manifest(
+                root,
+                "python",
+                "a" * 40,
+                7,
+                "macos",
+                "aarch64",
+                "CoreMLExecutionProvider",
+            )
+            self.assertEqual(value["provider"], "CoreMLExecutionProvider")
+            for system, architecture in [
+                ("windows", "x86_64"),
+                ("linux", "aarch64"),
+                ("macos", "x86_64"),
+            ]:
+                with self.assertRaises(builder.BuildError):
+                    builder.manifest(
+                        root,
+                        "python",
+                        "a" * 40,
+                        7,
+                        system,
+                        architecture,
+                        "CoreMLExecutionProvider",
+                    )
+
     def test_inventory_is_stable_and_binds_every_byte(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
