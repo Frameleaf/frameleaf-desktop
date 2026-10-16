@@ -348,7 +348,9 @@ Windows metadata probes request attributes only, bypass reparse processing and
 request no recall. Windows preview roots and named child directories now use a
 source-specific opener: only disk/share anchors are ambient, named components
 open relative to the parent handle, and directory type plus Cloud Files
-classification are checked before listing rights are requested through ReOpenFile.
+classification are checked before listing rights are requested through a pinned
+directory self-open. Hidden ancestors are traversed without inventorying them;
+privacy exclusions apply to the selected root and its descendants.
 Junctions, symbolic links and unknown reparse types remain excluded. Runtime and
 private staging roots retain their original strict path checks. Windows cloud-root
 copy approval still refuses explicitly until hydration-aware source-version checks

@@ -17,6 +17,7 @@ pub(crate) struct Observation {
     pub availability: Availability,
     pub pinned: bool,
     pub excluded: bool,
+    pub unsupported_reparse: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -60,6 +61,7 @@ fn windows_state(attributes: u32, placeholder: u32) -> Observation {
         availability,
         pinned: attributes & 0x80000 != 0,
         excluded: attributes & (2 | 4) != 0 || (attributes & 0x400 != 0 && !valid_placeholder),
+        unsupported_reparse: attributes & 0x400 != 0 && !valid_placeholder,
     }
 }
 #[cfg(any(target_os = "macos", test))]
@@ -72,6 +74,7 @@ fn mac_state(flags: u32) -> Observation {
         },
         pinned: false,
         excluded: flags & 0x8000 != 0,
+        unsupported_reparse: false,
     }
 }
 pub(crate) fn probe(dir: &Dir, name: &Path, meta: &Metadata) -> Result<Observation, String> {
@@ -179,7 +182,7 @@ pub(crate) fn open_preview_root(path: &Path) -> Result<Dir, String> {
     #[cfg(windows)]
     {
         use std::path::Prefix;
-        let mut parts = path.components();
+        let mut parts = path.components().peekable();
         let Some(Component::Prefix(prefix)) = parts.next() else {
             return Err("source_folder_invalid".into());
         };
@@ -202,16 +205,21 @@ pub(crate) fn open_preview_root(path: &Path) -> Result<Dir, String> {
                 eprintln!("source_preview_anchor_open_os={:?}", _error.raw_os_error());
                 "source_folder_unavailable"
             })?;
-        for part in parts {
+        while let Some(part) = parts.next() {
             if !matches!(part, Component::Normal(_)) {
                 return Err("source_folder_invalid".into());
             }
-            dir = open_preview_child(&dir, Path::new(part.as_os_str()))?;
+            // Ancestors are traversed, never inventoried; privacy exclusions start at the selected root.
+            dir = open_preview_child(&dir, Path::new(part.as_os_str()), parts.peek().is_none())?;
         }
         Ok(dir)
     }
 }
-pub(crate) fn open_preview_child(dir: &Dir, name: &Path) -> Result<Dir, String> {
+pub(crate) fn open_preview_child(
+    dir: &Dir,
+    name: &Path,
+    check_hidden: bool,
+) -> Result<Dir, String> {
     if name.components().count() != 1
         || !matches!(name.components().next(), Some(Component::Normal(_)))
     {
@@ -222,7 +230,12 @@ pub(crate) fn open_preview_child(dir: &Dir, name: &Path) -> Result<Dir, String> 
         let meta = dir
             .symlink_metadata(name)
             .map_err(|_| "source_metadata_unavailable")?;
-        if !meta.is_dir() || meta.is_symlink() || probe(dir, name, &meta)?.excluded {
+        let observation = probe(dir, name, &meta)?;
+        if !meta.is_dir()
+            || meta.is_symlink()
+            || observation.unsupported_reparse
+            || (check_hidden && observation.excluded)
+        {
             return Err("source_folder_excluded".into());
         }
         dir.open_dir(name)
@@ -231,14 +244,9 @@ pub(crate) fn open_preview_child(dir: &Dir, name: &Path) -> Result<Dir, String> 
     #[cfg(windows)]
     {
         use cap_std::fs::{OpenOptions, OpenOptionsExt};
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::{
-            Foundation::INVALID_HANDLE_VALUE,
-            Storage::FileSystem::{
-                ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-                SYNCHRONIZE,
-            },
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
         };
         let flags =
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_OPEN_REPARSE_POINT;
@@ -261,30 +269,34 @@ pub(crate) fn open_preview_child(dir: &Dir, name: &Path) -> Result<Dir, String> 
         let meta = candidate
             .dir_metadata()
             .map_err(|_| "source_metadata_unavailable")?;
-        if !meta.is_dir() || meta.is_symlink() || probe(&candidate, Path::new("."), &meta)?.excluded
+        let observation = probe(&candidate, Path::new("."), &meta)?;
+        if !meta.is_dir()
+            || meta.is_symlink()
+            || observation.unsupported_reparse
+            || (check_hidden && observation.excluded)
         {
             return Err("source_folder_excluded".into());
         }
-        // Reopen the validated object rather than resolving its name again with directory-list rights.
-        let handle = unsafe {
-            ReOpenFile(
-                candidate.as_raw_handle(),
-                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                3,
-                flags,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
+        // cap-std opens `.` as an empty NtCreateFile name relative to this pinned object.
+        options.access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES);
+        let listed = candidate.open_with(".", &options).map_err(|_error| {
             #[cfg(test)]
-            eprintln!(
-                "source_preview_reopen_os={:?}",
-                std::io::Error::last_os_error().raw_os_error()
-            );
-            return Err("source_folder_unavailable".into());
+            eprintln!("source_preview_self_open_os={:?}", _error.raw_os_error());
+            "source_folder_unavailable"
+        })?;
+        let listed = Dir::from_std_file(listed.into_std());
+        let meta = listed
+            .dir_metadata()
+            .map_err(|_| "source_metadata_unavailable")?;
+        let observation = probe(&listed, Path::new("."), &meta)?;
+        if !meta.is_dir()
+            || meta.is_symlink()
+            || observation.unsupported_reparse
+            || (check_hidden && observation.excluded)
+        {
+            return Err("source_folder_excluded".into());
         }
-        Ok(Dir::from_std_file(unsafe {
-            std::fs::File::from_raw_handle(handle)
-        }))
+        Ok(listed)
     }
 }
 
@@ -300,13 +312,48 @@ mod tests {
         std::fs::create_dir(path.join("child")).unwrap();
         let root = std::fs::canonicalize(&path).unwrap();
         let dir = open_preview_root(&root).unwrap();
-        assert!(open_preview_child(&dir, Path::new("photo.jpg")).is_err());
-        assert!(open_preview_child(&dir, Path::new("child")).is_ok());
-        assert!(open_preview_child(&dir, Path::new("..")).is_err());
-        assert!(open_preview_child(&dir, Path::new("child/..")).is_err());
+        assert!(open_preview_child(&dir, Path::new("photo.jpg"), true).is_err());
+        assert!(open_preview_child(&dir, Path::new("child"), true).is_ok());
+        assert!(open_preview_child(&dir, Path::new(".."), true).is_err());
+        assert!(open_preview_child(&dir, Path::new("child/.."), true).is_err());
         assert!(open_preview_root(&root.join("photo.jpg")).is_err());
         drop(dir);
         std::fs::remove_dir_all(path).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn hidden_ancestors_are_not_inventoried_but_selected_hidden_roots_stay_excluded() {
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
+        let base =
+            std::env::temp_dir().join(format!("frameleaf-hidden-parent-{}", uuid::Uuid::new_v4()));
+        let hidden = base.join("private");
+        let selected = hidden.join("Photos");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(hidden.join("unselected.jpg"), b"outside selected scope").unwrap();
+        std::fs::write(selected.join("selected.jpg"), b"inside selected scope").unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let hidden = base.join("private");
+        let selected = hidden.join("Photos");
+        let wide: Vec<_> = hidden.as_os_str().encode_wide().chain(Some(0)).collect();
+        let flags = std::fs::metadata(&hidden).unwrap().file_attributes();
+        assert_ne!(
+            unsafe { SetFileAttributesW(wide.as_ptr(), flags | FILE_ATTRIBUTE_HIDDEN) },
+            0
+        );
+        assert_eq!(
+            crate::photo_sources::inventory(&selected, 100)
+                .unwrap()
+                .photos,
+            1
+        );
+        assert_eq!(
+            crate::photo_sources::inventory(&base, 100).unwrap().photos,
+            0
+        );
+        assert!(crate::photo_sources::inventory(&hidden, 100).is_err());
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), flags) }, 0);
+        std::fs::remove_dir_all(base).unwrap();
     }
     #[cfg(windows)]
     #[test]
@@ -347,6 +394,8 @@ mod tests {
             windows_state(0, u32::MAX).availability,
             Availability::Unknown
         );
+        assert!(windows_state(0x400, 0).unsupported_reparse);
+        assert!(!windows_state(0x400, 1).unsupported_reparse);
         assert!(windows_state(2, 0).excluded);
         assert!(windows_state(4, 0).excluded);
         assert!(!windows_state(0, 0).excluded);

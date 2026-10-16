@@ -143,7 +143,7 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
                     result.skipped += 1;
                     continue;
                 }
-                match crate::source_metadata::open_preview_child(&dir, Path::new(name)) {
+                match crate::source_metadata::open_preview_child(&dir, Path::new(name), true) {
                     Ok(child) => pending.push_back((child, relative.join(name), depth + 1)),
                     Err(_) => {
                         unreadable += 1;
