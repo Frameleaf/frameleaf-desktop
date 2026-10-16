@@ -162,6 +162,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "--without-readline",
                     "--with-icu",
                     "--with-openssl",
+                    "--with-uuid=e2fs",
                     f"--with-includes={dependencies / 'opt/openssl@3/include'}:{dependencies / 'include'}",
                     f"--with-libraries={dependencies / 'opt/openssl@3/lib'}:{dependencies / 'lib'}",
                     "--with-lz4",
@@ -274,12 +275,20 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     result = json.loads(
                         sql(
                             database,
-                            "SELECT json_build_object('serverVersion',current_setting('server_version'),'vectorVersion',(SELECT extversion FROM pg_extension WHERE extname='vector'),'checksums',current_setting('data_checksums'),'neighbor',(SELECT id FROM native_fixture ORDER BY embedding <-> '[1,0,0]' LIMIT 1))",
+                            "SELECT json_build_object('serverVersion',current_setting('server_version'),'vectorVersion',(SELECT extversion FROM pg_extension WHERE extname='vector'),'extensions',(SELECT json_agg(extname ORDER BY extname) FROM pg_extension WHERE extname <> 'plpgsql'),'checksums',current_setting('data_checksums'),'neighbor',(SELECT id FROM native_fixture ORDER BY embedding <-> '[1,0,0]' LIMIT 1))",
                         )
                     )
                     if result != {
                         "serverVersion": lock["postgresVersion"],
                         "vectorVersion": lock["pgvectorVersion"],
+                        "extensions": [
+                            "cube",
+                            "earthdistance",
+                            "pg_trgm",
+                            "unaccent",
+                            "uuid-ossp",
+                            "vector",
+                        ],
                         "checksums": "on",
                         "neighbor": 1,
                     }:
@@ -290,7 +299,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     start()
                     sql(
                         "postgres",
-                        "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1));",
+                        "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent('café');",
                     )
                     report["fresh"] = facts("postgres")
                     backup = output / "fixture.dump"
