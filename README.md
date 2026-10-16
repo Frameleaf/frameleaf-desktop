@@ -270,6 +270,14 @@ and explicit download permission. It rejects other document types, traversal,
 linked ancestors/files and replaced roots. Directory handles constrain reads to the
 approved root; every item is checked before and after reading. A native free-space
 check retains 256 MiB beyond the file size, and incomplete staging is cleaned up.
+Before opening an original, capacity admission also allows a full original to
+materialize when residency is unknown or download-needed. It checks the opened
+source-parent and staging volumes, summing hydration and staging when their
+volume identities match. Unknown residency may conservatively require space for
+two copies even for an already local file. Checks repeat for each original, so
+retained provider downloads consume the next item's available space. These are
+free-space snapshots, not reservations against other writers; separate APFS
+volumes sharing a storage pool are not detected as a single volume.
 
 An immutable private staging directory holds independent original bytes and a signed
 SHA-256 receipt, with the source version and original filesystem dates. Creation time

@@ -119,14 +119,12 @@ fn root_identity(dir: &Dir) -> Result<String, String> {
         ))
     }
 }
-fn available_bytes(path: &Path) -> Result<u64, String> {
+fn available_bytes(dir: &Dir) -> Result<u64, String> {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
-        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| "source_capacity_unavailable")?;
+        use std::os::fd::AsRawFd;
         let mut info = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
-        if unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        if unsafe { libc::fstatvfs(dir.as_raw_fd(), info.as_mut_ptr()) } != 0 {
             return Err("source_capacity_unavailable".into());
         }
         let info = unsafe { info.assume_init() };
@@ -135,8 +133,27 @@ fn available_bytes(path: &Path) -> Result<u64, String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFinalPathNameByHandleW, FILE_NAME_OPENED,
+        };
+        let mut path = vec![0u16; 32768];
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                dir.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                FILE_NAME_OPENED,
+            )
+        } as usize;
+        if length == 0 || length >= path.len() - 1 {
+            return Err("source_capacity_unavailable".into());
+        }
+        // GetDiskFreeSpaceEx requires a trailing separator for UNC share roots.
+        if path[length - 1] != b'\\' as u16 {
+            path[length] = b'\\' as u16;
+            path[length + 1] = 0;
+        }
         let mut available = 0;
         if unsafe {
             windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
@@ -151,6 +168,27 @@ fn available_bytes(path: &Path) -> Result<u64, String> {
         }
         Ok(available)
     }
+}
+fn check_capacity(
+    bytes: u64,
+    source_free: u64,
+    staging_free: u64,
+    same_volume: bool,
+    may_download: bool,
+) -> Result<(), String> {
+    const RESERVE: u64 = 256 * 1024 * 1024;
+    let hydration = if may_download { bytes } else { 0 };
+    let staging_required = bytes
+        .checked_add(if same_volume { hydration } else { 0 })
+        .and_then(|value| value.checked_add(RESERVE))
+        .ok_or("source_capacity_insufficient")?;
+    let source_required = hydration
+        .checked_add(RESERVE)
+        .ok_or("source_capacity_insufficient")?;
+    if staging_free < staging_required || (may_download && source_free < source_required) {
+        return Err("source_capacity_insufficient".into());
+    }
+    Ok(())
 }
 fn relative_path(path: &str) -> Result<&Path, String> {
     let path = Path::new(path);
@@ -312,7 +350,8 @@ impl CopyApproval {
         if !before.is_file() || link(&before) || before.len() == 0 {
             return Err("source_item_invalid".into());
         }
-        if crate::source_metadata::probe(&dir, relative_path, &before)?.excluded {
+        let availability = crate::source_metadata::probe(&dir, relative_path, &before)?;
+        if availability.excluded {
             return Err("source_item_excluded".into());
         }
         if expected_bytes.is_some_and(|bytes| bytes != before.len()) {
@@ -321,9 +360,25 @@ impl CopyApproval {
         if before.len() > self.scope.max_item_bytes {
             return Err("source_copy_budget_exceeded".into());
         }
-        if available_bytes(destination)? < before.len().saturating_add(256 * 1024 * 1024) {
-            return Err("source_capacity_insufficient".into());
-        }
+        let staging = Dir::open_ambient_dir(destination, ambient_authority())
+            .map_err(|_| "source_stage_unavailable")?;
+        // Unknown residency reserves a full original; pinning and allocated blocks are not proof.
+        let may_download =
+            availability.availability != crate::source_metadata::Availability::Available;
+        // shortcut: volume IDs do not reveal shared APFS pools; add pool admission before parallel imports.
+        let source_volume = root_identity(&dir)?;
+        let staging_volume = root_identity(&staging)?;
+        check_capacity(
+            before.len(),
+            if may_download {
+                available_bytes(&dir)?
+            } else {
+                0
+            },
+            available_bytes(&staging)?,
+            source_volume.split(':').next() == staging_volume.split(':').next(),
+            may_download,
+        )?;
         let options = no_follow_options(false);
         let mut source = dir
             .open_with(relative_path, &options)
@@ -733,6 +788,22 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_accounts_for_original_and_stage_on_shared_volume() {
+        const RESERVE: u64 = 256 * 1024 * 1024;
+        assert!(check_capacity(100, 100 + RESERVE, 100 + RESERVE, true, true).is_err());
+        assert!(check_capacity(100, 200 + RESERVE, 200 + RESERVE, true, true).is_ok());
+        assert!(check_capacity(100, 100 + RESERVE, 100 + RESERVE, false, true).is_ok());
+        assert!(check_capacity(100, 99 + RESERVE, 100 + RESERVE, false, true).is_err());
+        assert!(check_capacity(100, 0, 100 + RESERVE, false, false).is_ok());
+        assert!(check_capacity(100, 0, 99 + RESERVE, false, false).is_err());
+        assert!(check_capacity(u64::MAX, u64::MAX, u64::MAX, true, true).is_err());
+    }
+    #[test]
+    fn capacity_uses_the_open_directory_volume() {
+        let root = Dir::open_ambient_dir(std::env::temp_dir(), ambient_authority()).unwrap();
+        assert!(available_bytes(&root).unwrap() > 0);
+    }
     #[test]
     fn source_version_change_is_rejected_before_staging_publication() {
         let path = std::env::temp_dir().join(format!("frameleaf-copy-version-{}", Uuid::new_v4()));
