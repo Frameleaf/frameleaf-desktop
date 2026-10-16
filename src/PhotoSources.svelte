@@ -17,6 +17,7 @@
   let message = $state('');
   const native = isTauri();
   const errors: Record<string, string> = {
+    source_preview_policy_unavailable: 'A download-free folder preview could not be enabled. No preview was started. Try again after restarting the app.',
     source_inventory_partial: 'The scan reached its safety limit. Choose a smaller photo subfolder for this copy.',
     source_inventory_unreadable: 'Some entries could not be inspected. Check folder and drive access before preparing the copy again.',
     source_no_media: 'No supported photo or video files were found in this folder.',

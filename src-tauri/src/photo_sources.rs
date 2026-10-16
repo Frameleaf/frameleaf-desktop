@@ -29,6 +29,8 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
     scan(root, limit).map(|scan| scan.inventory)
 }
 pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
+    #[cfg(target_os = "macos")]
+    let _policy = metadata_only::Guard::new()?;
     if !root.is_absolute() || root.parent().is_none() || limit == 0 || limit > 10_000 {
         return Err("source_folder_invalid".into());
     }
@@ -160,6 +162,10 @@ pub struct RootHint {
 }
 
 pub fn known_onedrive_roots(home: &Path, supplied: &[std::path::PathBuf]) -> Vec<RootHint> {
+    #[cfg(target_os = "macos")]
+    let Ok(_policy) = metadata_only::Guard::new() else {
+        return Vec::new();
+    };
     let mut candidates = supplied.to_vec();
     #[cfg(target_os = "macos")]
     if let Ok(entries) = std::fs::read_dir(home.join("Library/CloudStorage")) {
@@ -234,8 +240,93 @@ fn covers_home(root: &Path, home: &Path) -> bool {
     home.starts_with(root) || std::fs::canonicalize(home).is_ok_and(|home| home.starts_with(root))
 }
 
+#[cfg(target_os = "macos")]
+mod metadata_only {
+    use std::{marker::PhantomData, rc::Rc};
+    // Darwin sys/resource.h; Apple TN3150 requires disabling directory materialization too.
+    const KIND: libc::c_int = 3; // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+    const THREAD: libc::c_int = 1; // IOPOL_SCOPE_THREAD
+    unsafe extern "C" {
+        fn getiopolicy_np(kind: libc::c_int, scope: libc::c_int) -> libc::c_int;
+        fn setiopolicy_np(
+            kind: libc::c_int,
+            scope: libc::c_int,
+            policy: libc::c_int,
+        ) -> libc::c_int;
+    }
+    pub(super) fn current() -> Result<libc::c_int, String> {
+        let value = unsafe { getiopolicy_np(KIND, THREAD) };
+        if value < 0 {
+            Err("source_preview_policy_unavailable".into())
+        } else {
+            Ok(value)
+        }
+    }
+    pub(super) struct Guard {
+        previous: libc::c_int,
+        // The policy must be restored on the same OS thread, never across an await.
+        _thread: PhantomData<Rc<()>>,
+    }
+    impl Guard {
+        pub(super) fn new() -> Result<Self, String> {
+            let previous = current()?;
+            if unsafe { setiopolicy_np(KIND, THREAD, 1) } != 0 {
+                return Err("source_preview_policy_unavailable".into());
+            }
+            Ok(Self {
+                previous,
+                _thread: PhantomData,
+            })
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // A restore failure leaves the restrictive policy in place.
+            unsafe {
+                setiopolicy_np(KIND, THREAD, self.previous);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod root_tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metadata_preview_policy_is_thread_scoped_nested_and_restored_after_errors() {
+        let before = super::metadata_only::current().unwrap();
+        let (start, wait) = std::sync::mpsc::channel();
+        let (report, observations) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            report
+                .send(super::metadata_only::current().unwrap())
+                .unwrap();
+            wait.recv().unwrap();
+            report
+                .send(super::metadata_only::current().unwrap())
+                .unwrap();
+        });
+        let other_before = observations.recv().unwrap();
+        let outer = super::metadata_only::Guard::new().unwrap();
+        assert_eq!(super::metadata_only::current().unwrap(), 1);
+        {
+            let _inner = super::metadata_only::Guard::new().unwrap();
+            assert_eq!(super::metadata_only::current().unwrap(), 1);
+        }
+        assert_eq!(super::metadata_only::current().unwrap(), 1);
+        start.send(()).unwrap();
+        assert_eq!(observations.recv().unwrap(), other_before);
+        other.join().unwrap();
+        drop(outer);
+        assert_eq!(super::metadata_only::current().unwrap(), before);
+        let preview = || -> Result<(), &str> {
+            let _policy = super::metadata_only::Guard::new().unwrap();
+            Err("preview failed")
+        };
+        let result = preview();
+        assert!(result.is_err());
+        assert_eq!(super::metadata_only::current().unwrap(), before);
+    }
     #[test]
     fn copy_manifest_reuses_bounded_metadata_traversal_and_records_only_relative_media_names() {
         let parent =

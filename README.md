@@ -239,6 +239,11 @@ traversal; links, dot-prefixed entries and application/Photos packages are exclu
 The scan stops at 10,000 entries, 16 levels or 256 pending directories and reports
 partial/skipped results. It refuses the whole home folder or filesystem root.
 Cloud residency, required downloads and cloud-account completeness remain unknown.
+On macOS, preview and known-root discovery disable dataless materialization on the
+current OS thread before filesystem traversal, restoring its prior policy on exit.
+Cloud-only directory access can therefore be unavailable or partial rather than
+triggering a download during preview. Approved copy staging uses its separate read
+permission; the preview policy never grants download authority.
 
 The preview opens no source content. A separate explicit approval stores a signed,
 photo-session-bound folder permission in the OS credential store and registers its
