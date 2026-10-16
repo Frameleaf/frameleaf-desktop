@@ -3,11 +3,12 @@
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   type Hint = { label: string; path: string };
-  type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean };
+  type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
+  type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null };
   let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
@@ -17,6 +18,11 @@
   let message = $state('');
   const native = isTauri();
   const errors: Record<string, string> = {
+    source_metadata_unavailable: 'File metadata could not be checked safely. Check folder access before resuming; staged data is kept.',
+    source_folder_excluded: 'This folder is hidden or excluded. Choose an ordinary visible photo folder.',
+    source_item_excluded: 'A file or folder became hidden or excluded. Copying stopped before reading it; existing staged data is kept.',
+    source_item_invalid: 'This file is unsupported or linked. Some Windows cloud placeholders cannot be copied yet; export selected photos to an ordinary folder and try there.',
+
     source_preview_policy_unavailable: 'A download-free folder preview could not be enabled. No preview was started. Try again after restarting the app.',
     source_inventory_partial: 'The scan reached its safety limit. Choose a smaller photo subfolder for this copy.',
     source_inventory_unreadable: 'Some entries could not be inspected. Check folder and drive access before preparing the copy again.',
@@ -87,6 +93,9 @@
     if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
     if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} kB`;
     return `${bytes} bytes`;
+  }
+  function availabilityText(value: Availability) {
+    return `${value.available.toLocaleString()} OS-reported available; ${value.needsDownload.toLocaleString()} need downloading (${size(value.downloadBytes)} in originals); ${value.notReady.toLocaleString()} provider not ready; ${value.unknown.toLocaleString()} unknown. ${value.pinned.toLocaleString()} request pinning. These are metadata snapshots; pinning does not prove a complete local original. Unknown files may also need downloading.`;
   }
   async function prepareCopy() {
     busy = true; message = '';
@@ -166,6 +175,7 @@
           <p role="status">{job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'}: {job.completed.toLocaleString()} of {job.total.toLocaleString()} copies confirmed.</p>
           <progress max={Math.max(1, job.total)} value={job.completed} aria-label="Copies verified on your server"></progress>
           <p class="footnote">Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
+          {#if job.availability}<p class="footnote" aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
           {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
           {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
             <button class="secondary" disabled={busy} onclick={() => controlCopy('resume')}>{job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
@@ -184,7 +194,8 @@
     <div class="folder-preview" aria-label="Selected folder preview">
       <strong>{folder.path}</strong>
       <p>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}.</p>
-      <p class="footnote">{folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Files have not been opened, downloaded or imported. Cloud-only availability and account completeness are unknown.</p>
+      <p class="footnote">{folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</p>
+      {#if folder.availability}<p class="footnote" aria-label="Preview file availability">{availabilityText(folder.availability)}</p>{/if}
       <label class="source-consent"><input type="checkbox" bind:checked={allowReads} disabled={busy}> Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.</label>
       <button class="secondary" disabled={busy || !allowReads} onclick={() => approve()}>Approve this folder</button>
       <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; }}>Clear preview</button>

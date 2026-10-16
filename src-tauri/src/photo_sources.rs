@@ -10,6 +10,7 @@ pub struct FolderInventory {
     pub logical_bytes: u64,
     pub skipped: u64,
     pub truncated: bool,
+    pub availability: crate::source_metadata::AvailabilitySummary,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,12 +53,19 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
     }
     let dir = Dir::open_ambient_dir(root, ambient_authority())
         .map_err(|_| "source_folder_unavailable")?;
+    let root_meta = dir
+        .dir_metadata()
+        .map_err(|_| "source_folder_unavailable")?;
+    if crate::source_metadata::probe(&dir, Path::new("."), &root_meta)?.excluded {
+        return Err("source_folder_excluded".into());
+    }
     let mut result = FolderInventory {
         path: root.to_str().ok_or("source_folder_name_invalid")?.into(),
         photos: 0,
         logical_bytes: 0,
         skipped: 0,
         truncated: false,
+        availability: Default::default(),
     };
     let mut files = Vec::new();
     let mut unreadable = 0;
@@ -117,6 +125,21 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
                 result.skipped += 1;
                 continue;
             }
+            if !(meta.is_dir() || meta.is_file() && is_media_filename(name)) {
+                continue;
+            }
+            let observation = match crate::source_metadata::probe(&dir, Path::new(name), &meta) {
+                Ok(observation) => observation,
+                Err(_) => {
+                    unreadable += 1;
+                    result.skipped += 1;
+                    continue;
+                }
+            };
+            if observation.excluded {
+                result.skipped += 1;
+                continue;
+            }
             if meta.is_dir() {
                 if depth == 16 || pending.len() == 256 {
                     result.truncated = true;
@@ -140,6 +163,7 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
                     bytes: meta.len(),
                 });
                 result.photos += 1;
+                result.availability.record(observation, meta.len());
                 result.logical_bytes = result
                     .logical_bytes
                     .checked_add(meta.len())
@@ -291,6 +315,32 @@ mod metadata_only {
 
 #[cfg(test)]
 mod root_tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn os_hidden_files_and_directories_are_excluded_before_content_access() {
+        use std::os::unix::ffi::OsStrExt;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-hidden-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        for name in ["visible.jpg", "hidden.jpg", "private/secret.jpg"] {
+            std::fs::write(root.join(name), b"synthetic original").unwrap();
+        }
+        for name in ["hidden.jpg", "private"] {
+            let path = std::ffi::CString::new(root.join(name).as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chflags(path.as_ptr(), 0x8000) }, 0);
+        }
+        let result = super::inventory(&root, 100).unwrap();
+        assert_eq!(result.photos, 1);
+        assert_eq!(result.skipped, 2);
+    }
     #[cfg(target_os = "macos")]
     #[test]
     fn metadata_preview_policy_is_thread_scoped_nested_and_restored_after_errors() {

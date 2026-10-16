@@ -21,6 +21,8 @@ struct Manifest {
     files: Vec<SourceFile>,
     total_bytes: u64,
     skipped: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    availability: Option<crate::source_metadata::AvailabilitySummary>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -193,6 +195,7 @@ pub struct ImportView {
     pub logical_bytes: u64,
     pub skipped: u64,
     pub code: Option<String>,
+    pub availability: Option<crate::source_metadata::AvailabilitySummary>,
 }
 fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>) -> ImportView {
     ImportView {
@@ -202,6 +205,7 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
         completed: cursor.position,
         logical_bytes: manifest.total_bytes,
         skipped: manifest.skipped,
+        availability: manifest.availability.clone(),
         code,
     }
 }
@@ -254,6 +258,7 @@ fn manifest_for(
         files: scan.files,
         total_bytes,
         skipped: scan.inventory.skipped,
+        availability: Some(scan.inventory.availability),
     })
 }
 fn load(
@@ -865,6 +870,7 @@ mod tests {
             }],
             total_bytes: 8,
             skipped: 0,
+            availability: None,
         };
         let journal = Journal::new(&base, &manifest.source_id).unwrap();
         journal
@@ -1239,6 +1245,45 @@ mod tests {
     fn nas_original_verification_outlives_the_servers_ten_minute_hash_limit() {
         assert!(source_request_timeout("runs/id/items/id/verify").as_secs() > 600);
         assert_eq!(source_request_timeout("runs").as_secs(), 30);
+    }
+    #[test]
+    fn legacy_manifests_keep_their_signed_representation_and_resume_cursor() {
+        let mut f = Fixture::new();
+        f.manifest.availability = None;
+        let legacy = json!({"id":f.manifest.id,"sourceId":f.manifest.source_id,"scope":f.manifest.scope,
+            "files":f.manifest.files,"totalBytes":f.manifest.total_bytes,"skipped":f.manifest.skipped});
+        assert_eq!(digest(&f.manifest).unwrap(), digest(&legacy).unwrap());
+        f.journal
+            .write("manifest.json", &legacy, &f.identity)
+            .unwrap();
+        f.journal
+            .write(
+                "cursor.json",
+                &Cursor::new(&f.manifest).unwrap(),
+                &f.identity,
+            )
+            .unwrap();
+        let (manifest, cursor) = load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
+        assert!(manifest.availability.is_none());
+        assert_eq!(cursor.position, 0);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_hidden_after_approval_is_refused_before_new_staging() {
+        use std::os::unix::ffi::OsStrExt;
+        tauri::async_runtime::block_on(async {
+            let f = Fixture::new();
+            let path =
+                std::ffi::CString::new(f.base.join("source/photo.jpg").as_os_str().as_bytes())
+                    .unwrap();
+            assert_eq!(unsafe { libc::chflags(path.as_ptr(), 0x8000) }, 0);
+            let server = Server::new(f.replies(f.receipt(), false, false));
+            assert_eq!(
+                f.run(&server, &|| Ok(())).await.err().as_deref(),
+                Some("source_item_excluded")
+            );
+            assert!(!f.journal.root.join("stage").join(&f.stage).exists());
+        });
     }
     #[test]
     fn a_persisted_receipt_is_revalidated_before_releasing_a_stage_after_restart() {

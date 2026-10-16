@@ -300,6 +300,10 @@ impl CopyApproval {
         if root_identity(&dir)? != self.scope.root_identity {
             return Err("source_root_changed".into());
         }
+        let root_meta = dir.dir_metadata().map_err(|_| "source_root_unavailable")?;
+        if crate::source_metadata::probe(&dir, Path::new("."), &root_meta)?.excluded {
+            return Err("source_item_excluded".into());
+        }
         let (dir, name) = parent_dir(&dir, relative_path)?;
         let relative_path = name.as_path();
         let before = dir
@@ -307,6 +311,9 @@ impl CopyApproval {
             .map_err(|_| "source_item_unavailable")?;
         if !before.is_file() || link(&before) || before.len() == 0 {
             return Err("source_item_invalid".into());
+        }
+        if crate::source_metadata::probe(&dir, relative_path, &before)?.excluded {
+            return Err("source_item_excluded".into());
         }
         if expected_bytes.is_some_and(|bytes| bytes != before.len()) {
             return Err("source_item_changed".into());
@@ -620,6 +627,12 @@ fn parent_dir(root: &Dir, relative: &Path) -> Result<(Dir, std::path::PathBuf), 
     for part in parents {
         if !matches!(part, Component::Normal(_)) {
             return Err("source_item_invalid".into());
+        }
+        let before = dir
+            .symlink_metadata(part.as_os_str())
+            .map_err(|_| "source_item_unavailable")?;
+        if crate::source_metadata::probe(&dir, Path::new(part.as_os_str()), &before)?.excluded {
+            return Err("source_item_excluded".into());
         }
         let child = dir
             .open_with(part.as_os_str(), &no_follow_options(true))

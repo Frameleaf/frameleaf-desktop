@@ -15,6 +15,7 @@ mod resource_policy;
 pub mod runtime_store;
 mod source_consent;
 mod source_import;
+mod source_metadata;
 mod transport;
 pub mod worker;
 mod worker_control;

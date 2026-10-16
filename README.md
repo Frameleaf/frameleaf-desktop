@@ -238,7 +238,9 @@ logical sizes using metadata only. Capability-relative directory access confines
 traversal; links, dot-prefixed entries and application/Photos packages are excluded.
 The scan stops at 10,000 entries, 16 levels or 256 pending directories and reports
 partial/skipped results. It refuses the whole home folder or filesystem root.
-Cloud residency, required downloads and cloud-account completeness remain unknown.
+The preview reports OS availability hints, known download-needed logical sizes,
+provider-not-ready files, unknown states and separate pinning intent. Pinning does
+not establish that bytes are resident. Account completeness remains unknown.
 On macOS, preview and known-root discovery disable dataless materialization on the
 current OS thread before filesystem traversal, restoring its prior policy on exit.
 Cloud-only directory access can therefore be unavailable or partial rather than
@@ -330,3 +332,24 @@ the same upload. Source bytes remain unchanged. Ordinary tests skip this fixture
 
 Job/event dispatch is mocked: this does not prove background decoding, thumbnails,
 OS credential storage, provider hydration or installed-device acceptance.
+
+
+### Source availability and exclusions
+
+Windows metadata probes request attributes only, bypass reparse processing and
+request no recall. Cloud Files states distinguish available placeholders, missing
+local data, and provider-not-ready data (which may already be downloaded). Pinning
+intent is counted separately. Unknown or invalid states never become proof of local
+residency. Unknown reparse points and Hidden/System entries are excluded.
+
+macOS checks dataless and hidden flags relative to the approved directory handle;
+absence of the dataless flag stays unknown because it does not rule out network I/O.
+Linux folders also report unknown availability. No file allocation or zero-block
+heuristic is used. Copy plans retain their observed summary as a snapshot, and old
+signed manifests without it keep their original signature and progress identity.
+
+OS hidden flags are checked again at the source root, intermediate directories and
+file before staging. Actual macOS tests cover hidden-file/directory exclusion and
+hiding a file after approval. Windows provider probes and placeholder copies still
+need installed-provider qualification; existing copy-time reparse refusals remain.
+These hints do not reserve hydration storage or measure provider network traffic.
