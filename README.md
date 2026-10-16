@@ -123,7 +123,7 @@ Release signing is an authoring operation, separate from app code signing and pu
 
 The compiled initial epoch floor is 2. A persistent monotonic OS-keystore floor, protected key rotation, downloads and update recovery are still required before enabling automatic runtime updates. A valid component signature proves byte identity and release authority; it does not establish GPU qualification, app code signing or installed-device acceptance.
 
-The app-compiled model catalogue pins default SigLIP image/text profiles with 768-value CPU references, exact artifact/snapshot/preprocessing identity and measured memory floors. `model_catalogue::approved_profile` selects only an exact model/configuration/runtime/provider match; its returned type cannot be deserialized from a NAS response. Fresh canonical UUID challenges retain the model and fixture while changing the raw-spec digest. The catalogue matches the NAS resource byte for byte. Durable NAS challenge/admission state is implemented in companion PR #315. The automatic worker loop remains unfinished; unsupported profiles stay unavailable.
+The app-compiled model catalogue pins default SigLIP image/text profiles with 768-value CPU references, exact artifact/snapshot/preprocessing identity and measured memory floors. `model_catalogue::approved_profile` selects only an exact model/configuration/runtime/provider match; its returned type cannot be deserialized from a NAS response. Fresh canonical UUID challenges retain the model and fixture while changing the raw-spec digest. The catalogue matches the NAS resource byte for byte. Durable NAS challenge/admission state is implemented in companion PR #315. The automatic worker loop is implemented; unsupported profiles stay unavailable and installed sign-in acceptance remains required.
 
 ## Automatic preparation checkpoint
 
@@ -133,7 +133,7 @@ Power, network cost and available-memory checks now gate qualification. macOS us
 
 Missing model files download automatically only when the OS reports an unmetered network. Metered or unclassified downloads require an explicit local button; retrying setup alone does not grant permission. Sign-out cancels setup, waits for process cleanup, and clears credentials afterward. Remote Photos windows receive no preparation commands or events.
 
-The ordinary unsigned candidate does not yet bundle the signed runtime. It reports that missing component and keeps Photos usable. A qualified status records model checks only: this checkpoint does not schedule NAS jobs or refresh qualifications. The multi-model claim API validates every supplied accepted qualification and binds a returned job to its exact role and qualification. A warm multi-profile predictor and consumed resource-aware job loop must still connect that API to execution. Keep worker capability advertisement disabled until those pieces and an actual native NAS library job pass acceptance. The native resource probe has been exercised on macOS; Windows/Linux installed behavior remains an acceptance gate.
+The ordinary unsigned candidate does not yet bundle the signed runtime. It reports that missing component and keeps Photos usable. A qualified status records model checks only. The supervisor now starts a warm multi-profile predictor, refreshes expiring qualification and executes serial NAS jobs while enforcing resource and association checks. The multi-model claim API binds each returned job to its exact role and qualification. Capability advertisement remains gated on complete installed acceptance. The native resource probe has been exercised on macOS; Windows/Linux installed behavior remains an acceptance gate.
 
 `RuntimeStore::attestation` reverifies a leased installed release and exports its
 exact signed manifest as canonical gzip/base64. The NAS uses its own matching
@@ -147,12 +147,12 @@ specifications and fixtures must exactly match the app-compiled profile, and
 the manifest binding must match the locally verified runtime. Challenges also bind
 the server, account, device, session and credential generation. Report submission
 refuses an expired challenge or a different nonce/runtime. An accepted report is
-stored evidence; automatic orchestration and NAS inference admission remain
-pending.
+stored evidence; processing still requires live NAS admission for that exact
+association and model.
 
 Accepted runtime evidence is read through the signed worker API and sealed against the compiled profile, local qualified runtime, NAS-canonical report digest, connection association and absolute expiry. Token renewal preserves that association; a new sign-in changes it. Claims now require the exact accepted qualification ID and expiry, and all input/heartbeat/result/failure requests retain that binding. Native startup and execution stop at qualification expiry. Accepted evidence does not by itself enable NAS processing scope.
 
-The qualified predictor provides a continuous, serial job loop. It retains the accepted qualification and connection binding for every claim, input, heartbeat and result. Empty long-polls have a minimum idle delay; the first execution/authority failure stops the loop and owned process. Cancellation, a closed control channel, or dropping the loop future terminates in-flight work. The loop does not enable processing scope or automatically replace expired qualification evidence. Qualification refresh, resource/network policy and consumption by the sign-in supervisor remain required before the app can report active NAS assistance.
+The qualified predictor provides a continuous, serial job loop. It retains the accepted qualification and connection binding for every claim, input, heartbeat and result. Empty long-polls have a minimum idle delay; the first execution/authority failure stops the loop and owned process. Cancellation, a closed control channel, or dropping the loop future terminates in-flight work. The loop does not enable processing scope or automatically replace expired qualification evidence. The sign-in supervisor applies qualification refresh and resource/network policy; installed-platform acceptance remains required before release.
 
 ### Building a desktop installer
 
@@ -202,3 +202,17 @@ validators retain that gate. CoreML can choose CPU, GPU or Neural Engine executi
 provider registration and a compute plan alone cannot establish acceleration.
 See the [ONNX Runtime CoreML provider options](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html)
 and [Apple's runtime performance instruments](https://developer.apple.com/documentation/CoreAI/analyzing-model-runtime-performance-with-instruments).
+
+### Fresh sign-in acceptance fixture
+
+The opt-in NAS library-job fixture starts with an empty process-only credential
+store and no enrolled devices. It uses the same login and enrollment sequence as
+the native command against real HTTPS authentication, signed device enrollment and
+PostgreSQL session storage. Repeating preparation must retain one device identity.
+It then qualifies the approved model, executes a native job and verifies that stale
+source publication is refused. It uses generated credentials and public fixtures;
+it never reads the operating system credential store.
+
+This covers the login sequence and native processing, while runtime/model setup in
+the installed window and fresh-install Windows/macOS/Linux journeys remain separate
+acceptance gates.

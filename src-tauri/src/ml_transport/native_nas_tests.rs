@@ -89,8 +89,9 @@ fn install_test_keyring() {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FixtureConnection {
-    saved: SavedConnection,
-    worker: SavedWorker,
+    server: String,
+    email: String,
+    password: String,
     ca_pem: String,
     work_root: std::path::PathBuf,
 }
@@ -137,9 +138,13 @@ fn actual_native_nas_library_jobs() {
     let mut input = std::io::BufReader::new(std::io::stdin());
     let configuration: FixtureConnection =
         serde_json::from_value(read_fixture_message(&mut input)).expect("fixture connection");
-    credentials::save("worker-session", &configuration.worker).unwrap();
-    let worker = WorkerTransport::load(&configuration.saved).unwrap();
-    let url = normalize_server(&configuration.saved.server).unwrap();
+    assert!(credentials::load::<SavedConnection>("connection")
+        .unwrap()
+        .is_none());
+    assert!(credentials::load::<SavedWorker>("worker-session")
+        .unwrap()
+        .is_none());
+    let url = normalize_server(&configuration.server).unwrap();
     assert_eq!(url.host_str(), Some("tun.eu1.relays.frameleaf.test"));
     let client = Client::builder()
         .no_proxy()
@@ -155,9 +160,37 @@ fn actual_native_nas_library_jobs() {
         )
         .build()
         .unwrap();
+    let (saved, initial_worker) = tauri::async_runtime::block_on(async {
+        let (mut saved, view) = crate::sign_in(
+            &client,
+            &configuration.server,
+            &configuration.email,
+            configuration.password,
+            "Native sign-in fixture",
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.state, "preparing");
+        let device = saved.device_id.clone().unwrap();
+        let repeated = crate::prepare_with_client(&client, &mut saved).await;
+        assert_eq!(repeated.state, "preparing");
+        assert_eq!(saved.device_id.as_ref(), Some(&device));
+        let worker: SavedWorker = credentials::load("worker-session").unwrap().unwrap();
+        assert_eq!(worker.device_id, device);
+        (saved, worker)
+    });
+    let worker = WorkerTransport::load(&saved).unwrap();
     tauri::async_runtime::block_on(async {
         worker.0.lock().await.client = client;
     });
+    println!(
+        "NATIVE_SIGNED_IN {}",
+        serde_json::json!({
+            "deviceId": saved.device_id, "sessionId": initial_worker.session_id,
+            "accountId": saved.account_id,
+        })
+    );
+    std::io::stdout().flush().unwrap();
 
     crate::native_runtime::absolute_directory(configuration.work_root.parent().unwrap()).unwrap();
     fs::create_dir(&configuration.work_root).unwrap();
@@ -266,9 +299,10 @@ fn actual_native_nas_library_jobs() {
         std::io::stdout().flush().unwrap();
         predictor.stop().unwrap();
         let checkpoint: SavedWorker = credentials::load("worker-session").unwrap().unwrap();
-        assert!(checkpoint.next_sequence > configuration.worker.next_sequence);
+        assert!(checkpoint.next_sequence > initial_worker.next_sequence);
         credentials::delete("worker-session").unwrap();
         credentials::delete("installation").unwrap();
+        credentials::delete("connection").unwrap();
     });
 }
 
@@ -307,4 +341,20 @@ fn persisted_controls_survive_reload_and_do_not_cross_associations() {
         worker_control::load(&saved).unwrap(),
         WorkerControl::Stopped
     );
+}
+
+#[tokio::test]
+async fn fresh_sign_in_rejects_invalid_details_before_credentials_or_network() {
+    let client = crate::transport::client().unwrap();
+    for (email, password) in [("", "fixture"), ("fixture@example.test", "")] {
+        let result = crate::sign_in(
+            &client,
+            "https://unreachable.invalid/",
+            email,
+            password.into(),
+            "Fixture",
+        )
+        .await;
+        assert_eq!(result.err().as_deref(), Some("login_details_invalid"));
+    }
 }

@@ -52,7 +52,21 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
         Ok(c) => c,
         Err(_) => return ConnectionView::new(saved, "offline".into(), unavailable),
     };
-    match transport::capabilities(&client, saved).await {
+    prepare_with_client(&client, saved).await
+}
+
+async fn prepare_with_client(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+) -> ConnectionView {
+    let unavailable = Features {
+        enrollment: false,
+        worker: false,
+        worker_session: false,
+        sources: false,
+        native_host: false,
+    };
+    match transport::capabilities(client, saved).await {
         Ok(Some(caps)) => {
             if connection::persist_server_identity(saved, &caps.server_id, |value| {
                 credentials::save("connection", value)
@@ -68,7 +82,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
             if !caps.features.enrollment {
                 return ConnectionView::new(saved, "unsupported-server".into(), caps.features);
             }
-            match transport::enroll(&client, saved).await {
+            match transport::enroll(client, saved).await {
                 Ok(enrollment) => {
                     saved.device_id = Some(enrollment.id);
                     if credentials::save("connection", saved).is_err() {
@@ -87,7 +101,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
                                 caps.features,
                             );
                         }
-                        let issued = transport::issue_worker_session(&client, saved).await;
+                        let issued = transport::issue_worker_session(client, saved).await;
                         if issued
                             .and_then(|worker| credentials::save("worker-session", &worker))
                             .is_err()
@@ -133,15 +147,33 @@ async fn connect_server(
     if current.is_some() || credentials::load::<SavedConnection>("connection")?.is_some() {
         return Err("sign_out_before_switching_servers".into());
     }
-    let base = normalize_server(&server)?;
+    let client = transport::client()?;
+    let (saved, mut view) = sign_in(&client, &server, &email, password, &device_name).await?;
+    if view.state == "preparing"
+        && view.features.worker_session
+        && start_worker_setup(&app, &saved, false).await.is_err()
+    {
+        view.state = "worker-setup-failed".into();
+    }
+    *current = Some(saved);
+    Ok(view)
+}
+
+async fn sign_in(
+    client: &reqwest::Client,
+    server: &str,
+    email: &str,
+    password: String,
+    device_name: &str,
+) -> Result<(SavedConnection, ConnectionView), String> {
+    let base = normalize_server(server)?;
     let password = Zeroizing::new(password);
     if email.is_empty() || email.len() > 320 || password.is_empty() || password.len() > 4096 {
         return Err("login_details_invalid".into());
     }
     // Check secure persistence and the device identity before sending a password.
     let identity = credentials::identity()?;
-    identity.enrollment("validation", "validation", &device_name, "client-worker")?;
-    let client = transport::client()?;
+    identity.enrollment("validation", "validation", device_name, "client-worker")?;
     let response = client.post(base.join("api/auth/login").unwrap())
         .json(&serde_json::json!({ "email": email.trim(), "password": password.as_str(), "rememberMe": true }))
         .send().await.map_err(|_| "server_unreachable_or_certificate_invalid")?;
@@ -152,7 +184,7 @@ async fn connect_server(
         account_id: login.user_id,
         name: login.name,
         token: login.access_token,
-        device_name,
+        device_name: device_name.into(),
         mode: "client-worker".into(),
         device_id: None,
     };
@@ -164,15 +196,8 @@ async fn connect_server(
             .await;
         return Err(error);
     }
-    let mut view = prepare(&mut saved).await;
-    if view.state == "preparing"
-        && view.features.worker_session
-        && start_worker_setup(&app, &saved, false).await.is_err()
-    {
-        view.state = "worker-setup-failed".into();
-    }
-    *current = Some(saved);
-    Ok(view)
+    let view = prepare_with_client(client, &mut saved).await;
+    Ok((saved, view))
 }
 
 #[tauri::command]
