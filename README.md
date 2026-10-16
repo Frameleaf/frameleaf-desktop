@@ -121,3 +121,9 @@ Release signing is an authoring operation, separate from app code signing and pu
 The compiled initial epoch floor is 2. A persistent monotonic OS-keystore floor, protected key rotation, downloads and update recovery are still required before enabling automatic runtime updates. A valid component signature proves byte identity and release authority; it does not establish GPU qualification, app code signing or installed-device acceptance.
 
 The app-compiled model catalogue now pins default SigLIP image/text profiles with 768-value CPU references, exact artifact/snapshot/preprocessing identity and measured memory floors. `model_catalogue::approved_profile` selects only an exact model/configuration/runtime/provider match; its returned type cannot be deserialized from a NAS response. Fresh canonical UUID challenges retain the model and fixture while changing the raw-spec digest. The catalogue matches the NAS resource byte for byte. Durable NAS challenge/admission state and the automatic worker loop are still pending; unsupported profiles remain unavailable.
+
+`RuntimeStore::attestation` reverifies a leased installed release and exports its
+exact signed manifest as canonical gzip/base64. The NAS uses its own matching
+public release authority, with 2 MiB compressed and 8 MiB decompressed limits.
+This establishes release identity only; qualification, session-bound admission
+and model grants remain separate requirements.

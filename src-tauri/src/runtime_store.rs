@@ -25,6 +25,12 @@ pub struct InstalledRuntime {
     runtime: VerifiedRuntime,
     lease: Arc<File>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAttestation {
+    manifest_gzip_base64: String,
+    signature_base64: String,
+}
 struct Staging(PathBuf);
 impl Drop for Staging {
     fn drop(&mut self) {
@@ -195,6 +201,48 @@ impl RuntimeStore {
             return Err("runtime_release_identity_changed".into());
         }
         Ok(runtime)
+    }
+    /// Reverify the leased release before sending its exact factory-signed manifest.
+    pub fn attestation(&self, installed: &InstalledRuntime) -> Result<RuntimeAttestation, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use flate2::{write::GzEncoder, Compression};
+        let id = installed.manifest_sha256();
+        self.read_release(id, installed.runtime.epoch())?;
+        let release = self.root.join("releases").join(id);
+        let raw = read_bounded(&release.join("manifest.json"), 8 * 1024 * 1024)?;
+        let signature = read_bounded(&release.join("manifest.sig"), 64)?;
+        // Match the bytes read after verification as well as the retained runtime identity.
+        use sha2::{Digest, Sha256};
+        if format!("{:x}", Sha256::digest(&raw)) != id || signature.len() != 64 {
+            return Err("runtime_release_identity_changed".into());
+        }
+        let signature_array: [u8; 64] = signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "runtime_signature_invalid")?;
+        if !self.keys.iter().any(|key| {
+            key.verify_strict(
+                &raw,
+                &ed25519_dalek::Signature::from_bytes(&signature_array),
+            )
+            .is_ok()
+        }) {
+            return Err("runtime_signature_invalid".into());
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&raw)
+            .map_err(|_| "runtime_attestation_compression_failed")?;
+        let compressed = encoder
+            .finish()
+            .map_err(|_| "runtime_attestation_compression_failed")?;
+        if compressed.len() > 2 * 1024 * 1024 {
+            return Err("runtime_attestation_too_large".into());
+        }
+        Ok(RuntimeAttestation {
+            manifest_gzip_base64: STANDARD.encode(compressed),
+            signature_base64: STANDARD.encode(signature),
+        })
     }
     pub fn load_active(&self) -> Result<Option<InstalledRuntime>, String> {
         let lease = self.lock(true)?;

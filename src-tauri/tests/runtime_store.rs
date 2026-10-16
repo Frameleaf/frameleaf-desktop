@@ -247,3 +247,79 @@ fn installed_private_cpu_pack_runs_production_qualification_and_inference() {
         .unwrap();
     eprintln!("PASS: installed private runtime, production CPU qualification, scoped sidecar512 embedding and live update lease");
 }
+
+#[test]
+fn attestation_preserves_signed_bytes_and_rechecks_installed_release() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::io::Read;
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let store_root = fixture.0.join("store");
+    let store = RuntimeStore::new(&store_root, vec![key.verifying_key()], 1).unwrap();
+    let raw = manifest(2);
+    let signature = key.sign(&raw).to_bytes();
+    store
+        .install_and_activate(&candidate, &raw, &signature)
+        .unwrap();
+    let installed = store.load_active().unwrap().unwrap();
+    let attestation = serde_json::to_value(store.attestation(&installed).unwrap()).unwrap();
+    let compressed = STANDARD
+        .decode(attestation["manifestGzipBase64"].as_str().unwrap())
+        .unwrap();
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, raw);
+    assert_eq!(
+        STANDARD
+            .decode(attestation["signatureBase64"].as_str().unwrap())
+            .unwrap(),
+        signature
+    );
+    assert_eq!(attestation.as_object().unwrap().len(), 2);
+    let release = store_root
+        .join("releases")
+        .join(installed.manifest_sha256());
+    fs::write(release.join("manifest.sig"), [0; 64]).unwrap();
+    assert!(store.attestation(&installed).is_err());
+    fs::write(release.join("manifest.sig"), signature).unwrap();
+    fs::write(release.join("payload/python"), b"changed").unwrap();
+    assert!(store.attestation(&installed).is_err());
+}
+
+#[test]
+#[ignore = "requires a private factory-signed pack; never release credentials in CI"]
+fn factory_attestation_exports_exact_installed_release() {
+    let fixture = Fixture::new();
+    let root = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
+    let output = PathBuf::from(std::env::var("FRAMELEAF_FACTORY_ATTESTATION").unwrap());
+    let store =
+        frameleaf_desktop::release_policy::open_runtime_store(&fixture.0.join("store")).unwrap();
+    let raw = fs::read(root.join("manifest.json")).unwrap();
+    let signature: [u8; 64] = fs::read(root.join("manifest.sig"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    store
+        .install_and_activate(&root.join("payload"), &raw, &signature)
+        .unwrap();
+    let installed = store.load_active().unwrap().unwrap();
+    let envelope = serde_json::to_vec(&store.attestation(&installed).unwrap()).unwrap();
+    assert!(envelope.len() < 4 * 1024 * 1024);
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .unwrap();
+    file.write_all(&envelope).unwrap();
+    file.sync_all().unwrap();
+    eprintln!(
+        "PASS: exact installed factory runtime attestation exported, {} bytes",
+        envelope.len()
+    );
+}
