@@ -252,3 +252,40 @@ fn actual_native_nas_library_jobs() {
         credentials::delete("installation").unwrap();
     });
 }
+
+#[test]
+#[ignore = "changes the credential builder; run alone in its own test process"]
+fn persisted_controls_survive_reload_and_do_not_cross_associations() {
+    use crate::worker_control::{self, WorkerControl};
+    install_test_keyring();
+    let mut saved = SavedConnection {
+        server: "https://synthetic.test/".into(),
+        server_id: "server-a".into(),
+        account_id: "account-a".into(),
+        device_id: Some("device-a".into()),
+        name: "Synthetic".into(),
+        token: "synthetic".into(),
+        device_name: "Synthetic".into(),
+        mode: "client-worker".into(),
+    };
+    assert_eq!(
+        worker_control::load(&saved).unwrap(),
+        WorkerControl::Running
+    );
+    worker_control::save(&saved, WorkerControl::Paused).unwrap();
+    assert_eq!(worker_control::load(&saved).unwrap(), WorkerControl::Paused);
+    saved.account_id = "account-b".into();
+    assert_eq!(
+        worker_control::load(&saved).unwrap(),
+        WorkerControl::Running
+    );
+    worker_control::save(&saved, WorkerControl::Stopped).unwrap();
+    saved.account_id = "account-a".into();
+    assert_eq!(worker_control::load(&saved).unwrap(), WorkerControl::Paused);
+    worker_control::save(&saved, WorkerControl::Running).unwrap();
+    saved.account_id = "account-b".into();
+    assert_eq!(
+        worker_control::load(&saved).unwrap(),
+        WorkerControl::Stopped
+    );
+}

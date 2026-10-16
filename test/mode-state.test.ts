@@ -36,3 +36,9 @@ test('serial worker reports startup and waiting without claiming active inferenc
   assert.equal(workerStatus({ state: 'working', workerSupported: false }), 'Checking for AI work');
   assert.equal(workerStatus({ state: 'waiting-for-work', workerSupported: false }), 'Waiting for AI work');
 });
+
+
+test('user drain and immediate stop remain visible without claiming processing', () => {
+  assert.equal(workerStatus({ state: 'pausing', workerSupported: false }), 'Finishing the current task');
+  assert.equal(workerStatus({ state: 'stopped', workerSupported: false }), 'AI processing stopped');
+});

@@ -7,6 +7,7 @@ fn main() {
             "open_photos",
             "worker_setup_status",
             "prepare_models",
+            "control_worker",
         ]),
     ))
     .expect("build desktop ACL");

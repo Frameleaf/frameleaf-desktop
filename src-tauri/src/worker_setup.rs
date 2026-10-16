@@ -15,9 +15,11 @@ use std::{
 pub(crate) struct SetupStatus {
     pub state: String,
     pub code: Option<String>,
+    pub control: crate::worker_control::WorkerControl,
 }
 #[derive(Clone)]
 struct Progress {
+    user_paused: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     status: Arc<Mutex<SetupStatus>>,
     notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
@@ -30,6 +32,11 @@ impl Progress {
         let status = SetupStatus {
             state: state.into(),
             code,
+            control: if self.user_paused.load(Ordering::Acquire) {
+                crate::worker_control::WorkerControl::Paused
+            } else {
+                crate::worker_control::WorkerControl::Running
+            },
         };
         let mut current = self.status.lock().unwrap();
         if *current == status {
@@ -46,12 +53,47 @@ struct Running {
 }
 #[derive(Default)]
 pub(crate) struct WorkerSetup {
+    user_paused: Arc<AtomicBool>,
     running: tokio::sync::Mutex<Option<Running>>,
     status: Arc<Mutex<SetupStatus>>,
 }
 impl WorkerSetup {
     pub fn status(&self) -> SetupStatus {
         self.status.lock().unwrap().clone()
+    }
+    pub fn pause(&self) -> SetupStatus {
+        self.user_paused.store(true, Ordering::Release);
+        let mut status = self.status.lock().unwrap();
+        status.control = crate::worker_control::WorkerControl::Paused;
+        status.state = if matches!(
+            status.state.as_str(),
+            "working" | "preparing-runtime" | "preparing-models" | "qualifying" | "starting-worker"
+        ) {
+            "pausing".into()
+        } else {
+            "paused".into()
+        };
+        status.code = Some("user_paused".into());
+        status.clone()
+    }
+    pub async fn hold(&self, control: crate::worker_control::WorkerControl) -> SetupStatus {
+        self.stop().await;
+        self.user_paused.store(
+            control == crate::worker_control::WorkerControl::Paused,
+            Ordering::Release,
+        );
+        let status = SetupStatus {
+            state: if control == crate::worker_control::WorkerControl::Paused {
+                "paused"
+            } else {
+                "stopped"
+            }
+            .into(),
+            code: None,
+            control,
+        };
+        *self.status.lock().unwrap() = status.clone();
+        status
     }
     async fn start_work<F, Fut>(&self, notify: Arc<dyn Fn(SetupStatus) + Send + Sync>, work: F)
     where
@@ -63,8 +105,10 @@ impl WorkerSetup {
             previous.cancel.store(true, Ordering::Release);
             let _ = previous.task.await;
         }
+        self.user_paused.store(false, Ordering::Release);
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Progress {
+            user_paused: self.user_paused.clone(),
             cancelled: cancel.clone(),
             status: self.status.clone(),
             notify,
@@ -129,14 +173,34 @@ async fn cancellable<T>(
         _ = async { loop { if cancel.load(Ordering::Acquire) { break; } tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("worker_setup_cancelled".into())
     }
 }
+async fn wait_for_user<F: Future<Output = Result<(), String>>>(
+    progress: &Progress,
+    mut maintain: impl FnMut() -> F,
+) -> Result<(), String> {
+    while progress.user_paused.load(Ordering::Acquire) {
+        check_cancel(&progress.cancelled)?;
+        progress.set("paused", Some("user_paused".into()));
+        maintain().await?;
+        cancellable(
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            },
+            &progress.cancelled,
+        )
+        .await?;
+    }
+    check_cancel(&progress.cancelled)
+}
 async fn wait_for_capacity<F: Future<Output = Result<(), String>>>(
     required_memory: u64,
     progress: &Progress,
     mut maintain: impl FnMut() -> F,
 ) -> Result<(), String> {
     loop {
+        wait_for_user(progress, &mut maintain).await?;
         check_cancel(&progress.cancelled)?;
-        cancellable(maintain(), &progress.cancelled).await?;
+        maintain().await?;
         let status = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
             .await
             .map_err(|_| "resource_status_unavailable")?;
@@ -373,6 +437,7 @@ async fn prepare(
     // Complete acquisition before requesting short-lived nonces.
     let mut caches = Vec::new();
     for profile in &profiles {
+        wait_for_user(&progress, || worker.maintain_session()).await?;
         let cache = acquisition(
             profile.prepare_cache(
                 &paths.data.join("models"),
@@ -500,12 +565,17 @@ async fn prepare(
             check_cancel(&progress.cancelled)?;
             let (_sender, mut cancel) = tokio::sync::watch::channel(false);
             loop {
-                cancellable(worker.maintain_session(), &progress.cancelled).await?;
+                worker.maintain_session().await?;
                 let resources =
                     tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
                         .await
                         .map_err(|_| "resource_status_unavailable")?;
                 check_cancel(&progress.cancelled)?;
+                if progress.user_paused.load(Ordering::Acquire) {
+                    predictor.stop()?;
+                    progress.set("paused", Some("user_paused".into()));
+                    break;
+                }
                 if let Some(reason) = resources.refusal(required_memory) {
                     // Release model memory before waiting, otherwise the warm process can prevent recovery.
                     predictor.stop()?;
@@ -557,6 +627,66 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn user_pause_drains_current_work_and_prevents_the_next_task() {
+        let setup = WorkerSetup::default();
+        let jobs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = jobs.clone();
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish) = tokio::sync::oneshot::channel();
+        let (status_tx, mut status) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |value| {
+                    let _ = status_tx.send(value);
+                }),
+                move |progress| async move {
+                    progress.set("working", None);
+                    started_tx.send(()).unwrap();
+                    finish.await.unwrap();
+                    assert!(
+                        !progress.cancelled.load(Ordering::Acquire),
+                        "pause must drain rather than cancel"
+                    );
+                    count.fetch_add(1, Ordering::AcqRel);
+                    wait_for_user(&progress, || async { Ok(()) }).await?;
+                    count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+            )
+            .await;
+        started.await.unwrap();
+        assert_eq!(status.recv().await.unwrap().state, "working");
+        assert_eq!(
+            setup.pause().control,
+            crate::worker_control::WorkerControl::Paused
+        );
+        finish_tx.send(()).unwrap();
+        let paused = tokio::time::timeout(Duration::from_secs(2), status.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.state, "paused");
+        assert_eq!(jobs.load(Ordering::Acquire), 1);
+        setup
+            .hold(crate::worker_control::WorkerControl::Stopped)
+            .await;
+        assert_eq!(setup.status().state, "stopped");
+        assert_eq!(jobs.load(Ordering::Acquire), 1);
+        let (resumed_tx, resumed) = tokio::sync::oneshot::channel();
+        setup
+            .start_work(Arc::new(|_| {}), move |progress| async move {
+                wait_for_user(&progress, || async { Ok(()) }).await?;
+                resumed_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), resumed)
+            .await
+            .unwrap()
+            .unwrap();
+        setup.stop().await;
+    }
     #[tokio::test]
     async fn completed_acquisition_waits_for_inflight_token_rotation_checkpoint() {
         for sign_out in [false, true] {
@@ -857,6 +987,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let data = root.join("new-parent/app");
         let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(SetupStatus::default())),
             notify: Arc::new(|_| {}),

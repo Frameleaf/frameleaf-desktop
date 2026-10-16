@@ -12,6 +12,7 @@ mod resource_policy;
 pub mod runtime_store;
 mod transport;
 pub mod worker;
+mod worker_control;
 mod worker_setup;
 
 use connection::{normalize_server, ConnectionView, Features, SavedConnection};
@@ -349,7 +350,8 @@ pub fn run() {
             sign_out,
             open_photos,
             worker_setup_status,
-            prepare_models
+            prepare_models,
+            control_worker
         ])
         .run(tauri::generate_context!())
         .expect("Frameleaf desktop failed to start");
@@ -360,6 +362,12 @@ async fn start_worker_setup(
     saved: &SavedConnection,
     allow_download: bool,
 ) -> Result<(), String> {
+    let control = worker_control::load(saved)?;
+    if control != worker_control::WorkerControl::Running {
+        let status = app.state::<worker_setup::WorkerSetup>().hold(control).await;
+        let _ = app.emit_to("main", "worker-setup", status);
+        return Ok(());
+    }
     let paths = worker_setup::SetupPaths {
         data: app
             .path()
@@ -409,4 +417,44 @@ async fn prepare_models(
         return Err("desktop_enrollment_required".into());
     }
     start_worker_setup(&app, saved, allow_download).await
+}
+
+#[tauri::command]
+async fn control_worker(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    control: worker_control::WorkerControl,
+) -> Result<worker_setup::SetupStatus, String> {
+    require_local(&window)?;
+    let mut current = state.0.lock().await;
+    let saved = current.as_mut().ok_or("sign_in_required")?;
+    let setup = app.state::<worker_setup::WorkerSetup>();
+    match control {
+        worker_control::WorkerControl::Paused => {
+            let status = setup.pause();
+            worker_control::save(saved, control)?;
+            Ok(status)
+        }
+        worker_control::WorkerControl::Stopped => {
+            let status = setup.hold(control).await;
+            worker_control::save(saved, control)?;
+            Ok(status)
+        }
+        worker_control::WorkerControl::Running => {
+            let previous = worker_control::load(saved)?;
+            setup.stop().await;
+            let view = prepare(saved).await;
+            if view.state != "preparing" || !view.features.worker_session {
+                setup.hold(previous).await;
+                return Err("worker_setup_unavailable".into());
+            }
+            if let Err(error) = worker_control::save(saved, control) {
+                setup.hold(previous).await;
+                return Err(error);
+            }
+            start_worker_setup(&app, saved, false).await?;
+            Ok(setup.status())
+        }
+    }
 }

@@ -5,7 +5,7 @@
   import { workerStatus } from './mode-state';
   import mark from './mark.svg';
 
-  type Connection = { server: string; name: string; mode: string; state: string; features: { worker: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean } };
+  type Connection = { server: string; name: string; mode: string; state: string; features: { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean } };
   let mode = $state<'client-worker' | 'local-server'>('client-worker');
   let connection = $state<Connection | null>(null);
   let server = $state('');
@@ -15,15 +15,19 @@
   let busy = $state(false);
   let notice = $state('');
   let failure = $state('');
-  type SetupStatus = { state: string; code: string | null };
+  type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped' };
   let setup = $state<SetupStatus | null>(null);
   const setupState = $derived(setup?.state || connection?.state || '');
   const setupDetail = $derived(setup?.code === 'runtime_pack_unavailable'
     ? 'This build does not include a signed AI runtime yet. Photos remain available.'
     : setup?.state === 'model-download-required'
     ? 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks.'
+    : setup?.state === 'pausing'
+    ? 'The current bounded task will finish, then this computer will stop requesting work.'
+    : setup?.state === 'stopped'
+    ? 'AI processing is stopped on this computer. Resume whenever you are ready. Photos remain available.'
     : setup?.state === 'paused'
-    ? ({ on_battery: 'Plug in this computer to continue AI processing.', power_unknown: 'Power status could not be read. AI processing is paused.', metered_network: 'AI processing pauses on metered networks. Photos remain available.', network_unknown: 'Network cost could not be determined. AI processing is paused.', memory_low: 'Waiting for enough memory for the selected model.', memory_unknown: 'Memory status could not be read. AI processing is paused.' } as Record<string, string>)[setup.code ?? ''] ?? 'AI processing is paused.'
+    ? ({ user_paused: 'Paused by you. This computer will stay paused after reopening the app.', on_battery: 'Plug in this computer to continue AI processing.', power_unknown: 'Power status could not be read. AI processing is paused.', metered_network: 'AI processing pauses on metered networks. Photos remain available.', network_unknown: 'Network cost could not be determined. AI processing is paused.', memory_low: 'Waiting for enough memory for the selected model.', memory_unknown: 'Memory status could not be read. AI processing is paused.' } as Record<string, string>)[setup.code ?? ''] ?? 'AI processing is paused.'
     : setup?.state === 'qualified'
     ? 'The selected models passed this computer’s checks.'
     : setup?.state === 'starting-worker'
@@ -42,6 +46,7 @@
     ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : '');
   const native = isTauri();
   const errors: Record<string, string> = {
+    worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
     server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
     server_address_invalid: 'Enter a valid HTTPS server address.',
     server_identity_not_confirmed: 'Sign in again to confirm this server’s identity. Clear the saved sign-in first.',
@@ -90,6 +95,15 @@
     } catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
+  async function controlWorker(control: 'running' | 'paused' | 'stopped') {
+    busy = true; failure = '';
+    try { setup = await invoke<SetupStatus>('control_worker', { control }); }
+    catch (error) {
+      failure = explain(error);
+      setup = await invoke<SetupStatus>('worker_setup_status').catch(() => setup);
+    }
+    finally { busy = false; }
+  }
   async function prepareModels(allowDownload: boolean) {
     busy = true; failure = '';
     try { await invoke('prepare_models', { allowDownload }); }
@@ -119,7 +133,17 @@
         <p>{setupDetail || (connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : 'AI processing starts only after the server supports desktop workers and the selected models pass qualification.')}</p>
         {#if setup?.state === 'model-download-required'}<button class="secondary" disabled={busy} onclick={() => prepareModels(true)}>Download selected AI models</button>{/if}
         {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
-        <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>Not running</strong></div></div>
+        {#if connection.mode === 'client-worker' && connection.features.workerSession}
+          <div class="actions" aria-label="AI worker controls">
+            {#if setup?.control === 'paused' || setup?.control === 'stopped'}
+              <button class="secondary" disabled={busy} onclick={() => controlWorker('running')}>Resume AI processing</button>
+            {:else}
+              <button class="secondary" disabled={busy} onclick={() => controlWorker('paused')}>Pause after current task</button>
+            {/if}
+            <button class="text-button" disabled={busy || setup?.control === 'stopped'} onclick={() => controlWorker('stopped')}>Stop now</button>
+          </div>
+        {/if}
+        <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>{setupState === 'working' ? 'Available' : setupState === 'pausing' ? 'Finishing current task' : 'Not running'}</strong></div></div>
       </section>
       <div class="actions"><button class="primary" onclick={photos} disabled={busy || connection.state === 'identity-changed'}>Open Frameleaf Photos</button><button class="secondary" onclick={signOut} disabled={busy}>Sign out</button></div>
       <p class="footnote">Server administration uses your existing Frameleaf permissions inside Photos. Host controls require a separately paired Manager.</p>
