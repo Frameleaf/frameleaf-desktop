@@ -301,6 +301,13 @@ impl VerifiedHostRuntime {
             return Err("host_config_invalid".into());
         }
         crate::runtime_store::private_directory(state)?;
+        crate::host_storage::check(state)?;
+        let database = state.join("database");
+        match std::fs::symlink_metadata(&database) {
+            Ok(_) => crate::host_storage::check(&database)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("host_storage_unavailable".into()),
+        }
         if state.starts_with(&self.root) || self.root.starts_with(state) {
             return Err("host_state_overlaps_runtime".into());
         }

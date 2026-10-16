@@ -3,6 +3,7 @@ pub mod copy_source;
 pub mod copy_upload;
 mod credentials;
 pub mod host_runtime;
+mod host_storage;
 pub mod lifecycle;
 pub mod ml_transport;
 mod model_cache;

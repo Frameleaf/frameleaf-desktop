@@ -428,6 +428,15 @@ The desktop now contains a separate signed host-pack verifier and an owned host 
 
 `VerifiedHostRuntime::start` acquires the profile lease and installs OS process-tree ownership before opening the agent's start gate. Credentials pass through the private input pipe, not command-line arguments. Initial databases use checksums and SCRAM authentication on loopback; temporary initialization credentials are removed. Startup checks both the real API and Microservices. Same-runtime restarts preserve data; changed runtime identities require Manager rather than silently migrating an existing profile. The controller stops the app before PostgreSQL and monitors agent failure to terminate remaining owned processes. Unix termination retains the leader PID until group signalling completes.
 
+Before starting any process, the controller checks the actual profile volume and
+any existing database directory. Database admission requires writable local
+APFS/HFS on macOS, an ext-family/XFS/Btrfs/ZFS filesystem on Linux, or a fixed NTFS
+volume on Windows, with at least 2 GiB available to the current user. Unknown,
+network and linked paths are refused. This is a startup floor, not a complete
+library/model/backup budget or cloud-sync exclusion check. Photo-library storage
+has separate requirements. The native volume probe is exercised locally on macOS;
+installed Windows/Linux volume behavior remains unqualified.
+
 Real macOS controller fixtures passed fresh setup, restart and recovery after `initdb` but before application-database creation, using PostgreSQL 19 beta 4, pgvector 0.8.7 and all 38 application migrations. Wrong database passwords were rejected. Those developer fixtures link external development artifacts; they do not prove a complete signed or portable host bundle. A separate Rust test uses synthetic components to exercise the owner, output pipe, restart and forced-agent-crash paths.
 
 Local hosting remains unavailable in the setup UI. A complete private dependency bundle, local-filesystem qualification, OS credential-store setup, Manager operations/recovery and installed platform acceptance are still required. Studio/edge/full media processing are not qualified by startup alone. Windows needs a graceful application drain channel before host release; the current controller's Windows stop is forceful. No database upgrade or restore is enabled by this controller.

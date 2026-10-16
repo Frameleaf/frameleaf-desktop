@@ -79,6 +79,28 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn host_start_refuses_a_linked_database_before_launching_any_process() {
+    use zeroize::Zeroizing;
+    let fixture = Fixture::new();
+    let state = fixture.0.with_extension("state");
+    fs::create_dir(&state).unwrap();
+    let _cleanup = Fixture(state.clone(), json!(null));
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&fixture.0, state.join("database")).unwrap();
+    let verified = fixture.verify().unwrap();
+    let result = verified.start(
+        &state,
+        &Zeroizing::new("synthetic-host-password-with-enough-length".into()),
+        54321,
+        54322,
+    );
+    assert!(matches!(result, Err(ref code) if code == "runtime_link_forbidden"));
+    assert!(!state.join("agent.log").exists());
+}
+
 #[test]
 fn host_runtime_requires_signed_complete_source_pinned_components() {
     let mut fixture = Fixture::new();
