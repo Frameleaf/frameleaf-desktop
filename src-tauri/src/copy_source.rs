@@ -180,6 +180,22 @@ fn relative_path(path: &str) -> Result<&Path, String> {
     Ok(path)
 }
 impl CopyApproval {
+    pub(crate) fn source_id(&self) -> &str {
+        &self.scope.source_id
+    }
+    pub(crate) fn fingerprint(&self) -> String {
+        format!("{:x}", Sha256::digest(self.signature.as_bytes()))
+    }
+    pub(crate) fn root(&self) -> &Path {
+        Path::new(&self.scope.root)
+    }
+    pub(crate) fn validate_current(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<(), String> {
+        self.validate(saved, identity)
+    }
     pub fn approve(
         saved: &SavedConnection,
         identity: &DeviceIdentity,
@@ -389,6 +405,9 @@ impl Drop for Partial {
     }
 }
 impl StagedCopy {
+    pub(crate) fn source_id(&self) -> &str {
+        self.approval.source_id()
+    }
     pub(crate) fn filename(&self) -> Result<&str, String> {
         relative_path(&self.relative)?
             .file_name()

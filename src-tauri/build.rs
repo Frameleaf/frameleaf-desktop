@@ -10,6 +10,9 @@ fn main() {
             "control_worker",
             "discover_onedrive",
             "choose_photo_folder",
+            "approve_photo_folder",
+            "photo_source_status",
+            "revoke_photo_source",
         ]),
     ))
     .expect("build desktop ACL");

@@ -13,6 +13,7 @@ mod process_tree;
 pub mod release_policy;
 mod resource_policy;
 pub mod runtime_store;
+mod source_consent;
 mod transport;
 pub mod worker;
 mod worker_control;
@@ -253,6 +254,7 @@ async fn sign_out(
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<source_consent::SourceConsent>().clear()?;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let saved = current
         .clone()
@@ -262,7 +264,8 @@ async fn sign_out(
         async {
             let worker = credentials::delete("worker-session").is_ok();
             let connection = credentials::delete("connection").is_ok();
-            worker && connection
+            let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
+            worker && connection && sources
         },
         async {
             if let Some(photos) = app.get_webview_window("photos") {
@@ -373,6 +376,7 @@ pub fn run() {
         }))
         .manage(DesktopState::default())
         .manage(worker_setup::WorkerSetup::default())
+        .manage(source_consent::SourceConsent::default())
         .invoke_handler(tauri::generate_handler![
             connect_server,
             restore_connection,
@@ -382,7 +386,10 @@ pub fn run() {
             prepare_models,
             control_worker,
             discover_onedrive,
-            choose_photo_folder
+            choose_photo_folder,
+            approve_photo_folder,
+            photo_source_status,
+            revoke_photo_source
         ])
         .run(tauri::generate_context!())
         .expect("Frameleaf desktop failed to start");
@@ -521,9 +528,10 @@ async fn choose_photo_folder(
     window: WebviewWindow,
     app: tauri::AppHandle,
     one_drive: Option<usize>,
-) -> Result<Option<photo_sources::FolderInventory>, String> {
+) -> Result<Option<source_consent::SelectedFolder>, String> {
     use tauri_plugin_dialog::DialogExt;
     require_local(&window)?;
+    let generation = app.state::<source_consent::SourceConsent>().generation()?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut picker = app.dialog().file().set_title("Choose a photo folder");
         if let Some(index) = one_drive {
@@ -535,8 +543,81 @@ async fn choose_photo_folder(
             return Ok(None);
         };
         let path = folder.into_path().map_err(|_| "source_folder_invalid")?;
-        photo_sources::inventory(&path, 10_000).map(Some)
+        app.state::<source_consent::SourceConsent>()
+            .select(generation, path)
+            .map(Some)
     })
     .await
     .map_err(|_| "source_inventory_failed")?
+}
+
+#[tauri::command]
+async fn photo_source_status(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+) -> Result<Option<source_consent::ConsentView>, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let Some(consent) = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
+    else {
+        return Ok(None);
+    };
+    consent.require(saved, &credentials::identity()?)?;
+    Ok(Some(consent.view()))
+}
+#[tauri::command]
+async fn approve_photo_folder(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    selection_id: Option<String>,
+    allow_download: bool,
+) -> Result<source_consent::ConsentView, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let identity = credentials::identity()?;
+    let mut consent = if let Some(selection) = selection_id {
+        if credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?.is_some() {
+            return Err("source_remove_previous_approval".into());
+        }
+        app.state::<source_consent::SourceConsent>().approve(
+            saved,
+            &identity,
+            &selection,
+            allow_download,
+            |value| credentials::save(source_consent::CREDENTIAL, value),
+        )?
+    } else {
+        credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
+            .ok_or("source_approval_required")?
+    };
+    consent.register(saved, &identity).await?;
+    credentials::save(source_consent::CREDENTIAL, &consent)?;
+    Ok(consent.view())
+}
+#[tauri::command]
+async fn revoke_photo_source(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<bool, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
+    // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
+    credentials::delete(source_consent::CREDENTIAL)?;
+    app.state::<source_consent::SourceConsent>().clear()?;
+    match consent {
+        Ok(Some(consent)) => {
+            let Ok(identity) = credentials::identity() else {
+                return Ok(false);
+            };
+            Ok(consent.revoke(saved, &identity).await.is_ok())
+        }
+        Ok(None) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }

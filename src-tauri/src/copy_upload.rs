@@ -19,11 +19,43 @@ use std::{
 use url::Url;
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FolderUploadBinding {
+    kind: String,
+    source_id: String,
+    run_id: String,
+    item_id: String,
+}
+impl FolderUploadBinding {
+    pub fn new(copy: &StagedCopy, run: &str, item: &str) -> Result<Self, String> {
+        let value = Self {
+            kind: "folder".into(),
+            source_id: copy.source_id().into(),
+            run_id: run.into(),
+            item_id: item.into(),
+        };
+        value.validate(copy)?;
+        Ok(value)
+    }
+    fn validate(&self, copy: &StagedCopy) -> Result<(), String> {
+        if self.kind != "folder"
+            || self.source_id != copy.source_id()
+            || [&self.source_id, &self.run_id, &self.item_id]
+                .iter()
+                .any(|id| !canonical_uuid(id))
+        {
+            return Err("source_upload_binding_invalid".into());
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UploadSession {
     resource_id: String,
     stage_id: String,
+    binding: FolderUploadBinding,
     signature: String,
 }
 /// Even a matching duplicate still needs the NAS source service's healthy-owned-bytes receipt.
@@ -37,6 +69,7 @@ fn session_signature(
     identity: &DeviceIdentity,
     copy: &StagedCopy,
     resource: &str,
+    binding: &FolderUploadBinding,
 ) -> Result<String, String> {
     let value = serde_json_canonicalizer::to_vec(&(
         normalize_server(&saved.server)?.as_str(),
@@ -48,10 +81,11 @@ fn session_signature(
         &copy.sha256,
         copy.bytes,
         resource,
+        binding,
     ))
     .map_err(|_| "source_upload_journal_invalid")?;
     Ok(identity.sign(&format!(
-        "frameleaf-desktop/copy-upload/v1\n{}",
+        "frameleaf-desktop/copy-upload/v2\n{}",
         String::from_utf8(value).map_err(|_| "source_upload_journal_invalid")?
     )))
 }
@@ -203,10 +237,12 @@ fn date(ms: i64) -> Result<String, String> {
     ))
 }
 /// `persist` must durably save the signed session before returning success. Cancellation pauses it.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     saved: &SavedConnection,
     identity: &DeviceIdentity,
     copy: &StagedCopy,
+    binding: &FolderUploadBinding,
     staging: &Path,
     session: &mut Option<UploadSession>,
     persist: impl FnMut(&UploadSession) -> Result<(), String>,
@@ -218,6 +254,7 @@ pub async fn upload(
         saved,
         identity,
         copy,
+        binding,
         staging,
         session,
         persist,
@@ -232,22 +269,26 @@ async fn transfer(
     saved: &SavedConnection,
     identity: &DeviceIdentity,
     copy: &StagedCopy,
+    binding: &FolderUploadBinding,
     staging: &Path,
     session: &mut Option<UploadSession>,
     mut persist: impl FnMut(&UploadSession) -> Result<(), String>,
     cancelled: &AtomicBool,
 ) -> Result<UploadOutcome, String> {
     check_cancel(cancelled)?;
+    binding.validate(copy)?;
     let mut file = copy.verify(saved, identity, staging)?;
     let filename = copy.filename()?;
-    let metadata=URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({"filename":filename,"fileCreatedAt":date(copy.file_created_at_ms)?,"fileModifiedAt":date(copy.file_modified_at_ms)?})).map_err(|_|"source_upload_metadata_invalid")?);
+    let metadata=URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({"filename":filename,"fileCreatedAt":date(copy.file_created_at_ms)?,"fileModifiedAt":date(copy.file_modified_at_ms)?,"sourceIdentity":binding})).map_err(|_|"source_upload_metadata_invalid")?);
     if metadata.len() > 8192 {
         return Err("source_upload_metadata_invalid".into());
     }
     if let Some(current) = session.as_ref() {
         if current.stage_id != copy.id
+            || current.binding != *binding
             || !canonical_uuid(&current.resource_id)
-            || current.signature != session_signature(saved, identity, copy, &current.resource_id)?
+            || current.signature
+                != session_signature(saved, identity, copy, &current.resource_id, binding)?
         {
             return Err("source_upload_journal_invalid".into());
         }
@@ -334,9 +375,10 @@ async fn transfer(
             return Err("source_upload_response_invalid".into());
         }
         *session = Some(UploadSession {
-            signature: session_signature(saved, identity, copy, &id)?,
+            signature: session_signature(saved, identity, copy, &id, binding)?,
             resource_id: id,
             stage_id: copy.id.clone(),
+            binding: binding.clone(),
         });
         persist(session.as_ref().unwrap())?;
         initial

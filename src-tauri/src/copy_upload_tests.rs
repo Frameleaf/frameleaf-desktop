@@ -189,6 +189,14 @@ impl Fixture {
             copy,
         }
     }
+    fn binding(&self) -> FolderUploadBinding {
+        FolderUploadBinding::new(
+            &self.copy,
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        .unwrap()
+    }
     async fn run(
         &self,
         server: &Server,
@@ -201,6 +209,7 @@ impl Fixture {
             &self.saved,
             &self.identity,
             &self.copy,
+            &self.binding(),
             &self.root.join("stage"),
             journal,
             persist,
@@ -266,7 +275,10 @@ fn transfers_staged_bytes_with_signed_restart_and_strict_result_validation() {
         )
         .unwrap();
         assert_eq!(value["filename"], "旅行.jpg");
-        assert!(value.get("sourceIdentity").is_none());
+        assert_eq!(
+            value["sourceIdentity"],
+            serde_json::to_value(fixture.binding()).unwrap()
+        );
         let sent: Vec<_> = requests
             .iter()
             .filter(|(h, _)| h.starts_with("PATCH "))
@@ -432,11 +444,13 @@ fn tampered_session_and_mismatched_digest_are_never_accepted() {
         let session = UploadSession {
             resource_id: RESOURCE.into(),
             stage_id: fixture.copy.id.clone(),
+            binding: fixture.binding(),
             signature: session_signature(
                 &fixture.saved,
                 &fixture.identity,
                 &fixture.copy,
                 RESOURCE,
+                &fixture.binding(),
             )
             .unwrap(),
         };
@@ -493,11 +507,13 @@ fn invalid_server_offsets_and_capacity_never_send_bytes() {
             let mut journal = Some(UploadSession {
                 resource_id: RESOURCE.into(),
                 stage_id: fixture.copy.id.clone(),
+                binding: fixture.binding(),
                 signature: session_signature(
                     &fixture.saved,
                     &fixture.identity,
                     &fixture.copy,
                     RESOURCE,
+                    &fixture.binding(),
                 )
                 .unwrap(),
             });
@@ -564,5 +580,44 @@ fn cancellation_aborts_an_inflight_request_without_waiting_for_network_timeout()
         );
         assert!(now.elapsed() < Duration::from_secs(2));
         handle.join().unwrap();
+    });
+}
+
+#[test]
+fn a_resume_journal_cannot_be_rebound_to_a_different_source_run_or_item() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let session = UploadSession {
+            resource_id: RESOURCE.into(),
+            stage_id: fixture.copy.id.clone(),
+            binding: fixture.binding(),
+            signature: session_signature(
+                &fixture.saved,
+                &fixture.identity,
+                &fixture.copy,
+                RESOURCE,
+                &fixture.binding(),
+            )
+            .unwrap(),
+        };
+        for field in ["sourceId", "runId", "itemId", "kind"] {
+            let mut forged = serde_json::to_value(&session).unwrap();
+            forged["binding"][field] = serde_json::json!("44444444-4444-4444-8444-444444444444");
+            let mut journal = Some(serde_json::from_value(forged).unwrap());
+            let server = Server::new(vec![]);
+            assert_eq!(
+                fixture
+                    .run(&server, &mut journal, |_| Ok(()))
+                    .await
+                    .err()
+                    .as_deref(),
+                Some("source_upload_journal_invalid")
+            );
+            assert!(server.requests.lock().unwrap().is_empty());
+        }
+        let mut legacy = serde_json::to_value(&session).unwrap();
+        legacy.as_object_mut().unwrap().remove("binding");
+        assert!(serde_json::from_value::<UploadSession>(legacy).is_err());
+        assert!(FolderUploadBinding::new(&fixture.copy, "invalid", RESOURCE).is_err());
     });
 }

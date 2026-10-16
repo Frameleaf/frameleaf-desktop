@@ -240,10 +240,17 @@ The scan stops at 10,000 entries, 16 levels or 256 pending directories and repor
 partial/skipped results. It refuses the whole home folder or filesystem root.
 Cloud residency, required downloads and cloud-account completeness remain unknown.
 
-This is a transient local preview, not an import or a persistent source grant.
-Copy/import reconciliation, provider-aware hydration, external references, durable
-account-bound consent and PhotoKit integration remain required before sources are
-advertised by the NAS. No source bytes are uploaded or changed by this preview.
+The preview opens no source content. A separate explicit approval stores a signed,
+photo-session-bound folder permission in the OS credential store and registers its
+opaque scope with the NAS. The UI sends only an expiring native picker handle;
+it cannot approve an arbitrary filesystem path. A failed secure-store write keeps
+the selection retryable, and a failed registration keeps the same source identity.
+Removing permission clears local authority before contacting the NAS; offline or
+unconfirmed server revocation remains visible. Sign-out invalidates pending picker
+handles and removes the permission; a different photo sign-in cannot reuse it.
+Copy/import reconciliation, provider-aware hydration, external references and
+PhotoKit integration remain required before sources are advertised by the NAS.
+Approval does not begin a copy.
 The native picker uses the [Tauri dialog plugin](https://v2.tauri.app/plugin/dialog/)
 through local-only Rust commands; remote Photos windows receive no dialog or
 filesystem capabilities.
@@ -264,8 +271,8 @@ receipt and bytes before returning a read-only handle positioned at the beginnin
 A staged copy survives source eviction; changed bytes, journal tampering or a different
 account/server/device are refused.
 
-This engine is not exposed through UI commands yet. Persistent consent storage and
-revocation, whole-run capacity/network budgets, durable item dispositions, application
+The UI manages folder consent but does not start this engine yet. Whole-run
+capacity/network budgets, durable item dispositions, application
 NAS upload integration, source provenance and healthy managed-copy reconciliation
 remain required before the app can offer copy imports. A verified local stage is not
 a completed Frameleaf import or an external-reference grant. Real OneDrive hydration
@@ -279,10 +286,13 @@ before sharing filenames or bytes, negotiates current size limits, and creates a
 empty resource before requesting a durable signed journal checkpoint. Restarts use
 HEAD offsets on that same resource. Appends are bounded to 1 MiB, preserve source
 filesystem dates, send a whole-file SHA-256 digest, and support request cancellation.
+Requests and signed v2 resume journals bind the exact folder source, run and item;
+changed bindings and legacy unbound journals are refused before network use.
 Redirects and foreign, ambiguous or noncanonical resource locations are refused.
 
 A matching ingestion response is not proof of a healthy independent managed copy.
-The folder-source provenance/receipt contract, persistent consent and journal store,
-job lifecycle and UI remain to be connected before imports can be offered. Protocol
+The server source/receipt contract and local consent are implemented. The durable
+run/item journal, consent checks during jobs, verified managed-copy reconciliation,
+job lifecycle and import UI remain to be connected before imports can be offered. Protocol
 fixtures exercise real loopback HTTP requests with synthetic media; actual NAS HTTPS
 transfer and installed-device acceptance remain unqualified.
