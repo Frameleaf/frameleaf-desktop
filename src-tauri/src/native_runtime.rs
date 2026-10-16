@@ -915,7 +915,16 @@ mod accepted_qualification_tests {
     ) {
         let catalogue: Value =
             serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
-        let p = &catalogue["profiles"][0];
+        let data: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/accepted-qualification.json"
+        ))
+        .unwrap();
+        let p = catalogue["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["spec"]["modelKey"] == data["response"]["modelKey"])
+            .unwrap();
         let profile = approved_profile(
             p["modelName"].as_str().unwrap(),
             &p["spec"]["entries"],
@@ -923,10 +932,6 @@ mod accepted_qualification_tests {
             p["spec"]["provider"].as_str().unwrap(),
         )
         .unwrap()
-        .unwrap();
-        let data: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/accepted-qualification.json"
-        ))
         .unwrap();
         let response = data["response"].clone();
         let mut report = data["report"].clone();
