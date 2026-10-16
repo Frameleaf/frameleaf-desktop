@@ -431,6 +431,31 @@ pub enum WorkerFailure {
     Cancelled,
 }
 
+// Leave room for the 20-second claim and the longest ten-minute execution.
+const RENEW_BEFORE_MS: i64 = 15 * 60 * 1000;
+fn renewal_due(worker: &SavedWorker, at: i64) -> Result<bool, String> {
+    let remaining = millis(&worker.expires_at)? - at;
+    if remaining <= 0 || worker.next_sequence == 0 || worker.next_sequence > 2_147_483_647 {
+        return Err("worker_session_renewal_required".into());
+    }
+    Ok(remaining <= RENEW_BEFORE_MS || worker.next_sequence >= 2_147_483_646)
+}
+fn renewed_worker(
+    worker: &SavedWorker,
+    response: &SessionResponse,
+    at: i64,
+) -> Result<SavedWorker, String> {
+    let renewed = bind_renewal(worker, response)?;
+    let remaining = millis(&renewed.expires_at)? - at;
+    if renewed.worker_token == worker.worker_token
+        || remaining <= RENEW_BEFORE_MS
+        || remaining > 3_720_000
+    {
+        return Err("worker_session_response_invalid".into());
+    }
+    Ok(renewed)
+}
+
 struct Connection {
     client: Client,
     base: Url,
@@ -438,6 +463,16 @@ struct Connection {
     identity: DeviceIdentity,
 }
 impl Connection {
+    async fn renew(&mut self) -> Result<(), String> {
+        let response = self
+            .request(Method::POST, "api/desktop/worker/session", "renew", "{}")
+            .await?;
+        let session: SessionResponse = transport::json(response).await?;
+        let worker = renewed_worker(&self.worker, &session, now()?)?;
+        credentials::save_worker_checkpoint(&self.worker, &worker)?;
+        self.worker = worker;
+        Ok(())
+    }
     async fn request(
         &mut self,
         method: Method,
@@ -601,7 +636,12 @@ impl WorkerTransport {
         let payload =
             serde_json::json!({"modelKeys":[qualification.model_key],"waitMs":20000}).to_string();
         let mut connection = self.0.lock().await;
-        qualification.validate_authority(&connection.worker, now()?)?;
+        let at = now()?;
+        qualification.validate_authority(&connection.worker, at)?;
+        if renewal_due(&connection.worker, at)? {
+            connection.renew().await?;
+            qualification.validate_authority(&connection.worker, now()?)?;
+        }
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
             .await?;
@@ -740,15 +780,7 @@ impl WorkerTransport {
         .map(|ack| ack.accepted)
     }
     pub async fn renew(&self) -> Result<(), String> {
-        let mut connection = self.0.lock().await;
-        let response = connection
-            .request(Method::POST, "api/desktop/worker/session", "renew", "{}")
-            .await?;
-        let session: SessionResponse = transport::json(response).await?;
-        let worker = bind_renewal(&connection.worker, &session)?;
-        credentials::save_worker_checkpoint(&connection.worker, &worker)?;
-        connection.worker = worker;
-        Ok(())
+        self.0.lock().await.renew().await
     }
     pub async fn revoke(&self) -> Result<bool, String> {
         let mut connection = self.0.lock().await;
@@ -756,5 +788,74 @@ impl WorkerTransport {
             .request(Method::DELETE, "api/desktop/worker/session", "revoke", "")
             .await?;
         Ok(transport::json::<Ack>(response).await?.accepted)
+    }
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::*;
+    use serde_json::json;
+
+    const AT: i64 = 1_792_094_400_000;
+    fn worker() -> SavedWorker {
+        serde_json::from_value(
+            json!({"serverId":"server","accountId":"account","deviceId":"device",
+          "sessionId":"1117c1ca-0495-46e9-b579-f321520c2b1a","authorizationEpoch":2,
+          "workerToken":"a".repeat(64),"expiresAt":"2026-10-15T21:00:00Z","nextSequence":1}),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn renews_before_the_longest_claim_and_execution_or_counter_exhaustion() {
+        let mut worker = worker();
+        assert!(!renewal_due(&worker, AT + 2_699_999).unwrap());
+        assert!(renewal_due(&worker, AT + 2_700_000).unwrap());
+        worker.next_sequence = 2_147_483_646;
+        assert!(renewal_due(&worker, AT).unwrap());
+    }
+    #[test]
+    fn expired_invalid_or_exhausted_credentials_cannot_attempt_renewal() {
+        let mut worker = worker();
+        assert!(renewal_due(&worker, AT + 3_600_000).is_err());
+        worker.expires_at = "invalid".into();
+        assert!(renewal_due(&worker, AT).is_err());
+        worker = self::worker();
+        for sequence in [0, 2_147_483_648] {
+            worker.next_sequence = sequence;
+            assert!(renewal_due(&worker, AT).is_err());
+        }
+    }
+    #[test]
+    fn renewal_requires_a_new_token_and_a_bounded_future_lifetime_on_the_same_association() {
+        let worker = worker();
+        let response = json!({"sessionId":worker.session_id,"authorizationEpoch":2,
+          "workerToken":"b".repeat(64),"expiresAt":"2026-10-15T21:00:00Z","scopes":["library-inference"]});
+        let renewed = renewed_worker(
+            &worker,
+            &serde_json::from_value(response.clone()).unwrap(),
+            AT,
+        )
+        .unwrap();
+        assert_eq!(renewed.worker_token, "b".repeat(64));
+        assert_eq!(renewed.next_sequence, 1);
+        assert_eq!(renewed.session_id, worker.session_id);
+        assert_eq!(renewed.device_id, worker.device_id);
+        for (field, value) in [
+            ("workerToken", json!("a".repeat(64))),
+            ("expiresAt", json!("2026-10-15T20:15:00Z")),
+            ("expiresAt", json!("2026-10-15T19:59:00Z")),
+            ("expiresAt", json!("2026-10-15T21:03:00Z")),
+            ("expiresAt", json!("invalid")),
+            ("sessionId", json!("445bc2b6-f4cd-439e-b8bb-7e84d7ee0550")),
+            ("authorizationEpoch", json!(3)),
+            ("scopes", json!(["photos"])),
+        ] {
+            let mut changed = response.clone();
+            changed[field] = value;
+            assert!(
+                renewed_worker(&worker, &serde_json::from_value(changed).unwrap(), AT).is_err(),
+                "{field}"
+            );
+        }
     }
 }
