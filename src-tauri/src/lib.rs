@@ -6,6 +6,7 @@ mod model_cache;
 pub mod model_catalogue;
 pub mod native_predictor;
 pub mod native_runtime;
+pub mod photo_sources;
 mod process_tree;
 pub mod release_policy;
 mod resource_policy;
@@ -361,6 +362,7 @@ async fn open_photos(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -376,7 +378,9 @@ pub fn run() {
             open_photos,
             worker_setup_status,
             prepare_models,
-            control_worker
+            control_worker,
+            discover_onedrive,
+            choose_photo_folder
         ])
         .run(tauri::generate_context!())
         .expect("Frameleaf desktop failed to start");
@@ -482,4 +486,55 @@ async fn control_worker(
             Ok(setup.status())
         }
     }
+}
+
+fn source_hints(app: &tauri::AppHandle) -> Result<Vec<photo_sources::RootHint>, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|_| "source_home_unavailable")?;
+    let supplied: Vec<_> = if cfg!(target_os = "windows") {
+        ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(std::path::PathBuf::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(photo_sources::known_onedrive_roots(&home, &supplied))
+}
+#[tauri::command]
+async fn discover_onedrive(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<Vec<photo_sources::RootHint>, String> {
+    require_local(&window)?;
+    tauri::async_runtime::spawn_blocking(move || source_hints(&app))
+        .await
+        .map_err(|_| "source_discovery_failed")?
+}
+#[tauri::command]
+async fn choose_photo_folder(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    one_drive: Option<usize>,
+) -> Result<Option<photo_sources::FolderInventory>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    require_local(&window)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut picker = app.dialog().file().set_title("Choose a photo folder");
+        if let Some(index) = one_drive {
+            let hints = source_hints(&app)?;
+            let hint = hints.get(index).ok_or("source_account_unavailable")?;
+            picker = picker.set_directory(&hint.path);
+        }
+        let Some(folder) = picker.blocking_pick_folder() else {
+            return Ok(None);
+        };
+        let path = folder.into_path().map_err(|_| "source_folder_invalid")?;
+        photo_sources::inventory(&path, 10_000).map(Some)
+    })
+    .await
+    .map_err(|_| "source_inventory_failed")?
 }

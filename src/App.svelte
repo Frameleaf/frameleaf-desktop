@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { workerStatus } from './mode-state';
   import mark from './mark.svg';
+  import PhotoSources from './PhotoSources.svelte';
 
   type Connection = { server: string; name: string; mode: string; state: string; features: { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean } };
   let mode = $state<'client-worker' | 'local-server'>('client-worker');
@@ -167,6 +168,7 @@
       </section>
       <div class="actions"><button class="primary" onclick={photos} disabled={busy || connection.state === 'identity-changed'}>Open Frameleaf Photos</button><button class="secondary" onclick={signOut} disabled={busy}>Sign out</button></div>
       <p class="footnote">Server administration uses your existing Frameleaf permissions inside Photos. Host controls require a separately paired Manager.</p>
+      <PhotoSources />
     {:else}
       <p class="eyebrow">Frameleaf Desktop</p>
       <h1>Make yourself<br />at home.</h1>

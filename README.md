@@ -224,3 +224,26 @@ It requires real external power, an unmetered connection and sufficient memory;
 the fixture does not override those checks. Its dedicated NAS configuration enables
 OCR only. The private HTTPS fixture client is available only under Rust's test
 configuration and cannot alter the installed application's certificate policy.
+
+### Local photo-source preview
+
+The local setup window can find known OneDrive sync folders and open the native
+folder picker. Windows discovery uses the current user's OneDrive environment
+hints; macOS checks OneDrive directories under Library/CloudStorage. These hints
+are incomplete: relocated roots and additional accounts can be selected manually.
+Linux uses ordinary selected folders without claiming OneDrive placeholder support.
+
+After the user chooses a folder, the preview counts photo/video filenames and
+logical sizes using metadata only. Capability-relative directory access confines
+traversal; links, hidden entries and application/Photos packages are excluded.
+The scan stops at 10,000 entries, 16 levels or 256 pending directories and reports
+partial/skipped results. It refuses the whole home folder or filesystem root.
+Cloud residency, required downloads and cloud-account completeness remain unknown.
+
+This is a transient local preview, not an import or a persistent source grant.
+Copy/import reconciliation, provider-aware hydration, external references, durable
+account-bound consent and PhotoKit integration remain required before sources are
+advertised by the NAS. No source bytes are uploaded or changed by this preview.
+The native picker uses the [Tauri dialog plugin](https://v2.tauri.app/plugin/dialog/)
+through local-only Rust commands; remote Photos windows receive no dialog or
+filesystem capabilities.

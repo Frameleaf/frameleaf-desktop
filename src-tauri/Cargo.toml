@@ -30,6 +30,8 @@ time = { version = "0.3", features = ["parsing"] }
 
 tauri-plugin-single-instance = "2"
 serde_json_canonicalizer = "=0.3.2"
+tauri-plugin-dialog = "=2.8.3"
+cap-std = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

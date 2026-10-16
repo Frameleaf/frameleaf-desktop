@@ -8,6 +8,8 @@ fn main() {
             "worker_setup_status",
             "prepare_models",
             "control_worker",
+            "discover_onedrive",
+            "choose_photo_folder",
         ]),
     ))
     .expect("build desktop ACL");
