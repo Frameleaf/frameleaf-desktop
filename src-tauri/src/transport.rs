@@ -4,7 +4,16 @@ use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
+// Isolated opt-in fixtures supply their private CA without changing release TLS policy.
+#[cfg(test)]
+pub(crate) static FIXTURE_CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
 pub fn client() -> Result<Client, String> {
+    #[cfg(test)]
+    if let Some(client) = FIXTURE_CLIENT.get() {
+        return Ok(client.clone());
+    }
+
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))

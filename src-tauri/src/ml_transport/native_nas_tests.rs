@@ -192,6 +192,14 @@ fn actual_native_nas_library_jobs() {
     );
     std::io::stdout().flush().unwrap();
 
+    if std::env::var_os("FRAMELEAF_FACTORY_AUTOMATIC_SETUP").is_some() {
+        crate::transport::FIXTURE_CLIENT
+            .set(worker.0.blocking_lock().client.clone())
+            .unwrap();
+        automatic_setup_job(saved, configuration.work_root, &mut input);
+        return;
+    }
+
     crate::native_runtime::absolute_directory(configuration.work_root.parent().unwrap()).unwrap();
     fs::create_dir(&configuration.work_root).unwrap();
     let root = OwnedRoot(configuration.work_root.clone());
@@ -357,4 +365,59 @@ async fn fresh_sign_in_rejects_invalid_details_before_credentials_or_network() {
         .await;
         assert_eq!(result.err().as_deref(), Some("login_details_invalid"));
     }
+}
+
+fn automatic_setup_job(
+    saved: SavedConnection,
+    root: std::path::PathBuf,
+    input: &mut impl std::io::BufRead,
+) {
+    use std::{
+        io::Write,
+        time::{Duration, Instant},
+    };
+    std::fs::create_dir(&root).unwrap();
+    let root = OwnedRoot(root);
+    let setup = crate::worker_setup::WorkerSetup::default();
+    tauri::async_runtime::block_on(async {
+        setup
+            .start(
+                saved,
+                crate::worker_setup::SetupPaths {
+                    data: root.0.join("worker"),
+                    bundle: std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap().into(),
+                },
+                false,
+                std::sync::Arc::new(|status| {
+                    eprintln!("automatic setup: {} {:?}", status.state, status.code);
+                }),
+            )
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(900);
+        loop {
+            let status = setup.status();
+            assert_ne!(status.state, "setup-needs-attention", "{status:?}");
+            assert_ne!(status.state, "model-download-required", "{status:?}");
+            assert_ne!(status.state, "paused", "{status:?}");
+            if matches!(status.state.as_str(), "working" | "waiting-for-work") {
+                assert!(status
+                    .workloads
+                    .iter()
+                    .any(|item| item.workload == "ocr" && item.state == "ready"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "automatic setup deadline: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        println!("NATIVE_QUALIFIED {{\"roles\":1}}");
+        std::io::stdout().flush().unwrap();
+        assert_eq!(read_fixture_message(input)["command"], "execute");
+        assert_eq!(read_fixture_message(input)["command"], "complete");
+        setup.stop().await;
+        println!("NATIVE_EXECUTED {{\"iteration\":1}}");
+        std::io::stdout().flush().unwrap();
+    });
 }
