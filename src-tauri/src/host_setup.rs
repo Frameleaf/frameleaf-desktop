@@ -4,7 +4,7 @@ use crate::{
     manager_host::{Configuration, NativeManager},
 };
 use serde::Serialize;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
@@ -104,7 +104,7 @@ impl HostSetup {
                 return Err("native_manager_already_running".into());
             }
         }
-        if !cfg!(target_os = "macos") {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err("host_install_platform_unsupported".into());
         }
         // Validate the fixed identity before changing lifecycle state.
@@ -333,7 +333,7 @@ pub(crate) async fn authorize_owner(
     .await
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 fn require_leaf(path: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -355,7 +355,7 @@ fn require_leaf(path: &std::path::Path) -> Result<(), String> {
         Err("host_install_platform_unsupported".into())
     }
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn native_release(version: &str, revision: &str) -> Result<String, String> {
     if version.split('.').count() != 3
         || !version.split('.').all(|part| {
@@ -368,12 +368,12 @@ fn native_release(version: &str, revision: &str) -> Result<String, String> {
     Ok(format!("frameleaf-v{version}-native.{}-1", &revision[..12]))
 }
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (record, cancel);
         Err("host_install_platform_unsupported".into())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let current = Installation::read(&record.manifest_sha256)?;
         if &current != record {
@@ -401,7 +401,8 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
             return Err("host_install_runtime_changed".into());
         }
         let uid = unsafe { libc::geteuid() };
-        if uid < 501 || unsafe { libc::getuid() } != uid {
+        let minimum_uid = if cfg!(target_os = "linux") { 1 } else { 501 };
+        if uid < minimum_uid || unsafe { libc::getuid() } != uid {
             return Err("host_install_profile_required".into());
         }
         let profile = layout.profiles.join(uid.to_string());

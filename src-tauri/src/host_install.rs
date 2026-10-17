@@ -1,5 +1,8 @@
 //! Fixed-path installer phases only; never starts a host or reads a user's library.
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+const BASE: &str = "/opt/frameleaf";
+#[cfg(not(target_os = "linux"))]
 const BASE: &str = "/Library/Application Support/Frameleaf";
 pub struct Layout {
     pub runtime: PathBuf,
@@ -60,7 +63,7 @@ impl Installation {
     }
 }
 pub(crate) fn installed() -> Result<Vec<Installation>, String> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err("host_install_platform_unsupported".into());
     }
     let root = PathBuf::from(BASE).join("Runtimes");
@@ -105,7 +108,7 @@ fn receipt_present(path: &std::path::Path) -> Result<bool, String> {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn admit_versions(
     layout: &Layout,
     verify: impl FnOnce() -> Result<(), String>,
@@ -133,31 +136,69 @@ fn admit_versions(
 }
 
 pub fn prepare(manifest: &str, controller: &str) -> Result<serde_json::Value, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        macos::root()?;
-        macos::prepare(&Layout::new(manifest, controller)?, manifest, controller)
+        posix::root()?;
+        posix::prepare(&Layout::new(manifest, controller)?, manifest, controller)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (manifest, controller);
         Err("host_install_platform_unsupported".into())
     }
 }
 pub fn finalize(manifest: &str, controller: &str) -> Result<serde_json::Value, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        macos::root()?;
-        macos::finalize(&Layout::new(manifest, controller)?, manifest, controller)
+        posix::root()?;
+        #[cfg(target_os = "macos")]
+        let user = posix::console_user();
+        #[cfg(target_os = "linux")]
+        let user = None;
+        posix::finalize(
+            &Layout::new(manifest, controller)?,
+            manifest,
+            controller,
+            user,
+        )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (manifest, controller);
         Err("host_install_platform_unsupported".into())
     }
 }
-#[cfg(target_os = "macos")]
-mod macos {
+/// Linux installers explicitly select the account; a package-manager process has no console user.
+pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        posix::root()?;
+        let uid = parse_linux_profile_uid(uid)?;
+        let record = Installation::read(manifest)?;
+        if record.controller_sha256 != controller {
+            return Err("host_install_controller_changed".into());
+        }
+        let user = posix::linux_user(uid)?;
+        posix::finalize(&record.layout()?, manifest, controller, Some(user))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (manifest, controller, uid);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_profile_uid(value: &str) -> Result<u32, String> {
+    let uid: u32 = value
+        .parse()
+        .map_err(|_| "host_install_profile_user_invalid")?;
+    if uid == 0 || uid == u32::MAX || value != uid.to_string() {
+        return Err("host_install_profile_user_invalid".into());
+    }
+    Ok(uid)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod posix {
     use super::*;
     use crate::manager_host::protect;
     use sha2::{Digest, Sha256};
@@ -212,7 +253,9 @@ mod macos {
         controller: &str,
     ) -> Result<serde_json::Value, String> {
         protect(
-            Path::new("/Library/Application Support"),
+            Path::new(BASE)
+                .parent()
+                .ok_or("host_install_path_invalid")?,
             &mut BTreeSet::new(),
         )?;
         for path in [
@@ -229,7 +272,8 @@ mod macos {
             serde_json::json!({"protocolVersion":1,"state":"install-prepared","serverStarted":false}),
         )
     }
-    fn console_user() -> Option<(u32, u32)> {
+    #[cfg(target_os = "macos")]
+    pub(super) fn console_user() -> Option<(u32, u32)> {
         #[link(name = "SystemConfiguration", kind = "framework")]
         unsafe extern "C" {
             fn SCDynamicStoreCopyConsoleUser(
@@ -252,6 +296,29 @@ mod macos {
         } else {
             Some((uid, gid))
         }
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn linux_user(uid: u32) -> Result<(u32, u32), String> {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut result = std::ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status != 0 || result.is_null() {
+            return Err("host_install_profile_user_invalid".into());
+        }
+        let entry = unsafe { entry.assume_init() };
+        if entry.pw_uid != uid || entry.pw_gid == u32::MAX {
+            return Err("host_install_profile_user_invalid".into());
+        }
+        Ok((uid, entry.pw_gid))
     }
     fn private_leaf(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
         protect(
@@ -278,7 +345,9 @@ mod macos {
             }
             Err(_) => return Err("host_install_profile_failed".into()),
         }
-        crate::manager_host::no_acl(path)
+        #[cfg(target_os = "macos")]
+        crate::manager_host::no_acl(path)?;
+        Ok(())
     }
     fn write_record(layout: &Layout, manifest: &str, controller: &str) -> Result<(), String> {
         use std::io::Write;
@@ -315,7 +384,8 @@ mod macos {
             let source =
                 std::ffi::CString::new(temp.as_str()).map_err(|_| "host_install_record_failed")?;
             // A receipt becomes discoverable only after all its bytes are durable.
-            if unsafe {
+            #[cfg(target_os = "macos")]
+            let published = unsafe {
                 libc::renameatx_np(
                     directory.as_raw_fd(),
                     source.as_ptr(),
@@ -323,8 +393,19 @@ mod macos {
                     c"installation.json".as_ptr(),
                     libc::RENAME_EXCL,
                 )
-            } != 0
-            {
+            };
+            #[cfg(target_os = "linux")]
+            let published = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    directory.as_raw_fd(),
+                    source.as_ptr(),
+                    directory.as_raw_fd(),
+                    c"installation.json".as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if published != 0 {
                 return Err("host_install_record_failed".into());
             }
             directory
@@ -374,10 +455,10 @@ mod macos {
         layout: &Layout,
         manifest: &str,
         controller: &str,
+        user: Option<(u32, u32)>,
     ) -> Result<serde_json::Value, String> {
         verify_resources(layout, manifest, controller)?;
         root_directory(&layout.profiles)?;
-        let user = console_user();
         if let Some((uid, gid)) = user {
             let parent = layout.profiles.join(uid.to_string());
             root_directory(&parent)?;
@@ -451,19 +532,62 @@ mod tests {
     #[test]
     fn installer_layout_uses_only_fixed_versioned_system_paths() {
         let layout = Layout::new(&"a".repeat(64), &"b".repeat(64)).unwrap();
+        let base = if cfg!(target_os = "linux") {
+            "/opt/frameleaf"
+        } else {
+            "/Library/Application Support/Frameleaf"
+        };
         assert_eq!(
             layout.runtime,
-            PathBuf::from("/Library/Application Support/Frameleaf/Runtimes").join("a".repeat(64))
+            PathBuf::from(base).join("Runtimes").join("a".repeat(64))
         );
         assert_eq!(
             layout.controller,
-            PathBuf::from("/Library/Application Support/Frameleaf/Controllers")
+            PathBuf::from(base)
+                .join("Controllers")
                 .join("b".repeat(64))
                 .join("frameleaf-native-host")
         );
         for value in ["", "../escape", "/tmp", &"A".repeat(64)] {
             assert!(Layout::new(value, &"b".repeat(64)).is_err());
         }
+    }
+    #[test]
+    fn linux_profile_uid_is_explicit_and_rejects_root_and_path_values() {
+        assert_eq!(parse_linux_profile_uid("1000").unwrap(), 1000);
+        assert_eq!(parse_linux_profile_uid("2001").unwrap(), 2001);
+        assert_eq!(parse_linux_profile_uid("501").unwrap(), 501);
+        assert_eq!(parse_linux_profile_uid("999").unwrap(), 999);
+        for value in [
+            "",
+            "0",
+            "01000",
+            "+1000",
+            " 1000",
+            "1000\n",
+            "../1000",
+            "4294967295",
+            "4294967296",
+        ] {
+            assert!(parse_linux_profile_uid(value).is_err(), "{value:?}");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_profile_uses_the_system_account_database() {
+        let uid = unsafe { libc::getuid() };
+        let account = posix::linux_user(uid).unwrap();
+        assert_eq!(account.0, uid);
+        assert_ne!(account.1, u32::MAX);
+        assert!(posix::linux_user(u32::MAX - 1).is_err());
+    }
+    #[test]
+    fn profile_provisioning_requires_root_before_any_system_write() {
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert!(provision(&"a".repeat(64), &"b".repeat(64), "1000").is_err());
     }
     #[test]
     fn nonroot_or_unsupported_installer_phase_refuses_before_any_system_write() {
