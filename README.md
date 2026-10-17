@@ -486,3 +486,20 @@ bypasses the complete signed-host manifest gate. `redistributable` and
 `nativeClosureQualified` remain false: full native bindings, RAW/Studio/media,
 web assets, release signing and installed three-platform acceptance still need
 qualification before local hosting can be enabled.
+
+
+### Native core workflow plugin
+
+`python3 tools/build_host_plugin.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
+builds the core workflow WASM and manifest from an exact source archive. Extism
+and Binaryen compiler archives must match that revision's platform-specific
+`mise.lock` checksums. SDK/plugin installs use the frozen source lockfile; the
+plugin's own tests run before staging. The output records tool and artifact
+hashes and refuses retained links through the shared production staging gate.
+
+Run `private-node tools/qualify_host_plugin.mjs /absolute/private-runtime /absolute/plugin-build-output`
+to execute the receipt-bound WASM through the private server's Extism package.
+The macOS ARM64 candidate passed all 54 source tests and five real calls in each
+of foreground and worker modes, including the scoped host callback payload.
+No host filesystem mounts are granted. This is synthetic workflow acceptance,
+not complete workflow/server/UI, redistribution or installed-platform approval.
