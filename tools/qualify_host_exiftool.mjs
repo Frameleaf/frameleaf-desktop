@@ -22,7 +22,8 @@ if (mode === missingMode) {
   const tool = new ExifTool();
   try {
     await assert.rejects(
-      tool.version(),
+      // Resolve before entering the Windows process pool's startup retry loop.
+      windows ? tool.exiftoolPath() : tool.version(),
       missingMessage,
     );
   } finally {
