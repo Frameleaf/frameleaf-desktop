@@ -1,12 +1,88 @@
 import hashlib
+import shutil
+import tempfile
 import unittest
 from copy import deepcopy
+from pathlib import Path
+from unittest.mock import patch
 
-from build_host_raw import raw_contract
+from build_host_raw import build, raw_contract, stage_raw
 from build_runtime import BuildError
 
 
 class NativeRawContractTests(unittest.TestCase):
+    def test_linux_enters_the_same_pinned_builder(self):
+        with (
+            patch("build_host_raw.platform.system", return_value="Linux"),
+            self.assertRaisesRegex(BuildError, "host_raw_output_invalid"),
+        ):
+            build(Path("/source"), "bad", Path("/usr"), Path("/output"))
+
+    def test_linux_stages_elf_plugins_and_retains_data_and_notices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            prefix = work / "prefix"
+            entries = {
+                "bin/darktable-cli": b"\x7fELFfixture",
+                "lib/darktable/plugins/liblens.so": b"\x7fELFframeleaf-lens-calibration:",
+                "lib/darktable/plugins/librotatepixels.so": b"\x7fELFframeleaf-native-mask-geometry:rotatepixels:1",
+            }
+            for name, value in entries.items():
+                target = prefix / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(value)
+            for name in ["darktable", "lensfun"]:
+                folder = prefix / "share" / name
+                folder.mkdir(parents=True)
+                (folder / "data").write_text("fixture")
+            for name in [
+                "darktable/LICENSE",
+                "darktable/src/external/rawspeed/LICENSE",
+                "darktable/src/external/whereami/LICENSE.MIT",
+                "darktable/src/external/OpenCL/LICENSE",
+                "lensfun/docs/lgpl-3.0.txt",
+                "lensfun/docs/cc-by-sa-3.0.txt",
+                "libraw/LICENSE.LGPL",
+                "libraw/LICENSE.CDDL",
+            ]:
+                target = work / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("fixture notice")
+            output = root / "output"
+            output.mkdir()
+
+            def stage(found, directories, destination):
+                self.assertEqual(set(found), set(entries))
+                self.assertIn(prefix / "lib", directories)
+                for name, source in found.items():
+                    target = destination / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                return {"qualification": "passed"}
+
+            def command(arguments):
+                self.assertFalse(prefix.exists())
+                self.assertEqual(
+                    arguments, [output / "raw/bin/darktable-cli", "--version"]
+                )
+                return "darktable 5.6.2"
+
+            with (
+                patch("build_host_raw.platform.system", return_value="Linux"),
+                patch("build_host_raw.elf_closure", side_effect=stage),
+                patch(
+                    "build_host_raw.closure",
+                    side_effect=AssertionError("Mach-O on Linux"),
+                ),
+            ):
+                report = stage_raw(prefix, work, output, command, root / "dependencies")
+            self.assertEqual(report["nativeClosure"]["qualification"], "passed")
+            self.assertIn("share/darktable/data", report["files"])
+            self.assertIn("share/lensfun/data", report["files"])
+            self.assertIn("licenses/libraw-LICENSE.LGPL", report["files"])
+            self.assertEqual(report["rpathAdjustments"], {})
+
     def test_only_pinned_sources_and_exact_frameleaf_patches_are_accepted(self):
         repositories = {
             "darktable": ("darktable-org/darktable", "."),

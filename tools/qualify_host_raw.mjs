@@ -17,10 +17,9 @@ assert.equal(
 );
 assert.ok(isAbsolute(runtime) && isAbsolute(component));
 assert.equal(process.version, "v26.11.1");
-assert.equal(
-  process.platform,
-  "darwin",
-  "This native RAW fixture currently qualifies macOS only",
+assert.ok(
+  ["darwin", "linux"].includes(process.platform),
+  "This native RAW fixture supports macOS and Linux only",
 );
 const receipt = JSON.parse(
   await readFile(join(component, "qualification.json"), "utf8"),

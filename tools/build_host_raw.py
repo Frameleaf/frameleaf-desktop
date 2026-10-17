@@ -1,4 +1,4 @@
-"""Build the source-pinned macOS RAW engine and copy its private native closure."""
+"""Build the source-pinned macOS/Linux RAW engine and copy its private native closure."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from build_runtime import (
     regular,
     sha256,
 )
+from relocate_linux import closure as elf_closure
 from relocate_macos import closure, load_commands
 
 
@@ -72,13 +73,16 @@ def raw_contract(pin: dict, patches: dict[str, bytes], libraw: dict) -> dict:
     return pin
 
 
-def stage_raw(prefix: Path, work: Path, output: Path, command) -> dict:
+def stage_raw(
+    prefix: Path, work: Path, output: Path, command, dependencies: Path
+) -> dict:
+    linux = platform.system() == "Linux"
     entries = {}
     for path in prefix.rglob("*"):
         if not path.is_file() or path.is_symlink():
             continue
         with path.open("rb") as stream:
-            if stream.read(4) == b"\xcf\xfa\xed\xfe":
+            if stream.read(4) == (b"\x7fELF" if linux else b"\xcf\xfa\xed\xfe"):
                 entries[path.relative_to(prefix).as_posix()] = path
     regular(prefix / "bin/darktable-cli")
     for name, marker in [
@@ -93,17 +97,36 @@ def stage_raw(prefix: Path, work: Path, output: Path, command) -> dict:
         if marker not in path.read_bytes():
             raise BuildError("host_raw_patch_marker_missing")
     adjustments = {}
-    for name, path in entries.items():
-        _, dependencies, paths = load_commands(command(["/usr/bin/otool", "-l", path]))
-        if not any(value.startswith("@rpath/") for value in dependencies):
-            continue
-        before = sha256(path)
-        for search in [prefix / "lib", prefix / "lib/darktable"]:
-            if str(search) not in paths:
-                command(["/usr/bin/install_name_tool", "-add_rpath", str(search), path])
-        adjustments[name] = {"originalSha256": before, "normalizedSha256": sha256(path)}
+    if not linux:
+        for name, path in entries.items():
+            _, references, paths = load_commands(
+                command(["/usr/bin/otool", "-l", path])
+            )
+            if not any(value.startswith("@rpath/") for value in references):
+                continue
+            before = sha256(path)
+            for search in [prefix / "lib", prefix / "lib/darktable"]:
+                if str(search) not in paths:
+                    command(
+                        ["/usr/bin/install_name_tool", "-add_rpath", str(search), path]
+                    )
+            adjustments[name] = {
+                "originalSha256": before,
+                "normalizedSha256": sha256(path),
+            }
     staged = output / "raw"
-    native = closure(entries, staged)
+    if linux:
+        directories = [
+            prefix / "lib",
+            prefix / "lib/darktable",
+            dependencies / "lib",
+            dependencies / "lib" / (platform.machine() + "-linux-gnu"),
+        ]
+        native = elf_closure(
+            entries, [path for path in directories if path.is_dir()], staged
+        )
+    else:
+        native = closure(entries, staged)
     for name in ["share/darktable", "share/lensfun"]:
         stage_server(prefix / name, staged / name)
     notices = staged / "licenses"
@@ -133,7 +156,7 @@ def stage_raw(prefix: Path, work: Path, output: Path, command) -> dict:
 
 
 def build(source: Path, revision: str, dependencies: Path, output: Path) -> None:
-    if platform.system() != "Darwin":
+    if platform.system() not in {"Darwin", "Linux"}:
         raise BuildError("host_raw_target_unsupported")
     if (
         not re.fullmatch(r"[a-f0-9]{40}", revision)
@@ -179,10 +202,11 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "FRAMELEAF_BUILD_ERROR_LOG": str(output / "command-error.log"),
-            "CPPFLAGS": "-I" + str(dependencies / "opt/jpeg-turbo/include"),
-            "LDFLAGS": "-L" + str(dependencies / "opt/jpeg-turbo/lib"),
         }
     )
+    if platform.system() == "Darwin":
+        env["CPPFLAGS"] = "-I" + str(dependencies / "opt/jpeg-turbo/include")
+        env["LDFLAGS"] = "-L" + str(dependencies / "opt/jpeg-turbo/lib")
     git = tools["git"]
     patches = {
         name: git_blob(git, source, revision, "server/test/native/" + name, env)
@@ -198,7 +222,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     report = {
         "schemaVersion": 1,
         "sourceRevision": revision,
-        "platform": "Darwin-" + platform.machine(),
+        "platform": platform.system() + "-" + platform.machine(),
         "source": pin,
         "librawSource": libraw,
         "developmentDependencyPrefix": str(dependencies),
@@ -281,7 +305,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             )
             if "-DUSE_JPEG" not in (raw / "Makefile").read_text():
                 raise BuildError("host_raw_jpeg_decoder_missing")
-            command([tools["make"], "-j4"], raw)
+            command([tools["make"], "-j1"], raw)
             command([tools["make"], "install"], raw)
             cmake = tools["cmake"]
             command(
@@ -305,7 +329,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "-DBUILD_TESTS=OFF",
                 ]
             )
-            command([cmake, "--build", work / "lensfun-build", "--parallel", "4"])
+            command([cmake, "--build", work / "lensfun-build", "--parallel", "1"])
             command([cmake, "--install", work / "lensfun-build"])
             flags = [
                 "BINARY_PACKAGE_BUILD=ON",
@@ -345,13 +369,14 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "BUILD_TESTING",
                 ]
             ]
-            omp = dependencies / "opt/libomp"
-            for language in ["C", "CXX"]:
-                flags += [
-                    f"OpenMP_{language}_FLAGS=-Xpreprocessor -fopenmp -I{omp / 'include'}",
-                    f"OpenMP_{language}_LIB_NAMES=omp",
-                ]
-            flags += ["OpenMP_omp_LIBRARY=" + str(omp / "lib/libomp.dylib")]
+            if platform.system() == "Darwin":
+                omp = dependencies / "opt/libomp"
+                for language in ["C", "CXX"]:
+                    flags += [
+                        f"OpenMP_{language}_FLAGS=-Xpreprocessor -fopenmp -I{omp / 'include'}",
+                        f"OpenMP_{language}_LIB_NAMES=omp",
+                    ]
+                flags += ["OpenMP_omp_LIBRARY=" + str(omp / "lib/libomp.dylib")]
             command(
                 [
                     cmake,
@@ -379,9 +404,9 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                 re.MULTILINE,
             ):
                 raise BuildError("host_raw_libraw_linkage_not_pinned")
-            command([cmake, "--build", work / "darktable-build", "--parallel", "4"])
+            command([cmake, "--build", work / "darktable-build", "--parallel", "1"])
             command([cmake, "--install", work / "darktable-build"])
-            report.update(stage_raw(prefix, work, output, command))
+            report.update(stage_raw(prefix, work, output, command, dependencies))
             report["qualification"] = "passed"
         finally:
             (output / "qualification.json").write_text(

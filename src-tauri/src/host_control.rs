@@ -40,6 +40,12 @@ fn config(raw: &[u8]) -> Result<Config, String> {
                 || path
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
+                || (cfg!(windows)
+                    && path
+                        .as_os_str()
+                        .to_string_lossy()
+                        .split(['\\', '/'])
+                        .any(|part| part == ".."))
         })
         || !native_runtime::digest_valid(&config.manifest_sha256, 64)
         || !(24..=512).contains(&config.password.len())
@@ -120,6 +126,12 @@ pub fn inspect_owner() -> Result<(), String> {
                 || path
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
+                || (cfg!(windows)
+                    && path
+                        .as_os_str()
+                        .to_string_lossy()
+                        .split(['\\', '/'])
+                        .any(|part| part == ".."))
         })
     {
         return Err("host_control_config_invalid".into());

@@ -452,18 +452,14 @@ mod tests {
     fn installer_layout_uses_only_fixed_versioned_system_paths() {
         let layout = Layout::new(&"a".repeat(64), &"b".repeat(64)).unwrap();
         assert_eq!(
-            layout.runtime.to_str().unwrap(),
-            format!(
-                "/Library/Application Support/Frameleaf/Runtimes/{}",
-                "a".repeat(64)
-            )
+            layout.runtime,
+            PathBuf::from("/Library/Application Support/Frameleaf/Runtimes").join("a".repeat(64))
         );
         assert_eq!(
-            layout.controller.to_str().unwrap(),
-            format!(
-                "/Library/Application Support/Frameleaf/Controllers/{}/frameleaf-native-host",
-                "b".repeat(64)
-            )
+            layout.controller,
+            PathBuf::from("/Library/Application Support/Frameleaf/Controllers")
+                .join("b".repeat(64))
+                .join("frameleaf-native-host")
         );
         for value in ["", "../escape", "/tmp", &"A".repeat(64)] {
             assert!(Layout::new(value, &"b".repeat(64)).is_err());
