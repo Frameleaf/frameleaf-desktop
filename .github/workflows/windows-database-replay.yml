@@ -35,9 +35,9 @@ jobs:
           output.mkdir()
           archive = output / 'input.zip'
           with archive.open('wb') as stream:
-              subprocess.run(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/actions/artifacts/12113911730/zip'], stdout=stream, check=True)
+              subprocess.run(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/actions/artifacts/12116805879/zip'], stdout=stream, check=True)
           digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-          assert digest == '9956f2acc4ef96c1602ad8dfdbf3c6934121805a0da07873121dc6225e010c29', 'artifact digest mismatch'
+          assert digest == '5601dd2fe0e125cc4f4f9516423330ae00f12563e5d173d5a680e0297df786f2', 'artifact digest mismatch'
           with zipfile.ZipFile(archive) as bundle:
               inputs = [item for item in bundle.infolist() if item.filename.startswith('postgres/')]
               assert inputs and len(inputs) < 20000 and sum(item.file_size for item in inputs) < 1024**3
@@ -54,8 +54,8 @@ jobs:
           env = build_environment(output, os.environ)
           env['PATH'] = str(prefix / 'bin') + os.pathsep + env['PATH']
           env['FRAMELEAF_BUILD_ERROR_LOG'] = str(output / 'command-error.log')
-          report = {'qualification': 'failed', 'inputArtifactId': 12113911730, 'inputSha256': digest,
-                    'componentBuildHead': '977b29337d5d9be92c827730cd66fa57053d82ae',
+          report = {'qualification': 'failed', 'inputArtifactId': 12116805879, 'inputSha256': digest,
+                    'componentBuildHead': 'a99fcce5bbb8cc9a962aa473d8888ad78ea845e0',
                     'sourceRevision': receipt['sourceRevision'], 'redistributable': False,
                     'installedPlatformQualified': False, 'dlls': [], 'entrypoints': []}
           probe = 'import ctypes,sys; ctypes.WinDLL(sys.argv[1], winmode=0x1100)'
