@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 947568067639827de73e2de7260103df697c7f51
+          ref: 9bc18ba0474dc7df13ae80d6870e331f6c7641e6
           path: server-source
           sparse-checkout-cone-mode: false
           sparse-checkout: |
@@ -123,7 +123,7 @@ jobs:
       - name: Build patched codecs and execute all native HDR fixtures
         shell: pwsh
         run: |
-          python tools/build_host_media.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 947568067639827de73e2de7260103df697c7f51 --node-root "$env:FRAMELEAF_HDR_NODE_ROOT" --dependency-prefix "$env:FRAMELEAF_HDR_DEPENDENCIES" --output "$env:RUNNER_TEMP/fl-hdr"
+          python tools/build_host_media.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bc18ba0474dc7df13ae80d6870e331f6c7641e6 --node-root "$env:FRAMELEAF_HDR_NODE_ROOT" --dependency-prefix "$env:FRAMELEAF_HDR_DEPENDENCIES" --output "$env:RUNNER_TEMP/fl-hdr"
           if ($LASTEXITCODE) { throw 'Native HDR qualification failed' }
       - name: Retain private component and diagnostics
         if: always()
