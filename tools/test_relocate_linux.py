@@ -152,6 +152,7 @@ class LinuxRelocationTests(unittest.TestCase):
                 capture_output=True,
             )
             output = root / "payload"
+            (source / "libanswer.so.1").chmod(0o555)
             for index, entries in enumerate(
                 [
                     {"libraries/app": source / "main"},
@@ -202,6 +203,10 @@ class LinuxRelocationTests(unittest.TestCase):
             shutil.rmtree(source)
             moved = root / "moved payload"
             output.rename(moved)
+            readonly = next(
+                name for name in report["objects"] if name.endswith("/libanswer.so.1")
+            )
+            self.assertEqual((moved / readonly).stat().st_mode & 0o777, 0o555)
             result = subprocess.check_output(
                 [moved / "bin/main"], env={"PATH": os.defpath}, text=True
             )

@@ -193,6 +193,7 @@ def closure(entries: dict[str, Path], library_dirs: list[Path], output: Path) ->
         relative(name)
         objects[source] = {
             "path": name,
+            "mode": source.stat().st_mode & 0o777,
             "sourceSha256": digest,
             "needed": needed,
             "dependencies": dependencies,
@@ -208,7 +209,7 @@ def closure(entries: dict[str, Path], library_dirs: list[Path], output: Path) ->
         shutil.copyfile(source, destination)
         if sha256(destination) != item["sourceSha256"]:
             raise BuildError("host_elf_source_changed")
-        destination.chmod(source.stat().st_mode & 0o777)
+        destination.chmod(item["mode"] | 0o200)
     for item in objects.values():
         destination = output / item["path"]
         search = []
@@ -237,6 +238,7 @@ def closure(entries: dict[str, Path], library_dirs: list[Path], output: Path) ->
             )
         else:
             run([tools["patchelf"], "--remove-rpath", destination])
+        destination.chmod(item["mode"])
 
     report = {
         "schemaVersion": 1,
