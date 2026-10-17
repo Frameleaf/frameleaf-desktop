@@ -21,11 +21,27 @@ class WindowsDataDllTests(unittest.TestCase):
             image[64:68] = b"PE\0\0"
             image[68:70] = (0x8664).to_bytes(2, "little")
             image[84:86] = (240).to_bytes(2, "little")
+            image[86:88] = (0x2000).to_bytes(2, "little")
             image[88:90] = (0x20B).to_bytes(2, "little")
             image[196:200] = (16).to_bytes(4, "little")
-            (prefix / "bin/icudt78.dll").write_bytes(image)
+            binary = prefix / "bin/icudt78.dll"
+            binary.write_bytes(image)
             with patch("build_host_database_windows.run", return_value="File Type: DLL\n  Summary"):
                 stage_dependencies(prefix, dependencies, "dumpbin", {})
+                importing = bytearray(image)
+                importing[208:216] = (4096).to_bytes(4, "little") + (40).to_bytes(4, "little")
+                executable = bytearray(image)
+                executable[104:108] = (4096).to_bytes(4, "little")
+                outside = bytearray(image)
+                outside[60:64] = (2**32 - 1).to_bytes(4, "little")
+                for name, invalid in [
+                    ("imports", importing), ("entrypoint", executable),
+                    ("truncated", image[:220]), ("outside-header", outside),
+                    ("not-pe", b"not a PE image"),
+                ]:
+                    with self.subTest(name=name), self.assertRaisesRegex(BuildError, "pe_imports_missing"):
+                        binary.write_bytes(invalid)
+                        stage_dependencies(prefix, dependencies, "dumpbin", {})
 
 
 class WindowsDatabaseTests(unittest.TestCase):
