@@ -8,9 +8,63 @@ from unittest.mock import patch
 
 from build_host_raw import build, raw_contract, stage_raw
 from build_runtime import BuildError
+from test_relocate_windows import pe
 
 
 class NativeRawContractTests(unittest.TestCase):
+    def test_windows_stages_patched_pe_plugins_data_and_private_licenses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            work, output, dependencies = root / 'work', root / 'output', root / 'ucrt64'
+            prefix = work / 'prefix'
+            for name, marker in {
+                'bin/darktable-cli.exe': b'', 'bin/dcraw_emu.exe': b'',
+                'lib/darktable/plugins/liblens.dll': b'frameleaf-lens-calibration:',
+                'lib/darktable/plugins/librotatepixels.dll': b'frameleaf-native-mask-geometry:rotatepixels:1',
+            }.items():
+                path = prefix / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(pe() + marker)
+            for name in ['darktable', 'lensfun']:
+                path = prefix / 'share' / name
+                path.mkdir(parents=True)
+                (path / 'data').write_text('fixture')
+            for name in ['darktable/LICENSE', 'darktable/src/external/rawspeed/LICENSE',
+                         'darktable/src/external/whereami/LICENSE.MIT', 'darktable/src/external/OpenCL/LICENSE',
+                         'lensfun/docs/lgpl-3.0.txt', 'lensfun/docs/cc-by-sa-3.0.txt',
+                         'libraw/LICENSE.LGPL', 'libraw/LICENSE.CDDL']:
+                path = work / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('fixture notice')
+            (dependencies / 'bin').mkdir(parents=True)
+            (dependencies / 'share/licenses/fixture').mkdir(parents=True)
+            (dependencies / 'share/licenses/fixture/LICENSE').write_text('private dependency notice')
+            output.mkdir()
+
+            def command(arguments, runtime_root=None):
+                if '-p' in arguments:
+                    return 'DLL Name: KERNEL32.dll'
+                self.assertFalse(prefix.exists())
+                self.assertEqual(runtime_root, output / 'raw')
+                self.assertEqual(arguments, [output / 'raw/bin/darktable-cli.exe', '--version'])
+                return 'darktable 5.6.2'
+
+            with patch('build_host_raw.platform.system', return_value='Windows'):
+                report = stage_raw(prefix, work, output, command, dependencies)
+            self.assertEqual(len(report['nativeClosure']['objects']), 4)
+            self.assertFalse(report['nativeClosure']['posixRuntimeRequired'])
+            self.assertIn('share/lensfun/data', report['files'])
+            self.assertIn('licenses-toolchain/fixture/LICENSE', report['files'])
+            self.assertIn('licenses/darktable-LICENSE', report['files'])
+
+    def test_windows_enters_the_pinned_builder(self):
+        with (
+            patch("build_host_raw.platform.system", return_value="Windows"),
+            patch("build_host_raw.platform.machine", return_value="AMD64"),
+            self.assertRaisesRegex(BuildError, "host_raw_output_invalid"),
+        ):
+            build(Path("/source"), "bad", Path("/ucrt64"), Path("/output"))
+
     def test_linux_enters_the_same_pinned_builder(self):
         with (
             patch("build_host_raw.platform.system", return_value="Linux"),

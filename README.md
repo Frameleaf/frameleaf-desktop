@@ -603,6 +603,15 @@ complete signed-host assembly and installed three-platform acceptance are pendin
 
 ### Private native RAW engine
 
+The Windows authoring path uses MSYS2 UCRT64 GCC/Ninja to build the same pinned
+LibRaw, Lensfun and patched darktable sources. `windows-host-raw.yml` builds in
+private CI and records the installed toolchain package versions. Staging follows
+the transitive x64 PE imports, retains private DLLs, data and notices, rejects
+ambiguous or missing libraries and MSYS/Cygwin runtime dependencies, and tests
+startup after moving the original installation away. The toolchain is used only
+for authoring. Windows production RAW rendering and installed acceptance still
+require qualification; a successful component build is insufficient.
+
 `python3 tools/build_host_raw.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --dependency-prefix /opt/homebrew --output /absolute/path/to/new-raw-output`
 
 This macOS authoring builder checks the selected source's darktable, Lensfun,

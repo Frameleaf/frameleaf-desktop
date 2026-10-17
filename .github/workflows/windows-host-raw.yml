@@ -1,0 +1,99 @@
+name: Private Windows RAW candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_raw.py'
+      - 'tools/test_build_host_raw.py'
+      - 'tools/relocate_windows.py'
+      - 'tools/test_relocate_windows.py'
+      - 'tools/build_runtime.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_host_database_windows.py'
+      - '.github/workflows/windows-host-raw.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-raw-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  raw:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      OMP_NUM_THREADS: '1'
+      RAYON_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ca9db753e3d8557e6a26e712d83012505eb113b5
+          path: server-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Check RAW source and PE staging guards
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p test_relocate_windows.py -v
+          if ($LASTEXITCODE) { throw 'PE staging tests failed' }
+          python -m unittest discover -s tools -p test_build_host_raw.py -v
+          if ($LASTEXITCODE) { throw 'RAW source staging tests failed' }
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: false
+          path-type: minimal
+          install: >-
+            git make autoconf automake-wrapper libtool intltool perl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libxslt
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-exiv2
+            mingw-w64-ucrt-x86_64-gettext
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-iso-codes
+            mingw-w64-ucrt-x86_64-lcms2
+            mingw-w64-ucrt-x86_64-libarchive
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-pugixml
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-zstd
+      - name: Record authoring toolchain versions
+        shell: msys2 {0}
+        run: pacman -Q > "$(cygpath -u "$RUNNER_TEMP")/fl-raw-toolchain.txt"
+      - name: Build and relocate pinned patched native RAW engines
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          python tools/build_host_raw.py --source "$env:GITHUB_WORKSPACE/server-source" --revision ca9db753e3d8557e6a26e712d83012505eb113b5 --dependency-prefix "$env:MSYS2_LOCATION/ucrt64" --output "$env:RUNNER_TEMP/fl-windows-raw"
+          if ($LASTEXITCODE) { throw 'Native Windows RAW component qualification failed' }
+      - name: Retain private RAW component and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-private-raw-candidate
+          path: |
+            ${{ runner.temp }}/fl-windows-raw/raw/
+            ${{ runner.temp }}/fl-windows-raw/qualification.json
+            ${{ runner.temp }}/fl-windows-raw/build.log
+            ${{ runner.temp }}/fl-windows-raw/command-error.log
+            ${{ runner.temp }}/fl-raw-toolchain.txt
+          retention-days: 7
+          if-no-files-found: warn

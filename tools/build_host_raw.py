@@ -1,4 +1,4 @@
-"""Build the source-pinned macOS/Linux RAW engine and copy its private native closure."""
+"""Build the source-pinned native RAW engine and copy its private native closure."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from build_runtime import (
 )
 from relocate_linux import closure as elf_closure
 from relocate_macos import closure, load_commands
+from relocate_windows import closure as pe_closure
 
 
 def raw_contract(pin: dict, patches: dict[str, bytes], libraw: dict) -> dict:
@@ -77,14 +79,17 @@ def stage_raw(
     prefix: Path, work: Path, output: Path, command, dependencies: Path
 ) -> dict:
     linux = platform.system() == "Linux"
+    windows = platform.system() == "Windows"
+    extension = ".exe" if windows else ""
     entries = {}
     for path in prefix.rglob("*"):
         if not path.is_file() or path.is_symlink():
             continue
         with path.open("rb") as stream:
-            if stream.read(4) == (b"\x7fELF" if linux else b"\xcf\xfa\xed\xfe"):
+            header = stream.read(4)
+            if (header[:2] == b"MZ" if windows else header == (b"\x7fELF" if linux else b"\xcf\xfa\xed\xfe")):
                 entries[path.relative_to(prefix).as_posix()] = path
-    regular(prefix / "bin/darktable-cli")
+    regular(prefix / ("bin/darktable-cli" + extension))
     for name, marker in [
         ("liblens.so", b"frameleaf-lens-calibration:"),
         (
@@ -92,12 +97,12 @@ def stage_raw(
             b"frameleaf-native-mask-geometry:rotatepixels:1",
         ),
     ]:
-        path = prefix / "lib/darktable/plugins" / name
+        path = prefix / "lib/darktable/plugins" / (name.removesuffix(".so") + ".dll" if windows else name)
         regular(path)
         if marker not in path.read_bytes():
             raise BuildError("host_raw_patch_marker_missing")
     adjustments = {}
-    if not linux:
+    if not linux and not windows:
         for name, path in entries.items():
             _, references, paths = load_commands(
                 command(["/usr/bin/otool", "-l", path])
@@ -115,7 +120,11 @@ def stage_raw(
                 "normalizedSha256": sha256(path),
             }
     staged = output / "raw"
-    if linux:
+    if windows:
+        native = pe_closure(entries, [prefix / "bin", prefix / "lib", dependencies / "bin"], staged,
+                            lambda path: command([dependencies / "bin/objdump.exe", "-p", path]))
+        stage_server(dependencies / "share/licenses", staged / "licenses-toolchain")
+    elif linux:
         directories = [
             prefix / "lib",
             prefix / "lib/darktable",
@@ -144,7 +153,8 @@ def stage_raw(
         regular(path)
         shutil.copyfile(path, notices / name)
     prefix.rename(work / "original-install-unavailable")
-    banner = command([staged / "bin/darktable-cli", "--version"])
+    banner = command([staged / ("bin/darktable-cli" + extension), "--version"],
+                     **({"runtime_root": staged} if windows else {}))
     if not re.match(r"darktable(?:-cli)?\s+5\.6\.2(?:\s|$)", banner):
         raise BuildError("host_raw_version_mismatch")
     return {
@@ -156,7 +166,8 @@ def stage_raw(
 
 
 def build(source: Path, revision: str, dependencies: Path, output: Path) -> None:
-    if platform.system() not in {"Darwin", "Linux"}:
+    windows = platform.system() == "Windows"
+    if platform.system() not in {"Darwin", "Linux", "Windows"} or (windows and platform.machine().lower() not in {"amd64", "x86_64"}):
         raise BuildError("host_raw_target_unsupported")
     if (
         not re.fullmatch(r"[a-f0-9]{40}", revision)
@@ -179,6 +190,15 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             "xsltproc",
         ]
     }
+    if windows:
+        msys = dependencies.parent / "usr/bin"
+        tools = {name: str((msys if name in {"git", "make"} else dependencies / "bin") / (name + ".exe"))
+                 for name in ["git", "make", "cmake", "ninja", "pkg-config", "xsltproc"]}
+        tools.update({name: str(msys / name) for name in ["autoreconf", "intltool-merge"]})
+        tools["python3"] = sys.executable
+        tools["bash"] = str(msys / "bash.exe")
+        if dependencies.name != "ucrt64" or any(not Path(tool).is_file() for tool in tools.values()):
+            raise BuildError("host_raw_ucrt64_tools_missing")
     if not all(tools.values()):
         raise BuildError("host_raw_build_tools_missing")
     output.mkdir(mode=0o700)
@@ -204,6 +224,14 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             "FRAMELEAF_BUILD_ERROR_LOG": str(output / "command-error.log"),
         }
     )
+    if windows:
+        if not env.get("SystemRoot") or not Path(env["SystemRoot"]).is_absolute():
+            raise BuildError("host_raw_windows_system_root_missing")
+        env.update({
+            "PATH": os.pathsep.join([str(dependencies / "bin"), str(msys), str(Path(env["SystemRoot"]) / "System32")]),
+            "CC": "gcc", "CXX": "g++", "MSYSTEM": "UCRT64",
+            "CONFIG_SHELL": "/usr/bin/bash", "MSYS2_ARG_CONV_EXCL": "*",
+        })
     if platform.system() == "Darwin":
         env["CPPFLAGS"] = "-I" + str(dependencies / "opt/jpeg-turbo/include")
         env["LDFLAGS"] = "-L" + str(dependencies / "opt/jpeg-turbo/lib")
@@ -222,7 +250,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     report = {
         "schemaVersion": 1,
         "sourceRevision": revision,
-        "platform": platform.system() + "-" + platform.machine(),
+        "platform": "Windows-AMD64" if windows else platform.system() + "-" + platform.machine(),
         "source": pin,
         "librawSource": libraw,
         "developmentDependencyPrefix": str(dependencies),
@@ -234,12 +262,20 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     }
     with (output / "build.log").open("w") as log:
 
-        def command(arguments: list, cwd: Path = work) -> str:
+        def command(arguments: list, cwd: Path = work, runtime_root: Path | None = None) -> str:
+            child_env = env
+            if windows and runtime_root is not None:
+                child_env = {key: env[key] for key in ["SystemRoot", "HOME", "USERPROFILE", "TMP", "TEMP"]}
+                child_env["PATH"] = os.pathsep.join([str(runtime_root / "bin"), str(Path(env["SystemRoot"]) / "System32")])
+                child_env["OMP_NUM_THREADS"] = "1"
+            elif windows:
+                arguments = [tools["bash"], "--noprofile", "--norc", "-c", 'exec "$@"', "frameleaf-build",
+                             *[str(arg).replace("\\", "/") for arg in arguments]]
             result = subprocess.run(
                 arguments,
                 check=False,
                 cwd=cwd,
-                env=env,
+                env=child_env,
                 text=True,
                 capture_output=True,
                 timeout=1200,
@@ -251,6 +287,9 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             return result.stdout.strip()
 
         try:
+            if windows:
+                if command([dependencies / "bin/gcc.exe", "-dumpmachine"]) != "x86_64-w64-mingw32":
+                    raise BuildError("host_raw_compiler_target_invalid")
             for item in pin["inputs"]:
                 archive = work / (item["name"] + ".tar.gz")
                 download(item["url"], archive, item["sha256"])
@@ -300,6 +339,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "--prefix=" + str(prefix),
                     "--enable-examples",
                     "--disable-static",
+                    *(["--host=x86_64-w64-mingw32"] if windows else []),
                 ],
                 raw,
             )
@@ -399,7 +439,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             )
             cache = (work / "darktable-build/CMakeCache.txt").read_text()
             if not re.search(
-                r"^libraw_LIBRARY:FILEPATH=" + re.escape(str(prefix / "lib")) + "/",
+                r"^libraw_LIBRARY:FILEPATH=" + re.escape((prefix / "lib").as_posix()) + "/",
                 cache,
                 re.MULTILINE,
             ):
