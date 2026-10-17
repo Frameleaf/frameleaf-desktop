@@ -8,6 +8,21 @@ from build_host_bundle import REQUIRED_HOST_FILES, assemble, host_entries, host_
 from build_runtime import BuildError
 
 
+class ExifToolEntryTests(unittest.TestCase):
+    def test_metadata_entry_selects_the_platforms_vendored_runtime(self):
+        for system, os_name, expected in [
+            ("Windows", "nt", "server/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
+            ("Darwin", "posix", "server/node_modules/exiftool-vendored.pl/bin/exiftool"),
+            ("Linux", "posix", "server/node_modules/exiftool-vendored.pl/bin/exiftool"),
+        ]:
+            with (
+                self.subTest(system=system),
+                patch("build_host_bundle.platform.system", return_value=system),
+                patch("build_host_bundle.os.name", os_name),
+            ):
+                self.assertEqual(host_entries()["exiftool"], expected)
+
+
 class HostBundleTests(unittest.TestCase):
     def test_database_extension_entry_matches_each_native_install_layout(self):
         for system, os_name, vector, node in [
