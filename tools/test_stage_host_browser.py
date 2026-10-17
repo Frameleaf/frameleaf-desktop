@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ class BrowserStageTests(unittest.TestCase):
         (source / "Versions/1/browser").chmod(0o755)
         (source / "Versions/1/Resources/notice").write_text("licence fixture")
         (source / "Versions/Current").symlink_to("1", target_is_directory=True)
-        (source / "browser").symlink_to("Versions/Current/browser")
+        (source / "browser").symlink_to(Path("Versions") / "Current" / "browser")
         return source
 
     def test_materializes_internal_framework_aliases_and_inventories_every_file(self):
@@ -26,7 +27,8 @@ class BrowserStageTests(unittest.TestCase):
             files = stage_browser(source, root / "staged", "browser")
             self.assertEqual(len(files), 5)
             self.assertEqual((root / "staged/browser").read_bytes(), b"browser fixture")
-            self.assertTrue((root / "staged/browser").stat().st_mode & 0o111)
+            if os.name != "nt":
+                self.assertTrue((root / "staged/browser").stat().st_mode & 0o111)
             self.assertFalse(
                 any(path.is_symlink() for path in (root / "staged").rglob("*"))
             )

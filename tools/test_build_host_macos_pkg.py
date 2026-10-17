@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shlex
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ class MacHostInstallerTests(unittest.TestCase):
             with self.assertRaises(BuildError):
                 validate_identities(value, 'b' * 64)
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX installer shell')
     def test_scripts_refuse_other_volumes_and_only_pass_fixed_version_ids(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -34,6 +36,7 @@ class MacHostInstallerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text().splitlines(), ['--prepare-install', 'a' * 64, 'b' * 64])
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX file permissions')
     def test_staging_keeps_source_unchanged_and_only_places_versioned_resources(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
