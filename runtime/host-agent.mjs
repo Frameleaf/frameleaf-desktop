@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { createServer } from "node:net";
-import { delimiter, isAbsolute, join, dirname } from "node:path";
+import { delimiter, isAbsolute, join, dirname, basename } from "node:path";
 import { createInterface } from "node:readline";
 
 const fail = (code) => {
@@ -38,6 +38,8 @@ export function validateConfig(c) {
     "pgIsready",
     "pgCtl",
     "hdr",
+    "ffmpeg",
+    "ffprobe",
   ]) {
     const path = c.entryPoints?.[name];
     if (
@@ -49,6 +51,13 @@ export function validateConfig(c) {
     )
       fail("host_component_invalid");
   }
+  const extension = process.platform === "win32" ? ".exe" : "";
+  if (
+    basename(c.entryPoints.ffmpeg) !== "ffmpeg" + extension ||
+    basename(c.entryPoints.ffprobe) !== "ffprobe" + extension ||
+    dirname(c.entryPoints.ffmpeg) !== dirname(c.entryPoints.ffprobe)
+  )
+    fail("host_media_components_invalid");
 }
 async function stateFile(path, maximum) {
   const meta = await fs.lstat(path);
@@ -134,6 +143,26 @@ async function exited(child, ms) {
     await sleep(50);
   return !child.pid || child.exitCode !== null || child.signalCode !== null;
 }
+export function hostEnvironment(c) {
+  return {
+    FFMPEG_PATH: join(c.runtime, c.entryPoints.ffmpeg),
+    FFPROBE_PATH: join(c.runtime, c.entryPoints.ffprobe),
+    PATH: [
+      dirname(join(c.runtime, c.entryPoints.ffmpeg)),
+      dirname(join(c.runtime, c.entryPoints.node)),
+      dirname(join(c.runtime, c.entryPoints.postgres)),
+      process.platform === "win32"
+        ? join(process.env.SystemRoot ?? "C:\\Windows", "System32")
+        : "/usr/bin",
+      ...(process.platform === "win32" ? [] : ["/bin"]),
+    ].join(delimiter),
+    HOME: join(c.state, "home"),
+    LANG: "C",
+    ...(process.platform === "win32"
+      ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows" }
+      : {}),
+  };
+}
 export async function runHost(c, stopping, ready) {
   validateConfig(c);
   await portFree(c.apiPort);
@@ -165,21 +194,7 @@ export async function runHost(c, stopping, ready) {
   }
   const executable = (name) => join(c.runtime, c.entryPoints[name]);
   const data = join(c.state, "database");
-  const env = {
-    PATH: [
-      dirname(executable("node")),
-      dirname(executable("postgres")),
-      process.platform === "win32"
-        ? join(process.env.SystemRoot ?? "C:\\Windows", "System32")
-        : "/usr/bin",
-      ...(process.platform === "win32" ? [] : ["/bin"]),
-    ].join(delimiter),
-    HOME: join(c.state, "home"),
-    LANG: "C",
-    ...(process.platform === "win32"
-      ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows" }
-      : {}),
-  };
+  const env = hostEnvironment(c);
   const logPath = join(c.state, "host.log");
   try {
     const meta = await fs.lstat(logPath);

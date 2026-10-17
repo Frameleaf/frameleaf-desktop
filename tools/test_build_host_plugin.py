@@ -19,6 +19,18 @@ checksum = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             tool_pin(lock, "extism/js-pdk", "macos-arm64"),
             entry["platforms.macos-arm64"],
         )
+        other = {
+            "version": "1.7.0",
+            "platforms.windows-x64": entry["platforms.macos-arm64"],
+        }
+        self.assertEqual(
+            tool_pin(
+                {"tools": {"github:extism/js-pdk": [other, entry]}},
+                "extism/js-pdk",
+                "macos-arm64",
+            ),
+            entry["platforms.macos-arm64"],
+        )
         for key, value in [
             (
                 "url",

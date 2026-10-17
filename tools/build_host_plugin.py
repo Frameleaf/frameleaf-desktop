@@ -20,7 +20,11 @@ from build_runtime import BuildError, build_environment, git_blob, regular, run,
 
 
 def tool_pin(lock: dict, repository: str, target: str) -> dict:
-    entries = lock.get("tools", {}).get("github:" + repository, [])
+    entries = [
+        entry
+        for entry in lock.get("tools", {}).get("github:" + repository, [])
+        if "platforms." + target in entry
+    ]
     if len(entries) != 1:
         raise BuildError("host_plugin_tool_pin_ambiguous")
     pin = entries[0].get("platforms." + target, {})

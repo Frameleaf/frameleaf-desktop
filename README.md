@@ -528,3 +528,25 @@ and Studio command pages over HTTP on fresh startup and restart. Both boots
 retained all 38 migrations, checksums, SCRAM authentication and clean stops.
 This fixture used copied private components and bypassed the complete signed-host
 manifest; it does not prove browser interactions, Studio rendering or media jobs.
+
+
+### Private native FFmpeg
+
+`python3 tools/build_host_ffmpeg.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --output /absolute/path/to/new-output`
+selects the requested platform's portable FFmpeg release from that revision's
+`mise.lock` and requires the server's FFmpeg version to agree. Downloaded archives
+must match their pinned SHA-256. ZIP extraction rejects unsafe paths, links and
+case-insensitive duplicates before writing; staging refuses retained links.
+macOS binaries additionally pass architecture, Apple-only load-command and
+signature checks. Receipts record the source pins, binaries and synthetic codec
+outputs; redistribution and installed-platform qualification remain false.
+
+The macOS ARM64 candidate passed H.264, HEVC, VP9 and AV1 CPU encode/decode,
+AAC/Opus encoding and explicit PCM decoding, video/audio probing and thumbnail
+extraction. These are synthetic component checks, not full media/HDR/subtitle or
+GPU conformance. The host agent requires sibling `ffmpeg`/`ffprobe` executable
+names (`.exe` on Windows), places their verified directory first on PATH and
+sets their explicit environment paths. Other inherited caller variables remain
+excluded. Actual packaged `MediaRepository` probing and H.264/AAC-to-VP9/Opus
+transcoding passed inside the private-server fresh/restart fixture; complete
+signed-host and installed three-platform acceptance remain outstanding.

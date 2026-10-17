@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claimState, validateConfig } from "../runtime/host-agent.mjs";
+import {
+  claimState,
+  validateConfig,
+  hostEnvironment,
+} from "../runtime/host-agent.mjs";
 
 const config = (state) => ({
   state,
@@ -24,6 +28,8 @@ const config = (state) => ({
     pgIsready: "pg/pg_isready",
     pgCtl: "pg/pg_ctl",
     hdr: "media/hdr",
+    ffmpeg: "media/ffmpeg" + (process.platform === "win32" ? ".exe" : ""),
+    ffprobe: "media/ffprobe" + (process.platform === "win32" ? ".exe" : ""),
   },
 });
 test("host configuration rejects shared ports, unbounded secrets and relative paths", () => {
@@ -38,9 +44,36 @@ test("host configuration rejects shared ports, unbounded secrets and relative pa
     { postgresMajor: "16" },
     { manifestSha256: "bad" },
     { entryPoints: { ...good.entryPoints, postgres: "../postgres" } },
+    { entryPoints: { ...good.entryPoints, ffmpeg: "../ffmpeg" } },
+    { entryPoints: { ...good.entryPoints, ffprobe: "/usr/bin/ffprobe" } },
+    { entryPoints: { ...good.entryPoints, ffmpeg: undefined } },
+    {
+      entryPoints: {
+        ...good.entryPoints,
+        ffprobe: good.entryPoints.ffprobe.replace("media/", "other/"),
+      },
+    },
+    { entryPoints: { ...good.entryPoints, ffmpeg: "media/unrelated" } },
   ]) {
     assert.throws(() => validateConfig({ ...good, ...change }));
   }
+});
+test("host media commands use private binaries without inheriting the caller environment", () => {
+  const cfg = config("/private/state");
+  const env = hostEnvironment(cfg);
+  assert.equal(env.FFMPEG_PATH, join(cfg.runtime, cfg.entryPoints.ffmpeg));
+  assert.equal(env.FFPROBE_PATH, join(cfg.runtime, cfg.entryPoints.ffprobe));
+  assert.equal(env.HOME, join(cfg.state, "home"));
+  for (const name of [
+    "DB_PASSWORD",
+    "PGPASSWORD",
+    "DYLD_LIBRARY_PATH",
+    "LD_LIBRARY_PATH",
+  ])
+    assert.equal(Object.hasOwn(env, name), false);
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  assert.ok(env.PATH.split(delimiter).includes(join(cfg.runtime, "media")));
+  assert.equal(env.PATH.split(delimiter)[0], join(cfg.runtime, "media"));
 });
 test("host state binds one runtime before initialization and refuses adoption or changed authority", async () => {
   const root = await mkdtemp(join(tmpdir(), "frameleaf-host-agent-"));
