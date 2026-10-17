@@ -346,7 +346,14 @@ fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
         );
         profiles.push((profile.clone(), fixture));
     }
-    assert_eq!(proofs.len(), 3);
+    assert!([3, 5].contains(&proofs.len()));
+    assert_eq!(
+        profiles
+            .iter()
+            .filter(|(profile, _)| profile["workload"] == "clip")
+            .count(),
+        3
+    );
     let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
@@ -356,6 +363,7 @@ fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
         .start_bound_sidecar(&refs, &cache, &f.root, port)
         .unwrap();
     let scratch = sidecar.working_dir().to_owned();
+    let mut results = Vec::new();
     tauri::async_runtime::block_on(async {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -382,7 +390,7 @@ fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
             assert!(Instant::now() < deadline, "multi-binding startup timed out");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        for index in [0, 1, 2, 0] {
+        for index in (0..profiles.len()).chain([0]) {
             let (profile, fixture) = &profiles[index];
             let spec = &profile["spec"];
             let form = Form::new().text("entries", spec["entries"].to_string());
@@ -408,14 +416,7 @@ fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
                 response.status()
             );
             let output: Value = response.json().await.unwrap();
-            let vector: Vec<f64> = serde_json::from_str(output["clip"].as_str().unwrap()).unwrap();
-            let expected: Vec<f64> =
-                serde_json::from_str(spec["expectedOutput"]["clip"].as_str().unwrap()).unwrap();
-            assert_eq!(vector.len(), 768);
-            assert!(vector
-                .iter()
-                .zip(expected)
-                .all(|(actual, expected)| actual.is_finite() && (actual - expected).abs() < 0.002));
+            results.push(json!({"actual":output,"expected":spec["expectedOutput"]}));
             assert!(sidecar.is_running().unwrap());
         }
         let response = client
@@ -430,5 +431,32 @@ fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
     sidecar.stop().unwrap();
     drop(sidecar);
     assert!(!scratch.exists());
-    eprintln!("PASS: one installed factory-signed process served default text, English text, visual and default text again; unknown config refused; owned process/scratch removed");
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let manifest: Value = serde_json::from_slice(&raw).unwrap();
+    let namespace = manifest["moduleNamespace"].as_str().unwrap_or("immich_ml");
+    assert!(["immich_ml", "frameleaf_ml"].contains(&namespace));
+    let script = format!("import json,sys; from {namespace}.qualification import compare_output; [compare_output(pair['actual'], pair['expected']) for pair in json.load(sys.stdin)]");
+    let mut comparison = Command::new(
+        pack.join("payload")
+            .join(manifest["python"].as_str().unwrap()),
+    )
+    .args(["-I", "-B", "-c", &script])
+    .env_clear()
+    .stdin(Stdio::piped())
+    .spawn()
+    .unwrap();
+    comparison
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&results).unwrap())
+        .unwrap();
+    assert!(
+        comparison.wait().unwrap().success(),
+        "inference outputs differ from approved references"
+    );
+    eprintln!("PASS: one installed factory-signed process served all {} selected profiles and the first again; production output comparison passed; unknown config refused; owned process/scratch removed", profiles.len());
 }
