@@ -74,6 +74,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     env["RAYON_NUM_THREADS"] = "1"
     env["TOKIO_WORKER_THREADS"] = "1"
     env["UV_THREADPOOL_SIZE"] = "1"
+    env["NODE_OPTIONS"] = "--max-old-space-size=3072"
     env["PATH"] = os.pathsep.join(
         [str(node.parent), str(Path(pnpm).parent), os.defpath]
     )

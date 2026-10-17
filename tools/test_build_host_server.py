@@ -2,12 +2,31 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from build_host_server import stage_server
+from build_host_server import build, stage_server
 from build_runtime import BuildError
 
 
 class HostServerTests(unittest.TestCase):
+    def test_compiler_has_bounded_heap_without_inheriting_node_injection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            node = root / "node"
+            node.write_text("fixture")
+
+            def inspect_environment(git, source, revision, name, env):
+                self.assertEqual(env.get("NODE_OPTIONS"), "--max-old-space-size=3072")
+                raise BuildError("fixture_environment_checked")
+
+            with (
+                patch("build_host_server.shutil.which", return_value="/fixture/tool"),
+                patch("build_host_server.git_blob", side_effect=inspect_environment),
+                patch.dict(os.environ, {"NODE_OPTIONS": "--require=/untrusted.js"}),
+                self.assertRaisesRegex(BuildError, "fixture_environment_checked"),
+            ):
+                build(root, "a" * 40, node, root / "output")
+
     def test_staged_runtime_has_regular_dependencies_without_package_manager_links(
         self,
     ):
