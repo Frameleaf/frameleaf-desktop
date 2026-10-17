@@ -372,7 +372,8 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "-DPYTHON:FILEPATH=OFF",
                     "-DBUILD_DOC=OFF",
                     "-DBUILD_TESTS=OFF",
-                    *(["-DHAVE_REGEX_H=OFF"] if windows else []),
+                    *(["-DHAVE_REGEX_H=OFF", "-DCMAKE_INSTALL_DATAROOTDIR:PATH=share",
+                       "-DLENSFUN_WINDOWS_DATADIR:PATH=../share/lensfun"] if windows else []),
                 ]
             )
             command([cmake, "--build", work / "lensfun-build", "--parallel", "1"])

@@ -64,6 +64,7 @@ jobs:
           install: >-
             git make autoconf automake-wrapper libtool intltool perl
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
@@ -87,6 +88,30 @@ jobs:
       - name: Record authoring toolchain versions
         shell: msys2 {0}
         run: pacman -Q > "$(cygpath -u "$RUNNER_TEMP")/fl-raw-toolchain.txt"
+      - name: Verify the C and C++ OpenMP authoring runtime
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          probe="$(cygpath -u "$RUNNER_TEMP")/fl-raw-openmp"
+          mkdir -p "$probe"
+          cat > "$probe/probe.c" <<'C'
+          #include <omp.h>
+          #include <stdio.h>
+          #if !defined(_OPENMP) || _OPENMP < 201511
+          #error OpenMP 4.5 or newer is required
+          #endif
+          int main(void) {
+            int threads = 0;
+            #pragma omp parallel reduction(+:threads)
+            threads += 1;
+            printf("OpenMP=%d threads=%d\n", _OPENMP, threads);
+            return threads < 1;
+          }
+          C
+          for compiler in gcc g++; do
+            "$compiler" -fopenmp "$probe/probe.c" -o "$probe/probe.exe"
+            "$probe/probe.exe"
+          done
       - name: Build and relocate pinned patched native RAW engines
         shell: pwsh
         env:
@@ -121,6 +146,10 @@ jobs:
             ${{ runner.temp }}/fl-windows-raw/qualification.json
             ${{ runner.temp }}/fl-windows-raw/build.log
             ${{ runner.temp }}/fl-windows-raw/command-error.log
+            ${{ runner.temp }}/fl-windows-raw/work/libraw/config.log
+            ${{ runner.temp }}/fl-windows-raw/work/lensfun-build/CMakeCache.txt
+            ${{ runner.temp }}/fl-windows-raw/work/darktable-build/CMakeCache.txt
+            ${{ runner.temp }}/fl-windows-raw/work/darktable-build/CMakeFiles/CMakeConfigureLog.yaml
             ${{ runner.temp }}/fl-raw-toolchain.txt
             ${{ runner.temp }}/fl-raw-server/qualification.json
             ${{ runner.temp }}/fl-raw-server/build.log
