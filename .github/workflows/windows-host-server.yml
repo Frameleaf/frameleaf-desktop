@@ -4,6 +4,9 @@ on:
     paths:
       - 'tools/build_host_server.py'
       - 'tools/test_build_host_server.py'
+      - 'tools/build_host_exiftool_windows.py'
+      - 'tools/test_build_host_exiftool_windows.py'
+      - 'tools/qualify_host_exiftool.mjs'
       - 'tools/build_runtime.py'
       - '.github/workflows/windows-host-server.yml'
   workflow_dispatch:
@@ -27,7 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 947568067639827de73e2de7260103df697c7f51
+          ref: ca9db753e3d8557e6a26e712d83012505eb113b5
           path: server-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -48,12 +51,21 @@ jobs:
         run: |
           python -m unittest discover -s tools -p test_build_host_server.py -v
           if ($LASTEXITCODE) { throw 'Server packaging tests failed' }
+          python -m unittest discover -s tools -p test_build_host_exiftool_windows.py -v
+          if ($LASTEXITCODE) { throw 'Private ExifTool binding tests failed' }
       - name: Compile and verify the actual private production server
         shell: pwsh
         run: |
           $node = (Get-Command node).Source
-          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 947568067639827de73e2de7260103df697c7f51 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision ca9db753e3d8557e6a26e712d83012505eb113b5 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
           if ($LASTEXITCODE) { throw 'Windows production server qualification failed' }
+      - name: Bind and qualify private Windows metadata runtime
+        shell: pwsh
+        run: |
+          python tools/build_host_exiftool_windows.py --server "$env:RUNNER_TEMP/fl-windows-server" --output "$env:RUNNER_TEMP/fl-windows-metadata"
+          if ($LASTEXITCODE) { throw 'Private Windows ExifTool binding failed' }
+          node tools/qualify_host_exiftool.mjs "$env:RUNNER_TEMP/fl-windows-metadata" | Tee-Object -FilePath "$env:RUNNER_TEMP/fl-windows-metadata/metadata-qualification.json"
+          if ($LASTEXITCODE) { throw 'Production metadata qualification failed' }
       - name: Retain private server package and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -64,5 +76,6 @@ jobs:
             ${{ runner.temp }}/fl-windows-server/qualification.json
             ${{ runner.temp }}/fl-windows-server/build.log
             ${{ runner.temp }}/fl-windows-server/command-error.log
+            ${{ runner.temp }}/fl-windows-metadata/
           retention-days: 7
           if-no-files-found: warn
