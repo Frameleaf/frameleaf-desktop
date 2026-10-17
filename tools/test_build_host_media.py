@@ -38,8 +38,10 @@ class HostMediaTests(unittest.TestCase):
 
             def inspect_environment(git, source, revision, name, env):
                 self.assertEqual(env.get("PROCESSOR_ARCHITECTURE"), "AMD64")
+                self.assertEqual(env.get("CL"), "/DNOMINMAX")
                 self.assertNotIn("PROCESSOR_ARCHITEW6432", env)
                 self.assertNotIn("NODE_OPTIONS", env)
+                self.assertNotIn("_CL_", env)
                 raise BuildError("verified_architecture_checked_before_source_build")
 
             with (
@@ -47,7 +49,7 @@ class HostMediaTests(unittest.TestCase):
                 patch("build_host_media.platform.machine", return_value="AMD64"),
                 patch("build_host_media.shutil.which", return_value=str(root / "tools/tool.exe")),
                 patch("build_host_media.git_blob", side_effect=inspect_environment),
-                patch.dict(os.environ, {"PROCESSOR_ARCHITECTURE": "untrusted", "PROCESSOR_ARCHITEW6432": "ARM64", "NODE_OPTIONS": "--require=untrusted.js"}),
+                patch.dict(os.environ, {"PROCESSOR_ARCHITECTURE": "untrusted", "PROCESSOR_ARCHITEW6432": "ARM64", "NODE_OPTIONS": "--require=untrusted.js", "CL": "/FIuntrusted.h", "_CL_": "/FIuntrusted.h"}),
                 self.assertRaisesRegex(BuildError, "verified_architecture_checked"),
             ):
                 build(root, "a" * 40, root, root, root / "output")
