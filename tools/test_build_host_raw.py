@@ -17,31 +17,33 @@ UPSTREAM_WINDOWS_LENSFUN = '  # Add lensfun libraries\n  if(LensFun_FOUND)\n    
 
 class NativeRawContractTests(unittest.TestCase):
     def test_windows_installs_only_its_source_pinned_lensfun_database(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            prefix = root / "prefix"
-            database = prefix / "share/lensfun/version_1"
-            database.mkdir(parents=True)
-            (database / "timestamp.txt").write_text("source-pinned timestamp")
-            (database / "calibration.xml").write_text("source-pinned calibration")
-            macro = root / "windows-macros.cmake"
-            remainder = 'file(WRITE "${CMAKE_INSTALL_PREFIX}/other-runtime-data" "preserved")\n'
-            macro.write_text(UPSTREAM_WINDOWS_LENSFUN + remainder)
-            report = use_pinned_windows_lensfun_database(macro, prefix)
-            self.assertEqual(report["originalSha256"], hashlib.sha256((UPSTREAM_WINDOWS_LENSFUN + remainder).encode()).hexdigest())
-            self.assertEqual(report["adaptedSha256"], hashlib.sha256(macro.read_bytes()).hexdigest())
-            (root / "CMakeLists.txt").write_text(
-                'cmake_minimum_required(VERSION 3.16)\nproject(fixture NONE)\n'
-                'set(LensFun_FOUND TRUE)\nset(MINGW_PATH "${CMAKE_BINARY_DIR}/missing-toolchain/bin")\n'
-                'include("${CMAKE_SOURCE_DIR}/windows-macros.cmake")\n')
-            for arguments in [
-                ["cmake", "-S", str(root), "-B", str(root / "build"), "-DCMAKE_INSTALL_PREFIX=" + str(prefix)],
-                ["cmake", "--install", str(root / "build")],
-            ]:
-                subprocess.run(arguments, check=True, capture_output=True, text=True)
-            self.assertEqual((database / "calibration.xml").read_text(), "source-pinned calibration")
-            self.assertEqual((prefix / "other-runtime-data").read_text(), "preserved")
-            self.assertNotIn("LENSFUN_DB_UPDATES", macro.read_text())
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                prefix = root / "prefix"
+                database = prefix / "share/lensfun/version_1"
+                database.mkdir(parents=True)
+                (database / "timestamp.txt").write_text("source-pinned timestamp")
+                (database / "calibration.xml").write_text("source-pinned calibration")
+                macro = root / "windows-macros.cmake"
+                remainder = 'file(WRITE "${CMAKE_INSTALL_PREFIX}/other-runtime-data" "preserved")\n'
+                macro.write_bytes((UPSTREAM_WINDOWS_LENSFUN + remainder).replace("\n", newline).encode())
+                original_bytes = macro.read_bytes()
+                report = use_pinned_windows_lensfun_database(macro, prefix)
+                self.assertEqual(report["originalSha256"], hashlib.sha256(original_bytes).hexdigest())
+                self.assertEqual(report["adaptedSha256"], hashlib.sha256(macro.read_bytes()).hexdigest())
+                (root / "CMakeLists.txt").write_text(
+                    'cmake_minimum_required(VERSION 3.16)\nproject(fixture NONE)\n'
+                    'set(LensFun_FOUND TRUE)\nset(MINGW_PATH "${CMAKE_BINARY_DIR}/missing-toolchain/bin")\n'
+                    'include("${CMAKE_SOURCE_DIR}/windows-macros.cmake")\n')
+                for arguments in [
+                    ["cmake", "-S", str(root), "-B", str(root / "build"), "-DCMAKE_INSTALL_PREFIX=" + str(prefix)],
+                    ["cmake", "--install", str(root / "build")],
+                ]:
+                    subprocess.run(arguments, check=True, capture_output=True, text=True)
+                self.assertEqual((database / "calibration.xml").read_text(), "source-pinned calibration")
+                self.assertEqual((prefix / "other-runtime-data").read_text(), "preserved")
+                self.assertNotIn("LENSFUN_DB_UPDATES", macro.read_text())
 
     def test_windows_lensfun_packaging_refuses_missing_data_or_changed_upstream(self):
         with tempfile.TemporaryDirectory() as temporary:
