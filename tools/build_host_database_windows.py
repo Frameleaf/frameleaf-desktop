@@ -149,7 +149,8 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
         finally:
             password_file.unlink(missing_ok=True)
         start()
-        sql("postgres", "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent('café');")
+        # SQL Unicode escapes avoid Windows psql's ANSI command-line conversion.
+        sql("postgres", "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent(U&'caf\\00e9');")
         result = {"fresh": facts("postgres")}
         backup = output / "fixture.dump"
         command([binary("pg_dump"), *args, "-d", "postgres", "--format=custom", "--no-owner", "--no-acl", "--file", backup])

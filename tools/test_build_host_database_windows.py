@@ -149,6 +149,10 @@ class WindowsDatabaseTests(unittest.TestCase):
                         (output / "fixture-data/PG_VERSION").write_text("19")
                     if "--file" in arguments:
                         Path(arguments[arguments.index("--file") + 1]).write_bytes(b"synthetic dump")
+                    if "-c" in arguments:
+                        self.assertTrue(arguments[-1].isascii(), "Windows psql argv must not depend on the ANSI code page")
+                        if "CREATE EXTENSION" in arguments[-1]:
+                            self.assertIn("unaccent(U&'caf\\00e9')", arguments[-1])
                     if "-c" in arguments and str(arguments[-1]).startswith("SELECT json_build_object"):
                         return json.dumps({**expected, "neighbor": 2} if failure == "facts" else expected)
                     return ""
