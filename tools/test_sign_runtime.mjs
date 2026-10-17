@@ -359,7 +359,7 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     "25b22c16e47a27a2eb50017d838497abce850d11",
   );
   assert.deepEqual(profiles["cpu-ort"].additionalSources, {
-    "macos-aarch64": [source],
+    "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
     "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"],
   });
   assert.equal(
@@ -400,17 +400,19 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
   );
 });
 
-test("current CPU source packages only on its qualified Linux ARM64 target", async (t) => {
+test("current CPU source packages only on its qualified Linux and macOS ARM64 targets", async (t) => {
   const { packageConfiguration } = await import("./package_desktop.mjs");
   const profiles = JSON.parse(
     await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
   ).profiles;
   const source = "f93c34d196955da3e2760c095c08b27ccbf53315";
   assert.deepEqual(profiles["cpu-ort"].additionalSources["linux-aarch64"], [source]);
+  assert(profiles["cpu-ort"].additionalSources["macos-aarch64"].includes(source));
   for (const [target, sources] of Object.entries(
     profiles["cpu-ort"].additionalSources,
   )) {
-    if (target !== "linux-aarch64") assert(!sources.includes(source));
+    if (!["linux-aarch64", "macos-aarch64"].includes(target))
+      assert(!sources.includes(source));
   }
   assert.equal(profiles["coreml-ort"].additionalSources, undefined);
   const f = await fixture(t);
@@ -433,7 +435,7 @@ test("current CPU source packages only on its qualified Linux ARM64 target", asy
     f.privatePem,
     f.policy,
   );
-  if (process.platform !== "linux" || process.arch !== "arm64") {
+  if (!["linux", "darwin"].includes(process.platform) || process.arch !== "arm64") {
     await assert.rejects(
       packageConfiguration(f.root, f.policy),
       /runtime_bundle_source_unapproved/,
