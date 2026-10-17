@@ -8,6 +8,17 @@ from build_host_media import BuildError, build, codec_pin
 
 
 class HostMediaTests(unittest.TestCase):
+    def test_windows_rejects_unpinned_revision_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            with (
+                patch("build_host_media.platform.system", return_value="Windows"),
+                self.assertRaisesRegex(BuildError, "revision_invalid"),
+            ):
+                build(root, "main", root, root, output)
+            self.assertFalse(output.exists())
+
     def test_linux_rejects_unpinned_revision_before_creating_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -26,7 +37,7 @@ class HostMediaTests(unittest.TestCase):
             root = Path(temporary)
             output = root / "output"
             with (
-                patch("build_host_media.platform.system", return_value="Windows"),
+                patch("build_host_media.platform.system", return_value="FreeBSD"),
                 self.assertRaisesRegex(BuildError, "target_unsupported"),
             ):
                 build(root, "a" * 40, root, root, output)
