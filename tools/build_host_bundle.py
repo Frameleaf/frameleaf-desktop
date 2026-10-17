@@ -76,7 +76,9 @@ def host_entries() -> dict[str, str]:
         "hdr": "media/image-hdr.node",
         "ffmpeg": "media-tools/ffmpeg" + suffix,
         "ffprobe": "media-tools/ffprobe" + suffix,
-        "exiftool": "server/node_modules/exiftool-vendored.pl/bin/exiftool",
+        "exiftool": "server/node_modules/exiftool-vendored.exe/bin/exiftool.exe"
+        if os.name == "nt"
+        else "server/node_modules/exiftool-vendored.pl/bin/exiftool",
         "rawRenderer": "raw/bin/darktable-cli" + suffix,
         "rawDecoder": "raw/bin/dcraw_emu" + suffix,
         "webIndex": "build/www/index.html",

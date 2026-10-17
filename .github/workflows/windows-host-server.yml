@@ -1,0 +1,68 @@
+name: Private Windows server candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_server.py'
+      - 'tools/test_build_host_server.py'
+      - 'tools/build_runtime.py'
+      - '.github/workflows/windows-host-server.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-server-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  server:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      RAYON_NUM_THREADS: '1'
+      UV_THREADPOOL_SIZE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 947568067639827de73e2de7260103df697c7f51
+          path: server-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Prepare source-matched package manager
+        shell: pwsh
+        run: |
+          $package = Get-Content server-source/package.json -Raw | ConvertFrom-Json
+          if ($package.packageManager -ne 'pnpm@12.11.2') { throw 'Source package manager mismatch' }
+          npm install --global pnpm@12.11.2
+          if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
+      - name: Check production package staging guards
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p test_build_host_server.py -v
+          if ($LASTEXITCODE) { throw 'Server packaging tests failed' }
+      - name: Compile and verify the actual private production server
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 947568067639827de73e2de7260103df697c7f51 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
+          if ($LASTEXITCODE) { throw 'Windows production server qualification failed' }
+      - name: Retain private server package and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-private-server-candidate
+          path: |
+            ${{ runner.temp }}/fl-windows-server/server/
+            ${{ runner.temp }}/fl-windows-server/qualification.json
+            ${{ runner.temp }}/fl-windows-server/build.log
+            ${{ runner.temp }}/fl-windows-server/command-error.log
+          retention-days: 7
+          if-no-files-found: warn
