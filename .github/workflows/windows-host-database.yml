@@ -40,6 +40,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
+      - name: Check source and private DLL closure guards
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p test_build_host_database_windows.py -v
+          if ($LASTEXITCODE) { throw 'Windows database packaging tests failed' }
       - name: Prepare MSVC and pinned build tools
         shell: pwsh
         run: |

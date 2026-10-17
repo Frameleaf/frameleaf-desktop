@@ -1,4 +1,5 @@
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,30 @@ class WindowsBindingProjectTests(unittest.TestCase):
 
 
 class HostMediaTests(unittest.TestCase):
+    def test_windows_cmake_gets_verified_processor_identity_without_inherited_overrides(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ["bin/node.exe", "lib/node.lib", "include/node/node_api.h"]:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+
+            def inspect_environment(git, source, revision, name, env):
+                self.assertEqual(env.get("PROCESSOR_ARCHITECTURE"), "AMD64")
+                self.assertNotIn("PROCESSOR_ARCHITEW6432", env)
+                self.assertNotIn("NODE_OPTIONS", env)
+                raise BuildError("verified_architecture_checked_before_source_build")
+
+            with (
+                patch("build_host_media.platform.system", return_value="Windows"),
+                patch("build_host_media.platform.machine", return_value="AMD64"),
+                patch("build_host_media.shutil.which", return_value=str(root / "tools/tool.exe")),
+                patch("build_host_media.git_blob", side_effect=inspect_environment),
+                patch.dict(os.environ, {"PROCESSOR_ARCHITECTURE": "untrusted", "PROCESSOR_ARCHITEW6432": "ARM64", "NODE_OPTIONS": "--require=untrusted.js"}),
+                self.assertRaisesRegex(BuildError, "verified_architecture_checked"),
+            ):
+                build(root, "a" * 40, root, root, root / "output")
+
     def test_windows_rejects_unpinned_revision_before_creating_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

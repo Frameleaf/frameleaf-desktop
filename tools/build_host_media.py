@@ -100,7 +100,7 @@ def build(
             str(Path(pkg_config).parent), str(prefix / "bin"),
             str(dependency_prefix / "bin"), system_path,
         ]))
-        env.update(CC="cl", CXX="cl", PKG_CONFIG=pkg_config)
+        env.update(CC="cl", CXX="cl", PKG_CONFIG=pkg_config, PROCESSOR_ARCHITECTURE="AMD64")
         for key in ["INCLUDE", "LIB", "LIBPATH"]:
             if key in os.environ:
                 env[key] = os.environ[key]
