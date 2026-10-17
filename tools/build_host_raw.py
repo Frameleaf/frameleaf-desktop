@@ -75,6 +75,39 @@ def raw_contract(pin: dict, patches: dict[str, bytes], libraw: dict) -> dict:
     return pin
 
 
+def use_pinned_windows_lensfun_database(macro: Path, prefix: Path) -> dict:
+    database = prefix / "share/lensfun/version_1"
+    if not (database / "timestamp.txt").is_file() or not any(database.glob("*.xml")):
+        raise BuildError("host_raw_lensfun_database_missing")
+    regular(macro)
+    original = macro.read_text()
+    match = re.search(
+        r"  # Add lensfun libraries\n.*?  endif\(LensFun_FOUND\)\n",
+        original,
+        re.DOTALL,
+    )
+    if (
+        not match
+        or original.count("  # Add lensfun libraries\n") != 1
+        or hashlib.sha256(match.group().encode()).hexdigest()
+        != "06d7d8439b9ffc230aceba696f509cf5a0f526750c132d3aacda084c538629df"
+    ):
+        raise BuildError("host_raw_lensfun_packaging_changed")
+    before = sha256(macro)
+    # Lensfun already installed its pinned database here; do not import mutable MSYS data.
+    macro.write_text(
+        original[:match.start()]
+        + "  # Source-pinned Lensfun database already installed in this private prefix.\n"
+        + original[match.end():]
+    )
+    return {
+        "originalSha256": before,
+        "adaptedSha256": sha256(macro),
+        "databaseRelativePath": "share/lensfun/version_1",
+        "databaseFiles": inventory(database),
+    }
+
+
 def stage_raw(
     prefix: Path, work: Path, output: Path, command, dependencies: Path
 ) -> dict:
@@ -378,6 +411,10 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             )
             command([cmake, "--build", work / "lensfun-build", "--parallel", "1"])
             command([cmake, "--install", work / "lensfun-build"])
+            if windows:
+                report["windowsLensfunPackaging"] = use_pinned_windows_lensfun_database(
+                    work / "darktable/cmake/windows-macros.cmake", prefix
+                )
             flags = [
                 "BINARY_PACKAGE_BUILD=ON",
                 "RAWSPEED_ENABLE_WERROR=OFF",
