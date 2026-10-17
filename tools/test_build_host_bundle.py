@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from build_host_bundle import REQUIRED_HOST_FILES, assemble, host_entries, host_manifest
@@ -8,6 +9,21 @@ from build_runtime import BuildError
 
 
 class HostBundleTests(unittest.TestCase):
+    def test_database_extension_entry_matches_each_native_install_layout(self):
+        for system, os_name, vector, node in [
+            ("Windows", "nt", "pg/lib/vector.dll", "node.exe"),
+            ("Darwin", "posix", "pg/lib/postgresql/vector.dylib", "node"),
+            ("Linux", "posix", "pg/lib/postgresql/vector.so", "node"),
+        ]:
+            with (
+                self.subTest(system=system),
+                patch("build_host_bundle.platform.system", return_value=system),
+                patch("build_host_bundle.os.name", os_name),
+            ):
+                entries = host_entries()
+                self.assertEqual(entries["vector"], vector)
+                self.assertEqual(entries["node"], node)
+
     def test_complete_roles_and_unlisted_fixture_agent_are_not_confused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

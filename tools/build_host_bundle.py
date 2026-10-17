@@ -69,7 +69,10 @@ def host_entries() -> dict[str, str]:
                 "psql": "psql",
             }.items()
         },
-        "vector": "pg/lib/postgresql/vector." + library,
+        # pgvector's Windows Makefile installs into PGROOT/lib.
+        "vector": "pg/lib/vector.dll"
+        if os.name == "nt"
+        else "pg/lib/postgresql/vector." + library,
         "hdr": "media/image-hdr.node",
         "ffmpeg": "media-tools/ffmpeg" + suffix,
         "ffprobe": "media-tools/ffprobe" + suffix,
