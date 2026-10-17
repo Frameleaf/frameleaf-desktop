@@ -94,7 +94,7 @@ class WindowsDatabaseTests(unittest.TestCase):
             (dependencies / "bin/icu.dll").write_bytes(b"synthetic ICU")
             (dependencies / "share/icu").mkdir(parents=True)
             (dependencies / "share/icu/copyright").write_text("synthetic notice")
-            for extra in ["KERNEL32.dll\n  api-ms-win-crt-runtime-l1-1-0.dll", "missing.dll"]:
+            for extra in ["KERNEL32.dll\n  api-ms-win-crt-runtime-l1-1-0.dll", "WLDAP32.dll", "missing.dll"]:
                 with self.subTest(extra=extra), patch(
                     "build_host_database_windows.run", return_value="  icu.dll\n  " + extra
                 ):

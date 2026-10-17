@@ -26,7 +26,7 @@ SYSTEM_DLLS = {
     "normaliz.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "psapi.dll",
     "rpcrt4.dll", "secur32.dll", "setupapi.dll", "shell32.dll", "shlwapi.dll",
     "user32.dll", "userenv.dll", "ucrtbase.dll", "version.dll", "winmm.dll",
-    "ws2_32.dll", "wtsapi32.dll",
+    "ws2_32.dll", "wtsapi32.dll", "wldap32.dll",
 }
 
 
