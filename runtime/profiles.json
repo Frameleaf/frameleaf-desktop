@@ -15,7 +15,8 @@
       ],
       "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11",
       "additionalSources": {
-        "macos-aarch64": ["1ca4d52e2b8158d89d8de8b17e1e6535e17691f4"]
+        "macos-aarch64": ["1ca4d52e2b8158d89d8de8b17e1e6535e17691f4"],
+        "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"]
       }
     },
     "coreml-ort": {
