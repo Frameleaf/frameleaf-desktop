@@ -7,7 +7,41 @@ import {
   claimState,
   validateConfig,
   hostEnvironment,
+  studioReadyUntil,
+  ownStudioWorker,
 } from "../runtime/host-agent.mjs";
+
+test("Studio readiness accepts only the dedicated protocol and pinned engine", () => {
+  const now = Date.parse("2026-10-16T12:00:00.000Z");
+  const engine = "a".repeat(40);
+  const ready = {
+    protocolVersion: 1,
+    state: "ready",
+    engineDigest: engine,
+    expiresAt: new Date(now + 60 * 60_000).toISOString(),
+  };
+  assert.equal(studioReadyUntil(ready, engine, now), now + 50 * 60_000);
+  assert.equal(
+    studioReadyUntil({ protocolVersion: 1, state: "qualifying" }, engine, now),
+    0,
+  );
+  for (const message of [
+    null,
+    "[studio-worker] Admitted",
+    { ...ready, protocolVersion: 2 },
+    { ...ready, state: "running" },
+    { ...ready, engineDigest: "b".repeat(40) },
+    { ...ready, sessionToken: "synthetic-secret" },
+    { ...ready, expiresAt: "invalid" },
+    { ...ready, expiresAt: "2026-10-16" },
+    { ...ready, expiresAt: new Date(now + 10 * 60_000).toISOString() },
+    { protocolVersion: 1, state: "qualifying", expiresAt: ready.expiresAt },
+  ])
+    assert.throws(
+      () => studioReadyUntil(message, engine, now),
+      /host_studio_protocol_invalid/,
+    );
+});
 
 const config = (state) => ({
   state,
@@ -28,6 +62,10 @@ const config = (state) => ({
     pgIsready: "pg/pg_isready",
     pgCtl: "pg/pg_ctl",
     hdr: "media/hdr",
+    studioBrowser:
+      "browser/chrome" + (process.platform === "win32" ? ".exe" : ""),
+    studioBrowserGuard: "studio/guard/studio-browser-guard",
+    studio: "studio/tools/bundled-worker.mjs",
     rawRenderer:
       "raw/bin/darktable-cli" + (process.platform === "win32" ? ".exe" : ""),
     rawDecoder:
@@ -40,6 +78,13 @@ test("host configuration rejects shared ports, unbounded secrets and relative pa
   const good = config("/private/state");
   assert.doesNotThrow(() => validateConfig(good));
   for (const change of [
+    { entryPoints: { ...good.entryPoints, studioBrowser: undefined } },
+    { entryPoints: { ...good.entryPoints, studioBrowserGuard: undefined } },
+    { entryPoints: { ...good.entryPoints, studioBrowserGuard: "../guard" } },
+    { entryPoints: { ...good.entryPoints, studioBrowser: "../chrome" } },
+    {
+      entryPoints: { ...good.entryPoints, studioBrowser: "/usr/bin/chromium" },
+    },
     { entryPoints: { ...good.entryPoints, rawRenderer: undefined } },
     { entryPoints: { ...good.entryPoints, rawDecoder: undefined } },
     { entryPoints: { ...good.entryPoints, rawDecoder: "../dcraw_emu" } },
@@ -71,6 +116,20 @@ test("host media commands use private binaries without inheriting the caller env
   const cfg = config("/private/state");
   const env = hostEnvironment(cfg);
   assert.equal(
+    env.FRAMELEAF_STUDIO_CHROMIUM,
+    join(cfg.runtime, cfg.entryPoints.studioBrowser),
+  );
+  assert.equal(
+    env.FRAMELEAF_STUDIO_NODE,
+    join(cfg.runtime, cfg.entryPoints.node),
+  );
+  assert.equal(
+    env.FRAMELEAF_STUDIO_BROWSER_GUARD,
+    process.platform === "win32"
+      ? undefined
+      : join(cfg.runtime, cfg.entryPoints.studioBrowserGuard),
+  );
+  assert.equal(
     env.FRAMELEAF_RAW_DECODER_PATH,
     join(cfg.runtime, cfg.entryPoints.rawDecoder),
   );
@@ -80,6 +139,14 @@ test("host media commands use private binaries without inheriting the caller env
     env.PATH.split(process.platform === "win32" ? ";" : ":").includes(
       join(cfg.runtime, "raw/bin"),
     ),
+  );
+  assert.equal(
+    env.FRAMELEAF_STUDIO_WORKER_TRUST_DIR,
+    join(cfg.state, "studio-trust"),
+  );
+  assert.equal(
+    env.FRAMELEAF_STUDIO_WORKER_WORK_DIR,
+    join(cfg.state, "studio-work"),
   );
   assert.equal(env.HOME, join(cfg.state, "home"));
   for (const name of [
@@ -220,6 +287,44 @@ test(
       await assert.rejects(readFile(join(state, "database-password.tmp")), {
         code: "ENOENT",
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+test(
+  "Studio trust and scratch paths refuse linked profile directories before launch",
+  { skip: process.platform === "win32" },
+  async () => {
+    const { createServer } = await import("node:net");
+    const { mkdir, readdir, symlink } = await import("node:fs/promises");
+    const { runHost } = await import("../runtime/host-agent.mjs");
+    const root = await mkdtemp(join(tmpdir(), "frameleaf-host-studio-linked-"));
+    try {
+      const outside = join(root, "outside");
+      await mkdir(outside, { mode: 0o700 });
+      const probes = [createServer(), createServer()];
+      for (const probe of probes)
+        await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+      const ports = probes.map((probe) => probe.address().port);
+      for (const probe of probes)
+        await new Promise((resolve) => probe.close(resolve));
+      for (const name of ["studio-trust", "studio-work"]) {
+        const state = join(root, name);
+        await mkdir(state, { mode: 0o700 });
+        const cfg = {
+          ...config(state),
+          apiPort: ports[0],
+          databasePort: ports[1],
+        };
+        await claimState(cfg);
+        await symlink(outside, join(state, name), "dir");
+        await assert.rejects(
+          runHost(cfg, new Promise(() => {}), () => assert.fail()),
+          /host_state_not_private/,
+        );
+        assert.deepEqual(await readdir(outside), []);
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -1,0 +1,29 @@
+use std::process::Command;
+
+#[test]
+fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for phase in ["--prepare-install", "--finalize-install"] {
+        for ids in [vec![], vec!["a".repeat(64), "b".repeat(64)]] {
+            let output = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"))
+                .arg(phase)
+                .args(&ids)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stderr.is_empty());
+            let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let expected = if ids.is_empty() {
+                "host_control_arguments_invalid"
+            } else if cfg!(target_os = "macos") {
+                "host_install_root_required"
+            } else {
+                "host_install_platform_unsupported"
+            };
+            assert_eq!(receipt["code"], expected);
+        }
+    }
+}

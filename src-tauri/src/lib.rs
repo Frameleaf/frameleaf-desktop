@@ -2,9 +2,19 @@ pub mod connection;
 pub mod copy_source;
 pub mod copy_upload;
 mod credentials;
+mod host_commands;
+pub mod host_control;
+pub mod host_install;
 pub mod host_runtime;
+mod host_setup;
+mod host_state;
 mod host_storage;
 pub mod lifecycle;
+pub mod manager;
+mod manager_commands;
+pub mod manager_host;
+mod manager_profile;
+pub mod manager_tls;
 pub mod ml_transport;
 mod model_cache;
 pub mod model_catalogue;
@@ -153,6 +163,9 @@ async fn connect_server(
 ) -> Result<ConnectionView, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    if app.state::<host_setup::HostSetup>().background_active() {
+        return Err("local_host_active".into());
+    }
     if current.is_some() || credentials::load::<SavedConnection>("connection")?.is_some() {
         return Err("sign_out_before_switching_servers".into());
     }
@@ -217,6 +230,9 @@ async fn restore_connection(
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    if app.state::<host_setup::HostSetup>().background_active() {
+        return Ok(None);
+    }
     app.state::<source_import::SourceJobs>().stop().await;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load::<SavedConnection>("connection")? else {
@@ -382,10 +398,18 @@ pub fn run() {
             }
         }))
         .manage(DesktopState::default())
+        .manage(host_setup::HostSetup::default())
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
         .invoke_handler(tauri::generate_handler![
+            host_commands::open_local_photos,
+            host_commands::authorize_local_manager,
+            host_commands::installed_local_hosts,
+            host_commands::local_host_status,
+            host_commands::prepare_local_host,
+            host_commands::cancel_local_host_start,
+            host_commands::stop_local_host_manager,
             connect_server,
             restore_connection,
             sign_out,
@@ -400,10 +424,45 @@ pub fn run() {
             revoke_photo_source,
             photo_import_status,
             prepare_photo_import,
-            control_photo_import
+            control_photo_import,
+            manager_commands::manager_view,
+            manager_commands::manager_certificate_fingerprint,
+            manager_commands::pair_manager,
+            manager_commands::manager_request,
+            manager_commands::reauthenticate_manager,
+            manager_commands::disconnect_manager
         ])
-        .run(tauri::generate_context!())
-        .expect("Frameleaf desktop failed to start");
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && window.state::<host_setup::HostSetup>().background_active()
+            {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("Frameleaf desktop failed to start")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::Reopen { .. }) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if app.state::<host_setup::HostSetup>().background_active() {
+                    api.prevent_exit();
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.emit("native-host-exit-blocked", ());
+                    }
+                }
+            }
+        });
 }
 
 async fn start_worker_setup(

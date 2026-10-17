@@ -3,6 +3,38 @@
   "identifier": "desktop-setup",
   "description": "Packaged setup can connect to one server. Remote photo windows receive no native capabilities.",
   "local": true,
-  "windows": ["main"],
-  "permissions": ["core:default", "allow-connect-server", "allow-restore-connection", "allow-sign-out", "allow-open-photos", "allow-worker-setup-status", "allow-prepare-models", "allow-control-worker", "allow-discover-onedrive", "allow-choose-photo-folder", "allow-approve-photo-folder", "allow-photo-source-status", "allow-revoke-photo-source", "allow-photo-import-status", "allow-prepare-photo-import", "allow-control-photo-import"]
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-connect-server",
+    "allow-restore-connection",
+    "allow-sign-out",
+    "allow-open-photos",
+    "allow-worker-setup-status",
+    "allow-prepare-models",
+    "allow-control-worker",
+    "allow-discover-onedrive",
+    "allow-choose-photo-folder",
+    "allow-approve-photo-folder",
+    "allow-photo-source-status",
+    "allow-revoke-photo-source",
+    "allow-photo-import-status",
+    "allow-prepare-photo-import",
+    "allow-control-photo-import",
+    "allow-manager-view",
+    "allow-manager-certificate-fingerprint",
+    "allow-pair-manager",
+    "allow-manager-request",
+    "allow-reauthenticate-manager",
+    "allow-disconnect-manager",
+    "allow-installed-local-hosts",
+    "allow-local-host-status",
+    "allow-prepare-local-host",
+    "allow-cancel-local-host-start",
+    "allow-stop-local-host-manager",
+    "allow-authorize-local-manager",
+    "allow-open-local-photos"
+  ]
 }

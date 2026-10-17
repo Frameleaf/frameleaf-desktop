@@ -22,7 +22,7 @@ Local photo-source work includes OneDrive folders and Apple Photos/iCloud throug
 
 This private repository owns the desktop shell, supervisor, native adapters, packaging and desktop tests. Proposed `desktop/...` paths in the planning documents map here. Backend, Manager, shared web and ML contract changes remain in `Frameleaf/frameleaf-app`. Shared UI, SDK and runtime artifacts must be pinned to reviewed versions; do not fork the photo application.
 
-Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7ea`. PR #140 remains draft/open and unmerged. The foundation candidate contains a Tauri desktop shell, secure native password sign-in, OS-keystore session/device identity, automatic signed enrollment and an unprivileged window for the existing Frameleaf photo interface. Native inference and signed worker transport are implemented; serial multi-role scheduling is connected; Local macOS CPU fixtures have accepted actual NAS CLIP and OCR library jobs through the signed native runtime, including stale-source publication refusal. OCR runs without a NAS inference backend. Native full hosting, Manager pairing and local photo-source integrations remain unfinished. Installed-device release acceptance remains pending.
+Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7ea`. The server integration now includes merged PR #140 and the PR #274 UI changes on main. The foundation candidate contains a Tauri desktop shell, secure native password sign-in, OS-keystore session/device identity, automatic signed enrollment and an unprivileged window for the existing Frameleaf photo interface. Native inference and signed worker transport are implemented; serial multi-role scheduling is connected; Local macOS CPU fixtures have accepted actual NAS CLIP and OCR library jobs through the signed native runtime, including stale-source publication refusal. OCR runs without a NAS inference backend. Native full hosting, Manager pairing and local photo-source integrations remain unfinished. Installed-device release acceptance remains pending.
 
 
 ## Development
@@ -36,7 +36,7 @@ npm run desktop:dev
 
 Run `npm test`, `npm run check`, and `cargo test --manifest-path src-tauri/Cargo.toml`. Build a desktop installer with `npm run desktop:build -- --runtime /absolute/path/to/factory-signed-pack` (add `--debug` for an unsigned development candidate). The command verifies the release signature, complete payload, target platform and current bundle source before invoking Tauri. It includes the runtime at the resource path used by automatic worker setup. Shell smoke tests can use `npm run desktop:build:shell -- --debug`; those candidates deliberately omit the ML runtime.
 
-Connect using the HTTPS origin of a Frameleaf server. This candidate supports password sign-in; external-browser OAuth/OIDC is not implemented. PR #140 needs the additive desktop-device API before automatic enrollment is available. Existing servers can still open their photo interface after sign-in, with an explicit worker-upgrade status. A server without an established identity requires a new sign-in after restart.
+Connect using the HTTPS origin of a Frameleaf server. This candidate supports password sign-in; external-browser OAuth/OIDC is not implemented. Automatic enrollment requires a server version containing the desktop-device API from PR #140. Existing servers can still open their photo interface after sign-in, with an explicit worker-upgrade status. A server without an established identity requires a new sign-in after restart.
 
 The setup window has narrow native commands; remote Photos windows have no native capabilities. Session credentials and the Ed25519 installation key are stored only in the OS credential store. Sign-out invalidates the active association; permanent device revocation remains separate.
 
@@ -439,7 +439,7 @@ installed Windows/Linux volume behavior remains unqualified.
 
 Real macOS controller fixtures passed fresh setup, restart and recovery after `initdb` but before application-database creation, using PostgreSQL 19 beta 4, pgvector 0.8.7 and all 38 application migrations. Wrong database passwords were rejected. Those developer fixtures link external development artifacts; they do not prove a complete signed or portable host bundle. A separate Rust test uses synthetic components to exercise the owner, output pipe, restart and forced-agent-crash paths.
 
-Local hosting remains unavailable in the setup UI. A complete private dependency bundle, local-filesystem qualification, OS credential-store setup, Manager operations/recovery and installed platform acceptance are still required. Studio/edge/full media processing are not qualified by startup alone. Windows needs a graceful application drain channel before host release; the current controller's Windows stop is forceful. No database upgrade or restore is enabled by this controller.
+Local hosting remains unavailable in the setup UI. A complete private dependency bundle, local-filesystem qualification, OS credential-store setup, Manager operations/recovery and installed platform acceptance are still required. Studio/edge/full media processing are not qualified by startup alone. A private IPC application drain is now drafted; Windows lifecycle acceptance is still required before host release. No database upgrade or restore is enabled by this controller.
 
 ### macOS native component relocation
 
@@ -597,3 +597,185 @@ native images. Host manifests must inventory both `rawRenderer`
 startup. These are macOS component checks. Full RAW format/recipe conformance,
 complete signed host assembly, installed Windows/Linux support, minimum OS and
 redistribution qualification remain pending.
+
+### Native Studio worker draft
+
+`tools/build_host_studio.py` is a source-pinned authoring recipe. It snapshots a
+selected server revision, prepares the existing pinned engine, builds and attests
+its headless harness, then uses the existing bundled-worker packager. The staged
+worker includes its JavaScript runtime packages, subtitle sidecar, notices and
+server font resources. Required entries and font headers are checked before the
+package is accepted; Git LFS pointers are not usable font payloads.
+
+The host supplies profile-local Studio trust and scratch directories, applying
+the existing private-directory checks before launching processes. This lets the
+server write the worker's enrollment outside container-specific paths.
+
+This draft excludes Chromium and reports `runtimeQualified: false` and
+`redistributable: false`. The host manifest requires a `studioBrowser` entry
+covered by the signed file inventory, and the host supplies that explicit path
+through `FRAMELEAF_STUDIO_CHROMIUM`. A required `studioBrowserGuard` role and its
+inventoried Node helper are staged with the worker. On macOS/Linux the guardian
+forwards Playwright's CDP pipes to Chromium in the same private group, waits for
+an IPC watchdog before launching, and stops that group on owner or watchdog loss.
+The watchdog stops the group if the guardian dies. Windows uses the host's Job
+Object instead. Native launches request Chromium sandboxing and reject sandbox
+disable flags; no fallback is added for sandbox launch failures.
+
+The native path does not select a system or
+cached Playwright browser. A qualified browser payload, native font discovery,
+loopback worker admission, lifecycle ownership and actual render conformance
+remain required before Studio can be enabled. The build/test hold has been lifted.
+Local worker, host-owner, guardian and staging tests pass. On macOS ARM64, real
+Chromium 156.0.8078.4 (Playwright revision 1248) passed GPU render conformance,
+owner/guardian-loss process-group cleanup and browser-session cancellation.
+Those component checks used an isolated engine build and system FFmpeg tools;
+they do not qualify the complete assembled host or private-font identity.
+The Studio authoring recipe completed end to end on macOS ARM64 from local
+server revision `1de4d43db65c52db52356cc809454f0b0f08437e`; its packaged
+renderer/engine/guardian passed GPU codec/format conformance with the private
+headless browser. That check still used system FFmpeg and does not establish
+that admission conformance uses the packaged fonts. The local server draft now
+registers claim-granted TrueType bytes in each render page, checks their identity,
+limits font memory, and refuses titles without a granted family. Real Chromium
+reported a custom face for a private test family with all network blocked, and
+the renderer produced a title video. The executor also gives each downloaded
+font a distinct scratch file. These font changes are included in local source revision
+`ba85c33305772ba9f7415ef7d452f011bd4fc75f`. The native builder stages a separate
+admission face and metadata from the server font catalog. Native conformance
+verifies those bytes and registers them before rendering; missing or changed
+private fonts refuse admission before browser launch. The rebuilt package passed
+GPU codec/format conformance using its default private font location. This still
+uses system FFmpeg and is not assembled-host enrollment/job acceptance.
+
+`tools/stage_host_browser.py` materializes internal browser framework aliases into
+a link-free component with a complete hash inventory. It rejects escaped, cyclic
+or broken links, special files and unsafe destinations, and keeps its receipt
+outside source and payload. It does not acquire or sign browsers; the selected
+payload must match the pinned engine's Playwright browser registry. Its receipt
+always reports `runtimeQualified: false` and `redistributable: false`.
+The full macOS Chrome for Testing app cannot be used in this materialized layout:
+macOS rejects signing its flattened framework as an ambiguous bundle. The pinned
+headless-shell payload avoids that layout. On macOS ARM64 its five native objects
+passed local ad-hoc signing/strict verification, and the signed copy passed GPU
+render conformance, owner/guardian-loss cleanup and cancellation. Production
+Developer ID signing, hardened runtime and notarization remain unqualified;
+component receipts do not enable Studio.
+
+The server worker's native `--owner-pipe` draft also requires Node IPC. Stdin
+accepts only `stop\n`; EOF or IPC disconnect cancels work. The dedicated IPC
+channel reports `{protocolVersion: 1, state: "qualifying"}` and, only after real
+conformance and validated admission, a `ready` message with the pinned engine
+digest and session expiry. Tokens and enrolment secrets are omitted. Returning
+to admission clears readiness, and its maximum lifetime ends at the worker's
+renewal deadline, ten minutes before session expiry. `studioReadyUntil` validates
+these messages independently of stdout. The host worker launcher and readiness
+consumer are now drafted behind the compiled `STUDIO_ENABLED = false` gate;
+this protocol does not enable Studio. The child inherits host group/Job ownership,
+uses the loopback API and private profile paths, and has ten minutes to qualify.
+An IPC disconnect, process failure or invalid readiness stops the host path.
+Shutdown sends one stdin stop command, waits up to 35 seconds for worker/pipe
+closure, then forces termination and waits five more seconds. The API and
+PostgreSQL remain available during that drain; forced or failed cleanup is
+reported after their cleanup. The outer owner allows 150 seconds for the full
+shutdown and retains group/Job termination as a final fallback. The controller,
+gated launch branch still requires assembled-runtime acceptance; controller and
+protocol regression tests pass locally.
+
+The native API/supervisor draft uses `FRAMELEAF_NATIVE_OWNER=1` with a private Node
+IPC channel. The host requires the exact `frameleaf:owner-ready:v1` acknowledgement
+before API readiness; incompatible older server payloads cannot claim readiness.
+`frameleaf:stop` reuses the existing worker shutdown path. Native API and edge
+forks receive IPC stops, and owner loss also requests cleanup; container workers
+retain signal handling. The host waits up to 40 seconds for process and pipe
+closure, then forces and waits five more seconds before PostgreSQL shutdown.
+Failed IPC, failed worker cleanup and forced deadlines are reported as failures.
+Source protocol regression tests pass locally. Real Windows in-flight request/job
+cleanup remains unqualified. Studio remains disabled by its separate gate.
+
+
+A macOS component host fixture using local server/Studio revision
+`ba85c33305772ba9f7415ef7d452f011bd4fc75f` passed fresh and restarted worker
+admission with private FFmpeg, browser and font bytes. Each boot required a new
+conformance report, followed by ordered Studio/API/database stop and an empty
+owned host process group. This exercised a fixture-only copy with Studio enabled;
+the shipping gate stays false. The complete signed-host manifest was bypassed.
+An authenticated synthetic 720p title export also passed the real worker claim,
+server validation, library publication and original download path. It exposed and
+fixed the expanded font family's legacy-alias handling in local source revision
+`102cab85941bacde1c76accd47a05b4d85093c08`; all eight fixture worker modules
+match that source. The downloaded H.264 frame was visually checked.
+In-flight drain, other media/recipe cases, complete ML/Manager hosting and
+installed Windows/macOS/Linux acceptance remain separate requirements.
+
+
+A follow-up Mac component fixture interrupted real renders after nonzero frame
+progress. Owner cancellation removed browser processes and scratch files; the
+cancelled export stayed cancelled after restart. Host stop during another render
+queued a retry rather than owner cancellation, stopped all owned processes, then
+restarted and published exactly one 30-second result on attempt two. Live-render
+shutdown took 7.769 seconds in that fixture. Owner cancellation took 32.827 seconds
+with the current 30-second server heartbeat; responsiveness remains a limitation.
+These results do not enable the shipping Studio gate or qualify installed platforms.
+
+
+### Complete host inventory authoring
+
+`tools/build_host_bundle.py` combines the staged private host components with an
+application-trusted signed ML candidate. It excludes the fixture agent, checks
+all 26 roles and required resources, including Manager backend and recovery UI, and verifies the nested ML signature and
+payload again after copying. The output has `payload/`, an unsigned host
+`manifest.json`, and a scoped `qualification.json`; it does not sign or certify
+release readiness. The earlier 24-role Mac assembly contains 67,015 files and a 10.9 MB
+manifest. Host manifests are bounded at 16 MiB to fit that inventory; larger
+manifests are refused. The real payload passed the Rust verifier contract with
+an in-memory test authority. A factory host signature, complete controller/ML
+runtime qualification and installed three-OS acceptance remain required.
+
+
+`tools/sign_host_runtime.mjs --candidate /absolute/candidate --private-key-stdin`
+checks the full host inventory and independently signed nested ML candidate before
+writing a new `manifest.sig`. The existing Infisical-owned release key is supplied
+through a protected stdin channel in the trusted authoring environment. The tool
+never prints key material or overwrites a signature. Host signing has separate
+schema/pin checks; ML signing retains its existing validation and limits.
+
+The earlier 24-role Mac component candidate has a factory-authority signature.
+The actual Rust controller verified it through compiled application trust,
+started/stopped the server, and restarted/stopped the same database profile.
+This establishes the signed controller path. Database certification remains false;
+ML execution, app code signing/notarization and installed three-platform acceptance
+remain required before release enablement.
+
+
+The opt-in `factory_host_nested_ml_installs_qualifies_and_predicts` integration check also passed on macOS/aarch64: compiled release authority verifies the complete host, its nested signed CPU runtime installs through RuntimeStore, SigLIP textual qualification and authenticated 768-value inference match the compiled reference, live leases block replacement, and shutdown removes scratch before reactivation. This establishes one installed runtime/model component path; GPU/NAS jobs, other model entries and installed desktop acceptance remain open.
+
+
+Native database admission now rejects standard macOS File Provider/iCloud paths and probes Windows registered sync-root membership through the opened directory handle. Ordinary local Mac startup/restart and an owned mock-provider refusal pass. This applies only to database state; photo sources keep their separate consent path. Legacy sync-root, Windows runtime and Linux user-space sync qualification remain open before hosting setup is enabled.
+
+
+The development `frameleaf-native-host --owner-pipe` helper now provides bounded, manifest-pinned native host control using the compiled release authority. Actual signed Mac host startup, same-profile restart, explicit stop, owner-pipe closure and invalid-command drain pass; the final Rust suite has 176 passing tests with 15 opt-in cases skipped. This helper is not yet packaged/signed or wired into Manager’s operation journal/APIs or setup UI. It accepts credentials only on its private stdin pipe and exposes no listener. Existing desktop launches keep `frameleaf-desktop` as Cargo’s default target.
+
+
+### Native Manager packaging
+
+`tools/build_host_manager.py --source /absolute/repo --revision <commit> --node /absolute/private-node --output /absolute/new-output` builds Manager and its UI from an exact Git archive with the frozen npm lockfile. It ignores package lifecycle scripts, prunes development dependencies and checks deployed production imports, including the shared release verifier. Only runtime code, production dependencies, worker scripts, public release-verification resources, UI assets and licenses enter `output/manager`. `component.json` records the Manager revision independently of the photo server revision.
+
+Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manager` with the existing host/ML arguments. Manager code, UI, dependencies and release-verification resources are mandatory in the signed host inventory. An older pack that omits Manager now refuses admission. The previous factory-signed 24-role candidate and its component results remain historical evidence; a new complete candidate/signature and installed qualification are required. This package does not enable native hosting or supply the still-required protected installed supervisor and OS-keystore bootstrap.
+
+
+Native Manager accepts internal bootstrap protocol 2 through a single bounded private stdin record. The desktop TLS identity is generated in Rust and must be persisted through the OS keystore before use; native Manager validates its key, certificate, validity and exact origin. Native mode does not use OpenSSL or write TLS key files. The administration origin must be canonical HTTPS with a literal loopback address and an unprivileged port. Docker Manager retains its existing listener; the photo server has its separate listener.
+
+After the native HTTPS listener binds, Manager writes one JSON line to its private stdout: `protocolVersion: 2`, `state: "ready"`, `installationId`, `manifestSha256`, and `origin`. A supervisor must validate this receipt from its own live child before declaring readiness; a healthy HTTP listener alone is insufficient. Listener failure emits no readiness receipt. The installed supervisor, protected resource authority and actual OS-keystore acceptance are still required before enabling native setup.
+
+
+`VerifiedHostRuntime::manager_programs()` now prepares a native Manager launch authority. It checks every payload file and directory, including empty directories, under root-owned non-writable physical ancestors; macOS rejects extended ACLs through its native ACL API. The complete signed inventory is then revalidated. Windows refuses this native launch authority pending package ACL support. There is no arbitrary executable-path launcher exposed to the webview.
+
+The native `Programs::start` requires a separately protected controller and a previously persisted database password/TLS identity. It sends borrowed bootstrap fields through a bounded private stdin pipe, clears inherited environment and keeps secret bytes zeroized. `NativeManager` owns its child, validates bounded process-specific readiness and scoped HTTPS, and reaps the child after startup failure/cancellation. `shutdown` confirms Manager exit only; host/database quiescence still requires the controller journal/lease proof. The compiled Manager fixture passed this owner with empty PATH; setup, installed package authority, actual keychain persistence and background-role lifecycle remain unfinished.
+
+
+`Programs::start_from_keystore` now loads a configuration-bound database credential and TLS identity through the existing OS-keystore wrapper. The credential account is scoped by installation/configuration, exact runtime manifest and both physical profile-directory identities. Setup holds an OS file lease through bootstrap, and checks the retained directory identities after TLS keystore work. A missing credential against an existing reservation or database requires recovery; locked or failed storage never falls back to plaintext or a new password.
+
+Native profile roots require root-owned, non-writable, ACL-free parents as well as private user-owned leaf directories. These must be provisioned by the installer; ordinary user-writable home/profile parents refuse native hosting. Physical topology checks reuse the existing controller boundary and reject runtime overlap, state/data aliases and links. Only a nonsecret binding hash is written to `.host-profile`. Marker publication is complete before linking; a crash before unlinking its temporary hard link currently requires explicit recovery, which remains a release gate. Callback-backed profile tests do not establish actual OS-keystore or installed setup acceptance.
+
+TLS keystore records use the same complete profile binding as the database credential, under a separate account namespace. The profile lease remains held across TLS persistence and bootstrap. A changed runtime/configuration requires the future managed migration to preserve and rebind both secrets; automatic replacement currently refuses.

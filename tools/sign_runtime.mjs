@@ -44,7 +44,7 @@ async function directory(path) {
   if (!stat.isDirectory() || stat.isSymbolicLink())
     fail("runtime_directory_invalid");
 }
-async function boundedFile(path, max) {
+export async function boundedFile(path, max) {
   const stat = await lstat(path);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > max)
     fail("runtime_file_invalid");
@@ -64,9 +64,10 @@ async function boundedFile(path, max) {
     await handle.close();
   }
 }
-async function verifyPayload(payload, files) {
+export async function verifyPayload(payload, files, maximumFiles = 50000) {
   const names = Object.keys(files);
-  if (!names.length || names.length > 50000) fail("runtime_manifest_invalid");
+  if (!names.length || names.length > maximumFiles)
+    fail("runtime_manifest_invalid");
   const folded = new Set();
   let total = 0;
   for (const name of names) {
@@ -127,7 +128,7 @@ async function verifyPayload(payload, files) {
       fail("runtime_artifact_changed");
   }
 }
-async function releasePolicy(policy) {
+export async function releasePolicy(policy) {
   const trust =
     policy ?? JSON.parse(await boundedFile(fileURLToPath(trustPath), 16384));
   if (
@@ -281,7 +282,7 @@ export async function signCandidate(
     epoch: manifest.epoch,
   };
 }
-async function readSigningKey() {
+export async function readSigningKey() {
   process.stdin.setEncoding("utf8");
   let value = "";
   for await (const part of process.stdin) {

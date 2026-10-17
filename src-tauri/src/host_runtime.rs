@@ -31,11 +31,15 @@ struct EntryPoints {
     raw_decoder: String,
     web_index: String,
     studio: String,
+    studio_browser: String,
+    studio_browser_guard: String,
     core_plugin: String,
     ml_manifest: String,
+    manager: String,
+    manager_web_index: String,
 }
 impl EntryPoints {
-    fn paths(&self) -> [&str; 22] {
+    fn paths(&self) -> [&str; 26] {
         [
             &self.node,
             &self.server,
@@ -57,8 +61,12 @@ impl EntryPoints {
             &self.raw_decoder,
             &self.web_index,
             &self.studio,
+            &self.studio_browser,
+            &self.studio_browser_guard,
             &self.core_plugin,
             &self.ml_manifest,
+            &self.manager,
+            &self.manager_web_index,
         ]
     }
 }
@@ -94,7 +102,7 @@ impl VerifiedHostRuntime {
         minimum_epoch: u64,
     ) -> Result<Self, String> {
         if raw.is_empty()
-            || raw.len() > 8 * 1024 * 1024
+            || raw.len() > 16 * 1024 * 1024
             || !trusted.iter().any(|key| {
                 key.verify_strict(raw, &Signature::from_bytes(signature))
                     .is_ok()
@@ -124,6 +132,12 @@ impl VerifiedHostRuntime {
             return Err("host_manifest_incompatible".into());
         }
         for name in manifest.entry_points.paths().into_iter().chain([
+            "studio/engine-build.json",
+            "studio/guard/studio-browser-guard.mjs",
+            "studio/tools/bundled-worker-fonts.mjs",
+            "studio/tools/render-worker-font-inputs.mjs",
+            "studio/runtime/admission-font.json",
+            "studio/runtime/admission-font.ttf",
             "build/geodata/geodata-date.txt",
             "build/geodata/cities500.txt",
             "build/geodata/admin1CodesASCII.txt",
@@ -131,6 +145,22 @@ impl VerifiedHostRuntime {
             "build/geodata/countryInfo.txt",
             "build/geodata/ne_10m_admin_0_countries.geojson",
             "build/geodata/landmarks.ndjson.gz",
+            "manager/app/release-worker.cjs",
+            "manager/app/media-copy.cjs",
+            "manager/.github/frameleaf-release.cjs",
+            "manager/.github/verify-release-bundle.cjs",
+            "manager/cosign.pub",
+            "manager/component.json",
+            "manager/package.json",
+            "manager/LICENSE",
+            "manager/node_modules/@nestjs/common/package.json",
+            "manager/node_modules/@nestjs/core/package.json",
+            "manager/node_modules/@nestjs/platform-express/package.json",
+            "manager/node_modules/express/package.json",
+            "manager/node_modules/js-yaml/package.json",
+            "manager/node_modules/reflect-metadata/package.json",
+            "manager/node_modules/rxjs/package.json",
+            "manager/node_modules/zod/package.json",
         ]) {
             relative(name)?;
             if !manifest.files.contains_key(name) {
@@ -152,6 +182,16 @@ impl VerifiedHostRuntime {
     }
     pub fn certified(&self) -> bool {
         self.manifest.certified
+    }
+    pub fn manager_programs(&self) -> Result<crate::manager_host::Programs<'_>, String> {
+        let programs = crate::manager_host::Programs {
+            runtime: self,
+            root: self.root.clone(),
+            node: self.root.join(&self.manifest.entry_points.node),
+            main: self.root.join(&self.manifest.entry_points.manager),
+        };
+        programs.check()?;
+        Ok(programs)
     }
     pub fn check_files(&self) -> Result<(), String> {
         verify_files(&self.root, &self.manifest.files)
@@ -427,6 +467,56 @@ impl VerifiedHostRuntime {
     }
 }
 impl HostProcess {
+    /// Only this owned child's exit channel is authoritative; never reconnect to a saved PID.
+    pub fn is_running(&mut self) -> Result<bool, String> {
+        if let Some(result) = &self.stopped {
+            return result.clone().map(|()| false);
+        }
+        match self.exited.try_recv() {
+            Ok(result) => {
+                self.stopped = Some(result.clone());
+                result.map(|()| false)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(true),
+            Err(mpsc::TryRecvError::Disconnected) => Err("host_process_state_failed".into()),
+        }
+    }
+
+    /// An owner disappearing during startup must drain the host without waiting for API readiness.
+    pub fn wait_ready_or_cancel(
+        &mut self,
+        timeout: Duration,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                self.stop()?;
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("host_readiness_timeout".into());
+            }
+            match self
+                .ready
+                .recv_timeout(remaining.min(Duration::from_millis(100)))
+            {
+                Ok(result) => {
+                    result?;
+                    if !self.is_running()? {
+                        return Err("host_process_exited".into());
+                    }
+                    return Ok(true);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("host_readiness_failed".into());
+                }
+            }
+        }
+    }
+
     pub fn process_id(&self) -> u32 {
         self.pid
     }
@@ -456,7 +546,7 @@ impl HostProcess {
         if let Some(mut input) = self.input.take() {
             let _ = input.write_all(b"stop\n");
         }
-        let result = match self.exited.recv_timeout(Duration::from_secs(90)) {
+        let result = match self.exited.recv_timeout(Duration::from_secs(150)) {
             Ok(result) => result,
             Err(_) => {
                 self.owner.terminate();

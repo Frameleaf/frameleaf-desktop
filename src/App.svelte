@@ -5,6 +5,8 @@
   import { workerStatus } from './mode-state';
   import mark from './mark.svg';
   import PhotoSources from './PhotoSources.svelte';
+  import ManagerPanel from './ManagerPanel.svelte';
+  import LocalHost from './LocalHost.svelte';
 
   type Connection = { server: string; name: string; mode: string; state: string; features: { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean } };
   let mode = $state<'client-worker' | 'local-server'>('client-worker');
@@ -14,6 +16,8 @@
   let password = $state('');
   let deviceName = $state('My computer');
   let busy = $state(false);
+  let hostActive = $state(false);
+  let managerRevision = $state(0);
   let notice = $state('');
   let failure = $state('');
   type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: { workload: string; state: string; modelNames: string[]; code: string | null }[] };
@@ -49,6 +53,7 @@
     ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : '');
   const native = isTauri();
   const errors: Record<string, string> = {
+    local_host_active: 'Stop local management before connecting to another server.',
     worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
     server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
     server_address_invalid: 'Enter a valid HTTPS server address.',
@@ -72,6 +77,9 @@
       try {
         unlisten = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
         if (disposed) { unlisten(); return; }
+        const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
+        hostActive = host.backgroundActive;
+        if (hostActive) mode = 'local-server';
         connection = await invoke<Connection | null>('restore_connection');
         setup = await invoke<SetupStatus>('worker_setup_status');
       } catch (error) { failure = explain(error); }
@@ -173,13 +181,13 @@
       <p class="eyebrow">Frameleaf Desktop</p>
       <h1>Make yourself<br />at home.</h1>
       <p class="intro">Keep everything on this computer, or connect to your server and put your computer to work.</p>
-      <fieldset class="modes" disabled={busy}>
+      <fieldset class="modes" disabled={busy || hostActive}>
         <legend>How would you like to use Frameleaf?</legend>
         <label class:selected={mode === 'client-worker'}><input type="radio" bind:group={mode} value="client-worker" /><span><strong>Connect to my server</strong><small>Photos, server management and help with AI processing.</small></span></label>
         <label class:selected={mode === 'local-server'}><input type="radio" bind:group={mode} value="local-server" /><span><strong>Run Frameleaf here</strong><small>Host your photo library on this computer.</small></span></label>
       </fieldset>
       {#if mode === 'local-server'}
-        <section class="message"><h2>Local hosting is being prepared</h2><p>This preview does not include the native server runtime yet. Connect to an existing server to use the desktop client.</p></section>
+        <LocalHost onactive={(active) => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} />
       {:else}
         <form onsubmit={connect}>
           <label for="server">Server address</label><input id="server" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={busy} autocomplete="url" />
@@ -191,5 +199,6 @@
         </form>
       {/if}
     {/if}
+    {#key managerRevision}<ManagerPanel />{/key}
   </main>
 </div>

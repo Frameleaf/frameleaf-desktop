@@ -1,6 +1,13 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "open_local_photos",
+            "authorize_local_manager",
+            "installed_local_hosts",
+            "local_host_status",
+            "prepare_local_host",
+            "cancel_local_host_start",
+            "stop_local_host_manager",
             "connect_server",
             "restore_connection",
             "sign_out",
@@ -16,6 +23,12 @@ fn main() {
             "photo_import_status",
             "prepare_photo_import",
             "control_photo_import",
+            "manager_view",
+            "manager_certificate_fingerprint",
+            "pair_manager",
+            "manager_request",
+            "reauthenticate_manager",
+            "disconnect_manager",
         ]),
     ))
     .expect("build desktop ACL");

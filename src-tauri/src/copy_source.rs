@@ -167,7 +167,7 @@ fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String,
         opened_stamp(&file)
     }
 }
-fn root_identity(dir: &Dir) -> Result<String, String> {
+pub(crate) fn root_identity(dir: &Dir) -> Result<String, String> {
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt;

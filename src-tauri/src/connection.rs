@@ -63,6 +63,13 @@ pub struct DeviceIdentity {
     secret: [u8; 32],
 }
 impl DeviceIdentity {
+    pub fn public_key(&self) -> String {
+        STANDARD.encode(
+            SigningKey::from_bytes(&self.secret)
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
     pub fn sign(&self, message: &str) -> String {
         STANDARD.encode(
             SigningKey::from_bytes(&self.secret)

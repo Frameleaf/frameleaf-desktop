@@ -54,6 +54,10 @@ const environment = {
       ffmpeg: "media-tools/ffmpeg",
       ffprobe: "media-tools/ffprobe",
       node: "node",
+      // RAW component checks do not execute the browser role.
+      studioBrowser: "browser/chrome",
+      studioBrowserGuard: "studio/guard/studio-browser-guard",
+      studio: "studio/tools/bundled-worker.mjs",
       postgres: "pg/bin/postgres",
       rawRenderer: "raw/bin/darktable-cli",
       rawDecoder: "raw/bin/dcraw_emu",

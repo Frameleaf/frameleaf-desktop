@@ -9,6 +9,32 @@ import { createInterface } from "node:readline";
 const fail = (code) => {
   throw new Error(code);
 };
+// Enable only after private Chromium, fonts and installed lifecycle qualification.
+const STUDIO_ENABLED = false;
+// Read only the dedicated child IPC channel; stdout is never readiness evidence.
+export function studioReadyUntil(message, engineDigest, now = Date.now()) {
+  if (!message || message.protocolVersion !== 1)
+    fail("host_studio_protocol_invalid");
+  const keys = Object.keys(message).sort().join(",");
+  if (message.state === "qualifying" && keys === "protocolVersion,state")
+    return 0;
+  const expiry =
+    typeof message.expiresAt === "string" ? Date.parse(message.expiresAt) : NaN;
+  if (
+    keys !== "engineDigest,expiresAt,protocolVersion,state" ||
+    message.state !== "ready" ||
+    typeof engineDigest !== "string" ||
+    !/^[a-f0-9]{40}$/.test(engineDigest) ||
+    message.engineDigest !== engineDigest ||
+    !Number.isFinite(expiry) ||
+    new Date(expiry).toISOString() !== message.expiresAt ||
+    expiry <= now + 10 * 60_000
+  ) {
+    fail("host_studio_protocol_invalid");
+  }
+  // A worker renews ten minutes early; expired readiness must fail closed even if an IPC message is lost.
+  return expiry - 10 * 60_000;
+}
 export function validateConfig(c) {
   if (
     !c ||
@@ -42,6 +68,9 @@ export function validateConfig(c) {
     "ffprobe",
     "rawRenderer",
     "rawDecoder",
+    "studioBrowser",
+    "studioBrowserGuard",
+    "studio",
   ]) {
     const path = c.entryPoints?.[name];
     if (
@@ -113,7 +142,8 @@ export async function claimState(c) {
   }
   if (
     (await fs.readdir(c.state)).some(
-      (name) => !["lease.lock", "agent.log"].includes(name),
+      (name) =>
+        !["lease.lock", "agent.log", "controller-state.json"].includes(name),
     )
   )
     fail("host_state_not_empty");
@@ -150,6 +180,18 @@ async function exited(child, ms) {
 }
 export function hostEnvironment(c) {
   return {
+    FRAMELEAF_STUDIO_WORKER_TRUST_DIR: join(c.state, "studio-trust"),
+    FRAMELEAF_STUDIO_WORKER_WORK_DIR: join(c.state, "studio-work"),
+    FRAMELEAF_STUDIO_CHROMIUM: join(c.runtime, c.entryPoints.studioBrowser),
+    FRAMELEAF_STUDIO_NODE: join(c.runtime, c.entryPoints.node),
+    ...(process.platform === "win32"
+      ? {}
+      : {
+          FRAMELEAF_STUDIO_BROWSER_GUARD: join(
+            c.runtime,
+            c.entryPoints.studioBrowserGuard,
+          ),
+        }),
     FRAMELEAF_RAW_DECODER_PATH: join(c.runtime, c.entryPoints.rawDecoder),
     FFMPEG_PATH: join(c.runtime, c.entryPoints.ffmpeg),
     FFPROBE_PATH: join(c.runtime, c.entryPoints.ffprobe),
@@ -170,6 +212,165 @@ export function hostEnvironment(c) {
       : {}),
   };
 }
+
+/** The child inherits the host process group/Job; Chromium has its separate guardian. */
+export function ownStudioWorker(child, engineDigest) {
+  let readyUntil = 0,
+    deadline = Date.now() + 10 * 60_000;
+  let failure,
+    closed = false,
+    stopping = false,
+    drain;
+  const invalidate = (code) => {
+    readyUntil = 0;
+    failure ??= code;
+  };
+  const message = (value) => {
+    if (stopping || closed || failure) return;
+    try {
+      const until = studioReadyUntil(value, engineDigest);
+      if (until === 0 && readyUntil > 0) deadline = Date.now() + 10 * 60_000;
+      readyUntil = until;
+    } catch {
+      invalidate("host_studio_protocol_invalid");
+    }
+  };
+  const disconnect = () => {
+    if (!stopping) invalidate("host_studio_disconnected");
+  };
+  const error = () => invalidate("host_studio_process_failed");
+  const exit = () => {
+    if (!stopping) invalidate("host_studio_process_exited");
+  };
+  const close = () => {
+    closed = true;
+    readyUntil = 0;
+  };
+  const inputError = () => {
+    if (!stopping) invalidate("host_studio_pipe_failed");
+  };
+  child.on("message", message);
+  child.on("disconnect", disconnect);
+  child.on("error", error);
+  child.on("exit", exit);
+  child.on("close", close);
+  child.stdin?.on("error", inputError);
+  if (!child.stdin) invalidate("host_studio_pipe_failed");
+  const waitClosed = async (ms) => {
+    const until = Date.now() + ms;
+    while (!closed && Date.now() < until) await sleep(50);
+    return closed;
+  };
+  return {
+    check() {
+      if (stopping) return false;
+      if (failure) fail(failure);
+      if (closed || !child.connected) fail("host_studio_disconnected");
+      if (readyUntil && readyUntil <= Date.now()) {
+        readyUntil = 0;
+        deadline = Date.now() + 10 * 60_000;
+      }
+      if (!readyUntil && Date.now() >= deadline) {
+        invalidate("host_studio_not_ready");
+        fail(failure);
+      }
+      return readyUntil > Date.now();
+    },
+    stop() {
+      return (drain ??= (async () => {
+        stopping = true;
+        readyUntil = 0;
+        let forced = false;
+        try {
+          if (!closed && !child.stdin)
+            throw new Error("host_studio_pipe_failed");
+          if (!closed && !child.stdin.destroyed && !child.stdin.writableEnded)
+            child.stdin.end("stop\n");
+        } catch {
+          forced = true;
+          child.kill("SIGKILL");
+        }
+        if (!(await waitClosed(forced ? 5000 : 35_000))) {
+          forced = true;
+          child.kill("SIGKILL");
+          if (!(await waitClosed(5000))) fail("host_studio_shutdown_failed");
+        }
+        child.removeListener("message", message);
+        child.removeListener("disconnect", disconnect);
+        child.removeListener("exit", exit);
+        child.removeListener("close", close);
+        if (forced || child.exitCode !== 0) fail("host_studio_drain_failed");
+      })());
+    },
+  };
+}
+
+/** The server acknowledges ownership before API readiness; the channel never carries credentials. */
+export function ownHostServer(child) {
+  let acknowledged = false,
+    closed = false,
+    stopping = false,
+    failure,
+    drain;
+  const message = (value) => {
+    if (stopping) return;
+    if (value === "frameleaf:owner-ready:v1") acknowledged = true;
+    else failure ??= "host_server_protocol_invalid";
+  };
+  const disconnected = () => {
+    if (!stopping) failure ??= "host_server_disconnected";
+  };
+  const error = () => {
+    failure ??= "host_server_process_failed";
+  };
+  child.on("message", message);
+  child.on("disconnect", disconnected);
+  child.on("error", error);
+  child.once("close", () => {
+    closed = true;
+    acknowledged = false;
+  });
+  const waitClosed = async (ms) => {
+    const until = Date.now() + ms;
+    while (!closed && Date.now() < until) await sleep(50);
+    return closed;
+  };
+  return {
+    check() {
+      if (stopping) return false;
+      if (failure) fail(failure);
+      if (closed || !child.connected) fail("host_server_disconnected");
+      return acknowledged;
+    },
+    stop() {
+      return (drain ??= (async () => {
+        stopping = true;
+        acknowledged = false;
+        let controlFailed = false;
+        if (!closed) {
+          try {
+            if (child.connected)
+              child.send("frameleaf:stop", (error) => {
+                if (error) controlFailed = true;
+              });
+          } catch {
+            controlFailed = true;
+          }
+        }
+        if (!(await waitClosed(40_000))) {
+          controlFailed = true;
+          child.kill("SIGKILL");
+          if (!(await waitClosed(5000))) fail("host_server_shutdown_failed");
+        }
+        child.removeListener("message", message);
+        child.removeListener("disconnect", disconnected);
+        if (controlFailed || child.exitCode !== 0)
+          fail("host_server_drain_failed");
+      })());
+    },
+  };
+}
+
 export async function runHost(c, stopping, ready) {
   validateConfig(c);
   await portFree(c.apiPort);
@@ -184,7 +385,7 @@ export async function runHost(c, stopping, ready) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  for (const name of ["home", "media"]) {
+  for (const name of ["home", "media", "studio-trust", "studio-work"]) {
     const path = join(c.state, name);
     try {
       await fs.mkdir(path, { mode: 0o700 });
@@ -218,17 +419,17 @@ export async function runHost(c, stopping, ready) {
       constants.O_NOFOLLOW,
     0o600,
   );
-  let pg, app;
+  let pg, app, appOwner, studio;
   const children = new Set();
   let cancelled = false;
   stopping.then(() => {
     cancelled = true;
   });
-  function launch(args, extra = {}) {
+  function launch(args, extra = {}, stdio = ["ignore", "pipe", "pipe"]) {
     const child = spawn(args[0], args.slice(1), {
       cwd: c.state,
       env: { ...env, ...extra },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio,
       windowsHide: true,
     });
     children.add(child);
@@ -370,20 +571,26 @@ export async function runHost(c, stopping, ready) {
         ],
         { PGPASSWORD: c.password },
       );
-    app = launch([executable("node"), executable("server")], {
-      DB_HOSTNAME: "127.0.0.1",
-      DB_PORT: String(c.databasePort),
-      DB_USERNAME: "frameleaf",
-      DB_PASSWORD: c.password,
-      DB_DATABASE_NAME: "frameleaf",
-      FRAMELEAF_HOST: "127.0.0.1",
-      FRAMELEAF_PORT: String(c.apiPort),
-      FRAMELEAF_MEDIA_LOCATION: join(c.state, "media"),
-      FRAMELEAF_BUILD_DATA: join(c.runtime, "build"),
-      FRAMELEAF_HDR_BINDING: executable("hdr"),
-      FRAMELEAF_WORKERS_INCLUDE: "api,microservices",
-      FRAMELEAF_STUDIO_WORKER: "false",
-    });
+    app = launch(
+      [executable("node"), executable("server")],
+      {
+        DB_HOSTNAME: "127.0.0.1",
+        DB_PORT: String(c.databasePort),
+        DB_USERNAME: "frameleaf",
+        DB_PASSWORD: c.password,
+        DB_DATABASE_NAME: "frameleaf",
+        FRAMELEAF_HOST: "127.0.0.1",
+        FRAMELEAF_PORT: String(c.apiPort),
+        FRAMELEAF_MEDIA_LOCATION: join(c.state, "media"),
+        FRAMELEAF_BUILD_DATA: join(c.runtime, "build"),
+        FRAMELEAF_HDR_BINDING: executable("hdr"),
+        FRAMELEAF_WORKERS_INCLUDE: "api,microservices",
+        FRAMELEAF_NATIVE_OWNER: "1",
+        FRAMELEAF_STUDIO_WORKER: STUDIO_ENABLED ? "true" : "false",
+      },
+      ["ignore", "pipe", "pipe", "ipc"],
+    );
+    appOwner = ownHostServer(app);
     let markers = "",
       api = false,
       microservices = false;
@@ -407,7 +614,7 @@ export async function runHost(c, stopping, ready) {
         Date.now() > startupDeadline
       )
         fail("host_application_not_ready");
-      if (api && microservices) {
+      if (appOwner.check() && api && microservices) {
         try {
           const response = await fetch(
             `http://127.0.0.1:${c.apiPort}/api/server/ping`,
@@ -420,17 +627,45 @@ export async function runHost(c, stopping, ready) {
       }
       await sleep(100);
     }
+    if (STUDIO_ENABLED && !cancelled) {
+      const build = JSON.parse(
+        await stateFile(join(c.runtime, "studio/engine-build.json"), 65536),
+      );
+      if (
+        typeof build.upstreamCommit !== "string" ||
+        !/^[a-f0-9]{40}$/.test(build.upstreamCommit)
+      )
+        fail("host_studio_engine_invalid");
+      studio = ownStudioWorker(
+        launch(
+          [executable("node"), executable("studio"), "--owner-pipe"],
+          {
+            FRAMELEAF_STUDIO_WORKER: "true",
+            FRAMELEAF_STUDIO_WORKER_SERVER_URL: `http://127.0.0.1:${c.apiPort}`,
+          },
+          ["pipe", "pipe", "pipe", "ipc"],
+        ),
+        build.upstreamCommit,
+      );
+    }
     ready();
     while (!cancelled) {
       if ((await exited(app, 100)) || (await exited(pg, 100)))
         fail("host_process_exited");
+      appOwner.check();
+      studio?.check();
     }
   } finally {
-    if (app && !(await exited(app, 0))) {
-      // shortcut: Windows SIGTERM is forceful; require a tested native drain channel before Windows host release.
-      app.kill("SIGTERM");
-      if (!(await exited(app, 40_000))) app.kill("SIGKILL");
-      await exited(app, 5000);
+    let stopError;
+    try {
+      await studio?.stop();
+    } catch (error) {
+      stopError = error;
+    }
+    try {
+      await appOwner?.stop();
+    } catch (error) {
+      stopError ??= error;
     }
     if (pg && !(await exited(pg, 0))) {
       let pid;
@@ -469,6 +704,7 @@ export async function runHost(c, stopping, ready) {
         await exited(child, 5000);
       }
     await log.close();
+    if (stopError) throw stopError;
   }
 }
 async function main() {

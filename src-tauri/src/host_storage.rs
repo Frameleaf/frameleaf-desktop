@@ -29,6 +29,13 @@ fn admit(volume: &Volume) -> Result<(), String> {
 }
 
 pub(crate) fn check(path: &Path) -> Result<(), String> {
+    let directory = directory(path)?;
+    cloud_storage_check(path, &directory)?;
+    admit(&inspect(&directory)?)
+}
+
+/// Open the physical directory without following links; inspection does not require startup headroom.
+pub(crate) fn directory(path: &Path) -> Result<std::fs::File, String> {
     crate::native_runtime::absolute_directory(path)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -45,8 +52,97 @@ pub(crate) fn check(path: &Path) -> Result<(), String> {
         };
         options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let directory = options.open(path).map_err(|_| "host_storage_unavailable")?;
-    admit(&inspect(&directory)?)
+    options
+        .open(path)
+        .map_err(|_| "host_storage_unavailable".into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_provider_path(path: &Path) -> bool {
+    let parts: Vec<_> = path.components().collect();
+    parts.windows(2).any(|pair| {
+        pair[0].as_os_str().eq_ignore_ascii_case("Library")
+            && (pair[1].as_os_str().eq_ignore_ascii_case("CloudStorage")
+                || pair[1].as_os_str().eq_ignore_ascii_case("Mobile Documents"))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn windows_sync_result(result: i32) -> Result<(), String> {
+    match result as u32 {
+        0 => Err("host_database_cloud_storage_forbidden".into()),
+        // HRESULT_FROM_WIN32: NOT_A_CLOUD_FILE, CLOUD_FILE_NOT_UNDER_SYNC_ROOT, NOT_A_CLOUD_SYNC_ROOT.
+        0x80070178 | 0x80070186 | 0x80070195 => Ok(()),
+        _ => Err("host_database_cloud_state_unknown".into()),
+    }
+}
+
+#[cfg(windows)]
+fn cloud_storage_check(_path: &Path, directory: &std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CfGetSyncRootInfoByHandle, CF_SYNC_ROOT_BASIC_INFO, CF_SYNC_ROOT_INFO_BASIC,
+    };
+    let mut info = CF_SYNC_ROOT_BASIC_INFO::default();
+    windows_sync_result(unsafe {
+        CfGetSyncRootInfoByHandle(
+            directory.as_raw_handle(),
+            CF_SYNC_ROOT_INFO_BASIC,
+            (&mut info as *mut CF_SYNC_ROOT_BASIC_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+            std::ptr::null_mut(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn cloud_storage_check(path: &Path, _directory: &std::fs::File) -> Result<(), String> {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFType, TCFType},
+        boolean::CFBoolean,
+        dictionary::CFDictionary,
+        string::CFString,
+        url::{kCFURLIsUbiquitousItemKey, CFURLCopyResourcePropertiesForKeys, CFURL},
+    };
+    // shortcut: legacy sync roots outside iCloud/standard File Provider paths need qualification before enabling setup.
+    if mac_provider_path(path) {
+        return Err("host_database_cloud_storage_forbidden".into());
+    }
+    // Check ancestors too: an existing empty subdirectory may not have its own iCloud metadata yet.
+    for ancestor in path.ancestors() {
+        let url = CFURL::from_path(ancestor, true).ok_or("host_database_cloud_state_unknown")?;
+        let key = unsafe { CFString::wrap_under_get_rule(kCFURLIsUbiquitousItemKey) };
+        let keys = CFArray::from_CFTypes(std::slice::from_ref(&key));
+        let raw = unsafe {
+            CFURLCopyResourcePropertiesForKeys(
+                url.as_concrete_TypeRef(),
+                keys.as_concrete_TypeRef(),
+                std::ptr::null_mut(),
+            )
+        };
+        if raw.is_null() {
+            return Err("host_database_cloud_state_unknown".into());
+        }
+        let properties: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_create_rule(raw) };
+        // Core Foundation omits unavailable keys without an error on ordinary local directories.
+        if let Some(value) = properties.find(&key) {
+            let value = value
+                .downcast::<CFBoolean>()
+                .ok_or("host_database_cloud_state_unknown")?;
+            if bool::from(value) {
+                return Err("host_database_cloud_storage_forbidden".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cloud_storage_check(_path: &Path, _directory: &std::fs::File) -> Result<(), String> {
+    // shortcut: local user-space sync has no generic Linux registry; qualify the fixed app-state root before enabling setup.
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -164,6 +260,62 @@ fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_provider_roots_are_refused_even_when_fully_downloaded() {
+        for path in [
+            "/Users/example/Library/CloudStorage/OneDrive-Personal/Frameleaf",
+            "/Users/example/Library/Mobile Documents/com~apple~CloudDocs/Frameleaf",
+            "/Volumes/External/library/cloudstorage/Provider/database",
+        ] {
+            assert!(mac_provider_path(Path::new(path)));
+        }
+        for path in [
+            "/Users/example/Library/Application Support/Frameleaf",
+            "/Volumes/CloudStorage/Frameleaf",
+            "/Users/example/Library/CloudStorage-old/Frameleaf",
+        ] {
+            assert!(!mac_provider_path(Path::new(path)));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn database_storage_refuses_a_local_directory_under_a_provider_root() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-cloud-storage-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let mut provider = root.clone();
+        for part in ["Library", "CloudStorage", "FixtureProvider", "Frameleaf"] {
+            provider.push(part);
+            crate::runtime_store::private_directory(&provider).unwrap();
+        }
+        assert_eq!(
+            check(&provider).unwrap_err(),
+            "host_database_cloud_storage_forbidden"
+        );
+        assert!(std::fs::read_dir(&provider).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_sync_root_probe_refuses_membership_and_unexpected_errors() {
+        assert_eq!(
+            windows_sync_result(0).unwrap_err(),
+            "host_database_cloud_storage_forbidden"
+        );
+        for code in [376, 390, 405] {
+            assert!(windows_sync_result((0x80070000u32 | code) as i32).is_ok());
+        }
+        for result in [0x80070005u32 as i32, 0x80070002u32 as i32, -1, 1] {
+            assert_eq!(
+                windows_sync_result(result).unwrap_err(),
+                "host_database_cloud_state_unknown"
+            );
+        }
+    }
 
     #[test]
     fn database_storage_refuses_network_readonly_unknown_and_low_capacity() {

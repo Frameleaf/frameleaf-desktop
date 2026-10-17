@@ -71,6 +71,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     work = output / "work"
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
+    env["RAYON_NUM_THREADS"] = "1"
+    env["TOKIO_WORKER_THREADS"] = "1"
+    env["UV_THREADPOOL_SIZE"] = "1"
     env["PATH"] = os.pathsep.join(
         [str(node.parent), str(Path(pnpm).parent), os.defpath]
     )
