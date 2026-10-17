@@ -440,3 +440,27 @@ installed Windows/Linux volume behavior remains unqualified.
 Real macOS controller fixtures passed fresh setup, restart and recovery after `initdb` but before application-database creation, using PostgreSQL 19 beta 4, pgvector 0.8.7 and all 38 application migrations. Wrong database passwords were rejected. Those developer fixtures link external development artifacts; they do not prove a complete signed or portable host bundle. A separate Rust test uses synthetic components to exercise the owner, output pipe, restart and forced-agent-crash paths.
 
 Local hosting remains unavailable in the setup UI. A complete private dependency bundle, local-filesystem qualification, OS credential-store setup, Manager operations/recovery and installed platform acceptance are still required. Studio/edge/full media processing are not qualified by startup alone. Windows needs a graceful application drain channel before host release; the current controller's Windows stop is forceful. No database upgrade or restore is enabled by this controller.
+
+### macOS native component relocation
+
+`python3 tools/relocate_macos.py --entries /absolute/path/to/entries.json --output /absolute/path/to/new-payload`
+copies an explicitly selected thin Mach-O graph into a new private directory.
+The entries JSON maps payload-relative filenames to absolute component binaries.
+The tool resolves local and inherited search paths, refuses missing or ambiguous
+dependencies, rewrites non-Apple dependencies to private loader-relative paths,
+removes build search paths and audits the result. Different loader contexts keep
+separate copies even when the input library bytes match. Sources remain unchanged;
+existing output and reserved metadata/library destinations are refused.
+
+The receipt records original and relocated SHA-256 values. Local ad-hoc signatures
+allow qualification after rewriting; they are separate from release identity
+signing and notarization. The receipt remains `redistributable: false` and does
+not certify every runtime `dlopen` or plugin/resource requirement.
+
+The macOS ARM64 candidate closed 144 Node/PostgreSQL/HDR objects. A moved payload
+passed Node 26.11.1, PostgreSQL 19 beta 4/pgvector 0.8.7 fresh/restore/restart,
+all six baseline extensions and physical checksums. Private Node/HDR passed all
+38 HDR fixtures. Loaded-image traces for those fixtures contained only private
+payload or Apple system images. PostgreSQL's native build reserves linker-header
+space for relocation. This does not qualify the complete server, RAW/Studio,
+Windows/Linux dependency closure, release signing or installed-device acceptance.

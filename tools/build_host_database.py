@@ -91,6 +91,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     work, prefix = output / "work", output / "prefix"
     work.mkdir(mode=0o700)
     env = build_environment(work, {})
+    env["LDFLAGS"] = "-Wl,-headerpad_max_install_names"
     env["PATH"] = os.pathsep.join(
         [
             str(prefix / "bin"),
@@ -124,6 +125,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
         "pins": lock,
         "redistributable": False,
         "developmentDependencyPrefix": str(dependencies),
+        "linkerFlags": env["LDFLAGS"],
         "qualification": "failed",
     }
     with (output / "build.log").open("w") as log:
