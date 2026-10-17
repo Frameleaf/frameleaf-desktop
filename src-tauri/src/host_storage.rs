@@ -312,7 +312,13 @@ mod tests {
         for code in [376, 390, 405] {
             assert!(windows_sync_result((0x80070000u32 | code) as i32).is_ok());
         }
-        for result in [0x80070005u32 as i32, 0x80070002u32 as i32, -1, 1] {
+        for result in [
+            0x80070001u32 as i32,
+            0x80070005u32 as i32,
+            0x80070002u32 as i32,
+            -1,
+            1,
+        ] {
             assert_eq!(
                 windows_sync_result(result).unwrap_err(),
                 "host_database_cloud_state_unknown"
@@ -392,13 +398,13 @@ mod tests {
         crate::runtime_store::private_directory(&root).unwrap();
         let outcome = check(&root);
         std::fs::remove_dir(&root).unwrap();
-        // /tmp may be tmpfs/overlay or short of space: successful probing can correctly refuse it.
+        // CI temp storage may be unsupported, short of space, or lack a working Windows cloud probe.
         if let Err(code) = outcome {
             assert!(
                 matches!(
                     code.as_str(),
                     "host_database_volume_unsupported" | "host_database_space_insufficient"
-                ),
+                ) || (cfg!(windows) && code == "host_database_cloud_state_unknown"),
                 "{code}"
             );
         }

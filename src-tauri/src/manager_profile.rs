@@ -243,8 +243,14 @@ fn publish_marker(data: &cap_std::fs::Dir, temp: &str) -> Result<(), String> {
     {
         use cap_std::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileRenameInfo, SetFileInformationByHandle, DELETE, FILE_GENERIC_READ, FILE_RENAME_INFO,
+        use windows_sys::{
+            Wdk::Storage::FileSystem::{
+                FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+            },
+            Win32::{
+                Storage::FileSystem::{DELETE, FILE_GENERIC_READ},
+                System::IO::IO_STATUS_BLOCK,
+            },
         };
         let mut options = crate::host_state::options(false);
         options.access_mode(DELETE | FILE_GENERIC_READ);
@@ -254,9 +260,11 @@ fn publish_marker(data: &cap_std::fs::Dir, temp: &str) -> Result<(), String> {
             .into_std();
         crate::host_state::valid_file(&source).map_err(|_| "native_profile_binding_changed")?;
         let name: Vec<u16> = ".host-profile\0".encode_utf16().collect();
-        let size = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
+        let size = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * 2;
         let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status = IO_STATUS_BLOCK::default();
+        // Use the native relative-handle operation; never resolve the target through a mutable path.
         let result = unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = data.as_raw_handle();
@@ -266,19 +274,17 @@ fn publish_marker(data: &cap_std::fs::Dir, temp: &str) -> Result<(), String> {
                 std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
                 name.len(),
             );
-            SetFileInformationByHandle(
+            NtSetInformationFile(
                 source.as_raw_handle(),
-                FileRenameInfo,
+                &mut status,
                 info.cast(),
                 size as u32,
+                FileRenameInformation,
             )
         };
-        if result == 0 {
+        if result != 0 {
             #[cfg(test)]
-            eprintln!(
-                "native marker publication OS error: {:?}",
-                std::io::Error::last_os_error().raw_os_error()
-            );
+            eprintln!("native marker publication NTSTATUS: {result:#010x}");
             return Err("native_profile_binding_changed".into());
         }
         Ok(())
@@ -546,6 +552,31 @@ mod tests {
         std::fs::create_dir(&f.1.state).unwrap();
         assert!(profile.require_current(&f.1).is_err());
     }
+    #[cfg(windows)]
+    #[test]
+    fn marker_publication_stays_with_the_held_directory_after_path_replacement() {
+        let f = Fixture::new();
+        crate::runtime_store::private_directory(&f.1.data).unwrap();
+        let dir =
+            cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&f.1.data).unwrap());
+        let mut file = dir
+            .open_with(".first.tmp", &crate::host_state::options(true))
+            .unwrap();
+        file.write_all(b"held directory").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let moved = f.0.join("moved-manager");
+        std::fs::rename(&f.1.data, &moved).unwrap();
+        std::fs::create_dir(&f.1.data).unwrap();
+        publish_marker(&dir, ".first.tmp").unwrap();
+        assert_eq!(
+            std::fs::read(moved.join(".host-profile")).unwrap(),
+            b"held directory"
+        );
+        assert!(!f.1.data.join(".host-profile").exists());
+        assert!(!moved.join(".first.tmp").exists());
+    }
+
     #[test]
     fn marker_publication_moves_single_link_and_never_overwrites_existing_reservation() {
         let f = Fixture::new();
