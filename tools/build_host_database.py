@@ -75,7 +75,8 @@ def download(url: str, destination: Path, expected: str) -> None:
 
 
 def build(source: Path, revision: str, dependencies: Path, output: Path) -> None:
-    if platform.system() != "Darwin":
+    system = platform.system()
+    if system not in {"Darwin", "Linux"}:
         raise BuildError("host_database_feasibility_target_unsupported")
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or not all(
         path.is_absolute() for path in [source, dependencies, output]
@@ -91,7 +92,12 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     work, prefix = output / "work", output / "prefix"
     work.mkdir(mode=0o700)
     env = build_environment(work, {})
-    env["LDFLAGS"] = "-Wl,-headerpad_max_install_names"
+    env["LDFLAGS"] = "-Wl,-headerpad_max_install_names" if system == "Darwin" else ""
+    include_paths = [dependencies / "include"]
+    library_paths = [dependencies / "lib"]
+    if system == "Darwin":
+        include_paths.insert(0, dependencies / "opt/openssl@3/include")
+        library_paths.insert(0, dependencies / "opt/openssl@3/lib")
     env["PATH"] = os.pathsep.join(
         [
             str(prefix / "bin"),
@@ -121,7 +127,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
         "sourceDockerfileSha256": __import__("hashlib")
         .sha256(dockerfile.encode())
         .hexdigest(),
-        "platform": f"macos-{platform.machine()}",
+        "platform": f"{'macos' if system == 'Darwin' else 'linux'}-{platform.machine()}",
         "pins": lock,
         "redistributable": False,
         "developmentDependencyPrefix": str(dependencies),
@@ -165,25 +171,29 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "--with-icu",
                     "--with-openssl",
                     "--with-uuid=e2fs",
-                    f"--with-includes={dependencies / 'opt/openssl@3/include'}:{dependencies / 'include'}",
-                    f"--with-libraries={dependencies / 'opt/openssl@3/lib'}:{dependencies / 'lib'}",
+                    "--with-includes=" + ":".join(map(str, include_paths)),
+                    "--with-libraries=" + ":".join(map(str, library_paths)),
                     "--with-lz4",
                     "--with-zstd",
                     "--with-libxml",
                 ],
                 postgres,
             )
-            command([make, "-j4", "world-bin"], postgres)
+            command([make, "-j1", "world-bin"], postgres)
             command([make, "install-world-bin"], postgres)
             vector = work / "vector" / f"pgvector-{lock['pgvectorVersion']}"
             command(
-                [make, "-j4", f"PG_CONFIG={prefix / 'bin/pg_config'}", "OPTFLAGS="],
+                [make, "-j1", f"PG_CONFIG={prefix / 'bin/pg_config'}", "OPTFLAGS="],
                 vector,
             )
             command([make, f"PG_CONFIG={prefix / 'bin/pg_config'}", "install"], vector)
             report["postgresSha256"] = sha256(prefix / "bin/postgres")
             report["pgDumpSha256"] = sha256(prefix / "bin/pg_dump")
-            report["pgvectorSha256"] = sha256(prefix / "lib/postgresql/vector.dylib")
+            report["pgvectorSha256"] = sha256(
+                prefix
+                / "lib/postgresql"
+                / ("vector.dylib" if system == "Darwin" else "vector.so")
+            )
             data = output / "fixture-data"
             command(
                 [

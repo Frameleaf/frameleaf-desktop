@@ -6,10 +6,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from build_host_database import BuildError, database_contract, download
+from build_host_database import BuildError, build, database_contract, download
 
 
 class HostDatabaseTests(unittest.TestCase):
+    def test_linux_and_macos_validate_source_before_creating_build_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for system in ["Linux", "Darwin"]:
+                output = root / system
+                with (
+                    self.subTest(system=system),
+                    patch("build_host_database.platform.system", return_value=system),
+                    self.assertRaisesRegex(BuildError, "host_database_source_invalid"),
+                ):
+                    build(root, "untrusted-branch-name", root, output)
+                self.assertFalse(output.exists())
+
     def test_archives_are_refused_before_extraction_when_bytes_do_not_match_the_pin(
         self,
     ):
