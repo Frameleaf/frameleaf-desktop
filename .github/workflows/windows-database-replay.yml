@@ -1,0 +1,90 @@
+name: Private Windows database fixture replay
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-database-replay.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-database-replay-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  replay:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Replay the exact retained component with private loader diagnostics
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          from pathlib import Path, PurePosixPath
+          import hashlib, json, os, stat, subprocess, sys, zipfile
+          sys.path.insert(0, str(Path.cwd() / 'tools'))
+          from build_runtime import build_environment
+          from build_host_database_windows import qualify
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-database-replay'
+          output.mkdir()
+          archive = output / 'input.zip'
+          with archive.open('wb') as stream:
+              subprocess.run(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/actions/artifacts/12113911730/zip'], stdout=stream, check=True)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          assert digest == '9956f2acc4ef96c1602ad8dfdbf3c6934121805a0da07873121dc6225e010c29', 'artifact digest mismatch'
+          with zipfile.ZipFile(archive) as bundle:
+              inputs = [item for item in bundle.infolist() if item.filename.startswith('postgres/')]
+              assert inputs and len(inputs) < 20000 and sum(item.file_size for item in inputs) < 1024**3
+              for item in inputs:
+                  path = PurePosixPath(item.filename)
+                  assert not path.is_absolute() and '..' not in path.parts and '\\' not in item.filename
+                  assert not stat.S_ISLNK(item.external_attr >> 16)
+                  bundle.extract(item, output)
+              receipt = json.loads(bundle.read('qualification.json'))
+          lock = json.loads(Path('runtime/host-database.json').read_text())
+          assert receipt['pins'] == lock and receipt['sourceRevision'] == '947568067639827de73e2de7260103df697c7f51'
+          assert receipt['platform'] == 'windows-x86_64' and receipt['redistributable'] is False
+          prefix = output / 'postgres'
+          env = build_environment(output, os.environ)
+          env['PATH'] = str(prefix / 'bin') + os.pathsep + env['PATH']
+          env['FRAMELEAF_BUILD_ERROR_LOG'] = str(output / 'command-error.log')
+          report = {'qualification': 'failed', 'inputArtifactId': 12113911730, 'inputSha256': digest,
+                    'componentBuildHead': '977b29337d5d9be92c827730cd66fa57053d82ae',
+                    'sourceRevision': receipt['sourceRevision'], 'redistributable': False,
+                    'installedPlatformQualified': False, 'dlls': [], 'entrypoints': []}
+          probe = 'import ctypes,sys; ctypes.WinDLL(sys.argv[1], winmode=0x1100)'
+          try:
+              dlls = sorted((prefix / 'bin').glob('*.dll'))
+              assert 0 < len(dlls) < 512
+              for binary in dlls:
+                  result = subprocess.run([sys.executable, '-c', probe, str(binary)], env=env,
+                                          cwd=output, capture_output=True, text=True, timeout=15)
+                  report['dlls'].append({'name': binary.name, 'exitCode': result.returncode, 'error': result.stderr})
+                  (output / 'loader-report.json').write_text(json.dumps(report, indent=2))
+              for name in ['initdb', 'postgres', 'psql']:
+                  result = subprocess.run([str(prefix / 'bin' / (name + '.exe')), '--version'], env=env,
+                                          cwd=output, capture_output=True, text=True, timeout=15)
+                  report['entrypoints'].append({'name': name, 'exitCode': result.returncode,
+                                                'stdout': result.stdout, 'stderr': result.stderr})
+              (output / 'loader-report.json').write_text(json.dumps(report, indent=2))
+              report['fixture'] = qualify(prefix, output, lock, env)
+              report['qualification'] = 'passed'
+          finally:
+              (output / 'loader-report.json').write_text(json.dumps(report, indent=2))
+      - name: Retain bounded private diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-database-replay
+          path: |
+            ${{ runner.temp }}/fl-database-replay/loader-report.json
+            ${{ runner.temp }}/fl-database-replay/command-error.log
+            ${{ runner.temp }}/fl-database-replay/postgres.log
+          retention-days: 7
+          if-no-files-found: warn
