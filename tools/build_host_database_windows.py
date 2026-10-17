@@ -113,8 +113,16 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
             raise BuildError("host_database_major_mismatch")
         # Mark owned state before launch so a readiness failure is also drained.
         active = True
-        command([binary("pg_ctl"), "-D", data, "-l", output / "postgres.log", "-o",
-                 f"-h 127.0.0.1 -p {port}", "-w", "-t", "30", "start"])
+        # Windows pg_ctl's detached CMD child inherits captured pipes and prevents EOF.
+        with (output / "pg-ctl-start.log").open("w", encoding="utf-8") as log:
+            result = subprocess.run(
+                [binary("pg_ctl"), "-D", data, "-l", output / "postgres.log", "-o",
+                 f"-h 127.0.0.1 -p {port}", "-w", "-t", "30", "start"],
+                cwd=output, env=client_env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, timeout=45,
+            )
+        if result.returncode:
+            raise BuildError(f"host_database_start_failed:{result.returncode}")
 
     def stop() -> None:
         nonlocal active

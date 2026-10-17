@@ -86,5 +86,6 @@ jobs:
             ${{ runner.temp }}/fl-database-replay/loader-report.json
             ${{ runner.temp }}/fl-database-replay/command-error.log
             ${{ runner.temp }}/fl-database-replay/postgres.log
+            ${{ runner.temp }}/fl-database-replay/pg-ctl-start.log
           retention-days: 7
           if-no-files-found: warn
