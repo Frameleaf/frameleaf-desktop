@@ -32,7 +32,7 @@ class NativeRawContractTests(unittest.TestCase):
             for name in ['darktable/LICENSE', 'darktable/src/external/rawspeed/LICENSE',
                          'darktable/src/external/whereami/LICENSE.MIT', 'darktable/src/external/OpenCL/LICENSE',
                          'lensfun/docs/lgpl-3.0.txt', 'lensfun/docs/cc-by-sa-3.0.txt',
-                         'libraw/LICENSE.LGPL', 'libraw/LICENSE.CDDL']:
+                         'libraw/LICENSE.LGPL', 'libraw/LICENSE.CDDL', 'lensfun/include/regex/regex.h']:
                 path = work / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture notice')
@@ -56,6 +56,7 @@ class NativeRawContractTests(unittest.TestCase):
             self.assertIn('share/lensfun/data', report['files'])
             self.assertIn('licenses-toolchain/fixture/LICENSE', report['files'])
             self.assertIn('licenses/darktable-LICENSE', report['files'])
+            self.assertIn('licenses/lensfun-tre-regex.h', report['files'])
 
     def test_windows_enters_the_pinned_builder(self):
         with (

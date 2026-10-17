@@ -6,6 +6,10 @@ on:
       - 'tools/test_build_host_raw.py'
       - 'tools/relocate_windows.py'
       - 'tools/test_relocate_windows.py'
+      - 'tools/bind_host_raw.py'
+      - 'tools/test_bind_host_raw.py'
+      - 'tools/qualify_host_raw.mjs'
+      - 'runtime/host-agent.mjs'
       - 'tools/build_runtime.py'
       - 'tools/build_host_server.py'
       - 'tools/build_host_database_windows.py'
@@ -31,12 +35,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: ca9db753e3d8557e6a26e712d83012505eb113b5
+          ref: 0b733d7d43d20232dad0fe1a2c5134307abc5be2
+          fetch-depth: 2
           path: server-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
       - name: Check RAW source and PE staging guards
         shell: pwsh
         run: |
@@ -44,6 +52,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'PE staging tests failed' }
           python -m unittest discover -s tools -p test_build_host_raw.py -v
           if ($LASTEXITCODE) { throw 'RAW source staging tests failed' }
+          python -m unittest discover -s tools -p test_bind_host_raw.py -v
+          if ($LASTEXITCODE) { throw 'RAW binding tests failed' }
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
         id: msys2
         with:
@@ -84,6 +94,23 @@ jobs:
         run: |
           python tools/build_host_raw.py --source "$env:GITHUB_WORKSPACE/server-source" --revision ca9db753e3d8557e6a26e712d83012505eb113b5 --dependency-prefix "$env:MSYS2_LOCATION/ucrt64" --output "$env:RUNNER_TEMP/fl-windows-raw"
           if ($LASTEXITCODE) { throw 'Native Windows RAW component qualification failed' }
+      - name: Compile and verify the source-matched server consumer
+        shell: pwsh
+        run: |
+          $package = Get-Content server-source/package.json -Raw | ConvertFrom-Json
+          if ($package.packageManager -ne 'pnpm@12.11.2') { throw 'Source package manager mismatch' }
+          npm install --global pnpm@12.11.2
+          if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
+          $node = (Get-Command node).Source
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 0b733d7d43d20232dad0fe1a2c5134307abc5be2 --node $node --output "$env:RUNNER_TEMP/fl-raw-server"
+          if ($LASTEXITCODE) { throw 'RAW server consumer qualification failed' }
+      - name: Bind and qualify actual production RAW consumers
+        shell: pwsh
+        run: |
+          python tools/bind_host_raw.py --source "$env:GITHUB_WORKSPACE/server-source" --server "$env:RUNNER_TEMP/fl-raw-server" --raw "$env:RUNNER_TEMP/fl-windows-raw" --output "$env:RUNNER_TEMP/fl-raw-runtime"
+          if ($LASTEXITCODE) { throw 'RAW consumer binding failed' }
+          node tools/qualify_host_raw.mjs "$env:RUNNER_TEMP/fl-raw-runtime" "$env:RUNNER_TEMP/fl-windows-raw" | Tee-Object -FilePath "$env:RUNNER_TEMP/fl-raw-runtime/raw-qualification.json"
+          if ($LASTEXITCODE) { throw 'Production RAW rendering qualification failed' }
       - name: Retain private RAW component and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -95,5 +122,9 @@ jobs:
             ${{ runner.temp }}/fl-windows-raw/build.log
             ${{ runner.temp }}/fl-windows-raw/command-error.log
             ${{ runner.temp }}/fl-raw-toolchain.txt
+            ${{ runner.temp }}/fl-raw-server/qualification.json
+            ${{ runner.temp }}/fl-raw-server/build.log
+            ${{ runner.temp }}/fl-raw-server/command-error.log
+            ${{ runner.temp }}/fl-raw-runtime/
           retention-days: 7
           if-no-files-found: warn

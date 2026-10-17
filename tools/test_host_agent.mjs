@@ -115,6 +115,7 @@ test("host configuration rejects shared ports, unbounded secrets and relative pa
 test("host media commands use private binaries without inheriting the caller environment", () => {
   const cfg = config("/private/state");
   const env = hostEnvironment(cfg);
+  assert.equal(env.USERPROFILE, env.HOME);
   assert.equal(
     env.FRAMELEAF_STUDIO_CHROMIUM,
     join(cfg.runtime, cfg.entryPoints.studioBrowser),

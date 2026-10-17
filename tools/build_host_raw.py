@@ -140,6 +140,10 @@ def stage_raw(
         stage_server(prefix / name, staged / name)
     notices = staged / "licenses"
     notices.mkdir()
+    if windows:
+        regex_notice = work / "lensfun/include/regex/regex.h"
+        regular(regex_notice)
+        shutil.copyfile(regex_notice, notices / "lensfun-tre-regex.h")
     for name, path in {
         "darktable-LICENSE": work / "darktable/LICENSE",
         "rawspeed-LICENSE": work / "darktable/src/external/rawspeed/LICENSE",
@@ -368,6 +372,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "-DPYTHON:FILEPATH=OFF",
                     "-DBUILD_DOC=OFF",
                     "-DBUILD_TESTS=OFF",
+                    *(["-DHAVE_REGEX_H=OFF"] if windows else []),
                 ]
             )
             command([cmake, "--build", work / "lensfun-build", "--parallel", "1"])
