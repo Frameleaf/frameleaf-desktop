@@ -30,7 +30,8 @@ impl Fixture {
             ("ffmpeg", "media/ffmpeg"),
             ("ffprobe", "media/ffprobe"),
             ("exiftool", "media/exiftool"),
-            ("rawRenderer", "media/raw"),
+            ("rawRenderer", "raw/bin/darktable-cli"),
+            ("rawDecoder", "raw/bin/dcraw_emu"),
             ("webIndex", "build/www/index.html"),
             ("studio", "studio/worker"),
             ("corePlugin", "build/plugins/core/manifest.json"),
@@ -290,4 +291,22 @@ process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
         .unwrap()
         .contains(password.as_str()));
     drop(cleanup);
+}
+
+#[test]
+fn host_raw_decoder_must_be_explicit_and_inventory_verified() {
+    let mut fixture = Fixture::new();
+    let original = fixture.1.clone();
+    fixture.1["entryPoints"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rawDecoder");
+    assert!(fixture.verify().is_err());
+    fixture.1 = original;
+    fixture.1["files"]
+        .as_object_mut()
+        .unwrap()
+        .remove("raw/bin/dcraw_emu");
+    fs::remove_file(fixture.0.join("raw/bin/dcraw_emu")).unwrap();
+    assert!(matches!(fixture.verify(), Err(ref code) if code == "host_component_missing"));
 }

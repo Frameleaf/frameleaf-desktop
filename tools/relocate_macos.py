@@ -140,8 +140,13 @@ def closure(entries: dict[str, Path], output: Path) -> dict:
             metadata[source] = load_commands(run([tools["otool"], "-l", source]))
         identity, dependencies, paths = metadata[source]
         search_paths = []
-        for path in paths:
-            if path.startswith("@loader_path/"):
+        # A leaf with only Apple dependencies cannot consume an rpath; all are removed on staging.
+        for path in (
+            paths if any(not apple_library(value) for value in dependencies) else []
+        ):
+            if path == "@loader_path":
+                path = str(source.parent)
+            elif path.startswith("@loader_path/"):
                 path = str(source.parent / path[len("@loader_path/") :])
             if not path.startswith("/"):
                 raise BuildError("host_linkage_reference_unsupported")

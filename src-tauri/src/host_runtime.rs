@@ -28,13 +28,14 @@ struct EntryPoints {
     ffprobe: String,
     exiftool: String,
     raw_renderer: String,
+    raw_decoder: String,
     web_index: String,
     studio: String,
     core_plugin: String,
     ml_manifest: String,
 }
 impl EntryPoints {
-    fn paths(&self) -> [&str; 21] {
+    fn paths(&self) -> [&str; 22] {
         [
             &self.node,
             &self.server,
@@ -53,6 +54,7 @@ impl EntryPoints {
             &self.ffprobe,
             &self.exiftool,
             &self.raw_renderer,
+            &self.raw_decoder,
             &self.web_index,
             &self.studio,
             &self.core_plugin,

@@ -149,6 +149,7 @@ Load command 2
                     "-o",
                     str(base),
                     "-Wl,-install_name,@rpath/libbase.dylib",
+                    "-Wl,-rpath,@executable_path/unused",
                 ],
                 check=True,
             )
@@ -170,7 +171,7 @@ Load command 2
                     "clang",
                     str(source / "main.c"),
                     str(library),
-                    "-Wl,-rpath," + str(source),
+                    "-Wl,-rpath,@loader_path",
                     "-o",
                     str(executable),
                 ],
@@ -179,6 +180,20 @@ Load command 2
             output = root / "payload"
             clone = source / "second-executable"
             shutil.copy2(executable, clone)
+            subprocess.run(
+                [
+                    "install_name_tool",
+                    "-rpath",
+                    "@loader_path",
+                    "@executable_path",
+                    clone,
+                ],
+                check=True,
+            )
+            executable_relative = root / "refused-executable-path"
+            with self.assertRaisesRegex(BuildError, "reference_unsupported"):
+                closure({"bin/refused": clone}, executable_relative)
+            self.assertFalse(executable_relative.exists())
             unicode_output = root / "unicode-collision"
             with self.assertRaisesRegex(BuildError, "entry_invalid"):
                 closure({"é/node": executable, "e\u0301/node": clone}, unicode_output)

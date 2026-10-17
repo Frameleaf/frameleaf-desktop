@@ -206,7 +206,10 @@ fn main(){
         let deadline = Instant::now() + Duration::from_secs(5);
         while !runtime.working_dir().join("ready").is_file() {
             assert!(Instant::now() < deadline);
-            assert!(runtime.is_running().unwrap());
+            assert!(
+                runtime.is_running().unwrap(),
+                "fixture exited for namespace {namespace:?}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(
@@ -220,7 +223,13 @@ fn main(){
         assert!(!scratch.exists());
         fs::write(root.0.join(executable), b"tampered").unwrap();
         assert!(pack.start_sidecar(&cache.0, &workspace.0, 19999).is_err());
-        fs::write(root.0.join(executable), &bytes).unwrap();
+        // A fresh inode avoids macOS retaining an invalid signature after the tamper check.
+        fs::remove_file(root.0.join(executable)).unwrap();
+        fs::copy(
+            source.parent().unwrap().join(executable),
+            root.0.join(executable),
+        )
+        .unwrap();
     }
 }
 

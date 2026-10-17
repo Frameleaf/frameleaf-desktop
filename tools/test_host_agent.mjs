@@ -28,6 +28,10 @@ const config = (state) => ({
     pgIsready: "pg/pg_isready",
     pgCtl: "pg/pg_ctl",
     hdr: "media/hdr",
+    rawRenderer:
+      "raw/bin/darktable-cli" + (process.platform === "win32" ? ".exe" : ""),
+    rawDecoder:
+      "raw/bin/dcraw_emu" + (process.platform === "win32" ? ".exe" : ""),
     ffmpeg: "media/ffmpeg" + (process.platform === "win32" ? ".exe" : ""),
     ffprobe: "media/ffprobe" + (process.platform === "win32" ? ".exe" : ""),
   },
@@ -36,6 +40,11 @@ test("host configuration rejects shared ports, unbounded secrets and relative pa
   const good = config("/private/state");
   assert.doesNotThrow(() => validateConfig(good));
   for (const change of [
+    { entryPoints: { ...good.entryPoints, rawRenderer: undefined } },
+    { entryPoints: { ...good.entryPoints, rawDecoder: undefined } },
+    { entryPoints: { ...good.entryPoints, rawDecoder: "../dcraw_emu" } },
+    { entryPoints: { ...good.entryPoints, rawRenderer: "raw/bin/unrelated" } },
+    { entryPoints: { ...good.entryPoints, rawDecoder: "other/dcraw_emu" } },
     { apiPort: 54329 },
     { databasePort: 0 },
     { password: "" },
@@ -61,8 +70,17 @@ test("host configuration rejects shared ports, unbounded secrets and relative pa
 test("host media commands use private binaries without inheriting the caller environment", () => {
   const cfg = config("/private/state");
   const env = hostEnvironment(cfg);
+  assert.equal(
+    env.FRAMELEAF_RAW_DECODER_PATH,
+    join(cfg.runtime, cfg.entryPoints.rawDecoder),
+  );
   assert.equal(env.FFMPEG_PATH, join(cfg.runtime, cfg.entryPoints.ffmpeg));
   assert.equal(env.FFPROBE_PATH, join(cfg.runtime, cfg.entryPoints.ffprobe));
+  assert.ok(
+    env.PATH.split(process.platform === "win32" ? ";" : ":").includes(
+      join(cfg.runtime, "raw/bin"),
+    ),
+  );
   assert.equal(env.HOME, join(cfg.state, "home"));
   for (const name of [
     "DB_PASSWORD",

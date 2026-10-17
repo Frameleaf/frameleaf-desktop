@@ -40,6 +40,8 @@ export function validateConfig(c) {
     "hdr",
     "ffmpeg",
     "ffprobe",
+    "rawRenderer",
+    "rawDecoder",
   ]) {
     const path = c.entryPoints?.[name];
     if (
@@ -55,7 +57,10 @@ export function validateConfig(c) {
   if (
     basename(c.entryPoints.ffmpeg) !== "ffmpeg" + extension ||
     basename(c.entryPoints.ffprobe) !== "ffprobe" + extension ||
-    dirname(c.entryPoints.ffmpeg) !== dirname(c.entryPoints.ffprobe)
+    dirname(c.entryPoints.ffmpeg) !== dirname(c.entryPoints.ffprobe) ||
+    basename(c.entryPoints.rawRenderer) !== "darktable-cli" + extension ||
+    basename(c.entryPoints.rawDecoder) !== "dcraw_emu" + extension ||
+    dirname(c.entryPoints.rawRenderer) !== dirname(c.entryPoints.rawDecoder)
   )
     fail("host_media_components_invalid");
 }
@@ -145,10 +150,12 @@ async function exited(child, ms) {
 }
 export function hostEnvironment(c) {
   return {
+    FRAMELEAF_RAW_DECODER_PATH: join(c.runtime, c.entryPoints.rawDecoder),
     FFMPEG_PATH: join(c.runtime, c.entryPoints.ffmpeg),
     FFPROBE_PATH: join(c.runtime, c.entryPoints.ffprobe),
     PATH: [
       dirname(join(c.runtime, c.entryPoints.ffmpeg)),
+      dirname(join(c.runtime, c.entryPoints.rawRenderer)),
       dirname(join(c.runtime, c.entryPoints.node)),
       dirname(join(c.runtime, c.entryPoints.postgres)),
       process.platform === "win32"
