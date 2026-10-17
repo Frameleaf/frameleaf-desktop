@@ -207,9 +207,9 @@ def build(
                 run([git, "checkout", "--detach", pin["revision"]], checkout)
                 run([git, "apply", patch_file], checkout)
                 options = [
-                    f"-DCMAKE_INSTALL_PREFIX={prefix}",
+                    f"-DCMAKE_INSTALL_PREFIX={prefix.as_posix()}",
                     "-DCMAKE_BUILD_TYPE=Release",
-                    f"-DCMAKE_PREFIX_PATH={prefix};{dependency_prefix}",
+                    f"-DCMAKE_PREFIX_PATH={prefix.as_posix()};{dependency_prefix.as_posix()}",
                 ]
                 if system == "Windows":
                     options += ["-G", "Ninja", "-DBUILD_SHARED_LIBS=ON", "-DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON"]
@@ -258,8 +258,8 @@ def build(
                 binding_source.mkdir()
                 (binding_source / "CMakeLists.txt").write_text(windows_binding_project(original))
                 binding_options = [
-                    "-G", "Ninja", f"-DFRAMELEAF_HDR_SOURCE={snapshot / 'server/native/image-hdr.cc'}",
-                    f"-DNODE_API_LIBRARY={node_root / 'lib/node.lib'}",
+                    "-G", "Ninja", f"-DFRAMELEAF_HDR_SOURCE={(snapshot / 'server/native/image-hdr.cc').as_posix()}",
+                    f"-DNODE_API_LIBRARY={(node_root / 'lib/node.lib').as_posix()}",
                 ]
                 report["windowsBuildAdapterSha256"] = sha256(binding_source / "CMakeLists.txt")
                 report["nodeImportLibrarySha256"] = sha256(node_root / "lib/node.lib")
@@ -271,10 +271,10 @@ def build(
                     "-B",
                     binding_build,
                     "-DCMAKE_BUILD_TYPE=Release",
-                    f"-DCMAKE_PREFIX_PATH={prefix};{dependency_prefix}",
-                    f"-DNODE_API_INCLUDE_DIR={node_root / 'include/node'}",
-                    f"-DUHDR_INCLUDE_DIR={prefix / 'include'}",
-                    f"-DUHDR_LIBRARY={prefix / 'lib' / ('uhdr.lib' if system == 'Windows' else 'libuhdr.dylib' if system == 'Darwin' else 'libuhdr.so')}",
+                    f"-DCMAKE_PREFIX_PATH={prefix.as_posix()};{dependency_prefix.as_posix()}",
+                    f"-DNODE_API_INCLUDE_DIR={(node_root / 'include/node').as_posix()}",
+                    f"-DUHDR_INCLUDE_DIR={(prefix / 'include').as_posix()}",
+                    f"-DUHDR_LIBRARY={(prefix / 'lib' / ('uhdr.lib' if system == 'Windows' else 'libuhdr.dylib' if system == 'Darwin' else 'libuhdr.so')).as_posix()}",
                     *binding_options,
                 ]
             )
