@@ -287,9 +287,9 @@ def source_build_requirements(text: str) -> str:
 
 
 def dependency_indexes(system: str, architecture: str) -> list[str]:
-    # The lock selects +cpu only on Linux x86; PEP 440 otherwise prefers an unapproved Windows +cpu wheel.
+    # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
-    if system == "linux" and architecture == "x86_64":
+    if system == "linux" and architecture in {"x86_64", "aarch64"}:
         indexes += [
             "--index",
             "https://download.pytorch.org/whl/cpu",

@@ -278,14 +278,14 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
             self.assertEqual((root / "copy" / "python").read_bytes(), b"interpreter")
 
     def test_dependency_sources_match_the_locked_platform_markers(self):
-        self.assertIn(
-            "https://download.pytorch.org/whl/cpu",
-            builder.dependency_indexes("linux", "x86_64"),
-        )
+        for architecture in ["x86_64", "aarch64"]:
+            self.assertIn(
+                "https://download.pytorch.org/whl/cpu",
+                builder.dependency_indexes("linux", architecture),
+            )
         for system, architecture in [
             ("windows", "x86_64"),
             ("macos", "aarch64"),
-            ("linux", "aarch64"),
         ]:
             self.assertEqual(
                 builder.dependency_indexes(system, architecture),
