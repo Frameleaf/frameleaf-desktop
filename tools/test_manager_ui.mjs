@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
 import {readFile,mkdir} from 'node:fs/promises';
-import {resolve,join,isAbsolute} from 'node:path';
-import {pathToFileURL} from 'node:url';
+import {join,isAbsolute} from 'node:path';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 
 // Opt-in browser qualification: only a synthetic IPC bridge, never real Manager credentials or commands.
 if(process.env.FRAMELEAF_MANAGER_UI_TEST!=='1') {process.stdout.write('Manager UI browser qualification is opt-in.\n');process.exit(0);}
@@ -12,7 +12,7 @@ const playwright=process.env.FRAMELEAF_TEST_PLAYWRIGHT;
 const output=process.env.FRAMELEAF_TEST_OUTPUT;
 assert.ok(executablePath&&isAbsolute(executablePath)&&playwright&&isAbsolute(playwright)&&output&&isAbsolute(output));
 const {chromium}=await import(pathToFileURL(playwright));
-const root=resolve(new URL('..',import.meta.url).pathname);
+const root=fileURLToPath(new URL('..',import.meta.url));
 const listener=createServer();await new Promise(resolve=>listener.listen(0,'127.0.0.1',resolve));const address=listener.address();assert.ok(address&&typeof address!=='string');await new Promise(resolve=>listener.close(resolve));
 const origin=`http://127.0.0.1:${address.port}`;
 const vite=spawn(process.execPath,[join(root,'node_modules/vite/bin/vite.js'),'--host','127.0.0.1','--port',String(address.port),'--strictPort'],{cwd:root,stdio:['ignore','pipe','pipe']});

@@ -36,7 +36,8 @@ def codec_pin(name: str, manifest: dict, patch: bytes) -> dict:
 def build(
     source: Path, revision: str, node_root: Path, dependency_prefix: Path, output: Path
 ) -> None:
-    if platform.system() != "Darwin":
+    system = platform.system()
+    if system not in {"Darwin", "Linux"}:
         raise BuildError("host_media_feasibility_target_unsupported")
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise BuildError("host_media_revision_invalid")
@@ -44,10 +45,12 @@ def build(
         if not path.is_absolute():
             raise BuildError("host_media_absolute_path_required")
     git, cmake = shutil.which("git"), shutil.which("cmake")
+    audit = shutil.which("readelf") if system == "Linux" else "/usr/bin/otool"
     node = node_root / "bin/node"
     if (
         not git
         or not cmake
+        or not audit
         or not node.is_file()
         or not (node_root / "include/node/node_api.h").is_file()
     ):
@@ -72,7 +75,7 @@ def build(
         "schemaVersion": 1,
         "scope": "native-hdr-fixtures",
         "sourceRevision": revision,
-        "platform": f"macos-{platform.machine()}",
+        "platform": f"{'macos' if system == 'Darwin' else 'linux'}-{platform.machine()}",
         "osRelease": platform.release(),
         "redistributable": False,
         "developmentDependencyPrefix": str(dependency_prefix),
@@ -204,7 +207,7 @@ def build(
                     ).strip()
                     options += [f"-DJPEG_INCLUDE_DIR={jpeg_include}"]
                 run([cmake, "-S", checkout, "-B", checkout / "build", *options])
-                run([cmake, "--build", checkout / "build", "--parallel", "4"])
+                run([cmake, "--build", checkout / "build", "--parallel", "1"])
                 run([cmake, "--install", checkout / "build"])
             binding_build = work / "binding"
             run(
@@ -218,13 +221,13 @@ def build(
                     f"-DCMAKE_PREFIX_PATH={prefix};{dependency_prefix}",
                     f"-DNODE_API_INCLUDE_DIR={node_root / 'include/node'}",
                     f"-DUHDR_INCLUDE_DIR={prefix / 'include'}",
-                    f"-DUHDR_LIBRARY={prefix / 'lib/libuhdr.dylib'}",
+                    f"-DUHDR_LIBRARY={prefix / 'lib' / ('libuhdr.dylib' if system == 'Darwin' else 'libuhdr.so')}",
                 ]
             )
-            run([cmake, "--build", binding_build, "--parallel", "4"])
+            run([cmake, "--build", binding_build, "--parallel", "1"])
             binding = binding_build / "image-hdr.node"
             report["bindingSha256"] = sha256(binding)
-            run(["/usr/bin/otool", "-L", binding])
+            run([audit, "-L" if system == "Darwin" else "-dW", binding])
             run(
                 [node, "--test", snapshot / "server/test/native/image-hdr.test.mjs"],
                 extra={

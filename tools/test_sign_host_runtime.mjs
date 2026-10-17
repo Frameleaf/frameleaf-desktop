@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { signCandidate } from "./sign_runtime.mjs";
 import {
   signHostCandidate,
@@ -204,7 +205,7 @@ test("CLI never echoes malformed private-key input", async (t) => {
   const result = spawnSync(
     process.execPath,
     [
-      new URL("./sign_host_runtime.mjs", import.meta.url).pathname,
+      fileURLToPath(new URL("./sign_host_runtime.mjs", import.meta.url)),
       "--candidate",
       f.root,
       "--private-key-stdin",
