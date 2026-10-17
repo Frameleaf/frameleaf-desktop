@@ -422,6 +422,17 @@ python3 tools/build_host_database.py \
 
 This developer fixture requires macOS build tools and dependency libraries. It initializes fresh data with checksums, uses a private Unix socket with TCP disabled, and checks all baseline extensions (cube, earthdistance, pg_trgm, unaccent, uuid-ossp and vector/HNSW), logical dump/restore, restart and physical checksums. Local trust authentication is restricted to that disposable fixture; it is not the product authentication design. The receipt records source/binary/backup hashes and always declares `redistributable: false`; the lock remains `certified: false`. PostgreSQL 19 beta 4 with pgvector 0.8.7 passed this fixture on macOS ARM64. Full application migrations, server startup, portable dependency packaging and installed Windows/Linux acceptance remain separate gates.
 
+The Windows x64 authoring path is `tools/build_host_database_windows.py`;
+[its private candidate workflow](.github/workflows/windows-host-database.yml)
+prepares pinned MSVC build dependencies and invokes it with the same source,
+revision, dependency-prefix and fresh-output arguments. It builds PostgreSQL
+with Meson and pgvector with nmake, stages private DLLs and audits their imports.
+Its disposable loopback fixture uses SCRAM and checks all six extensions,
+dump/restore, restart and physical checksums with developer dependency paths
+removed. A submitted workflow is not qualification evidence: actual Windows
+build/runtime results, database certification and installed acceptance remain
+required; receipts retain `redistributable: false`.
+
 ### Native host controller
 
 The desktop now contains a separate signed host-pack verifier and an owned host process controller. `release_policy::verify_host_runtime` uses the desktop's compiled release keys; host packs require the pinned Node/PostgreSQL/vector versions, the current database certification status, all component entry points, geodata inputs and a complete hash-verified payload. ML manifests cannot substitute for host manifests. The existing ML file checks are shared without changing their validation rules.
@@ -540,6 +551,13 @@ case-insensitive duplicates before writing; staging refuses retained links.
 macOS binaries additionally pass architecture, Apple-only load-command and
 signature checks. Receipts record the source pins, binaries and synthetic codec
 outputs; redistribution and installed-platform qualification remain false.
+
+The [Windows media candidate workflow](.github/workflows/windows-host-media.yml)
+runs the existing source-pin and archive-safety tests on Windows before exercising
+the portable binaries against the synthetic codec fixtures. It retains the
+component, qualification receipt and failure diagnostics as private seven-day
+artifacts. Windows execution and installed acceptance remain unverified until
+their corresponding checks have actually passed.
 
 The macOS ARM64 candidate passed H.264, HEVC, VP9 and AV1 CPU encode/decode,
 AAC/Opus encoding and explicit PCM decoding, video/audio probing and thumbnail
