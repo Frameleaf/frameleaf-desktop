@@ -94,7 +94,7 @@ const { exiftoolPath } = require(modulePath);
                 (vendor / 'dist').mkdir(parents=True)
                 executable.mkdir()
                 (vendor / 'package.json').write_text('{"version":"39.0.1"}')
-                (vendor / 'dist/ExiftoolPath.js').write_text(self.source)
+                (vendor / 'dist/ExiftoolPath.js').write_bytes(self.source.encode('utf-8'))
                 (executable / 'package.json').write_text(json.dumps({'version': '0.0.0' if problem == 'version' else '13.59.3'}))
                 for name in ['bin/exiftool.exe', 'bin/exiftool_files/perl.exe', 'bin/exiftool_files/perl532.dll',
                              'bin/exiftool_files/lib/Image/ExifTool.pm', 'LICENSE', 'bin/exiftool_files/LICENSE']:
