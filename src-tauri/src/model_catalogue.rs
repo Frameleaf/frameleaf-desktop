@@ -148,7 +148,7 @@ impl ProfileData {
         };
         spec["fixtureFile"] = json!(format!("{id}.{extension}"));
         Ok((
-            serde_json::to_vec(&spec).map_err(|_| invalid())?,
+            serde_json_canonicalizer::to_vec(&spec).map_err(|_| invalid())?,
             self.fixture()?,
         ))
     }
@@ -1128,7 +1128,7 @@ mod tests {
     fn pr274_profiles_preserve_every_legacy_profile_and_use_distinct_new_identities() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 16);
+        assert_eq!(profiles.len(), 21);
         let legacy = Value::Array(profiles[..11].to_vec());
         assert_eq!(
             digest(&serde_json_canonicalizer::to_vec(&legacy).unwrap()),
@@ -1139,7 +1139,7 @@ mod tests {
             .iter()
             .map(|p| p["modelKey"].as_str().unwrap())
             .collect();
-        for profile in &profiles[11..] {
+        for profile in &profiles[11..16] {
             assert_eq!(profile["runtimeSourceRevision"], source);
             assert!(!old_keys.contains(profile["modelKey"].as_str().unwrap()));
         }
@@ -1169,6 +1169,11 @@ mod tests {
             "24f6500b8b91a7203c4b91f56fbbdfe3b51666e653d7c576fe065f9fe6709d2e",
             "fb3d5c5410ea666f34496fd324fc4c88678f3685d4a145c38811a7609355a5ab",
             "b9f58507b2f76a79c90a4cdc49155f162a086c502966a1280d0cb3a02bb86510",
+            "b435382d9f7d19b49cb227cdcbca97f258845c7df41f4dc7ec86fe4f6d944570",
+            "9c8818340b94b0f37cdd35509e038a86db8d1ced793aa7a742e74754215bc779",
+            "31337c0063a85bdf957d27ef7ec581b34e65ee4a73f53215c238ff2c9342d40c",
+            "75d39bab3c7ce04a0b3864ae8eb420664970faa66ab2f55a82c043a8d4c9ebc1",
+            "eae6ee5d7291fec288026e79094c294de27187f769310e373625e80a18bab1c2",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
@@ -1178,5 +1183,39 @@ mod tests {
                 .unwrap();
             assert_eq!(digest(&spec), expected);
         }
+    }
+    #[test]
+    fn current_profiles_preserve_all_released_bindings_and_select_only_the_qualified_source() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        assert_eq!(
+            digest(
+                &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..16].to_vec())).unwrap()
+            ),
+            "2e8b52cf4107668d2df47eb0564398028cb75502d766a3403b4201a41c7b03a1"
+        );
+        let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
+        assert_eq!(profiles[16..].len(), 5);
+        for profile in &profiles[16..] {
+            assert_eq!(profile["runtimeSourceRevision"], source);
+            assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
+            assert_eq!(
+                profile["spec"]["preprocessingSha256"],
+                "06c8c5cc89891f53ae06675c3a4f32113c45215e705a9b2da0051143a8e13639"
+            );
+        }
+        assert_eq!(
+            setup_profiles("ViT-B-16-SigLIP-384__webli", source, "CPUExecutionProvider")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            source,
+            "CUDAExecutionProvider"
+        )
+        .unwrap()
+        .is_empty());
     }
 }
