@@ -30,6 +30,31 @@ SYSTEM_DLLS = {
 }
 
 
+def data_only_pe(binary: Path) -> bool:
+    with binary.open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) != 64 or dos[:2] != b"MZ":
+            return False
+        offset = int.from_bytes(dos[60:64], "little")
+        if offset < 64:
+            return False
+        stream.seek(offset)
+        header = stream.read(24)
+        if len(header) != 24 or header[:6] != b"PE\0\0\x64\x86":
+            return False
+        size = int.from_bytes(header[20:22], "little")
+        if not 128 <= size <= 4096 or not int.from_bytes(header[22:24], "little") & 0x2000:
+            return False
+        optional = stream.read(size)
+    # ICU ships a data-only DLL: successful dumpbin output legitimately has no imports.
+    return (
+        len(optional) == size and optional[:2] == b"\x0b\x02"
+        and optional[4:8] == b"\0" * 4 and optional[16:20] == b"\0" * 4
+        and int.from_bytes(optional[108:112], "little") >= 2
+        and optional[120:128] == b"\0" * 8
+    )
+
+
 def stage_dependencies(prefix: Path, dependencies: Path, dumpbin: str, env: dict) -> None:
     for source in sorted((dependencies / "bin").glob("*.dll")):
         regular(source)
@@ -58,7 +83,7 @@ def stage_dependencies(prefix: Path, dependencies: Path, dumpbin: str, env: dict
         imports = re.findall(r"^\s+([\w.+-]+\.dll)\s*$", run(
             [dumpbin, "/nologo", "/dependents", binary], cwd=prefix, env=env
         ), re.MULTILINE | re.IGNORECASE)
-        if not imports:
+        if not imports and not data_only_pe(binary):
             raise BuildError("host_database_pe_imports_missing")
         for name in imports:
             key = name.lower()
