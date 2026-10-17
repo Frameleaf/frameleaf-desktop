@@ -332,7 +332,8 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             command([git, "-C", raw, "checkout", "--detach", "FETCH_HEAD"])
             if command([git, "-C", raw, "rev-parse", "HEAD"]) != libraw["revision"]:
                 raise BuildError("host_raw_libraw_revision_mismatch")
-            command([tools["autoreconf"], "--install"], raw)
+            command([tools["autoreconf"], "--install",
+                     *(["--force", "-I", "m4", "-I", (dependencies / "share/aclocal").as_posix()] if windows else [])], raw)
             command(
                 [
                     raw / "configure",
