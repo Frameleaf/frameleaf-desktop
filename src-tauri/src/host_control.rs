@@ -322,12 +322,20 @@ mod tests {
             "manifestSha256":"a".repeat(64),"password":"synthetic-password-long-enough",
             "databasePort":54321,"apiPort":54322});
         assert!(config(&serde_json::to_vec(&good).unwrap()).is_ok());
+        // Joining a Windows verbatim path normalizes away the traversal before validation.
+        let parent_path = |leaf: &str| {
+            json!(format!(
+                "{}{separator}parent{separator}..{separator}{leaf}",
+                root.display(),
+                separator = std::path::MAIN_SEPARATOR
+            ))
+        };
         for (field, value) in [
             ("protocolVersion", json!(2)),
             ("candidate", json!("relative")),
             ("state", json!("relative")),
-            ("state", json!(root.join("parent/../state"))),
-            ("candidate", json!(root.join("parent/../candidate"))),
+            ("state", parent_path("state")),
+            ("candidate", parent_path("candidate")),
             ("manifestSha256", json!("main")),
             ("password", json!("too-short")),
             ("password", json!("x".repeat(513))),

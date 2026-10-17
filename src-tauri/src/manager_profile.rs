@@ -355,6 +355,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(expected.as_str(), restored.password().as_str());
+        // Windows byte-range locks prohibit reading the lease until its owner releases it.
+        drop(restored);
         for entry in std::fs::read_dir(&f.1.data).unwrap() {
             let p = entry.unwrap().path();
             if p.is_file() {
@@ -364,7 +366,6 @@ mod tests {
                     .any(|v| v == expected.as_bytes()));
             }
         }
-        drop(restored);
         f.1.api_port = 2284;
         assert!(Profile::load_or_create(
             &f.1,
