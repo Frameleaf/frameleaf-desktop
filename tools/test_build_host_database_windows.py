@@ -1,5 +1,6 @@
 import tempfile
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +10,33 @@ from build_runtime import BuildError
 
 
 class WindowsDatabaseTests(unittest.TestCase):
+    def test_private_pkgconf_wins_over_strawberry_pkg_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dependencies = root / "dependencies"
+            private = dependencies / "tools/pkgconf/pkgconf.exe"
+
+            def which(name, *, path=None):
+                if name == "pkg-config":
+                    return str(root / "Strawberry/perl/bin/pkg-config.BAT")
+                if name == "pkgconf":
+                    return str(private) if path == str(private.parent) else None
+                return str(root / "build-tools" / name)
+
+            def inspect_environment(git, source, revision, name, env):
+                self.assertEqual(env["PKG_CONFIG"], str(private))
+                self.assertIn(str(private.parent), env["PATH"].split(os.pathsep))
+                raise BuildError("synthetic_before_source_download")
+
+            with (
+                patch("build_host_database_windows.platform.system", return_value="Windows"),
+                patch("build_host_database_windows.platform.machine", return_value="AMD64"),
+                patch("build_host_database_windows.shutil.which", side_effect=which),
+                patch("build_host_database_windows.git_blob", side_effect=inspect_environment),
+                self.assertRaisesRegex(BuildError, "synthetic_before_source_download"),
+            ):
+                build(root, "a" * 40, dependencies, root / "output")
+
     def test_invalid_source_cannot_create_a_build_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

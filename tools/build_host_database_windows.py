@@ -140,8 +140,9 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     if platform.system() != "Windows" or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise BuildError("host_database_windows_target_unsupported")
     tools = {name: shutil.which(name) for name in ["git", "cl", "nmake", "meson", "ninja", "dumpbin", "perl", "rc", "mt"]}
-    for name, alternate in [("flex", "win_flex"), ("bison", "win_bison"), ("pkg-config", "pkgconf")]:
+    for name, alternate in [("flex", "win_flex"), ("bison", "win_bison")]:
         tools[name] = shutil.which(name) or shutil.which(alternate)
+    tools["pkg-config"] = shutil.which("pkgconf", path=str(dependencies / "tools/pkgconf"))
     if not all(tools.values()):
         raise BuildError("host_database_build_tools_missing")
     output.mkdir(mode=0o700)
