@@ -18,7 +18,7 @@ fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
             let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             let expected = if ids.is_empty() {
                 "host_control_arguments_invalid"
-            } else if cfg!(target_os = "macos") {
+            } else if cfg!(any(target_os = "macos", target_os = "linux")) {
                 "host_install_root_required"
             } else {
                 "host_install_platform_unsupported"
