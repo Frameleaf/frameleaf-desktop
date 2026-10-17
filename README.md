@@ -503,3 +503,28 @@ The macOS ARM64 candidate passed all 54 source tests and five real calls in each
 of foreground and worker modes, including the scoped host callback payload.
 No host filesystem mounts are granted. This is synthetic workflow acceptance,
 not complete workflow/server/UI, redistribution or installed-platform approval.
+
+
+### Native photo UI and Studio assets
+
+`python3 tools/build_host_web.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
+builds the shared photo UI and Studio editor into `www/` from an exact Git
+archive. The selected source's Studio attestation config supplies npm's version;
+bootstrap npm installs it only into the new private toolchain prefix, with
+lifecycle scripts disabled. Studio preparation verifies its pinned upstream
+archive, patches and adapted-source digest. The existing adapter build preserves
+its attribution and unchanged-source audits. SDK/web installs use the frozen
+source lockfile. Staging rejects retained links and requires the photo index,
+Studio editor and Studio command pages together.
+
+The build receipt records source, lockfile, tool and output hashes. Its build
+qualification does not grant Studio rights approval, browser/media execution or
+installed-host acceptance; `runtimeQualified` and `redistributable` remain false.
+
+
+An actual macOS ARM64 integration fixture installed the exact staged core plugin
+into the private server database and served byte-matching photo, Studio editor
+and Studio command pages over HTTP on fresh startup and restart. Both boots
+retained all 38 migrations, checksums, SCRAM authentication and clean stops.
+This fixture used copied private components and bypassed the complete signed-host
+manifest; it does not prove browser interactions, Studio rendering or media jobs.
