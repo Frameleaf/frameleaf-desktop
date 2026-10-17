@@ -1,0 +1,114 @@
+name: Private Windows database candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_database_windows.py'
+      - 'tools/test_build_host_database_windows.py'
+      - 'runtime/host-database.json'
+      - '.github/workflows/windows-host-database.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-database-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  database:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      VCPKG_MAX_CONCURRENCY: '1'
+      VCPKG_DISABLE_METRICS: '1'
+      VCPKG_BINARY_SOURCES: clear
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 947568067639827de73e2de7260103df697c7f51
+          path: server-source
+          sparse-checkout: docker/postgres
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: microsoft/vcpkg
+          ref: bf19794383e8fb95eba5aa553235bc8ec2271688
+          path: vcpkg
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Prepare MSVC and pinned build tools
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation unavailable' }
+          $command = '"' + $vs + '\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && set'
+          $lines = & $env:ComSpec /d /s /c $command
+          if ($LASTEXITCODE) { throw 'MSVC environment failed' }
+          foreach ($line in $lines) {
+            $parts = $line -split '=', 2
+            if ($parts[0] -in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsRedistDir')) {
+              $line >> $env:GITHUB_ENV
+            }
+          }
+          python -m pip install meson==1.12.1 ninja==1.13.2
+          if ($LASTEXITCODE) { throw 'Pinned build tool installation failed' }
+          $zip = Join-Path $env:RUNNER_TEMP 'win_flex_bison-2.5.25.zip'
+          Invoke-WebRequest 'https://github.com/lexxmark/winflexbison/releases/download/v2.5.25/win_flex_bison-2.5.25.zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne '8d324b62be33604b2c45ad1dd34ab93d722534448f55a16ca7292de32b6ac135') { throw 'Parser tool digest mismatch' }
+          $parserTools = Join-Path $env:RUNNER_TEMP 'winflexbison'
+          Expand-Archive $zip $parserTools
+          $parserTools >> $env:GITHUB_PATH
+      - name: Build private dependencies from pinned vcpkg source
+        shell: pwsh
+        run: |
+          & ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { throw 'vcpkg bootstrap failed' }
+          $installed = Join-Path $env:RUNNER_TEMP 'frameleaf-db-dependencies'
+          & ./vcpkg/vcpkg.exe install icu:x64-windows openssl:x64-windows lz4:x64-windows zstd:x64-windows zlib:x64-windows libxml2:x64-windows pkgconf:x64-windows "--x-install-root=$installed"
+          if ($LASTEXITCODE) { throw 'Private dependency build failed' }
+          $dependencies = Join-Path $installed 'x64-windows'
+          $crt = Get-ChildItem (Join-Path $env:VCToolsRedistDir 'x64/Microsoft.VC*.CRT') -Directory
+          if ($crt.Count -ne 1) { throw 'Unique MSVC redistributable directory required' }
+          Copy-Item (Join-Path $crt.FullName '*.dll') (Join-Path $dependencies 'bin')
+          # This upstream Windows static library is pinned by bytes, not the mutable tag.
+          $uuidZip = Join-Path $env:RUNNER_TEMP 'ossp-uuid.zip'
+          Invoke-WebRequest 'https://github.com/dpage/winpgbuild/releases/download/ossp-uuid-latest/ossp-uuid-latest.zip' -OutFile $uuidZip
+          if ((Get-FileHash $uuidZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'ff73170bd286667620133d4fe6e3a27843124287e014ed89d9831907e8a0b46f') { throw 'UUID dependency digest mismatch' }
+          $uuidRoot = Join-Path $env:RUNNER_TEMP 'uuid-input'
+          Expand-Archive $uuidZip $uuidRoot
+          Copy-Item "$uuidRoot/ossp-uuid/include/*" "$dependencies/include"
+          Copy-Item "$uuidRoot/ossp-uuid/lib/*" "$dependencies/lib" -Recurse -Force
+          $notice = Join-Path $dependencies 'share/ossp-uuid'
+          New-Item -ItemType Directory -Path $notice | Out-Null
+          Copy-Item "$uuidRoot/ossp-uuid/MANIFESTS/ossp-uuid.spdx.json" $notice
+          $uuidSource = Join-Path $env:RUNNER_TEMP 'uuid-source.tar.gz'
+          Invoke-WebRequest 'https://deb.debian.org/debian/pool/main/o/ossp-uuid/ossp-uuid_1.6.2.orig.tar.gz' -OutFile $uuidSource
+          if ((Get-FileHash $uuidSource -Algorithm SHA256).Hash.ToLowerInvariant() -ne '11a615225baa5f8bb686824423f50e4427acd3f70d394765bdff32801f0fd5b0') { throw 'UUID source digest mismatch' }
+          tar -xzf $uuidSource -C $env:RUNNER_TEMP uuid-1.6.2/README
+          if ($LASTEXITCODE) { throw 'UUID source notice extraction failed' }
+          Copy-Item "$env:RUNNER_TEMP/uuid-1.6.2/README" "$notice/copyright"
+          (Join-Path $dependencies 'tools/pkgconf') >> $env:GITHUB_PATH
+          "FRAMELEAF_DATABASE_DEPENDENCIES=$dependencies" >> $env:GITHUB_ENV
+      - name: Build and qualify the native database
+        shell: pwsh
+        run: |
+          python tools/build_host_database_windows.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 947568067639827de73e2de7260103df697c7f51 --dependency-prefix "$env:FRAMELEAF_DATABASE_DEPENDENCIES" --output "$env:RUNNER_TEMP/frameleaf-windows-database"
+          if ($LASTEXITCODE) { throw 'Native database qualification failed' }
+      - name: Retain private component and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-private-database-candidate
+          path: |
+            ${{ runner.temp }}/frameleaf-windows-database/postgres/
+            ${{ runner.temp }}/frameleaf-windows-database/qualification.json
+            ${{ runner.temp }}/frameleaf-windows-database/build.log
+            ${{ runner.temp }}/frameleaf-windows-database/command-error.log
+            ${{ runner.temp }}/frameleaf-windows-database/postgres.log
+            ${{ runner.temp }}/frameleaf-windows-database/work/configured/meson-logs/meson-log.txt
+          retention-days: 7
+          if-no-files-found: warn
