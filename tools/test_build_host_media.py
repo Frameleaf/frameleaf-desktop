@@ -4,7 +4,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from build_host_media import BuildError, build, codec_pin
+from build_host_media import BuildError, build, codec_pin, windows_binding_project
+
+
+class WindowsBindingProjectTests(unittest.TestCase):
+    SOURCE = (
+        "add_library(image-hdr MODULE image-hdr.cc)\n"
+        "target_compile_options(image-hdr PRIVATE -Wall -Wextra -Werror)\n"
+    )
+
+    def test_adapter_binds_original_source_and_required_node_import_library(self):
+        result = windows_binding_project(self.SOURCE)
+        self.assertIn('add_library(image-hdr MODULE "${FRAMELEAF_HDR_SOURCE}")', result)
+        self.assertIn("target_compile_options(image-hdr PRIVATE /W4 /WX)", result)
+        self.assertIn("find_library(NODE_API_LIBRARY node REQUIRED)", result)
+        self.assertIn('target_link_libraries(image-hdr PRIVATE "${NODE_API_LIBRARY}")', result)
+
+    def test_changed_or_ambiguous_source_recipe_is_refused(self):
+        for source in [self.SOURCE.replace("image-hdr.cc", "renamed.cc"), self.SOURCE * 2]:
+            with self.subTest(source=source), self.assertRaisesRegex(BuildError, "cmake_source_changed"):
+                windows_binding_project(source)
 
 
 class HostMediaTests(unittest.TestCase):
