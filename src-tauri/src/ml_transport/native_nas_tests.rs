@@ -130,8 +130,9 @@ fn actual_native_nas_library_jobs() {
     let enrollment = identity
         .enrollment("synthetic", "synthetic", "Native fixture", "client-worker")
         .unwrap();
+    // Separate the protocol packet from libtest's test-name prefix.
     println!(
-        "NATIVE_IDENTITY {}",
+        "\nNATIVE_IDENTITY {}",
         serde_json::to_string(&enrollment).unwrap()
     );
     std::io::stdout().flush().unwrap();
@@ -378,6 +379,48 @@ fn automatic_setup_job(
     };
     std::fs::create_dir(&root).unwrap();
     let root = OwnedRoot(root);
+    // Seed approved staged weights for this offline automatic-setup fixture.
+    let pack = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
+    let cache = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(pack.join("manifest.json")).unwrap()).unwrap();
+    let catalogue: serde_json::Value =
+        serde_json::from_str(include_str!("../../../runtime/model-catalogue.json")).unwrap();
+    let profile = catalogue["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|profile| {
+            profile["workload"] == "ocr"
+                && profile["runtimeSourceRevision"] == manifest["sourceRevision"]
+                && profile["spec"]["provider"] == manifest["provider"]
+        })
+        .unwrap();
+    let name = profile["modelName"].as_str().unwrap();
+    let staged = root
+        .0
+        .join("worker/models")
+        .join(format!(
+            ".staging-{}",
+            profile["modelSnapshotRevision"].as_str().unwrap()
+        ))
+        .join("ocr")
+        .join(name);
+    let mut directories = std::fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directories.mode(0o700);
+    }
+    for artifact in profile["artifactBytes"].as_object().unwrap().keys() {
+        if artifact == &format!("models--frameleaf--{name}/refs/main") {
+            continue;
+        }
+        let destination = staged.join(artifact);
+        directories.create(destination.parent().unwrap()).unwrap();
+        std::fs::copy(cache.join("ocr").join(name).join(artifact), destination).unwrap();
+    }
     let setup = crate::worker_setup::WorkerSetup::default();
     tauri::async_runtime::block_on(async {
         setup
