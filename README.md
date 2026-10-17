@@ -464,3 +464,25 @@ all six baseline extensions and physical checksums. Private Node/HDR passed all
 payload or Apple system images. PostgreSQL's native build reserves linker-header
 space for relocation. This does not qualify the complete server, RAW/Studio,
 Windows/Linux dependency closure, release signing or installed-device acceptance.
+
+
+### Production server package
+
+`python3 tools/build_host_server.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
+builds the selected source revision from a fresh Git archive. The builder requires
+Node 26.11.1 and the source revision's pinned pnpm version, builds the SDKs before
+the server, uses frozen dependency installs and stages a production hoisted
+package. It removes package-manager metadata and CLI aliases, refuses retained
+links or special files, and runs that revision's server-package verifier. The
+receipt records the source archive, lockfile, Node and staged-file hashes; pnpm
+provenance records its version, not an executable digest.
+
+A macOS ARM64 fixture built source
+`614425745a23c1a015711bcf06d7e2f8b91661b2` into 30,805 regular files with no
+symlinks. Using physically copied private Node/PostgreSQL/HDR components and
+geodata, the actual host agent passed fresh API/Microservices startup, restart,
+all 38 migrations, checksums, SCRAM authentication and clean stops. This fixture
+bypasses the complete signed-host manifest gate. `redistributable` and
+`nativeClosureQualified` remain false: full native bindings, RAW/Studio/media,
+web assets, release signing and installed three-platform acceptance still need
+qualification before local hosting can be enabled.
