@@ -33,6 +33,7 @@ class HostBundleTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
             manifest = host_manifest(root, "a" * 40, 2)
+            self.assertEqual(manifest["protocolVersion"], 2)
             self.assertEqual(len(manifest["entryPoints"]), 26)
             self.assertEqual(set(manifest["files"]), names)
             self.assertFalse(manifest["certified"])

@@ -23,6 +23,8 @@
     if (value.startsWith('manager_') || value === 'native_manager_not_ready' || value === 'native_host_busy') return managerError(value);
     if (value === 'host_install_platform_unsupported') return 'Native server installation is not available on this platform in this build. You can connect to an existing server.';
     if (value === 'host_install_profile_required') return 'Run the server component installer while signed in to this computer, then try again.';
+    if (value === 'host_package_maintenance' || value === 'host_package_busy') return 'Server component maintenance is unfinished or the component is in use. Local management is unavailable until maintenance completes.';
+    if (value.startsWith('host_package_')) return 'The server component installation could not be verified. Local management is blocked; your existing library has been preserved.';
     if (value === 'native_manager_start_cancelled') return 'Local setup was cancelled.';
     if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, recover it in Manager first.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';

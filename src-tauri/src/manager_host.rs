@@ -237,6 +237,7 @@ pub struct NativeManager {
     verified_ready: bool,
     startup_lease: Option<crate::host_state::Owner>,
     certificate_pem: String,
+    _code_lease: Option<crate::package_lease::CodeLease>,
 }
 impl Programs<'_> {
     pub fn start_from_keystore(&self, config: &Configuration) -> Result<NativeManager, String> {
@@ -249,6 +250,7 @@ impl Programs<'_> {
         }
         let candidate = self.root.parent().ok_or("native_manager_layout_invalid")?;
         validate_paths(candidate, &config.state, &config.data)?;
+        let _code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
         let profile = crate::manager_profile::Profile::from_keystore(
             config,
             candidate,
@@ -281,6 +283,7 @@ impl Programs<'_> {
         self.check()?;
         protect_profile_parents(config)?;
         protect(&config.controller, &mut BTreeSet::new())?;
+        let code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
         let controller = crate::runtime_store::read_bounded(&config.controller, 256 * 1024 * 1024)?;
         let controller_hash = format!("{:x}", Sha256::digest(&controller));
         let client = reqwest::Client::builder()
@@ -365,6 +368,7 @@ impl Programs<'_> {
             self.runtime.manifest_sha256(),
             &config.origin,
             client,
+            Some(code_lease),
         )?;
         manager.certificate_pem = tls.certificate().into();
         Ok(manager)
@@ -378,7 +382,11 @@ impl NativeManager {
         hash: &str,
         origin: &str,
         client: reqwest::Client,
+        code_lease: Option<crate::package_lease::CodeLease>,
     ) -> Result<Self, String> {
+        if let Some(lease) = &code_lease {
+            lease.inherit(command);
+        }
         let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -396,6 +404,7 @@ impl NativeManager {
             verified_ready: false,
             startup_lease: None,
             certificate_pem: String::new(),
+            _code_lease: code_lease,
         };
         let stdout = owner
             .child
@@ -743,6 +752,7 @@ mod tests {
                 &"b".repeat(64),
                 "https://127.0.0.1:9443",
                 reqwest::Client::new(),
+                None,
             )
             .unwrap();
             let state = std::env::temp_dir()
@@ -832,6 +842,7 @@ mod tests {
             &"b".repeat(64),
             origin,
             client,
+            None,
         )
         .unwrap();
         let state = output.join("state");

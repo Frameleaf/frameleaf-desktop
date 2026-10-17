@@ -264,6 +264,9 @@ impl Owner {
         if self.read()?.is_some() {
             return self.inspect(id, sha).map(|_| ());
         }
+        self.empty()
+    }
+    fn empty(&self) -> Result<(), String> {
         for entry in self
             .root
             .entries()
@@ -278,6 +281,41 @@ impl Owner {
             }
         }
         self.placement()
+    }
+    /// Package maintenance checks liveness only; this never authorizes starting or restoring a host.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn package_idle(path: &Path) -> Result<(), String> {
+        let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+        match root.symlink_metadata(NAME) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return if root
+                    .entries()
+                    .map_err(|_| "host_controller_state_invalid")?
+                    .next()
+                    .is_none()
+                {
+                    Ok(())
+                } else {
+                    Err("host_recovery_requires_manager".into())
+                };
+            }
+            Err(_) => return Err("host_controller_state_invalid".into()),
+            Ok(_) => {}
+        }
+        let mut owner = Self::acquire(path, false)?;
+        match owner.read()? {
+            None => owner.empty(),
+            Some(marker) => {
+                if !crate::native_runtime::digest_valid(&marker.installation_id, 12)
+                    || !crate::native_runtime::digest_valid(&marker.manifest_sha256, 64)
+                {
+                    return Err("host_controller_binding_changed".into());
+                }
+                owner
+                    .inspect(&marker.installation_id, &marker.manifest_sha256)
+                    .map(|_| ())
+            }
+        }
     }
     pub fn inspect(&mut self, id: &str, sha: &str) -> Result<Marker, String> {
         let marker = self.read()?.ok_or("host_recovery_requires_manager")?;
@@ -442,5 +480,21 @@ mod tests {
         fs::write(g.0.join("unreviewed-data"), b"preserve").unwrap();
         assert!(other.admit_idle(ID, &sha()).is_err());
         assert_eq!(fs::read(g.0.join("unreviewed-data")).unwrap(), b"preserve");
+    }
+    #[test]
+    fn package_maintenance_requires_empty_or_clean_stopped_state_and_current_root() {
+        let fixture = Fixture::new();
+        Owner::package_idle(&fixture.0).unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.activate(ID, &sha()).unwrap();
+        assert!(Owner::package_idle(&fixture.0).is_err());
+        owner.clean_stop().unwrap();
+        drop(owner);
+        Owner::package_idle(&fixture.0).unwrap();
+        let crashed = Fixture::new();
+        let mut owner = Owner::acquire(&crashed.0, true).unwrap();
+        owner.activate(ID, &sha()).unwrap();
+        drop(owner);
+        assert!(Owner::package_idle(&crashed.0).is_err());
     }
 }

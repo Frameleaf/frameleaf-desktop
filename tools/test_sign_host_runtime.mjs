@@ -106,7 +106,7 @@ async function fixture(t) {
   }
   const manifest = {
     schemaVersion: 1,
-    protocolVersion: 1,
+    protocolVersion: 2,
     epoch: 2,
     ...target,
     sourceRevision: "b".repeat(40),
@@ -228,4 +228,12 @@ test("Manager code and recovery UI are required signed host roles", async (t) =>
     await assert.rejects(signHostCandidate(f.root, f.pem, f.policy), /host_manifest_invalid/);
     f.manifest.entryPoints[role] = path;
   }
+});
+
+// Earlier desktop hosts do not retain package code leases.
+test("host protocol one cannot be signed as a lease-aware host", async (t) => {
+  const f = await fixture(t);
+  f.manifest.protocolVersion = 1;
+  await f.save();
+  await assert.rejects(signHostCandidate(f.root, f.pem, f.policy), /host_manifest_incompatible/);
 });

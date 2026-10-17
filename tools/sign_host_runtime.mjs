@@ -146,7 +146,7 @@ async function checkedHost(candidate, trust, signature) {
   );
   if (
     manifest.schemaVersion !== 1 ||
-    manifest.protocolVersion !== 1 ||
+    manifest.protocolVersion !== 2 ||
     !Number.isSafeInteger(manifest.epoch) ||
     manifest.epoch < trust.minimumRuntimeEpoch ||
     !["macos", "linux", "windows"].includes(manifest.platform) ||

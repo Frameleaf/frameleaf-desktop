@@ -6,7 +6,11 @@ fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    for phase in ["--prepare-install", "--finalize-install"] {
+    for phase in [
+        "--prepare-install",
+        "--finalize-install",
+        "--prepare-maintenance",
+    ] {
         for ids in [vec![], vec!["a".repeat(64), "b".repeat(64)]] {
             let output = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"))
                 .arg(phase)

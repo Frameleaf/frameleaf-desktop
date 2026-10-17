@@ -107,7 +107,7 @@ def host_manifest(payload: Path, revision: str, epoch: int) -> dict:
     database = json.loads((ROOT / "runtime/host-database.json").read_text())
     result = {
         "schemaVersion": 1,
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "epoch": epoch,
         "platform": {"Darwin": "macos", "Linux": "linux", "Windows": "windows"}[
             platform.system()
