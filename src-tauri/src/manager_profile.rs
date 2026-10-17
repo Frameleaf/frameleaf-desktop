@@ -274,6 +274,11 @@ fn publish_marker(data: &cap_std::fs::Dir, temp: &str) -> Result<(), String> {
             )
         };
         if result == 0 {
+            #[cfg(test)]
+            eprintln!(
+                "native marker publication OS error: {:?}",
+                std::io::Error::last_os_error().raw_os_error()
+            );
             return Err("native_profile_binding_changed".into());
         }
         Ok(())

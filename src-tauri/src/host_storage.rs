@@ -84,7 +84,7 @@ fn cloud_storage_check(_path: &Path, directory: &std::fs::File) -> Result<(), St
         CfGetSyncRootInfoByHandle, CF_SYNC_ROOT_BASIC_INFO, CF_SYNC_ROOT_INFO_BASIC,
     };
     let mut info = CF_SYNC_ROOT_BASIC_INFO::default();
-    windows_sync_result(unsafe {
+    let result = unsafe {
         CfGetSyncRootInfoByHandle(
             directory.as_raw_handle(),
             CF_SYNC_ROOT_INFO_BASIC,
@@ -92,7 +92,10 @@ fn cloud_storage_check(_path: &Path, directory: &std::fs::File) -> Result<(), St
             std::mem::size_of_val(&info) as u32,
             std::ptr::null_mut(),
         )
-    })
+    };
+    #[cfg(test)]
+    eprintln!("native cloud-storage probe HRESULT: {result:#010x}");
+    windows_sync_result(result)
 }
 
 #[cfg(target_os = "macos")]
