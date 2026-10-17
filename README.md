@@ -550,3 +550,27 @@ sets their explicit environment paths. Other inherited caller variables remain
 excluded. Actual packaged `MediaRepository` probing and H.264/AAC-to-VP9/Opus
 transcoding passed inside the private-server fresh/restart fixture; complete
 signed-host and installed three-platform acceptance remain outstanding.
+
+### Private native ExifTool
+
+`python3 tools/build_host_perl.py --output /absolute/path/to/new-perl-output`
+builds the checksum-pinned Unix Perl source in `runtime/host-perl.json`. Its module
+tree is relocatable without shared libperl. The builder moves the runtime and
+makes its original installation unavailable before testing module lookup; loaded
+modules and native libraries must remain inside the private tree. macOS native
+objects also pass architecture, Apple-only dependency and signature checks.
+
+`python3 tools/build_host_exiftool.py --server /absolute/path/to/server-build-output --perl /absolute/path/to/perl-build-output --output /absolute/path/to/new-exiftool-output`
+copies qualified server and Perl packages, checks their complete file inventories,
+and binds the packaged ExifTool Node module to sibling `perl/bin/perl`. The
+adaptation requires the approved vendor version and exact source fragments,
+records original/adapted hashes, and refuses system-interpreter fallback.
+Frameleaf-app source is unchanged. Windows uses the vendored executable instead;
+this Unix builder does not qualify it.
+
+`/absolute/path/to/private-node tools/qualify_host_exiftool.mjs /absolute/path/to/exiftool-build-output`
+checks the actual packaged `MetadataRepository` with synthetic JPEGs: Unicode
+metadata read/write, location removal, original and decoded-pixel preservation,
+and refusal when private Perl is missing. This passed on macOS ARM64 with Perl
+5.44.0 and exiftool-vendored 39.0.1. Component receipts remain non-redistributable;
+complete signed-host assembly and installed three-platform acceptance are pending.
