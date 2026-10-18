@@ -14,10 +14,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Compile and compare Windows process paths
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Compare pinned Node module loaders
         shell: pwsh
         run: |
-          rustc --edition 2021 tools/diagnostics/windows_process_paths.rs -o "$env:RUNNER_TEMP/process-paths.exe"
+          $env:FRAMELEAF_DIAGNOSTIC_NODE = (Get-Command node).Source
+          rustc --edition 2021 tools/diagnostics/windows_node_paths.rs -o "$env:RUNNER_TEMP/process-paths.exe"
           if ($LASTEXITCODE) { throw 'Diagnostic compilation failed' }
           & "$env:RUNNER_TEMP/process-paths.exe"
           if ($LASTEXITCODE) { throw 'Diagnostic failed' }
