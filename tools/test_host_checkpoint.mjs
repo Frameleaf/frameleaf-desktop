@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, writeFile, rm, readdir, realpath, symlink, link } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -258,4 +260,150 @@ test("owner cleanup control commands bind the exact runtime receipt and accept n
   for (const raw of ["{", "x".repeat(1025)])
     assert.throws(() => owner.checkpointControlRequest(f.c, raw), /host_checkpoint_request_invalid/);
   assert.deepEqual(await readFile(join(f.path, "database.dump")), f.bytes);
+});
+
+
+async function crashCheckpoint(f, phase) {
+  const agent = new URL('../runtime/host-agent.mjs', import.meta.url).href;
+  const program = `
+import { promises as fs } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { join } from 'node:path';
+let raw=''; for await (const chunk of process.stdin) { raw+=chunk; if(raw.length>8192)process.exit(90); }
+const {c,operationId,phase}=JSON.parse(raw);
+const target=join(c.state,'checkpoints',operationId);
+const rename=fs.rename, unlink=fs.unlink;
+fs.rename=async(from,to)=>{if(phase==='complete'&&to===target)process.exit(72);return rename(from,to);};
+fs.unlink=async path=>{if(phase==='published'&&path===join(target,'checkpoint-attempt.json'))process.exit(73);return unlink(path);};
+syncBuiltinESMExports();
+const {createHostCheckpoint}=await import(${JSON.stringify(agent)});
+await createHostCheckpoint(c,operationId,async args=>{
+ if(args.includes('--format=custom')) {
+  await fs.writeFile(args[args.indexOf('--file')+1],'synthetic custom database dump');
+  if(phase==='dump')process.exit(71);
+ }
+});
+`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', program], {
+    env: process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot, PATH: '' } : { PATH: '' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  child.stdout.resume(); child.stderr.resume();
+  const closed = once(child, 'close');
+  const timeout = setTimeout(() => child.kill(), 10000);
+  try {
+    child.stdin.end(JSON.stringify({ c: f.c, operationId, phase }));
+    const [code, signal] = await closed;
+    assert.equal(signal, null);
+    assert.equal(code, { dump: 71, complete: 72, published: 73 }[phase]);
+  } finally { clearTimeout(timeout); if(child.exitCode===null)child.kill(); }
+}
+
+test('an interrupted checkpoint dump reconciles only its durable owned attempt before retry', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'dump');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  assert.ok((await readdir(partial)).includes('checkpoint-attempt.json'));
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  assert.equal(receipt.dump.sha256, createHash('sha256').update(f.bytes).digest('hex'));
+  assert.equal(f.calls.length, 2);
+  assert.deepEqual((await readdir(f.path)).sort(), ['checkpoint.json','database.dump']);
+  await assert.rejects(readdir(partial), { code: 'ENOENT' });
+});
+
+test('a completed unpublished checkpoint is adopted after a crash without dumping again', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'complete');
+  const receipt = await createHostCheckpoint(f.c, operationId, async () => assert.fail('completed checkpoint must not regenerate'));
+  assert.equal(receipt.dump.sha256, createHash('sha256').update(f.bytes).digest('hex'));
+  assert.deepEqual((await readdir(f.path)).sort(), ['checkpoint.json','database.dump']);
+});
+
+test('a published checkpoint finishes interrupted intent removal without dumping again', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'published');
+  assert.ok((await readdir(f.path)).includes('checkpoint-attempt.json'));
+  const receipt = await createHostCheckpoint(f.c, operationId, async () => assert.fail('published checkpoint must not regenerate'));
+  assert.equal(receipt.dump.sha256, createHash('sha256').update(f.bytes).digest('hex'));
+  assert.deepEqual((await readdir(f.path)).sort(), ['checkpoint.json','database.dump']);
+});
+
+test('unfinished recovery preserves unexpected files and foreign runtime attempts', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'dump');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  await assert.rejects(createHostCheckpoint({ ...f.c, manifestSha256: 'c'.repeat(64) }, operationId,
+    async () => assert.fail('foreign runtime must not execute')), /host_checkpoint_changed/);
+  await writeFile(join(partial, 'foreign'), 'keep', { mode: 0o600 });
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_changed/);
+  assert.equal(await readFile(join(partial, 'foreign'), 'utf8'), 'keep');
+  assert.deepEqual(await readFile(join(partial, 'database.dump')), f.bytes);
+  assert.equal(f.calls.length, 0);
+});
+
+test('unfinished recovery refuses a replaced dump inode and keeps both files', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'dump');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  renameSync(join(partial, 'database.dump'), join(f.c.state, 'original.dump'));
+  await writeFile(join(partial, 'database.dump'), 'foreign bytes', { mode: 0o600 });
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_changed/);
+  assert.equal(await readFile(join(partial, 'database.dump'), 'utf8'), 'foreign bytes');
+  assert.deepEqual(await readFile(join(f.c.state, 'original.dump')), f.bytes);
+  assert.equal(f.calls.length, 0);
+});
+
+test('unfinished recovery refuses a hardlinked owned dump', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'dump');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  await link(join(partial, 'database.dump'), join(f.c.state, 'linked.dump'));
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_changed/);
+  assert.deepEqual(await readFile(join(f.c.state, 'linked.dump')), f.bytes);
+  assert.deepEqual(await readFile(join(partial, 'database.dump')), f.bytes);
+  assert.equal(f.calls.length, 0);
+});
+
+test('a corrupted completed record stays intact and cannot trigger another dump', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'complete');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  await writeFile(join(partial, 'checkpoint.json'), '{');
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute));
+  assert.equal(await readFile(join(partial, 'checkpoint.json'), 'utf8'), '{');
+  assert.deepEqual(await readFile(join(partial, 'database.dump')), f.bytes);
+  assert.equal(f.calls.length, 0);
+});
+
+test('a copied intent cannot grant ownership of a replacement directory', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'dump');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  renameSync(partial, partial + '-original');
+  await mkdir(partial, { mode: 0o700 });
+  for (const name of await readdir(partial + '-original'))
+    await writeFile(join(partial, name), await readFile(join(partial + '-original', name)), { mode: 0o600 });
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_changed/);
+  assert.deepEqual(await readFile(join(partial, 'database.dump')), f.bytes);
+  assert.deepEqual(await readFile(join(partial + '-original', 'database.dump')), f.bytes);
+  assert.equal(f.calls.length, 0);
+});
+
+test('interrupted incomplete-attempt deletion resumes from the matching remaining files', async t => {
+  const f = await fixture(t);
+  await crashCheckpoint(f, 'dump');
+  const partial = join(f.c.state, 'checkpoints', '.' + operationId + '.partial');
+  const original = filesystem.unlink;
+  filesystem.unlink = async path => {
+    if (path === join(partial, '.checkpoint-record.partial')) throw Error('synthetic interrupted discard');
+    return original(path);
+  };
+  syncBuiltinESMExports();
+  try { await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /synthetic interrupted discard/); }
+  finally { filesystem.unlink = original; syncBuiltinESMExports(); }
+  assert.deepEqual((await readdir(partial)).sort(), ['.checkpoint-record.partial', 'checkpoint-attempt.json']);
+  assert.equal(f.calls.length, 0);
+  await createHostCheckpoint(f.c, operationId, f.execute);
+  assert.deepEqual((await readdir(f.path)).sort(), ['checkpoint.json', 'database.dump']);
+  assert.equal(f.calls.length, 2);
 });

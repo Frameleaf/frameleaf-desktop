@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { createServer } from "node:net";
 import { delimiter, isAbsolute, join, dirname, basename } from "node:path";
 import { createInterface } from "node:readline";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const fail = (code) => {
   throw new Error(code);
@@ -263,6 +263,72 @@ export async function cleanupHostCheckpoint(c, supplied) {
   return { ...expected, state: "checkpoint-cleaned" };
 }
 
+async function checkpointIdentity(path, directory = false) {
+  const meta = await fs.lstat(path, { bigint: true });
+  if (meta.isSymbolicLink() || (directory ? !meta.isDirectory() : !meta.isFile() || meta.nlink !== 1n) ||
+    meta.ino <= 0n || (process.platform !== "win32" && (meta.mode & 0o077n) !== 0n) ||
+    await fs.realpath(path) !== path) fail("host_checkpoint_changed");
+  return `${meta.dev}:${meta.ino}`;
+}
+async function checkpointAttempt(path, binding) {
+  const names = (await fs.readdir(path)).sort();
+  if (!names.includes("checkpoint-attempt.json") ||
+    names.some(name => !["checkpoint-attempt.json", "database.dump", ".checkpoint-record.partial", "checkpoint.json"].includes(name)) ||
+    (names.includes("checkpoint.json") && (!names.includes("database.dump") || names.includes(".checkpoint-record.partial"))))
+    fail("host_checkpoint_changed");
+  const marker = join(path, "checkpoint-attempt.json"), identity = await checkpointIdentity(marker);
+  const value = JSON.parse(await stateFile(marker, 8192));
+  if (!value || Object.keys(value).sort().join(",") !== "binding,files,schemaVersion" || value.schemaVersion !== 1 ||
+    !value.binding || Object.keys(value.binding).sort().join(",") !== Object.keys(binding).sort().join(",") ||
+    Object.entries(binding).some(([key, item]) => value.binding[key] !== item) ||
+    !value.files || Object.keys(value.files).sort().join(",") !== "directory,dump,intent,record" ||
+    Object.values(value.files).some(item => typeof item !== "string" || !/^[0-9]+:[1-9][0-9]*$/.test(item)) ||
+    value.files.intent !== identity || await checkpointIdentity(marker) !== identity ||
+    await checkpointIdentity(path, true) !== value.files.directory) fail("host_checkpoint_changed");
+  for (const name of names) {
+    const key = name === "database.dump" ? "dump" : name === "checkpoint-attempt.json" ? "intent" : "record";
+    if (await checkpointIdentity(join(path, name)) !== value.files[key]) fail("host_checkpoint_changed");
+  }
+  return { names, files: value.files };
+}
+async function checkpointReceipt(path, c, operationId, check) {
+  const directory = await checkpointIdentity(path, true);
+  const record = await checkpointIdentity(join(path, "checkpoint.json"));
+  const receipt = retirementReceipt(c, JSON.parse(await stateFile(join(path, "checkpoint.json"), 4096)));
+  if (receipt.operationId !== operationId) fail("host_checkpoint_changed");
+  const actual = await checkpointHash(join(path, "database.dump"), check);
+  check();
+  if (actual.bytes !== receipt.dump.bytes || actual.sha256 !== receipt.dump.sha256 ||
+    await checkpointIdentity(path, true) !== directory ||
+    await checkpointIdentity(join(path, "checkpoint.json")) !== record) fail("host_checkpoint_changed");
+  return receipt;
+}
+async function discardCheckpointAttempt(path, binding) {
+  let attempt = await checkpointAttempt(path, binding);
+  if (attempt.names.includes("checkpoint.json")) fail("host_checkpoint_changed");
+  for (const name of ["database.dump", ".checkpoint-record.partial"]) {
+    attempt = await checkpointAttempt(path, binding);
+    if (attempt.names.includes(name)) await fs.unlink(join(path, name));
+  }
+  await checkpointAttempt(path, binding);
+  await checkpointSyncDirectory(path);
+  // Move the empty intent aside before removing it so a crash cannot block the canonical retry path.
+  const empty = join(dirname(path), "." + binding.operationId + "." + randomUUID() + ".empty");
+  await fs.rename(path, empty);
+  await checkpointSyncDirectory(dirname(path));
+  await checkpointAttempt(empty, binding);
+  await fs.unlink(join(empty, "checkpoint-attempt.json"));
+  await fs.rmdir(empty);
+  await checkpointSyncDirectory(dirname(path));
+}
+async function finishCheckpointAttempt(path, binding) {
+  await checkpointAttempt(path, binding);
+  await checkpointSyncDirectory(path);
+  await checkpointSyncDirectory(dirname(path));
+  await fs.unlink(join(path, "checkpoint-attempt.json"));
+  await checkpointSyncDirectory(path);
+}
+
 /** Called only by the live owner, which serializes requests and owns the database process tree. */
 export async function createHostCheckpoint(c, operationId, execute, cancelled = () => false) {
   validateConfig(c);
@@ -272,54 +338,93 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
   await checkpointDirectory(c.state);
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root, true);
+  if (await fs.realpath(c.state) !== c.state || await fs.realpath(root) !== root) fail("host_checkpoint_changed");
   await checkpointSyncDirectory(c.state);
   // Any retirement intent forbids regenerating a different live dump under the same operation ID.
   try {
     await fs.lstat(join(root, "." + operationId + ".retired.json"));
     fail("host_checkpoint_retired");
   } catch (error) { if (error.code !== "ENOENT") throw error; }
-  const target = join(root, operationId);
+  const target = join(root, operationId), staging = join(root, "." + operationId + ".partial");
   const binding = { schemaVersion: 1, operationId, manifestSha256: c.manifestSha256,
     sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor, databaseFormat: "frameleaf-canonical" };
   let existing = false;
   try { await fs.lstat(target); existing = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
   if (existing) {
     await checkpointDirectory(target);
-    if ((await fs.readdir(target)).sort().join(",") !== "checkpoint.json,database.dump") fail("host_checkpoint_changed");
-    const receipt = JSON.parse(await stateFile(join(target, "checkpoint.json"), 4096));
-    if (!receipt || Object.keys(receipt).length !== Object.keys(binding).length + 1 ||
-      Object.entries(binding).some(([key, value]) => receipt[key] !== value) ||
-      !receipt.dump || Object.keys(receipt.dump).sort().join(",") !== "bytes,sha256") fail("host_checkpoint_changed");
-    const actual = await checkpointHash(join(target, "database.dump"), check);
-    if (actual.bytes !== receipt.dump.bytes || actual.sha256 !== receipt.dump.sha256) fail("host_checkpoint_changed");
-    check(); return receipt;
+    const names = (await fs.readdir(target)).sort().join(",");
+    if (names !== "checkpoint.json,database.dump" && names !== "checkpoint-attempt.json,checkpoint.json,database.dump")
+      fail("host_checkpoint_changed");
+    if (names.includes("checkpoint-attempt.json")) await checkpointAttempt(target, binding);
+    const receipt = await checkpointReceipt(target, c, operationId, check);
+    if (names.includes("checkpoint-attempt.json")) await finishCheckpointAttempt(target, binding);
+    return receipt;
   }
-  const staging = join(root, "." + operationId + ".partial");
-  // shortcut: crash-abandoned staging is retained; Manager recovery must verify it before cleanup and retry.
-  await fs.mkdir(staging, { mode: 0o700 });
+  let partial = false;
+  try { await fs.lstat(staging); partial = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (partial) {
+    const attempt = await checkpointAttempt(staging, binding);
+    if (attempt.names.includes("checkpoint.json")) {
+      const receipt = await checkpointReceipt(staging, c, operationId, check);
+      await checkpointAttempt(staging, binding);
+      await fs.rename(staging, target);
+      await finishCheckpointAttempt(target, binding);
+      return receipt;
+    }
+    await discardCheckpointAttempt(staging, binding);
+    check();
+  }
+  // No database bytes enter the random preparation directory before the ownership intent is durable.
+  const preparing = await fs.mkdtemp(join(root, "." + operationId + ".preparing-"));
+  const files = { directory: await checkpointIdentity(preparing, true) };
+  for (const [key, name] of [["dump", "database.dump"], ["record", ".checkpoint-record.partial"], ["intent", "checkpoint-attempt.json"]]) {
+    const file = await fs.open(join(preparing, name), "wx", 0o600);
+    try { await file.sync(); } finally { await file.close(); }
+    files[key] = await checkpointIdentity(join(preparing, name));
+  }
+  const intent = await fs.open(join(preparing, "checkpoint-attempt.json"), constants.O_WRONLY | constants.O_NOFOLLOW);
+  try { await intent.writeFile(JSON.stringify({ schemaVersion: 1, binding, files }) + "\n"); await intent.sync(); }
+  finally { await intent.close(); }
+  await checkpointSyncDirectory(preparing);
+  await fs.rename(preparing, staging);
+  await checkpointSyncDirectory(root);
   try {
     const dump = join(staging, "database.dump");
-    const reserved = await fs.open(dump, "wx", 0o600); await reserved.close();
+    await checkpointAttempt(staging, binding);
     await execute([join(c.runtime, c.entryPoints.pgDump), "--host", "127.0.0.1", "--port", String(c.databasePort),
       "--username", "frameleaf", "--no-password", "--format=custom", "--file", dump, "frameleaf"], { PGPASSWORD: c.password });
     check();
+    await checkpointAttempt(staging, binding);
     await execute([join(c.runtime, c.entryPoints.pgRestore), "--list", dump], {});
     check();
     const file = await fs.open(dump, constants.O_RDWR | constants.O_NOFOLLOW);
-    try { await file.sync(); } finally { await file.close(); }
+    try {
+      const meta = await file.stat({ bigint: true });
+      if (`${meta.dev}:${meta.ino}` !== files.dump) fail("host_checkpoint_changed");
+      await file.sync();
+    } finally { await file.close(); }
     const receipt = { ...binding, dump: await checkpointHash(dump, check) };
-    const record = await fs.open(join(staging, "checkpoint.json"), "wx", 0o600);
-    try { await record.writeFile(JSON.stringify(receipt) + "\n"); await record.sync(); } finally { await record.close(); }
-    await checkpointSyncDirectory(staging); check();
+    await checkpointAttempt(staging, binding);
+    const record = await fs.open(join(staging, ".checkpoint-record.partial"), constants.O_WRONLY | constants.O_NOFOLLOW);
+    try {
+      const meta = await record.stat({ bigint: true });
+      if (`${meta.dev}:${meta.ino}` !== files.record) fail("host_checkpoint_changed");
+      await record.writeFile(JSON.stringify(receipt) + "\n"); await record.sync();
+    } finally { await record.close(); }
+    check();
+    await checkpointAttempt(staging, binding);
+    await fs.rename(join(staging, ".checkpoint-record.partial"), join(staging, "checkpoint.json"));
+    await checkpointSyncDirectory(staging);
     await fs.rename(staging, target);
-    await checkpointSyncDirectory(root);
+    await finishCheckpointAttempt(target, binding);
     return receipt;
-  } finally {
-    // Only paths created by this attempt are removed; an existing staging directory is never adopted.
-    for (const name of ["checkpoint.json", "database.dump"]) await fs.unlink(join(staging, name)).catch(error => {
-      if (error.code !== "ENOENT") throw error;
-    });
-    await fs.rmdir(staging).catch(error => { if (error.code !== "ENOENT") throw error; });
+  } catch (error) {
+    // Completed records are immutable retry evidence; never discard them after a publication failure.
+    try {
+      const attempt = await checkpointAttempt(staging, binding);
+      if (!attempt.names.includes("checkpoint.json")) await discardCheckpointAttempt(staging, binding);
+    } catch { /* Preserve any changed or published attempt for explicit recovery. */ }
+    throw error;
   }
 }
 export async function claimState(c) {
