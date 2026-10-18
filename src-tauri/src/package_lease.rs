@@ -167,6 +167,13 @@ pub(crate) struct Maintenance {
     _lease: File,
 }
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl Drop for Maintenance {
+    fn drop(&mut self) {
+        // A concurrent fork may retain this open file description until exec closes CLOEXEC copies.
+        let _ = self._lease.unlock();
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl Maintenance {
     pub(crate) fn acquire(candidate: &Path) -> Result<Self, String> {
         let file = open(candidate, LEASE, true)?;
@@ -301,6 +308,20 @@ mod tests {
         drop(writer);
         assert!(f.0.join(FENCE).exists());
         assert!(CodeLease::acquire(&f.0).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_drop_releases_a_lock_even_with_a_fork_style_descriptor_copy() {
+        let f = Fixture::new();
+        let writer = Maintenance::acquire(&f.0).unwrap();
+        writer.fence().unwrap();
+        let inherited = writer._lease.try_clone().unwrap();
+        drop(writer);
+        let replacement = Maintenance::acquire(&f.0).unwrap();
+        assert!(replacement.require_unfenced().is_err());
+        drop(replacement);
+        drop(inherited);
+        assert!(f.0.join(FENCE).exists());
     }
     #[test]
     fn malformed_fences_stay_closed_instead_of_being_discarded() {

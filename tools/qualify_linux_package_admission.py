@@ -50,7 +50,8 @@ def qualify(binary):
     try:
         invoke('missing-bootstrap')
         assert not (BASE / 'Runtimes').exists()
-        bootstrap.parent.mkdir(parents=True, mode=0o755)
+        for directory in [BASE / 'Bootstrap', bootstrap.parent]:
+            directory.mkdir(mode=0o755)
         shutil.copyfile(binary, bootstrap)
         bootstrap.chmod(0o755)
         invoke('fresh-package', success=True)
@@ -112,7 +113,11 @@ def main(arguments=None):
     arguments = sys.argv[1:] if arguments is None else arguments
     if len(arguments) != 1:
         raise RuntimeError('expected_built_controller_path')
-    qualify(arguments[0])
+    previous = os.umask(0o022)
+    try:
+        qualify(arguments[0])
+    finally:
+        os.umask(previous)
 
 
 if __name__ == '__main__':

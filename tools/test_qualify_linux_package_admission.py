@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 PATH = Path(__file__).with_name('qualify_linux_package_admission.py')
 SPEC = importlib.util.spec_from_file_location('linux_admission', PATH)
@@ -57,6 +58,56 @@ class AdmissionGuardTests(unittest.TestCase):
                     admission.qualify(__file__)
             self.assertFalse(base.exists())
             self.assertEqual(sibling.read_bytes(), b'outside fixture')
+
+    @unittest.skipUnless(os.name == 'posix', 'Linux qualification uses POSIX permissions')
+    def test_bootstrap_ancestors_are_protected_with_a_shared_runner_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / 'frameleaf'
+            calls = 0
+
+            def invoke(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return SimpleNamespace(returncode=1, stdout='{"state":"failed","code":"missing"}')
+                self.assertEqual((base / 'Bootstrap').stat().st_mode & 0o777, 0o755)
+                directories = list((base / 'Bootstrap').iterdir())
+                self.assertEqual(len(directories), 1)
+                self.assertEqual(directories[0].stat().st_mode & 0o777, 0o755)
+                raise RuntimeError('stop_after_metadata')
+
+            previous = os.umask(0o002)
+            try:
+                with patch.object(admission, 'BASE', base), patch.object(admission.subprocess, 'run', side_effect=invoke):
+                    with self.assertRaisesRegex(RuntimeError, 'stop_after_metadata'):
+                        admission.qualify(__file__)
+            finally:
+                os.umask(previous)
+            self.assertFalse(base.exists())
+
+    @unittest.skipUnless(os.name == 'posix', 'Linux qualification uses POSIX permissions')
+    def test_cli_protects_later_fixture_files_and_restores_umask_on_success_or_failure(self):
+        for failure in [False, True]:
+            with tempfile.TemporaryDirectory() as directory:
+                def fixture(_binary):
+                    for name in ['installation.json', 'retained-data', 'controller']:
+                        path = Path(directory) / name
+                        path.write_bytes(b'synthetic fixture')
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+                    if failure:
+                        raise RuntimeError('fixture_failed')
+
+                previous = os.umask(0o002)
+                try:
+                    with patch.object(admission, 'require_hosted_linux'), patch.object(admission, 'qualify', side_effect=fixture):
+                        if failure:
+                            with self.assertRaisesRegex(RuntimeError, 'fixture_failed'):
+                                admission.main(['synthetic-controller'])
+                        else:
+                            admission.main(['synthetic-controller'])
+                    self.assertEqual(os.umask(0o002), 0o002)
+                finally:
+                    os.umask(previous)
 
 
 if __name__ == '__main__':
