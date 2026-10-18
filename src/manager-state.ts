@@ -1,4 +1,7 @@
 export type Control = 'start' | 'stop' | 'restart' | 'backup';
+export function localProfilePending(state: string | undefined, requesting: boolean): boolean {
+  return requesting || state === 'provisioning';
+}
 export type ManagerView = {
   origin: string; managerId: string; deviceId: string; installationId: string;
   expiresAt: number; scopes: string[]; certificateSha256: string | null;

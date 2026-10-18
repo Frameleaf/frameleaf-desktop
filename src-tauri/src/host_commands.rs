@@ -39,6 +39,23 @@ pub(crate) async fn prepare_local_host(
     setup.start(manifest_sha256).await
 }
 #[tauri::command]
+pub(crate) async fn provision_local_host_profile(
+    window: WebviewWindow,
+    setup: State<'_, HostSetup>,
+    app: tauri::AppHandle,
+    manifest_sha256: String,
+) -> Result<View, String> {
+    require_local(&window)?;
+    let state = app.state::<crate::DesktopState>();
+    let current = state.0.lock().await;
+    if current.is_some()
+        || crate::credentials::load::<crate::connection::SavedConnection>("connection")?.is_some()
+    {
+        return Err("sign_out_before_switching_servers".into());
+    }
+    setup.provision(manifest_sha256).await
+}
+#[tauri::command]
 pub(crate) fn cancel_local_host_start(
     window: WebviewWindow,
     setup: State<'_, HostSetup>,

@@ -110,6 +110,20 @@ fn receipt_present(path: &std::path::Path) -> Result<bool, String> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn finalization_guard(
+    candidate: &std::path::Path,
+    finish_maintenance: bool,
+    verify: impl FnOnce() -> Result<(), String>,
+) -> Result<crate::package_lease::Maintenance, String> {
+    let guard = crate::package_lease::Maintenance::acquire(candidate)?;
+    if !finish_maintenance {
+        guard.require_unfenced()?;
+    }
+    verify()?;
+    Ok(guard)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn admit_versions(
     layout: &Layout,
     verify: impl FnOnce() -> Result<(), String>,
@@ -161,6 +175,7 @@ pub fn finalize(manifest: &str, controller: &str) -> Result<serde_json::Value, S
             manifest,
             controller,
             user,
+            true,
         )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -187,6 +202,12 @@ pub fn prepare_maintenance(manifest: &str, controller: &str) -> Result<serde_jso
         Err("host_install_platform_unsupported".into())
     }
 }
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_for_profile(record: &Installation) -> Result<(), String> {
+    let layout = record.layout()?;
+    let _lease = crate::package_lease::CodeLease::acquire(&layout.runtime)?;
+    posix::verify_resources(&layout, &record.manifest_sha256, &record.controller_sha256)
+}
 /// Linux installers explicitly select the account; a package-manager process has no console user.
 pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_json::Value, String> {
     #[cfg(target_os = "linux")]
@@ -198,7 +219,7 @@ pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_js
             return Err("host_install_controller_changed".into());
         }
         let user = posix::linux_user(uid)?;
-        posix::finalize(&record.layout()?, manifest, controller, Some(user))
+        posix::finalize(&record.layout()?, manifest, controller, Some(user), false)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -526,9 +547,12 @@ mod posix {
         manifest: &str,
         controller: &str,
         user: Option<(u32, u32)>,
+        finish_maintenance: bool,
     ) -> Result<serde_json::Value, String> {
-        verify_resources(layout, manifest, controller)?;
-        let writer = crate::package_lease::Maintenance::acquire(&layout.runtime)?;
+        protect(&layout.runtime, &mut BTreeSet::new())?;
+        let writer = finalization_guard(&layout.runtime, finish_maintenance, || {
+            verify_resources(layout, manifest, controller)
+        })?;
         root_directory(&layout.profiles)?;
         if let Some((uid, gid)) = user {
             let parent = layout.profiles.join(uid.to_string());
@@ -545,7 +569,9 @@ mod posix {
         {
             profiles_idle(layout)?;
         }
-        writer.finish()?;
+        if finish_maintenance {
+            writer.finish()?;
+        }
         Ok(
             serde_json::json!({"protocolVersion":1,"state":"resources-installed","profileReady":user.is_some(),"manifestSha256":manifest,"controllerSha256":controller,"serverStarted":false,"runtimeQualified":false,"redistributable":false}),
         )
@@ -555,6 +581,50 @@ mod posix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finalization_verifies_while_exclusive_and_refuses_fenced_profile_admission() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-finalization-{}", uuid::Uuid::new_v4()));
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir(&root).unwrap();
+        let guard = finalization_guard(&root, false, || {
+            assert!(
+                crate::package_lease::CodeLease::acquire(&root).is_err(),
+                "verification_must_hold_exclusive_package_lease"
+            );
+            Ok(())
+        })
+        .unwrap();
+        guard.fence().unwrap();
+        drop(guard);
+        let checked = std::cell::Cell::new(false);
+        assert!(finalization_guard(&root, false, || {
+            checked.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(
+            !checked.get(),
+            "a fenced profile must refuse before verification or writes"
+        );
+        assert!(root.join(".package-maintenance").exists());
+        let guard = finalization_guard(&root, true, || {
+            assert!(crate::package_lease::CodeLease::acquire(&root).is_err());
+            Ok(())
+        })
+        .unwrap();
+        guard.finish().unwrap();
+        drop(guard);
+        assert!(crate::package_lease::CodeLease::acquire(&root).is_ok());
+    }
     #[test]
     fn identical_install_can_reprovision_missing_profile_only_after_verification() {
         let root =

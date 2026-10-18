@@ -23,6 +23,8 @@ pub mod native_runtime;
 mod package_lease;
 pub mod photo_sources;
 mod process_tree;
+#[cfg(any(target_os = "linux", test))]
+mod profile_elevation;
 pub mod release_policy;
 mod resource_policy;
 pub mod runtime_store;
@@ -409,6 +411,7 @@ pub fn run() {
             host_commands::installed_local_hosts,
             host_commands::local_host_status,
             host_commands::prepare_local_host,
+            host_commands::provision_local_host_profile,
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
             connect_server,

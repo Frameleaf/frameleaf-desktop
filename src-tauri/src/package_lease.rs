@@ -182,6 +182,12 @@ impl Maintenance {
             .map_err(|_| "host_package_state_unavailable")?;
         sync_directory(&self.candidate)
     }
+    pub(crate) fn require_unfenced(&self) -> Result<(), String> {
+        match fs::symlink_metadata(self.candidate.join(FENCE)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err("host_package_maintenance".into()),
+        }
+    }
     pub(crate) fn finish(&self) -> Result<(), String> {
         match fs::symlink_metadata(self.candidate.join(FENCE)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -278,6 +284,23 @@ mod tests {
         child.0.kill().unwrap();
         child.0.wait().unwrap();
         Maintenance::acquire(&f.0).unwrap();
+    }
+    #[test]
+    fn profile_provisioning_never_clears_an_installers_persistent_fence() {
+        let f = Fixture::new();
+        let writer = Maintenance::acquire(&f.0).unwrap();
+        writer.require_unfenced().unwrap();
+        writer.fence().unwrap();
+        assert_eq!(
+            writer.require_unfenced().unwrap_err(),
+            "host_package_maintenance"
+        );
+        drop(writer);
+        let writer = Maintenance::acquire(&f.0).unwrap();
+        assert!(writer.require_unfenced().is_err());
+        drop(writer);
+        assert!(f.0.join(FENCE).exists());
+        assert!(CodeLease::acquire(&f.0).is_err());
     }
     #[test]
     fn malformed_fences_stay_closed_instead_of_being_discarded() {

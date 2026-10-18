@@ -30,4 +30,21 @@ fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
             assert_eq!(receipt["code"], expected);
         }
     }
+    for phase in ["--provision-install", "--provision-profile"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"))
+            .args([phase, &"a".repeat(64), &"b".repeat(64), "1000"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            receipt["code"],
+            if cfg!(target_os = "linux") {
+                "host_install_root_required"
+            } else {
+                "host_install_platform_unsupported"
+            }
+        );
+    }
 }
