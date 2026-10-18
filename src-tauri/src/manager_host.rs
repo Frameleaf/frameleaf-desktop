@@ -891,6 +891,7 @@ mod tests {
                 &configuration,
                 &identity,
                 Zeroizing::new(password.into()),
+                false,
                 None,
                 |_| Err("credential_store_locked_or_unavailable".into()),
             )
@@ -909,6 +910,7 @@ mod tests {
             &configuration,
             &identity,
             Zeroizing::new(password.into()),
+            false,
             None,
             |record| {
                 let encoded = Zeroizing::new(serde_json::to_string(record).unwrap());
@@ -966,6 +968,7 @@ mod tests {
             &configuration,
             &identity,
             Zeroizing::new(password.into()),
+            false,
             Some(stored),
             |_| panic!("existing grant must not be replaced"),
         )
@@ -1009,6 +1012,7 @@ mod tests {
                 &configuration,
                 &identity,
                 Zeroizing::new(password.into()),
+                false,
                 Some(existing),
                 |_| panic!("must preserve existing pairing"),
             )

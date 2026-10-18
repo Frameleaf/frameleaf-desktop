@@ -31,6 +31,7 @@ pub(crate) async fn pair_manager(
     password: String,
     certificate: Option<manager::CertificateTrust>,
     allow_management: bool,
+    allow_recovery: bool,
 ) -> Result<manager::View, String> {
     require_local(&window)?;
     if !allow_management {
@@ -48,9 +49,14 @@ pub(crate) async fn pair_manager(
     // Confirm secure writes before sending a Manager password; no plaintext fallback.
     credentials::save("manager-pairing-check", &true)?;
     credentials::delete("manager-pairing-check")?;
-    manager::pair(&identity, &origin, password, certificate, |saved| {
-        credentials::save(manager::CREDENTIAL, saved)
-    })
+    manager::pair(
+        &identity,
+        &origin,
+        password,
+        certificate,
+        allow_recovery,
+        |saved| credentials::save(manager::CREDENTIAL, saved),
+    )
     .await
 }
 #[tauri::command]

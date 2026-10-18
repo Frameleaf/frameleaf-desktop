@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
-  import { controlIntent, restoreIntent, intentKey, managerError, type Control, type Intent, type ManagerView, type ManagerStatus, type Operation } from './manager-state';
+  import { controlIntent, restoreIntent, intentKey, managerError, type Control, type Intent, type ManagerView, type ManagerStatus, type Operation, backupReviewIntent, restoreBackupReview, backupReviewKey, type BackupEntry, type BackupReviewIntent, type BackupReview } from './manager-state';
   const native = isTauri();
   const labels: Record<Control, string> = { start: 'Start server', stop: 'Stop server', restart: 'Restart server', backup: 'Create database backup' };
   const outcomes: Record<Control, string> = { start: 'Start operation completed. Check Photos to confirm it is ready.', stop: 'Server stop completed.', restart: 'Restart operation completed. Check Photos to confirm it is ready.', backup: 'Database backup completed. Photos and videos are not included.' };
@@ -29,24 +29,31 @@
   let fingerprintPem = $state('');
   let certificateApproved = $state(false);
   let allowManagement = $state(false);
+  let allowRecovery = $state(false);
+  let backups = $state<BackupEntry[]>([]);
+  let backupsChecked = $state(false);
+  let selectedBackup = $state('');
+  let recoveryIntent = $state<BackupReviewIntent | null>(null);
+  let recovery = $state<BackupReview | null>(null);
   let busy = $state(false);
   let failure = $state('');
   let notice = $state('');
   let confirmation = $state<Control | null>(null);
   let authorization = $state<'authorize' | 'disconnect' | null>(null);
+  let recoveryAuthorization = $state(false);
   let checkedAt = $state<number | null>(null);
   let deviceChanged = $state(false);
   const active = $derived(!!pending || (!!operation && operation.state !== 'complete'));
   const expired = $derived(!!manager && manager.expiresAt <= Date.now());
   const library = $derived(status?.installation.name || 'your server');
 
-  async function perform(work: () => Promise<void>) {
+  async function perform(work: () => Promise<void>, recoveryAction = false) {
     if (busy || !native) return;
     busy = true; failure = ''; notice = '';
     try { await work(); }
     catch (error) {
       failure = managerError(error);
-      if (error === 'manager_recent_auth_required') authorization = 'authorize';
+      if (error === 'manager_recent_auth_required') { authorization = 'authorize'; recoveryAuthorization = recoveryAction; }
       if (error === 'manager_device_changed') { deviceChanged = true; confirmation = null; authorization = 'disconnect'; }
     } finally { busy = false; }
   }
@@ -91,6 +98,9 @@
     try { pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager); }
     catch { throw Error('manager_local_state_unavailable'); }
     await checkStatus();
+    try { recoveryIntent = restoreBackupReview(localStorage.getItem(backupReviewKey(manager)), manager); }
+    catch { throw Error('manager_local_state_unavailable'); }
+    if (recoveryIntent) selectedBackup = recoveryIntent.snapshot;
   }
   onMount(() => { if (native) void perform(restore); });
   async function reviewCertificate() {
@@ -105,7 +115,7 @@
     const secret = password; password = '';
     await perform(async () => {
       if (pem.trim() && (!certificateApproved || !fingerprint || pem !== fingerprintPem)) throw Error('manager_certificate_approval_required');
-      manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement });
+      manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery });
       pem = ''; fingerprint = ''; fingerprintPem = ''; certificateApproved = false;
       pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager);
       await checkStatus();
@@ -145,17 +155,44 @@
     await perform(async () => {
       if (authorization === 'disconnect') {
         await invoke('disconnect_manager', { password: secret });
-        manager = null; status = null; pending = null; operation = null; checkedAt = null; allowManagement = false;
+        manager = null; status = null; pending = null; operation = null; checkedAt = null; allowManagement = false; allowRecovery = false; backups = []; backupsChecked = false; recoveryIntent = null; recovery = null; selectedBackup = '';
         notice = 'Manager access was revoked and removed from this computer.';
       } else {
         await invoke('reauthenticate_manager', { password: secret });
         authorization = null;
-        if (pending && (operation?.state === 'failed' || operation?.state === 'interrupted')) await resume();
+        if (recoveryAuthorization) { recoveryAuthorization = false; if (recoveryIntent) await checkReview(); else await listBackups(); }
+        else if (pending && (operation?.state === 'failed' || operation?.state === 'interrupted')) await resume();
         else if (pending) await sendPending();
+        else if (recoveryIntent) await checkReview();
         else notice = 'Manager actions authorized. Choose the action you need.';
       }
       authorization = null;
     });
+  }
+  async function listBackups() {
+    backups = await invoke<BackupEntry[]>('manager_request', { command: { kind: 'backups' } });
+    backupsChecked = true;
+    if (!recoveryIntent) selectedBackup = backups[0]?.id || '';
+  }
+  async function checkReview() {
+    if (!manager || !recoveryIntent) return;
+    await invoke('manager_request', { command: { kind: 'review-restore', snapshot: recoveryIntent.snapshot, key: recoveryIntent.key } });
+    recovery = await invoke<BackupReview>('manager_request', { command: { kind: 'restore-review', id: recoveryIntent.key, snapshot: recoveryIntent.snapshot } });
+  }
+  async function beginReview() {
+    if (!manager) return;
+    const intent = backupReviewIntent(manager, selectedBackup, recoveryIntent);
+    try { localStorage.setItem(backupReviewKey(manager), JSON.stringify(intent)); }
+    catch { throw Error('manager_local_state_unavailable'); }
+    recoveryIntent = intent;
+    recovery = null;
+    await checkReview();
+  }
+  function clearReview() {
+    if (!manager) return;
+    try { localStorage.removeItem(backupReviewKey(manager)); }
+    catch { throw Error('manager_local_state_unavailable'); }
+    recoveryIntent = null; recovery = null;
   }
 </script>
 
@@ -202,17 +239,47 @@
         {/if}
       </div>
     {/if}
+    <section class="operation" aria-label="Database backup reviews">
+      <h3>Review a database backup</h3>
+      <p class="footnote">Check a backup before recovery. Photos and videos are not included.</p>
+      {#if !manager.scopes.includes('restore')}
+        <p class="footnote">Backup recovery permission was not granted. To enable reviews, disconnect Manager and pair again with recovery permission.</p>
+      {:else}
+        <button class="secondary" disabled={busy || expired || deviceChanged} onclick={() => perform(listBackups, true)}>Load database backups</button>
+        {#if backupsChecked && backups.length === 0}<p>No database backups were found.</p>{/if}
+        {#if backups.length && !recoveryIntent}
+          <div class="backup-picker"><label for="manager-review-snapshot">Database backup</label>
+          <select id="manager-review-snapshot" bind:value={selectedBackup} disabled={busy}>
+            {#each backups as backup}<option value={backup.id}>{new Date(backup.time).toLocaleString()} · {backup.id.slice(0, 12)}</option>{/each}
+          </select>
+          <button class="secondary" disabled={busy || expired || deviceChanged || !selectedBackup} onclick={() => perform(beginReview, true)}>Review selected backup</button></div>
+        {/if}
+        {#if recoveryIntent}
+          <p class="footnote">Backup <code>{recoveryIntent.snapshot.slice(0, 12)}</code></p>
+          <p role="status">{!recovery ? 'Review outcome has not been checked.' : recovery.state === 'preparing' ? 'Backup review is in progress. Check again when ready.' : recovery.state === 'prepared' ? 'Backup review is ready.' : recovery.state === 'expired' ? 'This review expired. Start a new review.' : recovery.state === 'interrupted' ? 'Manager restarted before the review finished. Start a new review.' : 'The backup could not be verified. Check the backup before starting another review.'}</p>
+          {#if recovery?.state === 'prepared'}
+            <p>Backup created {new Date(recovery.createdAt).toLocaleString()}.</p>
+            <p>{recovery.requiresRuntimeChange ? `This backup requires a runtime change from ${recovery.targetRelease} to ${recovery.release}.` : `Backup metadata matches ${recovery.targetRelease}.`}</p>
+            <p class="footnote">Review valid until {new Date(recovery.expires).toLocaleTimeString()}. Restoring a backup is not enabled yet.</p>
+          {/if}
+          <div class="manager-actions">
+            <button class="secondary" disabled={busy || expired || deviceChanged} onclick={() => perform(checkReview, true)}>Check backup review</button>
+            {#if recovery && recovery.state !== 'preparing'}<button class="text-button" disabled={busy} onclick={() => perform(async () => clearReview())}>Choose another backup</button>{/if}
+          </div>
+        {/if}
+      {/if}
+    </section>
     <div class="manager-actions">
       <button class="text-button" disabled={busy} onclick={() => perform(checkStatus)}>Refresh Manager</button>
-      <button class="text-button" disabled={busy || expired || deviceChanged} onclick={() => { password = ''; authorization = 'authorize'; }}>Authorize actions</button>
+      <button class="text-button" disabled={busy || expired || deviceChanged} onclick={() => { password = ''; recoveryAuthorization = false; authorization = 'authorize'; }}>Authorize actions</button>
       <button class="text-button" disabled={busy} onclick={() => { password = ''; authorization = 'disconnect'; }}>Disconnect Manager</button>
     </div>
     {#if authorization}
       <form onsubmit={authorize} class="authorization">
-        <p>{authorization === 'disconnect' ? 'Revoke this computer’s Manager access? Server operations continue, and your photo sign-in stays separate.' : pending ? 'Enter your Manager password to authorize and continue this operation.' : 'Enter your Manager password to authorize server actions for five minutes.'}</p>
+        <p>{authorization === 'disconnect' ? 'Revoke this computer’s Manager access? Server operations continue, and your photo sign-in stays separate.' : recoveryAuthorization ? 'Enter your Manager password to authorize backup review.' : pending ? 'Enter your Manager password to authorize and continue this operation.' : 'Enter your Manager password to authorize server actions for five minutes.'}</p>
         <label for="manager-authorization-password">Manager password</label>
         <input id="manager-authorization-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" disabled={busy} />
-        <div class="manager-actions"><button class="primary" disabled={busy}>{authorization === 'disconnect' ? 'Revoke and disconnect' : pending ? 'Authorize and continue' : 'Authorize actions'}</button><button class="secondary" type="button" disabled={busy} onclick={() => { authorization = null; password = ''; }}>Cancel</button></div>
+        <div class="manager-actions"><button class="primary" disabled={busy}>{authorization === 'disconnect' ? 'Revoke and disconnect' : recoveryAuthorization ? 'Authorize and review' : pending ? 'Authorize and continue' : 'Authorize actions'}</button><button class="secondary" type="button" disabled={busy} onclick={() => { authorization = null; password = ''; }}>Cancel</button></div>
       </form>
     {/if}
   {:else}
@@ -235,6 +302,7 @@
           {/if}
         </details>
         <label class="check"><input type="checkbox" bind:checked={allowManagement} required />Allow this computer to start, stop and restart this server, and create database backups.</label>
+        <label class="check"><input type="checkbox" bind:checked={allowRecovery} />Also allow backup recovery reviews and restore operations.</label>
         <button class="primary" disabled={!allowManagement || (!!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
         <p class="footnote">Your Manager password is used for this sign-in and is not saved. The separate management grant stays in your computer’s secure credential store.</p>
       </fieldset>
@@ -248,6 +316,8 @@
   .detail { color: var(--muted); line-height: 1.6; margin: 12px 0 22px; }
   fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
   fieldset > label, details > label:not(.check) { display: block; font-size: 13px; font-weight: 600; margin-bottom: 7px; }
+  .backup-picker { display: grid; gap: 10px; margin: 14px 0; }
+  select { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--text); font: inherit; }
   textarea { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--text); font: inherit; resize: vertical; margin: 8px 0 14px; }
   details { margin: 4px 0 22px; }
   summary { cursor: pointer; font-size: 14px; }

@@ -51,6 +51,13 @@ export function managerError(error: unknown): string {
     manager_pair_again: 'This computer’s Manager access expired or was revoked. Disconnect and pair again with Manager.',
     manager_pairing_expired: 'This computer’s Manager access expired. Disconnect and pair again with Manager.',
     manager_scope_denied: 'This Manager grant does not allow that action.',
+    manager_recovery_approval_required: 'Disconnect Manager, then pair again with backup recovery permission.',
+    manager_recovery_unavailable: 'Backup review needs an updated native Frameleaf Manager.',
+    manager_review_busy: 'Another backup review is still running. Check its existing request.',
+    manager_review_changed: 'This review could not be matched to the current backup and installation.',
+    manager_review_failed: 'The backup could not be verified for recovery.',
+    manager_backup_unavailable: 'Database backups are not available in this Manager.',
+    manager_review_pending: 'Finish checking the current review before choosing another backup.',
     manager_operation_pending: 'Resolve the existing request before starting another action.',
     manager_operation_in_progress: 'Another Manager operation is active. Resolve it in Manager before starting a new action.',
     manager_operation_not_recoverable: 'This operation cannot be resumed now. Check its latest state in Manager.',
@@ -84,4 +91,30 @@ export function managerError(error: unknown): string {
     operation_interrupted: 'This operation was interrupted. Check its state, then resume when ready.',
   };
   return Object.hasOwn(messages, code) ? messages[code]! : 'Manager could not finish this request. Check its operation state before retrying.';
+}
+
+export type BackupEntry = { id: string; time: string };
+export type BackupReviewIntent = Pick<ManagerView, 'origin' | 'managerId' | 'deviceId' | 'installationId'> & { snapshot: string; key: string };
+export type BackupReview = { id: string; snapshot: string; installationId: string; expires: number } & (
+  { state: 'preparing' | 'failed' | 'expired' | 'interrupted' } |
+  { state: 'prepared'; libraryId: string; release: string; targetRelease: string; createdAt: number; mediaIncluded: false; requiresRuntimeChange: boolean }
+);
+export function backupReviewKey(manager: ManagerView) { return `frameleaf.manager-review:${manager.managerId}:${manager.installationId}`; }
+export function restoreBackupReview(raw: string | null, manager: ManagerView): BackupReviewIntent | null {
+  try {
+    if (!raw || raw.length > 2048) return null;
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'deviceId,installationId,key,managerId,origin,snapshot') return null;
+    if (value.origin !== manager.origin || value.managerId !== manager.managerId || value.deviceId !== manager.deviceId || value.installationId !== manager.installationId || !uuid(value.key) || value.key === '00000000-0000-0000-0000-000000000000' || typeof value.snapshot !== 'string' || !/^[a-f0-9]{64}$/.test(value.snapshot)) return null;
+    return value;
+  } catch { return null; }
+}
+export function backupReviewIntent(manager: ManagerView, snapshot: string, prior: BackupReviewIntent | null): BackupReviewIntent {
+  if (!manager.scopes.includes('restore')) throw Error('manager_scope_denied');
+  if (typeof snapshot !== 'string' || !/^[a-f0-9]{64}$/.test(snapshot)) throw Error('manager_request_invalid');
+  if (prior) {
+    if (prior.snapshot !== snapshot || !restoreBackupReview(JSON.stringify(prior), manager)) throw Error('manager_review_pending');
+    return prior;
+  }
+  return { origin: manager.origin, managerId: manager.managerId, deviceId: manager.deviceId, installationId: manager.installationId, snapshot, key: crypto.randomUUID() };
 }

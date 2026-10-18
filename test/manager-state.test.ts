@@ -33,3 +33,17 @@ test('remote or native diagnostic text is never echoed as a UI error',()=>{
 test('prototype property names cannot become UI error content',()=>{
  for(const code of ['constructor','toString','__proto__'])assert.equal(typeof managerError(code),'string');
 });
+
+test('backup review request keys survive retries and stay bound to Manager and snapshot', async () => {
+ const {backupReviewIntent,restoreBackupReview,backupReviewKey}=await import('../src/manager-state.ts');
+ const owner={...manager,scopes:[...manager.scopes,'restore']},snapshot='a'.repeat(64);
+ const intent=backupReviewIntent(owner,snapshot,null);
+ assert.equal(backupReviewIntent(owner,snapshot,intent).key,intent.key);
+ assert.deepEqual(restoreBackupReview(JSON.stringify(intent),owner),intent);
+ assert.equal(restoreBackupReview(JSON.stringify(intent),{...owner,installationId:'bbbbbbbbbbbb'}),null);
+ assert.equal(restoreBackupReview(JSON.stringify({...intent,path:'/private'}),owner),null);
+ assert.equal(restoreBackupReview(JSON.stringify({...intent,snapshot:[snapshot]}),owner),null);
+ assert.throws(()=>backupReviewIntent(manager,snapshot,null),/manager_scope_denied/);
+ assert.throws(()=>backupReviewIntent(owner,'b'.repeat(64),intent),/manager_review_pending/);
+ assert.notEqual(backupReviewKey(owner),intentKey(owner));
+});
