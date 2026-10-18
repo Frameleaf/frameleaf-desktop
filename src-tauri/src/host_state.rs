@@ -34,6 +34,12 @@ pub(crate) struct Owner {
     active: Option<Marker>,
     writable: bool,
 }
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the file description until its CLOEXEC copies close.
+        let _ = self.file.unlock();
+    }
+}
 fn identity(root: &Dir) -> Result<String, String> {
     let value =
         crate::copy_source::root_identity(root).map_err(|_| "host_profile_identity_unavailable")?;
