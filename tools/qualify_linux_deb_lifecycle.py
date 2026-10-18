@@ -17,9 +17,9 @@ BASE = Path('/opt/frameleaf')
 
 def require_failure(output, code):
     receipts = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
-    assert sum(isinstance(value, dict) and value.get('protocolVersion') == 1
-               and value.get('state') == 'failed' and value.get('code') == code
-               for value in receipts) == 1, (code, receipts)
+    failures = [value for value in receipts if isinstance(value, dict) and value.get('state') == 'failed']
+    assert failures and all(value.get('protocolVersion') == 1 and value.get('code') == code
+                            for value in failures), (code, receipts)
 
 
 def qualify(binary):

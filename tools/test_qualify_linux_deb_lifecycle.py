@@ -46,3 +46,10 @@ class LifecycleGuardTests(unittest.TestCase):
         for output in ['', 'host_signature_invalid', '{"state":"failed","code":"native_manager_unprotected"}', '{"state":"ready","code":"host_signature_invalid"}']:
             with self.subTest(output=output), self.assertRaises(AssertionError):
                 module.require_failure(output, 'host_signature_invalid')
+
+    def test_repeated_matching_abort_recovery_receipts_are_required_to_agree(self):
+        busy = '{"protocolVersion":1,"state":"failed","code":"host_package_busy"}\n'
+        module.require_failure(busy + busy, 'host_package_busy')
+        different = '{"protocolVersion":1,"state":"failed","code":"host_signature_invalid"}\n'
+        with self.assertRaises(AssertionError):
+            module.require_failure(busy + different, 'host_package_busy')
