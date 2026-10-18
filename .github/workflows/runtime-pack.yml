@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 25b22c16e47a27a2eb50017d838497abce850d11
+          ref: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -43,7 +43,7 @@ jobs:
       - name: Builder regression checks
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
-        run: python desktop/tools/build_runtime.py --source server --output candidate --revision 25b22c16e47a27a2eb50017d838497abce850d11 --epoch 4
+        run: python desktop/tools/build_runtime.py --source server --output candidate --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --epoch 6
       - name: Retain private validation receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
