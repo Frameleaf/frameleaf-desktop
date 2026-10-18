@@ -9,6 +9,10 @@ on:
         description: Run only Windows directory and shared-cache qualification
         type: boolean
         default: false
+      keystore_probe:
+        description: Qualify real OS credential persistence on disposable hosted runners
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -16,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   check:
-    if: ${{ !inputs.directory_probe }}
+    if: ${{ !inputs.directory_probe && !inputs.keystore_probe }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +78,7 @@ jobs:
           $restore = @($tests | Select-String '^host_state::activation::restore_qualification::actual_postgres_restore_selection_finalization_and_writer_admission: test$')
           if ($restore.Count -ne 1) { throw 'Windows real restore test is missing' }
       - name: Qualify privileged Linux package admission in disposable runner
-        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        if: runner.os == 'Linux'
         run: |
           sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /usr/bin/unshare --mount --propagation private /bin/sh -eu -c '
             [ -d /opt ]
@@ -97,7 +101,7 @@ jobs:
           if-no-files-found: error
 
   directory-probe:
-    if: ${{ inputs.directory_probe }}
+    if: ${{ inputs.directory_probe && !inputs.keystore_probe }}
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -119,3 +123,45 @@ jobs:
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib model_catalogue::tests::composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering -- --exact --nocapture
           if ($LASTEXITCODE) { throw 'Private shared model-cache composition failed' }
+
+  keystore-probe:
+    if: ${{ inputs.keystore_probe }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      FRAMELEAF_TEST_DISPOSABLE_KEYSTORE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Linux native dependencies and Secret Service
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev dbus-x11 gnome-keyring
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Verify the real credential fixture is compiled
+        shell: python
+        run: |
+          import subprocess
+          tests = subprocess.check_output(["cargo", "test", "--locked", "--manifest-path", "src-tauri/Cargo.toml", "--lib", "--", "--list"], text=True)
+          if tests.splitlines().count("credentials::qualification::disposable_runner_epoch_persistence: test") != 1:
+              raise SystemExit("Real credential qualification fixture is missing")
+      - name: Qualify actual macOS and Windows credential persistence
+        if: runner.os != 'Linux'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib credentials::qualification::disposable_runner_epoch_persistence -- --exact --ignored
+      - name: Qualify actual Linux Secret Service persistence
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            python3 -c "import secrets, sys; sys.stdout.write(secrets.token_hex(32))" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            cargo test --locked --manifest-path src-tauri/Cargo.toml --lib credentials::qualification::disposable_runner_epoch_persistence -- --exact --ignored
+          '

@@ -5,6 +5,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+#[path = "credential_epoch_qualification.rs"]
+mod qualification;
+
 static INSTALLATION_LOCK: Mutex<()> = Mutex::new(());
 static WORKER_LOCK: Mutex<()> = Mutex::new(());
 fn worker_lock(account: &str) -> Result<Option<MutexGuard<'static, ()>>, String> {
