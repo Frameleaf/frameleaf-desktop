@@ -852,3 +852,8 @@ bounded ancestor checks; drive/GUID aliases remain excluded from execution autho
 The existing alias-rebind regression and a hosted Node file/module/nested-process
 regression cover this boundary. Full bundled-host and installed Windows acceptance
 remain separate gates.
+
+Temporary native inspection and restore leases explicitly unlock on scope exit,
+as the controller journal lease already does. A descriptor duplicated by a
+concurrent fork must not keep a completed operation's lock alive. Active host
+ownership and package code leases keep their existing lifetime rules.
