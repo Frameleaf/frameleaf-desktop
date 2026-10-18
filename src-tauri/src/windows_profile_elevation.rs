@@ -149,8 +149,7 @@ pub(crate) fn provision(record: &crate::host_install::Installation) -> Result<()
     }
     for name in ["state", "manager"] {
         let path = layout.profiles.join(&sid).join(name);
-        crate::native_runtime::absolute_directory(&path)?;
-        crate::runtime_store::private_directory(&path)?;
+        crate::host_setup::require_leaf(&path)?;
     }
     Ok(())
 }

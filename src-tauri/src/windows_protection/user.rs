@@ -129,14 +129,27 @@ fn open(path: &Path) -> Result<File, String> {
 }
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
     let user = current_user()?;
-    account_directory(path, &user, false)
+    account_directory(path, &user, DirectoryMode::CreateOrReuse)
 }
 pub(crate) fn new_private_directory(path: &Path) -> Result<(), String> {
     let user = current_user()?;
-    account_directory(path, &user, true)
+    account_directory(path, &user, DirectoryMode::CreateNew)
+}
+pub(crate) fn require_private_directory(path: &Path) -> Result<(), String> {
+    let user = current_user()?;
+    account_directory(path, &user, DirectoryMode::ExistingOnly)
+}
+pub(crate) enum DirectoryMode {
+    CreateOrReuse,
+    CreateNew,
+    ExistingOnly,
 }
 /// Installer-only caller must validate the selected account and require administrator authority.
-pub(crate) fn account_directory(path: &Path, user: &[u8], create_new: bool) -> Result<(), String> {
+pub(crate) fn account_directory(
+    path: &Path,
+    user: &[u8],
+    mode: DirectoryMode,
+) -> Result<(), String> {
     if !super::sid_valid(user) {
         return Err(ERROR.into());
     }
@@ -162,7 +175,10 @@ pub(crate) fn account_directory(path: &Path, user: &[u8], create_new: bool) -> R
     }
     let path: PathBuf = parent.join(path.file_name().ok_or(ERROR)?);
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !matches!(mode, DirectoryMode::ExistingOnly) =>
+        {
             let security = descriptor(user)?;
             let attributes = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -177,7 +193,7 @@ pub(crate) fn account_directory(path: &Path, user: &[u8], create_new: bool) -> R
                 return Err(ERROR.into());
             }
         }
-        Ok(_) if create_new => return Err(ERROR.into()),
+        Ok(_) if matches!(mode, DirectoryMode::CreateNew) => return Err(ERROR.into()),
         Ok(_) => {}
         Err(_) => return Err(ERROR.into()),
     }
@@ -227,6 +243,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn existing_private_admission_never_recreates_a_directory_removed_after_inspection() {
+        let root = std::env::temp_dir().join(format!(
+            "frameleaf-existing-private-{}",
+            uuid::Uuid::new_v4()
+        ));
+        new_private_directory(&root).unwrap();
+        crate::native_runtime::absolute_directory(&root).unwrap();
+        fs::remove_dir(&root).unwrap();
+        assert!(require_private_directory(&root).is_err());
+        assert!(!root.exists());
     }
     #[test]
     fn exclusive_private_creation_refuses_existing_state_without_repair_or_deletion() {

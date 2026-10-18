@@ -172,7 +172,11 @@ pub(super) fn prepare(profiles: &Path, user: &Account) -> Result<(), String> {
         }
     }
     for name in ["state", "manager"] {
-        crate::windows_protection::account_directory(&parent.join(name), &user.sid, false)?;
+        crate::windows_protection::account_directory(
+            &parent.join(name),
+            &user.sid,
+            crate::windows_protection::DirectoryMode::CreateOrReuse,
+        )?;
     }
     Ok(())
 }

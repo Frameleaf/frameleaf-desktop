@@ -26,7 +26,7 @@
     if (value.startsWith('manager_') || value === 'native_manager_not_ready' || value === 'native_host_busy') return managerError(value);
     if (value === 'host_install_platform_unsupported') return 'Native server installation is not available on this platform in this build. You can connect to an existing server.';
     if (value === 'host_install_profile_required') return 'Run the server component installer while signed in to this computer, then try again.';
-    if (value === 'host_install_linux_profile_required') return 'Prepare a private server profile for your account before starting local management.';
+    if (value === 'host_install_linux_profile_required' || value === 'host_install_windows_profile_required') return 'Prepare a private server profile for your account before starting local management.';
     if (value === 'host_profile_authorization_cancelled') return 'System authorization was cancelled. You can try again.';
     if (value === 'host_profile_authorization_unavailable') return 'System authorization is unavailable. Check your desktop’s authorization service, then try again.';
     if (value === 'host_profile_prepare_failed') return 'The server profile could not be prepared. Check that your installed Frameleaf components are up to date. Your existing library has been preserved.';
@@ -118,7 +118,7 @@
   {#if failure}<p class="message error" role="alert">{failure}</p>{/if}
   {#if notice}<p class="message" role="status">{notice}</p>{/if}
   {#if profilePending}<p role="status">Finish or dismiss the system authorization request, then check installation to continue.</p>{/if}
-  {#if (view?.profileSetupAvailable && installations.length > 0 && (view.state === 'idle' || view.state === 'needs-attention')) || view?.code === 'host_install_linux_profile_required' || view?.code?.startsWith('host_profile_')}
+  {#if (view?.profileSetupAvailable && installations.length > 0 && (view.state === 'idle' || view.state === 'needs-attention')) || view?.code === 'host_install_linux_profile_required' || view?.code === 'host_install_windows_profile_required' || view?.code?.startsWith('host_profile_')}
     <p>Your system may ask for administrator authorization to create private server folders for your account. Frameleaf does not receive your administrator password. This step does not start the photo server.</p>
     <button class="primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare my server profile</button>
   {/if}
