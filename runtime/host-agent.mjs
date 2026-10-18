@@ -12,6 +12,7 @@ const fail = (code) => {
 };
 // Enable only after private Chromium, fonts and installed lifecycle qualification.
 const STUDIO_ENABLED = false;
+const RESTORE_SESSION = Symbol("private restore session");
 // Read only the dedicated child IPC channel; stdout is never readiness evidence.
 export function studioReadyUntil(message, engineDigest, now = Date.now()) {
   if (!message || message.protocolVersion !== 1)
@@ -692,8 +693,10 @@ export function ownHostServer(child) {
   };
 }
 
-export async function runHost(c, stopping, ready) {
+export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
+  if (restoreSession !== undefined && restoreSession?.[RESTORE_SESSION] !== true) fail("host_restore_authority_invalid");
+  const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
   if (c.mode === "checkpoint-cleanup") {
     // Require an existing owned profile; retirement must not provision or touch database state.
     await checkpointDirectory(c.state);
@@ -715,7 +718,7 @@ export async function runHost(c, stopping, ready) {
     return;
   }
   const databaseOnly = c.mode === "database";
-  if (!databaseOnly) await portFree(c.apiPort);
+  if (!databaseOnly && !restoreOnly) await portFree(c.apiPort);
   await portFree(c.databasePort);
   if (databaseOnly) {
     try {
@@ -737,7 +740,7 @@ export async function runHost(c, stopping, ready) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  for (const name of databaseOnly ? ["home"] : ["home", "media", "studio-trust", "studio-work"]) {
+  for (const name of databaseOnly || restoreOnly ? ["home"] : ["home", "media", "studio-trust", "studio-work"]) {
     const path = join(c.state, name);
     try {
       await fs.mkdir(path, { mode: 0o700 });
@@ -833,6 +836,7 @@ export async function runHost(c, stopping, ready) {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    if (restoreOnly && initialized) fail("host_restore_target_not_empty");
     if (databaseOnly && !initialized) fail("host_database_missing");
     if (!initialized) {
       try {
@@ -915,6 +919,7 @@ export async function runHost(c, stopping, ready) {
     );
     if (database.trim() !== "" && database.trim() !== "1")
       fail("host_database_provisioning_failed");
+    if (restoreOnly && database.trim() !== "") fail("host_restore_target_not_empty");
     if (databaseOnly && database.trim() === "") fail("host_database_missing");
     if (database.trim() === "")
       await command(
@@ -930,7 +935,25 @@ export async function runHost(c, stopping, ready) {
         ],
         { PGPASSWORD: c.password },
       );
-    if (!databaseOnly) {
+    if (restoreOnly) {
+      const input = await readHostRestoreInput(restoreSession.original, restoreSession.binding);
+      await command([executable("pgRestore"), "--list", input.dump], {}, false, {quiet:true, timeout:7_200_000});
+      await command([executable("pgRestore"), "--no-password", "--host", "127.0.0.1", "--port", String(c.databasePort),
+        "--username", "frameleaf", "--dbname", "frameleaf", "--single-transaction", "--exit-on-error", "--no-owner", "--no-acl", input.dump],
+        {PGPASSWORD:c.password}, false, {quiet:true, timeout:7_200_000});
+      await command([executable("node"), executable("server"), "frameleaf-admin", "restore-state"], {
+        DB_HOSTNAME:"127.0.0.1", DB_PORT:String(c.databasePort), DB_USERNAME:"frameleaf", DB_PASSWORD:c.password, DB_DATABASE_NAME:"frameleaf",
+        FRAMELEAF_MANAGER_ORIGIN:"restored_library", FRAMELEAF_MANAGER_INSTALLATION:restoreSession.binding.installationId,
+        FRAMELEAF_MANAGER_RESTORE_OPERATION_ID:restoreSession.binding.operationId,
+        FRAMELEAF_MEDIA_LOCATION:join(restoreSession.original.state,"media"), FRAMELEAF_BUILD_DATA:join(c.runtime,"build"),
+        FRAMELEAF_HDR_BINDING:executable("hdr"), FRAMELEAF_STUDIO_WORKER:"false",
+      }, false, {quiet:true, timeout:7_200_000});
+      const validation = JSON.parse(await command([executable("psql"), "-h", "127.0.0.1", "-p", String(c.databasePort), "-U", "frameleaf", "-d", "frameleaf", "-XAt", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT json_build_object('postgresMajor',current_setting('server_version_num')::int / 10000,'vectorVersion',(SELECT extversion FROM pg_extension WHERE extname='vector'),'canonical',to_regclass('public.user') IS NOT NULL AND to_regclass('public.asset') IS NOT NULL AND to_regclass('public.album') IS NOT NULL)"], {PGPASSWORD:c.password}));
+      if (validation.postgresMajor !== 19 || validation.vectorVersion !== "0.8.7" || validation.canonical !== true) fail("host_restore_database_invalid");
+      restoreSession.validation = {postgresMajor:19, vectorVersion:"0.8.7", canonical:true, executionStateReconstructed:true};
+    }
+    if (!databaseOnly && !restoreOnly) {
       app = launch(
         [executable("node"), executable("server")],
         {
@@ -1030,7 +1053,7 @@ export async function runHost(c, stopping, ready) {
   } finally {
     cancelled = true;
     await checkpointWork?.catch(() => {});
-    let stopError;
+    let stopError, restoreStopped = false;
     try {
       await studio?.stop();
     } catch (error) {
@@ -1067,6 +1090,7 @@ export async function runHost(c, stopping, ready) {
             {},
             true,
           );
+          restoreStopped = true;
         } catch {
           /* The OS owner terminates any remaining processes below. */
         }
@@ -1078,6 +1102,8 @@ export async function runHost(c, stopping, ready) {
         await exited(child, 5000);
       }
     await log.close();
+    if (restoreOnly && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
+      stopError ??= new Error("host_restore_shutdown_unconfirmed");
     if (stopError) throw stopError;
   }
 }
@@ -1196,4 +1222,43 @@ export async function readHostRestoreInput(c, supplied) {
     for (const [path, identity] of identities) if (await checkpointIdentity(path, true) !== identity) fail("host_restore_input_invalid");
     return { binding, recovery, dump };
   } catch { fail("host_restore_input_invalid"); }
+}
+
+
+/** Prepare a fresh logical target; activation is a separate reviewed, exclusive controller operation. */
+export async function restoreHostDatabase(configuration, supplied, stopping) {
+  const c = {...configuration, entryPoints:{...configuration.entryPoints}};
+  let cancelled = false;
+  void stopping.then(() => {cancelled=true;});
+  const input = await readHostRestoreInput(c, supplied);
+  if (cancelled) fail("host_restore_cancelled");
+  if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision) fail("host_restore_runtime_required");
+  const profileIdentity = await checkpointIdentity(c.state, true);
+  const root = join(c.state, "restore-targets"), operationRoot = join(root, input.binding.operationId);
+  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (await fs.realpath(path) !== path) fail("host_restore_input_invalid");}
+  const attemptId = randomUUID(), target = join(operationRoot, attemptId);
+  await fs.mkdir(target, {mode:0o700});
+  const targetIdentity = await checkpointIdentity(target, true);
+  const inner = {...c, state:target, mode:"server"};
+  await claimState(inner);
+  const intent = {schemaVersion:1, binding:input.binding, attemptId, profileIdentity, targetIdentity};
+  const record = await fs.open(join(target,"restore-target.json"),"wx",0o600);
+  try {await record.writeFile(JSON.stringify(intent)+"\n");await record.sync();} finally {await record.close();}
+  await checkpointSyncDirectory(target);await checkpointSyncDirectory(operationRoot);await checkpointSyncDirectory(root);
+  if (cancelled) fail("host_restore_cancelled");
+  const session = {[RESTORE_SESSION]:true, original:c, binding:input.binding};
+  let finish, prepared=false;
+  const finished = new Promise(resolve => {finish=resolve;});
+  await runHost(inner, Promise.race([stopping,finished]), () => {prepared=true;finish();}, session);
+  if (!prepared || cancelled || !session.validation) fail("host_restore_cancelled");
+  if (await checkpointIdentity(c.state,true) !== profileIdentity || await checkpointIdentity(target,true) !== targetIdentity) fail("host_restore_input_invalid");
+  await readHostRestoreInput(c,input.binding);
+  const receipt = {schemaVersion:1, state:"restore-prepared", binding:input.binding, attemptId, profileIdentity, targetIdentity,
+    databaseIdentity:await checkpointIdentity(join(target,"database"),true), validation:session.validation};
+  if (cancelled) fail("host_restore_cancelled");
+  const result = await fs.open(join(target,"restore-result.json"),"wx",0o600);
+  try {if (cancelled) fail("host_restore_cancelled");await result.writeFile(JSON.stringify(receipt)+"\n");await result.sync();} finally {await result.close();}
+  await checkpointSyncDirectory(target);await checkpointSyncDirectory(operationRoot);
+  if (cancelled) fail("host_restore_cancelled");
+  return receipt;
 }

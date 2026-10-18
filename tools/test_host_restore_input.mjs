@@ -4,6 +4,13 @@ import { mkdtemp,mkdir,realpath,readFile,writeFile,rm,symlink,link } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import subprocess from 'node:child_process';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { basename } from 'node:path';
+import filesystem from 'node:fs/promises';
 import * as owner from '../runtime/host-agent.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 async function fixture(t,run){
@@ -39,5 +46,145 @@ test('owner refuses malformed bindings, changed bytes, links and unknown restore
    const file=join(path,'input','database.dump'),other=join(c.state,'outside');await writeFile(other,await readFile(file),{mode:0o600});await rm(file);if(mutation==='link')await symlink(other,file);else await link(other,file);
   }
   await assert.rejects(owner.readHostRestoreInput(c,supplied),/host_restore_input_invalid/);
+ });
+});
+
+
+async function restoreFixture(t, run) {
+ await fixture(t,async f=>{
+  f.recovery.checkpoint.sourceRevision=f.c.sourceRevision;
+  f.binding.recoverySha256=digest(f.recovery);
+  await writeFile(join(f.path,'input','recovery.json'),JSON.stringify(f.recovery),{mode:0o600});
+  await writeFile(join(f.path,'restore-intent.json'),JSON.stringify(f.binding),{mode:0o600});
+  await mkdir(join(f.c.state,'database'),{mode:0o700});await writeFile(join(f.c.state,'database','sentinel'),'original database must survive',{mode:0o600});
+  const calls=[];let pg,exists=false,failRestore=false,canonical=true,failStop=false;
+  const original=subprocess.spawn;
+  subprocess.spawn=(file,args,options)=>{
+   const name=basename(file).replace(/\.exe$/,'');calls.push({name,args,options});
+   assert.ok(['initdb','postgres','pgIsready','psql','createdb','pgRestore','node','pgCtl'].includes(name),'unexpected process '+name);
+   const child=new EventEmitter();Object.assign(child,{pid:7000+calls.length,exitCode:null,signalCode:null,stdout:new PassThrough(),stderr:new PassThrough()});
+   const exit=(code=0)=>{if(child.exitCode!==null)return;child.exitCode=code;child.stdout.end();child.stderr.end();child.emit('exit',code,null);child.emit('close',code,null);};child.kill=()=>exit();
+   if(name==='postgres'){pg=child;exists=false;writeFileSync(join(args[args.indexOf('-D')+1],'postmaster.pid'),String(child.pid)+'\n');}
+   else queueMicrotask(()=>{
+    if(name==='initdb'){mkdirSync(args[args.indexOf('-D')+1],{mode:0o700});writeFileSync(join(args[args.indexOf('-D')+1],'PG_VERSION'),'19');}
+    if(name==='psql')child.stdout.write(args.at(-1).includes('pg_database')?(exists?'1\n':'\n'):JSON.stringify({postgresMajor:19,vectorVersion:'0.8.7',canonical})+'\n');
+    if(name==='createdb')exists=true;
+    if(name==='pgRestore'&&!args.includes('--list')&&failRestore){failRestore=false;exit(1);return;}
+    if(name==='node'){
+     assert.deepEqual(args.slice(1),['frameleaf-admin','restore-state']);
+     assert.equal(options.env.FRAMELEAF_MANAGER_ORIGIN,'restored_library');
+     assert.equal(options.env.FRAMELEAF_MANAGER_INSTALLATION,f.binding.installationId);
+     assert.equal(options.env.FRAMELEAF_MANAGER_RESTORE_OPERATION_ID,f.binding.operationId);
+    }
+    if(name==='pgCtl'){if(failStop){failStop=false;exit(1);return;}pg.kill();}exit();
+   });
+   return child;
+  };syncBuiltinESMExports();
+  try{await run({...f,calls,failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;}});}
+  finally{subprocess.spawn=original;syncBuiltinESMExports();pg?.kill();}
+ });
+}
+
+test('restore creates and validates a fresh cluster, drains it, and retains the original database',async t=>{
+ await restoreFixture(t,async({c,binding,calls})=>{
+  assert.equal(typeof owner.restoreHostDatabase,'function');
+  const receipt=await owner.restoreHostDatabase(c,binding,new Promise(()=>{}));
+  assert.equal(receipt.state,'restore-prepared');assert.deepEqual(receipt.binding,binding);
+  assert.equal(receipt.validation.executionStateReconstructed,true);
+  assert.equal(receipt.validation.canonical,true);
+  const data=calls.find(x=>x.name==='postgres').args[1];
+  assert.ok(data.startsWith(join(c.state,'restore-targets',binding.operationId)));
+  assert.notEqual(data,join(c.state,'database'));
+  assert.deepEqual(calls.map(x=>x.name),['initdb','postgres','pgIsready','psql','createdb','pgRestore','pgRestore','node','psql','pgCtl']);
+  const restore=calls.find(x=>x.name==='pgRestore'&&!x.args.includes('--list'));
+  for(const flag of ['--single-transaction','--exit-on-error','--no-owner','--no-acl'])assert.ok(restore.args.includes(flag));
+  assert.ok(!JSON.stringify(calls.map(x=>x.args)).includes(c.password));
+  assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+  assert.deepEqual(JSON.parse(await readFile(join(data,'..','restore-result.json'),'utf8')),receipt);
+ });
+});
+
+test('uncertain restore attempts are retained and a retry never replays into their database',async t=>{
+ await restoreFixture(t,async({c,binding,calls,failRestore})=>{
+  assert.equal(typeof owner.restoreHostDatabase,'function');failRestore();
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})));
+  const first=calls.find(x=>x.name==='postgres').args[1];
+  const receipt=await owner.restoreHostDatabase(c,binding,new Promise(()=>{}));
+  const starts=calls.filter(x=>x.name==='postgres');assert.equal(starts.length,2);assert.notEqual(starts[1].args[1],first);
+  assert.ok(await readFile(join(first,'PG_VERSION')));assert.equal(receipt.state,'restore-prepared');
+  assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+test('failed canonical validation cannot publish a prepared restore target',async t=>{
+ await restoreFixture(t,async({c,binding,calls,invalidSchema})=>{
+  assert.equal(typeof owner.restoreHostDatabase,'function');invalidSchema();
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),/host_restore_database_invalid/);
+  const data=calls.find(x=>x.name==='postgres').args[1];
+  await assert.rejects(readFile(join(data,'..','restore-result.json')),{code:'ENOENT'});
+  assert.equal(calls.at(-1).name,'pgCtl');
+ });
+});
+
+
+test('restore requires confirmed clean shutdown before publishing its result',async t=>{
+ await restoreFixture(t,async({c,binding,calls,failStop})=>{
+  failStop();
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),/host_restore_shutdown_unconfirmed/);
+  const data=calls.find(x=>x.name==='postgres').args[1];
+  await assert.rejects(readFile(join(data,'..','restore-result.json')),{code:'ENOENT'});
+ });
+});
+
+test('a cancelled restore cannot allocate a target or start a process',async t=>{
+ await restoreFixture(t,async({c,binding,calls})=>{
+  await assert.rejects(owner.restoreHostDatabase(c,binding,Promise.resolve()),/host_restore_cancelled/);
+  assert.deepEqual(calls,[]);
+  await assert.rejects(readFile(join(c.state,'restore-targets')),{code:'ENOENT'});
+  await assert.rejects(owner.runHost(c,new Promise(()=>{}),()=>assert.fail(),{}),/host_restore_authority_invalid/);
+ });
+});
+
+test('a backup requiring another runtime cannot be restored using the currently selected runtime',async t=>{
+ await restoreFixture(t,async({c,binding,recovery,path,calls})=>{
+  recovery.checkpoint.sourceRevision='e'.repeat(40);binding.recoverySha256=digest(recovery);
+  await writeFile(join(path,'input','recovery.json'),JSON.stringify(recovery),{mode:0o600});
+  await writeFile(join(path,'restore-intent.json'),JSON.stringify(binding),{mode:0o600});
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),/host_restore_runtime_required/);
+  assert.deepEqual(calls,[]);
+ });
+});
+
+
+test('cancellation during final input verification cannot publish a prepared target',async t=>{
+ await restoreFixture(t,async({c,binding,calls})=>{
+  let stop;const stopping=new Promise(resolve=>{stop=resolve;});
+  const original=filesystem.realpath;
+  const probe=t.mock.method(filesystem,'realpath',async(...args)=>{
+   const value=await original(...args);
+   if(args[0]===join(c.state,'restore-input')&&calls.at(-1)?.name==='pgCtl')stop();
+   return value;
+  });syncBuiltinESMExports();
+  try{await assert.rejects(owner.restoreHostDatabase(c,binding,stopping),/host_restore_cancelled/);}
+  finally{probe.mock.restore();syncBuiltinESMExports();}
+  const data=calls.find(x=>x.name==='postgres').args[1];
+  await assert.rejects(readFile(join(data,'..','restore-result.json')),{code:'ENOENT'});
+ });
+});
+
+test('cancellation during result sync cannot return a successful prepared target',async t=>{
+ await restoreFixture(t,async({c,binding})=>{
+  let stop;const stopping=new Promise(resolve=>{stop=resolve;});
+  const original=filesystem.open;
+  const probe=t.mock.method(filesystem,'open',async(...args)=>{
+   const handle=await original(...args);
+   if(String(args[0]).endsWith('/restore-result.json')){
+    const sync=handle.sync.bind(handle);
+    t.mock.method(handle,'sync',async()=>{await sync();stop();});
+   }
+   return handle;
+  });syncBuiltinESMExports();
+  try{await assert.rejects(owner.restoreHostDatabase(c,binding,stopping),/host_restore_cancelled/);}
+  finally{probe.mock.restore();syncBuiltinESMExports();}
  });
 });
