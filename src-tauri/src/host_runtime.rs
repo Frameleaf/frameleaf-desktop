@@ -574,12 +574,14 @@ pub(crate) enum HostMode {
     #[default]
     Server,
     Database,
+    CheckpointCleanup,
 }
 impl HostMode {
     pub(crate) fn ready_state(self) -> &'static str {
         match self {
             Self::Server => "running",
             Self::Database => "database-ready",
+            Self::CheckpointCleanup => "checkpoint-cleanup-ready",
         }
     }
 }
@@ -704,12 +706,18 @@ impl VerifiedHostRuntime {
             self.root.parent().ok_or("native_manager_layout_invalid")?,
         )?;
         crate::runtime_store::private_directory(state)?;
-        crate::host_storage::check(state)?;
-        let database = state.join("database");
-        match std::fs::symlink_metadata(&database) {
-            Ok(_) => crate::host_storage::check(&database)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("host_storage_unavailable".into()),
+        if mode == HostMode::CheckpointCleanup {
+            crate::host_storage::check_cleanup(state)?;
+        } else {
+            crate::host_storage::check(state)?;
+        }
+        if mode != HostMode::CheckpointCleanup {
+            let database = state.join("database");
+            match std::fs::symlink_metadata(&database) {
+                Ok(_) => crate::host_storage::check(&database)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("host_storage_unavailable".into()),
+            }
         }
         let lease = private_file(&state.join("lease.lock"), false)?;
         lease.try_lock().map_err(|_| "host_already_owned")?;
@@ -1130,6 +1138,15 @@ mod checkpoint_tests {
             (HostMode::Database, "database-ready", true),
             (HostMode::Server, "database-ready", false),
             (HostMode::Database, "running", false),
+            (
+                HostMode::CheckpointCleanup,
+                "checkpoint-cleanup-ready",
+                true,
+            ),
+            (HostMode::CheckpointCleanup, "database-ready", false),
+            (HostMode::CheckpointCleanup, "running", false),
+            (HostMode::Server, "checkpoint-cleanup-ready", false),
+            (HostMode::Database, "checkpoint-cleanup-ready", false),
         ] {
             let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
             protocol.stopping.store(true, Ordering::Release);

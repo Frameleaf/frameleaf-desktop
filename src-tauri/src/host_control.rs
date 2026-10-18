@@ -317,16 +317,26 @@ pub fn run() -> Result<(), String> {
     separate_paths(&config.candidate, &config.state)?;
     let runtime = verify_candidate(&config.candidate, &config.manifest_sha256)?;
     let _code_lease = crate::package_lease::CodeLease::acquire(&config.candidate)?;
-    if config.mode == crate::host_runtime::HostMode::Database {
-        crate::host_storage::check(&config.state)?;
-        crate::host_storage::check(&config.state.join("database"))?;
+    if config.mode != crate::host_runtime::HostMode::Server {
+        if config.mode == crate::host_runtime::HostMode::CheckpointCleanup {
+            crate::host_storage::check_cleanup(&config.state)?;
+        } else {
+            crate::host_storage::check(&config.state)?;
+        }
+        if config.mode == crate::host_runtime::HostMode::Database {
+            crate::host_storage::check(&config.state.join("database"))?;
+        }
         candidate_file(&config.state.join("host-state.json"), 4096)?;
     }
     let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
-    crate::host_storage::check(&config.state)?;
+    if config.mode == crate::host_runtime::HostMode::CheckpointCleanup {
+        crate::host_storage::check_cleanup(&config.state)?;
+    } else {
+        crate::host_storage::check(&config.state)?;
+    }
     owner.activate(&config.installation_id, &config.manifest_sha256)?;
     let mut process = runtime.start_mode(
         &config.state,
@@ -353,7 +363,11 @@ pub fn run() -> Result<(), String> {
         if let Ok(command) = command_receiver.try_recv() {
             let result = match command {
                 CheckpointCommand::Checkpoint { operation_id, .. } => {
-                    process.request_checkpoint(&operation_id)
+                    if config.mode == crate::host_runtime::HostMode::CheckpointCleanup {
+                        Err("host_checkpoint_unavailable".into())
+                    } else {
+                        process.request_checkpoint(&operation_id)
+                    }
                 }
                 CheckpointCommand::CleanupCheckpoint { checkpoint, .. } => {
                     process.request_checkpoint_cleanup(&checkpoint)
@@ -496,6 +510,13 @@ mod tests {
                 .unwrap()
                 .mode,
             crate::host_runtime::HostMode::Database
+        );
+        maintenance["mode"] = json!("checkpoint-cleanup");
+        assert_eq!(
+            config(&serde_json::to_vec(&maintenance).unwrap())
+                .unwrap()
+                .mode,
+            crate::host_runtime::HostMode::CheckpointCleanup
         );
         for invalid in [json!(null), json!("backup"), json!(true)] {
             maintenance["mode"] = invalid;

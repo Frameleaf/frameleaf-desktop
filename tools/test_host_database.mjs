@@ -6,6 +6,7 @@ import * as subprocess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
@@ -106,5 +107,48 @@ test('host mode is a closed choice and defaults only when omitted', async t => {
     assert.doesNotThrow(()=>validateConfig({...c,mode:'server'}));
     const {mode,...legacy}=c;
     assert.doesNotThrow(()=>validateConfig(legacy));
+  });
+});
+
+
+test('cleanup-only owner retires an exact checkpoint with no database, ports or child processes', async t => {
+  await fixture(t, async ({c,calls}) => {
+    c.mode='checkpoint-cleanup';
+    await rm(join(c.state,'database'),{recursive:true});
+    const occupied=createServer();
+    await new Promise(resolve=>occupied.listen(c.databasePort,'127.0.0.1',resolve));
+    t.after(()=>new Promise(resolve=>occupied.close(resolve)));
+    const operationId='22222222-2222-4222-8222-222222222222';
+    const dump=Buffer.from('PGDMP verified cleanup bytes');
+    const checkpoint={schemaVersion:1,operationId,manifestSha256:c.manifestSha256,sourceRevision:c.sourceRevision,
+      postgresMajor:'19',databaseFormat:'frameleaf-canonical',dump:{bytes:dump.length,sha256:createHash('sha256').update(dump).digest('hex')}};
+    const directory=join(c.state,'checkpoints',operationId);
+    await mkdir(directory,{recursive:true,mode:0o700});
+    await writeFile(join(directory,'database.dump'),dump,{mode:0o600});
+    await writeFile(join(directory,'checkpoint.json'),JSON.stringify(checkpoint),{mode:0o600});
+    let stop,work;
+    const stopping=new Promise(resolve=>{stop=resolve;});
+    await runHost(c,stopping,handler=>{
+      work=(async()=>{
+        await assert.rejects(handler({action:'checkpoint',operationId}),/host_checkpoint_unavailable/);
+        const receipt=await handler({action:'cleanup-checkpoint',operationId,checkpoint});
+        assert.deepEqual(receipt,{...checkpoint,state:'checkpoint-cleaned'});
+      })().finally(stop);
+    });
+    await work;
+    assert.deepEqual(calls,[]);
+    await assert.rejects(readdir(directory),{code:'ENOENT'});
+    for(const name of ['database','home','media','studio-trust','studio-work','host.log'])
+      assert.ok(!(await readdir(c.state)).includes(name),name+' must remain absent');
+  });
+});
+
+test('cleanup-only owner refuses an unowned profile before creating state or launching children', async t => {
+  await fixture(t, async ({c,calls})=>{
+    c.mode='checkpoint-cleanup';
+    await rm(join(c.state,'host-state.json'));
+    await assert.rejects(runHost(c,new Promise(()=>{}),()=>assert.fail()),/host_state_invalid/);
+    assert.deepEqual(calls,[]);
+    await assert.rejects(readFile(join(c.state,'host-state.json')),{code:'ENOENT'});
   });
 });

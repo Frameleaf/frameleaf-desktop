@@ -39,7 +39,7 @@ export function studioReadyUntil(message, engineDigest, now = Date.now()) {
 export function validateConfig(c) {
   if (
     !c ||
-    (c.mode !== undefined && !["server", "database"].includes(c.mode)) ||
+    (c.mode !== undefined && !["server", "database", "checkpoint-cleanup"].includes(c.mode)) ||
     !isAbsolute(c.state ?? "") ||
     !isAbsolute(c.runtime ?? "") ||
     c.state === c.runtime ||
@@ -694,6 +694,26 @@ export function ownHostServer(child) {
 
 export async function runHost(c, stopping, ready) {
   validateConfig(c);
+  if (c.mode === "checkpoint-cleanup") {
+    // Require an existing owned profile; retirement must not provision or touch database state.
+    await checkpointDirectory(c.state);
+    if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
+    await stateFile(join(c.state, "host-state.json"), 4096).catch(() => fail("host_state_invalid"));
+    await claimState(c);
+    let pending, cancelled = false;
+    void stopping.then(() => { cancelled = true; });
+    ready(request => {
+      if (cancelled || pending || request.action !== "cleanup-checkpoint")
+        return Promise.reject(new Error("host_checkpoint_unavailable"));
+      const work = cleanupHostCheckpoint(c, request.checkpoint);
+      pending = work;
+      void work.finally(() => { if (pending === work) pending = undefined; }).catch(() => {});
+      return work;
+    });
+    try { await stopping; }
+    finally { cancelled = true; await pending?.catch(() => {}); }
+    return;
+  }
   const databaseOnly = c.mode === "database";
   if (!databaseOnly) await portFree(c.apiPort);
   await portFree(c.databasePort);
@@ -1095,7 +1115,7 @@ async function main() {
   try {
     await runHost(config, stopping, (handler) => {
       checkpoint = handler;
-      process.stdout.write(JSON.stringify({ state: config.mode === "database" ? "database-ready" : "running" }) + "\n");
+      process.stdout.write(JSON.stringify({ state: config.mode === "checkpoint-cleanup" ? "checkpoint-cleanup-ready" : config.mode === "database" ? "database-ready" : "running" }) + "\n");
     });
     await pending;
     if (protocolFailure) fail(protocolFailure);

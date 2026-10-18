@@ -9,6 +9,7 @@
     start: 'Starting the server', stop: 'Stopping the server', restart: 'Restarting the server',
     'database-backup': 'Creating the database backup',
     'native-backup-start-database': 'Preparing the database for backup',
+    'native-backup-start-cleanup': 'Preparing verified backup cleanup',
     'native-backup-checkpoint': 'Creating the database checkpoint',
     'native-backup-stage': 'Preparing recovery metadata',
     'native-backup-encrypt': 'Encrypting the database backup',
