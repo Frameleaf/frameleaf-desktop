@@ -75,6 +75,9 @@ class NativeRawContractTests(unittest.TestCase):
                 path = prefix / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(pe() + marker)
+            debug = prefix / 'lib/darktable/views/.debug/libslideshow.dll.dbg'
+            debug.parent.mkdir(parents=True)
+            debug.write_bytes(pe())
             for name in ['darktable', 'lensfun']:
                 path = prefix / 'share' / name
                 path.mkdir(parents=True)
@@ -93,6 +96,8 @@ class NativeRawContractTests(unittest.TestCase):
 
             def command(arguments, runtime_root=None):
                 if '-p' in arguments:
+                    if Path(arguments[-1]).suffix.casefold() == '.dbg':
+                        return 'There is an import table in .idata, but that section has no contents'
                     return 'DLL Name: KERNEL32.dll'
                 self.assertFalse(prefix.exists())
                 self.assertEqual(runtime_root, output / 'raw')
@@ -102,6 +107,8 @@ class NativeRawContractTests(unittest.TestCase):
             with patch('build_host_raw.platform.system', return_value='Windows'):
                 report = stage_raw(prefix, work, output, command, dependencies)
             self.assertEqual(len(report['nativeClosure']['objects']), 4)
+            self.assertFalse(any(name.casefold().endswith('.dbg') for name in report['files']))
+            self.assertTrue((work / 'original-install-unavailable/lib/darktable/views/.debug/libslideshow.dll.dbg').is_file())
             self.assertFalse(report['nativeClosure']['posixRuntimeRequired'])
             self.assertIn('share/lensfun/data', report['files'])
             self.assertIn('licenses-toolchain/fixture/LICENSE', report['files'])

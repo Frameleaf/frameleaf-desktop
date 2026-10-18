@@ -118,6 +118,9 @@ def stage_raw(
     for path in prefix.rglob("*"):
         if not path.is_file() or path.is_symlink():
             continue
+        # MinGW debug sidecars keep PE headers without loadable section contents.
+        if windows and path.suffix.casefold() == ".dbg":
+            continue
         with path.open("rb") as stream:
             header = stream.read(4)
             if (header[:2] == b"MZ" if windows else header == (b"\x7fELF" if linux else b"\xcf\xfa\xed\xfe")):
