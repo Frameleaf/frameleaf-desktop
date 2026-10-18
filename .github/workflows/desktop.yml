@@ -39,6 +39,16 @@ jobs:
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Qualify Windows controller dependencies without ambient runtime paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $inspectors = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe')
+          if ($LASTEXITCODE -or $inspectors.Count -lt 1) { throw 'Controller dependency inspector is missing' }
+          $controller = (Resolve-Path 'src-tauri/target/debug/frameleaf-native-host.exe').Path
+          python tools/qualify_windows_controller.py $controller $inspectors[0]
+          if ($LASTEXITCODE) { throw 'Windows controller dependency qualification failed' }
       - name: Qualify Windows package directory and receipt authority in disposable runner
         if: runner.os == 'Windows' && runner.environment == 'github-hosted'
         shell: pwsh
