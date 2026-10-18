@@ -16,6 +16,10 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(all(test, windows))]
+#[path = "manager_host_windows_tests.rs"]
+mod windows_tests;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn no_acl(path: &Path) -> Result<(), String> {
     use std::os::fd::AsRawFd;

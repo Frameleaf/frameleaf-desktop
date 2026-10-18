@@ -123,6 +123,12 @@ jobs:
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib model_catalogue::tests::composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering -- --exact --nocapture
           if ($LASTEXITCODE) { throw 'Private shared model-cache composition failed' }
+      - name: Qualify Windows Manager descendant ownership
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib manager_host::windows_tests:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Windows Manager descendant ownership failed' }
       - name: Probe the captured filesystem Shell path without elevation
         if: ${{ !cancelled() }}
         shell: pwsh
