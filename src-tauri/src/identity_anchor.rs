@@ -94,7 +94,7 @@ mod native {
         if result != 0
             || kind != REG_SZ
             || size < 2
-            || size % 2 != 0
+            || !size.is_multiple_of(2)
             || size as usize > std::mem::size_of_val(&bytes)
         {
             return Err(ERROR.into());

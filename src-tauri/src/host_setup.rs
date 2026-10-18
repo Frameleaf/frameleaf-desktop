@@ -507,7 +507,10 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         };
         #[cfg(windows)]
         let uid = crate::windows_protection::process_user_sid()?;
+        #[cfg(unix)]
         let profile = layout.profiles.join(uid.to_string());
+        #[cfg(windows)]
+        let profile = layout.profiles.join(&uid);
         let state = profile.join("state");
         let data = profile.join("manager");
         // Downstream shared setup helpers may create missing leaves; keep both existing objects pinned.
