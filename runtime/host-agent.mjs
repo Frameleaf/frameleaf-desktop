@@ -157,19 +157,21 @@ async function checkpointDirectory(path, create = false) {
   if (!meta.isDirectory() || meta.isSymbolicLink() ||
     (process.platform !== "win32" && (meta.mode & 0o077) !== 0)) fail("host_checkpoint_not_private");
 }
-async function checkpointHash(path, check) {
+async function checkpointHash(path, check, maximum = Number.MAX_SAFE_INTEGER) {
   const named = await fs.lstat(path, { bigint: true });
   if (!named.isFile() || named.isSymbolicLink()) fail("host_checkpoint_changed");
   const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await file.stat({ bigint: true });
     if (before.dev !== named.dev || before.ino !== named.ino || !before.isFile() || before.nlink !== 1n || before.size <= 0n ||
-      before.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+      before.size > BigInt(maximum) ||
       (process.platform !== "win32" && (before.mode & 0o077n) !== 0n)) fail("host_checkpoint_changed");
     const hash = createHash("sha256"); let bytes = 0;
-    for await (const chunk of file.createReadStream({ autoClose: false })) {
+    for await (const chunk of file.createReadStream({ autoClose: false, highWaterMark: Math.min(64 * 1024, maximum + 1) })) {
       check();
-      bytes += chunk.length; hash.update(chunk);
+      bytes += chunk.length;
+      if (bytes > maximum) fail("host_checkpoint_changed");
+      hash.update(chunk);
     }
     const after = await file.stat({ bigint: true });
     const stillNamed = await fs.lstat(path, { bigint: true });
@@ -1368,13 +1370,13 @@ export async function readHostRestoreTarget(configuration, supplied) {
         if (error.code !== "ENOENT") throw error;
       }
       const path = join(database, "PG_VERSION"),
-        before = await checkpointHash(path, () => {}),
+        before = await checkpointHash(path, () => {}, 16),
         raw = await stateFile(path, 16);
       if (
         raw.trim() !== c.postgresMajor ||
         Buffer.byteLength(raw) !== before.bytes ||
         createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
-        !isDeepStrictEqual(await checkpointHash(path, () => {}), before)
+        !isDeepStrictEqual(await checkpointHash(path, () => {}, 16), before)
       )
         fail("host_restore_target_invalid");
     }

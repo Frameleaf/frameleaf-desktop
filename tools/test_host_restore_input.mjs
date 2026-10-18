@@ -439,3 +439,36 @@ test('prepared target inspection refuses an oversized PG_VERSION before streamin
     }
   });
 });
+
+test('prepared target inspection bounds a version stream that grows after the opened-file size check', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  await preparedTargetFixture(t, async ({ c, receipt, database }) => {
+    const version = join(database, 'PG_VERSION');
+    const original = filesystem.open;
+    let chunks = 0;
+    const probe = t.mock.method(filesystem, 'open', async (...args) => {
+      const handle = await original(...args);
+      if (args[0] === version)
+        t.mock.method(handle, 'createReadStream', () =>
+          (async function* () {
+            chunks++;
+            yield Buffer.alloc(17, 0x31);
+            chunks++;
+            throw Error('must reject before consuming another oversized chunk');
+          })(),
+        );
+      return handle;
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        owner.readHostRestoreTarget(c, receipt),
+        /host_restore_target_invalid/,
+      );
+      assert.equal(chunks, 1);
+    } finally {
+      probe.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+});
