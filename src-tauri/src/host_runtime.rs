@@ -492,6 +492,7 @@ enum AgentEvent {
     RestoreVerified {
         prepared: PreparedRestore,
         offline_checksums: bool,
+        schema_validated: bool,
         verification_id: String,
     },
     #[serde(rename_all = "camelCase")]
@@ -704,10 +705,14 @@ impl CheckpointProtocol {
             AgentEvent::RestoreVerified {
                 prepared,
                 offline_checksums,
+                schema_validated,
                 verification_id,
             } => {
                 prepared.validate().map_err(|_| invalid())?;
-                if !offline_checksums || !checkpoint_operation_id(verification_id) {
+                if !offline_checksums
+                    || !schema_validated
+                    || !checkpoint_operation_id(verification_id)
+                {
                     return Err(invalid());
                 }
                 &prepared.binding.operation_id
@@ -1623,13 +1628,21 @@ mod checkpoint_tests {
     fn verified_restore_matches_the_entire_pending_prepared_receipt_and_checksum_proof() {
         let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
         let expected: PreparedRestore = serde_json::from_value(prepared()).unwrap();
-        let mut verified = serde_json::json!({"state":"restore-verified","prepared":expected,"offlineChecksums":true});
+        let mut verified = serde_json::json!({"state":"restore-verified","prepared":expected,"offlineChecksums":true,"schemaValidated":true});
         assert!(protocol.parse(&wire(&verified)).is_err());
         let verification_id = protocol.begin_verify_restore(&expected).unwrap();
         verified["verificationId"] = serde_json::json!(verification_id);
         assert!(protocol.begin_verify_restore(&expected).is_err());
         assert!(protocol.parse(&wire(&prepared())).is_err());
-        for mutation in ["attempt", "database", "binding", "checksum", "path"] {
+        for mutation in [
+            "attempt",
+            "database",
+            "binding",
+            "checksum",
+            "schema",
+            "missing-schema",
+            "path",
+        ] {
             let mut changed = verified.clone();
             match mutation {
                 "attempt" => changed["prepared"]["attemptId"] = serde_json::json!(OPERATION),
@@ -1638,6 +1651,10 @@ mod checkpoint_tests {
                     changed["prepared"]["binding"]["snapshotId"] = serde_json::json!("0".repeat(64))
                 }
                 "checksum" => changed["offlineChecksums"] = serde_json::json!(false),
+                "schema" => changed["schemaValidated"] = serde_json::json!(false),
+                "missing-schema" => {
+                    changed.as_object_mut().unwrap().remove("schemaValidated");
+                }
                 _ => changed["path"] = serde_json::json!("/outside"),
             }
             assert!(protocol.parse(&wire(&changed)).is_err(), "{mutation}");

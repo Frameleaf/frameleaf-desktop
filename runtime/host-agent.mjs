@@ -14,6 +14,7 @@ const fail = (code) => {
 // Enable only after private Chromium, fonts and installed lifecycle qualification.
 const STUDIO_ENABLED = false;
 const RESTORE_SESSION = Symbol("private restore session");
+const RESTORE_VALIDATION = Symbol("private read-only restore validation");
 // Read only the dedicated child IPC channel; stdout is never readiness evidence.
 export function studioReadyUntil(message, engineDigest, now = Date.now()) {
   if (!message || message.protocolVersion !== 1)
@@ -742,8 +743,9 @@ export async function readHostDatabase(profile, supplied) {
 
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
-  if (restoreSession !== undefined && restoreSession?.[RESTORE_SESSION] !== true) fail("host_restore_authority_invalid");
   const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
+  const validateOnly = restoreSession?.[RESTORE_VALIDATION] === true;
+  if ((restoreSession !== undefined && !restoreOnly && !validateOnly) || (validateOnly && c.mode !== "database")) fail("host_restore_authority_invalid");
   if (c.mode === "checkpoint-cleanup" || c.mode === "restore-prepare") {
     // Maintenance starts no original database; restore writes only a separate owned attempt.
     await checkpointDirectory(c.state);
@@ -756,7 +758,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       if (cancelled || pending || !(c.mode === "restore-prepare" ? ["prepare-restore", "verify-restore"] : ["cleanup-checkpoint"]).includes(request.action))
         return Promise.reject(new Error("host_checkpoint_unavailable"));
       const work = request.action === "verify-restore"
-        ? verifyHostRestoreTarget(c, request.prepared, stopping).then(checked => ({state:"restore-verified", prepared:checked.receipt, offlineChecksums:true, verificationId:request.verificationId}))
+        ? validateHostRestoreTarget(c, request.prepared, stopping).then(checked => ({state:"restore-verified", prepared:checked.receipt, offlineChecksums:true, schemaValidated:true, verificationId:request.verificationId}))
         : c.mode === "restore-prepare" ? restoreHostDatabase(c, request.binding, stopping) : cleanupHostCheckpoint(c, request.checkpoint);
       pending = work;
       void work.finally(() => { if (pending === work) pending = undefined; }).catch(() => {});
@@ -851,8 +853,9 @@ export async function runHost(c, stopping, ready, restoreSession) {
     const child = launch(args, extra, undefined, !options.quiet);
     let output = "",
       oversized = false;
-    if (options.quiet) {
-      child.stdout.resume(); child.stderr.resume();
+    if (options.quiet) child.stderr.resume();
+    if (options.quiet && !options.capture) {
+      child.stdout.resume();
     } else child.stdout.on("data", (chunk) => {
       if (Buffer.byteLength(output) + chunk.length > 65536) {
         oversized = true;
@@ -1084,6 +1087,21 @@ export async function runHost(c, stopping, ready, restoreSession) {
         );
       }
     }
+    if (validateOnly) {
+      const binding = restoreSession.prepared.binding;
+      const validation = JSON.parse(await command([executable("psql"), "-h", "127.0.0.1", "-p", String(c.databasePort), "-U", "frameleaf", "-d", "frameleaf", "-XAt", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT json_build_object('postgresMajor',current_setting('server_version_num')::int / 10000,'vectorVersion',(SELECT extversion FROM pg_extension WHERE extname='vector'),'canonical',to_regclass('public.user') IS NOT NULL AND to_regclass('public.asset') IS NOT NULL AND to_regclass('public.album') IS NOT NULL,'readOnly',current_setting('transaction_read_only')='on')"], {PGPASSWORD:c.password}, false, {quiet:true, capture:true}));
+      if (validation.postgresMajor !== 19 || validation.vectorVersion !== "0.8.7" || validation.canonical !== true || validation.readOnly !== true) fail("host_restore_canonical_invalid");
+      const report = JSON.parse(await command([executable("node"), executable("server"), "frameleaf-admin", "validate-restore"], {
+        DB_HOSTNAME:"127.0.0.1", DB_PORT:String(c.databasePort), DB_USERNAME:"frameleaf", DB_PASSWORD:c.password, DB_DATABASE_NAME:"frameleaf",
+        FRAMELEAF_MANAGER_ORIGIN:"restored_library", FRAMELEAF_MANAGER_INSTALLATION:binding.installationId,
+        FRAMELEAF_MANAGER_RESTORE_OPERATION_ID:binding.operationId,
+        FRAMELEAF_MEDIA_LOCATION:join(restoreSession.original.state,"media"), FRAMELEAF_BUILD_DATA:join(c.runtime,"build"),
+        FRAMELEAF_HDR_BINDING:executable("hdr"), FRAMELEAF_STUDIO_WORKER:"false",
+      }, false, {quiet:true, capture:true, timeout:7_200_000}));
+      if (cancelled || !isDeepStrictEqual(report, {protocolVersion:1, state:"restore-schema-valid", installationId:binding.installationId, operationId:binding.operationId})) fail("host_restore_canonical_invalid");
+      restoreSession.validated = true;
+    }
     ready((request) => {
       if (checkpointWork || cancelled || (app && (app.exitCode !== null || app.signalCode !== null)) || pg.exitCode !== null || pg.signalCode !== null)
         return Promise.reject(new Error("host_checkpoint_unavailable"));
@@ -1154,7 +1172,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
         await exited(child, 5000);
       }
     await log.close();
-    if (restoreOnly && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
+    if ((restoreOnly || validateOnly) && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
       stopError ??= new Error("host_restore_shutdown_unconfirmed");
     if (stopError) throw stopError;
   }
@@ -1551,5 +1569,29 @@ export async function verifyHostRestoreTarget(
           fail("host_restore_offline_stop_unconfirmed");
       }
     }
+  }
+}
+
+
+/** Offline checks surround an owned read-only SQL inspection; neither phase admits application writers. */
+export async function validateHostRestoreTarget(configuration, supplied, stopping) {
+  const c = {...configuration, entryPoints:{...configuration.entryPoints}}, expected = structuredClone(supplied);
+  let cancelled = false;
+  void stopping.then(() => { cancelled = true; });
+  try {
+    const checked = await verifyHostRestoreTarget(c, expected, stopping);
+    if (cancelled) fail("host_restore_cancelled");
+    const session = {[RESTORE_VALIDATION]:true, original:c, prepared:checked.receipt};
+    let finish, ready = false;
+    const finished = new Promise(resolve => { finish = resolve; });
+    await runHost({...c, state:checked.target, mode:"database", databaseReference:undefined}, Promise.race([stopping,finished]), () => {ready=true;finish();}, session);
+    if (cancelled) fail("host_restore_cancelled");
+    if (!ready || !session.validated) fail("host_restore_canonical_invalid");
+    const final = await verifyHostRestoreTarget(c, expected, stopping);
+    if (cancelled) fail("host_restore_cancelled");
+    return {...final, schemaValidated:true};
+  } catch (error) {
+    if (cancelled || error?.message === "host_restore_cancelled") fail("host_restore_cancelled");
+    fail("host_restore_canonical_invalid");
   }
 }

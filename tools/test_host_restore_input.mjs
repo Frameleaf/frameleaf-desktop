@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import subprocess from 'node:child_process';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { basename } from 'node:path';
 import filesystem from 'node:fs/promises';
@@ -57,30 +57,31 @@ async function restoreFixture(t, run) {
   await writeFile(join(f.path,'input','recovery.json'),JSON.stringify(f.recovery),{mode:0o600});
   await writeFile(join(f.path,'restore-intent.json'),JSON.stringify(f.binding),{mode:0o600});
   await mkdir(join(f.c.state,'database'),{mode:0o700});await writeFile(join(f.c.state,'database','sentinel'),'original database must survive',{mode:0o600});
-  const calls=[];let pg,exists=false,failRestore=false,canonical=true,failStop=false;
+  const calls=[];let pg,pgData,pgReadonly=false,exists=false,failRestore=false,canonical=true,failStop=false,badReceipt=false,failValidation=false,readOnlyProof=true,postgresMajor=19,vectorVersion='0.8.7';
   const original=subprocess.spawn;
   subprocess.spawn=(file,args,options)=>{
    const name=basename(file).replace(/\.exe$/,'');calls.push({name,args,options});
-   assert.ok(['initdb','postgres','pgIsready','psql','createdb','pgRestore','node','pgCtl'].includes(name),'unexpected process '+name);
+   assert.ok(['initdb','postgres','pgIsready','psql','createdb','pgRestore','node','pgCtl','pg_checksums'].includes(name),'unexpected process '+name);
    const child=new EventEmitter();Object.assign(child,{pid:7000+calls.length,exitCode:null,signalCode:null,stdout:new PassThrough(),stderr:new PassThrough()});
    const exit=(code=0)=>{if(child.exitCode!==null)return;child.exitCode=code;child.stdout.end();child.stderr.end();child.emit('exit',code,null);child.emit('close',code,null);};child.kill=()=>exit();
-   if(name==='postgres'){pg=child;exists=false;writeFileSync(join(args[args.indexOf('-D')+1],'postmaster.pid'),String(child.pid)+'\n');}
+   if(name==='postgres'){pg=child;pgData=args[args.indexOf('-D')+1];pgReadonly=args.includes('default_transaction_read_only=on');exists=pgReadonly;writeFileSync(join(pgData,'postmaster.pid'),String(child.pid)+'\n');}
    else queueMicrotask(()=>{
     if(name==='initdb'){mkdirSync(args[args.indexOf('-D')+1],{mode:0o700});writeFileSync(join(args[args.indexOf('-D')+1],'PG_VERSION'),'19');}
-    if(name==='psql')child.stdout.write(args.at(-1).includes('pg_database')?(exists?'1\n':'\n'):JSON.stringify({postgresMajor:19,vectorVersion:'0.8.7',canonical})+'\n');
+    if(name==='psql')child.stdout.write(args.at(-1).includes('pg_database')?(exists?'1\n':'\n'):JSON.stringify({postgresMajor,vectorVersion,canonical,...(args.at(-1).includes('transaction_read_only')?{readOnly:pgReadonly&&readOnlyProof}:{})})+'\n');
     if(name==='createdb')exists=true;
     if(name==='pgRestore'&&!args.includes('--list')&&failRestore){failRestore=false;exit(1);return;}
     if(name==='node'){
-     assert.deepEqual(args.slice(1),['frameleaf-admin','restore-state']);
+     assert.deepEqual(args.slice(1),['frameleaf-admin',pgReadonly?'validate-restore':'restore-state']);
+     if(pgReadonly){if(failValidation){child.stderr.write('synthetic secret validation error');exit(1);return;}child.stdout.write(JSON.stringify({protocolVersion:1,state:'restore-schema-valid',installationId:f.binding.installationId,operationId:badReceipt?'33333333-3333-4333-8333-333333333333':f.binding.operationId})+'\n');}
      assert.equal(options.env.FRAMELEAF_MANAGER_ORIGIN,'restored_library');
      assert.equal(options.env.FRAMELEAF_MANAGER_INSTALLATION,f.binding.installationId);
      assert.equal(options.env.FRAMELEAF_MANAGER_RESTORE_OPERATION_ID,f.binding.operationId);
     }
-    if(name==='pgCtl'){if(failStop){failStop=false;exit(1);return;}pg.kill();}exit();
+    if(name==='pgCtl'){if(failStop){failStop=false;exit(1);return;}if(pgReadonly)rmSync(join(pgData,'postmaster.pid'));pg.kill();}exit();
    });
    return child;
   };syncBuiltinESMExports();
-  try{await run({...f,calls,failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;}});}
+  try{await run({...f,calls,failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;},invalidValidationReceipt:()=>{badReceipt=true;},failValidation:()=>{failValidation=true;},invalidReadOnly:()=>{readOnlyProof=false;},invalidPgVersion:()=>{postgresMajor=18;},invalidVector:()=>{vectorVersion='0.8.6';}});}
   finally{subprocess.spawn=original;syncBuiltinESMExports();pg?.kill();}
  });
 }
@@ -709,7 +710,7 @@ test('restore owner verifies the exact prepared target without exposing paths or
     assert.deepEqual(owner.checkpointControlRequest(c, JSON.stringify(request) + ' '.repeat(1024)), request);
     assert.throws(() => owner.checkpointControlRequest(c, JSON.stringify(request) + ' '.repeat(4096)), /host_checkpoint_request_invalid/);
     for (const changed of [
-      { ...request, path: '/outside' }, { ...request, operationId: '11111111-1111-4111-8111-111111111111' },
+      { ...request, schemaValidated: true }, { ...request, path: '/outside' }, { ...request, operationId: '11111111-1111-4111-8111-111111111111' },
       { ...request, prepared: { ...receipt, path: '/outside' } },
       { ...request, prepared: { ...receipt, binding: { ...receipt.binding, manifestSha256: '0'.repeat(64) } } },
     ]) assert.throws(() => owner.checkpointControlRequest(c, JSON.stringify(changed)), /host_checkpoint_request_invalid/);
@@ -717,27 +718,36 @@ test('restore owner verifies the exact prepared target without exposing paths or
     let stop, handler, ready;
     const stopping = new Promise(resolve => { stop = resolve; });
     const waiting = new Promise(resolve => { ready = resolve; });
-    const seen = [];
-    const probe = t.mock.method(subprocess, 'spawn', (file, args) => {
-      seen.push({ file, args });
-      const child = new EventEmitter();
-      Object.assign(child, { pid: 8999, exitCode: null, signalCode: null });
-      child.kill = () => { child.exitCode = 1; child.emit('close', 1, null); return true; };
-      queueMicrotask(() => { child.exitCode = 0; child.emit('close', 0, null); });
-      return child;
-    });
-    syncBuiltinESMExports();
     const prior = calls.length;
     const host = owner.runHost(c, stopping, value => { handler = value; ready(); });
     try {
       await Promise.race([waiting, host]);
       const work = handler(request);
       await assert.rejects(handler(request), /host_checkpoint_unavailable/);
-      assert.deepEqual(await work, { state: 'restore-verified', prepared: receipt, offlineChecksums: true, verificationId: request.verificationId });
-      assert.equal(seen.length, 1);
-      assert.equal(seen[0].file, join(c.runtime, c.entryPoints.pgChecksums));
-      assert.equal(calls.length, prior);
+      assert.deepEqual(await work, { state: 'restore-verified', prepared: receipt, offlineChecksums: true, schemaValidated: true, verificationId: request.verificationId });
+      assert.deepEqual(calls.slice(prior).map(call => call.name), ['pg_checksums','postgres','pgIsready','psql','psql','node','pgCtl','pg_checksums']);
       assert.equal(await readFile(join(c.state, 'database/sentinel'), 'utf8'), 'original database must survive');
-    } finally { stop(); await host; probe.mock.restore(); syncBuiltinESMExports(); }
+    } finally { stop(); await host; }
   });
+});
+
+
+test('canonical target validation never publishes proof for schema, helper, receipt, stop or cancellation failures', async t => {
+  for (const mutation of ['schema', 'helper', 'receipt', 'stop', 'cancel', 'read-only', 'postgres', 'vector']) {
+    await preparedTargetFixture(t, async f => {
+      f.c.entryPoints.pgChecksums = 'bin/pg_checksums' + (process.platform === 'win32' ? '.exe' : '');
+      if (mutation === 'schema') f.invalidSchema();
+      if (mutation === 'read-only') f.invalidReadOnly();
+      if (mutation === 'postgres') f.invalidPgVersion();
+      if (mutation === 'vector') f.invalidVector();
+      if (mutation === 'helper') f.failValidation();
+      if (mutation === 'receipt') f.invalidValidationReceipt();
+      if (mutation === 'stop') f.failStop();
+      const prior = f.calls.length;
+      await assert.rejects(owner.validateHostRestoreTarget(f.c, f.receipt, mutation === 'cancel' ? Promise.resolve() : new Promise(() => {})), /host_restore_(canonical_invalid|cancelled)/);
+      assert.ok(!f.calls.slice(prior).some(call => ['initdb', 'createdb', 'pgRestore'].includes(call.name)));
+      assert.ok(!(await readFile(join(f.target, 'host.log'), 'utf8')).includes('synthetic secret validation error'));
+      assert.equal(await readFile(join(f.c.state, 'database/sentinel'), 'utf8'), 'original database must survive');
+    });
+  }
 });
