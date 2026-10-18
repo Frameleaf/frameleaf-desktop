@@ -440,3 +440,49 @@ fn recovery_pairing_accepts_only_the_explicitly_requested_permission_set() {
     )
     .is_err());
 }
+
+#[test]
+fn restore_execution_uses_explicit_scope_and_accepts_only_bound_public_restore_operations() {
+    let id = Uuid::new_v4();
+    let key = Uuid::new_v4();
+    let mut owner = saved();
+    for value in [
+        json!({"kind":"restore","reviewId":id,"key":key}),
+        json!({"kind":"restore-operation","id":id}),
+        json!({"kind":"resume-restore","id":id}),
+    ] {
+        let command: Command = serde_json::from_value(value).unwrap();
+        assert!(prepare(
+            &owner,
+            &identity(),
+            &command,
+            1700000000000,
+            &Uuid::new_v4().to_string()
+        )
+        .is_err());
+        owner.scopes.push(Scope::Restore);
+        assert!(prepare(
+            &owner,
+            &identity(),
+            &command,
+            1700000000000,
+            &Uuid::new_v4().to_string()
+        )
+        .is_ok());
+        owner.scopes.retain(|v| *v != Scope::Restore);
+    }
+    let command: Command =
+        serde_json::from_value(json!({"kind":"restore-operation","id":id})).unwrap();
+    let operation = json!({"id":id,"kind":"restore","state":"running","step":"native-restore-verify","completed":vec!["native-backup-verified";40],"error":null,"createdAt":1,"updatedAt":2});
+    assert!(validate_reply(&owner, &command, operation.clone()).is_ok());
+    for (field, value) in [
+        ("kind", json!("stop")),
+        ("id", json!(key)),
+        ("receipts", json!({"private":"secret"})),
+        ("completed", json!(vec!["step"; 65])),
+    ] {
+        let mut changed = operation.clone();
+        changed[field] = value;
+        assert!(validate_reply(&owner, &command, changed).is_err());
+    }
+}

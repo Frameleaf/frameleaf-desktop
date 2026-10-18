@@ -54,11 +54,36 @@ impl Action {
 pub enum Command {
     Status {},
     Backups {},
-    ReviewRestore { snapshot: String, key: Uuid },
-    RestoreReview { id: Uuid, snapshot: String },
-    Control { action: Action, key: Uuid },
-    Operation { id: Uuid },
-    Resume { action: Action, id: Uuid },
+    ReviewRestore {
+        snapshot: String,
+        key: Uuid,
+    },
+    RestoreReview {
+        id: Uuid,
+        snapshot: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Restore {
+        review_id: Uuid,
+        key: Uuid,
+    },
+    RestoreOperation {
+        id: Uuid,
+    },
+    ResumeRestore {
+        id: Uuid,
+    },
+    Control {
+        action: Action,
+        key: Uuid,
+    },
+    Operation {
+        id: Uuid,
+    },
+    Resume {
+        action: Action,
+        id: Uuid,
+    },
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -269,6 +294,9 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             "native_restore_review_changed" => "manager_review_changed",
             "native_restore_verification_failed" => "manager_review_failed",
             "native_backup_unavailable" => "manager_backup_unavailable",
+            "native_restore_review_expired"
+            | "native_restore_review_not_ready"
+            | "native_restore_runtime_change_required" => code,
             _ => "manager_request_failed",
         }
         .into());
@@ -494,6 +522,27 @@ fn prepare(
     let (scope, path, body) = match command {
         Command::Status {} => (Scope::Status, "/manager-api/desktop/status", json!({})),
         Command::Backups {} => (Scope::Restore, "/manager-api/desktop/backups", json!({})),
+        Command::Restore { review_id, key } => {
+            if review_id.is_nil() || key.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Restore,
+                "/manager-api/desktop/restore",
+                json!({"reviewId":review_id,"key":key}),
+            )
+        }
+        Command::RestoreOperation { id } | Command::ResumeRestore { id } => {
+            if id.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            let path = if matches!(command, Command::RestoreOperation { .. }) {
+                "/manager-api/desktop/restore-operation"
+            } else {
+                "/manager-api/desktop/resume-restore"
+            };
+            (Scope::Restore, path, json!({"id":id}))
+        }
         Command::ReviewRestore { snapshot, key } => {
             if !hex(snapshot, 64) || key.is_nil() {
                 return Err("manager_request_invalid".into());
@@ -624,9 +673,9 @@ pub async fn disconnect(saved: &SavedManager, password: String) -> Result<(), St
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Operation {
+struct Operation<K = Action, const MAX: usize = 32> {
     id: String,
-    kind: Action,
+    kind: K,
     state: String,
     step: Option<String>,
     completed: Vec<String>,
@@ -634,7 +683,7 @@ struct Operation {
     created_at: u64,
     updated_at: u64,
 }
-impl Operation {
+impl<K, const MAX: usize> Operation<K, MAX> {
     fn valid(&self) -> bool {
         let label = |value: &str| {
             !value.is_empty()
@@ -651,13 +700,18 @@ impl Operation {
                 self.state.as_str(),
                 "running" | "interrupted" | "failed" | "complete"
             )
-            && self.completed.len() <= 32
+            && self.completed.len() <= MAX
             && self.completed.iter().all(|value| label(value))
             && self.step.as_deref().is_none_or(label)
             && self.error.as_deref().is_none_or(label)
             && self.created_at <= self.updated_at
             && self.updated_at <= 9_007_199_254_740_991
     }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RestoreKind {
+    Restore,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -743,6 +797,24 @@ fn validate_reply(
 ) -> Result<Value, String> {
     let invalid = || "manager_response_invalid".to_string();
     match command {
+        Command::RestoreOperation { id } => {
+            let operation: Operation<RestoreKind, 64> =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if operation.id != id.to_string() || !operation.valid() {
+                return Err(invalid());
+            }
+            public_error(&mut value);
+        }
+        Command::Restore { .. } | Command::ResumeRestore { .. } => {
+            let accepted: Accepted =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if Uuid::parse_str(&accepted.id).is_err()
+                || accepted.id == Uuid::nil().to_string()
+                || matches!(command, Command::ResumeRestore {id} if accepted.id != id.to_string())
+            {
+                return Err(invalid());
+            }
+        }
         Command::Backups {} => {
             let entries: Vec<BackupEntry> =
                 serde_json::from_value(value.clone()).map_err(|_| invalid())?;

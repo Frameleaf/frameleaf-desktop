@@ -47,3 +47,19 @@ test('backup review request keys survive retries and stay bound to Manager and s
  assert.throws(()=>backupReviewIntent(owner,'b'.repeat(64),intent),/manager_review_pending/);
  assert.notEqual(backupReviewKey(owner),intentKey(owner));
 });
+
+test('restore intent requires a fresh compatible review and preserves one execution key across reload', async () => {
+ const {createBackupRestoreIntent,parseBackupRestoreIntent,backupRestoreKey}=await import('../src/manager-state.ts');
+ const owner={...manager,scopes:[...manager.scopes,'restore']};
+ const review={id:crypto.randomUUID(),snapshot:'a'.repeat(64),installationId:owner.installationId,expires:Date.now()+900000,state:'prepared' as const,libraryId:owner.installationId,release:'frameleaf-v3.0.0-1',targetRelease:'frameleaf-v3.0.0-1',createdAt:1,mediaIncluded:false as const,requiresRuntimeChange:false};
+ const intent=createBackupRestoreIntent(owner,review,null);
+ assert.notEqual(intent.key,review.id);
+ assert.equal(createBackupRestoreIntent(owner,review,intent).key,intent.key);
+ assert.deepEqual(parseBackupRestoreIntent(JSON.stringify(intent),owner),intent);
+ for(const patch of [{expires:0},{requiresRuntimeChange:true},{installationId:'b'.repeat(12)},{state:'preparing'}])assert.throws(()=>createBackupRestoreIntent(owner,{...review,...patch},null));
+ assert.throws(()=>createBackupRestoreIntent(manager,review,null),/manager_scope_denied/);
+ assert.throws(()=>createBackupRestoreIntent(owner,{...review,id:crypto.randomUUID()},intent),/manager_restore_pending/);
+ for(const patch of [{reviewId:'bad'},{id:'00000000-0000-0000-0000-000000000000'},{password:'secret'},{snapshot:['a'.repeat(64)]}])assert.equal(parseBackupRestoreIntent(JSON.stringify({...intent,...patch}),owner),null);
+ assert.equal(parseBackupRestoreIntent(JSON.stringify(intent),{...owner,deviceId:crypto.randomUUID()}),null);
+ assert.notEqual(backupRestoreKey(owner),intentKey(owner));
+});
