@@ -150,7 +150,6 @@ fn finalization_guard(
     Ok(guard)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn admit_versions(
     layout: &Layout,
     verify: impl FnOnce() -> Result<(), String>,
@@ -174,6 +173,22 @@ fn admit_versions(
         0 => Ok(()),
         2 => verify(),
         _ => Err("host_install_version_exists".into()),
+    }
+}
+
+/// Installer-only fresh Windows package preparation; never starts or replaces a runtime.
+pub fn prepare_windows_package(
+    manifest: &str,
+    controller: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        windows::package::prepare(manifest, controller)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
     }
 }
 
