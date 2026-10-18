@@ -1,0 +1,139 @@
+name: Private Windows HDR candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_media.py'
+      - 'tools/test_build_host_media.py'
+      - 'tools/build_host_database_windows.py'
+      - 'tools/build_host_database.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_runtime.py'
+      - '.github/workflows/windows-host-hdr.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-hdr-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  hdr:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      VCPKG_MAX_CONCURRENCY: '1'
+      VCPKG_DISABLE_METRICS: '1'
+      VCPKG_BINARY_SOURCES: clear
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ee7e711a263f1fdfed14414f1af987c9209a6765
+          path: server-source
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.nvmrc
+            /server/native/
+            /server/test/native/
+            /server/base-image/sources/
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: microsoft/vcpkg
+          ref: bf19794383e8fb95eba5aa553235bc8ec2271688
+          path: vcpkg
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Check build source and target guards
+        run: python -m unittest discover -s tools -p 'test_build_host_media.py' -v
+      - name: Prepare MSVC and pinned build tools
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation unavailable' }
+          $command = '"' + $vs + '\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && set'
+          $lines = & $env:ComSpec /d /s /c $command
+          if ($LASTEXITCODE) { throw 'MSVC environment failed' }
+          foreach ($line in $lines) {
+            $parts = $line -split '=', 2
+            if ($parts[0] -in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsRedistDir')) {
+              $line >> $env:GITHUB_ENV
+            }
+          }
+          python -m pip install ninja==1.13.2
+          if ($LASTEXITCODE) { throw 'Pinned Ninja installation failed' }
+          cmake --version
+          if ($LASTEXITCODE) { throw 'CMake unavailable' }
+      - name: Prepare version-matched Node SDK
+        shell: pwsh
+        run: |
+          $version = (Get-Content server-source/.nvmrc -Raw).Trim().TrimStart('v')
+          if ($version -ne '26.11.1' -or (& node --version) -ne "v$version") { throw 'Node source version mismatch' }
+          $sdk = Join-Path $env:RUNNER_TEMP 'fl-hdr-node'
+          New-Item -ItemType Directory -Path "$sdk/bin","$sdk/lib" | Out-Null
+          Copy-Item (Get-Command node).Source "$sdk/bin/node.exe"
+          $base = "https://nodejs.org/dist/v$version"
+          $sums = (Invoke-WebRequest "$base/SHASUMS256.txt").Content
+          $headers = "node-v$version-headers.tar.gz"
+          foreach ($item in @(
+            @{ Name = $headers; Target = "$sdk/headers.tar.gz" },
+            @{ Name = 'win-x64/node.lib'; Target = "$sdk/lib/node.lib" }
+          )) {
+            $pattern = '(?m)^([0-9a-f]{64})\s+' + [regex]::Escape($item.Name) + '\r?$'
+            $match = [regex]::Matches($sums, $pattern)
+            if ($match.Count -ne 1) { throw 'Unique official SDK digest required' }
+            Invoke-WebRequest "$base/$($item.Name)" -OutFile $item.Target
+            if ((Get-FileHash $item.Target -Algorithm SHA256).Hash.ToLowerInvariant() -ne $match[0].Groups[1].Value) { throw 'Node SDK digest mismatch' }
+          }
+          tar -xzf "$sdk/headers.tar.gz" -C $sdk --strip-components=1
+          if ($LASTEXITCODE) { throw 'Node headers extraction failed' }
+          "FRAMELEAF_HDR_NODE_ROOT=$sdk" >> $env:GITHUB_ENV
+      - name: Build private HDR dependencies
+        shell: pwsh
+        run: |
+          & ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { throw 'vcpkg bootstrap failed' }
+          $triplets = Join-Path $env:RUNNER_TEMP 'fl-hdr-triplets'
+          New-Item -ItemType Directory -Path $triplets | Out-Null
+          $baseTriplet = (Join-Path $env:GITHUB_WORKSPACE 'vcpkg/triplets/x64-windows.cmake').Replace('\','/')
+          @'
+          include("@BASE_TRIPLET@")
+          set(VCPKG_BUILD_TYPE release)
+          if(PORT STREQUAL "x265")
+            set(VCPKG_CMAKE_CONFIGURE_OPTIONS "-DHIGH_BIT_DEPTH=ON")
+          endif()
+          '@.Replace('@BASE_TRIPLET@', $baseTriplet) | Set-Content "$triplets/x64-windows-hdr.cmake"
+          $installed = Join-Path $env:RUNNER_TEMP 'fl-hdr-deps'
+          $ports = @('aom','dav1d','expat','lcms','libde265','libjpeg-turbo','libwebp','x265','pkgconf') | ForEach-Object { "$($_):x64-windows-hdr" }
+          & ./vcpkg/vcpkg.exe install @ports "--overlay-triplets=$triplets" "--x-install-root=$installed"
+          if ($LASTEXITCODE) { throw 'Private HDR dependency build failed' }
+          $dependencies = Join-Path $installed 'x64-windows-hdr'
+          $crt = Get-ChildItem (Join-Path $env:VCToolsRedistDir 'x64/Microsoft.VC*.CRT') -Directory
+          if ($crt.Count -ne 1) { throw 'Unique MSVC redistributable directory required' }
+          Copy-Item (Join-Path $crt.FullName '*.dll') (Join-Path $dependencies 'bin')
+          "FRAMELEAF_HDR_DEPENDENCIES=$dependencies" >> $env:GITHUB_ENV
+      - name: Build patched codecs and execute all native HDR fixtures
+        shell: pwsh
+        run: |
+          python tools/build_host_media.py --source "$env:GITHUB_WORKSPACE/server-source" --revision ee7e711a263f1fdfed14414f1af987c9209a6765 --node-root "$env:FRAMELEAF_HDR_NODE_ROOT" --dependency-prefix "$env:FRAMELEAF_HDR_DEPENDENCIES" --output "$env:RUNNER_TEMP/fl-hdr"
+          if ($LASTEXITCODE) { throw 'Native HDR qualification failed' }
+      - name: Retain private component and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-private-hdr-candidate
+          path: |
+            ${{ runner.temp }}/fl-hdr/media/
+            ${{ runner.temp }}/fl-hdr/qualification.json
+            ${{ runner.temp }}/fl-hdr/build.log
+            ${{ runner.temp }}/fl-hdr/source-error.log
+          retention-days: 7
+          if-no-files-found: warn

@@ -408,6 +408,11 @@ python3 tools/build_host_media.py \
 
 The receipt records source fixture hashes, Node and binding hashes, codec pins, platform and qualification scope, and always declares `redistributable: false`. The pinned macOS candidate passed 38/38 HDR tests; a stock-library control passed 27 and failed 11. The JPEG include path must come from package metadata to avoid stock HEIF headers shadowing the patched headers. This closes one native-host feasibility gap; it does not establish RAW/Studio parity, a portable dependency bundle, private PostgreSQL, Manager hosting, signing or installed three-platform acceptance.
 
+The [Windows HDR candidate workflow](.github/workflows/windows-host-hdr.yml) uses
+the same source-pinned codecs and HDR fixtures with an MSVC binding, matching Node
+import library, and audited private DLL closure. Its component checks remain
+separate from a complete host pack, Windows 11 installation, and release signing.
+
 ### Native host database feasibility
 
 `tools/build_host_database.py` builds PostgreSQL and pgvector under a fresh private macOS output directory. The lock in `runtime/host-database.json` must match the selected Frameleaf revision's database image, extension version and source digest. Downloaded source archives must match their SHA-256 pins before extraction.

@@ -12,7 +12,22 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from build_runtime import BuildError, build_environment, git_blob, inventory, sha256
+from build_runtime import BuildError, build_environment, git_blob, inventory, regular, sha256
+
+
+def windows_binding_project(original: str) -> str:
+    replacements = {
+        "add_library(image-hdr MODULE image-hdr.cc)": 'add_library(image-hdr MODULE "${FRAMELEAF_HDR_SOURCE}")',
+        "target_compile_options(image-hdr PRIVATE -Wall -Wextra -Werror)":
+            'target_compile_options(image-hdr PRIVATE /W4 /WX)\n'
+            'find_library(NODE_API_LIBRARY node REQUIRED)\n'
+            'target_link_libraries(image-hdr PRIVATE "${NODE_API_LIBRARY}")',
+    }
+    for before, after in replacements.items():
+        if original.count(before) != 1:
+            raise BuildError("host_media_windows_cmake_source_changed")
+        original = original.replace(before, after)
+    return original
 
 
 def codec_pin(name: str, manifest: dict, patch: bytes) -> dict:
@@ -37,16 +52,26 @@ def build(
     source: Path, revision: str, node_root: Path, dependency_prefix: Path, output: Path
 ) -> None:
     system = platform.system()
-    if system not in {"Darwin", "Linux"}:
+    if system not in {"Darwin", "Linux", "Windows"}:
         raise BuildError("host_media_feasibility_target_unsupported")
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise BuildError("host_media_revision_invalid")
+    if system == "Windows" and platform.machine().lower() not in {"amd64", "x86_64"}:
+        raise BuildError("host_media_feasibility_target_unsupported")
     for path in [source, node_root, dependency_prefix, output]:
         if not path.is_absolute():
             raise BuildError("host_media_absolute_path_required")
     git, cmake = shutil.which("git"), shutil.which("cmake")
-    audit = shutil.which("readelf") if system == "Linux" else "/usr/bin/otool"
-    node = node_root / "bin/node"
+    audit = (shutil.which("dumpbin") if system == "Windows" else
+             shutil.which("readelf") if system == "Linux" else "/usr/bin/otool")
+    node = node_root / "bin" / ("node.exe" if system == "Windows" else "node")
+    compiler = {}
+    pkg_config = "pkg-config"
+    if system == "Windows":
+        compiler = {name: shutil.which(name) for name in ["cl", "ninja", "rc", "mt"]}
+        pkg_config = shutil.which("pkgconf", path=str(dependency_prefix / "tools/pkgconf"))
+        if not all(compiler.values()) or not pkg_config or not (node_root / "lib/node.lib").is_file():
+            raise BuildError("host_media_build_tools_missing")
     if (
         not git
         or not cmake
@@ -58,7 +83,8 @@ def build(
     output.mkdir(mode=0o700)
     work, prefix = output / "work", output / "prefix"
     work.mkdir(mode=0o700)
-    env = build_environment(work, {})
+    env = build_environment(work, os.environ if system == "Windows" else {})
+    system_path = env["PATH"]
     env["PATH"] = os.pathsep.join(
         [
             str(node.parent),
@@ -67,6 +93,18 @@ def build(
             os.defpath,
         ]
     )
+    if system == "Windows":
+        env["PATH"] = os.pathsep.join(dict.fromkeys([
+            str(node.parent), str(Path(cmake).parent), str(Path(git).parent),
+            *[str(Path(tool).parent) for tool in compiler.values()],
+            str(Path(pkg_config).parent), str(prefix / "bin"),
+            str(dependency_prefix / "bin"), system_path,
+        ]))
+        # Windows headers must not turn patched codec std::min calls into macros.
+        env.update(CC="cl", CXX="cl", CL="/DNOMINMAX", PKG_CONFIG=pkg_config, PROCESSOR_ARCHITECTURE="AMD64")
+        for key in ["INCLUDE", "LIB", "LIBPATH"]:
+            if key in os.environ:
+                env[key] = os.environ[key]
     env["PKG_CONFIG_PATH"] = os.pathsep.join(
         str(p / "lib/pkgconfig") for p in [prefix, dependency_prefix]
     )
@@ -75,7 +113,7 @@ def build(
         "schemaVersion": 1,
         "scope": "native-hdr-fixtures",
         "sourceRevision": revision,
-        "platform": f"{'macos' if system == 'Darwin' else 'linux'}-{platform.machine()}",
+        "platform": f"{dict(Darwin='macos', Linux='linux', Windows='windows')[system]}-{platform.machine()}",
         "osRelease": platform.release(),
         "redistributable": False,
         "developmentDependencyPrefix": str(dependency_prefix),
@@ -169,10 +207,12 @@ def build(
                 run([git, "checkout", "--detach", pin["revision"]], checkout)
                 run([git, "apply", patch_file], checkout)
                 options = [
-                    f"-DCMAKE_INSTALL_PREFIX={prefix}",
+                    f"-DCMAKE_INSTALL_PREFIX={prefix.as_posix()}",
                     "-DCMAKE_BUILD_TYPE=Release",
-                    f"-DCMAKE_PREFIX_PATH={prefix};{dependency_prefix}",
+                    f"-DCMAKE_PREFIX_PATH={prefix.as_posix()};{dependency_prefix.as_posix()}",
                 ]
+                if system == "Windows":
+                    options += ["-G", "Ninja", "-DBUILD_SHARED_LIBS=ON", "-DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON"]
                 if name == "libheif":
                     options += [
                         "-DWITH_EXPERIMENTAL_GAIN_MAP=ON",
@@ -200,7 +240,7 @@ def build(
                     ]
                     # A broad JPEG include prefix shadows the patched HEIF headers on Homebrew.
                     jpeg_include = subprocess.check_output(
-                        ["pkg-config", "--variable=includedir", "libjpeg"],
+                        [pkg_config, "--variable=includedir", "libjpeg"],
                         env=env,
                         text=True,
                         timeout=30,
@@ -210,31 +250,79 @@ def build(
                 run([cmake, "--build", checkout / "build", "--parallel", "1"])
                 run([cmake, "--install", checkout / "build"])
             binding_build = work / "binding"
+            binding_source = snapshot / "server/native"
+            binding_options = []
+            if system == "Windows":
+                original = (binding_source / "CMakeLists.txt").read_text()
+                binding_source = work / "windows-binding"
+                binding_source.mkdir()
+                (binding_source / "CMakeLists.txt").write_text(windows_binding_project(original))
+                binding_options = [
+                    "-G", "Ninja", f"-DFRAMELEAF_HDR_SOURCE={(snapshot / 'server/native/image-hdr.cc').as_posix()}",
+                    f"-DNODE_API_LIBRARY={(node_root / 'lib/node.lib').as_posix()}",
+                ]
+                report["windowsBuildAdapterSha256"] = sha256(binding_source / "CMakeLists.txt")
+                report["nodeImportLibrarySha256"] = sha256(node_root / "lib/node.lib")
             run(
                 [
                     cmake,
                     "-S",
-                    snapshot / "server/native",
+                    binding_source,
                     "-B",
                     binding_build,
                     "-DCMAKE_BUILD_TYPE=Release",
-                    f"-DCMAKE_PREFIX_PATH={prefix};{dependency_prefix}",
-                    f"-DNODE_API_INCLUDE_DIR={node_root / 'include/node'}",
-                    f"-DUHDR_INCLUDE_DIR={prefix / 'include'}",
-                    f"-DUHDR_LIBRARY={prefix / 'lib' / ('libuhdr.dylib' if system == 'Darwin' else 'libuhdr.so')}",
+                    f"-DCMAKE_PREFIX_PATH={prefix.as_posix()};{dependency_prefix.as_posix()}",
+                    f"-DNODE_API_INCLUDE_DIR={(node_root / 'include/node').as_posix()}",
+                    f"-DUHDR_INCLUDE_DIR={(prefix / 'include').as_posix()}",
+                    f"-DUHDR_LIBRARY={(prefix / 'lib' / ('uhdr.lib' if system == 'Windows' else 'libuhdr.dylib' if system == 'Darwin' else 'libuhdr.so')).as_posix()}",
+                    *binding_options,
                 ]
             )
             run([cmake, "--build", binding_build, "--parallel", "1"])
             binding = binding_build / "image-hdr.node"
+            runtime_extra = {}
+            if system == "Windows":
+                from build_host_database_windows import SYSTEM_DLLS, stage_dependencies
+                stage_dependencies(prefix, dependency_prefix, audit, env)
+                media = output / "media"
+                media.mkdir(mode=0o700)
+                for source_file in [binding, *sorted((prefix / "bin").glob("*.dll"))]:
+                    regular(source_file)
+                    shutil.copy2(source_file, media / source_file.name)
+                shutil.copytree(prefix / "licenses", media / "licenses")
+                for name in ["libheif", "libultrahdr"]:
+                    notice_dir = media / "licenses" / name
+                    notice_dir.mkdir(exist_ok=True)
+                    for filename in ["LICENSE", "COPYING", "COPYING.LESSER", "NOTICE"]:
+                        notice = work / name / filename
+                        if notice.is_file():
+                            regular(notice)
+                            shutil.copy2(notice, notice_dir / filename)
+                binding = media / binding.name
+                imports = re.findall(r"^\s+([\w.+-]+\.(?:dll|exe))\s*$", subprocess.check_output(
+                    [audit, "/nologo", "/dependents", binding], cwd=work, env=env, text=True, timeout=30
+                ), re.MULTILINE | re.IGNORECASE)
+                if not imports:
+                    raise BuildError("host_media_windows_imports_missing")
+                private = {path.name.lower() for path in media.glob("*.dll")}
+                for imported in imports:
+                    name = imported.lower()
+                    if name not in private | SYSTEM_DLLS | {"node.exe"} and not name.startswith(("api-ms-win-", "ext-ms-win-")):
+                        raise BuildError("host_media_windows_dll_missing:" + name)
+                runtime_extra["PATH"] = os.pathsep.join([str(media), str(node.parent), system_path])
+                report["privateRuntimeImportsAudited"] = True
             report["bindingSha256"] = sha256(binding)
-            run([audit, "-L" if system == "Darwin" else "-dW", binding])
+            run([audit, "/dependents" if system == "Windows" else "-L" if system == "Darwin" else "-dW", binding])
             run(
                 [node, "--test", snapshot / "server/test/native/image-hdr.test.mjs"],
                 extra={
                     "FRAMELEAF_HDR_BINDING": str(binding),
                     "FRAMELEAF_HDR_ISO_TEST": "1",
+                    **runtime_extra,
                 },
             )
+            if system == "Windows":
+                report["files"] = inventory(output / "media")
             report["qualification"] = "passed"
         finally:
             (output / "qualification.json").write_text(
