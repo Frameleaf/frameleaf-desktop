@@ -486,13 +486,8 @@ mod tests {
         let root = Root::new();
         let stage = root.0.join(format!(".staging-{}", "1".repeat(40)));
         let model = stage.join("clip/test");
-        fs::create_dir_all(model.join("visual")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for p in [&stage, &stage.join("clip"), &model, &model.join("visual")] {
-                fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
-            }
+        for p in [&stage, &stage.join("clip"), &model, &model.join("visual")] {
+            crate::runtime_store::private_directory(p).unwrap();
         }
         fs::write(model.join("visual/model.onnx"), b"weights").unwrap();
         let reference = "1".repeat(40);

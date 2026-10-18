@@ -123,10 +123,14 @@ fn open(path: &Path) -> Result<File, String> {
 }
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
     let user = current_user()?;
-    account_directory(path, &user)
+    account_directory(path, &user, false)
+}
+pub(crate) fn new_private_directory(path: &Path) -> Result<(), String> {
+    let user = current_user()?;
+    account_directory(path, &user, true)
 }
 /// Installer-only caller must validate the selected account and require administrator authority.
-pub(crate) fn account_directory(path: &Path, user: &[u8]) -> Result<(), String> {
+pub(crate) fn account_directory(path: &Path, user: &[u8], create_new: bool) -> Result<(), String> {
     if !super::sid_valid(user) {
         return Err(ERROR.into());
     }
@@ -167,6 +171,7 @@ pub(crate) fn account_directory(path: &Path, user: &[u8]) -> Result<(), String> 
                 return Err(ERROR.into());
             }
         }
+        Ok(_) if create_new => return Err(ERROR.into()),
         Ok(_) => {}
         Err(_) => return Err(ERROR.into()),
     }
@@ -216,6 +221,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn exclusive_private_creation_refuses_existing_state_without_repair_or_deletion() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-new-private-{}", uuid::Uuid::new_v4()));
+        new_private_directory(&root).unwrap();
+        let fixture = Fixture(root);
+        let path = fixture.0.join("synthetic-state");
+        fs::write(&path, b"retain").unwrap();
+        let before = super::super::native::security(&open(&fixture.0).unwrap()).unwrap();
+        assert!(new_private_directory(&fixture.0).is_err());
+        assert_eq!(
+            super::super::native::security(&open(&fixture.0).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"retain");
+        private_directory(&fixture.0).unwrap();
     }
     #[test]
     fn private_directory_creates_user_acl_and_refuses_publicly_readable_existing_children() {

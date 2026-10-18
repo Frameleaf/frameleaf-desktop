@@ -746,7 +746,7 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join(format!("frameleaf-cache-set-{}", Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
+        crate::runtime_store::private_directory(&root).unwrap();
         let mut profiles = Vec::new();
         let mut caches = Vec::new();
         for (index, (workload, family, name, fixture)) in [
