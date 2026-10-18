@@ -68,8 +68,10 @@ mod tests {
     #[test]
     fn caller_environment_and_working_directory_cannot_redirect_the_machine_anchor() {
         let root = base().unwrap();
+        let inventory = serde_json::to_string(&super::super::installed().unwrap()).unwrap();
         if std::env::var_os("FRAMELEAF_LAYOUT_CHILD").is_some() {
             println!("physical-installation={}", root.display());
+            println!("installed-versions={inventory}");
             return;
         }
         let temporary = std::env::temp_dir();
@@ -89,5 +91,7 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&output.stdout)
             .contains(&format!("physical-installation={}", root.display())));
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("installed-versions={inventory}")));
     }
 }
