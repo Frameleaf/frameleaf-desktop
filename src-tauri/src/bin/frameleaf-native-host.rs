@@ -39,12 +39,20 @@ fn main() {
             }
         }
         [mode, manifest, controller, uid]
-            if mode == "--provision-install" || mode == "--provision-profile" =>
+            if mode == "--provision-install"
+                || mode == "--provision-profile"
+                || mode == "--provision-windows-profile" =>
         {
             match (manifest.to_str(), controller.to_str(), uid.to_str()) {
                 (Some(manifest), Some(controller), Some(uid)) => {
-                    frameleaf_desktop::host_install::provision(manifest, controller, uid)
-                        .map(|receipt| println!("{}", receipt))
+                    let result = if mode == "--provision-windows-profile" {
+                        frameleaf_desktop::host_install::provision_windows_profile(
+                            manifest, controller, uid,
+                        )
+                    } else {
+                        frameleaf_desktop::host_install::provision(manifest, controller, uid)
+                    };
+                    result.map(|receipt| println!("{}", receipt))
                 }
                 _ => Err("host_install_identity_invalid".into()),
             }

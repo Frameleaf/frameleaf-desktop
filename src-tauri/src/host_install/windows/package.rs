@@ -23,6 +23,9 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
+mod profile;
+pub(in crate::host_install) use profile::provision;
+
 const AUTHORITY: &str = "host_install_administrator_required";
 const DIRECTORY: &str = "host_install_directory_failed";
 const MACHINE_ACL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
@@ -346,6 +349,15 @@ mod tests {
                 AUTHORITY
             );
         }
+        assert_eq!(
+            crate::host_install::provision_windows_profile(
+                &"a".repeat(64),
+                &"b".repeat(64),
+                "S-1-5-18"
+            )
+            .unwrap_err(),
+            AUTHORITY
+        );
     }
 
     struct Fixture(std::path::PathBuf);
@@ -384,6 +396,57 @@ mod tests {
             let _ = fs::remove_dir(&self.0);
         }
     }
+    #[test]
+    #[ignore = "requires an elevated disposable GitHub-hosted Windows runner; never creates a real Frameleaf installation"]
+    fn disposable_runner_provisions_selected_user_leaves_and_preserves_existing_state() {
+        let fixture = Fixture::new();
+        let current = profile::current_account();
+        // The disabled built-in Guest has a different local SID; no test account is created.
+        let guest = format!("{}-501", current.name.rsplit_once('-').unwrap().0);
+        let user = profile::Account::lookup(&guest).unwrap();
+        assert_ne!(current.name, user.name);
+        let profiles = fixture.0.join("Profiles");
+        let parent = profiles.join(&user.name);
+        struct ProfileFixture(std::path::PathBuf);
+        impl Drop for ProfileFixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0.join("state").join("synthetic-state"));
+                let _ = fs::remove_dir(self.0.join("state"));
+                let _ = fs::remove_dir(self.0.join("manager"));
+                let _ = fs::remove_dir(&self.0);
+                let _ = fs::remove_dir(self.0.parent().unwrap());
+            }
+        }
+        let owned = ProfileFixture(parent);
+        let prepare = || {
+            let before = profile::ownership_enabled();
+            let result = {
+                let _ownership = profile::Ownership::enable().unwrap();
+                assert!(profile::ownership_enabled());
+                profile::prepare(&profiles, &user)
+            };
+            assert_eq!(
+                profile::ownership_enabled(),
+                before,
+                "ownership privilege must be restored"
+            );
+            result
+        };
+        prepare().unwrap();
+        let marker = owned.0.join("state").join("synthetic-state");
+        fs::write(&marker, b"existing synthetic state").unwrap();
+        prepare().unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), b"existing synthetic state");
+        let manager = owned.0.join("manager");
+        fs::remove_dir(&manager).unwrap();
+        fs::write(&manager, b"existing file must survive").unwrap();
+        assert!(prepare().is_err());
+        assert_eq!(fs::read(&manager).unwrap(), b"existing file must survive");
+        fs::remove_file(&manager).unwrap();
+        prepare().unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), b"existing synthetic state");
+    }
+
     #[test]
     #[ignore = "requires an elevated disposable GitHub-hosted Windows runner; never creates a real Frameleaf installation"]
     fn disposable_runner_creates_protected_directories_and_refuses_existing_unsafe_objects() {

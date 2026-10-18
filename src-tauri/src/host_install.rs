@@ -242,6 +242,23 @@ pub fn finalize_windows_package(
     }
 }
 
+/// Explicit account provisioning for the elevated Windows installer; never starts a host.
+pub fn provision_windows_profile(
+    manifest: &str,
+    controller: &str,
+    sid: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        windows::package::provision(manifest, controller, sid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller, sid);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+
 pub fn prepare(manifest: &str, controller: &str) -> Result<serde_json::Value, String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {

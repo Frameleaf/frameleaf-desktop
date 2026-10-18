@@ -122,15 +122,22 @@ fn open(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
-    crate::native_runtime::absolute_directory(path.parent().ok_or(ERROR)?)?;
     let user = current_user()?;
+    account_directory(path, &user)
+}
+/// Installer-only caller must validate the selected account and require administrator authority.
+pub(crate) fn account_directory(path: &Path, user: &[u8]) -> Result<(), String> {
+    if !super::sid_valid(user) {
+        return Err(ERROR.into());
+    }
+    crate::native_runtime::absolute_directory(path.parent().ok_or(ERROR)?)?;
     let private_trusted = vec![
-        user.clone(),
+        user.to_vec(),
         vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
         vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0],
     ];
     let mut trusted = super::native::trusted_sids()?.clone();
-    trusted.push(user.clone());
+    trusted.push(user.to_vec());
     let parent = super::stable_path(path.parent().ok_or(ERROR)?)?;
     let text = parent.to_str().ok_or(ERROR)?;
     // Hold the physical parent chain against deletion until creation and admission finish.
@@ -146,7 +153,7 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
     let path: PathBuf = parent.join(path.file_name().ok_or(ERROR)?);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let security = descriptor(&user)?;
+            let security = descriptor(user)?;
             let attributes = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: security.0,
@@ -168,7 +175,7 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
     // Protected DACLs prevent later parent inheritance from widening this private boundary.
     if !file.metadata().map_err(|_| ERROR)?.is_dir()
         || control & 0x1000 == 0
-        || !super::private_acl(&owner, &acl, &user, &private_trusted)
+        || !super::private_acl(&owner, &acl, user, &private_trusted)
     {
         return Err(ERROR.into());
     }
