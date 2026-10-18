@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, readFile, writeFile, rm, readdir, realpath, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, readdir, realpath, symlink, link } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { renameSync, mkdirSync, writeFileSync } from "node:fs";
+import { renameSync, mkdirSync, writeFileSync, promises as filesystem } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import * as owner from "../runtime/host-agent.mjs";
 import { checkpointRequest, createHostCheckpoint } from "../runtime/host-agent.mjs";
 
 const operationId = "11111111-1111-4111-8111-111111111111";
@@ -126,4 +128,114 @@ test("a renamed checkpoint directory cannot substitute different bytes during re
     return false;
   }), /host_checkpoint_changed/);
   assert.equal(await readFile(join(f.path, "database.dump"), "utf8"), "different fixture bytes");
+});
+
+
+test("retired checkpoints are removed idempotently and can never regenerate a dump", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  assert.equal(typeof owner.cleanupHostCheckpoint, "function");
+  assert.deepEqual(await owner.cleanupHostCheckpoint(f.c, receipt), { ...receipt, state: "checkpoint-cleaned" });
+  await assert.rejects(readFile(join(f.path, "database.dump")), { code: "ENOENT" });
+  assert.deepEqual(await owner.cleanupHostCheckpoint(f.c, receipt), { ...receipt, state: "checkpoint-cleaned" });
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_retired/);
+  assert.equal(f.calls.length, 2);
+});
+
+test("checkpoint cleanup refuses foreign receipts and altered bytes before retirement", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  assert.equal(typeof owner.cleanupHostCheckpoint, "function");
+  for (const changed of [{ ...receipt, sourceRevision: "e".repeat(40) },
+    { ...receipt, operationId: "../outside" }, { ...receipt, secret: "unaccepted" },
+    { ...receipt, dump: { ...receipt.dump, sha256: "e".repeat(64) } }]) {
+    await assert.rejects(owner.cleanupHostCheckpoint(f.c, changed));
+    assert.deepEqual(await readFile(join(f.path, "database.dump")), f.bytes);
+  }
+  await writeFile(join(f.path, "database.dump"), "changed dump");
+  await assert.rejects(owner.cleanupHostCheckpoint(f.c, receipt), /host_checkpoint_changed/);
+  assert.deepEqual(await readdir(join(f.c.state, "checkpoints")), [operationId]);
+});
+
+test("retirement reconciles a crash partial but preserves changed and unknown remnants", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  assert.equal(typeof owner.cleanupHostCheckpoint, "function");
+  await owner.cleanupHostCheckpoint(f.c, receipt);
+  await mkdir(f.path, { mode: 0o700 });
+  await writeFile(join(f.path, "checkpoint.json"), JSON.stringify(receipt), { mode: 0o600 });
+  await owner.cleanupHostCheckpoint(f.c, receipt);
+  await mkdir(f.path, { mode: 0o700 });
+  await writeFile(join(f.path, "database.dump"), "foreign changed bytes", { mode: 0o600 });
+  await assert.rejects(owner.cleanupHostCheckpoint(f.c, receipt), /host_checkpoint_changed/);
+  assert.equal(await readFile(join(f.path, "database.dump"), "utf8"), "foreign changed bytes");
+  await rm(join(f.path, "database.dump"));
+  await writeFile(join(f.path, "foreign"), "keep", { mode: 0o600 });
+  await assert.rejects(owner.cleanupHostCheckpoint(f.c, receipt), /host_checkpoint_changed/);
+  assert.equal(await readFile(join(f.path, "foreign"), "utf8"), "keep");
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_retired/);
+  assert.equal(f.calls.length, 2);
+});
+
+
+test("cleanup rejects a linked retirement record and leaves its external bytes intact", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  const outside = join(f.c.state, "external-record.json");
+  await writeFile(outside, JSON.stringify(receipt), { mode: 0o600 });
+  await link(outside, join(f.c.state, "checkpoints", "." + operationId + ".retired.json"));
+  await assert.rejects(owner.cleanupHostCheckpoint(f.c, receipt), /host_checkpoint_changed/);
+  assert.deepEqual(await readFile(join(f.path, "database.dump")), f.bytes);
+  assert.deepEqual(JSON.parse(await readFile(outside, "utf8")), receipt);
+});
+
+
+test("a failed unlink leaves a durable retirement intent and resumes without regenerating data", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  const original = filesystem.unlink;
+  filesystem.unlink = async path => {
+    if (path === join(f.path, "database.dump")) throw Object.assign(Error("synthetic interrupted unlink"), { code: "EIO" });
+    return original(path);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(owner.cleanupHostCheckpoint(f.c, receipt), /synthetic interrupted unlink/);
+  } finally { filesystem.unlink = original; syncBuiltinESMExports(); }
+  assert.deepEqual(await readdir(f.path), ["database.dump"]);
+  assert.deepEqual(JSON.parse(await readFile(join(f.c.state, "checkpoints", "." + operationId + ".retired.json"), "utf8")), receipt);
+  await assert.rejects(createHostCheckpoint(f.c, operationId, f.execute), /host_checkpoint_retired/);
+  await owner.cleanupHostCheckpoint(f.c, receipt);
+  await assert.rejects(readFile(join(f.path, "database.dump")), { code: "ENOENT" });
+  assert.equal(f.calls.length, 2);
+});
+
+
+test("retry syncs a retirement marker interrupted before its first file sync before deleting bytes", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  const marker = join(f.c.state, "checkpoints", "." + operationId + ".retired.json");
+  const originalOpen = filesystem.open, originalUnlink = filesystem.unlink;
+  const events = [];
+  let interrupted = false;
+  filesystem.open = async (...args) => {
+    const file = await originalOpen(...args);
+    if (args[0] === marker) {
+      const sync = file.sync.bind(file);
+      file.sync = async () => {
+        if (!interrupted) { interrupted = true; throw Error("synthetic marker sync interruption"); }
+        events.push("marker-sync");
+        return sync();
+      };
+    }
+    return file;
+  };
+  filesystem.unlink = async path => { events.push("unlink"); return originalUnlink(path); };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(owner.cleanupHostCheckpoint(f.c, receipt), /synthetic marker sync interruption/);
+    assert.deepEqual(await readFile(join(f.path, "database.dump")), f.bytes);
+    await owner.cleanupHostCheckpoint(f.c, receipt);
+    assert.deepEqual(events, ["marker-sync", "unlink", "unlink"]);
+  } finally { filesystem.open = originalOpen; filesystem.unlink = originalUnlink; syncBuiltinESMExports(); }
 });

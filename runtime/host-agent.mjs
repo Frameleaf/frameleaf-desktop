@@ -161,6 +161,92 @@ async function checkpointSyncDirectory(path) {
   const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try { await file.sync(); } finally { await file.close(); }
 }
+function retirementReceipt(c, value) {
+  if (!value || typeof value.operationId !== "string" || !CHECKPOINT_ID.test(value.operationId)) fail("host_checkpoint_changed");
+  const binding = { schemaVersion: 1, operationId: value.operationId, manifestSha256: c.manifestSha256,
+    sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor, databaseFormat: "frameleaf-canonical" };
+  if (Object.keys(value).sort().join(",") !== [...Object.keys(binding), "dump"].sort().join(",") ||
+    Object.entries(binding).some(([key, item]) => value[key] !== item) ||
+    !value.dump || Object.keys(value.dump).sort().join(",") !== "bytes,sha256" ||
+    !Number.isSafeInteger(value.dump.bytes) || value.dump.bytes <= 0 ||
+    typeof value.dump.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.dump.sha256)) fail("host_checkpoint_changed");
+  return { ...binding, dump: { bytes: value.dump.bytes, sha256: value.dump.sha256 } };
+}
+/** The owner retires an operation permanently before removing its verified checkpoint bytes. */
+export async function cleanupHostCheckpoint(c, supplied) {
+  validateConfig(c);
+  const expected = retirementReceipt(c, supplied);
+  await checkpointDirectory(c.state);
+  if (await fs.realpath(c.state) !== c.state) fail("host_checkpoint_changed");
+  const root = join(c.state, "checkpoints");
+  await checkpointDirectory(root);
+  if (await fs.realpath(root) !== root) fail("host_checkpoint_changed");
+  const target = join(root, expected.operationId), marker = join(root, "." + expected.operationId + ".retired.json");
+  let retired = false, markerIdentity;
+  try {
+    const named = await fs.lstat(marker);
+    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 ||
+      (process.platform !== "win32" && (named.mode & 0o077) !== 0) ||
+      (await fs.realpath(marker)) !== marker) fail("host_checkpoint_changed");
+    const value = retirementReceipt(c, JSON.parse(await stateFile(marker, 4096)));
+    if (JSON.stringify(value) !== JSON.stringify(expected)) fail("host_checkpoint_changed");
+    retired = true; markerIdentity = named;
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (retired) {
+    const file = await fs.open(marker, constants.O_RDWR | constants.O_NOFOLLOW);
+    try {
+      const current = await file.stat();
+      if (["dev", "ino", "size", "mtimeMs", "ctimeMs", "nlink", "mode"].some(key => current[key] !== markerIdentity[key]))
+        fail("host_checkpoint_changed");
+      // A previous process may have written this intent but crashed before syncing its contents.
+      await file.sync();
+    } finally { await file.close(); }
+  }
+  let directory;
+  try { directory = await fs.lstat(target); }
+  catch (error) { if (error.code !== "ENOENT" || !retired) throw error; }
+  if (directory) {
+    await checkpointDirectory(target);
+    if (await fs.realpath(target) !== target) fail("host_checkpoint_changed");
+    const names = (await fs.readdir(target)).sort();
+    if (names.some(name => !["checkpoint.json", "database.dump"].includes(name)) ||
+      (!retired && names.join(",") !== "checkpoint.json,database.dump")) fail("host_checkpoint_changed");
+    const files = new Map();
+    for (const name of names) {
+      const path = join(target, name), before = await fs.lstat(path);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
+        (await fs.realpath(path)) !== path) fail("host_checkpoint_changed");
+      if (name === "checkpoint.json") {
+        if (JSON.stringify(retirementReceipt(c, JSON.parse(await stateFile(path, 4096)))) !== JSON.stringify(expected))
+          fail("host_checkpoint_changed");
+      } else {
+        const actual = await checkpointHash(path, () => {});
+        if (actual.bytes !== expected.dump.bytes || actual.sha256 !== expected.dump.sha256) fail("host_checkpoint_changed");
+      }
+      files.set(name, before);
+    }
+    if (!retired) {
+      const file = await fs.open(marker, "wx", 0o600);
+      try { await file.writeFile(JSON.stringify(expected) + "\n"); await file.sync(); } finally { await file.close(); }
+    }
+    // Sync an existing intent too: a prior crash may have happened before its directory sync.
+    await checkpointSyncDirectory(root);
+    for (const name of names) {
+      const freshDirectory = await fs.lstat(target), path = join(target, name), fresh = await fs.lstat(path), before = files.get(name);
+      if (freshDirectory.dev !== directory.dev || freshDirectory.ino !== directory.ino ||
+        !freshDirectory.isDirectory() || freshDirectory.isSymbolicLink() ||
+        ["dev", "ino", "size", "mtimeMs", "ctimeMs", "nlink", "mode"].some(key => fresh[key] !== before[key]))
+        fail("host_checkpoint_changed");
+      await fs.unlink(path);
+    }
+    const freshDirectory = await fs.lstat(target);
+    if (freshDirectory.dev !== directory.dev || freshDirectory.ino !== directory.ino) fail("host_checkpoint_changed");
+    await fs.rmdir(target);
+  }
+  await checkpointSyncDirectory(root);
+  return { ...expected, state: "checkpoint-cleaned" };
+}
+
 /** Called only by the live owner, which serializes requests and owns the database process tree. */
 export async function createHostCheckpoint(c, operationId, execute, cancelled = () => false) {
   validateConfig(c);
@@ -171,6 +257,11 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root, true);
   await checkpointSyncDirectory(c.state);
+  // Any retirement intent forbids regenerating a different live dump under the same operation ID.
+  try {
+    await fs.lstat(join(root, "." + operationId + ".retired.json"));
+    fail("host_checkpoint_retired");
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
   const target = join(root, operationId);
   const binding = { schemaVersion: 1, operationId, manifestSha256: c.manifestSha256,
     sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor, databaseFormat: "frameleaf-canonical" };
