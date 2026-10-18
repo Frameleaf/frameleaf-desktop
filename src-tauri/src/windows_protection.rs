@@ -1,4 +1,7 @@
 //! Read-only Windows package admission; never edits an ACL.
+#[cfg(windows)]
+// Node's default realpath walk cannot traverse the GLOBALROOT namespace.
+pub(crate) const NODE_PATH_OPTIONS: &str = "--preserve-symlinks --preserve-symlinks-main";
 fn stable_volume_root(path: &str) -> Option<&str> {
     let prefix = [
         r"\\?\GLOBALROOT\Device\HarddiskVolume",
@@ -464,11 +467,11 @@ assert.ok(fs.readFileSync(executable).length > 0);
 assert.equal(require(process.argv[2]), 'kernel-common-ok');
 import(pathToFileURL(process.argv[3]).href).then(module => {
 assert.equal(module.value, 'kernel-module-ok');
-const child = spawnSync(executable, ['--eval', 'process.stdout.write("nested-kernel-ok")'],
-  {env: {SystemRoot: process.env.SystemRoot}, timeout: 10000, maxBuffer: 1024});
+const child = spawnSync(executable, ['--eval', 'process.stdout.write(require(process.argv[1]))', process.argv[2]],
+  {env: {SystemRoot: process.env.SystemRoot, NODE_OPTIONS: process.env.NODE_OPTIONS}, timeout: 10000, maxBuffer: 1024});
 assert.equal(child.error, undefined);
 assert.equal(child.status, 0);
-assert.equal(child.stdout.toString(), 'nested-kernel-ok');
+assert.equal(child.stdout.toString(), 'kernel-common-ok');
 process.stdout.write('device-kernel-node-ok');
 }).catch(error => { console.error(error); process.exitCode = 1; });
 "#;
@@ -479,6 +482,7 @@ process.stdout.write('device-kernel-node-ok');
                 .arg(&module)
                 .env_clear()
                 .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+                .env("NODE_OPTIONS", super::super::NODE_PATH_OPTIONS)
                 .output();
             std::fs::remove_dir_all(scratch).unwrap();
             let output = output.unwrap();

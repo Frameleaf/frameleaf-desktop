@@ -1126,6 +1126,8 @@ impl VerifiedHostRuntime {
         if let Some(system_root) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", system_root);
         }
+        #[cfg(windows)]
+        command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
         code_lease.inherit(&mut command);
         crate::process_tree::configure(&mut command);
         let mut child = command.spawn().map_err(|_| "host_agent_start_failed")?;

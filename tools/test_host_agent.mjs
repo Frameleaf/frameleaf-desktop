@@ -167,6 +167,26 @@ test("host media commands use private binaries without inheriting the caller env
   assert.ok(env.PATH.split(delimiter).includes(join(cfg.runtime, "media")));
   assert.equal(env.PATH.split(delimiter)[0], join(cfg.runtime, "media"));
 });
+test("host Node options preserve captured Windows paths without inheriting caller options", () => {
+  const cfg = config("/private/state");
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const previous = process.env.NODE_OPTIONS;
+  try {
+    process.env.NODE_OPTIONS = "--require=untrusted-caller-module";
+    for (const target of ["win32", "darwin", "linux"]) {
+      Object.defineProperty(process, "platform", { ...platform, value: target });
+      const env = hostEnvironment(cfg);
+      assert.equal(
+        env.NODE_OPTIONS,
+        target === "win32" ? "--preserve-symlinks --preserve-symlinks-main" : undefined,
+      );
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    if (previous === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previous;
+  }
+});
 test("host state binds one runtime before initialization and refuses adoption or changed authority", async () => {
   const root = await mkdtemp(join(tmpdir(), "frameleaf-host-agent-"));
   try {

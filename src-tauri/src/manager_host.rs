@@ -373,6 +373,8 @@ impl Programs<'_> {
             .env("MANAGER_RUNTIME", "native")
             .env("MANAGER_ORIGIN", &config.origin)
             .env("MANAGER_DATA", &config.data);
+        #[cfg(windows)]
+        command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
         let mut manager = NativeManager::spawn(
             &mut command,
             input,

@@ -552,7 +552,10 @@ export function hostEnvironment(c) {
     USERPROFILE: join(c.state, "home"),
     LANG: "C",
     ...(process.platform === "win32"
-      ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows" }
+      ? {
+          SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+          NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main",
+        }
       : {}),
   };
 }
