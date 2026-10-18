@@ -881,3 +881,5 @@ concurrent fork must not keep a completed operation's lock alive. Active host
 ownership and package code leases keep their existing lifetime rules.
 
 The active Windows RAW workflow now pins both the engine builder and server consumer to public source `ee7e711a263f1fdfed14414f1af987c9209a6765`. Engine/patch contracts and the prior consumer sources remain unchanged. New Windows engine rendering and the complete host still require qualification; packaging tests do not establish installed acceptance.
+
+The active Windows database qualifier includes the reviewed startup-pipe and SQL argument fixes from the retained Windows replay. That replay passed fresh/restore/restart and physical checksum checks on its pinned old component; the current-source producer and full Windows host still need separate qualification. The producer workflow now pins public source `ee7e711a263f1fdfed14414f1af987c9209a6765`.

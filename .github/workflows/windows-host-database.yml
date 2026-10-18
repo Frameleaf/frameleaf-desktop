@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
+          ref: ee7e711a263f1fdfed14414f1af987c9209a6765
           path: server-source
           sparse-checkout: docker/postgres
           persist-credentials: false
@@ -101,7 +101,7 @@ jobs:
       - name: Build and qualify the native database
         shell: pwsh
         run: |
-          python tools/build_host_database_windows.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --dependency-prefix "$env:FRAMELEAF_DATABASE_DEPENDENCIES" --output "$env:RUNNER_TEMP/frameleaf-windows-database"
+          python tools/build_host_database_windows.py --source "$env:GITHUB_WORKSPACE/server-source" --revision ee7e711a263f1fdfed14414f1af987c9209a6765 --dependency-prefix "$env:FRAMELEAF_DATABASE_DEPENDENCIES" --output "$env:RUNNER_TEMP/frameleaf-windows-database"
           if ($LASTEXITCODE) { throw 'Native database qualification failed' }
       - name: Retain private component and diagnostics
         if: always()
@@ -114,6 +114,7 @@ jobs:
             ${{ runner.temp }}/frameleaf-windows-database/build.log
             ${{ runner.temp }}/frameleaf-windows-database/command-error.log
             ${{ runner.temp }}/frameleaf-windows-database/postgres.log
+            ${{ runner.temp }}/frameleaf-windows-database/pg-ctl-start.log
             ${{ runner.temp }}/frameleaf-windows-database/work/configured/meson-logs/meson-log.txt
           retention-days: 7
           if-no-files-found: warn
