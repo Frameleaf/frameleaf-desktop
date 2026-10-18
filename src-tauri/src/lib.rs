@@ -4,6 +4,7 @@ pub mod copy_upload;
 mod credentials;
 mod host_commands;
 pub mod host_control;
+mod host_database;
 pub mod host_install;
 pub mod host_runtime;
 mod host_setup;
