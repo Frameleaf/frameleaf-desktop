@@ -9,7 +9,17 @@ use std::{
 };
 use uuid::Uuid;
 
+mod activation;
+pub(crate) use activation::SafetySnapshot;
+
 const NAME: &str = "controller-state.json";
+const ACTIVATION: &str = "restore-activation.json";
+fn no_activation(root: &Dir) -> Result<(), String> {
+    match root.symlink_metadata(ACTIVATION) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_restore_activation_pending".into()),
+    }
+}
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Phase {
@@ -25,6 +35,8 @@ pub(crate) struct Marker {
     pub profile_identity: String,
     pub generation: Uuid,
     pub phase: Phase,
+    #[serde(default)]
+    restore_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     database_reference: Option<crate::host_database::Reference>,
 }
@@ -220,10 +232,15 @@ impl Owner {
         sha: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(), String> {
-        let database_reference = match self.read()? {
+        if mode == crate::host_runtime::HostMode::Server {
+            no_activation(&self.root)?;
+        }
+        let (database_reference, restore_pending) = match self.read()? {
             Some(marker) => {
                 self.binding(&marker, id, sha)?;
-                if marker.phase != Phase::Stopped {
+                if marker.phase != Phase::Stopped
+                    || (mode == crate::host_runtime::HostMode::Server && marker.restore_pending)
+                {
                     return Err("host_recovery_requires_manager".into());
                 }
                 if mode.uses_database() {
@@ -231,7 +248,7 @@ impl Owner {
                         reference.resolve(&self.path)?;
                     }
                 }
-                marker.database_reference
+                (marker.database_reference, marker.restore_pending)
             }
             None => {
                 for entry in self
@@ -247,7 +264,7 @@ impl Owner {
                         return Err("host_recovery_requires_manager".into());
                     }
                 }
-                None
+                (None, false)
             }
         };
         let marker = Marker {
@@ -257,6 +274,7 @@ impl Owner {
             profile_identity: self.profile_identity.clone(),
             generation: Uuid::new_v4(),
             phase: Phase::Active,
+            restore_pending,
             database_reference,
         };
         self.write(&marker)?;
@@ -280,7 +298,10 @@ impl Owner {
         &mut self,
         manifest_sha256: &str,
         mode: crate::host_runtime::HostMode,
-    ) -> Result<(PathBuf, Option<crate::host_database::Reference>), String> {
+    ) -> Result<(PathBuf, Option<crate::host_database::Reference>, Uuid), String> {
+        if mode == crate::host_runtime::HostMode::Server {
+            no_activation(&self.root)?;
+        }
         let marker = self
             .active
             .as_ref()
@@ -289,6 +310,7 @@ impl Owner {
         let current = self.read()?.ok_or("host_controller_state_invalid")?;
         if current != marker
             || current.phase != Phase::Active
+            || (mode == crate::host_runtime::HostMode::Server && marker.restore_pending)
             || marker.manifest_sha256 != manifest_sha256
         {
             return Err("host_controller_binding_changed".into());
@@ -299,7 +321,11 @@ impl Owner {
                 reference.resolve(&self.path)?;
             }
         }
-        Ok((self.path.clone(), marker.database_reference))
+        Ok((
+            self.path.clone(),
+            marker.database_reference,
+            marker.generation,
+        ))
     }
     /// Keep this lease alive through Manager shutdown so a controller cannot start concurrently.
     pub(crate) fn admit_idle(&mut self, id: &str, sha: &str) -> Result<(), String> {
@@ -333,6 +359,7 @@ impl Owner {
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn package_idle(path: &Path) -> Result<(), String> {
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+        no_activation(&root)?;
         match root.symlink_metadata(NAME) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return if root
@@ -353,6 +380,9 @@ impl Owner {
         match owner.read()? {
             None => owner.empty(),
             Some(marker) => {
+                if marker.restore_pending {
+                    return Err("host_restore_activation_pending".into());
+                }
                 if !crate::native_runtime::digest_valid(&marker.installation_id, 12)
                     || !crate::native_runtime::digest_valid(&marker.manifest_sha256, 64)
                 {
@@ -551,7 +581,7 @@ mod tests {
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
-        let (profile, selected) = owner
+        let (profile, selected, _) = owner
             .launch_state(&sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
         assert_eq!(profile, fixture.0);
@@ -653,5 +683,66 @@ mod tests {
             .unwrap();
         drop(owner);
         assert!(Owner::package_idle(&crashed.0).is_err());
+    }
+    #[test]
+    fn activation_intent_fences_writers_and_packages_but_keeps_read_only_recovery() {
+        for contents in [b"{".as_slice(), b"{}", b""] {
+            let f = Fixture::new();
+            let mut owner = Owner::acquire(&f.0, true).unwrap();
+            owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::RestorePrepare)
+                .unwrap();
+            owner.clean_stop().unwrap();
+            fs::write(f.0.join("restore-activation.json"), contents).unwrap();
+            assert!(owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+                .is_err());
+            drop(owner);
+            assert!(Owner::package_idle(&f.0).is_err());
+            let mut owner = Owner::acquire(&f.0, true).unwrap();
+            for mode in [
+                crate::host_runtime::HostMode::Database,
+                crate::host_runtime::HostMode::RestorePrepare,
+                crate::host_runtime::HostMode::CheckpointCleanup,
+            ] {
+                owner.activate(ID, &sha(), mode).unwrap();
+                owner.launch_state(&sha(), mode).unwrap();
+                owner.clean_stop().unwrap();
+            }
+        }
+        let f = Fixture::new();
+        let mut owner = Owner::acquire(&f.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        fs::write(f.0.join("restore-activation.json"), b"{}").unwrap();
+        assert!(owner
+            .launch_state(&sha(), crate::host_runtime::HostMode::Server)
+            .is_err());
+    }
+    #[test]
+    fn pending_selection_marker_alone_fences_writers_and_survives_read_only_maintenance() {
+        let f = Fixture::new();
+        let mut owner = Owner::acquire(&f.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::RestorePrepare)
+            .unwrap();
+        owner.clean_stop().unwrap();
+        let mut marker = owner.read().unwrap().unwrap();
+        marker.restore_pending = true;
+        owner.write(&marker).unwrap();
+        for mode in [
+            crate::host_runtime::HostMode::Database,
+            crate::host_runtime::HostMode::RestorePrepare,
+        ] {
+            owner.activate(ID, &sha(), mode).unwrap();
+            owner.clean_stop().unwrap();
+            assert!(owner.read().unwrap().unwrap().restore_pending);
+        }
+        assert!(owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .is_err());
+        drop(owner);
+        assert!(Owner::package_idle(&f.0).is_err());
     }
 }

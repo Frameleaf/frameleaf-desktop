@@ -60,7 +60,6 @@ impl Reference {
             .map_err(|_| "host_database_reference_invalid".into())
     }
     /// A locator only: checksum/canonical validation and the controller lease still gate activation.
-    #[cfg(test)]
     pub(crate) fn capture(profile: &Path, operation: &str, attempt: &str) -> Result<Self, String> {
         let paths = Self::paths(profile, operation, attempt)?;
         let reference = Self {
@@ -75,6 +74,32 @@ impl Reference {
         }
         reference.resolve(profile)?;
         Ok(reference)
+    }
+    pub(crate) fn matches_node_identities(&self, values: [&str; 3]) -> bool {
+        values.into_iter().zip([0, 3, 4]).all(|(value, index)| {
+            #[cfg(windows)]
+            let value = {
+                let Some((volume, inode)) = value.split_once(':') else {
+                    return false;
+                };
+                let Ok(inode) = inode.parse::<u64>() else {
+                    return false;
+                };
+                format!("{volume}:{}:{}", inode >> 32, inode & 0xffff_ffff)
+            };
+            format!("{:x}", Sha256::digest(value.as_bytes())) == self.identities[index]
+        })
+    }
+    pub(crate) fn target_directory(&self, profile: &Path) -> Result<Dir, String> {
+        let database = self.resolve(profile)?;
+        let root = Dir::from_std_file(crate::host_storage::directory(
+            database.parent().ok_or("host_database_reference_invalid")?,
+        )?);
+        let id = crate::copy_source::root_identity(&root)?;
+        if format!("{:x}", Sha256::digest(id.as_bytes())) != self.identities[3] {
+            return Err("host_database_reference_invalid".into());
+        }
+        Ok(root)
     }
     pub(crate) fn resolve(&self, profile: &Path) -> Result<PathBuf, String> {
         let paths = Self::paths(profile, &self.operation_id, &self.attempt_id)?;
