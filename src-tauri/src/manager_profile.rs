@@ -1,6 +1,9 @@
-//! The database credential lives only in the OS keystore; disk holds a nonsecret reservation hash.
+//! Database and backup credentials live only in the OS keystore; disk holds a nonsecret reservation hash.
 use crate::manager_host::{validate_configuration, validate_paths, Configuration};
-use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +22,8 @@ pub(crate) struct Profile {
     schema_version: u32,
     binding_sha256: String,
     database_password: String,
+    #[serde(default)]
+    backup_key: Option<String>,
     #[serde(skip)]
     #[zeroize(skip)]
     guard: Option<ProfileGuard>,
@@ -68,6 +73,16 @@ impl Profile {
     pub(crate) fn password(&self) -> Zeroizing<String> {
         Zeroizing::new(self.database_password.clone())
     }
+    pub(crate) fn backup_key(&self) -> Result<Zeroizing<String>, String> {
+        let key = self
+            .backup_key
+            .as_deref()
+            .ok_or("native_backup_key_unavailable")?;
+        if !valid_backup_key(key) || key == self.database_password {
+            return Err("native_backup_key_invalid".into());
+        }
+        Ok(Zeroizing::new(key.to_owned()))
+    }
     pub(crate) fn from_keystore(
         config: &Configuration,
         candidate: &Path,
@@ -86,7 +101,7 @@ impl Profile {
         candidate: &Path,
         manifest: &str,
         load: impl FnOnce(&str) -> Result<Option<Self>, String>,
-        persist: impl FnOnce(&str, &Self) -> Result<(), String>,
+        mut persist: impl FnMut(&str, &Self) -> Result<(), String>,
     ) -> Result<Self, String> {
         validate_configuration(config)?;
         if !crate::native_runtime::digest_valid(manifest, 64) {
@@ -126,6 +141,9 @@ impl Profile {
             {
                 return Err("native_profile_binding_changed".into());
             }
+            if saved.backup_key.is_some() {
+                saved.backup_key()?;
+            }
             saved
         } else {
             if state
@@ -150,6 +168,7 @@ impl Profile {
                 schema_version: 1,
                 binding_sha256,
                 database_password: STANDARD_NO_PAD.encode(bytes.as_ref()),
+                backup_key: Some(new_backup_key()),
                 guard: None,
             };
             persist(&account, &profile)?;
@@ -196,6 +215,17 @@ impl Profile {
             }
             Err(_) => return Err("native_profile_binding_changed".into()),
         }
+        if profile.backup_key.is_none() {
+            // Existing encryption must be recovered, never silently assigned a replacement key.
+            for path in ["recovery-key", "backups/frameleaf-database"] {
+                match data.symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err("native_backup_key_recovery_required".into()),
+                }
+            }
+            profile.backup_key = Some(new_backup_key());
+            persist(&account, &profile)?;
+        }
         profile.guard = Some(ProfileGuard {
             _lease: lease,
             state,
@@ -204,6 +234,18 @@ impl Profile {
         profile.require_current(config)?;
         Ok(profile)
     }
+}
+
+pub(crate) fn valid_backup_key(key: &str) -> bool {
+    key.len() == 43
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+fn new_backup_key() -> String {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(bytes.as_mut());
+    URL_SAFE_NO_PAD.encode(bytes.as_ref())
 }
 
 // Publish in one operation: an interrupted setup must never leave a two-link marker.
@@ -336,6 +378,132 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn backup_key_is_independent_reused_and_never_written_to_profile_files() {
+        let f = Fixture::new();
+        let profile = f.create();
+        let key = profile.backup_key().unwrap();
+        assert_ne!(key.as_str(), profile.password().as_str());
+        assert_eq!(key.len(), 43);
+        let saved = serde_json::to_string(&profile).unwrap();
+        drop(profile);
+        let restored = Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            |_| Ok(Some(serde_json::from_str(&saved).unwrap())),
+            |_, _| panic!("must not replace backup key"),
+        )
+        .unwrap();
+        assert_eq!(key.as_str(), restored.backup_key().unwrap().as_str());
+        drop(restored);
+        for entry in std::fs::read_dir(&f.1.data).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                assert!(!std::fs::read(path)
+                    .unwrap()
+                    .windows(key.len())
+                    .any(|v| v == key.as_bytes()));
+            }
+        }
+    }
+    #[test]
+    fn legacy_backup_key_migration_preserves_database_password_and_fails_closed_if_persistence_is_locked(
+    ) {
+        let f = Fixture::new();
+        let profile = f.create();
+        let expected = profile.password();
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy.as_object_mut().unwrap().remove("backupKey");
+        drop(profile);
+        let load = |_account: &str| Ok(Some(serde_json::from_value(legacy.clone()).unwrap()));
+        assert!(Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            load,
+            |_, _| Err("credential_store_locked".into())
+        )
+        .is_err());
+        let saved = std::cell::RefCell::new(None);
+        let upgraded = Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            load,
+            |_, value| {
+                *saved.borrow_mut() = Some(serde_json::to_string(value).unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(upgraded.password().as_str(), expected.as_str());
+        let key = upgraded.backup_key().unwrap();
+        drop(upgraded);
+        let restored = Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            |_| {
+                Ok(Some(
+                    serde_json::from_str(saved.borrow().as_ref().unwrap()).unwrap(),
+                ))
+            },
+            |_, _| panic!("must not migrate twice"),
+        )
+        .unwrap();
+        assert_eq!(key.as_str(), restored.backup_key().unwrap().as_str());
+    }
+    #[test]
+    fn legacy_backup_key_refuses_existing_encryption_or_changed_marker_without_persisting() {
+        for existing in [
+            "recovery-key",
+            "backups/frameleaf-database/config",
+            "backups/frameleaf-database/data/pack",
+            ".host-profile",
+        ] {
+            let f = Fixture::new();
+            let profile = f.create();
+            let mut legacy = serde_json::to_value(&profile).unwrap();
+            legacy.as_object_mut().unwrap().remove("backupKey");
+            drop(profile);
+            let path = f.1.data.join(existing);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"existing bytes").unwrap();
+            let result = Profile::load_or_create(
+                &f.1,
+                &f.0.join("runtime"),
+                &"b".repeat(64),
+                |_| Ok(Some(serde_json::from_value(legacy.clone()).unwrap())),
+                |_, _| panic!("must not replace existing encryption"),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(path).unwrap(), b"existing bytes");
+        }
+    }
+    #[test]
+    fn populated_invalid_backup_key_is_never_regenerated() {
+        let f = Fixture::new();
+        let profile = f.create();
+        let mut saved = serde_json::to_value(&profile).unwrap();
+        drop(profile);
+        for key in [
+            "short".to_owned(),
+            "x".repeat(44),
+            "x".repeat(42) + "\n",
+            saved["databasePassword"].as_str().unwrap().to_owned(),
+        ] {
+            saved["backupKey"] = key.into();
+            let result = Profile::load_or_create(
+                &f.1,
+                &f.0.join("runtime"),
+                &"b".repeat(64),
+                |_| Ok(Some(serde_json::from_value(saved.clone()).unwrap())),
+                |_, _| panic!("must not replace corrupted credentials"),
+            );
+            assert!(result.is_err());
         }
     }
     #[test]

@@ -144,7 +144,7 @@ async fn native_manager_fresh_tls_uses_private_stdin_with_empty_path() {
     let controller = PathBuf::from("/bin/echo").canonicalize().unwrap();
     let data = output.join("manager");
     let config = Zeroizing::new(serde_json::to_vec(&serde_json::json!({
-        "protocolVersion":2,"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
+        "protocolVersion":2,"backupKey":"k".repeat(43),"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
         "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"backupEngine":{"executable":controller,"sha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap()))},"name":"Synthetic native TLS fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":identity.wire()
     })).unwrap());
     let mut child = Owned(

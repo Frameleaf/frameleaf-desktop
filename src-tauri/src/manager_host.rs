@@ -260,7 +260,7 @@ impl Programs<'_> {
             TlsIdentity::from_keystore(&config.installation_id, &config.origin, profile.binding())?;
         profile.require_current(config)?;
         let lease = crate::host_state::Owner::acquire(&config.state, true)?;
-        let mut manager = self.start(config, &profile.password(), &tls)?;
+        let mut manager = self.start(config, &profile.password(), &profile.backup_key()?, &tls)?;
         manager.startup_lease = Some(lease);
         Ok(manager)
     }
@@ -269,9 +269,13 @@ impl Programs<'_> {
         &self,
         config: &Configuration,
         password: &Zeroizing<String>,
+        backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
+        if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
+            return Err("native_backup_key_invalid".into());
+        }
         if !(24..=256).contains(&password.len()) || password.contains(['\r', '\n', '\0']) {
             return Err("native_manager_config_invalid".into());
         }
@@ -322,6 +326,7 @@ impl Programs<'_> {
             name: &'a str,
             release: &'a str,
             password: &'a str,
+            backup_key: &'a str,
             tls: crate::manager_tls::BootstrapTls<'a>,
         }
         let bootstrap = Bootstrap {
@@ -343,6 +348,7 @@ impl Programs<'_> {
             name: &config.name,
             release: &config.release,
             password,
+            backup_key,
             tls: tls.wire(),
         };
         let mut input = Zeroizing::new(
@@ -818,7 +824,7 @@ mod tests {
             TlsIdentity::load_or_create("aaaaaaaaaaaa", origin, || Ok(None), |_| Ok(())).unwrap();
         let controller = fs::canonicalize("/bin/echo").unwrap();
         let mut input=Zeroizing::new(serde_json::to_vec(&serde_json::json!({
-          "protocolVersion":2,"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
+          "protocolVersion":2,"backupKey":"k".repeat(43),"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
           "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"backupEngine":{"executable":controller,"sha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap()))},"name":"Synthetic owner fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":tls.wire()
         })).unwrap());
         input.push(b'\n');
