@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import { createServer } from "node:net";
 import { delimiter, isAbsolute, join, dirname, basename } from "node:path";
 import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
 
 const fail = (code) => {
   throw new Error(code);
@@ -63,6 +64,8 @@ export function validateConfig(c) {
     "psql",
     "pgIsready",
     "pgCtl",
+    "pgDump",
+    "pgRestore",
     "hdr",
     "ffmpeg",
     "ffprobe",
@@ -105,6 +108,111 @@ async function stateFile(path, maximum) {
     return buffer.subarray(0, bytesRead).toString("utf8");
   } finally {
     await file.close();
+  }
+}
+
+const CHECKPOINT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+export function checkpointRequest(line) {
+  try {
+    if (typeof line !== "string" || Buffer.byteLength(line) > 1024) throw Error();
+    const value = JSON.parse(line);
+    if (!value || Object.keys(value).sort().join(",") !== "action,operationId,protocolVersion" ||
+      value.protocolVersion !== 1 || value.action !== "checkpoint" ||
+      typeof value.operationId !== "string" || !CHECKPOINT_ID.test(value.operationId)) throw Error();
+    return value.operationId;
+  } catch {
+    fail("host_checkpoint_request_invalid");
+  }
+}
+async function checkpointDirectory(path, create = false) {
+  if (create) await fs.mkdir(path, { mode: 0o700 }).catch(error => {
+    if (error.code !== "EEXIST") throw error;
+  });
+  const meta = await fs.lstat(path);
+  if (!meta.isDirectory() || meta.isSymbolicLink() ||
+    (process.platform !== "win32" && (meta.mode & 0o077) !== 0)) fail("host_checkpoint_not_private");
+}
+async function checkpointHash(path, check) {
+  const named = await fs.lstat(path, { bigint: true });
+  if (!named.isFile() || named.isSymbolicLink()) fail("host_checkpoint_changed");
+  const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await file.stat({ bigint: true });
+    if (before.dev !== named.dev || before.ino !== named.ino || !before.isFile() || before.nlink !== 1n || before.size <= 0n ||
+      before.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+      (process.platform !== "win32" && (before.mode & 0o077n) !== 0n)) fail("host_checkpoint_changed");
+    const hash = createHash("sha256"); let bytes = 0;
+    for await (const chunk of file.createReadStream({ autoClose: false })) {
+      check();
+      bytes += chunk.length; hash.update(chunk);
+    }
+    const after = await file.stat({ bigint: true });
+    const stillNamed = await fs.lstat(path, { bigint: true });
+    if (BigInt(bytes) !== before.size || ["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink", "mode"].some(key => before[key] !== after[key]))
+      fail("host_checkpoint_changed");
+    if (!stillNamed.isFile() || stillNamed.isSymbolicLink() ||
+      ["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink", "mode"].some(key => after[key] !== stillNamed[key]))
+      fail("host_checkpoint_changed");
+    return { bytes, sha256: hash.digest("hex") };
+  } finally { await file.close(); }
+}
+async function checkpointSyncDirectory(path) {
+  if (process.platform === "win32") return;
+  const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { await file.sync(); } finally { await file.close(); }
+}
+/** Called only by the live owner, which serializes requests and owns the database process tree. */
+export async function createHostCheckpoint(c, operationId, execute, cancelled = () => false) {
+  validateConfig(c);
+  if (typeof operationId !== "string" || !CHECKPOINT_ID.test(operationId)) fail("host_checkpoint_request_invalid");
+  const check = () => { if (cancelled()) fail("host_checkpoint_cancelled"); };
+  check();
+  await checkpointDirectory(c.state);
+  const root = join(c.state, "checkpoints");
+  await checkpointDirectory(root, true);
+  await checkpointSyncDirectory(c.state);
+  const target = join(root, operationId);
+  const binding = { schemaVersion: 1, operationId, manifestSha256: c.manifestSha256,
+    sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor, databaseFormat: "frameleaf-canonical" };
+  let existing = false;
+  try { await fs.lstat(target); existing = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (existing) {
+    await checkpointDirectory(target);
+    if ((await fs.readdir(target)).sort().join(",") !== "checkpoint.json,database.dump") fail("host_checkpoint_changed");
+    const receipt = JSON.parse(await stateFile(join(target, "checkpoint.json"), 4096));
+    if (!receipt || Object.keys(receipt).length !== Object.keys(binding).length + 1 ||
+      Object.entries(binding).some(([key, value]) => receipt[key] !== value) ||
+      !receipt.dump || Object.keys(receipt.dump).sort().join(",") !== "bytes,sha256") fail("host_checkpoint_changed");
+    const actual = await checkpointHash(join(target, "database.dump"), check);
+    if (actual.bytes !== receipt.dump.bytes || actual.sha256 !== receipt.dump.sha256) fail("host_checkpoint_changed");
+    check(); return receipt;
+  }
+  const staging = join(root, "." + operationId + ".partial");
+  // shortcut: crash-abandoned staging is retained; Manager recovery must verify it before cleanup and retry.
+  await fs.mkdir(staging, { mode: 0o700 });
+  try {
+    const dump = join(staging, "database.dump");
+    const reserved = await fs.open(dump, "wx", 0o600); await reserved.close();
+    await execute([join(c.runtime, c.entryPoints.pgDump), "--host", "127.0.0.1", "--port", String(c.databasePort),
+      "--username", "frameleaf", "--no-password", "--format=custom", "--file", dump, "frameleaf"], { PGPASSWORD: c.password });
+    check();
+    await execute([join(c.runtime, c.entryPoints.pgRestore), "--list", dump], {});
+    check();
+    const file = await fs.open(dump, constants.O_RDWR | constants.O_NOFOLLOW);
+    try { await file.sync(); } finally { await file.close(); }
+    const receipt = { ...binding, dump: await checkpointHash(dump, check) };
+    const record = await fs.open(join(staging, "checkpoint.json"), "wx", 0o600);
+    try { await record.writeFile(JSON.stringify(receipt) + "\n"); await record.sync(); } finally { await record.close(); }
+    await checkpointSyncDirectory(staging); check();
+    await fs.rename(staging, target);
+    await checkpointSyncDirectory(root);
+    return receipt;
+  } finally {
+    // Only paths created by this attempt are removed; an existing staging directory is never adopted.
+    for (const name of ["checkpoint.json", "database.dump"]) await fs.unlink(join(staging, name)).catch(error => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    await fs.rmdir(staging).catch(error => { if (error.code !== "ENOENT") throw error; });
   }
 }
 export async function claimState(c) {
@@ -419,13 +527,13 @@ export async function runHost(c, stopping, ready) {
       constants.O_NOFOLLOW,
     0o600,
   );
-  let pg, app, appOwner, studio;
+  let pg, app, appOwner, studio, checkpointWork;
   const children = new Set();
   let cancelled = false;
   stopping.then(() => {
     cancelled = true;
   });
-  function launch(args, extra = {}, stdio = ["ignore", "pipe", "pipe"]) {
+  function launch(args, extra = {}, stdio = ["ignore", "pipe", "pipe"], logOutput = true) {
     const child = spawn(args[0], args.slice(1), {
       cwd: c.state,
       env: { ...env, ...extra },
@@ -433,29 +541,33 @@ export async function runHost(c, stopping, ready) {
       windowsHide: true,
     });
     children.add(child);
+    child.once("close", () => children.delete(child));
     child.on("error", () => {});
-    child.stdout.on("data", (chunk) => {
-      void log.write(chunk).catch(() => {});
-    });
-    child.stderr.on("data", (chunk) => {
-      void log.write(chunk).catch(() => {});
-    });
+    if (logOutput) {
+      child.stdout.on("data", (chunk) => { void log.write(chunk).catch(() => {}); });
+      child.stderr.on("data", (chunk) => { void log.write(chunk).catch(() => {}); });
+    }
     return child;
   }
-  async function command(args, extra = {}, duringStop = false) {
-    const child = launch(args, extra);
+  async function command(args, extra = {}, duringStop = false, options = {}) {
+    const child = launch(args, extra, undefined, !options.quiet);
     let output = "",
       oversized = false;
-    child.stdout.on("data", (chunk) => {
+    if (options.quiet) {
+      child.stdout.resume(); child.stderr.resume();
+    } else child.stdout.on("data", (chunk) => {
       if (Buffer.byteLength(output) + chunk.length > 65536) {
         oversized = true;
         child.kill();
       } else output += chunk.toString();
     });
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + (options.timeout ?? 30_000);
     while (!(await exited(child, 100))) {
       if ((cancelled && !duringStop) || Date.now() > deadline) {
         child.kill();
+        if (!(await exited(child, 5000))) {
+          child.kill("SIGKILL"); await exited(child, 5000);
+        }
         fail("host_command_timeout");
       }
     }
@@ -648,7 +760,16 @@ export async function runHost(c, stopping, ready) {
         build.upstreamCommit,
       );
     }
-    ready();
+    ready((operationId) => {
+      if (checkpointWork || cancelled || app.exitCode !== null || pg.exitCode !== null)
+        return Promise.reject(new Error("host_checkpoint_unavailable"));
+      const work = createHostCheckpoint(c, operationId,
+        (args, extra) => command(args, extra, false, { quiet: true, timeout: 7_200_000 }),
+        () => cancelled || app.exitCode !== null || pg.exitCode !== null);
+      checkpointWork = work;
+      void work.finally(() => { if (checkpointWork === work) checkpointWork = undefined; }).catch(() => {});
+      return work;
+    });
     while (!cancelled) {
       if ((await exited(app, 100)) || (await exited(pg, 100)))
         fail("host_process_exited");
@@ -656,6 +777,8 @@ export async function runHost(c, stopping, ready) {
       studio?.check();
     }
   } finally {
+    cancelled = true;
+    await checkpointWork?.catch(() => {});
     let stopError;
     try {
       await studio?.stop();
@@ -719,19 +842,29 @@ async function main() {
   process.stdin.on("end", stop);
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
+  let checkpoint, pending, protocolFailure;
   void (async () => {
     for await (const line of { [Symbol.asyncIterator]: () => lines }) {
       if (line === "stop") {
         stop();
         break;
       }
+      const operationId = checkpointRequest(line);
+      if (!checkpoint || pending) fail("host_checkpoint_unavailable");
+      pending = checkpoint(operationId)
+        .then(receipt => process.stdout.write(JSON.stringify({ state: "checkpoint", ...receipt }) + "\n"))
+        .catch(() => process.stdout.write(JSON.stringify({ state: "checkpoint-failed", operationId, code: "host_checkpoint_failed" }) + "\n"))
+        .finally(() => { pending = undefined; });
     }
     stop();
-  })();
+  })().catch(() => { protocolFailure = "host_control_command_invalid"; stop(); });
   try {
-    await runHost(JSON.parse(first.value), stopping, () =>
-      process.stdout.write('{"state":"running"}\n'),
-    );
+    await runHost(JSON.parse(first.value), stopping, (handler) => {
+      checkpoint = handler;
+      process.stdout.write('{"state":"running"}\n');
+    });
+    await pending;
+    if (protocolFailure) fail(protocolFailure);
   } finally {
     input.close();
     process.stdin.pause();

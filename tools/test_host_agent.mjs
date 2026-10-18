@@ -61,6 +61,8 @@ const config = (state) => ({
     psql: "pg/psql",
     pgIsready: "pg/pg_isready",
     pgCtl: "pg/pg_ctl",
+    pgDump: "pg/pg_dump",
+    pgRestore: "pg/pg_restore",
     hdr: "media/hdr",
     studioBrowser:
       "browser/chrome" + (process.platform === "win32" ? ".exe" : ""),
@@ -79,6 +81,10 @@ test("host configuration rejects shared ports, unbounded secrets and relative pa
   assert.doesNotThrow(() => validateConfig(good));
   for (const change of [
     { entryPoints: { ...good.entryPoints, studioBrowser: undefined } },
+    { entryPoints: { ...good.entryPoints, pgDump: undefined } },
+    { entryPoints: { ...good.entryPoints, pgRestore: undefined } },
+    { entryPoints: { ...good.entryPoints, pgDump: "../pg_dump" } },
+    { entryPoints: { ...good.entryPoints, pgRestore: "/usr/bin/pg_restore" } },
     { entryPoints: { ...good.entryPoints, studioBrowserGuard: undefined } },
     { entryPoints: { ...good.entryPoints, studioBrowserGuard: "../guard" } },
     { entryPoints: { ...good.entryPoints, studioBrowser: "../chrome" } },
