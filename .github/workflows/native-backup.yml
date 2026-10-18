@@ -1,0 +1,42 @@
+name: Private native backup engine
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_backup.py'
+      - 'tools/test_build_host_backup.py'
+      - 'runtime/host-backup*'
+      - '.github/workflows/native-backup.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-backup-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tools -p test_build_host_backup.py
+      - run: python tools/build_host_backup.py --output "${{ runner.temp }}/frameleaf-backup-engine"
+      - name: Retain private component and receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-backup-engine-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/frameleaf-backup-engine/backup/
+            ${{ runner.temp }}/frameleaf-backup-engine/qualification.json
+            ${{ runner.temp }}/frameleaf-backup-engine/work/command-error.log
+          if-no-files-found: error
+          retention-days: 7
