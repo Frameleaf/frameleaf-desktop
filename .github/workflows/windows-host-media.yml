@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 947568067639827de73e2de7260103df697c7f51
+          ref: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
           path: server-source
           sparse-checkout-cone-mode: false
           sparse-checkout: |
@@ -45,7 +45,7 @@ jobs:
       - name: Stage source-pinned portable binaries and qualify CPU codecs
         shell: pwsh
         run: |
-          python tools/build_host_ffmpeg.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 947568067639827de73e2de7260103df697c7f51 --output "$env:RUNNER_TEMP/frameleaf-windows-media"
+          python tools/build_host_ffmpeg.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --output "$env:RUNNER_TEMP/frameleaf-windows-media"
           if ($LASTEXITCODE) { throw 'Native media qualification failed' }
       - name: Retain private component and diagnostics
         if: always()
