@@ -159,7 +159,10 @@ pub(crate) fn account_directory(
     if !super::sid_valid(user) {
         return Err(ERROR.into());
     }
-    crate::native_runtime::absolute_directory(path.parent().ok_or(ERROR)?)?;
+    crate::native_runtime::absolute_directory(path.parent().ok_or(ERROR)?).inspect_err(|_| {
+        #[cfg(debug_assertions)]
+        eprintln!("private_directory_parent: stage=directory");
+    })?;
     let private_trusted = vec![
         user.to_vec(),
         vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
@@ -167,14 +170,22 @@ pub(crate) fn account_directory(
     ];
     let mut trusted = super::native::trusted_sids()?.clone();
     trusted.push(user.to_vec());
-    let parent = super::stable_path(path.parent().ok_or(ERROR)?)?;
+    let parent = super::stable_path(path.parent().ok_or(ERROR)?).inspect_err(|_| {
+        #[cfg(debug_assertions)]
+        eprintln!("private_directory_parent: stage=binding");
+    })?;
     let text = parent.to_str().ok_or(ERROR)?;
     // Hold the physical parent chain against deletion until creation and admission finish.
     let mut parents = Vec::new();
     for part in super::filesystem_components(text).ok_or(ERROR)? {
         let file = open(Path::new(part))?;
-        let (owner, acl, _) = super::native::security(&file)?;
+        let (owner, acl, _) = super::native::security(&file).inspect_err(|_| {
+            #[cfg(debug_assertions)]
+            eprintln!("private_directory_parent: stage=security");
+        })?;
         if !super::safe_acl(&owner, &acl, &trusted, true) {
+            #[cfg(debug_assertions)]
+            eprintln!("private_directory_parent: stage=acl");
             return Err(ERROR.into());
         }
         parents.push(file);
@@ -185,23 +196,41 @@ pub(crate) fn account_directory(
             if error.kind() == std::io::ErrorKind::NotFound
                 && !matches!(mode, DirectoryMode::ExistingOnly) =>
         {
-            let security = descriptor(user)?;
+            let security = descriptor(user).inspect_err(|_| {
+                #[cfg(debug_assertions)]
+                eprintln!("private_directory_create: stage=descriptor");
+            })?;
             let attributes = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: security.0,
                 bInheritHandle: 0,
             };
             let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            if name.len() > 32767
-                || name[..name.len() - 1].contains(&0)
-                || unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0
-            {
+            if name.len() > 32767 || name[..name.len() - 1].contains(&0) {
+                #[cfg(debug_assertions)]
+                eprintln!("private_directory_create: stage=name");
+                return Err(ERROR.into());
+            }
+            if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
+                #[cfg(debug_assertions)]
+                {
+                    let error = unsafe { GetLastError() };
+                    eprintln!(
+                        "private_directory_create: win32={error} utf16_units={}",
+                        name.len() - 1
+                    );
+                }
                 return Err(ERROR.into());
             }
         }
         Ok(_) if matches!(mode, DirectoryMode::CreateNew) => return Err(ERROR.into()),
         Ok(_) => {}
-        Err(_) => return Err(ERROR.into()),
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("private_directory_stat: win32={:?}", error.raw_os_error());
+            let _ = error;
+            return Err(ERROR.into());
+        }
     }
     let file = open(&path)?;
     let (owner, acl, control) = super::native::security(&file)?;
@@ -291,6 +320,31 @@ mod tests {
                 fs::remove_file(moved).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn private_directories_preserve_device_identity_beyond_legacy_path_limits() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-long-private-{}", uuid::Uuid::new_v4()));
+        new_private_directory(&root).unwrap();
+        let fixture = Fixture(root);
+        let mut path = super::super::stable_path(&fixture.0).unwrap();
+        let volume = super::super::stable_volume_root(path.to_str().unwrap())
+            .unwrap()
+            .to_owned();
+        for index in 0..6 {
+            path.push(format!("component-{index}-{}", "x".repeat(64)));
+            new_private_directory(&path).unwrap();
+            require_private_directory(&path).unwrap();
+            let captured = super::super::stable_path(&path).unwrap();
+            assert_eq!(
+                super::super::stable_volume_root(captured.to_str().unwrap()),
+                Some(volume.as_str())
+            );
+        }
+        assert!(path.as_os_str().encode_wide().count() > 400);
+        fs::write(path.join("probe"), b"private").unwrap();
+        require_private_directory(&path).unwrap();
     }
     #[test]
     fn existing_private_admission_never_recreates_a_directory_removed_after_inspection() {

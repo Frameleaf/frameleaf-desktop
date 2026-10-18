@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      directory_probe:
+        description: Run only Windows directory and shared-cache qualification
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -11,6 +16,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   check:
+    if: ${{ !inputs.directory_probe }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,3 +95,27 @@ jobs:
           path: src-tauri/target/debug/bundle/
           retention-days: 7
           if-no-files-found: error
+
+  directory-probe:
+    if: ${{ inputs.directory_probe }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - name: Qualify private directory admission and long physical paths
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_protection::user::tests:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Private Windows directory admission failed' }
+      - name: Diagnose real shared model-cache composition
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib model_catalogue::tests::composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering -- --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Private shared model-cache composition failed' }
