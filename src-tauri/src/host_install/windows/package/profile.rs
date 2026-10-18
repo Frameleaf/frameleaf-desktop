@@ -212,8 +212,8 @@ pub(super) fn ownership_enabled() -> bool {
     use windows_sys::Win32::{
         Foundation::LUID,
         Security::{
-            LookupPrivilegeValueW, PrivilegeCheck, LUID_AND_ATTRIBUTES, PRIVILEGE_SET,
-            SE_PRIVILEGE_ENABLED,
+            LookupPrivilegeValueW, TokenPrivileges, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+            TOKEN_PRIVILEGES,
         },
     };
     let token = process_token(TOKEN_QUERY).unwrap();
@@ -223,20 +223,31 @@ pub(super) fn ownership_enabled() -> bool {
         unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) },
         0
     );
-    let mut required = PRIVILEGE_SET {
-        PrivilegeCount: 1,
-        Control: 0,
-        Privilege: [LUID_AND_ATTRIBUTES {
-            Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
-        }],
-    };
-    let mut enabled = 0;
+    let mut buffer = [0usize; 1024];
+    let mut size = 0;
     assert_ne!(
-        unsafe { PrivilegeCheck(token.as_raw_handle(), &mut required, &mut enabled) },
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenPrivileges,
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer) as u32,
+                &mut size,
+            )
+        },
         0
     );
-    enabled != 0
+    let offset = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
+    assert!((offset..=std::mem::size_of_val(&buffer)).contains(&(size as usize)));
+    let privileges = buffer.as_ptr().cast::<TOKEN_PRIVILEGES>();
+    let count = unsafe { (*privileges).PrivilegeCount } as usize;
+    assert!(count <= (size as usize - offset) / std::mem::size_of::<LUID_AND_ATTRIBUTES>());
+    let entries = unsafe { std::slice::from_raw_parts((*privileges).Privileges.as_ptr(), count) };
+    entries.iter().any(|entry| {
+        entry.Luid.LowPart == luid.LowPart
+            && entry.Luid.HighPart == luid.HighPart
+            && entry.Attributes & SE_PRIVILEGE_ENABLED != 0
+    })
 }
 
 #[cfg(test)]
