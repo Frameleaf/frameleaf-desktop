@@ -75,6 +75,16 @@ impl Reference {
         reference.resolve(profile)?;
         Ok(reference)
     }
+    pub(crate) fn binds_restore(
+        &self,
+        operation: &str,
+        attempt: &str,
+        identities: [&str; 3],
+    ) -> bool {
+        self.operation_id == operation
+            && self.attempt_id == attempt
+            && self.matches_node_identities(identities)
+    }
     pub(crate) fn matches_node_identities(&self, values: [&str; 3]) -> bool {
         values.into_iter().zip([0, 3, 4]).all(|(value, index)| {
             #[cfg(windows)]

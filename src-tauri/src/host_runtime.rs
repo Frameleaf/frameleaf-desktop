@@ -346,6 +346,24 @@ pub(crate) struct PreparedRestore {
     validation: RestoreValidation,
 }
 impl PreparedRestore {
+    pub(crate) fn validate_reference(
+        &self,
+        reference: &crate::host_database::Reference,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if !reference.binds_restore(
+            &self.binding.operation_id,
+            &self.attempt_id,
+            [
+                &self.profile_identity,
+                &self.target_identity,
+                &self.database_identity,
+            ],
+        ) {
+            return Err("host_restore_proof_invalid".into());
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self) -> Result<(), String> {
         self.binding.validate()?;
         if self.schema_version != 1

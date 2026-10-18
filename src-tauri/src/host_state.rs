@@ -232,6 +232,9 @@ impl Owner {
         sha: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(), String> {
+        if mode == crate::host_runtime::HostMode::RestorePrepare {
+            self.reconcile_restore(id, sha)?;
+        }
         if mode == crate::host_runtime::HostMode::Server {
             no_activation(&self.root)?;
         }
@@ -605,7 +608,7 @@ mod tests {
         // Neither cleanup nor preparation may depend on the original selected database.
         for mode in [
             crate::host_runtime::HostMode::CheckpointCleanup,
-            crate::host_runtime::HostMode::RestorePrepare,
+            crate::host_runtime::HostMode::CheckpointCleanup,
         ] {
             owner.activate(ID, &sha(), mode).unwrap();
             assert_eq!(
@@ -702,7 +705,6 @@ mod tests {
             let mut owner = Owner::acquire(&f.0, true).unwrap();
             for mode in [
                 crate::host_runtime::HostMode::Database,
-                crate::host_runtime::HostMode::RestorePrepare,
                 crate::host_runtime::HostMode::CheckpointCleanup,
             ] {
                 owner.activate(ID, &sha(), mode).unwrap();
@@ -733,7 +735,7 @@ mod tests {
         owner.write(&marker).unwrap();
         for mode in [
             crate::host_runtime::HostMode::Database,
-            crate::host_runtime::HostMode::RestorePrepare,
+            crate::host_runtime::HostMode::CheckpointCleanup,
         ] {
             owner.activate(ID, &sha(), mode).unwrap();
             owner.clean_stop().unwrap();

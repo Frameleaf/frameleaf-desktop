@@ -478,6 +478,8 @@ test('offline restore verification checks only the prepared cluster with the sig
     await preparedTargetFixture(
       t,
       async ({ c, receipt, target, database, calls }) => {
+        // Retained controller metadata is outside the cluster checksum scope.
+        await writeFile(join(target, 'activation-intent.json'), JSON.stringify({ schemaVersion: 1, prepared: receipt }), { mode: 0o600 });
         c.entryPoints.pgChecksums =
           'bin/pg_checksums' + (process.platform === 'win32' ? '.exe' : '');
         const priorCalls = calls.length;

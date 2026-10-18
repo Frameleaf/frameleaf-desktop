@@ -77,6 +77,50 @@ fn verify_record(root: &Dir, name: &str, expected: &[u8]) -> Result<(), String> 
     }
     Ok(())
 }
+fn read_record(root: &Dir, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let file = match root.open_with(name, &options(false)) {
+        Ok(file) => file.into_std(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("host_restore_activation_requires_review".into()),
+    };
+    valid_file(&file)?;
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "host_restore_activation_requires_review")?;
+    if bytes.len() > 4096 {
+        return Err("host_restore_activation_requires_review".into());
+    }
+    Ok(Some(bytes))
+}
+fn recoverable_marker(owner: &mut Owner) -> Result<Option<Marker>, String> {
+    owner.placement()?;
+    owner
+        .file
+        .rewind()
+        .map_err(|_| "host_restore_activation_requires_review")?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut owner.file)
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "host_restore_activation_requires_review")?;
+    if bytes.len() > 4096 {
+        return Err("host_restore_activation_requires_review".into());
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(error) if error.is_eof() => Ok(None),
+        _ => Err("host_restore_activation_requires_review".into()),
+    }
+}
+fn same_selection(current: &Marker, expected: &Marker) -> bool {
+    let mut value = current.clone();
+    value.generation = expected.generation;
+    !current.generation.is_nil() && current.phase == Phase::Stopped && value == *expected
+}
 fn stopped_databases(paths: [&Path; 2]) -> Result<(), String> {
     for path in paths {
         match std::fs::symlink_metadata(path.join("postmaster.pid")) {
@@ -91,6 +135,132 @@ fn database_identity(path: &Path) -> Result<String, String> {
     identity(&root)
 }
 impl Owner {
+    /// Recover only the retained selection. This never clears pending state or grants writers.
+    pub(crate) fn reconcile_restore(
+        &mut self,
+        id: &str,
+        sha: &str,
+    ) -> Result<Option<Uuid>, String> {
+        if self.active.is_some() || !self.writable {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        self.placement()?;
+        let current = recoverable_marker(self)?;
+        let global = read_record(&self.root, ACTIVATION)?;
+        let bytes = match &global {
+            Some(bytes) => bytes.clone(),
+            None => match &current {
+                Some(marker) if marker.restore_pending => {
+                    self.binding(marker, id, sha)?;
+                    let reference = marker
+                        .database_reference
+                        .as_ref()
+                        .ok_or("host_restore_activation_requires_review")?;
+                    read_record(
+                        &reference.target_directory(&self.path)?,
+                        "activation-intent.json",
+                    )?
+                    .ok_or("host_restore_activation_requires_review")?
+                }
+                _ => return Ok(None),
+            },
+        };
+        let intent: Intent = serde_json::from_slice(&bytes)
+            .map_err(|_| "host_restore_activation_requires_review")?;
+        self.binding(&intent.previous, id, sha)?;
+        self.binding(&intent.next, id, sha)?;
+        intent.prepared.validate()?;
+        intent.safety.validate()?;
+        if intent.schema_version != 1
+            || intent.previous.phase != Phase::Stopped
+            || intent.next.phase != Phase::Stopped
+            || !intent.next.restore_pending
+            || intent.previous.generation == intent.next.generation
+            || !crate::host_runtime::checkpoint_operation_id(&intent.verification_id)
+            || !crate::native_runtime::digest_valid(&intent.previous_database_identity, 64)
+            || intent.prepared.binding.installation_id != id
+            || intent.prepared.binding.manifest_sha256 != sha
+            || !intent
+                .safety
+                .checkpoint
+                .matches_restore_runtime(&intent.prepared)
+        {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        let reference = intent
+            .next
+            .database_reference
+            .as_ref()
+            .ok_or("host_restore_activation_requires_review")?;
+        intent.prepared.validate_reference(reference)?;
+        let mut expected = intent.previous.clone();
+        expected.generation = intent.next.generation;
+        expected.restore_pending = true;
+        expected.database_reference = Some(reference.clone());
+        if expected != intent.next {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        if let Some(marker) = &current {
+            if !same_selection(marker, &intent.previous) && !same_selection(marker, &intent.next) {
+                return Err("host_restore_activation_requires_review".into());
+            }
+            if global.is_none() && !same_selection(marker, &intent.next) {
+                return Err("host_restore_activation_requires_review".into());
+            }
+        } else if global.is_none() {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        let host_lease = self
+            .root
+            .open_with("lease.lock", &options(false))
+            .map_err(|_| "host_process_state_requires_review")?
+            .into_std();
+        valid_file(&host_lease)?;
+        host_lease.try_lock().map_err(|_| "host_already_owned")?;
+        let original = match &intent.previous.database_reference {
+            Some(reference) => reference.resolve(&self.path)?,
+            None => self.path.join("database"),
+        };
+        let selected = reference.resolve(&self.path)?;
+        if database_identity(&original)? != intent.previous_database_identity {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        stopped_databases([&original, &selected])?;
+        let target = reference.target_directory(&self.path)?;
+        match read_record(&target, "activation-intent.json")? {
+            Some(retained) if retained == bytes => {}
+            Some(_) => return Err("host_restore_activation_requires_review".into()),
+            None => {}
+        }
+        if global.is_none() {
+            record(&self.root, ACTIVATION, &bytes)?;
+        }
+        if read_record(&target, "activation-intent.json")?.is_none() {
+            record(&target, "activation-intent.json", &bytes)?;
+        }
+        verify_record(&self.root, ACTIVATION, &bytes)?;
+        verify_record(&target, "activation-intent.json", &bytes)?;
+        reference.resolve(&self.path)?;
+        stopped_databases([&original, &selected])?;
+        if database_identity(&original)? != intent.previous_database_identity {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        self.placement()?;
+        let fresh = recoverable_marker(self)?;
+        if fresh != current {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        let marker = current
+            .filter(|marker| same_selection(marker, &intent.next))
+            .unwrap_or(intent.next);
+        self.write(&marker)?;
+        if self.read()? != Some(marker.clone()) {
+            return Err("host_restore_activation_requires_review".into());
+        }
+        verify_record(&self.root, ACTIVATION, &bytes)?;
+        verify_record(&target, "activation-intent.json", &bytes)?;
+        Ok(Some(marker.generation))
+    }
     pub(crate) fn select_restore(
         &mut self,
         proof: VerifiedRestore,
@@ -377,5 +547,193 @@ mod tests {
         assert_eq!(fs::read(f.path.join(ACTIVATION)).unwrap(), b"{");
         assert_eq!(f.owner.read().unwrap(), before);
         assert!(!f.target.join("activation-intent.json").exists());
+    }
+    #[test]
+    fn reconcile_recovers_each_publication_boundary_without_admitting_writers() {
+        for point in [
+            "global-only",
+            "retained",
+            "selected",
+            "torn",
+            "empty",
+            "missing-global",
+            "maintenance-generation",
+        ] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let safety = f.safety();
+            f.owner.select_restore(proof, safety).unwrap();
+            let bytes = fs::read(f.path.join(ACTIVATION)).unwrap();
+            let intent: Intent = serde_json::from_slice(&bytes).unwrap();
+            match point {
+                "global-only" => {
+                    fs::remove_file(f.target.join("activation-intent.json")).unwrap();
+                    f.owner.write(&intent.previous).unwrap();
+                }
+                "retained" => f.owner.write(&intent.previous).unwrap(),
+                "torn" => fs::write(f.path.join(NAME), b"{").unwrap(),
+                "empty" => fs::write(f.path.join(NAME), b"").unwrap(),
+                "missing-global" => fs::remove_file(f.path.join(ACTIVATION)).unwrap(),
+                "maintenance-generation" => {
+                    f.owner
+                        .activate(ID, &"b".repeat(64), crate::host_runtime::HostMode::Database)
+                        .unwrap();
+                    f.owner.clean_stop().unwrap();
+                }
+                _ => {}
+            }
+            f.owner
+                .reconcile_restore(ID, &"b".repeat(64))
+                .unwrap()
+                .unwrap();
+            let selected = f.owner.read().unwrap().unwrap();
+            assert!(selected.restore_pending, "{point}");
+            assert_eq!(selected.database_reference, intent.next.database_reference);
+            assert_eq!(selected.phase, Phase::Stopped);
+            assert_eq!(fs::read(f.path.join(ACTIVATION)).unwrap(), bytes);
+            assert_eq!(
+                fs::read(f.target.join("activation-intent.json")).unwrap(),
+                bytes
+            );
+            f.owner
+                .reconcile_restore(ID, &"b".repeat(64))
+                .unwrap()
+                .unwrap();
+            assert_eq!(f.owner.read().unwrap(), Some(selected));
+            assert!(f
+                .owner
+                .activate(ID, &"b".repeat(64), crate::host_runtime::HostMode::Server)
+                .is_err());
+            assert_eq!(
+                fs::read(f.path.join("database/sentinel")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                fs::read(f.target.join("database/sentinel")).unwrap(),
+                b"prepared"
+            );
+        }
+    }
+    #[test]
+    fn reconcile_refuses_foreign_lineage_live_ownership_changed_directories_and_bad_intents() {
+        for mutation in [
+            "global",
+            "retained",
+            "schema",
+            "pending",
+            "profile",
+            "prepared",
+            "marker",
+            "unknown-field",
+            "wrong-type",
+            "complete-empty",
+            "active",
+            "original",
+            "database",
+            "old-pid",
+            "new-pid",
+            "lease",
+        ] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let safety = f.safety();
+            f.owner.select_restore(proof, safety).unwrap();
+            let mut held_lease = None;
+            match mutation {
+                "global" => fs::write(f.path.join(ACTIVATION), b"{").unwrap(),
+                "retained" => fs::write(f.target.join("activation-intent.json"), b"{}").unwrap(),
+                "schema" | "pending" | "profile" | "prepared" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(f.path.join(ACTIVATION)).unwrap())
+                            .unwrap();
+                    match mutation {
+                        "schema" => value["schemaVersion"] = serde_json::json!(2),
+                        "pending" => value["next"]["restorePending"] = serde_json::json!(false),
+                        "profile" => {
+                            value["previous"]["profileIdentity"] = serde_json::json!("0".repeat(64))
+                        }
+                        _ => value["prepared"]["databaseIdentity"] = serde_json::json!("1:999"),
+                    }
+                    let bytes = serde_json::to_vec(&value).unwrap();
+                    fs::write(f.path.join(ACTIVATION), &bytes).unwrap();
+                    fs::write(f.target.join("activation-intent.json"), bytes).unwrap();
+                }
+                "unknown-field" | "wrong-type" | "complete-empty" => {
+                    let mut value = serde_json::to_value(f.owner.read().unwrap().unwrap()).unwrap();
+                    match mutation {
+                        "unknown-field" => value["futureAuthority"] = serde_json::json!(true),
+                        "wrong-type" => value["generation"] = serde_json::json!({"foreign":true}),
+                        _ => value = serde_json::json!({}),
+                    }
+                    fs::write(f.path.join(NAME), serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "marker" | "active" => {
+                    let mut marker = f.owner.read().unwrap().unwrap();
+                    if mutation == "marker" {
+                        marker.installation_id = "f".repeat(12);
+                    } else {
+                        marker.phase = Phase::Active;
+                    }
+                    f.owner.write(&marker).unwrap();
+                }
+                "original" => {
+                    fs::rename(f.path.join("database"), f.path.join("old-database")).unwrap();
+                    crate::runtime_store::private_directory(&f.path.join("database")).unwrap();
+                }
+                "database" => {
+                    fs::rename(f.target.join("database"), f.target.join("old-database")).unwrap();
+                    crate::runtime_store::private_directory(&f.target.join("database")).unwrap();
+                }
+                "old-pid" => fs::write(f.path.join("database/postmaster.pid"), b"unknown").unwrap(),
+                "new-pid" => {
+                    fs::write(f.target.join("database/postmaster.pid"), b"unknown").unwrap()
+                }
+                _ => {
+                    let lease = f
+                        .owner
+                        .root
+                        .open_with("lease.lock", &options(false))
+                        .unwrap()
+                        .into_std();
+                    lease.try_lock().unwrap();
+                    held_lease = Some(lease);
+                }
+            }
+            let before = fs::read(f.path.join(NAME)).unwrap();
+            assert!(
+                f.owner.reconcile_restore(ID, &"b".repeat(64)).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(fs::read(f.path.join(NAME)).unwrap(), before, "{mutation}");
+            assert!(f.path.join(ACTIVATION).exists());
+            drop(held_lease);
+        }
+    }
+    #[test]
+    fn restore_prepare_admission_reconciles_a_torn_marker_and_preserves_the_writer_fence() {
+        let mut f = Fixture::new();
+        let proof = f.proof();
+        let safety = f.safety();
+        f.owner.select_restore(proof, safety).unwrap();
+        fs::write(f.path.join(NAME), b"{").unwrap();
+        f.owner
+            .activate(
+                ID,
+                &"b".repeat(64),
+                crate::host_runtime::HostMode::RestorePrepare,
+            )
+            .unwrap();
+        assert!(f.owner.active.as_ref().unwrap().restore_pending);
+        f.owner
+            .launch_state(
+                &"b".repeat(64),
+                crate::host_runtime::HostMode::RestorePrepare,
+            )
+            .unwrap();
+        f.owner.clean_stop().unwrap();
+        assert!(f
+            .owner
+            .activate(ID, &"b".repeat(64), crate::host_runtime::HostMode::Server)
+            .is_err());
     }
 }
