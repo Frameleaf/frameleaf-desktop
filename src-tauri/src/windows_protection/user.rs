@@ -121,7 +121,12 @@ fn open(path: &Path) -> Result<File, String> {
         .share_mode(3)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|_| ERROR)?;
+        .map_err(|error| {
+            #[cfg(debug_assertions)]
+            eprintln!("private_directory_open: win32={:?}", error.raw_os_error());
+            let _ = error;
+            ERROR
+        })?;
     let info = file.metadata().map_err(|_| ERROR)?;
     if (!info.is_dir() && !info.is_file()) || info.file_attributes() & 0x400 != 0 {
         return Err(ERROR.into());
@@ -205,6 +210,13 @@ pub(crate) fn account_directory(
         || control & 0x1000 == 0
         || !super::private_acl(&owner, &acl, user, &private_trusted)
     {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "private_directory_leaf: protected={} user_owner={} private_acl={}",
+            control & 0x1000 != 0,
+            owner == user,
+            super::private_acl(&owner, &acl, user, &private_trusted)
+        );
         return Err(ERROR.into());
     }
     let mut pending = vec![path];
@@ -219,6 +231,8 @@ pub(crate) fn account_directory(
             let file = open(&path)?;
             let (owner, acl, _) = super::native::security(&file)?;
             if !super::private_acl(&owner, &acl, &owner, &private_trusted) {
+                #[cfg(debug_assertions)]
+                eprintln!("private_directory_descendant: private_acl=false");
                 return Err(ERROR.into());
             }
             if file.metadata().map_err(|_| ERROR)?.is_dir() {

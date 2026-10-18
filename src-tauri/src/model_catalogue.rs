@@ -686,7 +686,10 @@ pub(crate) fn shared_cache(
         .collect();
     let scope = digest(&serde_json::to_vec(&identity).map_err(|_| invalid())?);
     let active = root.join(scope);
-    private_directory(root)?;
+    private_directory(root).inspect_err(|_| {
+        #[cfg(debug_assertions)]
+        eprintln!("worker_cache_directory: stage=sets");
+    })?;
     if active.exists() {
         for (relative, (_, bytes, hash)) in &files {
             verify_file(&active.join(relative), *bytes, hash, cancel)?;
@@ -700,14 +703,20 @@ pub(crate) fn shared_cache(
         }
     }
     let staging = Staging(root.join(format!(".composition-{}", Uuid::new_v4())));
-    private_directory(&staging.0)?;
+    private_directory(&staging.0).inspect_err(|_| {
+        #[cfg(debug_assertions)]
+        eprintln!("worker_cache_directory: stage=composition");
+    })?;
     for (relative, (source, bytes, hash)) in &files {
         check_cancel(cancel)?;
         verify_file(source, *bytes, hash, cancel)?;
         let mut parent = staging.0.clone();
         for part in relative.parent().ok_or_else(invalid)?.components() {
             parent.push(part);
-            private_directory(&parent)?;
+            private_directory(&parent).inspect_err(|_| {
+                #[cfg(debug_assertions)]
+                eprintln!("worker_cache_directory: stage=component");
+            })?;
         }
         let target = staging.0.join(relative);
         // App-owned immutable weights share disk blocks; verify the published inode again before use.
@@ -805,6 +814,8 @@ mod tests {
             profiles.push(ApprovedProfile(profile));
             caches.push(cache);
         }
+        crate::runtime_store::private_directory(&root)
+            .expect("source cache fixture must remain private before composition");
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let active = shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
         for (family, name) in [
