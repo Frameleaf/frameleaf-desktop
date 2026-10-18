@@ -13,13 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn disposable(github: &str, environment: &str, opt_in: &str) -> Result<(), &'static str> {
-    if github == "true" && environment == "github-hosted" && opt_in == "1" {
-        Ok(())
-    } else {
-        Err("disposable_keystore_runner_required")
-    }
-}
 fn require_runner() {
     disposable(
         &std::env::var("GITHUB_ACTIONS").unwrap_or_default(),
@@ -52,9 +45,48 @@ fn disposable_runner_guard_refuses_ordinary_sessions() {
 }
 
 #[test]
+fn controller_credential_receipt_exposes_only_public_identity_and_runtime_history() {
+    let identity = DeviceIdentity::generate();
+    let receipt = controller_access_receipt(&identity, &identity.installation_id).unwrap();
+    let mut keys: Vec<_> = receipt
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "installationId",
+            "protocolVersion",
+            "publicKey",
+            "runtimeEpochs"
+        ]
+    );
+    assert_eq!(receipt["publicKey"], identity.public_key());
+    assert_eq!(
+        receipt["runtimeEpochs"],
+        serde_json::json!({"accepted": {}})
+    );
+    assert!(controller_access_receipt(&identity, &uuid::Uuid::new_v4().to_string()).is_err());
+    assert!(controller_access_receipt(&identity, "not-an-identity").is_err());
+}
+
+#[test]
 #[ignore = "requires a fresh disposable hosted runner and a real unlocked OS credential store"]
 fn disposable_runner_epoch_persistence() {
     require_runner();
+    let controller = std::path::PathBuf::from(
+        std::env::var_os("FRAMELEAF_TEST_CONTROLLER").expect("compiled controller is required"),
+    );
+    assert!(
+        controller.is_absolute()
+            && fs::symlink_metadata(&controller)
+                .unwrap()
+                .file_type()
+                .is_file()
+    );
     {
         let _lock = installation_lock().unwrap();
         assert!(
@@ -118,6 +150,31 @@ fn disposable_runner_epoch_persistence() {
             .unwrap_err(),
         "interrupted_publish"
     );
+    let expected_receipt = {
+        let _lock = installation_lock().unwrap();
+        controller_access_receipt(&runtime_identity().unwrap(), &installation_id).unwrap()
+    };
+    let output = scratch.0.join("controller-credential-receipt.json");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .unwrap();
+    let mut controller_child = Command::new(&controller)
+        .args(["--qualify-credential-access", &installation_id])
+        .stdout(file)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = wait_for_child(&mut controller_child);
+    let actual: serde_json::Value =
+        serde_json::from_slice(&crate::runtime_store::read_bounded(&output, 8192).unwrap())
+            .unwrap();
+    assert_eq!(
+        actual, expected_receipt,
+        "separate controller must read the same key and saved rollback floor"
+    );
+    assert!(status.success(), "controller credential access failed");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -130,19 +187,10 @@ fn disposable_runner_epoch_persistence() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "credential reload child failed");
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("credential reload child timed out");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert!(
+        wait_for_child(&mut child).success(),
+        "credential reload child failed"
+    );
     let store = RuntimeStore::new(
         &scratch.0.join("store-4"),
         vec![key.verifying_key()],
@@ -246,4 +294,19 @@ fn remove_owned_marker() {
     }
     assert_eq!(removed, 0);
     assert_eq!(flushed, 0);
+}
+
+fn wait_for_child(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("credential reload child timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

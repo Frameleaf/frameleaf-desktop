@@ -166,6 +166,45 @@ impl crate::runtime_epochs::EpochAuthority for CredentialEpochAuthority {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+fn disposable(github: &str, environment: &str, opt_in: &str) -> Result<(), &'static str> {
+    if github == "true" && environment == "github-hosted" && opt_in == "1" {
+        Ok(())
+    } else {
+        Err("disposable_keystore_runner_required")
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+fn controller_access_receipt(
+    identity: &DeviceIdentity,
+    expected: &str,
+) -> Result<serde_json::Value, String> {
+    if uuid::Uuid::parse_str(expected).is_err() || identity.installation_id != expected {
+        return Err("runtime_epoch_identity_changed".into());
+    }
+    let epochs = identity
+        .runtime_epochs
+        .as_ref()
+        .ok_or("runtime_epoch_recovery_required")?;
+    epochs.validate()?;
+    Ok(
+        serde_json::json!({"protocolVersion":1,"installationId":identity.installation_id,
+        "publicKey":identity.public_key(),"runtimeEpochs":epochs}),
+    )
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn qualify_controller_access(expected: &str) -> Result<serde_json::Value, String> {
+    disposable(
+        &std::env::var("GITHUB_ACTIONS").unwrap_or_default(),
+        &std::env::var("RUNNER_ENVIRONMENT").unwrap_or_default(),
+        &std::env::var("FRAMELEAF_TEST_DISPOSABLE_KEYSTORE").unwrap_or_default(),
+    )?;
+    let _lock = installation_lock()?;
+    controller_access_receipt(&runtime_identity()?, expected)
+}
+
 #[cfg(test)]
 mod epoch_enrollment_tests {
     use super::*;
