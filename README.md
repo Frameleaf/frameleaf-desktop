@@ -825,3 +825,5 @@ requires a complete Windows candidate with private database, Manager, backup and
 media dependencies; compilation alone does not qualify Windows restore.
 
 Windows profile credential bindings now use normalized volume-GUID names captured from opened handles, together with the existing physical state/data identities. Kernel-volume paths remain the authority for runtime verification and execution; GUID names are metadata only. An existing reservation without its matching credential requires recovery. Unix bindings are unchanged. Actual Windows reboot, credential-store and installed-server acceptance remain unverified.
+
+Windows kernel-volume storage separation now stops physical-identity ancestry checks at the actual filesystem root. It preserves self, descendant, ancestor and case-alias overlap refusals without trying to inspect Object Manager directories above the volume. The native Windows regression is present; actual Windows execution and installation remain unverified.
