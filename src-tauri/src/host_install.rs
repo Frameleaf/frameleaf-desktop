@@ -136,7 +136,7 @@ fn receipt_present(path: &std::path::Path) -> Result<bool, String> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn finalization_guard(
     candidate: &std::path::Path,
     finish_maintenance: bool,
@@ -176,6 +176,40 @@ fn admit_versions(
     }
 }
 
+fn verify_resources(layout: &Layout, manifest: &str, controller: &str) -> Result<(), String> {
+    use crate::manager_host::protect;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+    protect(&layout.runtime, &mut BTreeSet::new())?;
+    protect(&layout.controller, &mut BTreeSet::new())?;
+    let binary = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
+    if format!("{:x}", Sha256::digest(binary)) != controller {
+        return Err("host_install_controller_changed".into());
+    }
+    let raw = crate::runtime_store::read_bounded(
+        &layout.runtime.join("manifest.json"),
+        16 * 1024 * 1024,
+    )?;
+    let signature: [u8; 64] =
+        crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
+            .try_into()
+            .map_err(|_| "host_signature_invalid")?;
+    let runtime = crate::release_policy::verify_host_runtime(
+        &layout.runtime.join("payload"),
+        &raw,
+        &signature,
+    )?;
+    if runtime.manifest_sha256() != manifest {
+        return Err("host_install_runtime_changed".into());
+    }
+    runtime.manager_programs()?;
+    if receipt_present(&layout.runtime.join("installation.json"))?
+        && Installation::read(manifest)?.controller_sha256 != controller
+    {
+        return Err("host_install_record_invalid".into());
+    }
+    Ok(())
+}
 /// Installer-only fresh Windows package preparation; never starts or replaces a runtime.
 pub fn prepare_windows_package(
     manifest: &str,
@@ -184,6 +218,22 @@ pub fn prepare_windows_package(
     #[cfg(windows)]
     {
         windows::package::prepare(manifest, controller)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+
+/// Fresh Windows installer finalization; no profile provisioning or host startup.
+pub fn finalize_windows_package(
+    manifest: &str,
+    controller: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        windows::package::finalize(manifest, controller)
     }
     #[cfg(not(windows))]
     {
@@ -232,7 +282,7 @@ pub fn prepare_maintenance(manifest: &str, controller: &str) -> Result<serde_jso
     {
         posix::root()?;
         let layout = Layout::new(manifest, controller)?;
-        posix::verify_resources(&layout, manifest, controller)?;
+        verify_resources(&layout, manifest, controller)?;
         posix::fence(&layout)?;
         Ok(
             serde_json::json!({"protocolVersion":1,"state":"maintenance-prepared","serverStarted":false}),
@@ -388,7 +438,7 @@ fn repair_tree(
 pub(crate) fn verify_for_profile(record: &Installation) -> Result<(), String> {
     let layout = record.layout()?;
     let _lease = crate::package_lease::CodeLease::acquire(&layout.runtime)?;
-    posix::verify_resources(&layout, &record.manifest_sha256, &record.controller_sha256)
+    verify_resources(&layout, &record.manifest_sha256, &record.controller_sha256)
 }
 /// Linux installers explicitly select the account; a package-manager process has no console user.
 pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_json::Value, String> {
@@ -643,41 +693,6 @@ mod posix {
         result?;
         if cleanup.is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound) {
             return Err("host_install_record_failed".into());
-        }
-        Ok(())
-    }
-    pub(super) fn verify_resources(
-        layout: &Layout,
-        manifest: &str,
-        controller: &str,
-    ) -> Result<(), String> {
-        protect(&layout.runtime, &mut BTreeSet::new())?;
-        protect(&layout.controller, &mut BTreeSet::new())?;
-        let binary = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
-        if format!("{:x}", Sha256::digest(binary)) != controller {
-            return Err("host_install_controller_changed".into());
-        }
-        let raw = crate::runtime_store::read_bounded(
-            &layout.runtime.join("manifest.json"),
-            16 * 1024 * 1024,
-        )?;
-        let signature: [u8; 64] =
-            crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
-                .try_into()
-                .map_err(|_| "host_signature_invalid")?;
-        let runtime = crate::release_policy::verify_host_runtime(
-            &layout.runtime.join("payload"),
-            &raw,
-            &signature,
-        )?;
-        if runtime.manifest_sha256() != manifest {
-            return Err("host_install_runtime_changed".into());
-        }
-        runtime.manager_programs()?;
-        if receipt_present(&layout.runtime.join("installation.json"))?
-            && Installation::read(manifest)?.controller_sha256 != controller
-        {
-            return Err("host_install_record_invalid".into());
         }
         Ok(())
     }

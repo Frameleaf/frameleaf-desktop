@@ -39,9 +39,16 @@ jobs:
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - name: Qualify Windows package directory authority in disposable runner
+      - name: Qualify Windows package directory and receipt authority in disposable runner
         if: runner.os == 'Windows' && runner.environment == 'github-hosted'
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_creates_protected_directories_and_refuses_existing_unsafe_objects -- --ignored --exact
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE) { throw 'Windows package test discovery failed' }
+          $fixtures = @($tests | Select-String '^host_install::windows::package::tests::disposable_runner_.*: test$')
+          if ($fixtures.Count -ne 2) { throw 'Windows package qualification fixtures are missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
+          if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
       - name: Check Windows real restore test is compiled
         if: runner.os == 'Windows'
         shell: pwsh

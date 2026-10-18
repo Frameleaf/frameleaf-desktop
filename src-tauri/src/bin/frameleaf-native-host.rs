@@ -9,6 +9,7 @@ fn main() {
                 || mode == "--prepare-maintenance"
                 || mode == "--prepare-repair"
                 || mode == "--prepare-windows-package"
+                || mode == "--finalize-windows-package"
                 || mode == "--prepare-linux-package" =>
         {
             match (manifest.to_str(), controller.to_str()) {
@@ -21,6 +22,10 @@ fn main() {
                         frameleaf_desktop::host_install::prepare_repair(manifest, controller)
                     } else if mode == "--prepare-windows-package" {
                         frameleaf_desktop::host_install::prepare_windows_package(
+                            manifest, controller,
+                        )
+                    } else if mode == "--finalize-windows-package" {
+                        frameleaf_desktop::host_install::finalize_windows_package(
                             manifest, controller,
                         )
                     } else if mode == "--prepare-linux-package" {
