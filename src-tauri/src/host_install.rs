@@ -202,6 +202,72 @@ pub fn prepare_maintenance(manifest: &str, controller: &str) -> Result<serde_jso
         Err("host_install_platform_unsupported".into())
     }
 }
+/// Fence a damaged component for replacement without executing or trusting its payload.
+pub fn prepare_repair(manifest: &str, controller: &str) -> Result<serde_json::Value, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        posix::root()?;
+        let layout = Layout::new(manifest, controller)?;
+        posix::repair(&layout, manifest, controller)?;
+        Ok(
+            serde_json::json!({"protocolVersion":1,"state":"repair-prepared","serverStarted":false,"runtimeQualified":false}),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn repair_guard(
+    candidate: &std::path::Path,
+    verify: impl FnOnce() -> Result<(), String>,
+    profiles_idle: impl FnOnce() -> Result<(), String>,
+) -> Result<crate::package_lease::Maintenance, String> {
+    let guard = crate::package_lease::Maintenance::acquire(candidate)?;
+    verify()?;
+    profiles_idle()?;
+    guard.fence()?;
+    Ok(guard)
+}
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn repair_tree(
+    root: &std::path::Path,
+    limit: usize,
+    mut protect: impl FnMut(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let mut pending = vec![root.to_owned()];
+    let mut entries = 1;
+    if limit == 0 {
+        return Err("host_install_inventory_limit".into());
+    }
+    while let Some(path) = pending.pop() {
+        let info = fs::symlink_metadata(&path).map_err(|_| "host_install_repair_path_invalid")?;
+        if (!info.is_dir() && !info.is_file())
+            || info.mode() & 0o022 != 0
+            || (info.is_file() && info.nlink() != 1)
+        {
+            return Err("host_install_repair_path_invalid".into());
+        }
+        protect(&path)?;
+        if info.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|_| "host_install_repair_path_invalid")? {
+                if entries >= limit {
+                    return Err("host_install_inventory_limit".into());
+                }
+                entries += 1;
+                pending.push(
+                    entry
+                        .map_err(|_| "host_install_repair_path_invalid")?
+                        .path(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_for_profile(record: &Installation) -> Result<(), String> {
     let layout = record.layout()?;
@@ -542,6 +608,30 @@ mod posix {
         profiles_idle(layout)?;
         writer.fence()
     }
+    pub(super) fn repair(layout: &Layout, manifest: &str, controller: &str) -> Result<(), String> {
+        protect(&layout.runtime, &mut BTreeSet::new())?;
+        let _guard = repair_guard(
+            &layout.runtime,
+            || {
+                let mut checked = BTreeSet::new();
+                protect(&layout.controller, &mut checked)?;
+                let binary =
+                    crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
+                if format!("{:x}", Sha256::digest(binary)) != controller {
+                    return Err("host_install_controller_changed".into());
+                }
+                repair_tree(&layout.runtime, 100_000, |path| protect(path, &mut checked))?;
+                if receipt_present(&layout.runtime.join("installation.json"))?
+                    && Installation::read(manifest)?.controller_sha256 != controller
+                {
+                    return Err("host_install_record_invalid".into());
+                }
+                Ok(())
+            },
+            || profiles_idle(layout),
+        )?;
+        Ok(())
+    }
     pub(super) fn finalize(
         layout: &Layout,
         manifest: &str,
@@ -581,6 +671,103 @@ mod posix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    struct RepairFixture(PathBuf);
+    #[cfg(unix)]
+    impl RepairFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-repair-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for RepairFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn repair_admission_owns_code_before_validation_and_preserves_fences() {
+        let f = RepairFixture::new();
+        let calls = std::cell::Cell::new(0);
+        let reader = crate::package_lease::CodeLease::acquire(&f.0).unwrap();
+        assert!(repair_guard(
+            &f.0,
+            || {
+                calls.set(1);
+                Ok(())
+            },
+            || Ok(())
+        )
+        .is_err());
+        assert_eq!(calls.get(), 0);
+        drop(reader);
+        let guard = repair_guard(
+            &f.0,
+            || {
+                assert!(crate::package_lease::CodeLease::acquire(&f.0).is_err());
+                calls.set(1);
+                Ok(())
+            },
+            || {
+                assert_eq!(calls.get(), 1);
+                calls.set(2);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(f.0.join(".package-maintenance").is_file());
+        drop(guard);
+        assert!(crate::package_lease::CodeLease::acquire(&f.0).is_err());
+        assert!(repair_guard(
+            &f.0,
+            || Err("controller_changed".into()),
+            || panic!("must not inspect profiles")
+        )
+        .is_err());
+        assert!(repair_guard(&f.0, || Ok(()), || Err("profile_active".into())).is_err());
+        assert!(f.0.join(".package-maintenance").is_file());
+        drop(repair_guard(&f.0, || Ok(()), || Ok(())).unwrap());
+        assert!(f.0.join(".package-maintenance").is_file());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn repair_tree_accepts_corrupt_or_missing_bytes_but_refuses_unsafe_destinations() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let f = RepairFixture::new();
+        std::fs::create_dir(f.0.join("payload")).unwrap();
+        let data = f.0.join("payload/corrupt");
+        std::fs::write(&data, b"damaged binary, never execute").unwrap();
+        let visits = std::cell::Cell::new(0);
+        repair_tree(&f.0, 4, |_| {
+            visits.set(visits.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visits.get(), 3);
+        assert!(repair_tree(&f.0, 2, |_| Ok(())).is_err());
+        assert!(repair_tree(&f.0, 4, |_| Err("not_root_protected".into())).is_err());
+        symlink(&data, f.0.join("link")).unwrap();
+        assert!(repair_tree(&f.0, 4, |_| Ok(())).is_err());
+        std::fs::remove_file(f.0.join("link")).unwrap();
+        std::fs::hard_link(&data, f.0.join("alias")).unwrap();
+        assert!(repair_tree(&f.0, 4, |_| Ok(())).is_err());
+        std::fs::remove_file(f.0.join("alias")).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(repair_tree(&f.0, 4, |_| Ok(())).is_err());
+        std::fs::remove_file(data).unwrap();
+        repair_tree(&f.0, 4, |_| Ok(())).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = std::ffi::CString::new(f.0.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(repair_tree(&f.0, 4, |_| Ok(())).is_err());
+    }
     #[test]
     fn finalization_verifies_while_exclusive_and_refuses_fenced_profile_admission() {
         struct Cleanup(PathBuf);

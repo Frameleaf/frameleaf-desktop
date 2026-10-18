@@ -6,7 +6,8 @@ fn main() {
         [mode, manifest, controller]
             if mode == "--prepare-install"
                 || mode == "--finalize-install"
-                || mode == "--prepare-maintenance" =>
+                || mode == "--prepare-maintenance"
+                || mode == "--prepare-repair" =>
         {
             match (manifest.to_str(), controller.to_str()) {
                 (Some(manifest), Some(controller)) => {
@@ -14,6 +15,8 @@ fn main() {
                         frameleaf_desktop::host_install::prepare(manifest, controller)
                     } else if mode == "--prepare-maintenance" {
                         frameleaf_desktop::host_install::prepare_maintenance(manifest, controller)
+                    } else if mode == "--prepare-repair" {
+                        frameleaf_desktop::host_install::prepare_repair(manifest, controller)
                     } else {
                         frameleaf_desktop::host_install::finalize(manifest, controller)
                     };
