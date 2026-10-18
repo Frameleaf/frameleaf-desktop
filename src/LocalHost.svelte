@@ -2,9 +2,9 @@
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { managerError, localProfilePending } from './manager-state';
+  import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
   type Installation = { manifestSha256: string; controllerSha256: string };
-  type View = { state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; origin: string | null; installation: Installation | null };
+  type View = { state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -14,6 +14,7 @@
   let starting = $state(false);
   let provisioning = $state(false);
   const profilePending = $derived(localProfilePending(view?.state, provisioning));
+  const profileCopy = $derived(profileSetupCopy(view?.profileRequiresAuthorization !== false));
   let disposed = false;
   let failure = $state('');
   let notice = $state('');
@@ -27,6 +28,7 @@
     if (value === 'host_install_platform_unsupported') return 'Native server installation is not available on this platform in this build. You can connect to an existing server.';
     if (value === 'host_install_profile_required') return 'Run the server component installer while signed in to this computer, then try again.';
     if (value === 'host_install_linux_profile_required' || value === 'host_install_windows_profile_required') return 'Prepare a private server profile for your account before starting local management.';
+    if (value.startsWith('host_profile_legacy_')) return 'An existing server profile must be migrated before setup can continue. Your library and saved credentials have been preserved.';
     if (value === 'host_profile_authorization_cancelled') return 'System authorization was cancelled. You can try again.';
     if (value === 'host_profile_authorization_unavailable') return 'System authorization is unavailable. Check your desktop’s authorization service, then try again.';
     if (value === 'host_profile_prepare_failed') return 'The server profile could not be prepared. Check that your installed Frameleaf components are up to date. Your existing library has been preserved.';
@@ -58,7 +60,7 @@
   onMount(() => {
     if (!native) return;
     let unlisten: UnlistenFn | undefined;
-    void listen('native-host-exit-blocked', () => { notice = profilePending ? 'Finish or dismiss the system authorization request before quitting.' : 'Stop the photo server in Manager, then stop local management before quitting. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
+    void listen('native-host-exit-blocked', () => { notice = profilePending ? profileCopy.quit : 'Stop the photo server in Manager, then stop local management before quitting. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
     void refresh();
     return () => { disposed = true; unlisten?.(); };
   });
@@ -117,9 +119,9 @@
   <p>Keep your photo library here and manage it from Frameleaf. Server management and photo-server startup are separate steps.</p>
   {#if failure}<p class="message error" role="alert">{failure}</p>{/if}
   {#if notice}<p class="message" role="status">{notice}</p>{/if}
-  {#if profilePending}<p role="status">Finish or dismiss the system authorization request, then check installation to continue.</p>{/if}
-  {#if (view?.profileSetupAvailable && installations.length > 0 && (view.state === 'idle' || view.state === 'needs-attention')) || view?.code === 'host_install_linux_profile_required' || view?.code === 'host_install_windows_profile_required' || view?.code?.startsWith('host_profile_')}
-    <p>Your system may ask for administrator authorization to create private server folders for your account. Frameleaf does not receive your administrator password. This step does not start the photo server.</p>
+  {#if profilePending}<p role="status">{profileCopy.pending}</p>{/if}
+  {#if view?.profileSetupAvailable && installations.length > 0 && !view.code?.startsWith('host_profile_legacy_') && (view.state === 'idle' || view.state === 'needs-attention')}
+    <p>{profileCopy.preparation}</p>
     <button class="primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare my server profile</button>
   {/if}
   {#if native && !busy && !failure && installations.length === 0}
@@ -156,7 +158,7 @@
     {#if view?.backgroundActive && !profilePending}<button class="secondary" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
     <button class="text-button" disabled={busy || !native} onclick={refresh}>Check installation</button>
   </div>
-  <p class="footnote">{profilePending ? 'Finish or dismiss the system authorization request before quitting.' : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}</p>
+  <p class="footnote">{profilePending ? profileCopy.quit : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}</p>
 </section>
 
 <style>

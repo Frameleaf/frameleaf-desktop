@@ -67,6 +67,7 @@ async fn role(role: &str, root: &Path) {
                     startup: Some(
                         crate::host_state::Owner::acquire(&root.join("state"), true).unwrap(),
                     ),
+                    profiles: Vec::new(),
                 },
             )
             .unwrap();

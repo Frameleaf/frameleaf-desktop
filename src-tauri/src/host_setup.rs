@@ -23,6 +23,7 @@ pub(crate) struct View {
     origin: Option<String>,
     pub background_active: bool,
     profile_setup_available: bool,
+    profile_requires_authorization: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -33,6 +34,7 @@ impl Default for View {
             origin: None,
             background_active: false,
             profile_setup_available: cfg!(any(target_os = "linux", windows)),
+            profile_requires_authorization: cfg!(target_os = "linux"),
         }
     }
 }
@@ -62,6 +64,7 @@ impl HostSetup {
             installation,
             background_active: false,
             profile_setup_available: cfg!(any(target_os = "linux", windows)),
+            profile_requires_authorization: cfg!(target_os = "linux"),
         };
     }
     fn snapshot(&self) -> View {
@@ -113,7 +116,7 @@ impl HostSetup {
         #[cfg(windows)]
         {
             let record = Installation::read(&manifest)?;
-            self.provision_record(record, crate::windows_profile_elevation::provision)
+            self.provision_record(record, crate::windows_host_profile::prepare)
                 .await
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -494,10 +497,12 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         let uid = crate::windows_protection::process_user_sid()?;
         #[cfg(unix)]
         let profile = layout.profiles.join(uid.to_string());
-        #[cfg(windows)]
-        let profile = layout.profiles.join(&uid);
+        #[cfg(unix)]
         let state = profile.join("state");
+        #[cfg(unix)]
         let data = profile.join("manager");
+        #[cfg(windows)]
+        let (state, data) = crate::windows_host_profile::paths()?;
         // Downstream shared setup helpers may create missing leaves; keep both existing objects pinned.
         #[cfg(windows)]
         let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];

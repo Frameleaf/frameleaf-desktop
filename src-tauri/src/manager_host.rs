@@ -136,15 +136,22 @@ pub struct Configuration {
     pub database_port: u16,
     pub api_port: u16,
 }
-fn protect_profile_parents(config: &Configuration) -> Result<(), String> {
-    let mut checked = BTreeSet::new();
-    for path in [&config.state, &config.data] {
-        protect(
-            path.parent().ok_or("native_manager_config_invalid")?,
-            &mut checked,
-        )?;
+fn protect_profile_parents(config: &Configuration) -> Result<Vec<fs::File>, String> {
+    #[cfg(windows)]
+    {
+        crate::windows_host_profile::admit(&config.state, &config.data)
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let mut checked = BTreeSet::new();
+        for path in [&config.state, &config.data] {
+            protect(
+                path.parent().ok_or("native_manager_config_invalid")?,
+                &mut checked,
+            )?;
+        }
+        Ok(Vec::new())
+    }
 }
 pub(crate) fn validate_paths(candidate: &Path, state: &Path, data: &Path) -> Result<(), String> {
     for path in [state, data] {
@@ -248,17 +255,19 @@ pub struct NativeManager {
     startup_lease: Option<crate::host_state::Owner>,
     certificate_pem: String,
     _code_lease: Option<crate::package_lease::CodeLease>,
+    _profile_pins: Vec<fs::File>,
 }
 #[derive(Default)]
 struct Leases {
     code: Option<crate::package_lease::CodeLease>,
     startup: Option<crate::host_state::Owner>,
+    profiles: Vec<fs::File>,
 }
 impl Programs<'_> {
     pub fn start_from_keystore(&self, config: &Configuration) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         self.check()?;
-        protect_profile_parents(config)?;
+        let _profile_pins = protect_profile_parents(config)?;
         protect(&config.controller, &mut BTreeSet::new())?;
         if self.root.file_name() != Some(std::ffi::OsStr::new("payload")) {
             return Err("native_manager_layout_invalid".into());
@@ -314,7 +323,7 @@ impl Programs<'_> {
         let candidate = self.root.parent().ok_or("native_manager_layout_invalid")?;
         validate_paths(candidate, &config.state, &config.data)?;
         self.check()?;
-        protect_profile_parents(config)?;
+        let profile_pins = protect_profile_parents(config)?;
         protect(&config.controller, &mut BTreeSet::new())?;
         let code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
         let controller = crate::runtime_store::read_bounded(&config.controller, 256 * 1024 * 1024)?;
@@ -410,6 +419,7 @@ impl Programs<'_> {
             Leases {
                 code: Some(code_lease),
                 startup: startup_lease,
+                profiles: profile_pins,
             },
         )?;
         manager.certificate_pem = tls.certificate().into();
@@ -463,6 +473,7 @@ impl NativeManager {
             startup_lease: leases.startup,
             certificate_pem: String::new(),
             _code_lease: leases.code,
+            _profile_pins: leases.profiles,
         };
         let stdout = owner
             .child
@@ -708,6 +719,7 @@ impl Drop for NativeManager {
                 // Retain maintenance/startup exclusion until process exit if cleanup is unproven.
                 std::mem::forget(self._code_lease.take());
                 std::mem::forget(self.startup_lease.take());
+                std::mem::forget(std::mem::take(&mut self._profile_pins));
                 let _ = self.child.kill();
             }
         }

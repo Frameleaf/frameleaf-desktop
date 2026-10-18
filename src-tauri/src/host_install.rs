@@ -11,6 +11,10 @@ pub struct Layout {
     pub controller: PathBuf,
     pub profiles: PathBuf,
 }
+#[cfg(windows)]
+pub(crate) fn windows_profiles_root() -> Result<PathBuf, String> {
+    Ok(windows::base()?.join("Profiles"))
+}
 impl Layout {
     pub fn new(manifest: &str, controller: &str) -> Result<Self, String> {
         if !crate::native_runtime::digest_valid(manifest, 64)
@@ -451,7 +455,7 @@ fn repair_tree(
     }
     Ok(())
 }
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 pub(crate) fn verify_for_profile(record: &Installation) -> Result<(), String> {
     let layout = record.layout()?;
     let _lease = crate::package_lease::CodeLease::acquire(&layout.runtime)?;

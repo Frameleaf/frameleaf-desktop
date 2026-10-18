@@ -129,25 +129,29 @@ jobs:
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib manager_host::windows_tests:: -- --nocapture
           if ($LASTEXITCODE) { throw 'Windows Manager descendant ownership failed' }
-      - name: Probe the captured filesystem Shell path without elevation
+      - name: Qualify per-user host profile boundaries and controller pins
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_profile_elevation::tests::extended_filesystem_shell_path_launches_the_captured_child_without_elevation -- --exact --nocapture
-          if ($LASTEXITCODE) { throw 'Captured filesystem Shell path qualification failed' }
-      - name: Check Windows production and test code with strict Clippy
-        if: ${{ !cancelled() }}
-        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - name: Probe physical Shell paths with explicit executable classes without elevation
-        if: ${{ !cancelled() }}
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Per-user Windows host profile qualification failed' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_state:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Windows controller profile lifetime qualification failed' }
+      - name: Qualify explicit per-user profile preparation on a disposable Windows runner
+        if: ${{ !cancelled() && runner.environment == 'github-hosted' }}
+        env:
+          FRAMELEAF_TEST_DISPOSABLE_HOST_PROFILE: '1'
         shell: pwsh
         run: |
           $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
-          if ($LASTEXITCODE) { throw 'Shell class matrix discovery failed' }
-          $fixtures = @($tests | Select-String '^windows_profile_elevation::tests::physical_shell_class_matrix_without_elevation: test$')
-          if ($fixtures.Count -ne 1) { throw 'Shell class matrix fixture is missing' }
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_profile_elevation::tests::physical_shell_class_matrix_without_elevation -- --exact --ignored --nocapture
-          if ($LASTEXITCODE) { throw 'Physical Shell class matrix did not launch the test child' }
+          if ($LASTEXITCODE) { throw 'Per-user profile test discovery failed' }
+          $fixture = @($tests | Select-String '^windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile: test$')
+          if ($fixture.Count -ne 1) { throw 'Disposable per-user profile fixture is missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --exact --ignored --nocapture
+          if ($LASTEXITCODE) { throw 'Disposable per-user profile preparation failed' }
+      - name: Check Windows production and test code with strict Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   keystore-probe:
     if: ${{ inputs.keystore_probe }}

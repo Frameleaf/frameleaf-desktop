@@ -37,8 +37,8 @@ mod source_import;
 mod source_metadata;
 mod transport;
 mod upload_budget;
-#[cfg(any(windows, test))]
-mod windows_profile_elevation;
+#[cfg(windows)]
+mod windows_host_profile;
 #[cfg(any(windows, test))]
 mod windows_protection;
 pub mod worker;
