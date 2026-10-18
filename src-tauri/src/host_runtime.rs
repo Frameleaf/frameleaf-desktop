@@ -1130,7 +1130,16 @@ impl VerifiedHostRuntime {
         command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
         code_lease.inherit(&mut command);
         crate::process_tree::configure(&mut command);
-        let mut child = command.spawn().map_err(|_| "host_agent_start_failed")?;
+        let mut child = command.spawn().map_err(|error| {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "host_agent_spawn: kind={:?} errno={:?}",
+                error.kind(),
+                error.raw_os_error()
+            );
+            let _ = error;
+            "host_agent_start_failed"
+        })?;
         let tree = match crate::process_tree::ProcessTree::attach(&child) {
             Ok(tree) => tree,
             Err(error) => {

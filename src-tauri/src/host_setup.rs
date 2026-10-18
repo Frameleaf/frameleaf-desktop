@@ -446,12 +446,13 @@ fn native_release(version: &str, revision: &str) -> Result<String, String> {
 fn pin_profile_leaf(path: &std::path::Path) -> Result<std::fs::File, String> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        READ_CONTROL,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, READ_CONTROL,
     };
     let required = "host_install_windows_profile_required";
     let file = std::fs::OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        // Metadata-only handles do not participate in Windows sharing checks.
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
         .share_mode(3)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -566,6 +567,7 @@ mod tests {
         crate::runtime_store::private_directory(&root).unwrap();
         let pin = pin_profile_leaf(&root).unwrap();
         assert!(std::fs::remove_dir(&root).is_err());
+        assert!(std::fs::rename(&root, root.with_extension("moved")).is_err());
         require_leaf(&root).unwrap();
         crate::runtime_store::private_directory(&root).unwrap();
         drop(pin);

@@ -83,6 +83,8 @@ mod native {
             )
         };
         if result < 0 {
+            #[cfg(debug_assertions)]
+            eprintln!("host_profile_com: hresult={result}");
             return Err(UNAVAILABLE.into());
         }
         let _apartment = Apartment;
@@ -115,7 +117,10 @@ mod native {
             ..Default::default()
         };
         if unsafe { ShellExecuteExW(&mut info) } == 0 {
-            return Err(super::authorization_error(unsafe { GetLastError() }));
+            let code = unsafe { GetLastError() };
+            #[cfg(debug_assertions)]
+            eprintln!("host_profile_shell: win32={code}");
+            return Err(super::authorization_error(code));
         }
         if info.hProcess.is_null() {
             return Err(UNAVAILABLE.into());
