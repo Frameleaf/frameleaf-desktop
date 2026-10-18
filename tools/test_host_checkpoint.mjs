@@ -239,3 +239,23 @@ test("retry syncs a retirement marker interrupted before its first file sync bef
     assert.deepEqual(events, ["marker-sync", "unlink", "unlink"]);
   } finally { filesystem.open = originalOpen; filesystem.unlink = originalUnlink; syncBuiltinESMExports(); }
 });
+
+
+test("owner cleanup control commands bind the exact runtime receipt and accept no caller paths", async t => {
+  const f = await fixture(t);
+  const receipt = await createHostCheckpoint(f.c, operationId, f.execute);
+  assert.equal(typeof owner.checkpointControlRequest, "function");
+  const command = { protocolVersion: 1, action: "cleanup-checkpoint", operationId, checkpoint: receipt };
+  assert.deepEqual(owner.checkpointControlRequest(f.c, JSON.stringify(command)), command);
+  assert.deepEqual(owner.checkpointControlRequest(f.c, JSON.stringify(request)), request);
+  for (const changed of [null, {}, { ...command, path: "/outside" }, { ...command, protocolVersion: 2 },
+    { ...command, operationId: "22222222-2222-4222-8222-222222222222" },
+    { ...command, checkpoint: { ...receipt, sourceRevision: "e".repeat(40) } },
+    { ...command, checkpoint: { ...receipt, path: "/outside" } },
+    { ...command, checkpoint: { ...receipt, dump: { bytes: 0, sha256: "e".repeat(64) } } }]) {
+    assert.throws(() => owner.checkpointControlRequest(f.c, JSON.stringify(changed)), /host_checkpoint_request_invalid/);
+  }
+  for (const raw of ["{", "x".repeat(1025)])
+    assert.throws(() => owner.checkpointControlRequest(f.c, raw), /host_checkpoint_request_invalid/);
+  assert.deepEqual(await readFile(join(f.path, "database.dump")), f.bytes);
+});

@@ -124,6 +124,22 @@ export function checkpointRequest(line) {
     fail("host_checkpoint_request_invalid");
   }
 }
+export function checkpointControlRequest(c, line) {
+  try {
+    if (typeof line !== "string" || Buffer.byteLength(line) > 1024) throw Error();
+    const value = JSON.parse(line);
+    if (value?.action === "checkpoint") {
+      checkpointRequest(line);
+      return value;
+    }
+    if (!value || Object.keys(value).sort().join(",") !== "action,checkpoint,operationId,protocolVersion" ||
+      value.protocolVersion !== 1 || value.action !== "cleanup-checkpoint") throw Error();
+    const checkpoint = retirementReceipt(c, value.checkpoint);
+    if (checkpoint.operationId !== value.operationId) throw Error();
+    return { protocolVersion: 1, action: "cleanup-checkpoint", operationId: value.operationId, checkpoint };
+  } catch { fail("host_checkpoint_request_invalid"); }
+}
+
 async function checkpointDirectory(path, create = false) {
   if (create) await fs.mkdir(path, { mode: 0o700 }).catch(error => {
     if (error.code !== "EEXIST") throw error;
@@ -851,12 +867,14 @@ export async function runHost(c, stopping, ready) {
         build.upstreamCommit,
       );
     }
-    ready((operationId) => {
+    ready((request) => {
       if (checkpointWork || cancelled || app.exitCode !== null || pg.exitCode !== null)
         return Promise.reject(new Error("host_checkpoint_unavailable"));
-      const work = createHostCheckpoint(c, operationId,
-        (args, extra) => command(args, extra, false, { quiet: true, timeout: 7_200_000 }),
-        () => cancelled || app.exitCode !== null || pg.exitCode !== null);
+      const work = request.action === "cleanup-checkpoint"
+        ? cleanupHostCheckpoint(c, request.checkpoint)
+        : createHostCheckpoint(c, request.operationId,
+          (args, extra) => command(args, extra, false, { quiet: true, timeout: 7_200_000 }),
+          () => cancelled || app.exitCode !== null || pg.exitCode !== null);
       checkpointWork = work;
       void work.finally(() => { if (checkpointWork === work) checkpointWork = undefined; }).catch(() => {});
       return work;
@@ -933,6 +951,7 @@ async function main() {
   process.stdin.on("end", stop);
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
+  const config = JSON.parse(first.value);
   let checkpoint, pending, protocolFailure;
   void (async () => {
     for await (const line of { [Symbol.asyncIterator]: () => lines }) {
@@ -940,17 +959,19 @@ async function main() {
         stop();
         break;
       }
-      const operationId = checkpointRequest(line);
+      const request = checkpointControlRequest(config, line);
       if (!checkpoint || pending) fail("host_checkpoint_unavailable");
-      pending = checkpoint(operationId)
-        .then(receipt => process.stdout.write(JSON.stringify({ state: "checkpoint", ...receipt }) + "\n"))
-        .catch(() => process.stdout.write(JSON.stringify({ state: "checkpoint-failed", operationId, code: "host_checkpoint_failed" }) + "\n"))
+      const cleanup = request.action === "cleanup-checkpoint";
+      pending = checkpoint(request)
+        .then(receipt => process.stdout.write(JSON.stringify({ ...receipt, state: cleanup ? "checkpoint-cleaned" : "checkpoint" }) + "\n"))
+        .catch(() => process.stdout.write(JSON.stringify({ state: cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
+          operationId: request.operationId, code: cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
         .finally(() => { pending = undefined; });
     }
     stop();
   })().catch(() => { protocolFailure = "host_control_command_invalid"; stop(); });
   try {
-    await runHost(JSON.parse(first.value), stopping, (handler) => {
+    await runHost(config, stopping, (handler) => {
       checkpoint = handler;
       process.stdout.write('{"state":"running"}\n');
     });

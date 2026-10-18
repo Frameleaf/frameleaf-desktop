@@ -243,11 +243,42 @@ pub(crate) fn checkpoint_operation_id(value: &str) -> bool {
     })
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CheckpointDump {
     bytes: u64,
     sha256: String,
+}
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CheckpointReceipt {
+    schema_version: u32,
+    operation_id: String,
+    manifest_sha256: String,
+    source_revision: String,
+    postgres_major: String,
+    database_format: String,
+    dump: CheckpointDump,
+}
+impl CheckpointReceipt {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || !checkpoint_operation_id(&self.operation_id)
+            || !digest_valid(&self.manifest_sha256, 64)
+            || !digest_valid(&self.source_revision, 40)
+            || self.postgres_major != "19"
+            || self.database_format != "frameleaf-canonical"
+            || self.dump.bytes == 0
+            || self.dump.bytes > 9_007_199_254_740_991
+            || !digest_valid(&self.dump.sha256, 64)
+        {
+            return Err("host_checkpoint_request_invalid".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
@@ -263,14 +294,34 @@ enum AgentEvent {
         dump: CheckpointDump,
     },
     #[serde(rename_all = "camelCase")]
+    CheckpointCleaned {
+        schema_version: u32,
+        operation_id: String,
+        manifest_sha256: String,
+        source_revision: String,
+        postgres_major: String,
+        database_format: String,
+        dump: CheckpointDump,
+    },
+    #[serde(rename_all = "camelCase")]
+    CheckpointCleanupFailed {
+        operation_id: String,
+        code: String,
+    },
+    #[serde(rename_all = "camelCase")]
     CheckpointFailed {
         operation_id: String,
         code: String,
     },
     Stopped,
 }
+struct PendingCheckpoint {
+    operation: String,
+    accepted: bool,
+    cleanup: Option<CheckpointReceipt>,
+}
 struct CheckpointProtocol {
-    pending: Mutex<Option<(String, bool)>>,
+    pending: Mutex<Option<PendingCheckpoint>>,
     failed: AtomicBool,
     stopping: AtomicBool,
     manifest_sha256: String,
@@ -287,6 +338,22 @@ impl CheckpointProtocol {
         }
     }
     fn begin(&self, operation: &str) -> Result<(), String> {
+        self.begin_request(operation, None)
+    }
+    fn begin_cleanup(&self, receipt: &CheckpointReceipt) -> Result<(), String> {
+        receipt.validate()?;
+        if receipt.manifest_sha256 != self.manifest_sha256
+            || receipt.source_revision != self.source_revision
+        {
+            return Err("host_checkpoint_request_invalid".into());
+        }
+        self.begin_request(&receipt.operation_id, Some(receipt.clone()))
+    }
+    fn begin_request(
+        &self,
+        operation: &str,
+        cleanup: Option<CheckpointReceipt>,
+    ) -> Result<(), String> {
         if !checkpoint_operation_id(operation) {
             return Err("host_checkpoint_request_invalid".into());
         }
@@ -297,12 +364,18 @@ impl CheckpointProtocol {
         if pending.is_some() {
             return Err("host_checkpoint_busy".into());
         }
-        *pending = Some((operation.to_owned(), false));
+        *pending = Some(PendingCheckpoint {
+            operation: operation.to_owned(),
+            accepted: false,
+            cleanup,
+        });
         Ok(())
     }
     fn finish(&self, event: &AgentEvent) -> Result<(), String> {
         let operation = match event {
             AgentEvent::Checkpoint { operation_id, .. }
+            | AgentEvent::CheckpointCleaned { operation_id, .. }
+            | AgentEvent::CheckpointCleanupFailed { operation_id, .. }
             | AgentEvent::CheckpointFailed { operation_id, .. } => operation_id,
             AgentEvent::Stopped => return Err("host_checkpoint_protocol_invalid".into()),
         };
@@ -312,7 +385,7 @@ impl CheckpointProtocol {
             .map_err(|_| "host_checkpoint_protocol_invalid")?;
         if !pending
             .as_ref()
-            .is_some_and(|(expected, accepted)| expected == operation && *accepted)
+            .is_some_and(|expected| expected.operation == *operation && expected.accepted)
         {
             return Err("host_checkpoint_protocol_invalid".into());
         }
@@ -327,6 +400,15 @@ impl CheckpointProtocol {
         let event: AgentEvent = serde_json::from_slice(raw).map_err(|_| invalid())?;
         let operation = match &event {
             AgentEvent::Checkpoint {
+                schema_version,
+                operation_id,
+                manifest_sha256,
+                source_revision,
+                postgres_major,
+                database_format,
+                dump,
+            }
+            | AgentEvent::CheckpointCleaned {
                 schema_version,
                 operation_id,
                 manifest_sha256,
@@ -354,6 +436,12 @@ impl CheckpointProtocol {
                 }
                 operation_id
             }
+            AgentEvent::CheckpointCleanupFailed { operation_id, code } => {
+                if code != "host_checkpoint_cleanup_failed" {
+                    return Err(invalid());
+                }
+                operation_id
+            }
             AgentEvent::Stopped => {
                 return if self.stopping.load(Ordering::Acquire) {
                     Ok(event)
@@ -363,9 +451,29 @@ impl CheckpointProtocol {
             }
         };
         let mut pending = self.pending.lock().map_err(|_| invalid())?;
+        let cleanup = matches!(
+            event,
+            AgentEvent::CheckpointCleaned { .. } | AgentEvent::CheckpointCleanupFailed { .. }
+        );
         match pending.as_mut() {
-            Some((expected, accepted)) if expected == operation && !*accepted => {
-                *accepted = true;
+            Some(expected)
+                if expected.operation == *operation
+                    && !expected.accepted
+                    && expected.cleanup.is_some() == cleanup =>
+            {
+                if let (Some(receipt), AgentEvent::CheckpointCleaned { .. }) =
+                    (&expected.cleanup, &event)
+                {
+                    let mut returned = serde_json::to_value(&event).map_err(|_| invalid())?;
+                    returned
+                        .as_object_mut()
+                        .ok_or_else(invalid)?
+                        .remove("state");
+                    if returned != serde_json::to_value(receipt).map_err(|_| invalid())? {
+                        return Err(invalid());
+                    }
+                }
+                expected.accepted = true;
             }
             _ => return Err(invalid()),
         }
@@ -767,18 +875,34 @@ impl HostProcess {
         Ok(())
     }
     pub fn request_checkpoint(&mut self, operation: &str) -> Result<(), String> {
+        self.send_checkpoint_request(operation, None)
+    }
+    pub(crate) fn request_checkpoint_cleanup(
+        &mut self,
+        receipt: &CheckpointReceipt,
+    ) -> Result<(), String> {
+        self.send_checkpoint_request(&receipt.operation_id, Some(receipt))
+    }
+    fn send_checkpoint_request(
+        &mut self,
+        operation: &str,
+        cleanup: Option<&CheckpointReceipt>,
+    ) -> Result<(), String> {
         if !self.ready_seen
             || self.protocol.stopping.load(Ordering::Acquire)
             || !self.is_running()?
         {
             return Err("host_checkpoint_unavailable".into());
         }
-        self.protocol.begin(operation)?;
-        self.checkpoint_started = Some(Instant::now());
-        let wire = format!(
-            "{}\n",
+        let request = if let Some(receipt) = cleanup {
+            self.protocol.begin_cleanup(receipt)?;
+            serde_json::json!({"protocolVersion":1,"action":"cleanup-checkpoint","operationId":operation,"checkpoint":receipt})
+        } else {
+            self.protocol.begin(operation)?;
             serde_json::json!({"protocolVersion":1,"action":"checkpoint","operationId":operation})
-        );
+        };
+        self.checkpoint_started = Some(Instant::now());
+        let wire = format!("{request}\n");
         self.input
             .as_mut()
             .ok_or("host_agent_pipe_failed")?
@@ -901,6 +1025,31 @@ mod checkpoint_tests {
         ] {
             assert!(protocol.begin(value).is_err());
         }
+    }
+
+    #[test]
+    fn cleanup_receipts_cannot_cross_actions_or_change_the_expected_dump() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        let mut expected = receipt();
+        expected.as_object_mut().unwrap().remove("state");
+        let expected: CheckpointReceipt = serde_json::from_value(expected).unwrap();
+        protocol.begin_cleanup(&expected).unwrap();
+        assert!(protocol.parse(&wire(&receipt())).is_err());
+        let mut cleaned = receipt();
+        cleaned["state"] = serde_json::json!("checkpoint-cleaned");
+        let mut changed = cleaned.clone();
+        changed["dump"]["sha256"] = serde_json::json!("d".repeat(64));
+        assert!(protocol.parse(&wire(&changed)).is_err());
+        let event = protocol.parse(&wire(&cleaned)).unwrap();
+        protocol.finish(&event).unwrap();
+        protocol.begin(OPERATION).unwrap();
+        assert!(protocol.parse(&wire(&cleaned)).is_err());
+        let event = protocol.parse(&wire(&receipt())).unwrap();
+        protocol.finish(&event).unwrap();
+        protocol.begin_cleanup(&expected).unwrap();
+        let failure = serde_json::json!({"state":"checkpoint-cleanup-failed", "operationId":OPERATION, "code":"host_checkpoint_cleanup_failed"});
+        let event = protocol.parse(&wire(&failure)).unwrap();
+        protocol.finish(&event).unwrap();
     }
 
     #[test]

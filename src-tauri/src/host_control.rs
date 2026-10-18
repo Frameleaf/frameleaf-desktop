@@ -214,14 +214,22 @@ fn stopped(invalid: &AtomicBool) -> Result<(), String> {
     emit(json!({"protocolVersion":1,"state":"stopped"}))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CheckpointCommand {
-    protocol_version: u32,
-    action: String,
-    operation_id: String,
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+enum CheckpointCommand {
+    #[serde(rename_all = "camelCase")]
+    Checkpoint {
+        protocol_version: u32,
+        operation_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    CleanupCheckpoint {
+        protocol_version: u32,
+        operation_id: String,
+        checkpoint: crate::host_runtime::CheckpointReceipt,
+    },
 }
-fn read_owner_command(input: &mut impl BufRead) -> Result<Option<String>, String> {
+fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointCommand>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     let count = Read::by_ref(input)
         .take(1025)
@@ -235,17 +243,30 @@ fn read_owner_command(input: &mut impl BufRead) -> Result<Option<String>, String
     }
     let command: CheckpointCommand =
         serde_json::from_slice(&bytes).map_err(|_| "host_control_command_invalid")?;
-    if command.protocol_version != 1
-        || command.action != "checkpoint"
-        || !crate::host_runtime::checkpoint_operation_id(&command.operation_id)
-    {
+    let (protocol_version, operation_id) = match &command {
+        CheckpointCommand::Checkpoint {
+            protocol_version,
+            operation_id,
+        } => (protocol_version, operation_id),
+        CheckpointCommand::CleanupCheckpoint {
+            protocol_version,
+            operation_id,
+            checkpoint,
+        } => {
+            if checkpoint.validate().is_err() || checkpoint.operation_id() != operation_id {
+                return Err("host_control_command_invalid".into());
+            }
+            (protocol_version, operation_id)
+        }
+    };
+    if *protocol_version != 1 || !crate::host_runtime::checkpoint_operation_id(operation_id) {
         return Err("host_control_command_invalid".into());
     }
-    Ok(Some(command.operation_id))
+    Ok(Some(command))
 }
 fn read_owner_commands(
     input: &mut impl BufRead,
-    sender: mpsc::SyncSender<String>,
+    sender: mpsc::SyncSender<CheckpointCommand>,
     cancelled: &AtomicBool,
     invalid: &AtomicBool,
 ) {
@@ -321,8 +342,16 @@ pub fn run() -> Result<(), String> {
         return Err("host_control_output_unavailable".into());
     }
     while !cancelled.load(Ordering::Acquire) {
-        if let Ok(operation) = command_receiver.try_recv() {
-            if process.request_checkpoint(&operation).is_err() {
+        if let Ok(command) = command_receiver.try_recv() {
+            let result = match command {
+                CheckpointCommand::Checkpoint { operation_id, .. } => {
+                    process.request_checkpoint(&operation_id)
+                }
+                CheckpointCommand::CleanupCheckpoint { checkpoint, .. } => {
+                    process.request_checkpoint_cleanup(&checkpoint)
+                }
+            };
+            if result.is_err() {
                 invalid.store(true, Ordering::Release);
                 break;
             }
@@ -369,7 +398,10 @@ mod tests {
         let mut input = BufReader::new(bytes.as_bytes());
         assert_eq!(
             read_owner_command(&mut input).unwrap(),
-            Some(operation.to_owned())
+            Some(CheckpointCommand::Checkpoint {
+                protocol_version: 1,
+                operation_id: operation.to_owned()
+            })
         );
         assert_eq!(read_owner_command(&mut input).unwrap(), None);
         assert_eq!(read_owner_command(&mut &b""[..]).unwrap(), None);
@@ -377,6 +409,28 @@ mod tests {
             format!("{{\"protocolVersion\":1,\"action\":\"checkpoint\",\"operationId\":\"{operation}\",\"path\":\"/outside\"}}\n")] {
             assert!(read_owner_command(&mut raw.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn cleanup_input_requires_a_strict_receipt_for_the_same_operation() {
+        let operation = "11111111-1111-4111-8111-111111111111";
+        let receipt = json!({"schemaVersion":1,"operationId":operation,"manifestSha256":"a".repeat(64),
+            "sourceRevision":"b".repeat(40),"postgresMajor":"19","databaseFormat":"frameleaf-canonical",
+            "dump":{"bytes":27,"sha256":"c".repeat(64)}});
+        let request = json!({"protocolVersion":1,"action":"cleanup-checkpoint","operationId":operation,"checkpoint":receipt});
+        assert!(read_owner_command(&mut format!("{request}\n").as_bytes()).is_ok());
+        for (key, value) in [
+            ("checkpoint", json!(null)),
+            ("path", json!("/outside")),
+            ("operationId", json!("22222222-2222-4222-8222-222222222222")),
+        ] {
+            let mut changed = request.clone();
+            changed[key] = value;
+            assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+        }
+        let mut changed = request.clone();
+        changed["checkpoint"]["dump"]["bytes"] = json!(0);
+        assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
     }
 
     #[test]
