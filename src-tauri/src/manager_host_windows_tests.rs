@@ -166,7 +166,13 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
         };
         crate::runtime_store::private_directory(&fixture.root).unwrap();
         fs::create_dir(fixture.root.join("code")).unwrap();
-        fixture.owner = Some(command("owner", &fixture.root).spawn().unwrap());
+        eprintln!("manager_owner_case={mode}");
+        fixture.owner = Some(
+            command("owner", &fixture.root)
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
         wait_for(&fixture.root.join("owner-ready"));
         wait_for(&fixture.root.join("ready"));
         for name in ["worker", "browser", "leaf"] {
@@ -230,7 +236,10 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
             "natural fixture expiry cannot prove cleanup"
         );
         let status = fixture.owner.as_mut().unwrap().wait().unwrap();
-        assert!(mode == "owner-loss" || status.success());
+        assert!(
+            mode == "owner-loss" || status.success(),
+            "Manager owner failed in {mode}: {status}"
+        );
         lease.try_lock().unwrap();
         lease.unlock().unwrap();
         drop(crate::host_state::Owner::acquire(&fixture.root.join("state"), true).unwrap());
