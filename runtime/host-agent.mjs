@@ -40,7 +40,7 @@ export function studioReadyUntil(message, engineDigest, now = Date.now()) {
 export function validateConfig(c) {
   if (
     !c ||
-    (c.mode !== undefined && !["server", "database", "checkpoint-cleanup"].includes(c.mode)) ||
+    (c.mode !== undefined && !["server", "database", "checkpoint-cleanup", "restore-prepare"].includes(c.mode)) ||
     !isAbsolute(c.state ?? "") ||
     !isAbsolute(c.runtime ?? "") ||
     c.state === c.runtime ||
@@ -130,6 +130,12 @@ export function checkpointControlRequest(c, line) {
   try {
     if (typeof line !== "string" || Buffer.byteLength(line) > 1024) throw Error();
     const value = JSON.parse(line);
+    if (value?.action === "prepare-restore") {
+      if (c.mode !== "restore-prepare" || Object.keys(value).sort().join(",") !== "action,binding,operationId,protocolVersion" || value.protocolVersion !== 1) throw Error();
+      const binding = restoreInputBinding(c, value.binding);
+      if (binding.operationId !== value.operationId) throw Error();
+      return {protocolVersion:1, action:"prepare-restore", operationId:value.operationId, binding};
+    }
     if (value?.action === "checkpoint") {
       checkpointRequest(line);
       return value;
@@ -697,8 +703,8 @@ export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
   if (restoreSession !== undefined && restoreSession?.[RESTORE_SESSION] !== true) fail("host_restore_authority_invalid");
   const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
-  if (c.mode === "checkpoint-cleanup") {
-    // Require an existing owned profile; retirement must not provision or touch database state.
+  if (c.mode === "checkpoint-cleanup" || c.mode === "restore-prepare") {
+    // Maintenance starts no original database; restore writes only a separate owned attempt.
     await checkpointDirectory(c.state);
     if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
     await stateFile(join(c.state, "host-state.json"), 4096).catch(() => fail("host_state_invalid"));
@@ -706,9 +712,9 @@ export async function runHost(c, stopping, ready, restoreSession) {
     let pending, cancelled = false;
     void stopping.then(() => { cancelled = true; });
     ready(request => {
-      if (cancelled || pending || request.action !== "cleanup-checkpoint")
+      if (cancelled || pending || request.action !== (c.mode === "restore-prepare" ? "prepare-restore" : "cleanup-checkpoint"))
         return Promise.reject(new Error("host_checkpoint_unavailable"));
-      const work = cleanupHostCheckpoint(c, request.checkpoint);
+      const work = c.mode === "restore-prepare" ? restoreHostDatabase(c, request.binding, stopping) : cleanupHostCheckpoint(c, request.checkpoint);
       pending = work;
       void work.finally(() => { if (pending === work) pending = undefined; }).catch(() => {});
       return work;
@@ -1129,11 +1135,11 @@ async function main() {
       }
       const request = checkpointControlRequest(config, line);
       if (!checkpoint || pending) fail("host_checkpoint_unavailable");
-      const cleanup = request.action === "cleanup-checkpoint";
+      const cleanup = request.action === "cleanup-checkpoint", restore = request.action === "prepare-restore";
       pending = checkpoint(request)
-        .then(receipt => process.stdout.write(JSON.stringify({ ...receipt, state: cleanup ? "checkpoint-cleaned" : "checkpoint" }) + "\n"))
-        .catch(() => process.stdout.write(JSON.stringify({ state: cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
-          operationId: request.operationId, code: cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
+        .then(receipt => process.stdout.write(JSON.stringify(restore ? receipt : { ...receipt, state: cleanup ? "checkpoint-cleaned" : "checkpoint" }) + "\n"))
+        .catch(() => process.stdout.write(JSON.stringify({ state: restore ? "restore-prepare-failed" : cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
+          operationId: request.operationId, code: restore ? "host_restore_failed" : cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
         .finally(() => { pending = undefined; });
     }
     stop();
@@ -1141,7 +1147,7 @@ async function main() {
   try {
     await runHost(config, stopping, (handler) => {
       checkpoint = handler;
-      process.stdout.write(JSON.stringify({ state: config.mode === "checkpoint-cleanup" ? "checkpoint-cleanup-ready" : config.mode === "database" ? "database-ready" : "running" }) + "\n");
+      process.stdout.write(JSON.stringify({ state: config.mode === "restore-prepare" ? "restore-prepare-ready" : config.mode === "checkpoint-cleanup" ? "checkpoint-cleanup-ready" : config.mode === "database" ? "database-ready" : "running" }) + "\n");
     });
     await pending;
     if (protocolFailure) fail(protocolFailure);

@@ -230,6 +230,12 @@ enum CheckpointCommand {
         operation_id: String,
         checkpoint: crate::host_runtime::CheckpointReceipt,
     },
+    #[serde(rename_all = "camelCase")]
+    PrepareRestore {
+        protocol_version: u32,
+        operation_id: String,
+        binding: crate::host_runtime::RestoreBinding,
+    },
 }
 fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointCommand>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
@@ -256,6 +262,16 @@ fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointComma
             checkpoint,
         } => {
             if checkpoint.validate().is_err() || checkpoint.operation_id() != operation_id {
+                return Err("host_control_command_invalid".into());
+            }
+            (protocol_version, operation_id)
+        }
+        CheckpointCommand::PrepareRestore {
+            protocol_version,
+            operation_id,
+            binding,
+        } => {
+            if binding.validate().is_err() || binding.operation_id != *operation_id {
                 return Err("host_control_command_invalid".into());
             }
             (protocol_version, operation_id)
@@ -363,14 +379,29 @@ pub fn run() -> Result<(), String> {
         if let Ok(command) = command_receiver.try_recv() {
             let result = match command {
                 CheckpointCommand::Checkpoint { operation_id, .. } => {
-                    if config.mode == crate::host_runtime::HostMode::CheckpointCleanup {
+                    if matches!(
+                        config.mode,
+                        crate::host_runtime::HostMode::CheckpointCleanup
+                            | crate::host_runtime::HostMode::RestorePrepare
+                    ) {
                         Err("host_checkpoint_unavailable".into())
                     } else {
                         process.request_checkpoint(&operation_id)
                     }
                 }
                 CheckpointCommand::CleanupCheckpoint { checkpoint, .. } => {
-                    process.request_checkpoint_cleanup(&checkpoint)
+                    if config.mode == crate::host_runtime::HostMode::RestorePrepare {
+                        Err("host_checkpoint_unavailable".into())
+                    } else {
+                        process.request_checkpoint_cleanup(&checkpoint)
+                    }
+                }
+                CheckpointCommand::PrepareRestore { binding, .. } => {
+                    if binding.installation_id != config.installation_id {
+                        Err("host_restore_request_invalid".into())
+                    } else {
+                        process.request_restore(&binding)
+                    }
                 }
             };
             if result.is_err() {
@@ -456,6 +487,35 @@ mod tests {
     }
 
     #[test]
+    fn restore_input_requires_exact_binding_for_the_same_operation() {
+        let operation = "11111111-1111-4111-8111-111111111111";
+        let binding = json!({"schemaVersion":1,"runtime":"native","operationId":operation,
+            "reviewId":"22222222-2222-4222-8222-222222222222","snapshotId":"c".repeat(64),"installationId":"d".repeat(12),
+            "manifestSha256":"a".repeat(64),"sourceRevision":"b".repeat(40),"libraryId":"e".repeat(12),"recoverySha256":"f".repeat(64)});
+        let request = json!({"protocolVersion":1,"action":"prepare-restore","operationId":operation,"binding":binding});
+        assert!(read_owner_command(&mut format!("{request}\n").as_bytes()).is_ok());
+        for changed in [
+            {
+                let mut v = request.clone();
+                v["binding"]["runtime"] = json!("docker");
+                v
+            },
+            {
+                let mut v = request.clone();
+                v["binding"]["path"] = json!("/outside");
+                v
+            },
+            {
+                let mut v = request.clone();
+                v["operationId"] = json!("22222222-2222-4222-8222-222222222222");
+                v
+            },
+        ] {
+            assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+        }
+    }
+
+    #[test]
     fn a_flooded_command_channel_cancels_without_blocking_the_input_thread() {
         let request = json!({"protocolVersion":1,"action":"checkpoint","operationId":"11111111-1111-4111-8111-111111111111"});
         let input = format!("{request}\n{request}\nstop\n");
@@ -517,6 +577,13 @@ mod tests {
                 .unwrap()
                 .mode,
             crate::host_runtime::HostMode::CheckpointCleanup
+        );
+        maintenance["mode"] = json!("restore-prepare");
+        assert_eq!(
+            config(&serde_json::to_vec(&maintenance).unwrap())
+                .unwrap()
+                .mode,
+            crate::host_runtime::HostMode::RestorePrepare
         );
         for invalid in [json!(null), json!("backup"), json!(true)] {
             maintenance["mode"] = invalid;

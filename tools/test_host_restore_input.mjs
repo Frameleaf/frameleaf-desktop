@@ -178,7 +178,7 @@ test('cancellation during result sync cannot return a successful prepared target
   const original=filesystem.open;
   const probe=t.mock.method(filesystem,'open',async(...args)=>{
    const handle=await original(...args);
-   if(String(args[0]).endsWith('/restore-result.json')){
+   if(basename(String(args[0]))==='restore-result.json'){
     const sync=handle.sync.bind(handle);
     t.mock.method(handle,'sync',async()=>{await sync();stop();});
    }
@@ -186,5 +186,27 @@ test('cancellation during result sync cannot return a successful prepared target
   });syncBuiltinESMExports();
   try{await assert.rejects(owner.restoreHostDatabase(c,binding,stopping),/host_restore_cancelled/);}
   finally{probe.mock.restore();syncBuiltinESMExports();}
+ });
+});
+
+test('restore maintenance admits only exact input bindings and starts no original database',async t=>{
+ await restoreFixture(t,async({c,binding,calls})=>{
+  const config={...c,mode:'restore-prepare'};
+  const request={protocolVersion:1,action:'prepare-restore',operationId:binding.operationId,binding};
+  assert.deepEqual(owner.checkpointControlRequest(config,JSON.stringify(request)),request);
+  assert.throws(()=>owner.checkpointControlRequest({...c,mode:'server'},JSON.stringify(request)),/host_checkpoint_request_invalid/);
+  for(const changed of [{...request,path:'/outside'},{...request,operationId:'11111111-1111-4111-8111-111111111111'},{...request,binding:{...binding,recoverySha256:'invalid'}},{...request,binding:{...binding,manifestSha256:'0'.repeat(64)}}])
+   assert.throws(()=>owner.checkpointControlRequest(config,JSON.stringify(changed)),/host_checkpoint_request_invalid/);
+  let stop,handler;const stopping=new Promise(resolve=>{stop=resolve;});
+  let ready;const waiting=new Promise(resolve=>{ready=resolve;});
+  const host=owner.runHost(config,stopping,value=>{handler=value;ready();});
+  await Promise.race([waiting,host]);
+  assert.deepEqual(calls,[]);
+  await assert.rejects(handler({action:'checkpoint',operationId:binding.operationId}),/host_checkpoint_unavailable/);
+  const work=handler(request);
+  await assert.rejects(handler(request),/host_checkpoint_unavailable/);
+  const receipt=await work;assert.equal(receipt.state,'restore-prepared');assert.deepEqual(receipt.binding,binding);
+  stop();await host;
+  assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
  });
 });

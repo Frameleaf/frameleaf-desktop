@@ -375,6 +375,24 @@ mod tests {
         "b".repeat(64)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owner_drop_releases_fork_style_descriptor_without_claiming_clean_shutdown() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.activate(ID, &sha()).unwrap();
+        let inherited = owner.file.try_clone().unwrap();
+        assert!(Owner::acquire(&fixture.0, true).is_err());
+        drop(owner);
+        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        assert_eq!(
+            inspector.inspect(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        drop(inspector);
+        drop(inherited);
+    }
+
     #[test]
     fn controller_lease_excludes_inspection_from_before_start_until_shutdown() {
         let fixture = Fixture::new();
