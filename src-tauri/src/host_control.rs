@@ -214,10 +214,62 @@ fn stopped(invalid: &AtomicBool) -> Result<(), String> {
     emit(json!({"protocolVersion":1,"state":"stopped"}))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointCommand {
+    protocol_version: u32,
+    action: String,
+    operation_id: String,
+}
+fn read_owner_command(input: &mut impl BufRead) -> Result<Option<String>, String> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    let count = Read::by_ref(input)
+        .take(1025)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|_| "host_control_command_invalid")?;
+    if count == 0 || bytes.as_slice() == b"stop\n" {
+        return Ok(None);
+    }
+    if count > 1024 || !bytes.ends_with(b"\n") {
+        return Err("host_control_command_invalid".into());
+    }
+    let command: CheckpointCommand =
+        serde_json::from_slice(&bytes).map_err(|_| "host_control_command_invalid")?;
+    if command.protocol_version != 1
+        || command.action != "checkpoint"
+        || !crate::host_runtime::checkpoint_operation_id(&command.operation_id)
+    {
+        return Err("host_control_command_invalid".into());
+    }
+    Ok(Some(command.operation_id))
+}
+fn read_owner_commands(
+    input: &mut impl BufRead,
+    sender: mpsc::SyncSender<String>,
+    cancelled: &AtomicBool,
+    invalid: &AtomicBool,
+) {
+    loop {
+        match read_owner_command(input) {
+            Ok(Some(operation)) => {
+                if sender.try_send(operation).is_ok() {
+                    continue;
+                }
+                invalid.store(true, Ordering::Release);
+            }
+            Ok(None) => {}
+            _ => invalid.store(true, Ordering::Release),
+        }
+        cancelled.store(true, Ordering::Release);
+        return;
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let invalid = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel(1);
+    let (commands, command_receiver) = mpsc::sync_channel(1);
     let input_cancelled = cancelled.clone();
     let input_invalid = invalid.clone();
     std::thread::spawn(move || {
@@ -229,17 +281,8 @@ pub fn run() -> Result<(), String> {
         if sender.send(parsed).is_err() || !valid {
             return;
         }
-        // A missing owner is a clean stop; a malformed command also stops, then reports failure.
-        let mut bytes = Zeroizing::new(Vec::new());
-        match Read::by_ref(&mut input)
-            .take(65)
-            .read_until(b'\n', &mut bytes)
-        {
-            Ok(0) => {}
-            Ok(_) if bytes.as_slice() == b"stop\n" => {}
-            _ => input_invalid.store(true, Ordering::Release),
-        }
-        input_cancelled.store(true, Ordering::Release);
+        // A missing owner or malformed command still cancels while a checkpoint is running.
+        read_owner_commands(&mut input, commands, &input_cancelled, &input_invalid);
     });
     let mut config = receiver
         .recv()
@@ -278,6 +321,32 @@ pub fn run() -> Result<(), String> {
         return Err("host_control_output_unavailable".into());
     }
     while !cancelled.load(Ordering::Acquire) {
+        if let Ok(operation) = command_receiver.try_recv() {
+            if process.request_checkpoint(&operation).is_err() {
+                invalid.store(true, Ordering::Release);
+                break;
+            }
+        }
+        match process.poll_checkpoint() {
+            Ok(Some(mut receipt)) => {
+                receipt
+                    .as_object_mut()
+                    .ok_or("host_checkpoint_protocol_invalid")?
+                    .insert("protocolVersion".into(), json!(1));
+                if let Err(error) = emit(receipt) {
+                    process.stop()?;
+                    owner.clean_stop()?;
+                    return Err(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if process.stop().is_ok() {
+                    owner.clean_stop()?;
+                }
+                return Err(error);
+            }
+        }
         if !process.is_running()? {
             return Err("host_process_exited".into());
         }
@@ -291,6 +360,37 @@ pub fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_input_is_identity_only_and_stop_or_eof_remain_immediate() {
+        let operation = "11111111-1111-4111-8111-111111111111";
+        let request = json!({"protocolVersion":1,"action":"checkpoint","operationId":operation});
+        let bytes = format!("{request}\nstop\n");
+        let mut input = BufReader::new(bytes.as_bytes());
+        assert_eq!(
+            read_owner_command(&mut input).unwrap(),
+            Some(operation.to_owned())
+        );
+        assert_eq!(read_owner_command(&mut input).unwrap(), None);
+        assert_eq!(read_owner_command(&mut &b""[..]).unwrap(), None);
+        for raw in ["{}\n".to_owned(), format!("{request}"), "x".repeat(1025),
+            format!("{{\"protocolVersion\":1,\"action\":\"checkpoint\",\"operationId\":\"{operation}\",\"path\":\"/outside\"}}\n")] {
+            assert!(read_owner_command(&mut raw.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn a_flooded_command_channel_cancels_without_blocking_the_input_thread() {
+        let request = json!({"protocolVersion":1,"action":"checkpoint","operationId":"11111111-1111-4111-8111-111111111111"});
+        let input = format!("{request}\n{request}\nstop\n");
+        let (tx, rx) = mpsc::sync_channel(1);
+        let cancelled = AtomicBool::new(false);
+        let invalid = AtomicBool::new(false);
+        read_owner_commands(&mut input.as_bytes(), tx, &cancelled, &invalid);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(invalid.load(Ordering::Acquire));
+        assert!(rx.try_recv().is_ok());
+    }
 
     #[test]
     fn state_cannot_overlap_the_physical_runtime_tree_before_journal_creation() {

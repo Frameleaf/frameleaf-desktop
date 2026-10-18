@@ -112,6 +112,82 @@ impl Drop for Fixture {
 
 #[cfg(unix)]
 #[test]
+fn owned_checkpoint_transport_matches_receipts_and_cancels_without_a_second_channel_slot() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    use zeroize::Zeroizing;
+    let operation = "11111111-1111-4111-8111-111111111111";
+    for mode in ["normal", "cancel", "wrong-operation"] {
+        let mut fixture = Fixture::new();
+        let script = r##"#!/bin/sh
+exec /usr/bin/python3 -c '
+import sys,json
+mode="RESPONSE_MODE"
+c=json.loads(sys.stdin.readline())
+print(json.dumps({"state":"running"}),flush=True)
+pending=None
+for line in sys.stdin:
+ if line=="stop\n":
+  if pending is not None: print(json.dumps({"state":"checkpoint-failed","operationId":pending,"code":"host_checkpoint_failed"}),flush=True)
+  print(json.dumps({"state":"stopped"}),flush=True)
+  break
+ request=json.loads(line)
+ if request["protocolVersion"]!=1 or request["action"]!="checkpoint": sys.exit(9)
+ pending=request["operationId"]
+ if mode=="cancel": continue
+ operation="22222222-2222-4222-8222-222222222222" if mode=="wrong-operation" else pending
+ print(json.dumps({"state":"checkpoint","schemaVersion":1,"operationId":operation,"manifestSha256":c["manifestSha256"],"sourceRevision":c["sourceRevision"],"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"c"*64}}),flush=True)
+ pending=None
+'
+"##.replace("RESPONSE_MODE", mode);
+        fs::write(fixture.0.join("node"), script.as_bytes()).unwrap();
+        fs::set_permissions(fixture.0.join("node"), fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.1["files"]["node"] = json!({"bytes":script.len(),"sha256":format!("{:x}",Sha256::digest(script.as_bytes()))});
+        let runtime = fixture.verify().unwrap();
+        let mut child = runtime
+            .start(
+                &fixture.2.join("state"),
+                &Zeroizing::new("synthetic-private-checkpoint-password".into()),
+                54321,
+                54322,
+            )
+            .unwrap();
+        assert!(child.request_checkpoint(operation).is_err());
+        child.wait_ready(Duration::from_secs(10)).unwrap();
+        child.request_checkpoint(operation).unwrap();
+        assert!(child.request_checkpoint(operation).is_err());
+        if mode == "cancel" {
+            child.stop().unwrap();
+            assert!(!child.is_running().unwrap());
+            continue;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            match child.poll_checkpoint() {
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                result => break result,
+            }
+        };
+        if mode == "wrong-operation" {
+            assert_eq!(result.unwrap_err(), "host_checkpoint_protocol_invalid");
+        } else {
+            let receipt = result
+                .unwrap()
+                .expect("owned child did not acknowledge checkpoint");
+            assert_eq!(receipt["operationId"], operation);
+            assert_eq!(receipt["manifestSha256"], runtime.manifest_sha256());
+            assert_eq!(receipt["dump"]["bytes"], 27);
+            child.stop().unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn host_start_refuses_a_linked_database_before_launching_any_process() {
     use zeroize::Zeroizing;
     let fixture = Fixture::new();
