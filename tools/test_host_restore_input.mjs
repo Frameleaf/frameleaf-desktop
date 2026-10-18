@@ -210,3 +210,135 @@ test('restore maintenance admits only exact input bindings and starts no origina
   assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
  });
 });
+
+
+async function preparedTargetFixture(t, run) {
+  await restoreFixture(t, async (f) => {
+    const receipt = await owner.restoreHostDatabase(
+      f.c,
+      f.binding,
+      new Promise(() => {}),
+    );
+    const target = join(
+      f.c.state,
+      'restore-targets',
+      f.binding.operationId,
+      receipt.attemptId,
+    );
+    const database = join(target, 'database');
+    // The subprocess fixture models exit; real pg_ctl also removes this file on a clean stop.
+    await rm(join(database, 'postmaster.pid'));
+    await filesystem.chmod(join(database, 'PG_VERSION'), 0o600);
+    await run({ ...f, receipt, target, database });
+  });
+}
+
+test('prepared target inspection rechecks exact durable evidence and physical identities without starting or moving a database', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  await preparedTargetFixture(
+    t,
+    async ({ c, receipt, target, database, calls }) => {
+      const count = calls.length;
+      assert.deepEqual(await owner.readHostRestoreTarget(c, receipt), {
+        receipt,
+        target,
+        database,
+      });
+      assert.equal(calls.length, count);
+      assert.equal(
+        await readFile(join(c.state, 'database', 'sentinel'), 'utf8'),
+        'original database must survive',
+      );
+      assert.equal(await readFile(join(database, 'PG_VERSION'), 'utf8'), '19');
+    },
+  );
+});
+
+test('prepared target inspection refuses malformed or foreign receipt authority', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  for (const mutation of [
+    'attempt',
+    'binding',
+    'profile',
+    'target',
+    'database',
+    'validation',
+    'extra',
+  ]) {
+    await preparedTargetFixture(t, async ({ c, receipt }) => {
+      const changed = structuredClone(receipt);
+      if (mutation === 'attempt') changed.attemptId = '../outside';
+      if (mutation === 'binding') changed.binding.libraryId = '0'.repeat(12);
+      if (mutation === 'profile') changed.profileIdentity = '1:2';
+      if (mutation === 'target') changed.targetIdentity = '1:3';
+      if (mutation === 'database') changed.databaseIdentity = '1:4';
+      if (mutation === 'validation') changed.validation.canonical = false;
+      if (mutation === 'extra') changed.path = '/caller/selected/database';
+      await assert.rejects(
+        owner.readHostRestoreTarget(c, changed),
+        /host_restore_target_invalid/,
+      );
+    });
+  }
+});
+
+test('prepared target inspection refuses changed on-disk evidence, a live target and replaced directories', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  for (const mutation of [
+    'result',
+    'intent',
+    'version',
+    'pid',
+    'link',
+    'hardlink',
+    'replace',
+  ]) {
+    await preparedTargetFixture(t, async ({ c, receipt, target, database }) => {
+      const result = join(target, 'restore-result.json');
+      if (mutation === 'result')
+        await writeFile(
+          result,
+          JSON.stringify({ ...receipt, targetIdentity: '1:3' }),
+          { mode: 0o600 },
+        );
+      if (mutation === 'intent') {
+        const intent = JSON.parse(
+          await readFile(join(target, 'restore-target.json'), 'utf8'),
+        );
+        await writeFile(
+          join(target, 'restore-target.json'),
+          JSON.stringify({
+            ...intent,
+            attemptId: '44444444-4444-4444-8444-444444444444',
+          }),
+          { mode: 0o600 },
+        );
+      }
+      if (mutation === 'version')
+        await writeFile(join(database, 'PG_VERSION'), '18', { mode: 0o600 });
+      if (mutation === 'pid')
+        await writeFile(join(database, 'postmaster.pid'), '1234', {
+          mode: 0o600,
+        });
+      if (mutation === 'link' || mutation === 'hardlink') {
+        const retained = join(target, 'retained-result.json');
+        await filesystem.rename(result, retained);
+        if (mutation === 'link') await symlink(retained, result);
+        else await link(retained, result);
+      }
+      if (mutation === 'replace') {
+        await filesystem.rename(database, join(target, 'retained-database'));
+        await mkdir(database, { mode: 0o700 });
+        await writeFile(join(database, 'PG_VERSION'), '19', { mode: 0o600 });
+      }
+      await assert.rejects(
+        owner.readHostRestoreTarget(c, receipt),
+        /host_restore_target_invalid/,
+      );
+      assert.equal(
+        await readFile(join(c.state, 'database', 'sentinel'), 'utf8'),
+        'original database must survive',
+      );
+    });
+  }
+});
