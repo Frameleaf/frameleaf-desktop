@@ -594,6 +594,11 @@ async fn prepare(
         private_directory(&data)?;
         private_directory(&data.join("models"))?;
         private_directory(&data.join("scratch"))?;
+        if !paths.bundle.exists()
+            && matches!(std::fs::symlink_metadata(data.join("runtimes/active.json")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err("runtime_pack_unavailable".into());
+        }
         let store = open_runtime_store(&data.join("runtimes"))?;
         let installed = match store.load_active()? {
             Some(value) => value,

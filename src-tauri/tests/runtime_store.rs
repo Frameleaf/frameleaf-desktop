@@ -1,3 +1,4 @@
+mod common;
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::runtime_store::RuntimeStore;
 use serde_json::json;
@@ -30,7 +31,13 @@ fn installs_independent_verified_bytes_and_refuses_rollback_or_active_leases() {
     fs::create_dir(&candidate).unwrap();
     fs::write(candidate.join("python"), b"fixture").unwrap();
     let key = SigningKey::from_bytes(&[42; 32]);
-    let store = RuntimeStore::new(&fixture.0.join("store"), vec![key.verifying_key()], 1).unwrap();
+    let store = RuntimeStore::new(
+        &fixture.0.join("store"),
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
     assert!(store.load_active().unwrap().is_none());
     let raw = manifest(2);
     let signature = key.sign(&raw).to_bytes();
@@ -72,6 +79,32 @@ fn installs_independent_verified_bytes_and_refuses_rollback_or_active_leases() {
     assert!(fixture.0.join("store/releases").join(first).exists());
 }
 #[test]
+fn restoring_an_old_active_pointer_cannot_lower_the_historical_epoch() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let root = fixture.0.join("store");
+    let store =
+        RuntimeStore::new(&root, vec![key.verifying_key()], 1, common::authority()).unwrap();
+    let old = manifest(2);
+    store
+        .install_and_activate(&candidate, &old, &key.sign(&old).to_bytes())
+        .unwrap();
+    let old_pointer = fs::read(root.join("active.json")).unwrap();
+    let newer = manifest(3);
+    store
+        .install_and_activate(&candidate, &newer, &key.sign(&newer).to_bytes())
+        .unwrap();
+    fs::write(root.join("active.json"), old_pointer).unwrap();
+    assert!(
+        store.load_active().is_err(),
+        "restoring ordinary runtime metadata must not authorize a previously superseded runtime"
+    );
+}
+
+#[test]
 fn incomplete_staging_and_tampered_installed_payload_are_never_adopted() {
     let fixture = Fixture::new();
     let candidate = fixture.0.join("candidate");
@@ -79,7 +112,13 @@ fn incomplete_staging_and_tampered_installed_payload_are_never_adopted() {
     fs::write(candidate.join("python"), b"fixture").unwrap();
     let key = SigningKey::from_bytes(&[42; 32]);
     let store_root = fixture.0.join("store");
-    let store = RuntimeStore::new(&store_root, vec![key.verifying_key()], 1).unwrap();
+    let store = RuntimeStore::new(
+        &store_root,
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
     fs::create_dir(store_root.join(".staging-incomplete")).unwrap();
     assert!(store.load_active().unwrap().is_none());
     let raw = manifest(1);
@@ -107,7 +146,13 @@ fn epoch_cannot_be_reused_for_different_runtime_bytes() {
     fs::create_dir(&candidate).unwrap();
     fs::write(candidate.join("python"), b"fixture").unwrap();
     let key = SigningKey::from_bytes(&[42; 32]);
-    let store = RuntimeStore::new(&fixture.0.join("store"), vec![key.verifying_key()], 1).unwrap();
+    let store = RuntimeStore::new(
+        &fixture.0.join("store"),
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
     let raw = manifest(2);
     store
         .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
@@ -135,8 +180,13 @@ fn installed_private_cpu_pack_runs_production_qualification_and_inference() {
     let workspace = Fixture::new();
     let key = SigningKey::from_bytes(&[42; 32]);
     // This fixture-only trust key never enters application release policy.
-    let store =
-        RuntimeStore::new(&workspace.0.join("store"), vec![key.verifying_key()], 1).unwrap();
+    let store = RuntimeStore::new(
+        &workspace.0.join("store"),
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
     store
         .install_and_activate(&pack.join("payload"), &raw, &key.sign(&raw).to_bytes())
         .unwrap();
@@ -258,7 +308,13 @@ fn attestation_preserves_signed_bytes_and_rechecks_installed_release() {
     fs::write(candidate.join("python"), b"fixture").unwrap();
     let key = SigningKey::from_bytes(&[42; 32]);
     let store_root = fixture.0.join("store");
-    let store = RuntimeStore::new(&store_root, vec![key.verifying_key()], 1).unwrap();
+    let store = RuntimeStore::new(
+        &store_root,
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
     let raw = manifest(2);
     let signature = key.sign(&raw).to_bytes();
     store
@@ -322,4 +378,262 @@ fn factory_attestation_exports_exact_installed_release() {
         "PASS: exact installed factory runtime attestation exported, {} bytes",
         envelope.len()
     );
+}
+
+#[test]
+fn replaced_credential_identity_cannot_reauthorize_an_open_store() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let store = RuntimeStore::new(
+        &fixture.0.join("store"),
+        vec![key.verifying_key()],
+        1,
+        epochs.clone(),
+    )
+    .unwrap();
+    let raw = manifest(2);
+    store
+        .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+        .unwrap();
+    *epochs.id.lock().unwrap() = Uuid::new_v4().to_string();
+    assert!(
+        store.load_active().is_err(),
+        "a recreated credential must not adopt an already-open store"
+    );
+}
+
+#[test]
+fn historical_floor_survives_restart_deleted_pointer_and_another_root() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let root = fixture.0.join("store");
+    let store = RuntimeStore::new(&root, vec![key.verifying_key()], 1, epochs.clone()).unwrap();
+    let raw = manifest(3);
+    store
+        .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+        .unwrap();
+    fs::remove_file(root.join("active.json")).unwrap();
+    drop(store);
+    let restarted = RuntimeStore::new(&root, vec![key.verifying_key()], 1, epochs.clone()).unwrap();
+    let other = RuntimeStore::new(
+        &fixture.0.join("other"),
+        vec![key.verifying_key()],
+        1,
+        epochs,
+    )
+    .unwrap();
+    let old = manifest(2);
+    for store in [&restarted, &other] {
+        assert_eq!(
+            store
+                .install_and_activate(&candidate, &old, &key.sign(&old).to_bytes())
+                .unwrap_err(),
+            "runtime_epoch_rollback"
+        );
+        store
+            .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+            .unwrap();
+    }
+}
+#[test]
+fn failed_credential_write_retains_old_pointer_but_failed_publish_retains_new_floor() {
+    use std::sync::atomic::Ordering;
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let root = fixture.0.join("store");
+    let store = RuntimeStore::new(&root, vec![key.verifying_key()], 1, epochs.clone()).unwrap();
+    let old = manifest(2);
+    store
+        .install_and_activate(&candidate, &old, &key.sign(&old).to_bytes())
+        .unwrap();
+    let pointer = fs::read(root.join("active.json")).unwrap();
+    let newer = manifest(3);
+    epochs.fail_persist.store(true, Ordering::Release);
+    assert!(store
+        .install_and_activate(&candidate, &newer, &key.sign(&newer).to_bytes())
+        .is_err());
+    assert_eq!(fs::read(root.join("active.json")).unwrap(), pointer);
+    assert!(store.load_active().unwrap().is_some());
+    epochs.fail_persist.store(false, Ordering::Release);
+    epochs.fail_publish.store(true, Ordering::Release);
+    assert!(store
+        .install_and_activate(&candidate, &newer, &key.sign(&newer).to_bytes())
+        .is_err());
+    assert_eq!(fs::read(root.join("active.json")).unwrap(), pointer);
+    assert!(store.load_active().is_err());
+    epochs.fail_publish.store(false, Ordering::Release);
+    store
+        .install_and_activate(&candidate, &newer, &key.sign(&newer).to_bytes())
+        .unwrap();
+    assert!(store.load_active().unwrap().is_some());
+    epochs.unavailable.store(true, Ordering::Release);
+    assert!(store.load_active().is_err());
+    assert!(RuntimeStore::new(&root, vec![key.verifying_key()], 1, epochs).is_err());
+}
+#[test]
+fn missing_or_replaced_store_binding_requires_recovery_without_replacing_state() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let root = fixture.0.join("store");
+    let store = RuntimeStore::new(&root, vec![key.verifying_key()], 1, epochs.clone()).unwrap();
+    let raw = manifest(3);
+    store
+        .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+        .unwrap();
+    drop(store);
+    let pointer = fs::read(root.join("active.json")).unwrap();
+    let other_identity = common::authority();
+    assert!(RuntimeStore::new(&root, vec![key.verifying_key()], 1, other_identity).is_err());
+    fs::remove_file(root.join("epoch-authority.json")).unwrap();
+    assert!(RuntimeStore::new(&root, vec![key.verifying_key()], 1, epochs).is_err());
+    assert_eq!(fs::read(root.join("active.json")).unwrap(), pointer);
+}
+#[test]
+fn provider_scopes_keep_manifest_identity_and_epochs_separate_across_roots() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let cpu = manifest(2);
+    for (index, provider) in ["CPUExecutionProvider", "CUDAExecutionProvider"]
+        .into_iter()
+        .enumerate()
+    {
+        let store = RuntimeStore::new(
+            &fixture.0.join(format!("store-{index}")),
+            vec![key.verifying_key()],
+            1,
+            epochs.clone(),
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&cpu).unwrap();
+        value["provider"] = json!(provider);
+        let raw = serde_json::to_vec(&value).unwrap();
+        store
+            .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+            .unwrap();
+    }
+    let other = RuntimeStore::new(
+        &fixture.0.join("other"),
+        vec![key.verifying_key()],
+        1,
+        epochs,
+    )
+    .unwrap();
+    let mut changed: serde_json::Value = serde_json::from_slice(&cpu).unwrap();
+    changed["sourceRevision"] = json!("b".repeat(40));
+    let raw = serde_json::to_vec(&changed).unwrap();
+    assert_eq!(
+        other
+            .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+            .unwrap_err(),
+        "runtime_epoch_reused"
+    );
+}
+
+#[test]
+fn newer_gpu_epoch_also_prevents_older_cpu_runtime_from_another_root() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let gpu = RuntimeStore::new(
+        &fixture.0.join("gpu"),
+        vec![key.verifying_key()],
+        1,
+        epochs.clone(),
+    )
+    .unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&manifest(3)).unwrap();
+    value["provider"] = json!("CUDAExecutionProvider");
+    let raw = serde_json::to_vec(&value).unwrap();
+    gpu.install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+        .unwrap();
+    let cpu =
+        RuntimeStore::new(&fixture.0.join("cpu"), vec![key.verifying_key()], 1, epochs).unwrap();
+    let old = manifest(2);
+    assert_eq!(
+        cpu.install_and_activate(&candidate, &old, &key.sign(&old).to_bytes())
+            .err()
+            .as_deref(),
+        Some("runtime_epoch_rollback")
+    );
+}
+
+#[test]
+fn retained_runtime_cannot_start_or_qualify_after_another_root_advances() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let epochs = common::authority();
+    let first = RuntimeStore::new(
+        &fixture.0.join("first"),
+        vec![key.verifying_key()],
+        1,
+        epochs.clone(),
+    )
+    .unwrap();
+    let old = manifest(2);
+    first
+        .install_and_activate(&candidate, &old, &key.sign(&old).to_bytes())
+        .unwrap();
+    let retained = first.load_active().unwrap().unwrap();
+    let second = RuntimeStore::new(
+        &fixture.0.join("second"),
+        vec![key.verifying_key()],
+        1,
+        epochs,
+    )
+    .unwrap();
+    let newer = manifest(3);
+    second
+        .install_and_activate(&candidate, &newer, &key.sign(&newer).to_bytes())
+        .unwrap();
+    let cache = fixture.0.join("unused-cache");
+    let work = fixture.0.join("unused-work");
+    assert_eq!(
+        retained
+            .start_sidecar(&cache, &work, 19998)
+            .err()
+            .as_deref(),
+        Some("runtime_epoch_rollback")
+    );
+    assert_eq!(
+        retained
+            .start_bound_sidecar(&[], &cache, &work, 19998)
+            .err()
+            .as_deref(),
+        Some("runtime_epoch_rollback")
+    );
+    assert_eq!(
+        retained
+            .qualify(&cache, &work, b"", b"", &false.into())
+            .err()
+            .as_deref(),
+        Some("runtime_epoch_rollback")
+    );
+    assert!(!cache.exists());
+    assert!(!work.exists());
 }
