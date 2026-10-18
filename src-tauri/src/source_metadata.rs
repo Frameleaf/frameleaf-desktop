@@ -420,3 +420,64 @@ mod tests {
         assert_eq!(summary.not_ready, 1);
     }
 }
+
+#[cfg(all(test, windows))]
+mod directory_timestamp_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+    };
+
+    #[test]
+    fn pinned_directory_timestamp_changes_do_not_change_its_identity_but_file_changes_are_refused()
+    {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let base =
+            std::env::temp_dir().join(format!("frameleaf-directory-time-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let _cleanup = Cleanup(base.clone());
+        std::fs::write(base.join("photo.jpg"), b"synthetic metadata fixture").unwrap();
+        let directory = open_preview_root(&base).unwrap();
+        let before = directory.dir_metadata().unwrap();
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&base)
+            .unwrap();
+        let changed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        handle.set_modified(changed).unwrap();
+        assert_ne!(
+            before.modified().unwrap(),
+            directory.dir_metadata().unwrap().modified().unwrap()
+        );
+        let root_result = probe(&directory, Path::new("."), &before);
+
+        let file_before = directory.symlink_metadata("photo.jpg").unwrap();
+        let photo = std::fs::OpenOptions::new()
+            .write(true)
+            .open(base.join("photo.jpg"))
+            .unwrap();
+        photo.set_modified(changed).unwrap();
+        assert_ne!(
+            file_before.modified().unwrap(),
+            directory
+                .symlink_metadata("photo.jpg")
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        assert!(probe(&directory, Path::new("photo.jpg"), &file_before).is_err());
+        assert!(
+            root_result.is_ok(),
+            "pinned directory metadata: {root_result:?}"
+        );
+    }
+}
