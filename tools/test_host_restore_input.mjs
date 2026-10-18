@@ -472,3 +472,152 @@ test('prepared target inspection bounds a version stream that grows after the op
     }
   });
 });
+test('offline restore verification checks only the prepared cluster with the signed checksum tool', async (t) => {
+  assert.equal(typeof owner.verifyHostRestoreTarget, 'function');
+  for (const failure of [false, true]) {
+    await preparedTargetFixture(
+      t,
+      async ({ c, receipt, target, database, calls }) => {
+        c.entryPoints.pgChecksums =
+          'bin/pg_checksums' + (process.platform === 'win32' ? '.exe' : '');
+        const priorCalls = calls.length;
+        const seen = [];
+        const probe = t.mock.method(
+          subprocess,
+          'spawn',
+          (file, args, options) => {
+            seen.push({ file, args, options });
+            const child = new EventEmitter();
+            Object.assign(child, {
+              pid: 8999,
+              exitCode: null,
+              signalCode: null,
+            });
+            child.kill = () => {
+              child.exitCode = 1;
+              child.emit('close', 1, null);
+              return true;
+            };
+            queueMicrotask(() => {
+              child.exitCode = failure ? 1 : 0;
+              child.emit('close', child.exitCode, null);
+            });
+            return child;
+          },
+        );
+        syncBuiltinESMExports();
+        try {
+          const work = owner.verifyHostRestoreTarget(
+            c,
+            receipt,
+            new Promise(() => {}),
+          );
+          if (failure)
+            await assert.rejects(work, /host_restore_offline_invalid/);
+          else
+            assert.deepEqual(await work, {
+              receipt,
+              target,
+              database,
+              offlineChecksums: true,
+            });
+          assert.equal(seen.length, 1);
+          assert.equal(
+            seen[0].file,
+            join(c.runtime, c.entryPoints.pgChecksums),
+          );
+          assert.deepEqual(seen[0].args, ['--check', '--pgdata', database]);
+          assert.equal(seen[0].options.stdio, 'ignore');
+          assert.ok(!JSON.stringify(seen[0].args).includes(c.password));
+          assert.equal(calls.length, priorCalls);
+          assert.equal(
+            await readFile(join(c.state, 'database', 'sentinel'), 'utf8'),
+            'original database must survive',
+          );
+        } finally {
+          probe.mock.restore();
+          syncBuiltinESMExports();
+        }
+      },
+    );
+  }
+});
+
+test('offline restore verification refuses cancellation, unsafe cluster contents and changed target evidence', async (t) => {
+  assert.equal(typeof owner.verifyHostRestoreTarget, 'function');
+  for (const mutation of [
+    'cancel-before',
+    'cancel-during',
+    'hardlink',
+    'directory-link',
+    'changed',
+    'tool-path',
+  ]) {
+    await preparedTargetFixture(t, async ({ c, receipt, target, database }) => {
+      c.entryPoints.pgChecksums =
+        'bin/pg_checksums' + (process.platform === 'win32' ? '.exe' : '');
+      let stop;
+      const stopping = new Promise((resolve) => {
+        stop = resolve;
+      });
+      if (mutation === 'cancel-before') stop();
+      if (mutation === 'tool-path') c.entryPoints.pgChecksums = '../outside';
+      if (mutation === 'hardlink')
+        await link(
+          join(database, 'PG_VERSION'),
+          join(database, 'linked-version'),
+        );
+      if (mutation === 'directory-link')
+        await symlink(
+          c.state,
+          join(database, 'outside'),
+          process.platform === 'win32' ? 'junction' : 'dir',
+        );
+      let starts = 0,
+        kills = 0;
+      const probe = t.mock.method(subprocess, 'spawn', () => {
+        starts++;
+        const child = new EventEmitter();
+        Object.assign(child, { pid: 8999, exitCode: null, signalCode: null });
+        child.kill = () => {
+          kills++;
+          child.exitCode = 1;
+          child.emit('close', 1, null);
+          return true;
+        };
+        queueMicrotask(async () => {
+          if (mutation === 'cancel-during') {
+            stop();
+            return;
+          }
+          if (mutation === 'changed')
+            await writeFile(join(target, 'restore-result.json'), '{}', {
+              mode: 0o600,
+            });
+          child.exitCode = 0;
+          child.emit('close', 0, null);
+        });
+        return child;
+      });
+      syncBuiltinESMExports();
+      try {
+        await assert.rejects(
+          owner.verifyHostRestoreTarget(c, receipt, stopping),
+          /host_restore_offline_invalid|host_restore_cancelled/,
+        );
+        assert.equal(
+          starts,
+          ['cancel-during', 'changed'].includes(mutation) ? 1 : 0,
+        );
+        if (mutation === 'cancel-during') assert.ok(kills > 0);
+        assert.equal(
+          await readFile(join(c.state, 'database', 'sentinel'), 'utf8'),
+          'original database must survive',
+        );
+      } finally {
+        probe.mock.restore();
+        syncBuiltinESMExports();
+      }
+    });
+  }
+});
