@@ -61,10 +61,10 @@ file() { [ -f "$1" ] || exit 65; protected "$1"; [ "$(/usr/bin/stat -c %h -- "$1
     retained += 'for path in / /opt /opt/frameleaf /opt/frameleaf/Runtimes ' + runtime + '; do directory "$path"; done\n'
     retained += 'file ' + receipt + '\nfile ' + fence + '\n[ "$(/usr/bin/stat -c %s -- ' + fence + ')" = 0 ] || exit 65\n/bin/rm -- ' + receipt + '\nfi\n'
     runtime_hooks = {
-        'preinst': header + 'case "${1:-}" in install|upgrade) ;; *) exit 64 ;; esac\n' + verify + 'if [ -e ' + runtime + ' ] || [ -L ' + runtime + ' ]; then\n' + invoke + ' --prepare-repair' + ids + 'fi\n' + invoke + ' --prepare-install' + ids,
+        'preinst': header + 'case "${1:-}" in install|upgrade) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --prepare-linux-package' + ids,
         'postinst': header + 'case "${1:-}" in configure|abort-upgrade|abort-remove|abort-deconfigure) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --finalize-install' + ids,
         # A failed old prerm must never become permission to unpack over live code.
-        'prerm': header + 'case "${1:-}" in remove|upgrade|deconfigure) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --prepare-repair' + ids,
+        'prerm': header + 'case "${1:-}" in remove|upgrade|deconfigure) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --prepare-linux-package' + ids,
         'postrm': header + 'case "${1:-}" in remove|purge|upgrade) ;; failed-upgrade|abort-install|abort-upgrade) exit 0 ;; *) exit 64 ;; esac\n' + retained,
     }
     return {'bootstrap': bootstrap_hooks, 'runtime': runtime_hooks}

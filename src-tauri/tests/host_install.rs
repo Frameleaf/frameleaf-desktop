@@ -11,6 +11,7 @@ fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
         "--finalize-install",
         "--prepare-maintenance",
         "--prepare-repair",
+        "--prepare-linux-package",
     ] {
         for ids in [vec![], vec!["a".repeat(64), "b".repeat(64)]] {
             let output = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"))
@@ -23,7 +24,9 @@ fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
             let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             let expected = if ids.is_empty() {
                 "host_control_arguments_invalid"
-            } else if cfg!(any(target_os = "macos", target_os = "linux")) {
+            } else if cfg!(target_os = "linux")
+                || (cfg!(target_os = "macos") && phase != "--prepare-linux-package")
+            {
                 "host_install_root_required"
             } else {
                 "host_install_platform_unsupported"
