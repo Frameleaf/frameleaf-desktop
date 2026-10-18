@@ -26,6 +26,17 @@ fn stable_volume_root(path: &str) -> Option<&str> {
     }
     Some(&path[..root_end])
 }
+pub(crate) fn filesystem_components(path: &str) -> Option<Vec<&str>> {
+    let root = stable_volume_root(path)?;
+    let mut paths = vec![root];
+    if path.len() > root.len() {
+        for (index, _) in path[root.len()..].match_indices('\\') {
+            paths.push(&path[..root.len() + index]);
+        }
+        paths.push(path);
+    }
+    Some(paths)
+}
 fn sid_valid(sid: &[u8]) -> bool {
     sid.len() >= 8 && sid[0] == 1 && sid[1] <= 15 && sid.len() == 8 + 4 * usize::from(sid[1])
 }
@@ -95,8 +106,8 @@ mod native {
             DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
         },
         Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            READ_CONTROL,
+            GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, READ_CONTROL, VOLUME_NAME_NT,
         },
     };
     const ERROR: &str = "native_manager_unprotected";
@@ -186,20 +197,48 @@ mod native {
         }
         Ok(safe_acl(&owner, acl, trusted, false))
     }
+    /// Resolves one opened code object; callers must verify and use only the returned spelling.
+    pub(crate) fn stable_path(path: &Path) -> Result<PathBuf, String> {
+        if !path.is_absolute() {
+            return Err(ERROR.into());
+        }
+        let file = OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .share_mode(3)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| ERROR)?;
+        let meta = file.metadata().map_err(|_| ERROR)?;
+        if meta.file_attributes() & 0x400 != 0 || (!meta.is_file() && !meta.is_dir()) {
+            return Err(ERROR.into());
+        }
+        let mut buffer = vec![0u16; 32768];
+        let size = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                VOLUME_NAME_NT,
+            )
+        } as usize;
+        if size == 0 || size >= buffer.len() {
+            return Err(ERROR.into());
+        }
+        let nt = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
+        let value = format!(r"\\?\GLOBALROOT{nt}");
+        stable_volume_root(&value).ok_or(ERROR)?;
+        Ok(PathBuf::from(value))
+    }
     pub(crate) fn protect(
         path: &Path,
         checked: &mut BTreeSet<std::path::PathBuf>,
     ) -> Result<(), String> {
         let text = path.to_str().ok_or(ERROR)?;
-        let volume_root = stable_volume_root(text).ok_or(ERROR)?;
-        let mut current = PathBuf::from(volume_root);
-        let mut pending = vec![current.clone()];
-        if text.len() > volume_root.len() {
-            for part in text[volume_root.len()..].split('\\') {
-                current.push(part);
-                pending.push(current.clone());
-            }
-        }
+        let pending: Vec<_> = filesystem_components(text)
+            .ok_or(ERROR)?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         // The device name is valid only for this operation, never a durable installation identity.
         let start = pending
             .iter()
@@ -228,31 +267,131 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
-        fn stable_file_path(file: &File) -> PathBuf {
-            use windows_sys::Win32::Storage::FileSystem::{
-                GetFinalPathNameByHandleW, VOLUME_NAME_NT,
-            };
-            let mut buffer = vec![0u16; 32768];
-            let size = unsafe {
-                GetFinalPathNameByHandleW(
-                    file.as_raw_handle(),
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                    VOLUME_NAME_NT,
-                )
-            } as usize;
-            assert!(size > 0 && size < buffer.len());
-            let nt = String::from_utf16(&buffer[..size]).unwrap();
-            let stable = format!(r"\\?\GLOBALROOT{nt}");
-            assert!(stable_volume_root(&stable).is_some());
-            PathBuf::from(stable)
+        struct DriveAlias {
+            name: Vec<u16>,
+            targets: Vec<Vec<u16>>,
+        }
+        impl DriveAlias {
+            fn create(target: &str) -> Self {
+                let name: Vec<u16> = format!("FrameleafNativeTest-{}\0", uuid::Uuid::new_v4())
+                    .encode_utf16()
+                    .collect();
+                let mut alias = Self {
+                    name,
+                    targets: vec![],
+                };
+                alias.redirect(target);
+                alias
+            }
+            fn path(&self) -> PathBuf {
+                let name = String::from_utf16(&self.name[..self.name.len() - 1]).unwrap();
+                PathBuf::from(format!(r"\\.\{name}\cmd.exe"))
+            }
+            fn redirect(&mut self, target: &str) {
+                use windows_sys::Win32::Storage::FileSystem::{
+                    DefineDosDeviceW, DDD_NO_BROADCAST_SYSTEM, DDD_RAW_TARGET_PATH,
+                };
+                let value: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+                assert_ne!(
+                    unsafe {
+                        DefineDosDeviceW(
+                            DDD_RAW_TARGET_PATH | DDD_NO_BROADCAST_SYSTEM,
+                            self.name.as_ptr(),
+                            value.as_ptr(),
+                        )
+                    },
+                    0
+                );
+                self.targets.push(value);
+            }
+            fn cleanup(&mut self) -> bool {
+                use windows_sys::Win32::Storage::FileSystem::{
+                    DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_NO_BROADCAST_SYSTEM,
+                    DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION,
+                };
+                while let Some(target) = self.targets.last() {
+                    if unsafe {
+                        DefineDosDeviceW(
+                            DDD_EXACT_MATCH_ON_REMOVE
+                                | DDD_REMOVE_DEFINITION
+                                | DDD_RAW_TARGET_PATH
+                                | DDD_NO_BROADCAST_SYSTEM,
+                            self.name.as_ptr(),
+                            target.as_ptr(),
+                        )
+                    } == 0
+                    {
+                        return false;
+                    }
+                    self.targets.pop();
+                }
+                true
+            }
+        }
+        impl Drop for DriveAlias {
+            fn drop(&mut self) {
+                let _ = self.cleanup();
+            }
+        }
+        #[test]
+        fn verified_kernel_code_is_hashed_and_spawned_after_its_dos_alias_is_rebound() {
+            use sha2::{Digest, Sha256};
+            let system_root = std::env::var_os("SystemRoot").unwrap();
+            let system = stable_path(&Path::new(&system_root).join("System32")).unwrap();
+            let scratch =
+                std::env::temp_dir().join(format!("frameleaf-drive-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).unwrap();
+            std::fs::write(
+                scratch.join("cmd.exe"),
+                b"synthetic replacement is never executed",
+            )
+            .unwrap();
+            let malicious = stable_path(&scratch).unwrap();
+            let mut alias = DriveAlias::create(
+                system
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix(r"\\?\GLOBALROOT")
+                    .unwrap(),
+            );
+            let requested = alias.path();
+            let code = stable_path(&requested).unwrap();
+            let mut checked = BTreeSet::new();
+            protect(&code, &mut checked).unwrap();
+            let original = Sha256::digest(std::fs::read(&code).unwrap());
+            alias.redirect(
+                malicious
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix(r"\\?\GLOBALROOT")
+                    .unwrap(),
+            );
+            assert_eq!(
+                std::fs::read(&requested).unwrap(),
+                b"synthetic replacement is never executed"
+            );
+            assert!(protect(&requested, &mut checked).is_err());
+            assert_eq!(Sha256::digest(std::fs::read(&code).unwrap()), original);
+            let output = std::process::Command::new(&code)
+                .args(["/d", "/c", "exit", "0"])
+                .env_clear()
+                .env("SystemRoot", &system_root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(alias.cleanup(), "owned DOS alias cleanup failed");
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+        #[test]
+        fn relative_code_path_never_uses_the_process_working_directory() {
+            assert!(stable_path(Path::new("relative-code")).is_err());
         }
         #[test]
         fn actual_windows_security_descriptor_refuses_user_writable_temp_file() {
             let path = std::env::temp_dir().join(format!("frameleaf-acl-{}", uuid::Uuid::new_v4()));
             std::fs::write(&path, b"synthetic").unwrap();
             let file = File::open(&path).unwrap();
-            let stable = stable_file_path(&file);
+            let stable = stable_path(&path).unwrap();
             let direct = descriptor(&file, false);
             drop(file);
             let result = protect(&stable, &mut BTreeSet::new());
@@ -265,14 +404,13 @@ mod native {
             let path =
                 Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32/notepad.exe");
             assert!(protect(&path, &mut BTreeSet::new()).is_err());
-            let file = File::open(&path).unwrap();
-            let stable = stable_file_path(&file);
+            let stable = stable_path(&path).unwrap();
             protect(&stable, &mut BTreeSet::new()).unwrap();
         }
     }
 }
 #[cfg(windows)]
-pub(super) use native::protect;
+pub(crate) use native::{protect, stable_path};
 
 #[cfg(test)]
 mod tests {
@@ -310,6 +448,28 @@ mod tests {
             "a/file",
         ] {
             assert_eq!(stable_volume_root(&format!("{root}{tail}")), None, "{tail}");
+        }
+    }
+    #[test]
+    fn filesystem_walk_starts_at_the_volume_not_the_object_manager_namespace() {
+        let root = r"\\?\GLOBALROOT\Device\HarddiskVolume12\";
+        let folder = format!("{root}Windows");
+        let file = format!("{folder}\\System32\\cmd.exe");
+        assert_eq!(filesystem_components(root), Some(vec![root]));
+        assert_eq!(
+            filesystem_components(&file),
+            Some(vec![
+                root,
+                folder.as_str(),
+                &file[..file.len() - 8],
+                file.as_str()
+            ])
+        );
+        for value in [
+            r"C:\Windows",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume12\..\outside",
+        ] {
+            assert!(filesystem_components(value).is_none());
         }
     }
     fn sid(parts: &[u32]) -> Vec<u8> {

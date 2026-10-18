@@ -177,6 +177,11 @@ impl VerifiedHostRuntime {
                 return Err("host_component_missing".into());
             }
         }
+        #[cfg(windows)]
+        let stable_root = crate::windows_protection::stable_path(root)
+            .map_err(|_| "host_runtime_path_unavailable")?;
+        #[cfg(windows)]
+        let root = stable_root.as_path();
         verify_files(root, &manifest.files)?;
         Ok(Self {
             root: root.into(),

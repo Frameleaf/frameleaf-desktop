@@ -92,6 +92,18 @@ pub(crate) fn absolute_directory(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("runtime_root_invalid".into());
     }
+    #[cfg(windows)]
+    if let Some(parts) = path
+        .to_str()
+        .and_then(crate::windows_protection::filesystem_components)
+    {
+        for part in parts {
+            if !no_link(Path::new(part))?.is_dir() {
+                return Err("runtime_root_invalid".into());
+            }
+        }
+        return Ok(());
+    }
     for ancestor in path.ancestors() {
         if !no_link(ancestor)?.is_dir() {
             return Err("runtime_root_invalid".into());

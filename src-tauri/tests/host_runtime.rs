@@ -115,11 +115,24 @@ fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
     let mut fixture = Fixture::new();
     let verified = fixture.verify().unwrap();
     let engine = verified.backup_engine().unwrap();
+    #[cfg(not(windows))]
     assert_eq!(engine.executable, fixture.0.join("backup/restic"));
+    #[cfg(windows)]
+    {
+        assert!(engine
+            .executable
+            .to_str()
+            .unwrap()
+            .starts_with(r"\\?\GLOBALROOT\Device\HarddiskVolume"));
+        assert_eq!(
+            fs::canonicalize(&engine.executable).unwrap(),
+            fixture.0.join("backup/restic")
+        );
+    }
     assert_eq!(engine.sha256, format!("{:x}", Sha256::digest(b"fixture")));
     assert_eq!(
         serde_json::to_value(&engine).unwrap(),
-        json!({"executable":fixture.0.join("backup/restic"),"sha256":engine.sha256})
+        json!({"executable":engine.executable,"sha256":engine.sha256})
     );
     fs::write(&engine.executable, b"changed").unwrap();
     assert_eq!(verified.backup_engine().unwrap().sha256, engine.sha256);
@@ -132,12 +145,15 @@ fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
     fixture.1["entryPoints"]["backupEngine"] = json!("backup/alternate");
     fixture.1["files"]["backup/alternate"] = fixture.1["files"]["backup/restic"].clone();
     assert_eq!(
-        fixture
-            .verify()
-            .unwrap()
-            .backup_engine()
-            .unwrap()
-            .executable,
+        fs::canonicalize(
+            fixture
+                .verify()
+                .unwrap()
+                .backup_engine()
+                .unwrap()
+                .executable
+        )
+        .unwrap(),
         fixture.0.join("backup/alternate")
     );
 }
