@@ -65,7 +65,11 @@ fn open(candidate: &Path, name: &str, initialize: bool) -> Result<File, String> 
     }
     let options = |create| {
         let mut value = OpenOptions::new();
-        value.read(true).write(create).create_new(create);
+        // Windows requires write access to flush an existing maintenance fence on retry.
+        value
+            .read(true)
+            .write(create || (initialize && name == FENCE))
+            .create_new(create);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
