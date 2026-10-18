@@ -591,10 +591,18 @@ records original/adapted hashes, and refuses system-interpreter fallback.
 Frameleaf-app source is unchanged. Windows uses the vendored executable instead;
 this Unix builder does not qualify it.
 
+`python tools/build_host_exiftool_windows.py --server C:/absolute/server-output --output C:/absolute/new-metadata-output`
+binds a qualified Windows x64 server to its complete vendored ExifTool 13.59.3
+executable and private Perl tree. It verifies the input inventory, approved
+vendor-module hash and versions, and required runtime/license files before
+removing the resolver's global executable fallback. The Windows server candidate
+workflow pins the draft shared migration-loader fix by exact commit; that pin
+does not imply the server change has merged.
+
 `/absolute/path/to/private-node tools/qualify_host_exiftool.mjs /absolute/path/to/exiftool-build-output`
 checks the actual packaged `MetadataRepository` with synthetic JPEGs: Unicode
 metadata read/write, location removal, original and decoded-pixel preservation,
-and refusal when private Perl is missing. This passed on macOS ARM64 with Perl
+and refusal when the private Perl or Windows executable is missing. This passed on macOS ARM64 with Perl
 5.44.0 and exiftool-vendored 39.0.1. Component receipts remain non-redistributable;
 complete signed-host assembly and installed three-platform acceptance are pending.
 
