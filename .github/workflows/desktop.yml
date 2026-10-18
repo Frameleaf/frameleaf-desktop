@@ -39,6 +39,9 @@ jobs:
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Qualify privileged Linux package admission in disposable runner
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        run: sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT python3 tools/qualify_linux_package_admission.py src-tauri/target/debug/frameleaf-native-host
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build unsigned shell smoke-test candidate
         run: npm run desktop:build:shell -- --debug
