@@ -1,5 +1,6 @@
 //! Selection stays fenced until independent finalization admits writers.
 use super::*;
+mod safety;
 use crate::host_runtime::{CheckpointReceipt, PreparedRestore, VerifiedRestore};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -280,6 +281,7 @@ impl Owner {
         if previous.generation != proof.generation {
             return Err("host_restore_proof_invalid".into());
         }
+        safety.verify_readback(&self.root, &proof.prepared)?;
         let existing = read_record(&self.root, ACTIVATION)?;
         if existing.is_some() || previous.restore_pending {
             proof.prepared.validate_reference(&proof.reference)?;
@@ -452,8 +454,32 @@ mod tests {
             proof
         }
         fn safety(&self) -> SafetySnapshot {
-            serde_json::from_value(serde_json::json!({"snapshotId":"1".repeat(64),"recoverySha256":"2".repeat(64),
-                "checkpoint":{"schemaVersion":1,"operationId":OP,"manifestSha256":"b".repeat(64),"sourceRevision":"d".repeat(40),"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"3".repeat(64)}}})).unwrap()
+            let dump = b"PGDMP safety database";
+            let checkpoint = serde_json::json!({"schemaVersion":1,"operationId":OP,"manifestSha256":"b".repeat(64),"sourceRevision":"d".repeat(40),"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":dump.len(),"sha256":format!("{:x}",Sha256::digest(dump))}});
+            let mut envelope = checkpoint.clone();
+            envelope["protocolVersion"] = serde_json::json!(1);
+            envelope["state"] = serde_json::json!("checkpoint");
+            let recovery = serde_json::json!({"schemaVersion":1,"runtime":"native","mediaIncluded":false,"databaseFormat":"frameleaf-canonical","libraryId":"e".repeat(12),"createdAt":1,"installation":{"id":ID,"name":"Fixture","release":"frameleaf-v3.0.0-1"},"checkpoint":envelope});
+            let bytes = serde_json::to_vec(&recovery).unwrap();
+            let parent = self.path.join("restore-safety");
+            let target = parent.join(OP);
+            crate::runtime_store::private_directory(&parent).unwrap();
+            crate::runtime_store::private_directory(&target).unwrap();
+            fs::write(target.join("database.dump"), dump).unwrap();
+            fs::write(
+                target.join("recovery.json"),
+                [bytes.as_slice(), b"\n"].concat(),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for name in ["database.dump", "recovery.json"] {
+                    fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+            }
+            serde_json::from_value(serde_json::json!({"snapshotId":"1".repeat(64),"recoverySha256":format!("{:x}",Sha256::digest(&bytes)),"checkpoint":checkpoint})).unwrap()
         }
     }
     impl Drop for Fixture {
@@ -872,5 +898,132 @@ mod tests {
             assert_eq!(fs::read(f.path.join(NAME)).unwrap(), marker);
             drop(held_lease);
         }
+    }
+    #[test]
+    fn missing_safety_readback_cannot_publish_selection() {
+        let mut f = Fixture::new();
+        let proof = f.proof();
+        let safety = f.safety();
+        fs::remove_dir_all(f.path.join("restore-safety")).unwrap();
+        assert!(f.owner.select_restore(proof, safety).is_err());
+        assert!(!f.path.join(ACTIVATION).exists());
+    }
+    #[test]
+    fn corrupt_foreign_linked_or_oversized_safety_artifacts_cannot_publish_selection() {
+        for mutation in [
+            "dump",
+            "json",
+            "large-json",
+            "inventory",
+            "hardlink",
+            "library",
+            "checkpoint",
+            "header",
+        ] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let mut safety = f.safety();
+            let artifact = f.path.join("restore-safety").join(OP);
+            match mutation {
+                "dump" => {
+                    let mut bytes = fs::read(artifact.join("database.dump")).unwrap();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    fs::write(artifact.join("database.dump"), bytes).unwrap();
+                }
+                "json" => fs::write(artifact.join("recovery.json"), b"{}").unwrap(),
+                "large-json" => {
+                    fs::write(artifact.join("recovery.json"), vec![b' '; 4097]).unwrap()
+                }
+                "inventory" => fs::write(artifact.join("foreign"), b"preserve").unwrap(),
+                "hardlink" => {
+                    fs::hard_link(artifact.join("database.dump"), f.path.join("linked.dump"))
+                        .unwrap()
+                }
+                _ => {
+                    let mut recovery: serde_json::Value =
+                        serde_json::from_slice(&fs::read(artifact.join("recovery.json")).unwrap())
+                            .unwrap();
+                    if mutation == "library" {
+                        recovery["libraryId"] = serde_json::json!("0".repeat(12));
+                    } else if mutation == "checkpoint" {
+                        recovery["checkpoint"]["sourceRevision"] =
+                            serde_json::json!("0".repeat(40));
+                    } else {
+                        let mut dump = fs::read(artifact.join("database.dump")).unwrap();
+                        dump[0] = b'X';
+                        fs::write(artifact.join("database.dump"), &dump).unwrap();
+                        recovery["checkpoint"]["dump"]["sha256"] =
+                            serde_json::json!(format!("{:x}", Sha256::digest(&dump)));
+                        let mut checkpoint = serde_json::to_value(&safety.checkpoint).unwrap();
+                        checkpoint["dump"] = recovery["checkpoint"]["dump"].clone();
+                        safety.checkpoint = serde_json::from_value(checkpoint).unwrap();
+                    }
+                    let bytes = serde_json::to_vec(&recovery).unwrap();
+                    safety.recovery_sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    fs::write(artifact.join("recovery.json"), bytes).unwrap();
+                }
+            }
+            let before = f.owner.read().unwrap();
+            assert!(f.owner.select_restore(proof, safety).is_err(), "{mutation}");
+            assert!(!f.path.join(ACTIVATION).exists(), "{mutation}");
+            assert_eq!(f.owner.read().unwrap(), before);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn linked_or_nonprivate_safety_paths_never_follow_originals_or_select_a_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for mutation in ["root-link", "file-link", "root-mode", "file-mode"] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let safety = f.safety();
+            let root = f.path.join("restore-safety");
+            let artifact = root.join(OP);
+            match mutation {
+                "root-link" => {
+                    fs::rename(&root, f.path.join("retained-safety")).unwrap();
+                    symlink(f.path.join("retained-safety"), &root).unwrap();
+                }
+                "file-link" => {
+                    fs::rename(artifact.join("database.dump"), f.path.join("saved.dump")).unwrap();
+                    symlink(f.path.join("saved.dump"), artifact.join("database.dump")).unwrap();
+                }
+                "root-mode" => {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap()
+                }
+                _ => fs::set_permissions(
+                    artifact.join("database.dump"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap(),
+            }
+            assert!(f.owner.select_restore(proof, safety).is_err(), "{mutation}");
+            assert!(!f.path.join(ACTIVATION).exists());
+        }
+    }
+    #[test]
+    fn safety_reader_accepts_actual_manager_serialization_and_rejects_sorted_key_replacement() {
+        let mut f = Fixture::new();
+        let proof = f.proof();
+        let mut safety = f.safety();
+        // Generated by Manager createNativeRecovery + digest, including its original JSON field order.
+        let bytes = include_bytes!("activation/manager-safety-recovery.fixture.json");
+        safety.recovery_sha256 =
+            "caed8986d0779a8c2aed955d68d2767055e6c577acfb74831da8915c1ba124fd".into();
+        let path = f.path.join("restore-safety").join(OP).join("recovery.json");
+        fs::write(&path, bytes).unwrap();
+        f.owner.select_restore(proof, safety.clone()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        f.owner
+            .activate(
+                ID,
+                &"b".repeat(64),
+                crate::host_runtime::HostMode::RestorePrepare,
+            )
+            .unwrap();
+        let fresh = f.proof();
+        assert!(f.owner.select_restore(fresh, safety).is_err());
+        assert!(f.path.join(ACTIVATION).exists());
     }
 }

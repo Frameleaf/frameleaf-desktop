@@ -82,10 +82,13 @@ pub(crate) fn options(write: bool) -> OpenOptions {
     options
 }
 pub(crate) fn valid_file(file: &File) -> Result<(), String> {
+    valid_sized_file(file, 4096)
+}
+fn valid_sized_file(file: &File, maximum: u64) -> Result<(), String> {
     let meta = file
         .metadata()
         .map_err(|_| "host_controller_state_invalid")?;
-    if !meta.is_file() || meta.len() > 4096 {
+    if !meta.is_file() || meta.len() > maximum {
         return Err("host_controller_state_invalid".into());
     }
     #[cfg(unix)]
