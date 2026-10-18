@@ -162,6 +162,12 @@ fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String,
             .map_err(|_| "source_identity_unavailable")?;
         let meta = file.metadata().map_err(|_| "source_identity_unavailable")?;
         if !meta.is_file() || link(&meta) || stamp(&meta)? != stamp(expected)? {
+            #[cfg(test)]
+            eprintln!(
+                "source_identity/path_stamp expected={:?} opened={:?}",
+                stamp(expected),
+                stamp(&meta)
+            );
             return Err("source_item_changed".into());
         }
         opened_stamp(&file)
@@ -466,6 +472,11 @@ impl CopyApproval {
             .map_err(|_| "source_item_unavailable")?;
         let opened = source.metadata().map_err(|_| "source_item_unavailable")?;
         if !opened.is_file() || link(&opened) || opened_stamp(&source)? != source_stamp {
+            #[cfg(test)]
+            eprintln!(
+                "source_identity/stage_open expected={source_stamp} opened={:?}",
+                opened_stamp(&source)
+            );
             return Err("source_item_changed".into());
         }
         let id = stage_id.to_string();
@@ -815,6 +826,8 @@ fn unchanged(
                 .map_err(|_| "source_item_changed")?,
         )? != before
     {
+        #[cfg(test)]
+        eprintln!("source_identity/unchanged expected={before} opened={:?} named={:?} expected_bytes={expected} copied={copied}", opened_stamp(source), dir.symlink_metadata(relative).and_then(|meta| stamp(&meta).map_err(std::io::Error::other)));
         return Err("source_item_changed".into());
     }
     Ok(())
@@ -872,6 +885,37 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn fresh_windows_source_metadata_matches_opened_handles() {
+        for iteration in 0..64 {
+            let path = std::env::temp_dir().join(format!("frameleaf-fresh-{}", Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            let cleanup = Partial(Some(path.clone()));
+            fs::write(path.join("旅行.jpg"), b"abcdefghij").unwrap();
+            let dir = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
+            let root = dir.dir_metadata().unwrap();
+            crate::source_metadata::probe(&dir, Path::new("."), &root)
+                .unwrap_or_else(|code| panic!("iteration={iteration} root probe: {code}"));
+            let name = Path::new("旅行.jpg");
+            let before = dir.symlink_metadata(name).unwrap();
+            crate::source_metadata::probe(&dir, name, &before)
+                .unwrap_or_else(|code| panic!("iteration={iteration} file probe: {code}"));
+            let expected = path_stamp(&dir, name, &before)
+                .unwrap_or_else(|code| panic!("iteration={iteration} path stamp: {code}"));
+            let file = dir.open_with(name, &no_follow_options(false)).unwrap();
+            assert_eq!(
+                opened_stamp(&file).unwrap(),
+                expected,
+                "iteration={iteration}"
+            );
+            unchanged(&dir, name, &file, &expected, 10, 10)
+                .unwrap_or_else(|code| panic!("iteration={iteration} after read: {code}"));
+            drop(file);
+            drop(dir);
+            drop(cleanup);
+        }
+    }
     #[test]
     fn opened_source_identity_survives_reopen_and_distinguishes_another_file() {
         let path = std::env::temp_dir().join(format!("frameleaf-identity-{}", Uuid::new_v4()));
