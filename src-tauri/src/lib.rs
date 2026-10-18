@@ -9,6 +9,8 @@ pub mod host_runtime;
 mod host_setup;
 mod host_state;
 mod host_storage;
+#[cfg(test)]
+mod restore_activation;
 pub mod lifecycle;
 pub mod manager;
 mod manager_commands;
