@@ -123,6 +123,12 @@ jobs:
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib model_catalogue::tests::composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering -- --exact --nocapture
           if ($LASTEXITCODE) { throw 'Private shared model-cache composition failed' }
+      - name: Probe the captured filesystem Shell path without elevation
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_profile_elevation::tests::extended_filesystem_shell_path_launches_the_captured_child_without_elevation -- --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Captured filesystem Shell path qualification failed' }
       - name: Check Windows production and test code with strict Clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

@@ -239,6 +239,25 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn extended_filesystem_shell_path_launches_the_captured_child_without_elevation() {
+        let device =
+            crate::windows_protection::stable_path(&std::env::current_exe().unwrap()).unwrap();
+        let path = std::path::PathBuf::from(
+            crate::windows_protection::extended_filesystem_path(device.to_str().unwrap()).unwrap(),
+        );
+        let _pin = native::pin(&path).unwrap();
+        assert_eq!(
+            native::execute(
+                &path,
+                "--exact windows_profile_elevation::tests::shell_launch_child --ignored",
+                false,
+            )
+            .unwrap(),
+            73
+        );
+    }
+    #[cfg(windows)]
+    #[test]
     fn pinned_controller_refuses_concurrent_write_and_rename() {
         let root =
             std::env::temp_dir().join(format!("frameleaf-controller-pin-{}", uuid::Uuid::new_v4()));
