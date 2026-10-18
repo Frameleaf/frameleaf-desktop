@@ -608,6 +608,15 @@ complete signed-host assembly and installed three-platform acceptance are pendin
 
 ### Private native RAW engine
 
+The Windows authoring path uses MSYS2 UCRT64 GCC/Ninja to build the same pinned
+LibRaw, Lensfun and patched darktable sources. `windows-host-raw.yml` builds in
+private CI and records the installed toolchain package versions. Staging follows
+the transitive x64 PE imports, retains private DLLs, data and notices, rejects
+ambiguous or missing libraries and MSYS/Cygwin runtime dependencies, and tests
+startup after moving the original installation away. The toolchain is used only
+for authoring. Windows production RAW rendering and installed acceptance still
+require qualification; a successful component build is insufficient.
+
 `python3 tools/build_host_raw.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --dependency-prefix /opt/homebrew --output /absolute/path/to/new-raw-output`
 
 This macOS authoring builder checks the selected source's darktable, Lensfun,
@@ -870,3 +879,5 @@ Temporary native inspection and restore leases explicitly unlock on scope exit,
 as the controller journal lease already does. A descriptor duplicated by a
 concurrent fork must not keep a completed operation's lock alive. Active host
 ownership and package code leases keep their existing lifetime rules.
+
+The active Windows RAW workflow now pins both the engine builder and server consumer to public source `ee7e711a263f1fdfed14414f1af987c9209a6765`. Engine/patch contracts and the prior consumer sources remain unchanged. New Windows engine rendering and the complete host still require qualification; packaging tests do not establish installed acceptance.

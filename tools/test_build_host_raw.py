@@ -1,16 +1,128 @@
 import hashlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from build_host_raw import build, raw_contract, stage_raw
+from build_host_raw import build, raw_contract, stage_raw, use_pinned_windows_lensfun_database
 from build_runtime import BuildError
+from test_relocate_windows import pe
+
+
+UPSTREAM_WINDOWS_LENSFUN = '  # Add lensfun libraries\n  if(LensFun_FOUND)\n    set(LENSFUN_DB_GLOBAL "${MINGW_PATH}/../share/lensfun/version_1")\n    set(LENSFUN_DB_UPDATES "${MINGW_PATH}/../var/lib/lensfun-updates/version_1")\n    set(LENSFUN_DB "${LENSFUN_DB_GLOBAL}")\n    if(EXISTS "${LENSFUN_DB_UPDATES}")\n      file(READ "${LENSFUN_DB_GLOBAL}/timestamp.txt" LENSFUN_TS)\n      file(READ "${LENSFUN_DB_UPDATES}/timestamp.txt" LENSFUN_TS_UPDATE)\n      if(LENSFUN_TS LESS LENSFUN_TS_UPDATE)\n        set(LENSFUN_DB "${LENSFUN_DB_UPDATES}")\n      endif()\n    endif()\n    message(STATUS "Installing lensfun database from ${LENSFUN_DB}")\n    install(DIRECTORY\n        "${LENSFUN_DB}"\n        DESTINATION share/lensfun/\n        COMPONENT DTApplication)\n  endif(LensFun_FOUND)\n'
 
 
 class NativeRawContractTests(unittest.TestCase):
+    def test_windows_installs_only_its_source_pinned_lensfun_database(self):
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                prefix = root / "prefix"
+                database = prefix / "share/lensfun/version_1"
+                database.mkdir(parents=True)
+                (database / "timestamp.txt").write_text("source-pinned timestamp")
+                (database / "calibration.xml").write_text("source-pinned calibration")
+                macro = root / "windows-macros.cmake"
+                remainder = 'file(WRITE "${CMAKE_INSTALL_PREFIX}/other-runtime-data" "preserved")\n'
+                macro.write_bytes((UPSTREAM_WINDOWS_LENSFUN + remainder).replace("\n", newline).encode())
+                original_bytes = macro.read_bytes()
+                report = use_pinned_windows_lensfun_database(macro, prefix)
+                self.assertEqual(report["originalSha256"], hashlib.sha256(original_bytes).hexdigest())
+                self.assertEqual(report["adaptedSha256"], hashlib.sha256(macro.read_bytes()).hexdigest())
+                (root / "CMakeLists.txt").write_text(
+                    'cmake_minimum_required(VERSION 3.16)\nproject(fixture NONE)\n'
+                    'set(LensFun_FOUND TRUE)\nset(MINGW_PATH "${CMAKE_BINARY_DIR}/missing-toolchain/bin")\n'
+                    'include("${CMAKE_SOURCE_DIR}/windows-macros.cmake")\n')
+                for arguments in [
+                    ["cmake", "-S", str(root), "-B", str(root / "build"), "-DCMAKE_INSTALL_PREFIX=" + str(prefix)],
+                    ["cmake", "--install", str(root / "build")],
+                ]:
+                    subprocess.run(arguments, check=True, capture_output=True, text=True)
+                self.assertEqual((database / "calibration.xml").read_text(), "source-pinned calibration")
+                self.assertEqual((prefix / "other-runtime-data").read_text(), "preserved")
+                self.assertNotIn("LENSFUN_DB_UPDATES", macro.read_text())
+
+    def test_windows_lensfun_packaging_refuses_missing_data_or_changed_upstream(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            macro = root / "windows-macros.cmake"
+            macro.write_text(UPSTREAM_WINDOWS_LENSFUN)
+            with self.assertRaisesRegex(BuildError, "host_raw_lensfun_database_missing"):
+                use_pinned_windows_lensfun_database(macro, root / "prefix")
+            data = root / "prefix/share/lensfun/version_1"
+            data.mkdir(parents=True)
+            (data / "timestamp.txt").write_text("pinned")
+            (data / "calibration.xml").write_text("pinned")
+            changed = UPSTREAM_WINDOWS_LENSFUN.replace("# Add lensfun libraries", "# Changed upstream")
+            macro.write_text(changed)
+            with self.assertRaisesRegex(BuildError, "host_raw_lensfun_packaging_changed"):
+                use_pinned_windows_lensfun_database(macro, root / "prefix")
+            self.assertEqual(macro.read_text(), changed)
+
+    def test_windows_stages_patched_pe_plugins_data_and_private_licenses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            work, output, dependencies = root / 'work', root / 'output', root / 'ucrt64'
+            prefix = work / 'prefix'
+            for name, marker in {
+                'bin/darktable-cli.exe': b'', 'bin/dcraw_emu.exe': b'',
+                'lib/darktable/plugins/liblens.dll': b'frameleaf-lens-calibration:',
+                'lib/darktable/plugins/librotatepixels.dll': b'frameleaf-native-mask-geometry:rotatepixels:1',
+            }.items():
+                path = prefix / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(pe() + marker)
+            debug = prefix / 'lib/darktable/views/.debug/libslideshow.dll.dbg'
+            debug.parent.mkdir(parents=True)
+            debug.write_bytes(pe())
+            for name in ['darktable', 'lensfun']:
+                path = prefix / 'share' / name
+                path.mkdir(parents=True)
+                (path / 'data').write_text('fixture')
+            for name in ['darktable/LICENSE', 'darktable/src/external/rawspeed/LICENSE',
+                         'darktable/src/external/whereami/LICENSE.MIT', 'darktable/src/external/OpenCL/LICENSE',
+                         'lensfun/docs/lgpl-3.0.txt', 'lensfun/docs/cc-by-sa-3.0.txt',
+                         'libraw/LICENSE.LGPL', 'libraw/LICENSE.CDDL', 'lensfun/include/regex/regex.h']:
+                path = work / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('fixture notice')
+            (dependencies / 'bin').mkdir(parents=True)
+            (dependencies / 'share/licenses/fixture').mkdir(parents=True)
+            (dependencies / 'share/licenses/fixture/LICENSE').write_text('private dependency notice')
+            output.mkdir()
+
+            def command(arguments, runtime_root=None):
+                if '-p' in arguments:
+                    if Path(arguments[-1]).suffix.casefold() == '.dbg':
+                        return 'There is an import table in .idata, but that section has no contents'
+                    return 'DLL Name: KERNEL32.dll'
+                self.assertFalse(prefix.exists())
+                self.assertEqual(runtime_root, output / 'raw')
+                self.assertEqual(arguments, [output / 'raw/bin/darktable-cli.exe', '--version'])
+                return 'darktable 5.6.2'
+
+            with patch('build_host_raw.platform.system', return_value='Windows'):
+                report = stage_raw(prefix, work, output, command, dependencies)
+            self.assertEqual(len(report['nativeClosure']['objects']), 4)
+            self.assertFalse(any(name.casefold().endswith('.dbg') for name in report['files']))
+            self.assertTrue((work / 'original-install-unavailable/lib/darktable/views/.debug/libslideshow.dll.dbg').is_file())
+            self.assertFalse(report['nativeClosure']['posixRuntimeRequired'])
+            self.assertIn('share/lensfun/data', report['files'])
+            self.assertIn('licenses-toolchain/fixture/LICENSE', report['files'])
+            self.assertIn('licenses/darktable-LICENSE', report['files'])
+            self.assertIn('licenses/lensfun-tre-regex.h', report['files'])
+
+    def test_windows_enters_the_pinned_builder(self):
+        with (
+            patch("build_host_raw.platform.system", return_value="Windows"),
+            patch("build_host_raw.platform.machine", return_value="AMD64"),
+            self.assertRaisesRegex(BuildError, "host_raw_output_invalid"),
+        ):
+            build(Path("/source"), "bad", Path("/ucrt64"), Path("/output"))
+
     def test_linux_enters_the_same_pinned_builder(self):
         with (
             patch("build_host_raw.platform.system", return_value="Linux"),
