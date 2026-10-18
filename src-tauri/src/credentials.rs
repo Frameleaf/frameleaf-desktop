@@ -201,8 +201,44 @@ pub(crate) fn qualify_controller_access(expected: &str) -> Result<serde_json::Va
         &std::env::var("RUNNER_ENVIRONMENT").unwrap_or_default(),
         &std::env::var("FRAMELEAF_TEST_DISPOSABLE_KEYSTORE").unwrap_or_default(),
     )?;
+    #[cfg(target_os = "macos")]
+    let _interaction = qualification_keychain::NonInteractive::enter()?;
+    eprintln!("credential_probe_phase=installation_lock");
     let _lock = installation_lock()?;
-    controller_access_receipt(&runtime_identity()?, expected)
+    eprintln!("credential_probe_phase=identity_read");
+    let identity = runtime_identity()?;
+    eprintln!("credential_probe_phase=public_receipt");
+    controller_access_receipt(&identity, expected)
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+mod qualification_keychain {
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> i32;
+        fn SecKeychainSetUserInteractionAllowed(state: u8) -> i32;
+    }
+
+    pub(super) struct NonInteractive(u8);
+    impl NonInteractive {
+        pub(super) fn enter() -> Result<Self, &'static str> {
+            let mut previous = 0;
+            if unsafe { SecKeychainGetUserInteractionAllowed(&mut previous) } != 0 {
+                return Err("credential_probe_interaction_state_unavailable");
+            }
+            if unsafe { SecKeychainSetUserInteractionAllowed(0) } != 0 {
+                return Err("credential_probe_interaction_disable_failed");
+            }
+            Ok(Self(previous))
+        }
+    }
+    impl Drop for NonInteractive {
+        fn drop(&mut self) {
+            if unsafe { SecKeychainSetUserInteractionAllowed(self.0) } != 0 {
+                eprintln!("credential_probe_interaction_restore_failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

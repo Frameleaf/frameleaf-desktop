@@ -163,10 +163,10 @@ fn disposable_runner_epoch_persistence() {
     let mut controller_child = Command::new(&controller)
         .args(["--qualify-credential-access", &installation_id])
         .stdout(file)
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .unwrap();
-    let status = wait_for_child(&mut controller_child);
+    let status = wait_for_child(&mut controller_child, "separate-controller");
     let actual: serde_json::Value =
         serde_json::from_slice(&crate::runtime_store::read_bounded(&output, 8192).unwrap())
             .unwrap();
@@ -188,7 +188,7 @@ fn disposable_runner_epoch_persistence() {
         .spawn()
         .unwrap();
     assert!(
-        wait_for_child(&mut child).success(),
+        wait_for_child(&mut child, "same-test-binary").success(),
         "credential reload child failed"
     );
     let store = RuntimeStore::new(
@@ -296,7 +296,8 @@ fn remove_owned_marker() {
     assert_eq!(flushed, 0);
 }
 
-fn wait_for_child(child: &mut std::process::Child) -> std::process::ExitStatus {
+fn wait_for_child(child: &mut std::process::Child, phase: &str) -> std::process::ExitStatus {
+    eprintln!("credential_fixture_phase={phase}");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -305,7 +306,7 @@ fn wait_for_child(child: &mut std::process::Child) -> std::process::ExitStatus {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("credential reload child timed out");
+            panic!("credential reload child timed out: {phase}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
