@@ -236,17 +236,23 @@ enum CheckpointCommand {
         operation_id: String,
         binding: crate::host_runtime::RestoreBinding,
     },
+    #[serde(rename_all = "camelCase")]
+    VerifyRestore {
+        protocol_version: u32,
+        operation_id: String,
+        prepared: Box<crate::host_runtime::PreparedRestore>,
+    },
 }
 fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointCommand>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     let count = Read::by_ref(input)
-        .take(1025)
+        .take(4097)
         .read_until(b'\n', &mut bytes)
         .map_err(|_| "host_control_command_invalid")?;
     if count == 0 || bytes.as_slice() == b"stop\n" {
         return Ok(None);
     }
-    if count > 1024 || !bytes.ends_with(b"\n") {
+    if count > 4096 || !bytes.ends_with(b"\n") {
         return Err("host_control_command_invalid".into());
     }
     let command: CheckpointCommand =
@@ -272,6 +278,16 @@ fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointComma
             binding,
         } => {
             if binding.validate().is_err() || binding.operation_id != *operation_id {
+                return Err("host_control_command_invalid".into());
+            }
+            (protocol_version, operation_id)
+        }
+        CheckpointCommand::VerifyRestore {
+            protocol_version,
+            operation_id,
+            prepared,
+        } => {
+            if prepared.validate().is_err() || prepared.binding.operation_id != *operation_id {
                 return Err("host_control_command_invalid".into());
             }
             (protocol_version, operation_id)
@@ -405,6 +421,13 @@ pub fn run() -> Result<(), String> {
                         process.request_restore(&binding)
                     }
                 }
+                CheckpointCommand::VerifyRestore { prepared, .. } => {
+                    if prepared.binding.installation_id != config.installation_id {
+                        Err("host_restore_request_invalid".into())
+                    } else {
+                        process.request_verify_restore(&prepared)
+                    }
+                }
             };
             if result.is_err() {
                 invalid.store(true, Ordering::Release);
@@ -514,6 +537,40 @@ mod tests {
             },
         ] {
             assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn verification_command_is_bounded_and_binds_the_entire_prepared_receipt() {
+        let operation = "11111111-1111-4111-8111-111111111111";
+        let binding = json!({"schemaVersion":1,"runtime":"native","operationId":operation,
+            "reviewId":"22222222-2222-4222-8222-222222222222","snapshotId":"c".repeat(64),"installationId":"d".repeat(12),
+            "manifestSha256":"a".repeat(64),"sourceRevision":"b".repeat(40),"libraryId":"e".repeat(12),"recoverySha256":"f".repeat(64)});
+        let prepared = json!({"schemaVersion":1,"state":"restore-prepared","binding":binding,
+            "attemptId":"33333333-3333-4333-8333-333333333333","profileIdentity":"1:2","targetIdentity":"1:3","databaseIdentity":"1:4",
+            "validation":{"postgresMajor":19,"vectorVersion":"0.8.7","canonical":true,"executionStateReconstructed":true}});
+        let request = json!({"protocolVersion":1,"action":"verify-restore","operationId":operation,"prepared":prepared});
+        assert!(read_owner_command(&mut format!("{request}\n").as_bytes()).is_ok());
+        assert!(
+            read_owner_command(&mut format!("{request}{}\n", " ".repeat(1024)).as_bytes()).is_ok()
+        );
+        assert!(
+            read_owner_command(&mut format!("{request}{}\n", " ".repeat(4096)).as_bytes()).is_err()
+        );
+        for mutation in ["operation", "path", "canonical", "attempt"] {
+            let mut changed = request.clone();
+            match mutation {
+                "operation" => {
+                    changed["operationId"] = json!("22222222-2222-4222-8222-222222222222")
+                }
+                "path" => changed["prepared"]["path"] = json!("/outside"),
+                "canonical" => changed["prepared"]["validation"]["canonical"] = json!(false),
+                _ => changed["prepared"]["attemptId"] = json!("../outside"),
+            }
+            assert!(
+                read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err(),
+                "{mutation}"
+            );
         }
     }
 

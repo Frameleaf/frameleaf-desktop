@@ -129,8 +129,14 @@ export function checkpointRequest(line) {
 }
 export function checkpointControlRequest(c, line) {
   try {
-    if (typeof line !== "string" || Buffer.byteLength(line) > 1024) throw Error();
+    if (typeof line !== "string" || Buffer.byteLength(line) > 4096) throw Error();
     const value = JSON.parse(line);
+    if (value?.action === "verify-restore") {
+      if (c.mode !== "restore-prepare" || Object.keys(value).sort().join(",") !== "action,operationId,prepared,protocolVersion,verificationId" || value.protocolVersion !== 1 || typeof value.verificationId !== "string" || !CHECKPOINT_ID.test(value.verificationId)) throw Error();
+      const prepared = preparedRestoreReceipt(c, value.prepared);
+      if (prepared.binding.operationId !== value.operationId) throw Error();
+      return {protocolVersion:1, action:"verify-restore", operationId:value.operationId, prepared, verificationId:value.verificationId};
+    }
     if (value?.action === "prepare-restore") {
       if (c.mode !== "restore-prepare" || Object.keys(value).sort().join(",") !== "action,binding,operationId,protocolVersion" || value.protocolVersion !== 1) throw Error();
       const binding = restoreInputBinding(c, value.binding);
@@ -742,9 +748,11 @@ export async function runHost(c, stopping, ready, restoreSession) {
     let pending, cancelled = false;
     void stopping.then(() => { cancelled = true; });
     ready(request => {
-      if (cancelled || pending || request.action !== (c.mode === "restore-prepare" ? "prepare-restore" : "cleanup-checkpoint"))
+      if (cancelled || pending || !(c.mode === "restore-prepare" ? ["prepare-restore", "verify-restore"] : ["cleanup-checkpoint"]).includes(request.action))
         return Promise.reject(new Error("host_checkpoint_unavailable"));
-      const work = c.mode === "restore-prepare" ? restoreHostDatabase(c, request.binding, stopping) : cleanupHostCheckpoint(c, request.checkpoint);
+      const work = request.action === "verify-restore"
+        ? verifyHostRestoreTarget(c, request.prepared, stopping).then(checked => ({state:"restore-verified", prepared:checked.receipt, offlineChecksums:true, verificationId:request.verificationId}))
+        : c.mode === "restore-prepare" ? restoreHostDatabase(c, request.binding, stopping) : cleanupHostCheckpoint(c, request.checkpoint);
       pending = work;
       void work.finally(() => { if (pending === work) pending = undefined; }).catch(() => {});
       return work;
@@ -1168,11 +1176,11 @@ async function main() {
       }
       const request = checkpointControlRequest(config, line);
       if (!checkpoint || pending) fail("host_checkpoint_unavailable");
-      const cleanup = request.action === "cleanup-checkpoint", restore = request.action === "prepare-restore";
+      const cleanup = request.action === "cleanup-checkpoint", verify = request.action === "verify-restore", restore = request.action === "prepare-restore" || verify;
       pending = checkpoint(request)
         .then(receipt => process.stdout.write(JSON.stringify(restore ? receipt : { ...receipt, state: cleanup ? "checkpoint-cleaned" : "checkpoint" }) + "\n"))
-        .catch(() => process.stdout.write(JSON.stringify({ state: restore ? "restore-prepare-failed" : cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
-          operationId: request.operationId, code: restore ? "host_restore_failed" : cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
+        .catch(() => process.stdout.write(JSON.stringify({ state: verify ? "restore-verify-failed" : restore ? "restore-prepare-failed" : cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
+          operationId: request.operationId, ...(verify ? {verificationId:request.verificationId} : {}), code: verify ? "host_restore_verification_failed" : restore ? "host_restore_failed" : cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
         .finally(() => { pending = undefined; });
     }
     stop();
@@ -1303,6 +1311,51 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   return receipt;
 }
 
+/** Normalize receipt identity without granting filesystem or activation authority. */
+function preparedRestoreReceipt(c, supplied) {
+  if (
+    !supplied ||
+    Object.keys(supplied).sort().join(",") !==
+      "attemptId,binding,databaseIdentity,profileIdentity,schemaVersion,state,targetIdentity,validation" ||
+    supplied.schemaVersion !== 1 ||
+    supplied.state !== "restore-prepared" ||
+    typeof supplied.attemptId !== "string" ||
+    !CHECKPOINT_ID.test(supplied.attemptId) ||
+    ![
+      supplied.profileIdentity,
+      supplied.targetIdentity,
+      supplied.databaseIdentity,
+    ].every(
+      (value) =>
+        typeof value === "string" &&
+        value.length <= 128 &&
+        /^[0-9]+:[0-9]+$/.test(value),
+    ) ||
+    !isDeepStrictEqual(supplied.validation, {
+      postgresMajor: 19,
+      vectorVersion: "0.8.7",
+      canonical: true,
+      executionStateReconstructed: true,
+    })
+  )
+    fail("host_restore_target_invalid");
+  return {
+    schemaVersion: 1,
+    state: "restore-prepared",
+    binding: restoreInputBinding(c, supplied.binding),
+    attemptId: supplied.attemptId,
+    profileIdentity: supplied.profileIdentity,
+    targetIdentity: supplied.targetIdentity,
+    databaseIdentity: supplied.databaseIdentity,
+    validation: {
+      postgresMajor: 19,
+      vectorVersion: "0.8.7",
+      canonical: true,
+      executionStateReconstructed: true,
+    },
+  };
+}
+
 /** Recheck prepared evidence only; exclusive activation must still verify offline database state. */
 export async function readHostRestoreTarget(configuration, supplied, check = () => {}) {
   try {
@@ -1312,47 +1365,7 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
     };
     check();
     validateConfig(c);
-    if (
-      !supplied ||
-      Object.keys(supplied).sort().join(",") !==
-        "attemptId,binding,databaseIdentity,profileIdentity,schemaVersion,state,targetIdentity,validation" ||
-      supplied.schemaVersion !== 1 ||
-      supplied.state !== "restore-prepared" ||
-      typeof supplied.attemptId !== "string" ||
-      !CHECKPOINT_ID.test(supplied.attemptId) ||
-      ![
-        supplied.profileIdentity,
-        supplied.targetIdentity,
-        supplied.databaseIdentity,
-      ].every(
-        (value) =>
-          typeof value === "string" &&
-          value.length <= 128 &&
-          /^[0-9]+:[0-9]+$/.test(value),
-      ) ||
-      !isDeepStrictEqual(supplied.validation, {
-        postgresMajor: 19,
-        vectorVersion: "0.8.7",
-        canonical: true,
-        executionStateReconstructed: true,
-      })
-    )
-      fail("host_restore_target_invalid");
-    const receipt = {
-      schemaVersion: 1,
-      state: "restore-prepared",
-      binding: restoreInputBinding(c, supplied.binding),
-      attemptId: supplied.attemptId,
-      profileIdentity: supplied.profileIdentity,
-      targetIdentity: supplied.targetIdentity,
-      databaseIdentity: supplied.databaseIdentity,
-      validation: {
-        postgresMajor: 19,
-        vectorVersion: "0.8.7",
-        canonical: true,
-        executionStateReconstructed: true,
-      },
-    };
+    const receipt = preparedRestoreReceipt(c, supplied);
     const root = join(c.state, "restore-targets"),
       operationRoot = join(root, receipt.binding.operationId);
     const target = join(operationRoot, receipt.attemptId),

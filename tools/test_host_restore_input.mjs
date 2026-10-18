@@ -697,3 +697,45 @@ test('prepared target metadata hashes stop if a JSON file grows beyond its opene
     }
   });
 });
+
+test('restore owner verifies the exact prepared target without exposing paths or starting an application', async t => {
+  await preparedTargetFixture(t, async ({ c, receipt, calls }) => {
+    c = { ...c, mode: 'restore-prepare', entryPoints: { ...c.entryPoints,
+      pgChecksums: 'bin/pg_checksums' + (process.platform === 'win32' ? '.exe' : '') } };
+    const request = { protocolVersion: 1, action: 'verify-restore', operationId: receipt.binding.operationId, prepared: receipt, verificationId: '44444444-4444-4444-8444-444444444444' };
+    assert.deepEqual(owner.checkpointControlRequest(c, JSON.stringify(request)), request);
+    assert.deepEqual(owner.checkpointControlRequest(c, JSON.stringify(request) + ' '.repeat(1024)), request);
+    assert.throws(() => owner.checkpointControlRequest(c, JSON.stringify(request) + ' '.repeat(4096)), /host_checkpoint_request_invalid/);
+    for (const changed of [
+      { ...request, path: '/outside' }, { ...request, operationId: '11111111-1111-4111-8111-111111111111' },
+      { ...request, prepared: { ...receipt, path: '/outside' } },
+      { ...request, prepared: { ...receipt, binding: { ...receipt.binding, manifestSha256: '0'.repeat(64) } } },
+    ]) assert.throws(() => owner.checkpointControlRequest(c, JSON.stringify(changed)), /host_checkpoint_request_invalid/);
+    assert.throws(() => owner.checkpointControlRequest({ ...c, mode: 'server' }, JSON.stringify(request)), /host_checkpoint_request_invalid/);
+    let stop, handler, ready;
+    const stopping = new Promise(resolve => { stop = resolve; });
+    const waiting = new Promise(resolve => { ready = resolve; });
+    const seen = [];
+    const probe = t.mock.method(subprocess, 'spawn', (file, args) => {
+      seen.push({ file, args });
+      const child = new EventEmitter();
+      Object.assign(child, { pid: 8999, exitCode: null, signalCode: null });
+      child.kill = () => { child.exitCode = 1; child.emit('close', 1, null); return true; };
+      queueMicrotask(() => { child.exitCode = 0; child.emit('close', 0, null); });
+      return child;
+    });
+    syncBuiltinESMExports();
+    const prior = calls.length;
+    const host = owner.runHost(c, stopping, value => { handler = value; ready(); });
+    try {
+      await Promise.race([waiting, host]);
+      const work = handler(request);
+      await assert.rejects(handler(request), /host_checkpoint_unavailable/);
+      assert.deepEqual(await work, { state: 'restore-verified', prepared: receipt, offlineChecksums: true, verificationId: request.verificationId });
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].file, join(c.runtime, c.entryPoints.pgChecksums));
+      assert.equal(calls.length, prior);
+      assert.equal(await readFile(join(c.state, 'database/sentinel'), 'utf8'), 'original database must survive');
+    } finally { stop(); await host; probe.mock.restore(); syncBuiltinESMExports(); }
+  });
+});

@@ -312,7 +312,7 @@ impl RestoreBinding {
         Ok(())
     }
 }
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RestoreValidation {
     postgres_major: u32,
@@ -322,10 +322,46 @@ struct RestoreValidation {
 }
 fn restore_identity(value: &str) -> bool {
     let parts: Vec<_> = value.split(':').collect();
-    parts.len() == 2
+    value.len() <= 128
+        && parts.len() == 2
         && parts
             .iter()
             .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+}
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PreparedRestore {
+    schema_version: u32,
+    state: String,
+    pub(crate) binding: RestoreBinding,
+    attempt_id: String,
+    profile_identity: String,
+    target_identity: String,
+    database_identity: String,
+    validation: RestoreValidation,
+}
+impl PreparedRestore {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.binding.validate()?;
+        if self.schema_version != 1
+            || self.state != "restore-prepared"
+            || !checkpoint_operation_id(&self.attempt_id)
+            || ![
+                &self.profile_identity,
+                &self.target_identity,
+                &self.database_identity,
+            ]
+            .iter()
+            .all(|id| restore_identity(id))
+            || self.validation.postgres_major != 19
+            || self.validation.vector_version != "0.8.7"
+            || !self.validation.canonical
+            || !self.validation.execution_state_reconstructed
+        {
+            return Err("host_restore_request_invalid".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
@@ -375,13 +411,30 @@ enum AgentEvent {
         operation_id: String,
         code: String,
     },
+    #[serde(rename_all = "camelCase")]
+    RestoreVerified {
+        prepared: PreparedRestore,
+        offline_checksums: bool,
+        verification_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    RestoreVerifyFailed {
+        operation_id: String,
+        code: String,
+        verification_id: String,
+    },
     Stopped,
+}
+struct PendingVerification {
+    prepared: PreparedRestore,
+    verification_id: String,
 }
 struct PendingCheckpoint {
     operation: String,
     accepted: bool,
     cleanup: Option<CheckpointReceipt>,
     restore: Option<RestoreBinding>,
+    verify: Option<PendingVerification>,
 }
 struct CheckpointProtocol {
     pending: Mutex<Option<PendingCheckpoint>>,
@@ -401,7 +454,7 @@ impl CheckpointProtocol {
         }
     }
     fn begin(&self, operation: &str) -> Result<(), String> {
-        self.begin_request(operation, None, None)
+        self.begin_request(operation, None, None, None)
     }
     fn begin_cleanup(&self, receipt: &CheckpointReceipt) -> Result<(), String> {
         receipt.validate()?;
@@ -410,7 +463,7 @@ impl CheckpointProtocol {
         {
             return Err("host_checkpoint_request_invalid".into());
         }
-        self.begin_request(&receipt.operation_id, Some(receipt.clone()), None)
+        self.begin_request(&receipt.operation_id, Some(receipt.clone()), None, None)
     }
     fn begin_restore(&self, binding: &RestoreBinding) -> Result<(), String> {
         binding.validate()?;
@@ -419,13 +472,33 @@ impl CheckpointProtocol {
         {
             return Err("host_restore_request_invalid".into());
         }
-        self.begin_request(&binding.operation_id, None, Some(binding.clone()))
+        self.begin_request(&binding.operation_id, None, Some(binding.clone()), None)
+    }
+    fn begin_verify_restore(&self, prepared: &PreparedRestore) -> Result<String, String> {
+        prepared.validate()?;
+        if prepared.binding.manifest_sha256 != self.manifest_sha256
+            || prepared.binding.source_revision != self.source_revision
+        {
+            return Err("host_restore_request_invalid".into());
+        }
+        let verification_id = uuid::Uuid::new_v4().to_string();
+        self.begin_request(
+            &prepared.binding.operation_id,
+            None,
+            None,
+            Some(PendingVerification {
+                prepared: prepared.clone(),
+                verification_id: verification_id.clone(),
+            }),
+        )?;
+        Ok(verification_id)
     }
     fn begin_request(
         &self,
         operation: &str,
         cleanup: Option<CheckpointReceipt>,
         restore: Option<RestoreBinding>,
+        verify: Option<PendingVerification>,
     ) -> Result<(), String> {
         if !checkpoint_operation_id(operation) {
             return Err("host_checkpoint_request_invalid".into());
@@ -442,6 +515,7 @@ impl CheckpointProtocol {
             accepted: false,
             cleanup,
             restore,
+            verify,
         });
         Ok(())
     }
@@ -452,7 +526,9 @@ impl CheckpointProtocol {
             | AgentEvent::CheckpointCleanupFailed { operation_id, .. }
             | AgentEvent::CheckpointFailed { operation_id, .. } => operation_id,
             AgentEvent::RestorePrepared { binding, .. } => &binding.operation_id,
-            AgentEvent::RestorePrepareFailed { operation_id, .. } => operation_id,
+            AgentEvent::RestorePrepareFailed { operation_id, .. }
+            | AgentEvent::RestoreVerifyFailed { operation_id, .. } => operation_id,
+            AgentEvent::RestoreVerified { prepared, .. } => &prepared.binding.operation_id,
             AgentEvent::Stopped => return Err("host_checkpoint_protocol_invalid".into()),
         };
         let mut pending = self
@@ -548,6 +624,29 @@ impl CheckpointProtocol {
                 }
                 operation_id
             }
+            AgentEvent::RestoreVerified {
+                prepared,
+                offline_checksums,
+                verification_id,
+            } => {
+                prepared.validate().map_err(|_| invalid())?;
+                if !offline_checksums || !checkpoint_operation_id(verification_id) {
+                    return Err(invalid());
+                }
+                &prepared.binding.operation_id
+            }
+            AgentEvent::RestoreVerifyFailed {
+                operation_id,
+                code,
+                verification_id,
+            } => {
+                if code != "host_restore_verification_failed"
+                    || !checkpoint_operation_id(verification_id)
+                {
+                    return Err(invalid());
+                }
+                operation_id
+            }
             AgentEvent::Stopped => {
                 return if self.stopping.load(Ordering::Acquire) {
                     Ok(event)
@@ -565,12 +664,17 @@ impl CheckpointProtocol {
             event,
             AgentEvent::RestorePrepared { .. } | AgentEvent::RestorePrepareFailed { .. }
         );
+        let verify = matches!(
+            event,
+            AgentEvent::RestoreVerified { .. } | AgentEvent::RestoreVerifyFailed { .. }
+        );
         match pending.as_mut() {
             Some(expected)
                 if expected.operation == *operation
                     && !expected.accepted
                     && expected.cleanup.is_some() == cleanup
-                    && expected.restore.is_some() == restore =>
+                    && expected.restore.is_some() == restore
+                    && expected.verify.is_some() == verify =>
             {
                 if let (Some(receipt), AgentEvent::CheckpointCleaned { .. }) =
                     (&expected.cleanup, &event)
@@ -593,6 +697,20 @@ impl CheckpointProtocol {
                 {
                     if binding != returned {
                         return Err(invalid());
+                    }
+                }
+                if let Some(expected) = &expected.verify {
+                    match &event {
+                        AgentEvent::RestoreVerified {
+                            prepared,
+                            verification_id,
+                            ..
+                        } if expected.prepared == *prepared
+                            && expected.verification_id == *verification_id => {}
+                        AgentEvent::RestoreVerifyFailed {
+                            verification_id, ..
+                        } if expected.verification_id == *verification_id => {}
+                        _ => return Err(invalid()),
                     }
                 }
                 expected.accepted = true;
@@ -1107,6 +1225,26 @@ impl HostProcess {
             .write_all(format!("{request}\n").as_bytes())
             .map_err(|_| "host_agent_pipe_failed".into())
     }
+    pub(crate) fn request_verify_restore(
+        &mut self,
+        prepared: &PreparedRestore,
+    ) -> Result<(), String> {
+        if self.mode != HostMode::RestorePrepare
+            || !self.ready_seen
+            || self.protocol.stopping.load(Ordering::Acquire)
+            || !self.is_running()?
+        {
+            return Err("host_restore_unavailable".into());
+        }
+        let verification_id = self.protocol.begin_verify_restore(prepared)?;
+        self.checkpoint_started = Some(Instant::now());
+        let request = serde_json::json!({"protocolVersion":1,"action":"verify-restore","operationId":prepared.binding.operation_id,"prepared":prepared,"verificationId":verification_id});
+        self.input
+            .as_mut()
+            .ok_or("host_agent_pipe_failed")?
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|_| "host_agent_pipe_failed".into())
+    }
     fn send_checkpoint_request(
         &mut self,
         operation: &str,
@@ -1215,6 +1353,40 @@ mod checkpoint_tests {
             "attemptId":"33333333-3333-4333-8333-333333333333","profileIdentity":"1:2","targetIdentity":"1:3","databaseIdentity":"1:4",
             "validation":{"postgresMajor":19,"vectorVersion":"0.8.7","canonical":true,"executionStateReconstructed":true}})
     }
+    #[test]
+    fn verified_restore_matches_the_entire_pending_prepared_receipt_and_checksum_proof() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        let expected: PreparedRestore = serde_json::from_value(prepared()).unwrap();
+        let mut verified = serde_json::json!({"state":"restore-verified","prepared":expected,"offlineChecksums":true});
+        assert!(protocol.parse(&wire(&verified)).is_err());
+        let verification_id = protocol.begin_verify_restore(&expected).unwrap();
+        verified["verificationId"] = serde_json::json!(verification_id);
+        assert!(protocol.begin_verify_restore(&expected).is_err());
+        assert!(protocol.parse(&wire(&prepared())).is_err());
+        for mutation in ["attempt", "database", "binding", "checksum", "path"] {
+            let mut changed = verified.clone();
+            match mutation {
+                "attempt" => changed["prepared"]["attemptId"] = serde_json::json!(OPERATION),
+                "database" => changed["prepared"]["databaseIdentity"] = serde_json::json!("1:999"),
+                "binding" => {
+                    changed["prepared"]["binding"]["snapshotId"] = serde_json::json!("0".repeat(64))
+                }
+                "checksum" => changed["offlineChecksums"] = serde_json::json!(false),
+                _ => changed["path"] = serde_json::json!("/outside"),
+            }
+            assert!(protocol.parse(&wire(&changed)).is_err(), "{mutation}");
+        }
+        let accepted = protocol.parse(&wire(&verified)).unwrap();
+        assert!(protocol.parse(&wire(&verified)).is_err());
+        protocol.finish(&accepted).unwrap();
+        assert!(protocol.parse(&wire(&verified)).is_err());
+        protocol.begin_verify_restore(&expected).unwrap();
+        assert!(
+            protocol.parse(&wire(&verified)).is_err(),
+            "a delayed prior verification must not satisfy a fresh retry"
+        );
+    }
+
     #[test]
     fn restore_receipt_requires_exact_pending_binding_and_canonical_validation() {
         let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
