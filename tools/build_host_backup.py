@@ -129,6 +129,8 @@ def build(output):
     try:
         download(pin['url'], archive, pin['sha256'])
         unpack(archive, binary, pin['sha256'])
+        if sha256(binary) != pin['binarySha256']:
+            raise BuildError('host_backup_binary_digest_mismatch')
         shutil.copyfile(ROOT / 'runtime/host-backup-LICENSE.txt', component / 'LICENSE')
         receipt['checks'] = qualify(binary, work, env)
         receipt['files'] = inventory(component)

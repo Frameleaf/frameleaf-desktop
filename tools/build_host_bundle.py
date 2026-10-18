@@ -12,10 +12,13 @@ import stat
 from pathlib import Path
 
 from build_host_server import stage_server
+from build_host_backup import CONTRACT as BACKUP_CONTRACT, artifact as backup_artifact
 from build_runtime import BuildError, build_environment, inventory, regular, run, sha256
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_HOST_FILES = (
+    "backup/LICENSE",
+    "backup/component.json",
     "studio/engine-build.json",
     "studio/guard/studio-browser-guard.mjs",
     "studio/tools/bundled-worker-fonts.mjs",
@@ -87,7 +90,44 @@ def host_entries() -> dict[str, str]:
         "mlManifest": "ml/manifest.json",
         "manager": "manager/app/build/main.js",
         "managerWebIndex": "manager/app/ui/dist/index.html",
+        "backupEngine": "backup/restic" + suffix,
     }
+
+
+def backup_component(root: Path) -> dict:
+    metadata = regular(root / "component.json")
+    if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 16 * 1024:
+        raise BuildError("host_backup_component_invalid")
+    record = json.loads((root / "component.json").read_text())
+    pin = backup_artifact(platform.system(), platform.machine())
+    binary = "restic.exe" if os.name == "nt" else "restic"
+    if (
+        not isinstance(record, dict)
+        or type(record.get("schemaVersion")) is not int
+        or record.get("schemaVersion") != 1
+        or record.get("name") != "restic"
+        or record.get("version") != BACKUP_CONTRACT["version"]
+        or record.get("source") != BACKUP_CONTRACT["source"]
+        or record.get("artifact") != pin
+        or record.get("qualification") != "passed"
+        or record.get("runtimeQualified") is not False
+        or record.get("redistributable") is not False
+        or not isinstance(record.get("checks"), dict)
+        or any(record["checks"].get(key) is not True for key in [
+            "encryptedRepository", "wrongKeyRejected", "readDataCheck", "verifiedRestore"
+        ])
+    ):
+        raise BuildError("host_backup_component_invalid")
+    files = inventory(root)
+    files.pop("component.json", None)
+    if (
+        set(files) != {binary, "LICENSE"}
+        or files != record.get("files")
+        or files[binary]["sha256"] != pin["binarySha256"]
+        or files["LICENSE"]["sha256"] != BACKUP_CONTRACT["licenseSha256"]
+    ):
+        raise BuildError("host_backup_component_invalid")
+    return record
 
 
 def host_manifest(payload: Path, revision: str, epoch: int) -> dict:
@@ -132,20 +172,22 @@ def host_manifest(payload: Path, revision: str, epoch: int) -> dict:
 
 
 def assemble(
-    host: Path, ml: Path, manager: Path, output: Path, revision: str, epoch: int
+    host: Path, ml: Path, manager: Path, backup: Path, output: Path, revision: str, epoch: int
 ) -> None:
     if (
-        not all(p.is_absolute() for p in [host, ml, manager, output])
+        not all(p.is_absolute() for p in [host, ml, manager, backup, output])
         or output.exists()
         or output.is_symlink()
         or output.resolve().is_relative_to(host.resolve())
         or output.resolve().is_relative_to(ml.resolve())
         or output.resolve().is_relative_to(manager.resolve())
+        or output.resolve().is_relative_to(backup.resolve())
     ):
         raise BuildError("host_bundle_paths_invalid")
     regular(host)
     regular(ml)
     regular(manager)
+    regular(backup)
     component_file = manager / "component.json"
     metadata = regular(component_file)
     if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 16 * 1024:
@@ -173,6 +215,7 @@ def assemble(
         or component["redistributable"] is not False
     ):
         raise BuildError("host_manager_component_invalid")
+    backup_record = backup_component(backup)
     output.mkdir(mode=0o700)
     work = output / "work"
     work.mkdir(mode=0o700)
@@ -207,6 +250,9 @@ def assemble(
     for name in directories:
         stage_server(host / name, payload / name)
     stage_server(manager, payload / "manager")
+    stage_server(backup, payload / "backup")
+    if backup_component(payload / "backup") != backup_record:
+        raise BuildError("host_backup_component_changed")
     shutil.copy2(node, payload / node.name)
     (payload / "ml").mkdir(mode=0o700)
     stage_server(ml / "payload", payload / "ml/payload")
@@ -230,6 +276,7 @@ def assemble(
                 "manifestSha256": sha256(output / "manifest.json"),
                 "ml": checked,
                 "manager": component,
+                "backup": backup_record,
                 "signaturePresent": False,
                 "runtimeQualified": False,
                 "redistributable": False,
@@ -243,7 +290,7 @@ def assemble(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["host", "ml", "manager", "output", "revision"]:
+    for name in ["host", "ml", "manager", "backup", "output", "revision"]:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--epoch", required=True, type=int)
     args = parser.parse_args()
@@ -252,6 +299,7 @@ if __name__ == "__main__":
             Path(args.host),
             Path(args.ml),
             Path(args.manager),
+            Path(args.backup),
             Path(args.output),
             args.revision,
             args.epoch,

@@ -7,23 +7,29 @@
   "artifacts": {
     "darwin_amd64": {
       "url": "https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_darwin_amd64.bz2",
-      "sha256": "eb8543ed92ff1ddb67762daebf09f7bea4b0c37d21edb6a910bee3d4f514015f"
+      "sha256": "eb8543ed92ff1ddb67762daebf09f7bea4b0c37d21edb6a910bee3d4f514015f",
+      "binarySha256": "09aab37b854d45e397a3991901105e9b2ed4dc7abbdd0ae7cf50d11afe5e02c3"
     },
     "darwin_arm64": {
       "url": "https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_darwin_arm64.bz2",
-      "sha256": "193fccc8bb4567b498923bc70261e104ff22be88016f0f108b035dad372ab711"
+      "sha256": "193fccc8bb4567b498923bc70261e104ff22be88016f0f108b035dad372ab711",
+      "binarySha256": "c5ca77ae4aed8e9597c9f6ef5c8cb910c17758c2b0a79db307d36fa6c3a14964"
     },
     "linux_amd64": {
       "url": "https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2",
-      "sha256": "680838f19d67151adba227e1570cdd8af12c19cf1735783ed1ba928bc41f363d"
+      "sha256": "680838f19d67151adba227e1570cdd8af12c19cf1735783ed1ba928bc41f363d",
+      "binarySha256": "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6"
     },
     "linux_arm64": {
       "url": "https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_arm64.bz2",
-      "sha256": "87f53fddde38764095e9c058a3b31834052c37e5826d2acf34e18923c006bd45"
+      "sha256": "87f53fddde38764095e9c058a3b31834052c37e5826d2acf34e18923c006bd45",
+      "binarySha256": "f04a6bf766a33fba44b5be068e29091259dda5ef37f1e68ba9a8e0cda053120e"
     },
     "windows_amd64": {
       "url": "https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_windows_amd64.zip",
-      "sha256": "0c1a713440578cb400d2e76208feb24f1b339426b075a21f73b6b2132692515d"
+      "sha256": "0c1a713440578cb400d2e76208feb24f1b339426b075a21f73b6b2132692515d",
+      "binarySha256": "034b7bf67a23049d30d58ddf4fb318239726cc74728b80bff876de824f2fc786"
     }
-  }
+  },
+  "licenseSha256": "6f08a01a9fab5b24e139a09f15cc24a73087c7bc09e3bacf099fdf2d767bf897"
 }

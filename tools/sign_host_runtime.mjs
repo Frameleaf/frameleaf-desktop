@@ -44,8 +44,11 @@ export const HOST_ROLES = [
   "mlManifest",
   "manager",
   "managerWebIndex",
+  "backupEngine",
 ];
 export const HOST_REQUIRED = [
+  "backup/LICENSE",
+  "backup/component.json",
   "studio/engine-build.json",
   "studio/guard/studio-browser-guard.mjs",
   "studio/tools/bundled-worker-fonts.mjs",

@@ -217,11 +217,14 @@ test("CLI never echoes malformed private-key input", async (t) => {
   assert.match(result.stderr, /host_signing_failed/);
 });
 
-test("Manager code and recovery UI are required signed host roles", async (t) => {
+test("Manager code, recovery UI and backup engine are required signed host roles", async (t) => {
   const f = await fixture(t);
   assert.ok(HOST_ROLES.includes('manager'));
   assert.ok(HOST_ROLES.includes('managerWebIndex'));
-  for (const role of ['manager', 'managerWebIndex']) {
+  assert.ok(HOST_ROLES.includes('backupEngine'));
+  assert.ok(HOST_REQUIRED.includes('backup/LICENSE'));
+  assert.ok(HOST_REQUIRED.includes('backup/component.json'));
+  for (const role of ['manager', 'managerWebIndex', 'backupEngine']) {
     const path = f.manifest.entryPoints[role];
     delete f.manifest.entryPoints[role];
     await f.save();

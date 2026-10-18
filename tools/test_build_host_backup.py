@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from build_host_backup import artifact, unpack
+from build_host_backup import artifact, unpack, build
 from build_runtime import BuildError
 
 
@@ -16,10 +16,27 @@ class BackupEngineTests(unittest.TestCase):
         for system, machine in [('Darwin', 'arm64'), ('Darwin', 'x86_64'), ('Linux', 'aarch64'), ('Linux', 'x86_64'), ('Windows', 'AMD64')]:
             pin = artifact(system, machine)
             self.assertRegex(pin['sha256'], r'^[a-f0-9]{64}$')
+            self.assertRegex(pin['binarySha256'], r'^[a-f0-9]{64}$')
             self.assertTrue(pin['url'].startswith('https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_'))
         for system, machine in [('Windows', 'ARM64'), ('Linux', 'i686'), ('Other', 'x86_64')]:
             with self.assertRaises(BuildError):
                 artifact(system, machine)
+
+    def test_changed_executable_is_rejected_before_qualification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            archive = root / 'source.bz2'
+            archive.write_bytes(bz2.compress(b'changed engine'))
+            pin = {'url': 'https://github.com/restic/restic/releases/download/v0.18.1/restic.bz2',
+                   'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'binarySha256': '0' * 64}
+
+            def downloaded(_url, destination, _digest):
+                destination.write_bytes(archive.read_bytes())
+
+            with patch('build_host_backup.artifact', return_value=pin), patch('build_host_backup.download', side_effect=downloaded), patch('build_host_backup.qualify') as qualify:
+                with self.assertRaisesRegex(BuildError, 'host_backup_binary_digest_mismatch'):
+                    build(root / 'candidate')
+                qualify.assert_not_called()
 
     def test_digest_is_checked_before_decompression_or_destination_creation(self):
         with tempfile.TemporaryDirectory() as directory:

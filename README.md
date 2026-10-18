@@ -741,7 +741,7 @@ These results do not enable the shipping Studio gate or qualify installed platfo
 
 `tools/build_host_bundle.py` combines the staged private host components with an
 application-trusted signed ML candidate. It excludes the fixture agent, checks
-all 26 roles and required resources, including Manager backend and recovery UI, and verifies the nested ML signature and
+all 27 roles and required resources, including Manager backend, recovery UI and the private backup engine, and verifies the nested ML signature and
 payload again after copying. The output has `payload/`, an unsigned host
 `manifest.json`, and a scoped `qualification.json`; it does not sign or certify
 release readiness. The earlier 24-role Mac assembly contains 67,015 files and a 10.9 MB
@@ -779,7 +779,9 @@ The development `frameleaf-native-host --owner-pipe` helper now provides bounded
 
 `tools/build_host_manager.py --source /absolute/repo --revision <commit> --node /absolute/private-node --output /absolute/new-output` builds Manager and its UI from an exact Git archive with the frozen npm lockfile. It ignores package lifecycle scripts, prunes development dependencies and checks deployed production imports, including the shared release verifier. Only runtime code, production dependencies, worker scripts, public release-verification resources, UI assets and licenses enter `output/manager`. `component.json` records the Manager revision independently of the photo server revision.
 
-Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manager` with the existing host/ML arguments. Manager code, UI, dependencies and release-verification resources are mandatory in the signed host inventory. An older pack that omits Manager now refuses admission. The previous factory-signed 24-role candidate and its component results remain historical evidence; a new complete candidate/signature and installed qualification are required. This package does not enable native hosting or supply the still-required protected installed supervisor and OS-keystore bootstrap.
+Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manager --backup /absolute/backup-output/backup` with the existing host/ML arguments. Manager code, UI, dependencies, release-verification resources and the backup engine are mandatory in the signed host inventory. An older pack that omits these components refuses admission. The previous factory-signed 24-role candidate and its component results remain historical evidence; a new complete candidate/signature and installed qualification are required. This package does not enable native hosting or supply the still-required protected installed supervisor and OS-keystore bootstrap.
+
+Build the private backup component with `python tools/build_host_backup.py --output /absolute/backup-output` using a new output directory. The builder verifies the pinned official restic archive and executable digests, retains its license, and exercises encrypted synthetic backup/check/restore before producing the component receipt. Assembly checks the approved target, executable and license hashes, and rechecks the staged component before constructing the host manifest. Manager backup integration and installed-host recovery qualification remain separate requirements; this component does not enable the native backup action.
 
 
 Native Manager accepts internal bootstrap protocol 2 through a single bounded private stdin record. The desktop TLS identity is generated in Rust and must be persisted through the OS keystore before use; native Manager validates its key, certificate, validity and exact origin. Native mode does not use OpenSSL or write TLS key files. The administration origin must be canonical HTTPS with a literal loopback address and an unprivileged port. Docker Manager retains its existing listener; the photo server has its separate listener.
