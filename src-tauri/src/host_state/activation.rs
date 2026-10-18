@@ -1401,3 +1401,6 @@ mod tests {
         assert!(!f.path.join(ACTIVATION).exists());
     }
 }
+
+#[cfg(all(test, unix))]
+mod restore_qualification;

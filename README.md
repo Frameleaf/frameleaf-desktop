@@ -799,3 +799,23 @@ The native `Programs::start` requires a separately protected controller and a pr
 Native profile roots require root-owned, non-writable, ACL-free parents as well as private user-owned leaf directories. These must be provisioned by the installer; ordinary user-writable home/profile parents refuse native hosting. Physical topology checks reuse the existing controller boundary and reject runtime overlap, state/data aliases and links. Only a nonsecret binding hash is written to `.host-profile`. Marker publication is complete before linking; a crash before unlinking its temporary hard link currently requires explicit recovery, which remains a release gate. Callback-backed profile tests do not establish actual OS-keystore or installed setup acceptance.
 
 TLS keystore records use the same complete profile binding as the database credential, under a separate account namespace. The profile lease remains held across TLS persistence and bootstrap. A changed runtime/configuration requires the future managed migration to preserve and rebind both secrets; automatic replacement currently refuses.
+
+The ignored Unix test `actual_postgres_restore_selection_finalization_and_writer_admission`
+exercises the compiled controller with a real synthetic PostgreSQL restore. Set
+`FRAMELEAF_TEST_HOST_PACK` to a complete measured candidate directory containing
+`manifest.json` and `payload`, and `FRAMELEAF_TEST_RESTORE_ROOT` to a new absolute
+fixture directory, then run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --lib \
+  actual_postgres_restore_selection_finalization_and_writer_admission -- --ignored --nocapture
+```
+
+The test signs only in memory with its test key. It creates an encrypted selected
+snapshot and a separate current-state safety backup through the compiled Manager,
+requires real owner-pipe verification before selection and independent finalization,
+checks writer refusal while pending, retries finalization after a lost acknowledgement,
+and starts the selected server before comparing selected and retained original rows.
+It retains the synthetic profile and receipt for inspection. Use a fresh fixture root
+for each run. This does not establish release trust, OS credential storage, installed
+application acceptance, or GPU qualification.
