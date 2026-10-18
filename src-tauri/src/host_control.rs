@@ -249,6 +249,13 @@ enum CheckpointCommand {
         verification_id: String,
         safety: Box<crate::host_state::SafetySnapshot>,
     },
+    #[serde(rename_all = "camelCase")]
+    FinalizeRestore {
+        protocol_version: u32,
+        operation_id: String,
+        verification_id: String,
+        safety: Box<crate::host_state::SafetySnapshot>,
+    },
 }
 fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointCommand>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
@@ -300,6 +307,12 @@ fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointComma
             (protocol_version, operation_id)
         }
         CheckpointCommand::SelectRestore {
+            protocol_version,
+            operation_id,
+            verification_id,
+            safety,
+        }
+        | CheckpointCommand::FinalizeRestore {
             protocol_version,
             operation_id,
             verification_id,
@@ -415,6 +428,7 @@ pub fn run() -> Result<(), String> {
     }
     while !cancelled.load(Ordering::Acquire) {
         if let Ok(command) = command_receiver.try_recv() {
+            let finalizing = matches!(&command, CheckpointCommand::FinalizeRestore { .. });
             let result = match command {
                 CheckpointCommand::Checkpoint { operation_id, .. } => {
                     if matches!(
@@ -453,6 +467,12 @@ pub fn run() -> Result<(), String> {
                     verification_id,
                     safety,
                     ..
+                }
+                | CheckpointCommand::FinalizeRestore {
+                    operation_id,
+                    verification_id,
+                    safety,
+                    ..
                 } => {
                     if config.mode != crate::host_runtime::HostMode::RestorePrepare {
                         return Err("host_restore_unavailable".into());
@@ -460,9 +480,18 @@ pub fn run() -> Result<(), String> {
                     process.stop()?;
                     owner.clean_stop()?;
                     let proof = process.take_verified_restore(&operation_id, &verification_id)?;
-                    let generation = owner.select_restore(proof, *safety)?;
+                    let generation = if finalizing {
+                        owner.finalize_restore(proof, *safety)?
+                    } else {
+                        owner.select_restore(proof, *safety)?
+                    };
+                    let state = if finalizing {
+                        "restore-finalized"
+                    } else {
+                        "restore-activation-pending"
+                    };
                     emit(
-                        json!({"protocolVersion":1,"state":"restore-activation-pending","operationId":operation_id,"generation":generation}),
+                        json!({"protocolVersion":1,"state":state,"operationId":operation_id,"generation":generation}),
                     )?;
                     return stopped(&invalid);
                 }
@@ -752,6 +781,24 @@ mod tests {
         assert!(candidate_file(&fifo, 7).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn final_admission_pipe_requires_the_same_bound_nonce_and_safety_as_selection() {
+        let op = "11111111-1111-4111-8111-111111111111";
+        let request = json!({"protocolVersion":1,"action":"finalize-restore","operationId":op,
+            "verificationId":"22222222-2222-4222-8222-222222222222",
+            "safety":{"snapshotId":"a".repeat(64),"recoverySha256":"b".repeat(64),
+                "checkpoint":{"schemaVersion":1,"operationId":op,"manifestSha256":"c".repeat(64),"sourceRevision":"d".repeat(40),"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"e".repeat(64)}}}});
+        assert!(read_owner_command(&mut format!("{request}\n").as_bytes()).is_ok());
+        for key in ["verificationId", "safety"] {
+            let mut changed = request.clone();
+            changed.as_object_mut().unwrap().remove(key);
+            assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+        }
+        let mut changed = request;
+        changed["verified"] = json!(true);
+        assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+    }
+
     #[test]
     fn selection_pipe_accepts_only_a_nonce_and_bound_safety_metadata_never_boolean_proof_or_paths()
     {
