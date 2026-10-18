@@ -1175,10 +1175,10 @@ if (process.env.FRAMELEAF_HOST_AGENT === "1") {
 async function restoreInputJson(path) {
   if ((await fs.lstat(path)).size > 4096) fail("host_restore_input_invalid");
   const identity = await checkpointIdentity(path);
-  const before = await checkpointHash(path, () => {});
+  const before = await checkpointHash(path, () => {}, 4096);
   const raw = await stateFile(path, 4096);
   if (Buffer.byteLength(raw) !== before.bytes || createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
-    JSON.stringify(await checkpointHash(path, () => {})) !== JSON.stringify(before) || await checkpointIdentity(path) !== identity)
+    JSON.stringify(await checkpointHash(path, () => {}, 4096)) !== JSON.stringify(before) || await checkpointIdentity(path) !== identity)
     fail("host_restore_input_invalid");
   return JSON.parse(raw);
 }
@@ -1212,8 +1212,9 @@ function restoreInputRecovery(c, value) {
 }
 
 /** Fixed-path staged input validation only; restore effects require the later exclusive controller operation. */
-export async function readHostRestoreInput(c, supplied) {
+export async function readHostRestoreInput(c, supplied, check = () => {}) {
   try {
+    check();
     validateConfig(c);
     const binding = restoreInputBinding(c, supplied), root = join(c.state, "restore-input"), target = join(root, binding.operationId), input = join(target, "input");
     const identities = new Map();
@@ -1226,11 +1227,11 @@ export async function readHostRestoreInput(c, supplied) {
     const recovery = restoreInputRecovery(c, await restoreInputJson(join(input, "recovery.json")));
     if (recovery.libraryId !== binding.libraryId || createHash("sha256").update(JSON.stringify(recovery)).digest("hex") !== binding.recoverySha256)
       fail("host_restore_input_invalid");
-    const dump = join(input, "database.dump"), actual = await checkpointHash(dump, () => {});
+    const dump = join(input, "database.dump"), actual = await checkpointHash(dump, check);
     if (JSON.stringify(actual) !== JSON.stringify(recovery.checkpoint.dump)) fail("host_restore_input_invalid");
     for (const [path, identity] of identities) if (await checkpointIdentity(path, true) !== identity) fail("host_restore_input_invalid");
     return { binding, recovery, dump };
-  } catch { fail("host_restore_input_invalid"); }
+  } catch (error) { if (error?.message === "host_restore_cancelled") throw error; fail("host_restore_input_invalid"); }
 }
 
 
@@ -1273,12 +1274,13 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
 }
 
 /** Recheck prepared evidence only; exclusive activation must still verify offline database state. */
-export async function readHostRestoreTarget(configuration, supplied) {
+export async function readHostRestoreTarget(configuration, supplied, check = () => {}) {
   try {
     const c = {
       ...configuration,
       entryPoints: { ...configuration.entryPoints },
     };
+    check();
     validateConfig(c);
     if (
       !supplied ||
@@ -1370,7 +1372,7 @@ export async function readHostRestoreTarget(configuration, supplied) {
         if (error.code !== "ENOENT") throw error;
       }
       const path = join(database, "PG_VERSION"),
-        before = await checkpointHash(path, () => {}, 16),
+        before = await checkpointHash(path, check, 16),
         raw = await stateFile(path, 16);
       if (
         raw.trim() !== c.postgresMajor ||
@@ -1381,7 +1383,7 @@ export async function readHostRestoreTarget(configuration, supplied) {
         fail("host_restore_target_invalid");
     }
     await verifyRecords();
-    const input = await readHostRestoreInput(c, receipt.binding);
+    const input = await readHostRestoreInput(c, receipt.binding, check);
     if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision)
       fail("host_restore_target_invalid");
     for (const [path, identity] of identities)
@@ -1392,7 +1394,114 @@ export async function readHostRestoreTarget(configuration, supplied) {
       if ((await checkpointIdentity(path, true)) !== identity)
         fail("host_restore_target_invalid");
     return { receipt, target, database };
-  } catch {
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
     fail("host_restore_target_invalid");
+  }
+}
+/** Read-only evidence under the controller's exclusive leases; this never activates a database. */
+export async function verifyHostRestoreTarget(
+  configuration,
+  supplied,
+  stopping,
+) {
+  let child,
+    cancelled = false,
+    spawnFailed = false;
+  const deadline = Date.now() + 2 * 60 * 60_000;
+  void stopping.then(() => {
+    cancelled = true;
+  });
+  function check() {
+    if (cancelled) fail("host_restore_cancelled");
+    if (Date.now() > deadline) fail("host_restore_offline_invalid");
+  }
+  try {
+    const c = {
+      ...configuration,
+      entryPoints: { ...configuration.entryPoints },
+    };
+    const expected = structuredClone(supplied);
+    const checked = await readHostRestoreTarget(c, expected, check);
+    check();
+    const tool = c.entryPoints.pgChecksums;
+    if (
+      typeof tool !== "string" ||
+      tool.includes("\\") ||
+      tool.includes(":") ||
+      tool.split("/").some((part) => !part || part === "." || part === "..") ||
+      basename(tool) !==
+        "pg_checksums" + (process.platform === "win32" ? ".exe" : "")
+    )
+      fail("host_restore_offline_invalid");
+    async function tree() {
+      const entries = new Map(),
+        pending = [checked.database];
+      while (pending.length) {
+        check();
+        const path = pending.pop(),
+          meta = await fs.lstat(path, { bigint: true });
+        const directory = meta.isDirectory(),
+          identity = await checkpointIdentity(path, directory);
+        if (identity !== meta.dev + ":" + meta.ino || entries.size >= 100_000)
+          fail("host_restore_offline_invalid");
+        entries.set(path, {
+          identity,
+          directory,
+          size: meta.size,
+          modified: meta.mtimeNs,
+        });
+        if (directory) {
+          const handle = await fs.opendir(path);
+          for await (const entry of handle) {
+            check();
+            if (entries.size + pending.length >= 100_000)
+              fail("host_restore_offline_invalid");
+            pending.push(join(path, entry.name));
+          }
+          if ((await checkpointIdentity(path, true)) !== identity)
+            fail("host_restore_offline_invalid");
+        }
+      }
+      return entries;
+    }
+    const before = await tree();
+    check();
+    child = spawn(
+      join(c.runtime, tool),
+      ["--check", "--pgdata", checked.database],
+      {
+        cwd: checked.target,
+        env: hostEnvironment(c),
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    child.on("error", () => {
+      spawnFailed = true;
+    });
+    while (!(await exited(child, 100))) check();
+    check();
+    if (spawnFailed || child.exitCode !== 0 || child.signalCode !== null)
+      fail("host_restore_offline_invalid");
+    if (
+      !isDeepStrictEqual(await tree(), before) ||
+      !isDeepStrictEqual(await readHostRestoreTarget(c, expected, check), checked)
+    )
+      fail("host_restore_offline_invalid");
+    check();
+    return { ...checked, offlineChecksums: true };
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
+    fail("host_restore_offline_invalid");
+  } finally {
+    if (child && !(await exited(child, 100))) {
+      child.kill();
+      if (!(await exited(child, 5000))) {
+        child.kill("SIGKILL");
+        if (!(await exited(child, 5000)))
+          fail("host_restore_offline_stop_unconfirmed");
+      }
+    }
   }
 }

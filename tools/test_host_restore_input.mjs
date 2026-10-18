@@ -621,3 +621,79 @@ test('offline restore verification refuses cancellation, unsafe cluster contents
     });
   }
 });
+test('offline verification cancels while hashing staged input without launching a checksum process', async (t) => {
+  assert.equal(typeof owner.verifyHostRestoreTarget, 'function');
+  await preparedTargetFixture(t, async ({ c, receipt, path, bytes }) => {
+    c.entryPoints.pgChecksums =
+      'bin/pg_checksums' + (process.platform === 'win32' ? '.exe' : '');
+    let stop;
+    const stopping = new Promise((resolve) => {
+      stop = resolve;
+    });
+    let chunks = 0,
+      starts = 0;
+    const original = filesystem.open;
+    const fileProbe = t.mock.method(filesystem, 'open', async (...args) => {
+      const handle = await original(...args);
+      if (args[0] === join(path, 'input', 'database.dump'))
+        t.mock.method(handle, 'createReadStream', () =>
+          (async function* () {
+            chunks++;
+            stop();
+            yield bytes;
+            chunks++;
+            throw Error('cancelled dump must not consume another chunk');
+          })(),
+        );
+      return handle;
+    });
+    const spawnProbe = t.mock.method(subprocess, 'spawn', () => {
+      starts++;
+      throw Error('must not spawn');
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        owner.verifyHostRestoreTarget(c, receipt, stopping),
+        /host_restore_cancelled/,
+      );
+      assert.equal(chunks, 1);
+      assert.equal(starts, 0);
+    } finally {
+      fileProbe.mock.restore();
+      spawnProbe.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+test('prepared target metadata hashes stop if a JSON file grows beyond its opened-file bound', async (t) => {
+  await preparedTargetFixture(t, async ({ c, receipt, target }) => {
+    let chunks = 0;
+    const original = filesystem.open;
+    const probe = t.mock.method(filesystem, 'open', async (...args) => {
+      const handle = await original(...args);
+      if (args[0] === join(target, 'restore-target.json'))
+        t.mock.method(handle, 'createReadStream', () =>
+          (async function* () {
+            chunks++;
+            yield Buffer.alloc(4097, 0x31);
+            chunks++;
+            throw Error('oversized metadata must not consume another chunk');
+          })(),
+        );
+      return handle;
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        owner.readHostRestoreTarget(c, receipt),
+        /host_restore_target_invalid/,
+      );
+      assert.equal(chunks, 1);
+    } finally {
+      probe.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+});
