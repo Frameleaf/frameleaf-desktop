@@ -5,6 +5,18 @@
   const native = isTauri();
   const labels: Record<Control, string> = { start: 'Start server', stop: 'Stop server', restart: 'Restart server', backup: 'Create database backup' };
   const outcomes: Record<Control, string> = { start: 'Start operation completed. Check Photos to confirm it is ready.', stop: 'Server stop completed.', restart: 'Restart operation completed. Check Photos to confirm it is ready.', backup: 'Database backup completed. Photos and videos are not included.' };
+  const steps: Record<string, string> = {
+    start: 'Starting the server', stop: 'Stopping the server', restart: 'Restarting the server',
+    'database-backup': 'Creating the database backup',
+    'native-backup-start-database': 'Preparing the database for backup',
+    'native-backup-checkpoint': 'Creating the database checkpoint',
+    'native-backup-stage': 'Preparing recovery metadata',
+    'native-backup-encrypt': 'Encrypting the database backup',
+    'native-backup-verified': 'Restoring and verifying the encrypted backup',
+    'native-backup-owner-cleaned': 'Retiring the temporary checkpoint',
+    'native-backup-stage-cleaned': 'Removing temporary backup files',
+    'native-backup-stop-database': 'Confirming the backup database has stopped',
+  };
   let manager = $state<ManagerView | null>(null);
   let status = $state<ManagerStatus | null>(null);
   let pending = $state<Intent | null>(null);
@@ -177,7 +189,7 @@
       <div class="operation" aria-label="Manager operation">
         <h3>{labels[pending?.action || operation!.kind]}</h3>
         <p role="status">{operation ? operation.state === 'complete' ? operation.error ? 'Finished with a condition that needs review.' : 'Completed' : operation.state === 'failed' ? 'Needs attention' : operation.state === 'interrupted' ? 'Interrupted' : 'In progress' : pending?.id ? 'Waiting for operation state' : 'Request outcome has not been confirmed'}</p>
-        {#if operation?.step}<p class="footnote">{{ start: 'Starting the server', stop: 'Stopping the server', restart: 'Restarting the server', 'database-backup': 'Creating the database backup' }[operation.step] || 'Manager is processing this operation.'}</p>{/if}
+        {#if operation?.step}<p class="footnote">{Object.hasOwn(steps, operation.step) ? steps[operation.step] : 'Manager is processing this operation.'}</p>{/if}
         {#if operation?.error}<p class="error">{managerError(operation.error)}</p>{/if}
         {#if pending?.id || operation?.id}<p class="footnote">Operation <code>{pending?.id || operation?.id}</code></p>{/if}
         {#if pending}
