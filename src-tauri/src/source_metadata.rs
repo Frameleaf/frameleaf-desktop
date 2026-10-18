@@ -140,10 +140,12 @@ pub(crate) fn probe(dir: &Dir, name: &Path, meta: &Metadata) -> Result<Observati
         if opened.len() != meta.len()
             || opened.is_dir() != meta.is_dir()
             || opened.file_attributes() != meta.file_attributes()
-            || opened
-                .modified()
-                .map_err(|_| "source_metadata_unavailable")?
-                != meta.modified().map_err(|_| "source_metadata_unavailable")?
+            // The pinned root is opened by handle; child activity can change its timestamp.
+            || ((name != Path::new(".") || !opened.is_dir())
+                && opened
+                    .modified()
+                    .map_err(|_| "source_metadata_unavailable")?
+                    != meta.modified().map_err(|_| "source_metadata_unavailable")?)
         {
             #[cfg(debug_assertions)]
             eprintln!("source_identity/windows_probe root={} expected_len={} opened_len={} expected_dir={} opened_dir={} expected_attributes={:#x} opened_attributes={:#x} expected_modified={:?} opened_modified={:?}", name == Path::new("."), meta.len(), opened.len(), meta.is_dir(), opened.is_dir(), meta.file_attributes(), opened.file_attributes(), meta.modified(), opened.modified());
