@@ -60,14 +60,38 @@ async fn role(role: &str, root: &Path) {
                 &"b".repeat(64),
                 "https://127.0.0.1:9443",
                 reqwest::Client::new(),
-                Some(crate::package_lease::CodeLease::acquire(&root.join("code")).unwrap()),
+                Leases {
+                    code: Some(
+                        crate::package_lease::CodeLease::acquire(&root.join("code")).unwrap(),
+                    ),
+                    startup: Some(
+                        crate::host_state::Owner::acquire(&root.join("state"), true).unwrap(),
+                    ),
+                },
             )
             .unwrap();
             record(root, "worker", owner.child.id());
             fs::write(root.join("owner-ready"), b"ready").unwrap();
             wait_for(&root.join("action"));
-            if fs::read(root.join("action")).unwrap() == b"shutdown" {
-                owner.shutdown(Duration::from_secs(5)).await.unwrap();
+            match fs::read(root.join("action")).unwrap().as_slice() {
+                b"shutdown" => owner.shutdown(Duration::from_secs(5)).await.unwrap(),
+                action @ (b"cancel" | b"bad-receipt") => {
+                    let cancelled = action == b"cancel";
+                    let error = owner
+                        .wait_ready(Duration::from_secs(5), &AtomicBool::new(cancelled))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        error,
+                        if cancelled {
+                            "native_manager_start_cancelled"
+                        } else {
+                            "native_manager_receipt_invalid"
+                        }
+                    );
+                    assert!(owner.startup_lease.is_none());
+                }
+                _ => {}
             }
             drop(owner);
         }
@@ -121,7 +145,14 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
         role(&value, &PathBuf::from(std::env::var_os(ROOT).unwrap())).await;
         return;
     }
-    for mode in ["drop", "leader-first", "shutdown", "owner-loss"] {
+    for mode in [
+        "drop",
+        "leader-first",
+        "shutdown",
+        "cancel",
+        "bad-receipt",
+        "owner-loss",
+    ] {
         let started = Instant::now();
         let root = std::env::temp_dir()
             .canonicalize()
@@ -160,6 +191,7 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
             lease.try_lock().is_err(),
             "live Manager must exclude maintenance"
         );
+        assert!(crate::host_state::Owner::acquire(&fixture.root.join("state"), true).is_err());
         for handle in &fixture.handles {
             assert_eq!(
                 unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
@@ -200,5 +232,6 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
         assert!(mode == "owner-loss" || status.success());
         lease.try_lock().unwrap();
         lease.unlock().unwrap();
+        drop(crate::host_state::Owner::acquire(&fixture.root.join("state"), true).unwrap());
     }
 }

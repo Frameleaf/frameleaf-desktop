@@ -237,6 +237,8 @@ fn ready(bytes: &[u8], id: &str, hash: &str, origin: &str) -> Result<(), String>
 }
 pub struct NativeManager {
     child: Child,
+    #[cfg(windows)]
+    tree: crate::process_tree::ProcessTree,
     receipt: mpsc::Receiver<Result<Vec<u8>, String>>,
     installation_id: String,
     manifest_sha256: String,
@@ -246,6 +248,11 @@ pub struct NativeManager {
     startup_lease: Option<crate::host_state::Owner>,
     certificate_pem: String,
     _code_lease: Option<crate::package_lease::CodeLease>,
+}
+#[derive(Default)]
+struct Leases {
+    code: Option<crate::package_lease::CodeLease>,
+    startup: Option<crate::host_state::Owner>,
 }
 impl Programs<'_> {
     pub fn start_from_keystore(&self, config: &Configuration) -> Result<NativeManager, String> {
@@ -268,9 +275,13 @@ impl Programs<'_> {
             TlsIdentity::from_keystore(&config.installation_id, &config.origin, profile.binding())?;
         profile.require_current(config)?;
         let lease = crate::host_state::Owner::acquire(&config.state, true)?;
-        let mut manager = self.start(config, &profile.password(), &profile.backup_key()?, &tls)?;
-        manager.startup_lease = Some(lease);
-        Ok(manager)
+        self.start_owned(
+            config,
+            &profile.password(),
+            &profile.backup_key()?,
+            &tls,
+            Some(lease),
+        )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
     pub fn start(
@@ -279,6 +290,16 @@ impl Programs<'_> {
         password: &Zeroizing<String>,
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
+    ) -> Result<NativeManager, String> {
+        self.start_owned(config, password, backup_key, tls, None)
+    }
+    fn start_owned(
+        &self,
+        config: &Configuration,
+        password: &Zeroizing<String>,
+        backup_key: &Zeroizing<String>,
+        tls: &TlsIdentity,
+        startup_lease: Option<crate::host_state::Owner>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
@@ -386,7 +407,10 @@ impl Programs<'_> {
             self.runtime.manifest_sha256(),
             &config.origin,
             client,
-            Some(code_lease),
+            Leases {
+                code: Some(code_lease),
+                startup: startup_lease,
+            },
         )?;
         manager.certificate_pem = tls.certificate().into();
         Ok(manager)
@@ -400,29 +424,45 @@ impl NativeManager {
         hash: &str,
         origin: &str,
         client: reqwest::Client,
-        code_lease: Option<crate::package_lease::CodeLease>,
+        leases: Leases,
     ) -> Result<Self, String> {
-        if let Some(lease) = &code_lease {
+        if let Some(lease) = &leases.code {
             lease.inherit(command);
         }
+        #[cfg(windows)]
+        crate::process_tree::configure(command);
         let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| "native_manager_launch_failed")?;
+        #[cfg(windows)]
+        let (child, tree) = {
+            let mut child = child;
+            match crate::process_tree::ProcessTree::attach(&child) {
+                Ok(tree) => (child, tree),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("native_manager_process_owner_failed".into());
+                }
+            }
+        };
         let (receipt_tx, receipt) = mpsc::channel();
         let mut owner = Self {
             child,
+            #[cfg(windows)]
+            tree,
             receipt,
             installation_id: id.into(),
             manifest_sha256: hash.into(),
             origin: origin.into(),
             client,
             verified_ready: false,
-            startup_lease: None,
+            startup_lease: leases.startup,
             certificate_pem: String::new(),
-            _code_lease: code_lease,
+            _code_lease: leases.code,
         };
         let stdout = owner
             .child
@@ -474,9 +514,14 @@ impl NativeManager {
         }
         let result = self.wait_ready_inner(timeout, cancel).await;
         if result.is_err() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
             self.verified_ready = false;
+            #[cfg(windows)]
+            self.cleanup_windows(Duration::from_secs(5))?;
+            #[cfg(not(windows))]
+            {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
         }
         self.startup_lease.take();
         result
@@ -602,27 +647,15 @@ impl NativeManager {
                 .map_err(|_| "native_manager_state_unavailable")?
                 .is_none())
     }
-    /// Confirms only this Manager's exit. Controller/host quiescence requires its separate journal/lease proof.
+    /// Database quiescence requires separate journal/lease proof before stopping the Manager.
     pub async fn shutdown(&mut self, timeout: Duration) -> Result<(), String> {
         self.verified_ready = false;
-        if self
-            .child
-            .try_wait()
-            .map_err(|_| "native_manager_state_unavailable")?
-            .is_some()
+        #[cfg(windows)]
         {
-            return Ok(());
+            self.cleanup_windows(timeout)
         }
-        #[cfg(unix)]
-        if unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) } != 0 {
-            return Err("native_manager_shutdown_unconfirmed".into());
-        }
-        #[cfg(not(unix))]
-        self.child
-            .kill()
-            .map_err(|_| "native_manager_shutdown_unconfirmed")?;
-        let deadline = Instant::now() + timeout;
-        loop {
+        #[cfg(not(windows))]
+        {
             if self
                 .child
                 .try_wait()
@@ -631,15 +664,54 @@ impl NativeManager {
             {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            #[cfg(unix)]
+            if unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) } != 0 {
                 return Err("native_manager_shutdown_unconfirmed".into());
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            #[cfg(not(unix))]
+            self.child
+                .kill()
+                .map_err(|_| "native_manager_shutdown_unconfirmed")?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                if self
+                    .child
+                    .try_wait()
+                    .map_err(|_| "native_manager_state_unavailable")?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err("native_manager_shutdown_unconfirmed".into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    #[cfg(windows)]
+    fn cleanup_windows(&mut self, timeout: Duration) -> Result<(), String> {
+        self.tree
+            .terminate_confirmed(timeout)
+            .map_err(|_| "native_manager_shutdown_unconfirmed")?;
+        match self.child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            _ => Err("native_manager_shutdown_unconfirmed".into()),
         }
     }
 }
 impl Drop for NativeManager {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if self.cleanup_windows(Duration::from_secs(5)).is_err() {
+                // Retain maintenance/startup exclusion until process exit if cleanup is unproven.
+                std::mem::forget(self._code_lease.take());
+                std::mem::forget(self.startup_lease.take());
+                let _ = self.child.kill();
+            }
+        }
+        #[cfg(not(windows))]
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -770,7 +842,7 @@ mod tests {
                 &"b".repeat(64),
                 "https://127.0.0.1:9443",
                 reqwest::Client::new(),
-                None,
+                Leases::default(),
             )
             .unwrap();
             let state = std::env::temp_dir()
@@ -876,7 +948,7 @@ mod tests {
             &"b".repeat(64),
             origin,
             client,
-            None,
+            Leases::default(),
         )
         .unwrap();
         let state = output.join("state");
