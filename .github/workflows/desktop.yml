@@ -132,6 +132,16 @@ jobs:
       - name: Check Windows production and test code with strict Clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Probe physical Shell paths with explicit executable classes without elevation
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE) { throw 'Shell class matrix discovery failed' }
+          $fixtures = @($tests | Select-String '^windows_profile_elevation::tests::physical_shell_class_matrix_without_elevation: test$')
+          if ($fixtures.Count -ne 1) { throw 'Shell class matrix fixture is missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_profile_elevation::tests::physical_shell_class_matrix_without_elevation -- --exact --ignored --nocapture
+          if ($LASTEXITCODE) { throw 'Physical Shell class matrix did not launch the test child' }
 
   keystore-probe:
     if: ${{ inputs.keystore_probe }}

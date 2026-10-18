@@ -76,6 +76,14 @@ mod native {
         Ok(file)
     }
     pub(super) fn execute(path: &Path, parameters: &str, elevate: bool) -> Result<u32, String> {
+        execute_configured(path, parameters, elevate, |_| {})
+    }
+    pub(super) fn execute_configured(
+        path: &Path,
+        parameters: &str,
+        elevate: bool,
+        configure: impl FnOnce(&mut SHELLEXECUTEINFOW),
+    ) -> Result<u32, String> {
         let result = unsafe {
             CoInitializeEx(
                 std::ptr::null(),
@@ -116,6 +124,7 @@ mod native {
             nShow: 0,
             ..Default::default()
         };
+        configure(&mut info);
         if unsafe { ShellExecuteExW(&mut info) } == 0 {
             let code = unsafe { GetLastError() };
             #[cfg(debug_assertions)]
@@ -254,6 +263,69 @@ mod tests {
             )
             .unwrap(),
             73
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "diagnostic physical-path/class matrix; never prompts for elevation"]
+    fn physical_shell_class_matrix_without_elevation() {
+        use windows_sys::Win32::{
+            System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ},
+            UI::Shell::{SEE_MASK_CLASSKEY, SEE_MASK_CLASSNAME},
+        };
+        struct Key(HKEY);
+        impl Drop for Key {
+            fn drop(&mut self) {
+                unsafe { RegCloseKey(self.0) };
+            }
+        }
+        let mut key = Key(std::ptr::null_mut());
+        let name: Vec<u16> = "Software\\Classes\\exefile\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, name.as_ptr(), 0, KEY_READ, &mut key.0) },
+            0
+        );
+        assert!(!key.0.is_null());
+        let class: Vec<u16> = "exefile\0".encode_utf16().collect();
+        let device =
+            crate::windows_protection::stable_path(&std::env::current_exe().unwrap()).unwrap();
+        let filesystem = std::path::PathBuf::from(
+            crate::windows_protection::extended_filesystem_path(device.to_str().unwrap()).unwrap(),
+        );
+        let _pin = native::pin(&device).unwrap();
+        let mut succeeded = 0;
+        for (spelling, path) in [("device", &device), ("filesystem", &filesystem)] {
+            for variant in ["default", "named-executable", "machine-executable"] {
+                eprintln!("shell_class_probe: path={spelling} class={variant}");
+                let result = native::execute_configured(
+                    path,
+                    "--exact windows_profile_elevation::tests::shell_launch_child --ignored",
+                    false,
+                    |info| match variant {
+                        "named-executable" => {
+                            info.fMask |= SEE_MASK_CLASSNAME;
+                            info.lpClass = class.as_ptr();
+                        }
+                        "machine-executable" => {
+                            info.fMask |= SEE_MASK_CLASSKEY;
+                            info.hkeyClass = key.0;
+                        }
+                        _ => {}
+                    },
+                );
+                match result {
+                    Ok(code) => {
+                        assert_eq!(code, 73);
+                        succeeded += 1;
+                        eprintln!("shell_class_probe: child_exit={code}");
+                    }
+                    Err(code) => eprintln!("shell_class_probe: failed={code}"),
+                }
+            }
+        }
+        assert!(
+            succeeded > 0,
+            "all six physical Shell path/class variants failed"
         );
     }
     #[cfg(windows)]
