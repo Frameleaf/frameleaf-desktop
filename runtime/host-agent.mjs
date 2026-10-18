@@ -702,6 +702,33 @@ export function ownHostServer(child) {
   };
 }
 
+/** Internal controller locator only; no caller-supplied paths and no activation authority. */
+export async function readHostDatabase(profile, supplied) {
+  if (supplied === undefined) return join(profile, "database");
+  try {
+    const reference = structuredClone(supplied);
+    if (!reference || Object.keys(reference).sort().join(",") !== "attemptId,identities,operationId" ||
+      typeof reference.operationId !== "string" || !CHECKPOINT_ID.test(reference.operationId) ||
+      typeof reference.attemptId !== "string" || !CHECKPOINT_ID.test(reference.attemptId) ||
+      !Array.isArray(reference.identities) || reference.identities.length !== 5 ||
+      !reference.identities.every(value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)))
+      fail("host_database_reference_invalid");
+    const root = join(profile, "restore-targets"), operation = join(root, reference.operationId),
+      target = join(operation, reference.attemptId), database = join(target, "database");
+    const paths = [profile, root, operation, target, database];
+    for (let i = 0; i < paths.length; i++) {
+      await checkpointIdentity(paths[i], true);
+      const meta = await fs.lstat(paths[i], { bigint: true });
+      // Match the controller's native identity namespace, including Windows' high/low file index.
+      const identity = process.platform === "win32"
+        ? `${meta.dev}:${meta.ino >> 32n}:${meta.ino & 0xffffffffn}` : `${meta.dev}:${meta.ino}`;
+      if (createHash("sha256").update(identity).digest("hex") !== reference.identities[i])
+        fail("host_database_reference_invalid");
+    }
+    return database;
+  } catch { fail("host_database_reference_invalid"); }
+}
+
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
   if (restoreSession !== undefined && restoreSession?.[RESTORE_SESSION] !== true) fail("host_restore_authority_invalid");
@@ -726,6 +753,9 @@ export async function runHost(c, stopping, ready, restoreSession) {
     finally { cancelled = true; await pending?.catch(() => {}); }
     return;
   }
+  const databaseReference = c.databaseReference === undefined ? undefined : structuredClone(c.databaseReference);
+  const data = await readHostDatabase(c.state, databaseReference);
+  const selectedDatabase = databaseReference !== undefined;
   const databaseOnly = c.mode === "database";
   if (!databaseOnly && !restoreOnly) await portFree(c.apiPort);
   await portFree(c.databasePort);
@@ -765,7 +795,6 @@ export async function runHost(c, stopping, ready, restoreSession) {
       fail("host_state_not_private");
   }
   const executable = (name) => join(c.runtime, c.entryPoints[name]);
-  const data = join(c.state, "database");
   const env = hostEnvironment(c);
   const logPath = join(c.state, "host.log");
   try {
@@ -846,7 +875,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       if (error.code !== "ENOENT") throw error;
     }
     if (restoreOnly && initialized) fail("host_restore_target_not_empty");
-    if (databaseOnly && !initialized) fail("host_database_missing");
+    if ((databaseOnly || selectedDatabase) && !initialized) fail("host_database_missing");
     if (!initialized) {
       try {
         await fs.lstat(data);
@@ -874,6 +903,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       }
     }
     if (cancelled) fail("host_cancelled");
+    if (selectedDatabase) await readHostDatabase(c.state, databaseReference);
     pg = launch([
       executable("postgres"),
       "-D",
@@ -929,7 +959,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
     if (database.trim() !== "" && database.trim() !== "1")
       fail("host_database_provisioning_failed");
     if (restoreOnly && database.trim() !== "") fail("host_restore_target_not_empty");
-    if (databaseOnly && database.trim() === "") fail("host_database_missing");
+    if ((databaseOnly || selectedDatabase) && database.trim() === "") fail("host_database_missing");
     if (database.trim() === "")
       await command(
         [
@@ -1249,7 +1279,7 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   const attemptId = randomUUID(), target = join(operationRoot, attemptId);
   await fs.mkdir(target, {mode:0o700});
   const targetIdentity = await checkpointIdentity(target, true);
-  const inner = {...c, state:target, mode:"server"};
+  const inner = {...c, state:target, mode:"server", databaseReference:undefined};
   await claimState(inner);
   const intent = {schemaVersion:1, binding:input.binding, attemptId, profileIdentity, targetIdentity};
   const record = await fs.open(join(target,"restore-target.json"),"wx",0o600);

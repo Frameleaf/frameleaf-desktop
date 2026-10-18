@@ -339,9 +339,6 @@ pub fn run() -> Result<(), String> {
         } else {
             crate::host_storage::check(&config.state)?;
         }
-        if config.mode == crate::host_runtime::HostMode::Database {
-            crate::host_storage::check(&config.state.join("database"))?;
-        }
         candidate_file(&config.state.join("host-state.json"), 4096)?;
     }
     let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
@@ -353,13 +350,18 @@ pub fn run() -> Result<(), String> {
     } else {
         crate::host_storage::check(&config.state)?;
     }
-    owner.activate(&config.installation_id, &config.manifest_sha256)?;
+    owner.activate(
+        &config.installation_id,
+        &config.manifest_sha256,
+        config.mode,
+    )?;
     let mut process = runtime.start_mode(
         &config.state,
         &password,
         config.database_port,
         config.api_port,
         config.mode,
+        Some(&mut owner),
     )?;
     if !process.wait_ready_or_cancel(Duration::from_secs(240), &cancelled)? {
         owner.clean_stop()?;

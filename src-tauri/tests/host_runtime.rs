@@ -241,6 +241,23 @@ fn host_start_refuses_a_linked_database_before_launching_any_process() {
 }
 
 #[test]
+fn direct_host_start_cannot_bypass_a_controller_managed_profile() {
+    let fixture = Fixture::new();
+    let state = fixture.2.join("state");
+    fs::create_dir(&state).unwrap();
+    fs::write(
+        state.join("controller-state.json"),
+        b"even a torn marker requires its controller",
+    )
+    .unwrap();
+    let verified = fixture.verify().unwrap();
+    assert!(
+        matches!(verified.start(&state, &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()), 54321, 54322), Err(code) if code == "host_controller_required")
+    );
+    assert!(!state.join("agent.log").exists());
+}
+
+#[test]
 fn host_start_refuses_maintenance_before_creating_private_state() {
     use zeroize::Zeroizing;
     let fixture = Fixture::new();

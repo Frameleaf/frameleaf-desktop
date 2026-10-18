@@ -16,7 +16,7 @@ pub(crate) enum Phase {
     Active,
     Stopped,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Marker {
     schema_version: u32,
@@ -25,6 +25,8 @@ pub(crate) struct Marker {
     pub profile_identity: String,
     pub generation: Uuid,
     pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    database_reference: Option<crate::host_database::Reference>,
 }
 pub(crate) struct Owner {
     path: PathBuf,
@@ -212,13 +214,24 @@ impl Owner {
             .and_then(|_| self.file.sync_all())
             .map_err(|_| "host_controller_state_write_failed".into())
     }
-    pub fn activate(&mut self, id: &str, sha: &str) -> Result<(), String> {
-        match self.read()? {
+    pub fn activate(
+        &mut self,
+        id: &str,
+        sha: &str,
+        mode: crate::host_runtime::HostMode,
+    ) -> Result<(), String> {
+        let database_reference = match self.read()? {
             Some(marker) => {
                 self.binding(&marker, id, sha)?;
                 if marker.phase != Phase::Stopped {
                     return Err("host_recovery_requires_manager".into());
                 }
+                if mode.uses_database() {
+                    if let Some(reference) = &marker.database_reference {
+                        reference.resolve(&self.path)?;
+                    }
+                }
+                marker.database_reference
             }
             None => {
                 for entry in self
@@ -234,8 +247,9 @@ impl Owner {
                         return Err("host_recovery_requires_manager".into());
                     }
                 }
+                None
             }
-        }
+        };
         let marker = Marker {
             schema_version: 1,
             installation_id: id.into(),
@@ -243,6 +257,7 @@ impl Owner {
             profile_identity: self.profile_identity.clone(),
             generation: Uuid::new_v4(),
             phase: Phase::Active,
+            database_reference,
         };
         self.write(&marker)?;
         self.active = Some(marker);
@@ -251,7 +266,7 @@ impl Owner {
     pub fn clean_stop(&mut self) -> Result<(), String> {
         let mut marker = self.active.clone().ok_or("host_controller_state_invalid")?;
         let current = self.read()?.ok_or("host_controller_state_invalid")?;
-        if current.generation != marker.generation || current.phase != Phase::Active {
+        if current != marker || current.phase != Phase::Active {
             return Err("host_controller_binding_changed".into());
         }
         self.binding(&current, &marker.installation_id, &marker.manifest_sha256)?;
@@ -259,6 +274,32 @@ impl Owner {
         self.write(&marker)?;
         self.active = None;
         Ok(())
+    }
+    /// Only the active controller can derive the internal host configuration.
+    pub(crate) fn launch_state(
+        &mut self,
+        manifest_sha256: &str,
+        mode: crate::host_runtime::HostMode,
+    ) -> Result<(PathBuf, Option<crate::host_database::Reference>), String> {
+        let marker = self
+            .active
+            .as_ref()
+            .ok_or("host_controller_state_invalid")?
+            .clone();
+        let current = self.read()?.ok_or("host_controller_state_invalid")?;
+        if current != marker
+            || current.phase != Phase::Active
+            || marker.manifest_sha256 != manifest_sha256
+        {
+            return Err("host_controller_binding_changed".into());
+        }
+        self.binding(&current, &marker.installation_id, &marker.manifest_sha256)?;
+        if mode.uses_database() {
+            if let Some(reference) = &marker.database_reference {
+                reference.resolve(&self.path)?;
+            }
+        }
+        Ok((self.path.clone(), marker.database_reference))
     }
     /// Keep this lease alive through Manager shutdown so a controller cannot start concurrently.
     pub(crate) fn admit_idle(&mut self, id: &str, sha: &str) -> Result<(), String> {
@@ -340,16 +381,22 @@ impl Owner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err("host_process_state_requires_review".into()),
         };
-        match self.root.symlink_metadata("database") {
-            Ok(_) => {
-                crate::native_runtime::absolute_directory(&self.path.join("database"))?;
-                match self.root.symlink_metadata("database/postmaster.pid") {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err("host_process_state_requires_review".into()),
+        let mut databases = vec![self.path.join("database")];
+        if let Some(reference) = &marker.database_reference {
+            databases.push(reference.resolve(&self.path)?);
+        }
+        for database in databases {
+            match std::fs::symlink_metadata(&database) {
+                Ok(_) => {
+                    crate::native_runtime::absolute_directory(&database)?;
+                    match std::fs::symlink_metadata(database.join("postmaster.pid")) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        _ => return Err("host_process_state_requires_review".into()),
+                    }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("host_process_state_requires_review".into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("host_process_state_requires_review".into()),
         }
         self.placement()?;
         Ok(marker)
@@ -386,7 +433,9 @@ mod tests {
     fn owner_drop_releases_fork_style_descriptor_without_claiming_clean_shutdown() {
         let fixture = Fixture::new();
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         let inherited = owner.file.try_clone().unwrap();
         assert!(Owner::acquire(&fixture.0, true).is_err());
         drop(owner);
@@ -405,7 +454,9 @@ mod tests {
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
         assert!(Owner::acquire(&fixture.0, true).is_err());
         assert!(Owner::acquire(&fixture.0, false).is_err());
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         drop(owner);
         let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
         assert_eq!(
@@ -418,7 +469,9 @@ mod tests {
     fn only_matching_clean_stop_and_current_physical_root_can_be_inspected() {
         let fixture = Fixture::new();
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         owner.clean_stop().unwrap();
         drop(owner);
         let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
@@ -443,11 +496,15 @@ mod tests {
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
         fs::write(fixture.0.join("legacy-data"), b"retained").unwrap();
         assert_eq!(
-            owner.activate(ID, &sha()).unwrap_err(),
+            owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+                .unwrap_err(),
             "host_recovery_requires_manager"
         );
         fs::remove_file(fixture.0.join("legacy-data")).unwrap();
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         owner.clean_stop().unwrap();
         drop(owner);
         fs::create_dir(fixture.0.join("database")).unwrap();
@@ -465,6 +522,74 @@ mod tests {
         assert!(inspector.inspect(ID, &sha()).is_err());
     }
 
+    #[test]
+    fn selected_database_survives_start_stop_and_idle_inspection_checks_its_pid() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        owner.clean_stop().unwrap();
+        let op = "11111111-1111-4111-8111-111111111111";
+        let attempt = "22222222-2222-4222-8222-222222222222";
+        let target = fixture.0.join("restore-targets").join(op).join(attempt);
+        for path in [
+            fixture.0.join("database"),
+            fixture.0.join("restore-targets"),
+            fixture.0.join("restore-targets").join(op),
+            target.clone(),
+            target.join("database"),
+        ] {
+            crate::runtime_store::private_directory(&path).unwrap();
+        }
+        fs::write(fixture.0.join("database/sentinel"), b"retained").unwrap();
+        let reference = crate::host_database::Reference::capture(&fixture.0, op, attempt).unwrap();
+        let mut marker = owner.read().unwrap().unwrap();
+        marker.database_reference = Some(reference.clone());
+        owner.write(&marker).unwrap();
+        owner.inspect(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        let (profile, selected) = owner
+            .launch_state(&sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(profile, fixture.0);
+        assert_eq!(selected, Some(reference.clone()));
+        owner.clean_stop().unwrap();
+        let stopped = owner.read().unwrap().unwrap();
+        assert_eq!(stopped.database_reference, Some(reference.clone()));
+        fs::write(target.join("database/postmaster.pid"), b"never adopt").unwrap();
+        assert_eq!(
+            owner.inspect(ID, &sha()).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        fs::remove_file(target.join("database/postmaster.pid")).unwrap();
+        fs::rename(target.join("database"), target.join("retained-database")).unwrap();
+        crate::runtime_store::private_directory(&target.join("database")).unwrap();
+        let journal = owner.read().unwrap().unwrap();
+        assert!(owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .is_err());
+        assert_eq!(owner.read().unwrap().unwrap(), journal);
+        // Neither cleanup nor preparation may depend on the original selected database.
+        for mode in [
+            crate::host_runtime::HostMode::CheckpointCleanup,
+            crate::host_runtime::HostMode::RestorePrepare,
+        ] {
+            owner.activate(ID, &sha(), mode).unwrap();
+            assert_eq!(
+                owner.launch_state(&sha(), mode).unwrap().1,
+                Some(reference.clone())
+            );
+            owner.clean_stop().unwrap();
+        }
+        assert_eq!(
+            fs::read(fixture.0.join("database/sentinel")).unwrap(),
+            b"retained"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn journal_refuses_symlinks_and_hardlinks_and_a_replaced_root() {
@@ -478,7 +603,9 @@ mod tests {
         assert!(Owner::acquire(&fixture.0, true).is_err());
         fs::remove_file(fixture.0.join(NAME)).unwrap();
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         let moved = fixture.0.with_extension("moved");
         fs::rename(&fixture.0, &moved).unwrap();
         fs::create_dir(&fixture.0).unwrap();
@@ -494,7 +621,9 @@ mod tests {
         let mut owner = Owner::acquire(&f.0, true).unwrap();
         owner.admit_idle(ID, &sha()).unwrap();
         assert!(Owner::acquire(&f.0, true).is_err());
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         assert!(owner.admit_idle(ID, &sha()).is_err());
         owner.clean_stop().unwrap();
         owner.admit_idle(ID, &sha()).unwrap();
@@ -510,14 +639,18 @@ mod tests {
         let fixture = Fixture::new();
         Owner::package_idle(&fixture.0).unwrap();
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         assert!(Owner::package_idle(&fixture.0).is_err());
         owner.clean_stop().unwrap();
         drop(owner);
         Owner::package_idle(&fixture.0).unwrap();
         let crashed = Fixture::new();
         let mut owner = Owner::acquire(&crashed.0, true).unwrap();
-        owner.activate(ID, &sha()).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
         drop(owner);
         assert!(Owner::package_idle(&crashed.0).is_err());
     }

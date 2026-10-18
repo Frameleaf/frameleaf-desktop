@@ -60,6 +60,7 @@ impl Reference {
             .map_err(|_| "host_database_reference_invalid".into())
     }
     /// A locator only: checksum/canonical validation and the controller lease still gate activation.
+    #[cfg(test)]
     pub(crate) fn capture(profile: &Path, operation: &str, attempt: &str) -> Result<Self, String> {
         let paths = Self::paths(profile, operation, attempt)?;
         let reference = Self {
@@ -154,6 +155,44 @@ mod tests {
             .unwrap()
             .contains(f.0.to_str().unwrap()));
     }
+    #[test]
+    fn node_owner_resolves_the_same_reference_in_the_native_identity_namespace() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let f = Fixture::new();
+        let reference = Reference::capture(&f.0, OP, ATTEMPT).unwrap();
+        let module = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../runtime/host-agent.mjs")
+            .canonicalize()
+            .unwrap();
+        let module = url::Url::from_file_path(module).unwrap();
+        let script = format!("import fs from 'node:fs'; import {{readHostDatabase}} from '{}'; const c=JSON.parse(fs.readFileSync(0,'utf8')); console.log(JSON.stringify(await readHostDatabase(c.profile,c.reference)));", module);
+        let mut child = Command::new("node")
+            .args(["--input-type=module", "--eval", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&serde_json::json!({"profile":f.0,"reference":reference}))
+                    .unwrap(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let selected: PathBuf = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(selected, f.database());
+    }
+
     #[test]
     fn references_refuse_path_authority_live_capture_and_changed_directory_identities() {
         for value in [

@@ -700,6 +700,9 @@ pub(crate) enum HostMode {
     RestorePrepare,
 }
 impl HostMode {
+    pub(crate) fn uses_database(self) -> bool {
+        matches!(self, Self::Server | Self::Database)
+    }
     pub(crate) fn ready_state(self) -> &'static str {
         match self {
             Self::Server => "running",
@@ -715,6 +718,8 @@ impl HostMode {
 struct HostStart<'a> {
     mode: HostMode,
     state: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database_reference: Option<&'a crate::host_database::Reference>,
     runtime: &'a Path,
     manifest_sha256: &'a str,
     source_revision: &'a str,
@@ -795,6 +800,13 @@ pub struct HostProcess {
     ready_seen: bool,
     mode: HostMode,
 }
+fn direct_profile(state: &Path) -> Result<(), String> {
+    // Controller-managed profiles must enter through their exact journal owner.
+    match std::fs::symlink_metadata(state.join("controller-state.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_controller_required".into()),
+    }
+}
 impl VerifiedHostRuntime {
     /// Credentials are native-only; callers persist them in the OS credential store before first start.
     pub fn start(
@@ -804,7 +816,14 @@ impl VerifiedHostRuntime {
         database_port: u16,
         api_port: u16,
     ) -> Result<HostProcess, String> {
-        self.start_mode(state, password, database_port, api_port, HostMode::Server)
+        self.start_mode(
+            state,
+            password,
+            database_port,
+            api_port,
+            HostMode::Server,
+            None,
+        )
     }
     pub(crate) fn start_mode(
         &self,
@@ -813,7 +832,18 @@ impl VerifiedHostRuntime {
         database_port: u16,
         api_port: u16,
         mode: HostMode,
+        mut owner: Option<&mut crate::host_state::Owner>,
     ) -> Result<HostProcess, String> {
+        let database_reference = if let Some(owner) = owner.as_mut() {
+            let (profile, reference) = owner.launch_state(&self.manifest_sha256, mode)?;
+            if profile != state {
+                return Err("host_controller_binding_changed".into());
+            }
+            reference
+        } else {
+            direct_profile(state)?;
+            None
+        };
         self.check_files()?;
         if password.len() < 24
             || password.len() > 512
@@ -836,8 +866,11 @@ impl VerifiedHostRuntime {
         } else {
             crate::host_storage::check(state)?;
         }
-        if !matches!(mode, HostMode::CheckpointCleanup | HostMode::RestorePrepare) {
-            let database = state.join("database");
+        if mode.uses_database() {
+            let database = match &database_reference {
+                Some(reference) => reference.resolve(state)?,
+                None => state.join("database"),
+            };
             match std::fs::symlink_metadata(&database) {
                 Ok(_) => crate::host_storage::check(&database)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -850,6 +883,11 @@ impl VerifiedHostRuntime {
             serde_json::to_vec(&HostStart {
                 mode,
                 state,
+                database_reference: if mode.uses_database() {
+                    database_reference.as_ref()
+                } else {
+                    None
+                },
                 runtime: &self.root,
                 manifest_sha256: &self.manifest_sha256,
                 source_revision: &self.manifest.source_revision,
@@ -861,6 +899,11 @@ impl VerifiedHostRuntime {
             })
             .map_err(|_| "host_config_invalid")?,
         );
+        if let Some(owner) = owner.as_mut() {
+            owner.launch_state(&self.manifest_sha256, mode)?;
+        } else {
+            direct_profile(state)?;
+        }
         let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
         command
             .args(["--input-type=module", "--eval", AGENT])
