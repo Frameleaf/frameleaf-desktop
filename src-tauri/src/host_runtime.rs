@@ -500,12 +500,13 @@ fn read_agent_output(
     ready: mpsc::Sender<Result<(), String>>,
     checkpoints: mpsc::SyncSender<AgentEvent>,
     protocol: Arc<CheckpointProtocol>,
+    mode: HostMode,
     fault: impl FnOnce(),
 ) {
     let result = (|| -> Result<(), String> {
         let raw = agent_line(&mut reader)?.ok_or("host_readiness_failed")?;
         if serde_json::from_slice::<serde_json::Value>(&raw).ok()
-            != Some(serde_json::json!({"state":"running"}))
+            != Some(serde_json::json!({"state":mode.ready_state()}))
         {
             return Err("host_readiness_failed".into());
         }
@@ -567,9 +568,26 @@ fn private_file(path: &Path, append: bool) -> Result<File, String> {
     Ok(file)
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum HostMode {
+    #[default]
+    Server,
+    Database,
+}
+impl HostMode {
+    pub(crate) fn ready_state(self) -> &'static str {
+        match self {
+            Self::Server => "running",
+            Self::Database => "database-ready",
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostStart<'a> {
+    mode: HostMode,
     state: &'a Path,
     runtime: &'a Path,
     manifest_sha256: &'a str,
@@ -659,6 +677,16 @@ impl VerifiedHostRuntime {
         database_port: u16,
         api_port: u16,
     ) -> Result<HostProcess, String> {
+        self.start_mode(state, password, database_port, api_port, HostMode::Server)
+    }
+    pub(crate) fn start_mode(
+        &self,
+        state: &Path,
+        password: &Zeroizing<String>,
+        database_port: u16,
+        api_port: u16,
+        mode: HostMode,
+    ) -> Result<HostProcess, String> {
         self.check_files()?;
         if password.len() < 24
             || password.len() > 512
@@ -687,6 +715,7 @@ impl VerifiedHostRuntime {
         lease.try_lock().map_err(|_| "host_already_owned")?;
         let message = Zeroizing::new(
             serde_json::to_vec(&HostStart {
+                mode,
                 state,
                 runtime: &self.root,
                 manifest_sha256: &self.manifest_sha256,
@@ -784,6 +813,7 @@ impl VerifiedHostRuntime {
                 sender,
                 checkpoint_sender,
                 protocol,
+                mode,
                 || output_owner.terminate(),
             )
         });
@@ -1094,6 +1124,33 @@ mod checkpoint_tests {
     }
 
     #[test]
+    fn database_readiness_cannot_be_confused_with_a_running_application() {
+        for (mode, state, accepted) in [
+            (HostMode::Server, "running", true),
+            (HostMode::Database, "database-ready", true),
+            (HostMode::Server, "database-ready", false),
+            (HostMode::Database, "running", false),
+        ] {
+            let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
+            protocol.stopping.store(true, Ordering::Release);
+            let (ready_tx, ready) = mpsc::channel();
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let failed = AtomicBool::new(false);
+            let input = format!("{{\"state\":\"{state}\"}}\n{{\"state\":\"stopped\"}}\n");
+            read_agent_output(
+                std::io::Cursor::new(input),
+                ready_tx,
+                tx,
+                protocol,
+                mode,
+                || failed.store(true, Ordering::Release),
+            );
+            assert_eq!(ready.recv().unwrap().is_ok(), accepted);
+            assert_eq!(failed.load(Ordering::Acquire), !accepted);
+        }
+    }
+
+    #[test]
     fn output_reader_rejects_a_duplicate_receipt_instead_of_blocking_on_a_full_channel() {
         let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
         protocol.begin(OPERATION).unwrap();
@@ -1110,6 +1167,7 @@ mod checkpoint_tests {
             ready_tx,
             tx,
             protocol.clone(),
+            HostMode::Server,
             || failed.store(true, Ordering::Release),
         );
         assert!(ready.recv().unwrap().is_ok());
@@ -1130,6 +1188,7 @@ mod checkpoint_tests {
             ready_tx,
             tx,
             protocol.clone(),
+            HostMode::Server,
             || panic!("valid cancellation was refused"),
         );
         assert!(ready.recv().unwrap().is_ok());

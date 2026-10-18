@@ -18,6 +18,8 @@ use zeroize::{Zeroize, Zeroizing};
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Config {
     protocol_version: u32,
+    #[serde(default)]
+    mode: crate::host_runtime::HostMode,
     installation_id: String,
     candidate: PathBuf,
     state: PathBuf,
@@ -315,24 +317,30 @@ pub fn run() -> Result<(), String> {
     separate_paths(&config.candidate, &config.state)?;
     let runtime = verify_candidate(&config.candidate, &config.manifest_sha256)?;
     let _code_lease = crate::package_lease::CodeLease::acquire(&config.candidate)?;
+    if config.mode == crate::host_runtime::HostMode::Database {
+        crate::host_storage::check(&config.state)?;
+        crate::host_storage::check(&config.state.join("database"))?;
+        candidate_file(&config.state.join("host-state.json"), 4096)?;
+    }
     let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
     crate::host_storage::check(&config.state)?;
     owner.activate(&config.installation_id, &config.manifest_sha256)?;
-    let mut process = runtime.start(
+    let mut process = runtime.start_mode(
         &config.state,
         &password,
         config.database_port,
         config.api_port,
+        config.mode,
     )?;
     if !process.wait_ready_or_cancel(Duration::from_secs(240), &cancelled)? {
         owner.clean_stop()?;
         return stopped(&invalid);
     }
     if emit(
-        json!({"protocolVersion":1,"state":"running", "manifestSha256":runtime.manifest_sha256(),
+        json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
         "sourceRevision":runtime.source_revision(),"certified":runtime.certified()}),
     )
     .is_err()
@@ -477,6 +485,22 @@ mod tests {
             "manifestSha256":"a".repeat(64),"password":"synthetic-password-long-enough",
             "databasePort":54321,"apiPort":54322});
         assert!(config(&serde_json::to_vec(&good).unwrap()).is_ok());
+        assert_eq!(
+            config(&serde_json::to_vec(&good).unwrap()).unwrap().mode,
+            crate::host_runtime::HostMode::Server
+        );
+        let mut maintenance = good.clone();
+        maintenance["mode"] = json!("database");
+        assert_eq!(
+            config(&serde_json::to_vec(&maintenance).unwrap())
+                .unwrap()
+                .mode,
+            crate::host_runtime::HostMode::Database
+        );
+        for invalid in [json!(null), json!("backup"), json!(true)] {
+            maintenance["mode"] = invalid;
+            assert!(config(&serde_json::to_vec(&maintenance).unwrap()).is_err());
+        }
         // Joining a Windows verbatim path normalizes away the traversal before validation.
         let parent_path = |leaf: &str| {
             json!(format!(

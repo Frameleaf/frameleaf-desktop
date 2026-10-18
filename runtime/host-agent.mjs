@@ -39,6 +39,7 @@ export function studioReadyUntil(message, engineDigest, now = Date.now()) {
 export function validateConfig(c) {
   if (
     !c ||
+    (c.mode !== undefined && !["server", "database"].includes(c.mode)) ||
     !isAbsolute(c.state ?? "") ||
     !isAbsolute(c.runtime ?? "") ||
     c.state === c.runtime ||
@@ -693,8 +694,19 @@ export function ownHostServer(child) {
 
 export async function runHost(c, stopping, ready) {
   validateConfig(c);
-  await portFree(c.apiPort);
+  const databaseOnly = c.mode === "database";
+  if (!databaseOnly) await portFree(c.apiPort);
   await portFree(c.databasePort);
+  if (databaseOnly) {
+    try {
+      await checkpointDirectory(c.state);
+      if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
+      await stateFile(join(c.state, "host-state.json"), 4096);
+    } catch (error) {
+      if (error.code === "ENOENT") fail("host_database_missing");
+      throw error;
+    }
+  }
   await claimState(c);
   const previousPassword = join(c.state, "database-password.tmp");
   try {
@@ -705,7 +717,7 @@ export async function runHost(c, stopping, ready) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  for (const name of ["home", "media", "studio-trust", "studio-work"]) {
+  for (const name of databaseOnly ? ["home"] : ["home", "media", "studio-trust", "studio-work"]) {
     const path = join(c.state, name);
     try {
       await fs.mkdir(path, { mode: 0o700 });
@@ -801,6 +813,7 @@ export async function runHost(c, stopping, ready) {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    if (databaseOnly && !initialized) fail("host_database_missing");
     if (!initialized) {
       try {
         await fs.lstat(data);
@@ -836,6 +849,7 @@ export async function runHost(c, stopping, ready) {
       "127.0.0.1",
       "-p",
       String(c.databasePort),
+      ...(databaseOnly ? ["-c", "default_transaction_read_only=on"] : []),
     ]);
     const deadline = Date.now() + 30_000;
     while (true) {
@@ -881,6 +895,7 @@ export async function runHost(c, stopping, ready) {
     );
     if (database.trim() !== "" && database.trim() !== "1")
       fail("host_database_provisioning_failed");
+    if (databaseOnly && database.trim() === "") fail("host_database_missing");
     if (database.trim() === "")
       await command(
         [
@@ -895,99 +910,101 @@ export async function runHost(c, stopping, ready) {
         ],
         { PGPASSWORD: c.password },
       );
-    app = launch(
-      [executable("node"), executable("server")],
-      {
-        DB_HOSTNAME: "127.0.0.1",
-        DB_PORT: String(c.databasePort),
-        DB_USERNAME: "frameleaf",
-        DB_PASSWORD: c.password,
-        DB_DATABASE_NAME: "frameleaf",
-        FRAMELEAF_HOST: "127.0.0.1",
-        FRAMELEAF_PORT: String(c.apiPort),
-        FRAMELEAF_MEDIA_LOCATION: join(c.state, "media"),
-        FRAMELEAF_BUILD_DATA: join(c.runtime, "build"),
-        FRAMELEAF_HDR_BINDING: executable("hdr"),
-        FRAMELEAF_WORKERS_INCLUDE: "api,microservices",
-        FRAMELEAF_NATIVE_OWNER: "1",
-        FRAMELEAF_STUDIO_WORKER: STUDIO_ENABLED ? "true" : "false",
-      },
-      ["ignore", "pipe", "pipe", "ipc"],
-    );
-    appOwner = ownHostServer(app);
-    let markers = "",
-      api = false,
-      microservices = false;
-    const observe = (chunk) => {
-      markers = (markers + chunk.toString()).slice(-65536);
-      api ||= markers.includes("Frameleaf Server is listening on");
-      microservices ||= markers.includes("Frameleaf Microservices is running");
-    };
-    app.stdout.on("data", observe);
-    app.stderr.on("data", observe);
-    const startupDeadline = Date.now() + 180_000;
-    while (true) {
-      if (
-        cancelled ||
-        !app.pid ||
-        !pg.pid ||
-        app.exitCode !== null ||
-        app.signalCode !== null ||
-        pg.exitCode !== null ||
-        pg.signalCode !== null ||
-        Date.now() > startupDeadline
-      )
-        fail("host_application_not_ready");
-      if (appOwner.check() && api && microservices) {
-        try {
-          const response = await fetch(
-            `http://127.0.0.1:${c.apiPort}/api/server/ping`,
-            { signal: AbortSignal.timeout(2000), redirect: "error" },
-          );
-          if (response.ok && (await response.json()).res === "pong") break;
-        } catch {
-          /* Startup may have attached the listener before its first request succeeds. */
+    if (!databaseOnly) {
+      app = launch(
+        [executable("node"), executable("server")],
+        {
+          DB_HOSTNAME: "127.0.0.1",
+          DB_PORT: String(c.databasePort),
+          DB_USERNAME: "frameleaf",
+          DB_PASSWORD: c.password,
+          DB_DATABASE_NAME: "frameleaf",
+          FRAMELEAF_HOST: "127.0.0.1",
+          FRAMELEAF_PORT: String(c.apiPort),
+          FRAMELEAF_MEDIA_LOCATION: join(c.state, "media"),
+          FRAMELEAF_BUILD_DATA: join(c.runtime, "build"),
+          FRAMELEAF_HDR_BINDING: executable("hdr"),
+          FRAMELEAF_WORKERS_INCLUDE: "api,microservices",
+          FRAMELEAF_NATIVE_OWNER: "1",
+          FRAMELEAF_STUDIO_WORKER: STUDIO_ENABLED ? "true" : "false",
+        },
+        ["ignore", "pipe", "pipe", "ipc"],
+      );
+      appOwner = ownHostServer(app);
+      let markers = "",
+        api = false,
+        microservices = false;
+      const observe = (chunk) => {
+        markers = (markers + chunk.toString()).slice(-65536);
+        api ||= markers.includes("Frameleaf Server is listening on");
+        microservices ||= markers.includes("Frameleaf Microservices is running");
+      };
+      app.stdout.on("data", observe);
+      app.stderr.on("data", observe);
+      const startupDeadline = Date.now() + 180_000;
+      while (true) {
+        if (
+          cancelled ||
+          !app.pid ||
+          !pg.pid ||
+          app.exitCode !== null ||
+          app.signalCode !== null ||
+          pg.exitCode !== null ||
+          pg.signalCode !== null ||
+          Date.now() > startupDeadline
+        )
+          fail("host_application_not_ready");
+        if (appOwner.check() && api && microservices) {
+          try {
+            const response = await fetch(
+              `http://127.0.0.1:${c.apiPort}/api/server/ping`,
+              { signal: AbortSignal.timeout(2000), redirect: "error" },
+            );
+            if (response.ok && (await response.json()).res === "pong") break;
+          } catch {
+            /* Startup may have attached the listener before its first request succeeds. */
+          }
         }
+        await sleep(100);
       }
-      await sleep(100);
-    }
-    if (STUDIO_ENABLED && !cancelled) {
-      const build = JSON.parse(
-        await stateFile(join(c.runtime, "studio/engine-build.json"), 65536),
-      );
-      if (
-        typeof build.upstreamCommit !== "string" ||
-        !/^[a-f0-9]{40}$/.test(build.upstreamCommit)
-      )
-        fail("host_studio_engine_invalid");
-      studio = ownStudioWorker(
-        launch(
-          [executable("node"), executable("studio"), "--owner-pipe"],
-          {
-            FRAMELEAF_STUDIO_WORKER: "true",
-            FRAMELEAF_STUDIO_WORKER_SERVER_URL: `http://127.0.0.1:${c.apiPort}`,
-          },
-          ["pipe", "pipe", "pipe", "ipc"],
-        ),
-        build.upstreamCommit,
-      );
+      if (STUDIO_ENABLED && !cancelled) {
+        const build = JSON.parse(
+          await stateFile(join(c.runtime, "studio/engine-build.json"), 65536),
+        );
+        if (
+          typeof build.upstreamCommit !== "string" ||
+          !/^[a-f0-9]{40}$/.test(build.upstreamCommit)
+        )
+          fail("host_studio_engine_invalid");
+        studio = ownStudioWorker(
+          launch(
+            [executable("node"), executable("studio"), "--owner-pipe"],
+            {
+              FRAMELEAF_STUDIO_WORKER: "true",
+              FRAMELEAF_STUDIO_WORKER_SERVER_URL: `http://127.0.0.1:${c.apiPort}`,
+            },
+            ["pipe", "pipe", "pipe", "ipc"],
+          ),
+          build.upstreamCommit,
+        );
+      }
     }
     ready((request) => {
-      if (checkpointWork || cancelled || app.exitCode !== null || pg.exitCode !== null)
+      if (checkpointWork || cancelled || (app && (app.exitCode !== null || app.signalCode !== null)) || pg.exitCode !== null || pg.signalCode !== null)
         return Promise.reject(new Error("host_checkpoint_unavailable"));
       const work = request.action === "cleanup-checkpoint"
         ? cleanupHostCheckpoint(c, request.checkpoint)
         : createHostCheckpoint(c, request.operationId,
           (args, extra) => command(args, extra, false, { quiet: true, timeout: 7_200_000 }),
-          () => cancelled || app.exitCode !== null || pg.exitCode !== null);
+          () => cancelled || (app && (app.exitCode !== null || app.signalCode !== null)) || pg.exitCode !== null || pg.signalCode !== null);
       checkpointWork = work;
       void work.finally(() => { if (checkpointWork === work) checkpointWork = undefined; }).catch(() => {});
       return work;
     });
     while (!cancelled) {
-      if ((await exited(app, 100)) || (await exited(pg, 100)))
+      if ((app && await exited(app, 100)) || (await exited(pg, 100)))
         fail("host_process_exited");
-      appOwner.check();
+      appOwner?.check();
       studio?.check();
     }
   } finally {
@@ -1078,7 +1095,7 @@ async function main() {
   try {
     await runHost(config, stopping, (handler) => {
       checkpoint = handler;
-      process.stdout.write('{"state":"running"}\n');
+      process.stdout.write(JSON.stringify({ state: config.mode === "database" ? "database-ready" : "running" }) + "\n");
     });
     await pending;
     if (protocolFailure) fail(protocolFailure);
