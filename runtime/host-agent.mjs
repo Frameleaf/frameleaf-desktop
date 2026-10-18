@@ -1135,3 +1135,65 @@ if (process.env.FRAMELEAF_HOST_AGENT === "1") {
       process.exitCode = 1;
     });
 }
+
+
+async function restoreInputJson(path) {
+  if ((await fs.lstat(path)).size > 4096) fail("host_restore_input_invalid");
+  const identity = await checkpointIdentity(path);
+  const before = await checkpointHash(path, () => {});
+  const raw = await stateFile(path, 4096);
+  if (Buffer.byteLength(raw) !== before.bytes || createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
+    JSON.stringify(await checkpointHash(path, () => {})) !== JSON.stringify(before) || await checkpointIdentity(path) !== identity)
+    fail("host_restore_input_invalid");
+  return JSON.parse(raw);
+}
+function restoreInputBinding(c, value) {
+  const keys = "installationId,libraryId,manifestSha256,operationId,recoverySha256,reviewId,runtime,schemaVersion,snapshotId,sourceRevision";
+  if (!value || Object.keys(value).sort().join(",") !== keys || value.schemaVersion !== 1 || value.runtime !== "native" ||
+    ![value.operationId, value.reviewId].every(id => typeof id === "string" && CHECKPOINT_ID.test(id)) ||
+    ![value.installationId, value.libraryId].every(id => typeof id === "string" && /^[a-f0-9]{12}$/.test(id)) ||
+    ![value.snapshotId, value.recoverySha256].every(id => typeof id === "string" && /^[a-f0-9]{64}$/.test(id)) ||
+    value.manifestSha256 !== c.manifestSha256 || value.sourceRevision !== c.sourceRevision) fail("host_restore_input_invalid");
+  return { schemaVersion: 1, runtime: "native", operationId: value.operationId, reviewId: value.reviewId, snapshotId: value.snapshotId,
+    installationId: value.installationId, manifestSha256: value.manifestSha256, sourceRevision: value.sourceRevision,
+    libraryId: value.libraryId, recoverySha256: value.recoverySha256 };
+}
+function restoreInputRecovery(c, value) {
+  if (!value || Object.keys(value).sort().join(",") !== "checkpoint,createdAt,databaseFormat,installation,libraryId,mediaIncluded,runtime,schemaVersion" ||
+    value.schemaVersion !== 1 || value.runtime !== "native" || value.mediaIncluded !== false || value.databaseFormat !== "frameleaf-canonical" ||
+    typeof value.libraryId !== "string" || !/^[a-f0-9]{12}$/.test(value.libraryId) || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0 ||
+    !value.installation || Object.keys(value.installation).sort().join(",") !== "id,name,release" ||
+    typeof value.installation.id !== "string" || !/^[a-f0-9]{12}$/.test(value.installation.id) || typeof value.installation.name !== "string" ||
+    !value.installation.name.trim() || value.installation.name.trim().length > 120 || typeof value.installation.release !== "string" ||
+    !/^frameleaf-v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value.installation.release) ||
+    !value.checkpoint || value.checkpoint.protocolVersion !== 1 || value.checkpoint.state !== "checkpoint" ||
+    typeof value.checkpoint.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.checkpoint.manifestSha256) ||
+    typeof value.checkpoint.sourceRevision !== "string" || !/^[a-f0-9]{40}$/.test(value.checkpoint.sourceRevision)) fail("host_restore_input_invalid");
+  const { protocolVersion, state, ...disk } = value.checkpoint;
+  const checkpoint = retirementReceipt({ ...c, manifestSha256: disk.manifestSha256, sourceRevision: disk.sourceRevision }, disk);
+  return { schemaVersion: 1, runtime: "native", mediaIncluded: false, databaseFormat: "frameleaf-canonical", libraryId: value.libraryId,
+    createdAt: value.createdAt, installation: { id: value.installation.id, name: value.installation.name.trim(), release: value.installation.release },
+    checkpoint: { protocolVersion, state, ...checkpoint } };
+}
+
+/** Fixed-path staged input validation only; restore effects require the later exclusive controller operation. */
+export async function readHostRestoreInput(c, supplied) {
+  try {
+    validateConfig(c);
+    const binding = restoreInputBinding(c, supplied), root = join(c.state, "restore-input"), target = join(root, binding.operationId), input = join(target, "input");
+    const identities = new Map();
+    for (const path of [c.state, root, target, input]) identities.set(path, await checkpointIdentity(path, true));
+    const marker = await restoreInputJson(join(c.state, "host-state.json"));
+    const expected = { schemaVersion: 1, manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor };
+    if (Object.keys(marker).sort().join(",") !== Object.keys(expected).sort().join(",") || Object.entries(expected).some(([key, value]) => marker[key] !== value) ||
+      (await fs.readdir(target)).sort().join(",") !== "input,restore-intent.json" || (await fs.readdir(input)).sort().join(",") !== "database.dump,recovery.json" ||
+      JSON.stringify(restoreInputBinding(c, await restoreInputJson(join(target, "restore-intent.json")))) !== JSON.stringify(binding)) fail("host_restore_input_invalid");
+    const recovery = restoreInputRecovery(c, await restoreInputJson(join(input, "recovery.json")));
+    if (recovery.libraryId !== binding.libraryId || createHash("sha256").update(JSON.stringify(recovery)).digest("hex") !== binding.recoverySha256)
+      fail("host_restore_input_invalid");
+    const dump = join(input, "database.dump"), actual = await checkpointHash(dump, () => {});
+    if (JSON.stringify(actual) !== JSON.stringify(recovery.checkpoint.dump)) fail("host_restore_input_invalid");
+    for (const [path, identity] of identities) if (await checkpointIdentity(path, true) !== identity) fail("host_restore_input_invalid");
+    return { binding, recovery, dump };
+  } catch { fail("host_restore_input_invalid"); }
+}
