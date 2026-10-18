@@ -47,3 +47,19 @@ test('user drain and immediate stop remain visible without claiming processing',
 test('reconnection is visible without claiming current inference or acceleration', () => {
   assert.equal(workerStatus({ state: 'reconnecting', workerSupported: false }), 'Reconnecting to your server');
 });
+
+test('runtime history failures explain recovery without suggesting a network retry', async () => {
+  const { runtimeRecoveryMessage } = await import('../src/mode-state.ts');
+  for (const code of ['runtime_epoch_credential_missing', 'runtime_epoch_identity_changed', 'runtime_epoch_recovery_required', 'runtime_epoch_record_invalid', 'runtime_epoch_binding_invalid', 'runtime_epoch_identity_invalid']) {
+    assert.match(runtimeRecoveryMessage(code)!, /recovery/i);
+    assert.match(runtimeRecoveryMessage(code)!, /Photos remain available/);
+    assert.doesNotMatch(runtimeRecoveryMessage(code)!, /network|sign out|delete|reset/i);
+  }
+  for (const code of ['runtime_epoch_rollback', 'runtime_epoch_reused']) {
+    assert.match(runtimeRecoveryMessage(code)!, /runtime was rejected/i);
+    assert.match(runtimeRecoveryMessage(code)!, /Photos remain available/);
+  }
+  assert.equal(runtimeRecoveryMessage(null), null);
+  assert.equal(runtimeRecoveryMessage('server_unreachable'), null);
+  assert.equal(runtimeRecoveryMessage('runtime_epoch_unknown'), null);
+});

@@ -23,3 +23,20 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
   if (state === 'incompatible') return 'This computer is not compatible with the selected models';
   return 'Preparing this computer';
 }
+
+export function runtimeRecoveryMessage(code: string | null): string | null {
+  switch (code) {
+    case 'runtime_epoch_credential_missing':
+    case 'runtime_epoch_identity_changed':
+    case 'runtime_epoch_recovery_required':
+    case 'runtime_epoch_record_invalid':
+    case 'runtime_epoch_binding_invalid':
+    case 'runtime_epoch_identity_invalid':
+      return 'AI processing needs recovery because this computer’s saved runtime history could not be verified. Photos remain available.';
+    case 'runtime_epoch_rollback':
+    case 'runtime_epoch_reused':
+      return 'This AI runtime was rejected because it does not match this computer’s accepted runtime history. Photos remain available.';
+    default:
+      return null;
+  }
+}

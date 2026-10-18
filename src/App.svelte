@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { workerStatus } from './mode-state';
+  import { workerStatus, runtimeRecoveryMessage } from './mode-state';
   import mark from './mark.svg';
   import PhotoSources from './PhotoSources.svelte';
   import ManagerPanel from './ManagerPanel.svelte';
@@ -23,7 +23,7 @@
   type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: { workload: string; state: string; modelNames: string[]; code: string | null }[] };
   let setup = $state<SetupStatus | null>(null);
   const setupState = $derived(setup?.state || connection?.state || '');
-  const setupDetail = $derived(setup?.code === 'runtime_pack_unavailable'
+  const setupDetail = $derived(runtimeRecoveryMessage(setup?.code ?? null) ?? (setup?.code === 'runtime_pack_unavailable'
     ? 'This build does not include a signed AI runtime yet. Photos remain available.'
     : setup?.state === 'model-download-required'
     ? 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks.'
@@ -50,7 +50,7 @@
     : setup?.state === 'preparing-runtime'
     ? 'Checking the signed runtime included with this app.'
     : setup?.state === 'setup-needs-attention'
-    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : '');
+    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : ''));
   const native = isTauri();
   const errors: Record<string, string> = {
     local_host_active: 'Stop local management before connecting to another server.',
