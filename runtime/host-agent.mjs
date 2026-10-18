@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { delimiter, isAbsolute, join, dirname, basename } from "node:path";
 import { createInterface } from "node:readline";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 const fail = (code) => {
   throw new Error(code);
@@ -1267,4 +1268,129 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   await checkpointSyncDirectory(target);await checkpointSyncDirectory(operationRoot);
   if (cancelled) fail("host_restore_cancelled");
   return receipt;
+}
+
+/** Recheck prepared evidence only; exclusive activation must still verify offline database state. */
+export async function readHostRestoreTarget(configuration, supplied) {
+  try {
+    const c = {
+      ...configuration,
+      entryPoints: { ...configuration.entryPoints },
+    };
+    validateConfig(c);
+    if (
+      !supplied ||
+      Object.keys(supplied).sort().join(",") !==
+        "attemptId,binding,databaseIdentity,profileIdentity,schemaVersion,state,targetIdentity,validation" ||
+      supplied.schemaVersion !== 1 ||
+      supplied.state !== "restore-prepared" ||
+      typeof supplied.attemptId !== "string" ||
+      !CHECKPOINT_ID.test(supplied.attemptId) ||
+      ![
+        supplied.profileIdentity,
+        supplied.targetIdentity,
+        supplied.databaseIdentity,
+      ].every(
+        (value) =>
+          typeof value === "string" &&
+          value.length <= 128 &&
+          /^[0-9]+:[0-9]+$/.test(value),
+      ) ||
+      !isDeepStrictEqual(supplied.validation, {
+        postgresMajor: 19,
+        vectorVersion: "0.8.7",
+        canonical: true,
+        executionStateReconstructed: true,
+      })
+    )
+      fail("host_restore_target_invalid");
+    const receipt = {
+      schemaVersion: 1,
+      state: "restore-prepared",
+      binding: restoreInputBinding(c, supplied.binding),
+      attemptId: supplied.attemptId,
+      profileIdentity: supplied.profileIdentity,
+      targetIdentity: supplied.targetIdentity,
+      databaseIdentity: supplied.databaseIdentity,
+      validation: {
+        postgresMajor: 19,
+        vectorVersion: "0.8.7",
+        canonical: true,
+        executionStateReconstructed: true,
+      },
+    };
+    const root = join(c.state, "restore-targets"),
+      operationRoot = join(root, receipt.binding.operationId);
+    const target = join(operationRoot, receipt.attemptId),
+      database = join(target, "database");
+    const identities = new Map();
+    for (const path of [c.state, root, operationRoot, target, database])
+      identities.set(path, await checkpointIdentity(path, true));
+    if (
+      identities.get(c.state) !== receipt.profileIdentity ||
+      identities.get(target) !== receipt.targetIdentity ||
+      identities.get(database) !== receipt.databaseIdentity
+    )
+      fail("host_restore_target_invalid");
+    const intent = {
+      schemaVersion: 1,
+      binding: receipt.binding,
+      attemptId: receipt.attemptId,
+      profileIdentity: receipt.profileIdentity,
+      targetIdentity: receipt.targetIdentity,
+    };
+    const marker = {
+      schemaVersion: 1,
+      manifestSha256: c.manifestSha256,
+      sourceRevision: c.sourceRevision,
+      postgresMajor: c.postgresMajor,
+    };
+    async function verifyRecords() {
+      if (
+        !isDeepStrictEqual(
+          await restoreInputJson(join(target, "restore-target.json")),
+          intent,
+        ) ||
+        !isDeepStrictEqual(
+          await restoreInputJson(join(target, "restore-result.json")),
+          receipt,
+        ) ||
+        !isDeepStrictEqual(
+          await restoreInputJson(join(target, "host-state.json")),
+          marker,
+        )
+      )
+        fail("host_restore_target_invalid");
+      try {
+        await fs.lstat(join(database, "postmaster.pid"));
+        fail("host_restore_target_invalid");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const path = join(database, "PG_VERSION"),
+        before = await checkpointHash(path, () => {}),
+        raw = await stateFile(path, 16);
+      if (
+        raw.trim() !== c.postgresMajor ||
+        Buffer.byteLength(raw) !== before.bytes ||
+        createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
+        !isDeepStrictEqual(await checkpointHash(path, () => {}), before)
+      )
+        fail("host_restore_target_invalid");
+    }
+    await verifyRecords();
+    const input = await readHostRestoreInput(c, receipt.binding);
+    if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision)
+      fail("host_restore_target_invalid");
+    for (const [path, identity] of identities)
+      if ((await checkpointIdentity(path, true)) !== identity)
+        fail("host_restore_target_invalid");
+    await verifyRecords();
+    for (const [path, identity] of identities)
+      if ((await checkpointIdentity(path, true)) !== identity)
+        fail("host_restore_target_invalid");
+    return { receipt, target, database };
+  } catch {
+    fail("host_restore_target_invalid");
+  }
 }

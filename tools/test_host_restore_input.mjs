@@ -342,3 +342,100 @@ test('prepared target inspection refuses changed on-disk evidence, a live target
     });
   }
 });
+
+test('prepared target inspection revalidates staged input and the current profile descriptor', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  for (const mutation of ['input', 'profile']) {
+    await preparedTargetFixture(t, async ({ c, receipt, path }) => {
+      if (mutation === 'input')
+        await writeFile(
+          join(path, 'input', 'database.dump'),
+          'changed after preparation',
+          { mode: 0o600 },
+        );
+      else
+        await writeFile(join(c.state, 'host-state.json'), '{}', {
+          mode: 0o600,
+        });
+      await assert.rejects(
+        owner.readHostRestoreTarget(c, receipt),
+        /host_restore_target_invalid/,
+      );
+      assert.equal(
+        await readFile(join(c.state, 'database', 'sentinel'), 'utf8'),
+        'original database must survive',
+      );
+    });
+  }
+});
+
+test('prepared target inspection refuses a changed target descriptor and a database replaced during inspection', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  for (const mutation of ['marker', 'race']) {
+    await preparedTargetFixture(t, async ({ c, receipt, target, database }) => {
+      if (mutation === 'marker')
+        await writeFile(join(target, 'host-state.json'), '{}', { mode: 0o600 });
+      let replaced = false,
+        probe;
+      if (mutation === 'race') {
+        const original = filesystem.open;
+        probe = t.mock.method(filesystem, 'open', async (...args) => {
+          const file = await original(...args);
+          if (!replaced && args[0] === join(target, 'restore-result.json')) {
+            replaced = true;
+            await filesystem.rename(
+              database,
+              join(target, 'retained-database'),
+            );
+            await mkdir(database, { mode: 0o700 });
+            await writeFile(join(database, 'PG_VERSION'), '19', {
+              mode: 0o600,
+            });
+          }
+          return file;
+        });
+        syncBuiltinESMExports();
+      }
+      try {
+        await assert.rejects(
+          owner.readHostRestoreTarget(c, receipt),
+          /host_restore_target_invalid/,
+        );
+      } finally {
+        probe?.mock.restore();
+        syncBuiltinESMExports();
+      }
+      if (mutation === 'race') assert.equal(replaced, true);
+    });
+  }
+});
+
+test('prepared target inspection refuses an oversized PG_VERSION before streaming its contents', async (t) => {
+  assert.equal(typeof owner.readHostRestoreTarget, 'function');
+  await preparedTargetFixture(t, async ({ c, receipt, database }) => {
+    const version = join(database, 'PG_VERSION');
+    await filesystem.truncate(version, 1024 * 1024);
+    const original = filesystem.open;
+    let contentReads = 0;
+    const probe = t.mock.method(filesystem, 'open', async (...args) => {
+      const handle = await original(...args);
+      if (args[0] === version)
+        t.mock.method(handle, 'createReadStream', () => {
+          contentReads++;
+          throw Error('oversized version content must not be scanned');
+        });
+      return handle;
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        owner.readHostRestoreTarget(c, receipt),
+        /host_restore_target_invalid/,
+      );
+      assert.equal(contentReads, 0);
+    } finally {
+      probe.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+});
