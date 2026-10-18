@@ -210,17 +210,17 @@ export async function cleanupHostCheckpoint(c, supplied) {
   validateConfig(c);
   const expected = retirementReceipt(c, supplied);
   await checkpointDirectory(c.state);
-  if (await fs.realpath(c.state) !== c.state) fail("host_checkpoint_changed");
+  if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_checkpoint_changed");
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root);
-  if (await fs.realpath(root) !== root) fail("host_checkpoint_changed");
+  if (!canonicalHostPathMatches(await fs.realpath(root), root)) fail("host_checkpoint_changed");
   const target = join(root, expected.operationId), marker = join(root, "." + expected.operationId + ".retired.json");
   let retired = false, markerIdentity;
   try {
     const named = await fs.lstat(marker);
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 ||
       (process.platform !== "win32" && (named.mode & 0o077) !== 0) ||
-      (await fs.realpath(marker)) !== marker) fail("host_checkpoint_changed");
+      !canonicalHostPathMatches(await fs.realpath(marker), marker)) fail("host_checkpoint_changed");
     const value = retirementReceipt(c, JSON.parse(await stateFile(marker, 4096)));
     if (JSON.stringify(value) !== JSON.stringify(expected)) fail("host_checkpoint_changed");
     retired = true; markerIdentity = named;
@@ -240,7 +240,7 @@ export async function cleanupHostCheckpoint(c, supplied) {
   catch (error) { if (error.code !== "ENOENT" || !retired) throw error; }
   if (directory) {
     await checkpointDirectory(target);
-    if (await fs.realpath(target) !== target) fail("host_checkpoint_changed");
+    if (!canonicalHostPathMatches(await fs.realpath(target), target)) fail("host_checkpoint_changed");
     const names = (await fs.readdir(target)).sort();
     if (names.some(name => !["checkpoint.json", "database.dump"].includes(name)) ||
       (!retired && names.join(",") !== "checkpoint.json,database.dump")) fail("host_checkpoint_changed");
@@ -248,7 +248,7 @@ export async function cleanupHostCheckpoint(c, supplied) {
     for (const name of names) {
       const path = join(target, name), before = await fs.lstat(path);
       if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
-        (await fs.realpath(path)) !== path) fail("host_checkpoint_changed");
+        !canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_checkpoint_changed");
       if (name === "checkpoint.json") {
         if (JSON.stringify(retirementReceipt(c, JSON.parse(await stateFile(path, 4096)))) !== JSON.stringify(expected))
           fail("host_checkpoint_changed");
@@ -280,11 +280,16 @@ export async function cleanupHostCheckpoint(c, supplied) {
   return { ...expected, state: "checkpoint-cleaned" };
 }
 
+export function canonicalHostPathMatches(actual, expected, platform = process.platform) {
+  // Node strips the local-drive verbatim prefix returned by Rust canonicalize on Windows.
+  return actual === expected || (platform === "win32" && /^\\\\\?\\[A-Za-z]:\\/.test(expected) && actual === expected.slice(4));
+}
+
 async function checkpointIdentity(path, directory = false) {
   const meta = await fs.lstat(path, { bigint: true });
   if (meta.isSymbolicLink() || (directory ? !meta.isDirectory() : !meta.isFile() || meta.nlink !== 1n) ||
     meta.ino <= 0n || (process.platform !== "win32" && (meta.mode & 0o077n) !== 0n) ||
-    await fs.realpath(path) !== path) fail("host_checkpoint_changed");
+    !canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_checkpoint_changed");
   return `${meta.dev}:${meta.ino}`;
 }
 async function checkpointAttempt(path, binding) {
@@ -355,7 +360,7 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
   await checkpointDirectory(c.state);
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root, true);
-  if (await fs.realpath(c.state) !== c.state || await fs.realpath(root) !== root) fail("host_checkpoint_changed");
+  if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state) || !canonicalHostPathMatches(await fs.realpath(root), root)) fail("host_checkpoint_changed");
   await checkpointSyncDirectory(c.state);
   // Any retirement intent forbids regenerating a different live dump under the same operation ID.
   try {
@@ -742,7 +747,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
   if (c.mode === "checkpoint-cleanup" || c.mode === "restore-prepare") {
     // Maintenance starts no original database; restore writes only a separate owned attempt.
     await checkpointDirectory(c.state);
-    if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
+    if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_state_not_private");
     await stateFile(join(c.state, "host-state.json"), 4096).catch(() => fail("host_state_invalid"));
     await claimState(c);
     let pending, cancelled = false;
@@ -770,7 +775,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
   if (databaseOnly) {
     try {
       await checkpointDirectory(c.state);
-      if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
+      if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_state_not_private");
       await stateFile(join(c.state, "host-state.json"), 4096);
     } catch (error) {
       if (error.code === "ENOENT") fail("host_database_missing");
@@ -1283,7 +1288,7 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision) fail("host_restore_runtime_required");
   const profileIdentity = await checkpointIdentity(c.state, true);
   const root = join(c.state, "restore-targets"), operationRoot = join(root, input.binding.operationId);
-  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (await fs.realpath(path) !== path) fail("host_restore_input_invalid");}
+  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (!canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_restore_input_invalid");}
   const attemptId = randomUUID(), target = join(operationRoot, attemptId);
   await fs.mkdir(target, {mode:0o700});
   const targetIdentity = await checkpointIdentity(target, true);
