@@ -144,6 +144,10 @@ pub(crate) fn require_private_directory(path: &Path) -> Result<(), String> {
     let user = current_user()?;
     account_directory(path, &user, DirectoryMode::ExistingOnly)
 }
+pub(crate) fn pin_private_directory(path: &Path) -> Result<Vec<File>, String> {
+    let user = current_user()?;
+    pinned_account_directory(path, &user, DirectoryMode::ExistingOnly)
+}
 pub(crate) enum DirectoryMode {
     CreateOrReuse,
     CreateNew,
@@ -155,6 +159,13 @@ pub(crate) fn account_directory(
     user: &[u8],
     mode: DirectoryMode,
 ) -> Result<(), String> {
+    pinned_account_directory(path, user, mode).map(|_| ())
+}
+fn pinned_account_directory(
+    path: &Path,
+    user: &[u8],
+    mode: DirectoryMode,
+) -> Result<Vec<File>, String> {
     if !super::sid_valid(user) {
         return Err(ERROR.into());
     }
@@ -271,7 +282,8 @@ pub(crate) fn account_directory(
             }
         }
     }
-    Ok(())
+    parents.push(file);
+    Ok(parents)
 }
 
 #[cfg(test)]
@@ -290,6 +302,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn retained_private_admission_pins_the_leaf_and_its_ancestors() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-ancestry-pin-{}", uuid::Uuid::new_v4()));
+        new_private_directory(&root).unwrap();
+        let fixture = Fixture(root);
+        let leaf = fixture.0.join("state");
+        new_private_directory(&leaf).unwrap();
+        let pins = pin_private_directory(&leaf).unwrap();
+        assert!(fs::rename(&fixture.0, fixture.0.with_extension("moved")).is_err());
+        assert!(fs::rename(&leaf, leaf.with_extension("moved")).is_err());
+        assert!(fs::remove_dir(&leaf).is_err());
+        fs::write(leaf.join("allowed"), b"synthetic state").unwrap();
+        fs::remove_file(leaf.join("allowed")).unwrap();
+        drop(pins);
+        let moved = fixture.0.join("moved");
+        fs::rename(&leaf, &moved).unwrap();
+        fs::rename(&moved, &leaf).unwrap();
+        let moved = fixture.0.with_extension("moved");
+        fs::rename(&fixture.0, &moved).unwrap();
+        fs::rename(&moved, &fixture.0).unwrap();
     }
     #[test]
     fn private_admission_handles_block_file_and_directory_replacement() {

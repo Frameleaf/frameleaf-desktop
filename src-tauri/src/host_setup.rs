@@ -443,26 +443,11 @@ fn native_release(version: &str, revision: &str) -> Result<String, String> {
     Ok(format!("frameleaf-v{version}-native.{}-1", &revision[..12]))
 }
 #[cfg(windows)]
-fn pin_profile_leaf(path: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, READ_CONTROL,
-    };
-    let required = "host_install_windows_profile_required";
-    let file = std::fs::OpenOptions::new()
-        // Metadata-only handles do not participate in Windows sharing checks.
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
-        .share_mode(3)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|_| required)?;
-    let info = file.metadata().map_err(|_| required)?;
-    if !info.is_dir() || info.file_attributes() & 0x400 != 0 {
-        return Err(required.into());
-    }
-    Ok(file)
+fn pin_profile_leaf(path: &std::path::Path) -> Result<Vec<std::fs::File>, String> {
+    crate::windows_protection::pin_private_directory(path)
+        .map_err(|_| "host_install_windows_profile_required".into())
 }
+
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
