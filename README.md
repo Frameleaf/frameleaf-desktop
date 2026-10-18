@@ -823,3 +823,5 @@ application acceptance, or GPU qualification.
 Windows CI checks that this ignored test is compiled. Actual Windows execution
 requires a complete Windows candidate with private database, Manager, backup and
 media dependencies; compilation alone does not qualify Windows restore.
+
+Windows profile credential bindings now use normalized volume-GUID names captured from opened handles, together with the existing physical state/data identities. Kernel-volume paths remain the authority for runtime verification and execution; GUID names are metadata only. An existing reservation without its matching credential requires recovery. Unix bindings are unchanged. Actual Windows reboot, credential-store and installed-server acceptance remain unverified.

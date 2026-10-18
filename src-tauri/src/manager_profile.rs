@@ -14,6 +14,9 @@ use std::{
     sync::Mutex,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+#[cfg(any(windows, test))]
+mod windows_binding;
+
 const ACCOUNT: &str = "native-host-profile";
 static LOCK: Mutex<()> = Mutex::new(());
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -128,8 +131,31 @@ impl Profile {
             .try_lock()
             .map_err(|_| "native_profile_already_owned")?;
         let state = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&config.state)?);
+        #[cfg(not(windows))]
         let binding = serde_json::json!({"schemaVersion":1,"configuration":config,"candidate":candidate,"manifestSha256":manifest,
             "stateIdentity":crate::copy_source::root_identity(&state)?,"managerIdentity":crate::copy_source::root_identity(&data)?});
+        #[cfg(windows)]
+        let binding = {
+            let candidate =
+                cap_std::fs::Dir::from_std_file(crate::host_storage::directory(candidate)?);
+            let controller =
+                File::open(crate::windows_protection::stable_path(&config.controller)?)
+                    .map_err(|_| "native_profile_binding_invalid")?;
+            windows_binding::value(
+                config,
+                manifest,
+                [
+                    crate::copy_source::root_identity(&state)?,
+                    crate::copy_source::root_identity(&data)?,
+                ],
+                [
+                    crate::windows_protection::durable_name(&candidate)?,
+                    crate::windows_protection::durable_name(&controller)?,
+                    crate::windows_protection::durable_name(&state)?,
+                    crate::windows_protection::durable_name(&data)?,
+                ],
+            )?
+        };
         let binding_sha256 = format!(
             "{:x}",
             Sha256::digest(
@@ -361,7 +387,11 @@ mod tests {
                 installation_id: "a".repeat(12),
                 name: "Synthetic".into(),
                 release: "frameleaf-v3.0.0-1".into(),
-                controller: std::path::PathBuf::from("/bin/echo"),
+                controller: if cfg!(windows) {
+                    std::env::current_exe().unwrap()
+                } else {
+                    std::path::PathBuf::from("/bin/echo")
+                },
                 state: root.join("state"),
                 data: root.join("manager"),
                 origin: "https://127.0.0.1:9443".into(),
@@ -560,6 +590,25 @@ mod tests {
             |_account, _profile| panic!("must not replace")
         )
         .is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn old_windows_reservation_without_matching_secret_requires_recovery() {
+        let f = Fixture::new();
+        let profile = f.create();
+        drop(profile);
+        let marker = f.1.data.join(".host-profile");
+        let old_binding = "e".repeat(64);
+        std::fs::write(&marker, &old_binding).unwrap();
+        let result = Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            |_| Ok(None),
+            |_, _| panic!("never replace an existing Windows reservation"),
+        );
+        assert!(matches!(result, Err(ref code) if code == "native_profile_recovery_required"));
+        assert_eq!(std::fs::read(marker).unwrap(), old_binding.as_bytes());
     }
     #[test]
     fn missing_or_locked_credentials_never_replace_an_existing_profile_or_database() {

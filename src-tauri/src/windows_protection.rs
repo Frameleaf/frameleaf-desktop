@@ -37,6 +37,28 @@ pub(crate) fn filesystem_components(path: &str) -> Option<Vec<&str>> {
     }
     Some(paths)
 }
+/// Metadata only: volume GUID names are never execution authority.
+pub(crate) fn volume_guid_name(value: &str) -> Option<String> {
+    let rest = value.strip_prefix(r"\\?\Volume{")?;
+    let (guid, tail) = rest.split_once("}\\")?;
+    if guid.len() != 36 {
+        return None;
+    }
+    let guid = uuid::Uuid::parse_str(guid).ok()?;
+    if guid.is_nil()
+        || (!tail.is_empty()
+            && tail.split('\\').any(|part| {
+                part.is_empty()
+                    || part == "."
+                    || part == ".."
+                    || part.contains([':', '/', '\0'])
+                    || part.ends_with(['.', ' '])
+            }))
+    {
+        return None;
+    }
+    Some(format!(r"\\?\Volume{{{guid}}}\{tail}"))
+}
 fn sid_valid(sid: &[u8]) -> bool {
     sid.len() >= 8 && sid[0] == 1 && sid[1] <= 15 && sid.len() == 8 + 4 * usize::from(sid[1])
 }
@@ -107,7 +129,7 @@ mod native {
         },
         Storage::FileSystem::{
             GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, READ_CONTROL, VOLUME_NAME_NT,
+            FILE_READ_ATTRIBUTES, READ_CONTROL, VOLUME_NAME_GUID, VOLUME_NAME_NT,
         },
     };
     const ERROR: &str = "native_manager_unprotected";
@@ -228,6 +250,23 @@ mod native {
         let value = format!(r"\\?\GLOBALROOT{nt}");
         stable_volume_root(&value).ok_or(ERROR)?;
         Ok(PathBuf::from(value))
+    }
+    /// Capture identity metadata from an already-open object, never resolve a GUID alias for execution.
+    pub(crate) fn durable_name(handle: &impl AsRawHandle) -> Result<String, String> {
+        let mut buffer = vec![0u16; 32768];
+        let size = unsafe {
+            GetFinalPathNameByHandleW(
+                handle.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                VOLUME_NAME_GUID,
+            )
+        } as usize;
+        if size == 0 || size >= buffer.len() {
+            return Err(ERROR.into());
+        }
+        let value = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
+        volume_guid_name(&value).ok_or_else(|| ERROR.into())
     }
     pub(crate) fn protect(
         path: &Path,
@@ -359,6 +398,7 @@ mod native {
             let mut checked = BTreeSet::new();
             protect(&code, &mut checked).unwrap();
             let original = Sha256::digest(std::fs::read(&code).unwrap());
+            let persistent_name = durable_name(&File::open(&code).unwrap()).unwrap();
             alias.redirect(
                 malicious
                     .to_str()
@@ -372,6 +412,10 @@ mod native {
             );
             assert!(protect(&requested, &mut checked).is_err());
             assert_eq!(Sha256::digest(std::fs::read(&code).unwrap()), original);
+            assert_eq!(
+                durable_name(&File::open(&code).unwrap()).unwrap(),
+                persistent_name
+            );
             let output = std::process::Command::new(&code)
                 .args(["/d", "/c", "exit", "0"])
                 .env_clear()
@@ -410,11 +454,40 @@ mod native {
     }
 }
 #[cfg(windows)]
-pub(crate) use native::{protect, stable_path};
+pub(crate) use native::{durable_name, protect, stable_path};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persistent_names_normalize_only_the_guid_and_refuse_unsafe_metadata() {
+        let guid = "ABCDEFAB-2222-3333-4444-555555555555";
+        assert_eq!(
+            volume_guid_name(&format!(r"\\?\Volume{{{guid}}}\CaseSensitive\Profile")),
+            Some(r"\\?\Volume{abcdefab-2222-3333-4444-555555555555}\CaseSensitive\Profile".into())
+        );
+        for guid in ["invalid", "00000000-0000-0000-0000-000000000000"] {
+            assert!(volume_guid_name(&format!(r"\\?\Volume{{{guid}}}\profile")).is_none());
+        }
+        for tail in [
+            r"..\profile",
+            r"a\..\profile",
+            r".\profile",
+            r"a\\profile",
+            "profile:stream",
+            "profile.",
+            "profile ",
+            "a/profile",
+        ] {
+            assert!(
+                volume_guid_name(&format!(
+                    r"\\?\Volume{{abcdefab-2222-3333-4444-555555555555}}\{tail}"
+                ))
+                .is_none(),
+                "{tail}"
+            );
+        }
+    }
     #[test]
     fn stable_paths_reject_drive_network_device_and_component_aliases() {
         let root = r"\\?\GLOBALROOT\Device\HarddiskVolume12\";
