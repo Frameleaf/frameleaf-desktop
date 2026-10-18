@@ -2,7 +2,6 @@
 use std::{
     fs::{self, File, OpenOptions},
     os::windows::{
-        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
@@ -205,7 +204,10 @@ pub(crate) fn account_directory(
                 lpSecurityDescriptor: security.0,
                 bInheritHandle: 0,
             };
-            let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Device syntax keeps the NT identity but still hits CreateDirectoryW's legacy limit.
+            let filesystem_path =
+                super::extended_filesystem_path(path.to_str().ok_or(ERROR)?).ok_or(ERROR)?;
+            let name: Vec<u16> = filesystem_path.encode_utf16().chain(Some(0)).collect();
             if name.len() > 32767 || name[..name.len() - 1].contains(&0) {
                 #[cfg(debug_assertions)]
                 eprintln!("private_directory_create: stage=name");
@@ -275,6 +277,7 @@ pub(crate) fn account_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::{
         AddAccessAllowedAce,
         Authorization::{SetSecurityInfo, SE_FILE_OBJECT},

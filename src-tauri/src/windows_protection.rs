@@ -45,6 +45,14 @@ pub(crate) fn filesystem_components(path: &str) -> Option<Vec<&str>> {
     }
     Some(paths)
 }
+/// Filesystem APIs need extended syntax; keep execution on its separately qualified spelling.
+pub(crate) fn extended_filesystem_path(path: &str) -> Option<String> {
+    stable_volume_root(path)?;
+    let tail = path
+        .strip_prefix(r"\\.\GLOBALROOT\")
+        .or_else(|| path.strip_prefix(r"\\?\GLOBALROOT\"))?;
+    Some(format!(r"\\?\GLOBALROOT\{tail}"))
+}
 /// Metadata only: volume GUID names are never execution authority.
 pub(crate) fn volume_guid_name(value: &str) -> Option<String> {
     let rest = value.strip_prefix(r"\\?\Volume{")?;
@@ -563,6 +571,31 @@ pub(crate) use native::{durable_name, protect, stable_path};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extended_filesystem_spelling_keeps_long_unicode_nt_paths_and_refuses_aliases() {
+        let tail = format!(
+            r"Device\HarddiskVolume12\{}\写真",
+            ["long-component"; 30].join("\\")
+        );
+        let extended = format!(r"\\?\GLOBALROOT\{tail}");
+        let device = format!(r"\\.\GLOBALROOT\{tail}");
+        assert!(device.len() > 400);
+        assert_eq!(extended_filesystem_path(&device), Some(extended.clone()));
+        assert_eq!(extended_filesystem_path(&extended), Some(extended));
+        for bad in [
+            r"C:\folder",
+            r"\\?\C:\folder",
+            r"\\server\share\folder",
+            r"\\?\Volume{11111111-1111-1111-1111-111111111111}\folder",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\..\folder",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\folder:stream",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\folder.",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\folder ",
+            r"\\.\GLOBALROOT\Device\Mup\share\folder",
+        ] {
+            assert!(extended_filesystem_path(bad).is_none(), "{bad}");
+        }
+    }
     #[test]
     fn device_kernel_paths_keep_the_same_physical_volume_boundary() {
         let root = r"\\.\GLOBALROOT\Device\HarddiskVolume12\";

@@ -123,6 +123,9 @@ jobs:
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib model_catalogue::tests::composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering -- --exact --nocapture
           if ($LASTEXITCODE) { throw 'Private shared model-cache composition failed' }
+      - name: Check Windows production and test code with strict Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   keystore-probe:
     if: ${{ inputs.keystore_probe }}
