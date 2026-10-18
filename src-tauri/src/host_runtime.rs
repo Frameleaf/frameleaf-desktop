@@ -94,6 +94,12 @@ pub struct VerifiedHostRuntime {
     manifest: HostManifest,
     manifest_sha256: String,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupEngine {
+    pub executable: PathBuf,
+    pub sha256: String,
+}
 impl VerifiedHostRuntime {
     /// Keys and rollback floor are supplied by compiled desktop release authority, never by a server.
     pub fn verify(
@@ -186,6 +192,18 @@ impl VerifiedHostRuntime {
     }
     pub fn certified(&self) -> bool {
         self.manifest.certified
+    }
+    pub fn backup_engine(&self) -> Result<BackupEngine, String> {
+        let role = &self.manifest.entry_points.backup_engine;
+        let artifact = self
+            .manifest
+            .files
+            .get(role)
+            .ok_or("host_backup_engine_missing")?;
+        Ok(BackupEngine {
+            executable: self.root.join(role),
+            sha256: artifact.sha256.clone(),
+        })
     }
     pub fn manager_programs(&self) -> Result<crate::manager_host::Programs<'_>, String> {
         let programs = crate::manager_host::Programs {

@@ -105,11 +105,14 @@ async fn native_manager_fresh_tls_uses_private_stdin_with_empty_path() {
     let manager = PathBuf::from(std::env::var("FRAMELEAF_TEST_MANAGER").unwrap());
     let output = PathBuf::from(std::env::var("FRAMELEAF_TEST_OUTPUT").unwrap());
     assert!(node.is_absolute() && manager.is_absolute() && output.is_absolute());
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:9443").expect("fixture Manager port must be unused");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
     drop(listener);
     fs::create_dir(&output).unwrap();
-    let origin = "https://127.0.0.1:9443";
+    let origin = origin.as_str();
     let identity =
         TlsIdentity::load_or_create("aaaaaaaaaaaa", origin, || Ok(None), |_| Ok(())).unwrap();
     let other =
@@ -142,7 +145,7 @@ async fn native_manager_fresh_tls_uses_private_stdin_with_empty_path() {
     let data = output.join("manager");
     let config = Zeroizing::new(serde_json::to_vec(&serde_json::json!({
         "protocolVersion":2,"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
-        "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"name":"Synthetic native TLS fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":identity.wire()
+        "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"backupEngine":{"executable":controller,"sha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap()))},"name":"Synthetic native TLS fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":identity.wire()
     })).unwrap());
     let mut child = Owned(
         Command::new(&node)
@@ -209,7 +212,7 @@ async fn native_manager_fresh_tls_uses_private_stdin_with_empty_path() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&receipt).unwrap(),
         serde_json::json!({
-            "protocolVersion":2,"state":"ready","installationId":"aaaaaaaaaaaa", "manifestSha256":"b".repeat(64),"origin":"https://127.0.0.1:9443"
+            "protocolVersion":2,"state":"ready","installationId":"aaaaaaaaaaaa", "manifestSha256":"b".repeat(64),"origin":origin
         })
     );
     // A different child must not claim readiness from the first child's healthy HTTPS listener.
