@@ -19,7 +19,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, READ_CONTROL,
+        FILE_READ_ATTRIBUTES, FILE_READ_DATA, READ_CONTROL,
     },
     System::Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
 };
@@ -116,7 +116,8 @@ fn descriptor(user: &[u8]) -> Result<Local, String> {
 }
 fn open(path: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        // Read-data (list-directory for folders) makes no-delete sharing effective.
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA)
         .share_mode(3)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -242,6 +243,39 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn private_admission_handles_block_file_and_directory_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-private-pin-{}", uuid::Uuid::new_v4()));
+        new_private_directory(&root).unwrap();
+        let fixture = Fixture(root);
+        for directory in [false, true] {
+            let path = fixture.0.join(if directory { "directory" } else { "file" });
+            if directory {
+                new_private_directory(&path).unwrap();
+            } else {
+                fs::write(&path, b"synthetic state").unwrap();
+            }
+            let handle = open(&path).unwrap();
+            let moved = path.with_extension("moved");
+            assert!(fs::rename(&path, &moved).is_err());
+            if directory {
+                assert!(fs::remove_dir(&path).is_err());
+                fs::write(path.join("child"), b"allowed").unwrap();
+                fs::remove_file(path.join("child")).unwrap();
+            } else {
+                assert!(fs::remove_file(&path).is_err());
+                fs::write(&path, b"allowed").unwrap();
+            }
+            drop(handle);
+            fs::rename(&path, &moved).unwrap();
+            if directory {
+                fs::remove_dir(moved).unwrap();
+            } else {
+                fs::remove_file(moved).unwrap();
+            }
         }
     }
     #[test]
