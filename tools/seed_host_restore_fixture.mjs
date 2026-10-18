@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { readFile, writeFile, rm, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { claimState, runHost, hostEnvironment } from "../runtime/host-agent.mjs";
+import { claimState, runHost, hostEnvironment, canonicalHostPathMatches } from "../runtime/host-agent.mjs";
 
 let input = "";
 for await (const part of process.stdin) {
@@ -15,7 +15,7 @@ for await (const part of process.stdin) {
 }
 const config = JSON.parse(input);
 const { root, manager, mode, ...c } = config;
-assert.equal(await realpath(root), root);
+assert.ok(canonicalHostPathMatches(await realpath(root), root));
 assert.equal(c.state, join(root, "profile"));
 assert.equal(resolve(c.runtime), c.runtime);
 assert.equal(resolve(manager), manager);
@@ -64,7 +64,8 @@ if (mode === "selected") {
   const key = randomBytes(32).toString("base64url");
   const backups = new Backups(join(root, "repository"), async () => key,
     (binary, args, options = {}) => backupCommand(binary, args, { ...options, executable,
-      env: { HOME: root, XDG_CACHE_HOME: join(root, "cache"), PATH: "", GOMAXPROCS: "1" } }));
+      env: { HOME: root, XDG_CACHE_HOME: join(root, "cache"), PATH: "", GOMAXPROCS: "1",
+        ...(process.platform === "win32" ? { SystemRoot: env.SystemRoot } : {}) } }));
   let stop, work, handler, phase = "stopped", initialized = false;
   const startOwner = mode => new Promise((ready, reject) => {
     const stopping = new Promise(resolve => { stop = resolve; });

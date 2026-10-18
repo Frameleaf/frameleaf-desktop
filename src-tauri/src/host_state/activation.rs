@@ -1402,5 +1402,5 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod restore_qualification;

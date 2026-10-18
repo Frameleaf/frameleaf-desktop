@@ -39,6 +39,14 @@ jobs:
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Check Windows real restore test is compiled
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE) { throw 'Restore test discovery failed' }
+          $restore = @($tests | Select-String '^host_state::activation::restore_qualification::actual_postgres_restore_selection_finalization_and_writer_admission: test$')
+          if ($restore.Count -ne 1) { throw 'Windows real restore test is missing' }
       - name: Qualify privileged Linux package admission in disposable runner
         if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         run: |

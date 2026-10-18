@@ -28,9 +28,13 @@ fn helper(node: &Path, config: &Value, mode: &str) -> Value {
     config["mode"] = json!(mode);
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/seed_host_restore_fixture.mjs");
-    let mut child = Command::new(node)
-        .arg(script)
-        .env_clear()
+    let mut command = Command::new(node);
+    command.arg(script).env_clear();
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
