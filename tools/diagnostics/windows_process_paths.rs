@@ -134,15 +134,46 @@ fn main() {
         ("where.exe", vec!["/?"]),
     ] {
         let original = Path::new(&system_root).join("System32").join(role);
+        let kernel = final_name(&original, 2);
+        let guid = final_name(&original, 1);
+        let kernel_tail = kernel.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        let guid_tail = guid.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        let bytes = std::fs::read(&original).unwrap();
         for (kind, path) in [
             ("dos", original.clone()),
-            ("kernel", final_name(&original, 2)),
-            ("guid", final_name(&original, 1)),
+            ("verbatim-dos", final_name(&original, 0)),
+            ("kernel", kernel.clone()),
+            ("guid", guid.clone()),
+            (
+                "device-kernel",
+                PathBuf::from(format!(r"\\.\{kernel_tail}")),
+            ),
+            ("device-guid", PathBuf::from(format!(r"\\.\{guid_tail}"))),
+            ("nt-kernel", PathBuf::from(format!(r"\??\{kernel_tail}"))),
+            (
+                "global-dos",
+                PathBuf::from(format!(r"\\?\GLOBALROOT\GLOBAL??\{}", original.display())),
+            ),
+            (
+                "device-global-dos",
+                PathBuf::from(format!(r"\\.\GLOBALROOT\GLOBAL??\{}", original.display())),
+            ),
+            (
+                "global-guid",
+                PathBuf::from(format!(r"\\?\GLOBALROOT\GLOBAL??\{guid_tail}")),
+            ),
         ] {
-            assert_eq!(
-                std::fs::read(&original).unwrap(),
-                std::fs::read(&path).unwrap()
-            );
+            let observed = match std::fs::read(&path) {
+                Ok(value) => value,
+                Err(error) => {
+                    println!(
+                        "role={role} path={kind} read-error={:?}",
+                        error.raw_os_error()
+                    );
+                    continue;
+                }
+            };
+            assert_eq!(bytes, observed, "never launch a different image");
             for explicit in [false, true] {
                 let result = direct_process(&path, &args, explicit);
                 if kind == "dos" {
