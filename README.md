@@ -829,3 +829,18 @@ Windows profile credential bindings now use normalized volume-GUID names capture
 Windows kernel-volume storage separation now stops physical-identity ancestry checks at the actual filesystem root. It preserves self, descendant, ancestor and case-alias overlap refusals without trying to inspect Object Manager directories above the volume. The native Windows regression is present; actual Windows execution and installation remain unverified.
 
 Disposable hosted Linux CI now includes a real `dpkg` failed-install lifecycle probe with a separate package database and log. Its synthetic unsigned runtime must remain half-configured and fenced across retries; an active code lease must block removal. This verifies refusal/recovery behavior only, not successful signed installation or installed-server acceptance.
+
+The opt-in `native_photo` integration test uses a measured test candidate and a new
+synthetic profile to check the native web entry, admin signup, generated PNG upload,
+thumbnail processing, clean controller stop/restart, and persisted metadata plus
+byte-exact original and thumbnail retrieval. Set `FRAMELEAF_TEST_HOST_PACK` as above
+and `FRAMELEAF_TEST_PHOTO_STATE` to a new absolute profile path, then run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --test native_photo -- \
+  --ignored --exact actual_native_photo_upload_thumbnail_and_restart
+```
+
+It retains only generated fixture data for inspection and uses in-memory test
+signing authority. This does not qualify the Owner journal, OS keystore, installed
+desktop UI, release signing, or NAS/GPU work.
