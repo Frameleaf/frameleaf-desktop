@@ -110,6 +110,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Qualify host state, checkpoint and restore paths with spaces and Unicode
+        run: node --test tools/test_host_agent.mjs tools/test_host_database.mjs tools/test_host_checkpoint.mjs tools/test_host_restore_input.mjs tools/test_host_server_owner.mjs
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - name: Qualify private directory admission and long physical paths

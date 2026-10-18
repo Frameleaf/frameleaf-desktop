@@ -13,7 +13,7 @@ import { join, basename, toNamespacedPath } from 'node:path';
 import { claimState, runHost, validateConfig, canonicalHostPathMatches } from '../runtime/host-agent.mjs';
 
 async function fixture(t, body) {
-  const state = await realpath(await mkdtemp(join(tmpdir(), 'frameleaf-database-only-')));
+  const state = await realpath(await mkdtemp(join(tmpdir(), 'Frameleaf Desktop Host ü database-')));
   t.after(() => rm(state, { recursive: true, force: true }));
   const occupied = createServer();
   await new Promise(resolve => occupied.listen(0, '127.0.0.1', resolve));
