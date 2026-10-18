@@ -123,7 +123,7 @@ fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
             .executable
             .to_str()
             .unwrap()
-            .starts_with(r"\\?\GLOBALROOT\Device\HarddiskVolume"));
+            .starts_with(r"\\.\GLOBALROOT\Device\HarddiskVolume"));
         assert_eq!(
             fs::canonicalize(&engine.executable).unwrap(),
             fixture.0.join("backup/restic")

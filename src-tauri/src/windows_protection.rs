@@ -1,7 +1,12 @@
 //! Read-only Windows package admission; never edits an ACL.
 fn stable_volume_root(path: &str) -> Option<&str> {
-    const PREFIX: &str = r"\\?\GLOBALROOT\Device\HarddiskVolume";
-    let rest = path.strip_prefix(PREFIX)?;
+    let prefix = [
+        r"\\?\GLOBALROOT\Device\HarddiskVolume",
+        r"\\.\GLOBALROOT\Device\HarddiskVolume",
+    ]
+    .into_iter()
+    .find(|prefix| path.starts_with(prefix))?;
+    let rest = path.strip_prefix(prefix)?;
     let end = rest.find('\\')?;
     let number = &rest[..end];
     if number.is_empty()
@@ -11,7 +16,7 @@ fn stable_volume_root(path: &str) -> Option<&str> {
     {
         return None;
     }
-    let root_end = PREFIX.len() + end + 1;
+    let root_end = prefix.len() + end + 1;
     let tail = &path[root_end..];
     if !tail.is_empty()
         && tail.split('\\').any(|part| {
@@ -247,7 +252,8 @@ mod native {
             return Err(ERROR.into());
         }
         let nt = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
-        let value = format!(r"\\?\GLOBALROOT{nt}");
+        // The device spelling preserves the NT object and works with CreateProcessW.
+        let value = format!(r"\\.\GLOBALROOT{nt}");
         stable_volume_root(&value).ok_or(ERROR)?;
         Ok(PathBuf::from(value))
     }
@@ -390,7 +396,7 @@ mod native {
                 system
                     .to_str()
                     .unwrap()
-                    .strip_prefix(r"\\?\GLOBALROOT")
+                    .strip_prefix(r"\\.\GLOBALROOT")
                     .unwrap(),
             );
             let requested = alias.path();
@@ -403,7 +409,7 @@ mod native {
                 malicious
                     .to_str()
                     .unwrap()
-                    .strip_prefix(r"\\?\GLOBALROOT")
+                    .strip_prefix(r"\\.\GLOBALROOT")
                     .unwrap(),
             );
             assert_eq!(
@@ -425,6 +431,63 @@ mod native {
             assert!(output.status.success());
             assert!(alias.cleanup(), "owned DOS alias cleanup failed");
             std::fs::remove_dir_all(scratch).unwrap();
+        }
+        #[test]
+        fn captured_device_kernel_path_supports_node_io_and_nested_processes() {
+            let located = std::process::Command::new("node")
+                .args(["--eval", "process.stdout.write(process.execPath)"])
+                .output()
+                .unwrap();
+            assert!(located.status.success(), "CI Node fixture unavailable");
+            let path = PathBuf::from(String::from_utf8(located.stdout).unwrap());
+            let code = stable_path(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(&code).unwrap());
+            let scratch =
+                std::env::temp_dir().join(format!("frameleaf-node-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).unwrap();
+            let common = scratch.join("fixture.cjs");
+            let module = scratch.join("fixture.mjs");
+            std::fs::write(&common, "module.exports = 'kernel-common-ok';").unwrap();
+            std::fs::write(&module, "export const value = 'kernel-module-ok';").unwrap();
+            let common = stable_path(&common).unwrap();
+            let module = stable_path(&module).unwrap();
+            let script = r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const {spawnSync} = require('node:child_process');
+const {pathToFileURL} = require('node:url');
+const executable = process.argv[1];
+assert.ok(path.isAbsolute(executable));
+assert.equal(path.join(path.dirname(executable), 'node.exe'), executable);
+assert.ok(fs.readFileSync(executable).length > 0);
+assert.equal(require(process.argv[2]), 'kernel-common-ok');
+import(pathToFileURL(process.argv[3]).href).then(module => {
+assert.equal(module.value, 'kernel-module-ok');
+const child = spawnSync(executable, ['--eval', 'process.stdout.write("nested-kernel-ok")'],
+  {env: {SystemRoot: process.env.SystemRoot}, timeout: 10000, maxBuffer: 1024});
+assert.equal(child.error, undefined);
+assert.equal(child.status, 0);
+assert.equal(child.stdout.toString(), 'nested-kernel-ok');
+process.stdout.write('device-kernel-node-ok');
+}).catch(error => { console.error(error); process.exitCode = 1; });
+"#;
+            let output = std::process::Command::new(&code)
+                .args(["--eval", script])
+                .arg(&code)
+                .arg(&common)
+                .arg(&module)
+                .env_clear()
+                .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+                .output();
+            std::fs::remove_dir_all(scratch).unwrap();
+            let output = output.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"device-kernel-node-ok");
         }
         #[test]
         fn relative_code_path_never_uses_the_process_working_directory() {
@@ -459,6 +522,25 @@ pub(crate) use native::{durable_name, protect, stable_path};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_kernel_paths_keep_the_same_physical_volume_boundary() {
+        let root = r"\\.\GLOBALROOT\Device\HarddiskVolume12\";
+        let file = format!(r"{root}Windows\System32\cmd.exe");
+        assert_eq!(stable_volume_root(&file), Some(root));
+        let components = filesystem_components(&file).unwrap();
+        assert_eq!(components.first().copied(), Some(root));
+        assert_eq!(components.last().copied(), Some(file.as_str()));
+        assert_eq!(components.len(), 4);
+        for bad in [
+            r"\\.\C:\Windows\cmd.exe",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume0\file",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\..\file",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\file:stream",
+            r"\\.\GLOBALROOT\Device\Mup\share\file",
+        ] {
+            assert!(filesystem_components(bad).is_none(), "{bad}");
+        }
+    }
     #[test]
     fn persistent_names_normalize_only_the_guid_and_refuse_unsafe_metadata() {
         let guid = "ABCDEFAB-2222-3333-4444-555555555555";

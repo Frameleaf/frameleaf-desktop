@@ -77,10 +77,9 @@ fn physical_id(path: &Path) -> Result<String, String> {
 }
 fn storage_ancestors(path: &Path) -> Result<Vec<&Path>, String> {
     #[cfg(any(windows, test))]
-    if let Some(value) = path
-        .to_str()
-        .filter(|value| value.starts_with(r"\\?\GLOBALROOT"))
-    {
+    if let Some(value) = path.to_str().filter(|value| {
+        value.starts_with(r"\\?\GLOBALROOT") || value.starts_with(r"\\.\GLOBALROOT")
+    }) {
         return Ok(crate::windows_protection::filesystem_components(value)
             .ok_or("host_control_config_invalid")?
             .into_iter()
@@ -696,6 +695,23 @@ mod tests {
         assert_eq!(
             storage_ancestors(&ordinary).unwrap(),
             ordinary.ancestors().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn device_kernel_storage_ancestry_stops_at_the_filesystem_root() {
+        let root = r"\\.\GLOBALROOT\Device\HarddiskVolume12\";
+        let child = format!(r"{root}Frameleaf\state");
+        assert_eq!(
+            storage_ancestors(Path::new(&child)).unwrap(),
+            vec![
+                Path::new(&child),
+                Path::new(&format!(r"{root}Frameleaf")),
+                Path::new(root)
+            ]
+        );
+        assert!(
+            storage_ancestors(Path::new(r"\\.\GLOBALROOT\Device\HarddiskVolume0\state")).is_err()
         );
     }
     #[cfg(windows)]

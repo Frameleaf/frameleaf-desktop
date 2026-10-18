@@ -844,3 +844,11 @@ cargo test --manifest-path src-tauri/Cargo.toml --test native_photo -- \
 It retains only generated fixture data for inspection and uses in-memory test
 signing authority. This does not qualify the Owner journal, OS keystore, installed
 desktop UI, release signing, or NAS/GPU work.
+
+Windows code capture now uses the device form of the opened object's kernel path
+(`\\.\GLOBALROOT\Device\HarddiskVolumeN`), which the standalone Windows process
+probe can launch. Both kernel spellings retain strict physical-volume parsing and
+bounded ancestor checks; drive/GUID aliases remain excluded from execution authority.
+The existing alias-rebind regression and a hosted Node file/module/nested-process
+regression cover this boundary. Full bundled-host and installed Windows acceptance
+remain separate gates.
