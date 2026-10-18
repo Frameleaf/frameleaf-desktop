@@ -28,6 +28,7 @@ struct Intent {
     previous: Marker,
     next: Marker,
     previous_database_identity: String,
+    media_identity: Option<String>,
     prepared: PreparedRestore,
     verification_id: String,
     safety: SafetySnapshot,
@@ -135,6 +136,24 @@ fn database_identity(path: &Path) -> Result<String, String> {
     let root = Dir::from_std_file(crate::host_storage::directory(path)?);
     identity(&root)
 }
+fn media_identity(root: &Dir) -> Result<Option<String>, String> {
+    match root.symlink_metadata("media") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
+        _ => return Err("host_restore_media_changed".into()),
+    }
+    let open = || {
+        crate::copy_source::parent_dir(root, Path::new("media/placeholder"))
+            .map(|(directory, _)| directory)
+            .map_err(|_| "host_restore_media_changed".to_string())
+    };
+    let directory = open()?;
+    let captured = identity(&directory)?;
+    if identity(&open()?)? != captured {
+        return Err("host_restore_media_changed".into());
+    }
+    Ok(Some(captured))
+}
 impl Owner {
     /// Recover only the retained selection. This never clears pending state or grants writers.
     pub(crate) fn reconcile_restore(
@@ -179,6 +198,10 @@ impl Owner {
             || intent.previous.generation == intent.next.generation
             || !crate::host_runtime::checkpoint_operation_id(&intent.verification_id)
             || !crate::native_runtime::digest_valid(&intent.previous_database_identity, 64)
+            || intent
+                .media_identity
+                .as_ref()
+                .is_some_and(|value| !crate::native_runtime::digest_valid(value, 64))
             || intent.prepared.binding.installation_id != id
             || intent.prepared.binding.manifest_sha256 != sha
             || !intent
@@ -187,6 +210,9 @@ impl Owner {
                 .matches_restore_runtime(&intent.prepared)
         {
             return Err("host_restore_activation_requires_review".into());
+        }
+        if media_identity(&self.root)? != intent.media_identity {
+            return Err("host_restore_media_changed".into());
         }
         let reference = intent
             .next
@@ -246,6 +272,9 @@ impl Owner {
         if database_identity(&original)? != intent.previous_database_identity {
             return Err("host_restore_activation_requires_review".into());
         }
+        if media_identity(&self.root)? != intent.media_identity {
+            return Err("host_restore_media_changed".into());
+        }
         self.placement()?;
         let fresh = recoverable_marker(self)?;
         if fresh != current {
@@ -260,6 +289,9 @@ impl Owner {
         }
         verify_record(&self.root, ACTIVATION, &bytes)?;
         verify_record(&target, "activation-intent.json", &bytes)?;
+        if media_identity(&self.root)? != intent.media_identity {
+            return Err("host_restore_media_changed".into());
+        }
         Ok(Some(marker.generation))
     }
     pub(crate) fn select_restore(
@@ -340,6 +372,7 @@ impl Owner {
             previous,
             next,
             previous_database_identity: previous_identity,
+            media_identity: media_identity(&self.root)?,
             prepared: proof.prepared,
             verification_id: proof.verification_id,
             safety,
@@ -350,12 +383,16 @@ impl Owner {
             return Err("host_restore_activation_write_failed".into());
         }
         self.placement()?;
+        if media_identity(&self.root)? != intent.media_identity {
+            return Err("host_restore_media_changed".into());
+        }
         // Publish and sync the global writer fence before any selection change.
         record(&self.root, ACTIVATION, &bytes)?;
         let target = proof.reference.target_directory(&self.path)?;
         record(&target, "activation-intent.json", &bytes)?;
         proof.reference.resolve(&self.path)?;
         if database_identity(&database)? != intent.previous_database_identity
+            || media_identity(&self.root)? != intent.media_identity
             || self.read()? != Some(intent.previous.clone())
         {
             return Err("host_restore_activation_requires_review".into());
@@ -371,6 +408,9 @@ impl Owner {
         verify_record(&self.root, ACTIVATION, &bytes)?;
         verify_record(&target, "activation-intent.json", &bytes)?;
         // The immutable fence deliberately remains: this operation cannot admit writers.
+        if media_identity(&self.root)? != intent.media_identity {
+            return Err("host_restore_media_changed".into());
+        }
         Ok(intent.next.generation)
     }
 }
@@ -1025,5 +1065,63 @@ mod tests {
         let fresh = f.proof();
         assert!(f.owner.select_restore(fresh, safety).is_err());
         assert!(f.path.join(ACTIVATION).exists());
+    }
+    #[test]
+    fn media_root_replacement_stops_reconciliation_without_changing_the_fence() {
+        for mutation in ["replace", "missing"] {
+            let mut f = Fixture::new();
+            let media = f.path.join("media");
+            crate::runtime_store::private_directory(&media).unwrap();
+            let proof = f.proof();
+            let safety = f.safety();
+            f.owner.select_restore(proof, safety).unwrap();
+            let fence = std::fs::read(f.path.join(ACTIVATION)).unwrap();
+            let marker = f.owner.read().unwrap();
+            std::fs::rename(&media, f.path.join("retained-media")).unwrap();
+            if mutation == "replace" {
+                crate::runtime_store::private_directory(&media).unwrap();
+            }
+            assert!(
+                f.owner.reconcile_restore(ID, &"b".repeat(64)).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(f.owner.read().unwrap(), marker);
+            assert_eq!(std::fs::read(f.path.join(ACTIVATION)).unwrap(), fence);
+        }
+    }
+    #[test]
+    fn absent_media_is_bound_and_unchanged_media_can_resume() {
+        for present in [false, true] {
+            let mut f = Fixture::new();
+            if present {
+                crate::runtime_store::private_directory(&f.path.join("media")).unwrap();
+            }
+            let proof = f.proof();
+            let safety = f.safety();
+            let generation = f.owner.select_restore(proof, safety).unwrap();
+            assert_eq!(
+                f.owner.reconcile_restore(ID, &"b".repeat(64)).unwrap(),
+                Some(generation)
+            );
+            if !present {
+                crate::runtime_store::private_directory(&f.path.join("media")).unwrap();
+                assert!(f.owner.reconcile_restore(ID, &"b".repeat(64)).is_err());
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn media_links_are_refused_before_selection_changes() {
+        use std::os::unix::fs::symlink;
+        let mut f = Fixture::new();
+        let alternate = f.path.join("alternate-media");
+        crate::runtime_store::private_directory(&alternate).unwrap();
+        symlink(&alternate, f.path.join("media")).unwrap();
+        let proof = f.proof();
+        let safety = f.safety();
+        let before = f.owner.read().unwrap();
+        assert!(f.owner.select_restore(proof, safety).is_err());
+        assert_eq!(f.owner.read().unwrap(), before);
+        assert!(!f.path.join(ACTIVATION).exists());
     }
 }
