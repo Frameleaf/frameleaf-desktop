@@ -138,7 +138,9 @@ fn private_acl(owner: &[u8], acl: &[u8], user: &[u8], trusted: &[Vec<u8>]) -> bo
 #[cfg(windows)]
 mod user;
 #[cfg(windows)]
-pub(crate) use user::{account_directory, new_private_directory, private_directory};
+pub(crate) use user::{
+    account_directory, new_private_directory, private_directory, process_user_sid,
+};
 
 #[cfg(windows)]
 mod native {

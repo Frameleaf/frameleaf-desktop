@@ -451,7 +451,7 @@ fn repair_tree(
     }
     Ok(())
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn verify_for_profile(record: &Installation) -> Result<(), String> {
     let layout = record.layout()?;
     let _lease = crate::package_lease::CodeLease::acquire(&layout.runtime)?;

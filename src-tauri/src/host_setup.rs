@@ -22,6 +22,7 @@ pub(crate) struct View {
     installation: Option<Installation>,
     origin: Option<String>,
     pub background_active: bool,
+    profile_setup_available: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -31,6 +32,7 @@ impl Default for View {
             installation: None,
             origin: None,
             background_active: false,
+            profile_setup_available: cfg!(any(target_os = "linux", windows)),
         }
     }
 }
@@ -59,6 +61,7 @@ impl HostSetup {
                 .map(|_| "https://127.0.0.1:9443".into()),
             installation,
             background_active: false,
+            profile_setup_available: cfg!(any(target_os = "linux", windows)),
         };
     }
     fn snapshot(&self) -> View {
@@ -107,13 +110,19 @@ impl HostSetup {
             self.provision_record(record, crate::profile_elevation::provision)
                 .await
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let record = Installation::read(&manifest)?;
+            self.provision_record(record, crate::windows_profile_elevation::provision)
+                .await
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = manifest;
             Err("host_install_platform_unsupported".into())
         }
     }
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", windows, test))]
     async fn provision_record<F>(
         &self,
         installation: Installation,
@@ -515,6 +524,19 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_setup_capability_survives_lifecycle_transitions() {
+        let setup = HostSetup::default();
+        for state in ["idle", "provisioning", "profile-ready", "needs-attention"] {
+            setup.set(state, None, None);
+            let view = serde_json::to_value(setup.snapshot()).unwrap();
+            assert_eq!(
+                view["profileSetupAvailable"],
+                cfg!(any(target_os = "linux", windows))
+            );
+            assert_eq!(view["state"], state);
+        }
+    }
     #[tokio::test]
     async fn local_photos_requires_an_owned_manager_before_reading_credentials() {
         assert_eq!(

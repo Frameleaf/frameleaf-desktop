@@ -77,7 +77,7 @@ fn current_user() -> Result<Vec<u8>, String> {
     }
     unsafe { super::native::sid_bytes(sid) }.map_err(|_| ERROR.into())
 }
-fn descriptor(user: &[u8]) -> Result<Local, String> {
+fn sid_name(user: &[u8]) -> Result<String, String> {
     let mut text = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(user.as_ptr().cast_mut().cast(), &mut text) } == 0
         || text.is_null()
@@ -88,8 +88,14 @@ fn descriptor(user: &[u8]) -> Result<Local, String> {
     let length = (0..256)
         .find(|i| unsafe { *text.add(*i) == 0 })
         .ok_or(ERROR)?;
-    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
-        .map_err(|_| ERROR)?;
+    String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+        .map_err(|_| ERROR.into())
+}
+pub(crate) fn process_user_sid() -> Result<String, String> {
+    sid_name(&current_user()?)
+}
+fn descriptor(user: &[u8]) -> Result<Local, String> {
+    let sid = sid_name(user)?;
     let sddl: Vec<u16> = format!("O:{sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})\0")
         .encode_utf16()
         .collect();

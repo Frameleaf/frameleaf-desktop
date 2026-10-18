@@ -4,7 +4,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { managerError, localProfilePending } from './manager-state';
   type Installation = { manifestSha256: string; controllerSha256: string };
-  type View = { state: string; code: string | null; backgroundActive: boolean; origin: string | null; installation: Installation | null };
+  type View = { state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -88,7 +88,7 @@
     busy = true; provisioning = true; onactive(true); failure = ''; notice = '';
     try {
       show(await invoke<View>('provision_local_host_profile', { manifestSha256: selected }));
-      notice = 'Your private server profile is ready. You can now prepare local Manager.';
+      notice = 'Your private server profile is ready. Check installation to continue.';
     } catch (error) {
       failure = explain(error);
       const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
@@ -118,7 +118,7 @@
   {#if failure}<p class="message error" role="alert">{failure}</p>{/if}
   {#if notice}<p class="message" role="status">{notice}</p>{/if}
   {#if profilePending}<p role="status">Finish or dismiss the system authorization request, then check installation to continue.</p>{/if}
-  {#if view?.code === 'host_install_linux_profile_required' || view?.code?.startsWith('host_profile_')}
+  {#if (view?.profileSetupAvailable && installations.length > 0 && (view.state === 'idle' || view.state === 'needs-attention')) || view?.code === 'host_install_linux_profile_required' || view?.code?.startsWith('host_profile_')}
     <p>Your system may ask for administrator authorization to create private server folders for your account. Frameleaf does not receive your administrator password. This step does not start the photo server.</p>
     <button class="primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare my server profile</button>
   {/if}
