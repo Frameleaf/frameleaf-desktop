@@ -43,7 +43,7 @@ class WindowsClosureTests(unittest.TestCase):
             source.mkdir()
             for name in ['engine.exe', 'Vendor.dll', 'nested.dll']:
                 (source / name).write_bytes(pe())
-            imports = {'engine.exe': ['VENDOR.DLL', 'KERNEL32.dll', 'gdiplus.dll'],
+            imports = {'engine.exe': ['VENDOR.DLL', 'KERNEL32.dll', 'gdiplus.dll', 'COMCTL32.dll'],
                        'Vendor.dll': ['nested.dll', 'api-ms-win-core-file-l1-1-0.dll'],
                        'nested.dll': ['ucrtbase.dll']}
             calls = []
@@ -60,6 +60,8 @@ class WindowsClosureTests(unittest.TestCase):
             self.assertFalse((root / 'output/bin/KERNEL32.dll').exists())
             self.assertIn('kernel32.dll', report['systemLibraries'])
             self.assertIn('gdiplus.dll', report['systemLibraries'])
+            self.assertIn('comctl32.dll', report['systemLibraries'])
+            self.assertFalse((root / 'output/bin/comctl32.dll').exists())
             self.assertFalse((root / 'output/bin/gdiplus.dll').exists())
             self.assertEqual(len(report['objects']), 3)
 
@@ -121,4 +123,20 @@ class WindowsSystemGraphicsTests(unittest.TestCase):
         self.assertLess(length, len(buffer))
         resolved = Path(buffer.value).resolve(strict=True)
         self.assertEqual(resolved.name.casefold(), 'gdiplus.dll')
+        self.assertTrue(resolved.is_relative_to(Path(os.environ['SystemRoot']).resolve(strict=True)))
+
+    @unittest.skipUnless(os.name == 'nt', 'actual Windows common-controls system-loader probe')
+    def test_comctl32_resolves_from_the_operating_system(self):
+        import ctypes
+        library = ctypes.WinDLL('comctl32.dll', winmode=0x00000800)
+        self.assertIsNotNone(library.InitCommonControlsEx)
+        kernel = ctypes.WinDLL('kernel32.dll', use_last_error=True)
+        kernel.GetModuleFileNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel.GetModuleFileNameW.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel.GetModuleFileNameW(library._handle, buffer, len(buffer))
+        self.assertGreater(length, 0)
+        self.assertLess(length, len(buffer))
+        resolved = Path(buffer.value).resolve(strict=True)
+        self.assertEqual(resolved.name.casefold(), 'comctl32.dll')
         self.assertTrue(resolved.is_relative_to(Path(os.environ['SystemRoot']).resolve(strict=True)))
