@@ -75,6 +75,31 @@ def raw_contract(pin: dict, patches: dict[str, bytes], libraw: dict) -> dict:
     return pin
 
 
+
+def use_windows_libraw_wide_input(source: Path) -> dict:
+    regular(source)
+    original = source.read_text()
+    include = "#include <windows.h>\n"
+    opening = "        ret = RawProcessor.open_file(argv[arg]);\n"
+    if original.count(include) != 1 or original.count(opening) != 1:
+        raise BuildError("host_raw_libraw_entrypoint_changed")
+    before = sha256(source)
+    # Keep the original UTF-16 input; the CRT narrow argv has already lost Unicode characters.
+    adapted = original.replace(include, include + "#include <shellapi.h>\n#include <memory>\n")
+    adapted = adapted.replace(opening, """#ifndef LIBRAW_WIN32_UNICODEPATHS
+#error Windows RAW input requires wide-path support
+#endif
+        int wide_argc = 0;
+        std::unique_ptr<wchar_t *, decltype(&LocalFree)> wide_argv(
+            CommandLineToArgvW(GetCommandLineW(), &wide_argc), &LocalFree);
+        if (!wide_argv || wide_argc != argc)
+          return 1;
+        ret = RawProcessor.open_file(wide_argv.get()[arg]);
+""")
+    source.write_text(adapted)
+    return {"originalSha256": before, "adaptedSha256": sha256(source)}
+
+
 def use_pinned_windows_lensfun_database(macro: Path, prefix: Path) -> dict:
     database = prefix / "share/lensfun/version_1"
     if not (database / "timestamp.txt").is_file() or not any(database.glob("*.xml")):
@@ -372,6 +397,10 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
             command([git, "-C", raw, "checkout", "--detach", "FETCH_HEAD"])
             if command([git, "-C", raw, "rev-parse", "HEAD"]) != libraw["revision"]:
                 raise BuildError("host_raw_libraw_revision_mismatch")
+            if windows:
+                report["windowsLibRawWideInput"] = use_windows_libraw_wide_input(
+                    raw / "samples/dcraw_emu.cpp"
+                )
             command([tools["autoreconf"], "--install",
                      *(["--force", "-I", "m4", "-I", (dependencies / "share/aclocal").as_posix()] if windows else [])], raw)
             command(
@@ -380,7 +409,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                     "--prefix=" + str(prefix),
                     "--enable-examples",
                     "--disable-static",
-                    *(["--host=x86_64-w64-mingw32"] if windows else []),
+                    *(["--host=x86_64-w64-mingw32", "LIBS=-lshell32"] if windows else []),
                 ],
                 raw,
             )

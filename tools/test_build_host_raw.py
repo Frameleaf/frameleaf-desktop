@@ -16,6 +16,33 @@ UPSTREAM_WINDOWS_LENSFUN = '  # Add lensfun libraries\n  if(LensFun_FOUND)\n    
 
 
 class NativeRawContractTests(unittest.TestCase):
+    def test_windows_decoder_adaptation_preserves_original_wide_input_and_refuses_drift(self):
+        from build_host_raw import use_windows_libraw_wide_input
+        original = '#include <windows.h>\n' + '        ret = RawProcessor.open_file(argv[arg]);\n'
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "dcraw_emu.cpp"
+                source.write_bytes(original.replace("\n", newline).encode())
+                before = source.read_bytes()
+                report = use_windows_libraw_wide_input(source)
+                adapted = source.read_text()
+                self.assertIn('CommandLineToArgvW(GetCommandLineW(), &wide_argc)', adapted)
+                self.assertIn('RawProcessor.open_file(wide_argv.get()[arg])', adapted)
+                self.assertIn('wide_argc != argc', adapted)
+                self.assertIn('decltype(&LocalFree)', adapted)
+                self.assertIn('#error Windows RAW input requires wide-path support', adapted)
+                self.assertEqual(report['originalSha256'], hashlib.sha256(before).hexdigest())
+                self.assertEqual(report['adaptedSha256'], hashlib.sha256(source.read_bytes()).hexdigest())
+                saved = source.read_bytes()
+                with self.assertRaisesRegex(BuildError, 'host_raw_libraw_entrypoint_changed'):
+                    use_windows_libraw_wide_input(source)
+                self.assertEqual(source.read_bytes(), saved)
+                for changed in (original.replace('argv[arg]', 'other'), original + original):
+                    source.write_text(changed)
+                    with self.assertRaisesRegex(BuildError, 'host_raw_libraw_entrypoint_changed'):
+                        use_windows_libraw_wide_input(source)
+                    self.assertEqual(source.read_text(), changed)
+
     def test_windows_installs_only_its_source_pinned_lensfun_database(self):
         for newline in ("\n", "\r\n"):
             with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
