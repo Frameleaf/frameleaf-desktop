@@ -522,6 +522,21 @@ mod tests {
             serde_json::from_value(serde_json::json!({"snapshotId":"1".repeat(64),"recoverySha256":format!("{:x}",Sha256::digest(&bytes)),"checkpoint":checkpoint})).unwrap()
         }
     }
+    // Inject crash bytes through the held journal handle; Windows locks reject a second handle.
+    fn journal_bytes(owner: &mut Owner) -> Vec<u8> {
+        owner.file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut owner.file)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+    fn inject_journal(owner: &mut Owner, bytes: &[u8]) {
+        owner.file.rewind().unwrap();
+        owner.file.set_len(0).unwrap();
+        owner.file.write_all(bytes).unwrap();
+        owner.file.sync_all().unwrap();
+    }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
@@ -671,8 +686,8 @@ mod tests {
                     f.owner.write(&intent.previous).unwrap();
                 }
                 "retained" => f.owner.write(&intent.previous).unwrap(),
-                "torn" => fs::write(f.path.join(NAME), b"{").unwrap(),
-                "empty" => fs::write(f.path.join(NAME), b"").unwrap(),
+                "torn" => inject_journal(&mut f.owner, b"{"),
+                "empty" => inject_journal(&mut f.owner, b""),
                 "missing-global" => fs::remove_file(f.path.join(ACTIVATION)).unwrap(),
                 "maintenance-generation" => {
                     f.owner
@@ -765,7 +780,7 @@ mod tests {
                         "wrong-type" => value["generation"] = serde_json::json!({"foreign":true}),
                         _ => value = serde_json::json!({}),
                     }
-                    fs::write(f.path.join(NAME), serde_json::to_vec(&value).unwrap()).unwrap();
+                    inject_journal(&mut f.owner, &serde_json::to_vec(&value).unwrap());
                 }
                 "marker" | "active" => {
                     let mut marker = f.owner.read().unwrap().unwrap();
@@ -799,12 +814,12 @@ mod tests {
                     held_lease = Some(lease);
                 }
             }
-            let before = fs::read(f.path.join(NAME)).unwrap();
+            let before = journal_bytes(&mut f.owner);
             assert!(
                 f.owner.reconcile_restore(ID, &"b".repeat(64)).is_err(),
                 "{mutation}"
             );
-            assert_eq!(fs::read(f.path.join(NAME)).unwrap(), before, "{mutation}");
+            assert_eq!(journal_bytes(&mut f.owner), before, "{mutation}");
             assert!(f.path.join(ACTIVATION).exists());
             drop(held_lease);
         }
@@ -815,7 +830,7 @@ mod tests {
         let proof = f.proof();
         let safety = f.safety();
         f.owner.select_restore(proof, safety).unwrap();
-        fs::write(f.path.join(NAME), b"{").unwrap();
+        inject_journal(&mut f.owner, b"{");
         f.owner
             .activate(
                 ID,
@@ -928,14 +943,14 @@ mod tests {
             }
             let global = fs::read(f.path.join(ACTIVATION)).unwrap();
             let retained = fs::read(f.target.join("activation-intent.json")).unwrap();
-            let marker = fs::read(f.path.join(NAME)).unwrap();
+            let marker = journal_bytes(&mut f.owner);
             assert!(f.owner.select_restore(proof, safety).is_err(), "{mutation}");
             assert_eq!(fs::read(f.path.join(ACTIVATION)).unwrap(), global);
             assert_eq!(
                 fs::read(f.target.join("activation-intent.json")).unwrap(),
                 retained
             );
-            assert_eq!(fs::read(f.path.join(NAME)).unwrap(), marker);
+            assert_eq!(journal_bytes(&mut f.owner), marker);
             drop(held_lease);
         }
     }
