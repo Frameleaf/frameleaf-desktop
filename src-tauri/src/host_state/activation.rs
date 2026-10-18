@@ -269,7 +269,6 @@ impl Owner {
         if self.active.is_some() || !self.writable {
             return Err("host_restore_proof_invalid".into());
         }
-        no_activation(&self.root)?;
         safety.validate()?;
         if !safety.checkpoint.matches_restore_runtime(&proof.prepared) {
             return Err("host_restore_safety_invalid".into());
@@ -281,6 +280,41 @@ impl Owner {
         if previous.generation != proof.generation {
             return Err("host_restore_proof_invalid".into());
         }
+        let existing = read_record(&self.root, ACTIVATION)?;
+        if existing.is_some() || previous.restore_pending {
+            proof.prepared.validate_reference(&proof.reference)?;
+            let target = proof.reference.target_directory(&self.path)?;
+            let bytes = match existing {
+                Some(bytes) => bytes,
+                None => read_record(&target, "activation-intent.json")?
+                    .ok_or("host_restore_activation_requires_review")?,
+            };
+            let intent: Intent = serde_json::from_slice(&bytes)
+                .map_err(|_| "host_restore_activation_requires_review")?;
+            if !previous.restore_pending
+                || previous.database_reference.as_ref() != Some(&proof.reference)
+                || intent.next.database_reference.as_ref() != Some(&proof.reference)
+                || intent.prepared != proof.prepared
+                || intent.safety != safety
+            {
+                return Err("host_restore_activation_requires_review".into());
+            }
+            // A fresh proof can acknowledge the same selection; the original fence stays immutable.
+            let generation = self
+                .reconcile_restore(
+                    &proof.prepared.binding.installation_id,
+                    &proof.prepared.binding.manifest_sha256,
+                )?
+                .ok_or("host_restore_activation_requires_review")?;
+            if generation != proof.generation || self.read()? != Some(previous) {
+                return Err("host_restore_activation_requires_review".into());
+            }
+            proof.reference.resolve(&self.path)?;
+            verify_record(&self.root, ACTIVATION, &bytes)?;
+            verify_record(&target, "activation-intent.json", &bytes)?;
+            return Ok(generation);
+        }
+        no_activation(&self.root)?;
         let host_lease = self
             .root
             .open_with("lease.lock", &options(false))
@@ -735,5 +769,108 @@ mod tests {
             .owner
             .activate(ID, &"b".repeat(64), crate::host_runtime::HostMode::Server)
             .is_err());
+    }
+    #[test]
+    fn fresh_proof_acknowledges_an_already_selected_restore_without_replacing_its_fence() {
+        for missing_global in [false, true] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let safety = f.safety();
+            f.owner.select_restore(proof, safety.clone()).unwrap();
+            let bytes = fs::read(f.path.join(ACTIVATION)).unwrap();
+            f.owner
+                .activate(
+                    ID,
+                    &"b".repeat(64),
+                    crate::host_runtime::HostMode::RestorePrepare,
+                )
+                .unwrap();
+            let proof = f.proof();
+            let generation = proof.generation;
+            if missing_global {
+                fs::remove_file(f.path.join(ACTIVATION)).unwrap();
+            }
+            assert_eq!(f.owner.select_restore(proof, safety).unwrap(), generation);
+            assert_eq!(fs::read(f.path.join(ACTIVATION)).unwrap(), bytes);
+            assert_eq!(
+                fs::read(f.target.join("activation-intent.json")).unwrap(),
+                bytes
+            );
+            let marker = f.owner.read().unwrap().unwrap();
+            assert_eq!(marker.generation, generation);
+            assert!(marker.restore_pending);
+            assert_eq!(
+                fs::read(f.path.join("database/sentinel")).unwrap(),
+                b"original"
+            );
+            assert!(f
+                .owner
+                .activate(ID, &"b".repeat(64), crate::host_runtime::HostMode::Server)
+                .is_err());
+        }
+    }
+    #[test]
+    fn selection_retry_rejects_changed_safety_prepared_receipt_and_intent_without_mutation() {
+        for mutation in [
+            "safety",
+            "prepared",
+            "intent",
+            "generation",
+            "pid",
+            "lease",
+            "target",
+        ] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let safety = f.safety();
+            f.owner.select_restore(proof, safety.clone()).unwrap();
+            f.owner
+                .activate(
+                    ID,
+                    &"b".repeat(64),
+                    crate::host_runtime::HostMode::RestorePrepare,
+                )
+                .unwrap();
+            let mut proof = f.proof();
+            let mut safety = safety;
+            let mut held_lease = None;
+            match mutation {
+                "safety" => safety.snapshot_id = "9".repeat(64),
+                "prepared" => {
+                    let mut value = serde_json::to_value(&proof.prepared).unwrap();
+                    value["binding"]["snapshotId"] = serde_json::json!("9".repeat(64));
+                    proof.prepared = serde_json::from_value(value).unwrap();
+                }
+                "generation" => proof.generation = Uuid::new_v4(),
+                "pid" => fs::write(f.target.join("database/postmaster.pid"), b"unknown").unwrap(),
+                "lease" => {
+                    let file = f
+                        .owner
+                        .root
+                        .open_with("lease.lock", &options(false))
+                        .unwrap()
+                        .into_std();
+                    file.try_lock().unwrap();
+                    held_lease = Some(file);
+                }
+                "target" => {
+                    fs::rename(f.target.join("database"), f.target.join("changed-database"))
+                        .unwrap();
+                    crate::runtime_store::private_directory(&f.target.join("database")).unwrap();
+                }
+                _ => fs::write(f.path.join(ACTIVATION), b"{").unwrap(),
+            }
+            let global = fs::read(f.path.join(ACTIVATION)).unwrap();
+            let retained = fs::read(f.target.join("activation-intent.json")).unwrap();
+            let marker = fs::read(f.path.join(NAME)).unwrap();
+            assert!(f.owner.select_restore(proof, safety).is_err(), "{mutation}");
+            assert_eq!(fs::read(f.path.join(ACTIVATION)).unwrap(), global);
+            assert_eq!(
+                fs::read(f.target.join("activation-intent.json")).unwrap(),
+                retained
+            );
+            assert_eq!(fs::read(f.path.join(NAME)).unwrap(), marker);
+            drop(held_lease);
+        }
     }
 }
