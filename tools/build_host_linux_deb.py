@@ -132,7 +132,8 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
             if not match:
                 match = re.fullmatch(r'([A-Za-z0-9_.+-]+)-([0-9][A-Za-z0-9_.+-]*)\.so', soname)
             if not match:
-                if re.fullmatch(r'[A-Za-z0-9_.+-]+\.so', soname):
+                # Node/Bare add-ons expose SONAMEs but have no Debian shared-library version.
+                if re.fullmatch(r'[A-Za-z0-9_.+-]+(?:\.so|\.node|(?:@[0-9]+)?\.bare)', soname):
                     continue
                 raise BuildError('host_install_private_soname_unsupported')
             shlibs.add(match[1] + ' ' + match[2] + ' ' + package)
