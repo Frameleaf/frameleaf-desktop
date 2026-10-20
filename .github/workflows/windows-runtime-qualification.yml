@@ -1,6 +1,6 @@
 name: Private Windows current CPU qualification
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       artifact_id:
         description: Artifact ID from the approved current Windows runtime build

@@ -14,13 +14,23 @@ on:
         description: Build only the Windows CPU runtime
         type: boolean
         default: true
+      qualify_windows_artifact_id:
+        description: Replay this retained Windows artifact instead of building
+        type: string
+        default: ''
+      qualify_windows_artifact_sha256:
+        description: SHA-256 of the retained Windows artifact ZIP
+        type: string
+        default: ''
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: cpu-runtime-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build:
+    if: inputs.qualify_windows_artifact_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -78,3 +88,12 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 3
+  qualify-windows:
+    if: inputs.qualify_windows_artifact_id != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/windows-runtime-qualification.yml
+    with:
+      artifact_id: ${{ inputs.qualify_windows_artifact_id }}
+      artifact_sha256: ${{ inputs.qualify_windows_artifact_sha256 }}
