@@ -581,16 +581,18 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
 });
 
 
-test("current precision source is approved only for qualified Linux CPU and macOS CoreML targets", async (t) => {
+test("current precision source is approved only for qualified Linux and Windows CPU and macOS CoreML targets", async (t) => {
   const source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   for (const [name, profile] of Object.entries(profiles)) {
     const targets = Object.entries(profile.additionalSources ?? {}).filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
-    assert.deepEqual(targets, name === "cpu-ort" ? ["linux-x86_64"] : name === "coreml-ort" ? ["macos-aarch64"] : []);
+    assert.deepEqual(targets, name === "cpu-ort" ? ["linux-x86_64", "windows-x86_64"] : name === "coreml-ort" ? ["macos-aarch64"] : []);
   }
   const { packageConfiguration } = await import("./package_desktop.mjs");
   for (const [platform, architecture, provider, allowed] of [
     ["linux", "x86_64", "CPUExecutionProvider", true],
+    ["windows", "x86_64", "CPUExecutionProvider", true],
+    ["macos", "x86_64", "CPUExecutionProvider", false],
     ["macos", "aarch64", "CPUExecutionProvider", false],
     ["macos", "aarch64", "CoreMLExecutionProvider", true],
   ]) {
