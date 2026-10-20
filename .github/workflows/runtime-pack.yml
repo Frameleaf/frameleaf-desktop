@@ -9,6 +9,11 @@ on:
       - 'src-tauri/src/process_tree.rs'
       - '.github/workflows/runtime-pack.yml'
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build only the Windows CPU runtime
+        type: boolean
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -19,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-24.04]
+        os: ${{ fromJSON(inputs.windows_only && '["windows-latest"]' || '["macos-latest","windows-latest","ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -30,7 +35,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
+          ref: f2c451a6bf71ca3f3aec986e07f0852937268e2f
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -43,7 +48,7 @@ jobs:
       - name: Builder regression checks
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
-        run: python desktop/tools/build_runtime.py --source server --output candidate --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --epoch 6
+        run: python desktop/tools/build_runtime.py --source server --output candidate --revision f2c451a6bf71ca3f3aec986e07f0852937268e2f --epoch 15
       - name: Retain private validation receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -54,6 +59,15 @@ jobs:
             candidate/payload/requirements.txt
             candidate/payload/build-requirements.txt
           retention-days: 7
+          if-no-files-found: error
+      - name: Retain the private Windows runtime for qualification
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-candidate-Windows
+          path: candidate/
+          include-hidden-files: true
+          retention-days: 3
           if-no-files-found: error
       - name: Retain private failure diagnostics
         if: failure()
