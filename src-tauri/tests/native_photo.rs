@@ -1,6 +1,9 @@
 //! Real synthetic-media journey; the fixture authority never enters release trust.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
+use frameleaf_desktop::host_epochs::{HostEpochAuthority, HostEpochs, HostExecution};
+#[path = "common/host_authority.rs"]
+mod host_authority;
 use frameleaf_desktop::host_runtime::VerifiedHostRuntime;
 use reqwest::{multipart, Client};
 use serde_json::{json, Value};
@@ -50,7 +53,13 @@ async fn actual_native_photo_upload_thumbnail_and_restart() {
         .unwrap();
     let password = Zeroizing::new(format!("Synthetic-{}!", Uuid::new_v4()));
     let mut process = host
-        .start(&state, &password, database_port, api_port)
+        .start(
+            &state,
+            &password,
+            database_port,
+            api_port,
+            &host_authority::Authority::admitted(&host).execution(),
+        )
         .unwrap();
     process.wait_ready(Duration::from_secs(240)).unwrap();
     let web = client.get(&base).send().await.unwrap();
@@ -122,7 +131,13 @@ async fn actual_native_photo_upload_thumbnail_and_restart() {
     process.stop().unwrap();
     drop(process);
     let mut restarted = host
-        .start(&state, &password, database_port, api_port)
+        .start(
+            &state,
+            &password,
+            database_port,
+            api_port,
+            &host_authority::Authority::admitted(&host).execution(),
+        )
         .unwrap();
     restarted.wait_ready(Duration::from_secs(240)).unwrap();
     let client = Client::builder()

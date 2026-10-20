@@ -1,115 +1,123 @@
 use ed25519_dalek::{Signer, SigningKey};
+use frameleaf_desktop::host_epochs::{HostEpochAuthority, HostEpochs, HostExecution};
+#[path = "common/host_authority.rs"]
+mod host_authority;
 use frameleaf_desktop::host_runtime::VerifiedHostRuntime;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 use uuid::Uuid;
 
-struct Fixture(PathBuf, Value, PathBuf);
-impl Fixture {
-    fn new() -> Self {
-        let candidate = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("frameleaf-host-{}", Uuid::new_v4()));
-        let root = candidate.join("payload");
-        fs::create_dir_all(&root).unwrap();
-        let paths = BTreeMap::from([
-            ("node", "node"),
-            ("server", "server/main.js"),
-            ("postgres", "pg/postgres"),
-            ("initdb", "pg/initdb"),
-            ("pgDump", "pg/pg_dump"),
-            ("pgRestore", "pg/pg_restore"),
-            ("pgIsready", "pg/pg_isready"),
-            ("pgChecksums", "pg/pg_checksums"),
-            ("pgCtl", "pg/pg_ctl"),
-            ("psql", "pg/psql"),
-            ("createdb", "pg/createdb"),
-            ("vector", "pg/vector"),
-            ("hdr", "media/hdr"),
-            ("ffmpeg", "media/ffmpeg"),
-            ("ffprobe", "media/ffprobe"),
-            ("exiftool", "media/exiftool"),
-            ("rawRenderer", "raw/bin/darktable-cli"),
-            ("rawDecoder", "raw/bin/dcraw_emu"),
-            ("webIndex", "build/www/index.html"),
-            ("studio", "studio/worker"),
-            ("studioBrowser", "browser/chrome"),
-            ("studioBrowserGuard", "studio/guard/studio-browser-guard"),
-            ("corePlugin", "build/plugins/core/manifest.json"),
-            ("mlManifest", "ml/manifest.json"),
-            ("manager", "manager/app/build/main.js"),
-            ("managerWebIndex", "manager/app/ui/dist/index.html"),
-            ("backupEngine", "backup/restic"),
-        ]);
-        let mut files = serde_json::Map::new();
-        for name in paths.values().copied().chain([
-            "backup/LICENSE",
-            "backup/component.json",
-            "studio/engine-build.json",
-            "studio/guard/studio-browser-guard.mjs",
-            "studio/tools/bundled-worker-fonts.mjs",
-            "studio/tools/render-worker-font-inputs.mjs",
-            "studio/runtime/admission-font.json",
-            "studio/runtime/admission-font.ttf",
-            "build/geodata/geodata-date.txt",
-            "build/geodata/cities500.txt",
-            "build/geodata/admin1CodesASCII.txt",
-            "build/geodata/admin2Codes.txt",
-            "build/geodata/countryInfo.txt",
-            "build/geodata/ne_10m_admin_0_countries.geojson",
-            "build/geodata/landmarks.ndjson.gz",
-            "manager/app/release-worker.cjs",
-            "manager/app/media-copy.cjs",
-            "manager/.github/frameleaf-release.cjs",
-            "manager/.github/verify-release-bundle.cjs",
-            "manager/cosign.pub",
-            "manager/component.json",
-            "manager/package.json",
-            "manager/LICENSE",
-            "manager/node_modules/@nestjs/common/package.json",
-            "manager/node_modules/@nestjs/core/package.json",
-            "manager/node_modules/@nestjs/platform-express/package.json",
-            "manager/node_modules/express/package.json",
-            "manager/node_modules/js-yaml/package.json",
-            "manager/node_modules/reflect-metadata/package.json",
-            "manager/node_modules/rxjs/package.json",
-            "manager/node_modules/zod/package.json",
-        ]) {
-            let path = root.join(name);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, b"fixture").unwrap();
-            files.insert(
-                name.into(),
-                json!({"bytes":7,"sha256":format!("{:x}",Sha256::digest(b"fixture"))}),
-            );
-        }
-        let spec = json!({"schemaVersion":1,"protocolVersion":2,"epoch":1,
-            "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
-            "sourceRevision":"a".repeat(40),"nodeVersion":"26.11.1",
-            "postgresVersion":"19beta4","vectorVersion":"0.8.7","certified":false,
-            "entryPoints":paths,"files":files});
-        Self(root, spec, candidate)
-    }
-    fn verify(&self) -> Result<VerifiedHostRuntime, String> {
-        let key = SigningKey::from_bytes(&[42; 32]);
-        let raw = serde_json::to_vec(&self.1).unwrap();
-        VerifiedHostRuntime::verify(
-            &self.0,
-            &raw,
-            &key.sign(&raw).to_bytes(),
-            &[key.verifying_key()],
-            1,
-        )
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.2);
-    }
+#[path = "common/host_fixture.rs"]
+mod host_fixture;
+use host_fixture::Fixture;
+
+#[test]
+fn host_history_survives_serialization_and_refuses_old_roots_and_same_epoch_mutation() {
+    use frameleaf_desktop::host_epochs::HostEpochs;
+    let original = Fixture::new();
+    let retained = original.verify().unwrap();
+    let mut history = HostEpochs::default();
+    history.admit(&retained).unwrap();
+    let mut newer = Fixture::new();
+    newer.1["epoch"] = json!(8);
+    history.admit(&newer.verify().unwrap()).unwrap();
+    let saved = serde_json::to_value(&history).unwrap();
+    let mut restarted: HostEpochs = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(
+        restarted.check(&retained).unwrap_err(),
+        "host_epoch_rollback"
+    );
+    assert_eq!(
+        restarted
+            .admit(&Fixture::new().verify().unwrap())
+            .unwrap_err(),
+        "host_epoch_rollback"
+    );
+    let mut retry = Fixture::new();
+    retry.1["epoch"] = json!(8);
+    restarted.admit(&retry.verify().unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(&restarted).unwrap(), saved);
+    retry.1["sourceRevision"] = json!("b".repeat(40));
+    assert_eq!(
+        restarted.admit(&retry.verify().unwrap()).unwrap_err(),
+        "host_epoch_reused"
+    );
+    assert_eq!(serde_json::to_value(restarted).unwrap(), saved);
 }
 
+#[test]
+fn host_history_does_not_advance_for_a_changed_verified_payload() {
+    use frameleaf_desktop::host_epochs::HostEpochs;
+    let original = Fixture::new();
+    let mut history = HostEpochs::default();
+    history.admit(&original.verify().unwrap()).unwrap();
+    let before = serde_json::to_value(&history).unwrap();
+    let mut newer = Fixture::new();
+    newer.1["epoch"] = json!(9);
+    let verified = newer.verify().unwrap();
+    fs::write(newer.0.join("node"), b"changed").unwrap();
+    assert!(history.admit(&verified).is_err());
+    assert_eq!(serde_json::to_value(&history).unwrap(), before);
+    fs::write(newer.0.join("node"), b"fixture").unwrap();
+    history.admit(&verified).unwrap();
+}
+
+#[test]
+fn host_and_ml_release_numbers_are_independent_and_share_the_unchanged_installation_key() {
+    use frameleaf_desktop::{
+        connection::DeviceIdentity, host_epochs::HostEpochs, native_runtime::VerifiedRuntime,
+        runtime_epochs::RuntimeEpochs,
+    };
+    let mut fixture = Fixture::new();
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let other_os = if os == "linux" { "macos" } else { "linux" };
+    let other_arch = if arch == "x86_64" {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let mut host: HostEpochs = serde_json::from_value(json!({"accepted":[
+        {"scope":format!("factory-host-v1/{other_os}/{arch}"),"epoch":99999,"manifestSha256":"a".repeat(64)},
+        {"scope":format!("factory-host-v1/{os}/{other_arch}"),"epoch":99999,"manifestSha256":"b".repeat(64)}
+    ]})).unwrap();
+    let ml_root = fixture.2.join("ml-payload");
+    fs::create_dir(&ml_root).unwrap();
+    fs::write(ml_root.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let raw = serde_json::to_vec(&json!({"schemaVersion":1,"protocolVersion":1,"epoch":1000,"platform":os,"architecture":arch,"provider":"CPUExecutionProvider","python":"python","sourceRevision":"c".repeat(40),"files":{"python":{"bytes":7,"sha256":format!("{:x}",Sha256::digest(b"fixture"))}}})).unwrap();
+    let runtime = VerifiedRuntime::verify(
+        &ml_root,
+        &raw,
+        &key.sign(&raw).to_bytes(),
+        &[key.verifying_key()],
+        1,
+    )
+    .unwrap();
+    let mut ml = RuntimeEpochs::default();
+    ml.admit(&runtime).unwrap();
+    let ml_before = serde_json::to_value(&ml).unwrap();
+    host.admit(&fixture.verify().unwrap()).unwrap();
+    fixture.1["epoch"] = json!(9000);
+    host.admit(&fixture.verify().unwrap()).unwrap();
+    ml.check(&runtime).unwrap();
+    assert_eq!(serde_json::to_value(&ml).unwrap(), ml_before);
+    let identity = DeviceIdentity::generate();
+    let mut saved = serde_json::to_value(&identity).unwrap();
+    saved["runtimeEpochs"] = ml_before.clone();
+    saved["hostEpochs"] = serde_json::to_value(&host).unwrap();
+    let restored: DeviceIdentity = serde_json::from_value(saved).unwrap();
+    assert_eq!(restored.installation_id, identity.installation_id);
+    assert_eq!(restored.public_key(), identity.public_key());
+    assert_eq!(
+        restored.sign("history-preservation"),
+        identity.sign("history-preservation")
+    );
+    let saved = serde_json::to_value(restored).unwrap();
+    assert_eq!(saved["runtimeEpochs"], ml_before);
+    assert_eq!(saved["hostEpochs"], serde_json::to_value(host).unwrap());
+}
 #[test]
 fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
     let mut fixture = Fixture::new();
@@ -171,8 +179,10 @@ fn owned_checkpoint_transport_matches_receipts_and_cancels_without_a_second_chan
         let mut fixture = Fixture::new();
         let script = r##"#!/bin/sh
 exec /usr/bin/python3 -c '
-import sys,json
+import sys,json,base64
 mode="RESPONSE_MODE"
+source=base64.b64decode(sys.stdin.readline().rstrip("\n"),validate=True)
+if len(source)<32768 or "--eval" not in sys.argv or max(map(len,sys.argv))>8000: sys.exit(8)
 c=json.loads(sys.stdin.readline())
 print(json.dumps({"state":"running"}),flush=True)
 pending=None
@@ -188,7 +198,7 @@ for line in sys.stdin:
  operation="22222222-2222-4222-8222-222222222222" if mode=="wrong-operation" else pending
  print(json.dumps({"state":"checkpoint","schemaVersion":1,"operationId":operation,"manifestSha256":c["manifestSha256"],"sourceRevision":c["sourceRevision"],"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"c"*64}}),flush=True)
  pending=None
-'
+' "$@"
 "##.replace("RESPONSE_MODE", mode);
         fs::write(fixture.0.join("node"), script.as_bytes()).unwrap();
         fs::set_permissions(fixture.0.join("node"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -200,6 +210,7 @@ for line in sys.stdin:
                 &Zeroizing::new("synthetic-private-checkpoint-password".into()),
                 54321,
                 54322,
+                &host_authority::Authority::admitted(&runtime).execution(),
             )
             .unwrap();
         assert!(child.request_checkpoint(operation).is_err());
@@ -251,6 +262,7 @@ fn host_start_refuses_a_linked_database_before_launching_any_process() {
         &Zeroizing::new("synthetic-host-password-with-enough-length".into()),
         54321,
         54322,
+        &host_authority::Authority::admitted(&verified).execution(),
     );
     assert!(matches!(result, Err(ref code) if code == "runtime_link_forbidden"));
     assert!(!state.join("agent.log").exists());
@@ -268,7 +280,7 @@ fn direct_host_start_cannot_bypass_a_controller_managed_profile() {
     .unwrap();
     let verified = fixture.verify().unwrap();
     assert!(
-        matches!(verified.start(&state, &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()), 54321, 54322), Err(code) if code == "host_controller_required")
+        matches!(verified.start(&state, &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()), 54321, 54322, &host_authority::Authority::admitted(&verified).execution()), Err(code) if code == "host_controller_required")
     );
     assert!(!state.join("agent.log").exists());
 }
@@ -285,6 +297,7 @@ fn host_start_refuses_maintenance_before_creating_private_state() {
         &Zeroizing::new("synthetic-host-password-with-enough-length".into()),
         54321,
         54322,
+        &host_authority::Authority::admitted(&verified).execution(),
     );
     assert!(matches!(result, Err(ref code) if code == "host_package_maintenance"));
     assert!(!state.exists());
@@ -392,7 +405,12 @@ fn rust_owner_drains_agent_output_and_restarts_without_reinitializing_database()
     }
     put("pg/initdb",b"#!/bin/sh\nmkdir \"$2\" || exit 1\nprintf 19 >\"$2/PG_VERSION\"\necho init >>init-count\n",true);
     put("pg/postgres",b"#!/bin/sh\necho $$ >\"$2/postmaster.pid\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",true);
-    put("pg/pg_isready", b"#!/bin/sh\nexit 0\n", true);
+    // Readiness must wait for this cycle's database process to publish its PID.
+    put(
+        "pg/pg_isready",
+        b"#!/bin/sh\ntest -s database/postmaster.pid || exit 1\nkill -0 \"$(head -n 1 database/postmaster.pid)\"\n",
+        true,
+    );
     put("pg/createdb", b"#!/bin/sh\ntouch db-created\n", true);
     put(
         "pg/psql",
@@ -434,7 +452,13 @@ process.on('message',message=>{if(message==='frameleaf:stop')server.close(()=>pr
         drop(database);
         drop(api);
         let mut process = verified
-            .start(&state, &password, database_port, api_port)
+            .start(
+                &state,
+                &password,
+                database_port,
+                api_port,
+                &host_authority::Authority::admitted(&verified).execution(),
+            )
             .unwrap();
         if cycle == 1 {
             let cancelled = std::sync::atomic::AtomicBool::new(true);
@@ -472,7 +496,15 @@ process.on('message',message=>{if(message==='frameleaf:stop')server.close(()=>pr
     let ap = api.local_addr().unwrap().port();
     drop(database);
     drop(api);
-    let mut crashed = verified.start(&state, &password, dp, ap).unwrap();
+    let mut crashed = verified
+        .start(
+            &state,
+            &password,
+            dp,
+            ap,
+            &host_authority::Authority::admitted(&verified).execution(),
+        )
+        .unwrap();
     crashed.wait_ready(Duration::from_secs(15)).unwrap();
     let pg_pid = fs::read_to_string(state.join("database/postmaster.pid"))
         .unwrap()
@@ -663,7 +695,13 @@ fn factory_signed_host_starts_and_restarts_through_compiled_authority() {
     let password = Zeroizing::new(format!("synthetic-{}", Uuid::new_v4()));
     for _ in 0..2 {
         let mut process = host
-            .start(&state, &password, database_port, api_port)
+            .start(
+                &state,
+                &password,
+                database_port,
+                api_port,
+                &host_authority::Authority::admitted(&host).execution(),
+            )
             .unwrap();
         process.wait_ready(Duration::from_secs(240)).unwrap();
         #[cfg(unix)]
@@ -856,5 +894,31 @@ fn signed_but_user_writable_host_cannot_receive_manager_credentials() {
     let verified = fixture.verify().unwrap();
     assert!(
         matches!(verified.manager_programs(), Err(ref code) if code == "native_manager_unprotected" || code == "native_manager_protection_unavailable")
+    );
+}
+
+#[test]
+fn retained_host_start_rechecks_release_and_identity_at_actual_spawn() {
+    use zeroize::Zeroizing;
+    let fixture = Fixture::new();
+    let runtime = fixture.verify().unwrap();
+    let authority = host_authority::Authority::admitted(&runtime);
+    let execution = authority.execution();
+    let mut higher = Fixture::new();
+    higher.1["epoch"] = json!(2);
+    let next = higher.verify().unwrap();
+    let password = Zeroizing::new("synthetic-host-password-with-enough-length".into());
+    assert!(
+        matches!(next.start(&higher.2.join("state"), &password, 54321, 54322, &execution), Err(e) if e == "host_epoch_not_admitted")
+    );
+    authority
+        .activate(host_authority::ID, &next, &mut || Ok(()))
+        .unwrap();
+    assert!(
+        matches!(runtime.start(&fixture.2.join("state"), &password, 54321, 54322, &execution), Err(e) if e == "host_epoch_rollback")
+    );
+    authority.0.lock().unwrap().0 = "22222222-2222-4222-8222-222222222222".into();
+    assert!(
+        matches!(next.start(&higher.2.join("state"), &password, 54321, 54322, &execution), Err(e) if e == "host_installation_identity_changed")
     );
 }

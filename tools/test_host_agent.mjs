@@ -156,6 +156,7 @@ test("host media commands use private binaries without inheriting the caller env
     join(cfg.state, "studio-work"),
   );
   assert.equal(env.HOME, join(cfg.state, "home"));
+  assert.equal(env.FONTCONFIG_FILE, join(cfg.runtime, "server/resources/fonts/fonts.conf"));
   for (const name of [
     "DB_PASSWORD",
     "PGPASSWORD",

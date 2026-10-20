@@ -25,6 +25,7 @@ flate2 = "1"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+hmac = "=0.12.1"
 zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 time = { version = "0.3", features = ["parsing"] }
@@ -57,3 +58,7 @@ debug-assertions = true
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Large signed packs otherwise use SHA-256 software compression on Apple silicon.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }

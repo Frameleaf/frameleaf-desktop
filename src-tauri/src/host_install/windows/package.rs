@@ -24,7 +24,9 @@ use windows_sys::Win32::{
 };
 
 mod profile;
+mod transaction;
 pub(in crate::host_install) use profile::provision;
+pub(in crate::host_install) use transaction::{install, remove};
 
 const AUTHORITY: &str = "host_install_administrator_required";
 const DIRECTORY: &str = "host_install_directory_failed";
@@ -343,12 +345,22 @@ mod tests {
         for operation in [
             crate::host_install::prepare_windows_package,
             crate::host_install::finalize_windows_package,
+            crate::host_install::remove_windows_package,
         ] {
             assert_eq!(
                 operation(&"a".repeat(64), &"b".repeat(64)).unwrap_err(),
                 AUTHORITY
             );
         }
+        assert_eq!(
+            crate::host_install::install_windows_package(
+                Path::new(r"C:\must-not-be-accessed"),
+                &"a".repeat(64),
+                &"b".repeat(64)
+            )
+            .unwrap_err(),
+            AUTHORITY
+        );
         assert_eq!(
             crate::host_install::provision_windows_profile(
                 &"a".repeat(64),

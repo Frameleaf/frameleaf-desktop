@@ -4,20 +4,38 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   type Hint = { label: string; path: string };
   type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
-  type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
+  type Inventory = { kind: string; selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
+  let photosCount = $state(10);
+  const macos = nativePlatform();
+  function nativePlatform() { return typeof navigator !== 'undefined' && /Mac/.test(navigator.platform); }
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
+  type Consent = { allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
+  type CopyJob = { provider: string | null; stagedBytes: number | null; exportRemaining: number | null; additionalExportAllowance: number; sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
+  let allowHydration = $state(false);
   let allowReads = $state(false);
   let alive = true;
   let busy = $state(false);
   let message = $state('');
   const native = isTauri();
   const errors: Record<string, string> = {
+    photos_macos_update_required: 'Apple Photos integration needs macOS 11 or later. You can still choose an exported photo folder.',
+    photos_macos_required: 'Apple Photos is available on macOS. Choose a photo folder on this computer.',
+    photos_permission_required: 'Photos access is unavailable or was revoked. Enable it in macOS System Settings, or remove this source permission. Staged data is kept.',
+    photos_permission_pending: 'The macOS Photos permission request is still pending. Finish it, then try again.',
+    photos_scope_invalid: 'No supported originals were selected. Choose a smaller recent scope or export originals manually from Photos.',
+    photos_scope_too_large: 'The selection contains more than 100 original resources. Select fewer recent photos.',
+    photos_metadata_invalid: 'Photos metadata could not be verified. No originals were read. Try again.',
+    photos_scope_changed: 'Photos no longer exposes this exact approved original. Copying stopped; existing staged bytes are kept. Remove this source and select it again.',
+    photos_original_resources_unavailable: 'An original format or paired resource cannot be copied safely. Export those originals from Photos manually.',
+    photos_original_unavailable: 'Photos could not export the original, or the export timed out. Check iCloud and Photos access before retrying; staged data is kept.',
+    photos_export_interrupted: 'An earlier export was interrupted. Its staged bytes are retained. Retry with an export allowance; it will use a fresh attempt.',
+    photos_export_budget_exceeded: 'This original exceeds the approved 2 GiB resource ceiling. Its partial staged bytes are kept. Export this original manually from Photos.',
+    photos_export_budget_required: 'This copy needs an explicit export allowance before Photos can read originals.',
+    photos_export_budget_exhausted: 'The Photos export allowance was used, including interrupted attempts. Approve another bounded export allowance to retry. Staged bytes are kept.',
     source_metadata_unavailable: 'File metadata could not be checked safely. Check folder access before resuming; staged data is kept.',
     source_folder_excluded: 'This folder is hidden or excluded. Choose an ordinary visible photo folder.',
     source_item_excluded: 'A file or folder became hidden or excluded. Copying stopped before reading it; existing staged data is kept.',
@@ -62,7 +80,7 @@
     server_identity_changed: 'The server identity changed. Sign out before reconnecting.',
 
     source_choose_photo_subfolder: 'Choose a photo folder inside your home folder, rather than your entire home folder.',
-    source_package_requires_provider: 'Apple Photos libraries need the Photos connection. Choose an ordinary folder here.',
+    source_package_requires_provider: 'Use the Apple Photos button to read selected originals through macOS, or export originals from Photos and choose the exported folder.',
     source_folder_unavailable: 'This folder is unavailable. Check that its drive is connected and you have access.',
     source_account_unavailable: 'This OneDrive folder moved or is unavailable. Choose its new location.',
   };
@@ -73,7 +91,7 @@
       if (alive) { consent = current; blockedConsent = false; }
     } catch (error) {
       if (alive) {
-        blockedConsent = ['source_photo_session_changed', 'source_approval_invalid', 'credential_record_invalid'].includes(String(error));
+        blockedConsent = ['source_photo_session_changed', 'source_approval_invalid', 'credential_record_invalid', 'photos_permission_required', 'photos_macos_required'].includes(String(error));
         message = explain(error);
       }
     }
@@ -108,7 +126,7 @@
     catch (error) { message = explain(error); }
     finally { busy = false; }
   }
-  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload') {
+  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload' | 'approve-export') {
     busy = true; message = '';
     try { job = await invoke<CopyJob>('control_photo_import', { action }); }
     catch (error) { message = explain(error); }
@@ -118,8 +136,8 @@
     if (!retry && (!folder || !allowReads)) return;
     busy = true; message = '';
     try {
-      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads });
-      folder = null; allowReads = false;
+      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads, allowPhotosHydration: allowHydration });
+      folder = null; allowReads = false; allowHydration = false;
     } catch (error) { await loadConsent(); message = explain(error); }
     finally { busy = false; }
   }
@@ -127,7 +145,7 @@
     busy = true; message = '';
     try {
       const confirmed = await invoke<boolean>('revoke_photo_source');
-      consent = null; job = null; blockedConsent = false; folder = null; allowReads = false;
+      consent = null; job = null; blockedConsent = false; folder = null; allowReads = false; allowHydration = false;
       message = confirmed ? 'Folder permission removed. Existing server copies are kept.' : 'Local folder permission removed. The server could not confirm revocation; check it when connected.';
     } catch (error) { message = explain(error); }
     finally { busy = false; }
@@ -140,11 +158,17 @@
     } catch { message = 'Could not check OneDrive locations. Choose a synced folder yourself.'; }
     finally { busy = false; }
   }
+  async function choosePhotos() {
+    busy = true; message = '';
+    try { folder = await invoke<Inventory>('choose_apple_photos', { count: photosCount }); allowReads = false; allowHydration = false; }
+    catch (error) { message = explain(error); }
+    finally { busy = false; }
+  }
   async function choose(oneDrive: number | null = null) {
     busy = true; message = '';
     try {
       const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive });
-      if (selected) { folder = selected; allowReads = false; }
+      if (selected) { folder = selected; allowReads = false; allowHydration = false; }
     } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
     finally { busy = false; }
   }
@@ -157,6 +181,15 @@
     <button class="secondary" disabled={busy || !native || !!consent || blockedConsent} onclick={() => choose()}>Choose a photo folder</button>
     <button class="text-button" disabled={busy || !native || !!consent || blockedConsent} onclick={discover}>Find OneDrive folders</button>
   </div>
+  {#if macos}
+    <div class="actions">
+      <label>Apple Photos scope <select bind:value={photosCount} disabled={busy || !!consent || blockedConsent}>
+        {#each [1, 10, 25, 50, 100] as count}<option value={count}>Most recent {count} {count === 1 ? 'asset' : 'assets'}</option>{/each}
+      </select></label>
+      <button class="secondary" disabled={busy || !native || !!consent || blockedConsent} onclick={choosePhotos}>Choose Apple Photos originals</button>
+    </div>
+    <p class="footnote">This button requests macOS Photos access. Preview reads metadata only from the accessible System Photo Library; it does not download originals. iCloud Photos must be enabled in Photos to expose its originals here.</p>
+  {/if}
   {#if hints.length}
     <ul aria-label="Known OneDrive folders">
       {#each hints as hint, index (hint.path)}
@@ -169,6 +202,7 @@
   {#if consent}
     <div class="folder-preview" aria-label="Approved photo folder">
       <strong>{consent.name}</strong><p>{consent.path}</p>
+      {#if consent.kind === 'apple-photos'}<p class="footnote">{consent.allowPhotosHydration ? 'Photos-managed iCloud downloads are allowed. They can exceed the export/staging ceiling.' : 'Photos network downloads are disabled. Cloud-only originals will stop safely until you remove this permission and approve hydration in a new selection.'}</p>{/if}
       <p>{consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</p>
       {#if !consent.registered}<button class="secondary" disabled={busy} onclick={() => approve(true)}>Retry server registration</button>{/if}
       {#if consent.registered && !job}
@@ -179,38 +213,47 @@
         <div class="copy-job" aria-label="Photo copy progress">
           <p role="status">{job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'}: {job.completed.toLocaleString()} of {job.total.toLocaleString()} copies confirmed.</p>
           <progress max={Math.max(1, job.total)} value={job.completed} aria-label="Copies verified on your server"></progress>
-          <p class="footnote">Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
+          <p class="footnote">{job.provider ? 'Maximum selected export data' : 'Prepared originals'}: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Originals stay in their source. A copy is confirmed only after your server verifies its stored bytes.</p>
+          {#if job.provider}
+            <p class="footnote">Original sizes are unknown until export. Each resource is capped at 2 GiB; Live Photo and RAW companion resources are copied separately in original formats. {job.exportRemaining === null ? 'No export allowance remains approved.' : `${size(job.exportRemaining)} of maximum exported data remaining.`} Every export attempt reserves its full ceiling before reading, including retries. Interrupted bytes remain in local staging. Photos-managed downloads are separate and can exceed this ceiling when you enable hydration.</p>
+            {#if job.stagedBytes !== null}<p class="footnote">Current verified staged original: {size(job.stagedBytes)}. Upload approval is separate from Photos export.</p>{/if}
+            {#if job.code === 'photos_export_budget_exhausted' || job.code === 'photos_export_budget_required'}<button class="secondary" disabled={busy} onclick={() => controlCopy('approve-export')}>Approve {size(job.additionalExportAllowance)} more export data</button>{/if}
+          {/if}
           <p class="footnote">{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
-          {#if !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted')}
+          {#if !['complete', 'cancelled', 'copying'].includes(job.state) && (!job.provider || job.stagedBytes !== null) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted')}
             <button class="secondary" disabled={busy} onclick={() => controlCopy('approve-upload')}>Approve {size(job.additionalUploadAllowance)} more upload data</button>
           {/if}
           {#if job.availability}<p class="footnote" aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
           {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
           {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
-            <button class="secondary" disabled={busy || job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
+            <button class="secondary" disabled={busy || (!job.provider && job.uploadRemaining === null) || (job.provider && job.stagedBytes !== null && job.uploadRemaining === null) || job.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job.provider && job.stagedBytes === null ? 'Export next original within allowance' : job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
           {/if}
           {#if job.state === 'copying'}<button class="secondary" disabled={busy} onclick={() => controlCopy('pause')}>Pause copy</button>{/if}
           {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}
           {#if job.state === 'cancelled'}<p class="footnote">Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</p>{/if}
         </div>
       {/if}
-      <button class="text-button" disabled={busy} onclick={revoke}>Remove folder permission</button>
+      <button class="text-button" disabled={busy} onclick={revoke}>Remove source permission</button>
     </div>
   {:else if blockedConsent}
-    <button class="text-button" disabled={busy} onclick={revoke}>Remove previous folder permission</button>
+    <button class="text-button" disabled={busy} onclick={revoke}>Remove previous source permission</button>
   {/if}
   {#if folder && !consent && !blockedConsent}
     <div class="folder-preview" aria-label="Selected folder preview">
       <strong>{folder.path}</strong>
-      <p>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}.</p>
+      <p>{folder.photos.toLocaleString()} {folder.kind === 'apple-photos' ? 'original resources selected' : 'photo or video filenames found'}{folder.truncated ? ' in a partial preview' : ''}.</p>
       <p class="footnote">{folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</p>
-      {#if folder.availability}<p class="footnote" aria-label="Preview file availability">{availabilityText(folder.availability)}</p>{/if}
-      <label class="source-consent"><input type="checkbox" bind:checked={allowReads} disabled={busy}> Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.</label>
-      <button class="secondary" disabled={busy || !allowReads} onclick={() => approve()}>Approve this folder</button>
-      <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; }}>Clear preview</button>
+      {#if folder.kind === 'apple-photos'}<p class="footnote">Sizes and cloud residency are unknown. Approval permits up to {size(folder.logicalBytes)} of original export attempts, capped at 2 GiB per resource, including paired originals. Export stops at this ceiling. This metadata snapshot and its exact original resources are bound to your current sign-in and device; library changes require a new selection.</p>{/if}
+      {#if folder.kind !== 'apple-photos' && folder.availability}<p class="footnote" aria-label="Preview file availability">{availabilityText(folder.availability)}</p>{/if}
+      <label class="source-consent"><input type="checkbox" bind:checked={allowReads} disabled={busy}> {folder.kind === 'apple-photos' ? `Allow Photos to read these selected originals within the ${size(folder.logicalBytes)} export allowance. Upload approval follows verified staging.` : 'Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.'}</label>
+      {#if folder.kind === 'apple-photos'}
+        <label class="source-consent"><input type="checkbox" bind:checked={allowHydration} disabled={busy}> Allow Apple Photos to download iCloud originals. Photos can download and cache the full original before Frameleaf receives any bytes. The export/staging ceiling does not limit Photos-managed network traffic; downloads may exceed it. An unmetered connection is still required.</label>
+      {/if}
+      <button class="secondary" disabled={busy || !allowReads} onclick={() => approve()}>Approve this {folder.kind === 'apple-photos' ? 'Photos scope and export allowance' : 'folder'}</button>
+      <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; allowHydration = false; }}>Clear preview</button>
     </div>
   {/if}
-  <p class="footnote">Copy jobs require explicit folder approval and an unmetered connection. Cloud-only files may download while staging an approved original. External-library connections are still being implemented. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
+  <p class="footnote">Copy jobs require explicit source approval and an unmetered connection. Cloud-only files may download while staging an approved original. External-library connections are still being implemented. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
 </section>
 
 <style>

@@ -58,6 +58,21 @@ mod native {
         "InstallationId\0".encode_utf16().collect()
     }
     pub(crate) fn read() -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(directory) = crate::credential_lock::fixture_directory() {
+            let path = directory.join("installation.json");
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(ERROR.into()),
+                Ok(_) => {}
+            }
+            return super::valid(
+                serde_json::from_slice(&crate::runtime_store::read_bounded(&path, 128)?)
+                    .map_err(|_| ERROR)?,
+            )
+            .map(Some);
+        }
+
         let mut raw = std::ptr::null_mut();
         let result = unsafe {
             RegOpenKeyExW(
@@ -106,6 +121,21 @@ mod native {
         super::valid(String::from_utf16(&words[..words.len() - 1]).map_err(|_| ERROR)?).map(Some)
     }
     pub(crate) fn write(value: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(directory) = crate::credential_lock::fixture_directory() {
+            use std::io::Write;
+            let value = super::valid(value.to_owned())?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join("installation.json"))
+                .map_err(|_| ERROR)?;
+            return file
+                .write_all(&serde_json::to_vec(&value).map_err(|_| ERROR)?)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| ERROR.into());
+        }
+
         let mut raw = std::ptr::null_mut();
         if unsafe {
             RegCreateKeyExW(

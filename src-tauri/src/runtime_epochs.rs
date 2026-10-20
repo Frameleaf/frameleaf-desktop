@@ -110,6 +110,13 @@ pub trait EpochAuthority: Send + Sync {
 mod tests {
     use super::*;
     #[test]
+    fn new_installation_identity_has_separate_empty_host_history() {
+        let identity = crate::connection::DeviceIdentity::generate();
+        let value = serde_json::to_value(identity).unwrap();
+        assert_eq!(value["hostEpochs"], serde_json::json!({"accepted":[]}));
+        assert_eq!(value["runtimeEpochs"], serde_json::json!({"accepted":{}}));
+    }
+    #[test]
     fn malformed_or_unknown_historical_records_are_refused() {
         let scope = format!(
             "factory-v1/{}/{}/CPUExecutionProvider",

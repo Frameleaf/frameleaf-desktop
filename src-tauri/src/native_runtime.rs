@@ -1,4 +1,5 @@
 //! Signed private runtimes; no shell, ambient Python or server-selected executable.
+mod metal;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -45,6 +46,8 @@ struct Manifest {
     source_revision: String,
     #[serde(default)]
     module_namespace: ModuleNamespace,
+    #[serde(default)]
+    device_observer: Option<metal::Descriptor>,
     files: BTreeMap<String, Artifact>,
 }
 
@@ -191,6 +194,7 @@ impl VerifiedRuntime {
         if !manifest.files.contains_key(&manifest.python) {
             return Err("runtime_interpreter_unapproved".into());
         }
+        metal::validate(&manifest)?;
         let verified = Self {
             root: root.to_path_buf(),
             manifest,
@@ -303,7 +307,14 @@ def lost_parent():
     os._exit(125)
 threading.Thread(target=lost_parent,daemon=True).start()
 sys.argv=sys.argv[1:]
-runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
+if sys.argv[0]=='frameleaf-desktop-metal-v1':
+    parent,expected_hash,mode=sys.argv[1:4]
+    sys.argv=[mode]+sys.argv[4:]
+    sys.path.insert(0,parent)
+    from frameleaf_desktop_ml.entry import run
+    run(mode,expected_hash)
+else:
+    runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
 "#;
 
 pub struct NativeSidecar {
@@ -482,10 +493,7 @@ impl VerifiedRuntime {
             .arg("-B")
             .arg("-c")
             .arg(GATE)
-            .arg(format!(
-                "{}.{module}",
-                self.manifest.module_namespace.prefix()
-            ))
+            .args(metal::arguments(&self.manifest, &self.root, module)?)
             .arg("--cache-dir")
             .arg(cache)
             .current_dir(&scratch)
@@ -714,7 +722,12 @@ impl VerifiedRuntime {
         }
         let report: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "runtime_qualification_report_invalid")?;
-        validate_report(&report, &value, &format!("{:x}", Sha256::digest(spec)))?;
+        validate_report(
+            &report,
+            &value,
+            &format!("{:x}", Sha256::digest(spec)),
+            metal::collector_hash(&self.manifest),
+        )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
             spec: spec.to_vec(),
@@ -727,6 +740,7 @@ fn validate_report(
     report: &serde_json::Value,
     spec: &serde_json::Value,
     binding: &str,
+    expected_collector: Option<&str>,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -755,14 +769,20 @@ fn validate_report(
         return Err(invalid());
     }
     let provider = spec["provider"].as_str().ok_or_else(invalid)?;
-    if !matches!(provider, "CPUExecutionProvider" | "CUDAExecutionProvider") {
+    if !matches!(
+        provider,
+        "CPUExecutionProvider" | "CUDAExecutionProvider" | "CoreMLExecutionProvider"
+    ) {
         return Err(invalid());
+    }
+    if provider == "CoreMLExecutionProvider" {
+        metal::validate_report(report, spec, expected_collector.ok_or_else(invalid)?)?;
     }
     let execution = report["execution"]
         .as_array()
         .filter(|v| !v.is_empty() && v.len() <= 64)
         .ok_or_else(invalid)?;
-    let mut mixed = false;
+    let mut mixed = provider == "CoreMLExecutionProvider";
     for item in execution {
         let nodes = item["nodes"].as_object().ok_or_else(invalid)?;
         if !item["reason"].is_null()
@@ -779,7 +799,9 @@ fn validate_report(
         }
         let state = if provider == "CPUExecutionProvider" {
             "ready-cpu"
-        } else if nodes.contains_key("CPUExecutionProvider") {
+        } else if provider == "CoreMLExecutionProvider"
+            || nodes.contains_key("CPUExecutionProvider")
+        {
             mixed = true;
             "ready-mixed"
         } else {
@@ -805,6 +827,49 @@ fn validate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn signed_metal_descriptor_binds_every_private_entrypoint_byte() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-metal-manifest-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut files = serde_json::Map::new();
+        for name in [
+            "python",
+            "private/frameleaf_desktop_ml/__init__.py",
+            "private/frameleaf_desktop_ml/entry.py",
+            "private/frameleaf_desktop_ml/metal_observer.py",
+            "private/frameleaf_desktop_ml/metal_inference.py",
+            "private/frameleaf_desktop_ml/_frameleaf_coreml_observer.dylib",
+        ] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"owned fixture").unwrap();
+            files.insert(name.into(), serde_json::json!({"sha256":format!("{:x}",Sha256::digest(b"owned fixture")),"bytes":13}));
+        }
+        let manifest = serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":"macos","architecture":"aarch64","provider":"CoreMLExecutionProvider","python":"python","sourceRevision":"a".repeat(40),"moduleNamespace":"frameleaf_ml","deviceObserver":{"kind":"metal-v1"},"files":files});
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        let key = SigningKey::from_bytes(&[71; 32]);
+        let signature = key.sign(&raw).to_bytes();
+        let result = VerifiedRuntime::verify(&root, &raw, &signature, &[key.verifying_key()], 1);
+        assert!(
+            result.is_ok(),
+            "signed fixed observer manifest refused: {:?}",
+            result.err()
+        );
+        fs::write(
+            root.join("private/frameleaf_desktop_ml/entry.py"),
+            b"changed bytes",
+        )
+        .unwrap();
+        assert!(
+            VerifiedRuntime::verify(&root, &raw, &signature, &[key.verifying_key()], 1).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn qualification_cannot_start_a_different_runtime_manifest() {
         let runtime = VerifiedRuntime {
@@ -847,6 +912,49 @@ mod tests {
                 "runtime_qualification_binding_invalid"
             );
         }
+    }
+    #[test]
+    fn python_gate_selects_the_fixed_private_entrypoint_with_signed_hash_argument() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-metal-gate-{}", uuid::Uuid::new_v4()));
+        let package = root.join("frameleaf_desktop_ml");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("__init__.py"), b"").unwrap();
+        fs::write(package.join("entry.py"),"import sys\ndef run(mode,expected):\n assert mode=='native_qualification'\n assert expected=='a'*64\n assert sys.argv==[mode,'--owned-fixture']\n").unwrap();
+        let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+        command
+            .args(["-I", "-B", "-c", GATE, "frameleaf-desktop-metal-v1"])
+            .arg(&root)
+            .arg("a".repeat(64))
+            .args(["native_qualification", "--owned-fixture"])
+            .env("PYTHONPATH", root.join("untrusted-ambient-path"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(START).unwrap();
+        let status = child.wait().unwrap();
+        drop(pipe);
+        tree.terminate();
+        let mut errors = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .take(4096)
+            .read_to_string(&mut errors)
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(status.success(), "fixed entrypoint failed: {errors}");
     }
     #[test]
     fn python_gate_registers_the_executed_main_module() {

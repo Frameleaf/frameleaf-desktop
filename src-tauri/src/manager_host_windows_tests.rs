@@ -49,6 +49,21 @@ fn record(root: &Path, name: &str, pid: u32) {
     fs::rename(temporary, root.join(name)).unwrap();
 }
 
+fn configuration(root: &Path) -> Configuration {
+    Configuration {
+        installation_id: "a".repeat(12),
+        secure_installation_id: "11111111-1111-4111-8111-111111111111".into(),
+        name: "Synthetic Manager job".into(),
+        release: "frameleaf-v3.0.0-1".into(),
+        controller: std::env::current_exe().unwrap(),
+        state: root.join("state"),
+        data: root.join("manager"),
+        origin: "https://127.0.0.1:9443".into(),
+        database_port: 54329,
+        api_port: 2283,
+    }
+}
+
 async fn role(role: &str, root: &Path) {
     match role {
         "owner" => {
@@ -65,9 +80,19 @@ async fn role(role: &str, root: &Path) {
                         crate::package_lease::CodeLease::acquire(&root.join("code")).unwrap(),
                     ),
                     startup: Some(
-                        crate::host_state::Owner::acquire(&root.join("state"), true).unwrap(),
+                        crate::host_state::Owner::acquire(
+                            &root.join("state"),
+                            true,
+                            "11111111-1111-4111-8111-111111111111",
+                        )
+                        .unwrap(),
                     ),
                     profiles: Vec::new(),
+                    profile: Some(
+                        crate::manager_profile::ProfileGuard::acquire(&configuration(root))
+                            .unwrap(),
+                    ),
+                    execution: None,
                 },
             )
             .unwrap();
@@ -198,7 +223,16 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
             lease.try_lock().is_err(),
             "live Manager must exclude maintenance"
         );
-        assert!(crate::host_state::Owner::acquire(&fixture.root.join("state"), true).is_err());
+        assert!(crate::host_state::Owner::acquire(
+            &fixture.root.join("state"),
+            true,
+            "11111111-1111-4111-8111-111111111111"
+        )
+        .is_err());
+        assert!(
+            matches!(crate::manager_profile::ProfileGuard::acquire(&configuration(&fixture.root)),
+            Err(e) if e == "native_profile_already_owned")
+        );
         for handle in &fixture.handles {
             assert_eq!(
                 unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
@@ -240,8 +274,16 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
             mode == "owner-loss" || status.success(),
             "Manager owner failed in {mode}: {status}"
         );
+        drop(crate::manager_profile::ProfileGuard::acquire(&configuration(&fixture.root)).unwrap());
         lease.try_lock().unwrap();
         lease.unlock().unwrap();
-        drop(crate::host_state::Owner::acquire(&fixture.root.join("state"), true).unwrap());
+        drop(
+            crate::host_state::Owner::acquire(
+                &fixture.root.join("state"),
+                true,
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .unwrap(),
+        );
     }
 }

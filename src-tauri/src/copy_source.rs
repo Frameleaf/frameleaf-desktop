@@ -28,6 +28,8 @@ struct CopyScope {
     root_identity: String,
     max_item_bytes: u64,
     allow_download: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photos: Option<crate::apple_photos::Selection>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -197,7 +199,7 @@ pub(crate) fn root_identity(dir: &Dir) -> Result<String, String> {
         ))
     }
 }
-fn available_bytes(dir: &Dir) -> Result<u64, String> {
+pub(crate) fn available_bytes(dir: &Dir) -> Result<u64, String> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -296,6 +298,77 @@ fn relative_path(path: &str) -> Result<&Path, String> {
     Ok(path)
 }
 impl CopyApproval {
+    pub(crate) fn is_photos(&self) -> bool {
+        self.scope.photos.is_some()
+    }
+    pub(crate) fn allows_photos_hydration(&self) -> bool {
+        self.scope
+            .photos
+            .as_ref()
+            .is_some_and(|p| p.allow_hydration)
+    }
+    pub(crate) fn kind(&self) -> &str {
+        if self.is_photos() {
+            "apple-photos"
+        } else {
+            "folder"
+        }
+    }
+    pub(crate) fn files(&self) -> Result<crate::photo_sources::FolderScan, String> {
+        if let Some(photos) = &self.scope.photos {
+            crate::apple_photos::authorized()?;
+            let files = photos.files()?;
+            return Ok(crate::photo_sources::FolderScan {
+                inventory: crate::photo_sources::FolderInventory {
+                    path: "Apple Photos".into(),
+                    photos: files.len() as u64,
+                    logical_bytes: files.len() as u64 * crate::apple_photos::RESOURCE_CEILING,
+                    skipped: 0,
+                    truncated: false,
+                    availability: Default::default(),
+                },
+                files,
+                unreadable: 0,
+            });
+        }
+        crate::photo_sources::scan(self.root(), 10_000)
+    }
+    pub(crate) fn approve_photos(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        photos: crate::apple_photos::Selection,
+        allow_download: bool,
+    ) -> Result<Self, String> {
+        normalize_server(&saved.server)?;
+        photos.validate()?;
+        crate::apple_photos::authorized()?;
+        if saved.server_id.is_empty()
+            || saved.account_id.is_empty()
+            || saved.device_id.as_deref().is_none_or(str::is_empty)
+            || !allow_download
+        {
+            return Err("source_approval_invalid".into());
+        }
+        let scope = CopyScope {
+            version: 1,
+            source_id: Uuid::new_v4().to_string(),
+            server: saved.server.clone(),
+            server_id: saved.server_id.clone(),
+            account_id: saved.account_id.clone(),
+            device_id: saved.device_id.clone().unwrap(),
+            installation_id: identity.installation_id.clone(),
+            root: "photokit".into(),
+            root_identity: "selected-originals-v1".into(),
+            max_item_bytes: crate::apple_photos::RESOURCE_CEILING,
+            allow_download,
+            photos: Some(photos),
+        };
+        Ok(Self {
+            signature: signed(identity, "copy-approval", &scope)?,
+            scope,
+        })
+    }
+
     pub(crate) fn source_id(&self) -> &str {
         &self.scope.source_id
     }
@@ -310,7 +383,11 @@ impl CopyApproval {
         saved: &SavedConnection,
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
-        self.validate(saved, identity)
+        self.validate(saved, identity)?;
+        if self.is_photos() {
+            crate::apple_photos::authorized()?;
+        }
+        Ok(())
     }
     pub fn approve(
         saved: &SavedConnection,
@@ -352,11 +429,98 @@ impl CopyApproval {
             root_identity: root_identity(&dir)?,
             max_item_bytes,
             allow_download,
+            photos: None,
         };
         Ok(Self {
             signature: signed(identity, "copy-approval", &scope)?,
             scope,
         })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn stage_photos(
+        &self,
+        photos: &crate::apple_photos::Selection,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        relative: &str,
+        destination: &Path,
+        stage_id: &str,
+        cancelled: &AtomicBool,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<StagedCopy, String> {
+        self.validate(saved, identity)?;
+        crate::apple_photos::authorized()?;
+        let resource = photos.resource(relative)?;
+        relative_path(relative)?;
+        crate::native_runtime::absolute_directory(destination)?;
+        let dir = Dir::open_ambient_dir(destination, ambient_authority())
+            .map_err(|_| "source_stage_unavailable")?;
+        check_capacity(
+            self.scope.max_item_bytes,
+            available_bytes(&dir)?,
+            available_bytes(&dir)?,
+            true,
+            true,
+        )?;
+        let path = destination.join(stage_id);
+        if path.exists() {
+            return Err("photos_export_interrupted".into());
+        }
+        crate::runtime_store::private_directory(&path)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options
+            .open(path.join("original"))
+            .map_err(|_| "source_stage_unavailable")?;
+        let mut hash = Sha256::new();
+        let mut bytes = 0u64;
+        // Keep incomplete exports for investigation/retry; they never gain an integrity receipt.
+        crate::apple_photos::export(resource, photos.allow_hydration, &mut |chunk| {
+            cancel(cancelled)?;
+            gate()?;
+            let next =
+                crate::apple_photos::admitted_bytes(bytes, chunk.len(), self.scope.max_item_bytes)?;
+            output
+                .write_all(chunk)
+                .map_err(|_| "source_stage_write_failed")?;
+            hash.update(chunk);
+            bytes = next;
+            Ok(())
+        })?;
+        cancel(cancelled)?;
+        gate()?;
+        if bytes == 0 {
+            return Err("photos_original_unavailable".into());
+        }
+        output.sync_all().map_err(|_| "source_stage_write_failed")?;
+        drop(output);
+        let mut result = StagedCopy {
+            id: stage_id.into(),
+            bytes,
+            sha256: format!("{:x}", hash.finalize()),
+            file_created_at_ms: resource.created(),
+            file_modified_at_ms: resource.modified(),
+            source_signature: self.signature.clone(),
+            source_stamp: serde_json::to_string(resource).map_err(|_| "photos_metadata_invalid")?,
+            relative: relative.into(),
+            approval: self.clone(),
+            signature: String::new(),
+        };
+        result.signature = result.sign(identity)?;
+        let data = serde_json::to_vec(&result).map_err(|_| "source_stage_write_failed")?;
+        let mut receipt = options
+            .open(path.join("receipt.json"))
+            .map_err(|_| "source_stage_write_failed")?;
+        receipt
+            .write_all(&data)
+            .and_then(|_| receipt.sync_all())
+            .map_err(|_| "source_stage_write_failed")?;
+        Ok(result)
     }
     fn validate(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
         let scope = &self.scope;
@@ -409,6 +573,21 @@ impl CopyApproval {
         gate()?;
         self.validate(saved, identity)?;
         cancel(cancelled)?;
+        if let Some(photos) = &self.scope.photos {
+            if !self.scope.allow_download || expected_bytes != Some(self.scope.max_item_bytes) {
+                return Err("source_download_permission_required".into());
+            }
+            return self.stage_photos(
+                photos,
+                saved,
+                identity,
+                relative,
+                destination,
+                stage_id,
+                cancelled,
+                gate,
+            );
+        }
         if !self.scope.allow_download {
             return Err("source_download_permission_required".into());
         }
@@ -600,7 +779,12 @@ impl Drop for Partial {
 }
 impl StagedCopy {
     pub(crate) fn matches_entry(&self, relative: &str, bytes: u64) -> bool {
-        self.relative == relative && self.bytes == bytes
+        self.relative == relative
+            && if self.approval.is_photos() {
+                self.bytes > 0 && self.bytes <= bytes
+            } else {
+                self.bytes == bytes
+            }
     }
     pub(crate) fn resource_key(&self) -> String {
         format!(
@@ -656,10 +840,10 @@ impl StagedCopy {
             .map_err(|_| "source_stage_unavailable")?;
         let file = staged_file(&dir, &Path::new(id).join("receipt.json"))?;
         let mut bytes = Vec::new();
-        file.take(262_145)
+        file.take(524_289)
             .read_to_end(&mut bytes)
             .map_err(|_| "source_stage_unavailable")?;
-        if bytes.len() > 262_144 {
+        if bytes.len() > 524_288 {
             return Err("source_stage_invalid".into());
         }
         let copy: Self = serde_json::from_slice(&bytes).map_err(|_| "source_stage_invalid")?;
@@ -890,6 +1074,65 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn photos_consent_binds_resource_snapshot_hydration_device_and_creation_metadata() {
+        let saved = SavedConnection {
+            server: "https://nas.test/".into(),
+            server_id: "nas".into(),
+            account_id: "owner".into(),
+            name: "Synthetic".into(),
+            token: "synthetic-session".into(),
+            device_name: "Synthetic".into(),
+            mode: "client-worker".into(),
+            device_id: Some("device".into()),
+        };
+        let identity = DeviceIdentity::generate();
+        let photos: crate::apple_photos::Selection = serde_json::from_value(serde_json::json!({
+            "assets":1,"resources":[{"asset":"synthetic-private-id","created":1000,"modified":2000,
+                "index":0,"kind":1,"filename":"original.HEIC"}]
+        }))
+        .unwrap();
+        photos.validate().unwrap();
+        assert!(!photos.allow_hydration);
+        let scope = CopyScope {
+            version: 1,
+            source_id: Uuid::new_v4().to_string(),
+            server: saved.server.clone(),
+            server_id: saved.server_id.clone(),
+            account_id: saved.account_id.clone(),
+            device_id: saved.device_id.clone().unwrap(),
+            installation_id: identity.installation_id.clone(),
+            root: "photokit".into(),
+            root_identity: "selected-originals-v1".into(),
+            max_item_bytes: crate::apple_photos::RESOURCE_CEILING,
+            allow_download: true,
+            photos: Some(photos),
+        };
+        let approval = CopyApproval {
+            signature: signed(&identity, "copy-approval", &scope).unwrap(),
+            scope,
+        };
+        approval.validate(&saved, &identity).unwrap();
+        assert_eq!(approval.kind(), "apple-photos");
+        let mut widened = approval.clone();
+        widened.scope.photos.as_mut().unwrap().allow_hydration = true;
+        assert!(widened.validate(&saved, &identity).is_err());
+        let mut altered = serde_json::to_value(&approval).unwrap();
+        altered["scope"]["photos"]["resources"][0]["created"] = serde_json::json!(2000);
+        let altered: CopyApproval = serde_json::from_value(altered).unwrap();
+        assert!(altered.validate(&saved, &identity).is_err());
+        let mut other = saved.clone();
+        other.device_id = Some("other-device".into());
+        assert!(approval.validate(&other, &identity).is_err());
+        let mut folder = approval.clone();
+        folder.scope.photos = None;
+        assert!(!serde_json::to_value(&folder.scope)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("photos"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn fresh_windows_source_metadata_matches_opened_handles() {

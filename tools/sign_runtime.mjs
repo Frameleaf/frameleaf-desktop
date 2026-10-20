@@ -135,6 +135,8 @@ export async function releasePolicy(policy) {
     trust.schemaVersion !== 1 ||
     !Number.isSafeInteger(trust.minimumRuntimeEpoch) ||
     trust.minimumRuntimeEpoch < 1 ||
+    !Number.isSafeInteger(trust.minimumHostEpoch) ||
+    trust.minimumHostEpoch < 1 ||
     !Array.isArray(trust.keys) ||
     !trust.keys.length ||
     trust.keys.length > 16
@@ -187,6 +189,8 @@ async function checkedCandidate(candidate, trust, signature) {
   ];
   if (Object.hasOwn(manifest, "moduleNamespace"))
     fields.push("moduleNamespace");
+  if (Object.hasOwn(manifest, "deviceObserver"))
+    fields.push("deviceObserver");
   if (
     Object.keys(manifest).sort().join(",") !== fields.sort().join(",") ||
     (Object.hasOwn(manifest, "moduleNamespace") &&
@@ -202,6 +206,18 @@ async function checkedCandidate(candidate, trust, signature) {
     Array.isArray(manifest.files)
   )
     fail("runtime_manifest_invalid");
+  if (Object.hasOwn(manifest, "deviceObserver")) {
+    const observer = manifest.deviceObserver;
+    const names = ["__init__.py", "entry.py", "metal_observer.py", "metal_inference.py", "_frameleaf_coreml_observer.dylib"];
+    if (!observer || typeof observer !== "object" || Array.isArray(observer) ||
+      Object.keys(observer).join(",") !== "kind" || observer.kind !== "metal-v1" ||
+      manifest.provider !== "CoreMLExecutionProvider" || manifest.platform !== "macos" ||
+      manifest.architecture !== "aarch64" || manifest.moduleNamespace !== "frameleaf_ml" ||
+      names.some(name => {
+        const file = manifest.files[`private/frameleaf_desktop_ml/${name}`];
+        return !file || !hashPattern.test(file.sha256) || !Number.isSafeInteger(file.bytes) || file.bytes <= 0 || file.bytes > 4 * 1024 ** 2;
+      })) fail("runtime_device_observer_invalid");
+  }
   const profiles = JSON.parse(
     await boundedFile(fileURLToPath(profilesPath), 16384),
   );

@@ -18,10 +18,12 @@ pub struct SourceConsent {
 struct Pending {
     generation: u64,
     selected: Option<(String, PathBuf)>,
+    photos: Option<(String, crate::apple_photos::Selection)>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectedFolder {
+    pub kind: String,
     pub selection_id: String,
     #[serde(flatten)]
     pub inventory: FolderInventory,
@@ -41,6 +43,8 @@ pub struct ConsentView {
     id: String,
     name: String,
     path: String,
+    kind: String,
+    allow_photos_hydration: bool,
     allow_download: bool,
     registered: bool,
 }
@@ -62,6 +66,7 @@ impl SourceConsent {
             .checked_add(1)
             .ok_or("source_selection_unavailable")?;
         pending.selected = None;
+        pending.photos = None;
         Ok(())
     }
     pub fn select(&self, generation: u64, path: PathBuf) -> Result<SelectedFolder, String> {
@@ -74,12 +79,49 @@ impl SourceConsent {
             return Err("source_selection_changed".into());
         }
         let selection_id = uuid::Uuid::new_v4().to_string();
+        pending.photos = None;
         pending.selected = Some((selection_id.clone(), path));
         Ok(SelectedFolder {
+            kind: "folder".into(),
             selection_id,
             inventory,
         })
     }
+    pub fn select_photos(
+        &self,
+        generation: u64,
+        photos: crate::apple_photos::Selection,
+    ) -> Result<SelectedFolder, String> {
+        photos.validate()?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "source_selection_unavailable")?;
+        if generation != pending.generation {
+            return Err("source_selection_changed".into());
+        }
+        let selection_id = uuid::Uuid::new_v4().to_string();
+        let inventory = FolderInventory {
+            path: format!(
+                "Apple Photos: {} selected recent assets, {} original resources",
+                photos.assets,
+                photos.resources.len()
+            ),
+            photos: photos.resources.len() as u64,
+            logical_bytes: photos.resources.len() as u64 * crate::apple_photos::RESOURCE_CEILING,
+            skipped: 0,
+            truncated: false,
+            availability: Default::default(),
+        };
+        pending.selected = None;
+        pending.photos = Some((selection_id.clone(), photos));
+        Ok(SelectedFolder {
+            kind: "apple-photos".into(),
+            selection_id,
+            inventory,
+        })
+    }
+    #[cfg(test)]
     pub fn approve(
         &self,
         saved: &SavedConnection,
@@ -88,28 +130,54 @@ impl SourceConsent {
         allow_download: bool,
         persist: impl FnOnce(&Consent) -> Result<(), String>,
     ) -> Result<Consent, String> {
+        self.approve_with_hydration(saved, identity, selection, allow_download, false, persist)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_with_hydration(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        selection: &str,
+        allow_download: bool,
+        allow_photos_hydration: bool,
+        persist: impl FnOnce(&Consent) -> Result<(), String>,
+    ) -> Result<Consent, String> {
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| "source_selection_unavailable")?;
-        let path = &pending
-            .selected
-            .as_ref()
-            .filter(|(id, _)| id == selection)
-            .ok_or("source_selection_changed")?
-            .1;
-        let approval = CopyApproval::approve(
-            saved,
-            identity,
-            path,
-            2 * 1024 * 1024 * 1024,
-            allow_download,
-        )?;
-        let name = source_label(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .ok_or("source_folder_name_invalid")?,
-        );
+        let (approval, name) = if let Some((id, photos)) = &pending.photos {
+            if id != selection {
+                return Err("source_selection_changed".into());
+            }
+            let mut photos = photos.clone();
+            photos.allow_hydration = allow_photos_hydration;
+            (
+                CopyApproval::approve_photos(saved, identity, photos, allow_download)?,
+                "Apple Photos originals".into(),
+            )
+        } else {
+            let path = &pending
+                .selected
+                .as_ref()
+                .filter(|(id, _)| id == selection)
+                .ok_or("source_selection_changed")?
+                .1;
+            (
+                CopyApproval::approve(
+                    saved,
+                    identity,
+                    path,
+                    2 * 1024 * 1024 * 1024,
+                    allow_download,
+                )?,
+                source_label(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or("source_folder_name_invalid")?,
+                ),
+            )
+        };
         let consent = Consent {
             approval,
             session_signature: session_signature(saved, identity),
@@ -119,6 +187,7 @@ impl SourceConsent {
         };
         persist(&consent)?;
         pending.selected = None;
+        pending.photos = None;
         Ok(consent)
     }
 }
@@ -176,13 +245,19 @@ impl Consent {
         ConsentView {
             id: self.approval.source_id().into(),
             name: self.name.clone(),
-            path: self.approval.root().to_string_lossy().into(),
+            path: if self.approval.is_photos() {
+                "System Photo Library (selected originals)".into()
+            } else {
+                self.approval.root().to_string_lossy().into()
+            },
+            kind: self.approval.kind().into(),
+            allow_photos_hydration: self.approval.allows_photos_hydration(),
             allow_download: self.allow_download,
             registered: self.registered,
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
-        json!({"id":self.approval.source_id(),"deviceId":saved.device_id,"kind":"folder","mode":"copy","name":source_label(&self.name),"scopeFingerprint":self.approval.fingerprint()})
+        json!({"id":self.approval.source_id(),"deviceId":saved.device_id,"kind":self.approval.kind(),"mode":"copy","name":source_label(&self.name),"scopeFingerprint":self.approval.fingerprint()})
     }
     fn accept(&self, saved: &SavedConnection, ack: &Value) -> Result<(), String> {
         let request = self.request(saved);

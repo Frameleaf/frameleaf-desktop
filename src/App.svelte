@@ -17,6 +17,7 @@
   let deviceName = $state('My computer');
   let busy = $state(false);
   let hostActive = $state(false);
+  let hostMaintenance = $state(false);
   let managerRevision = $state(0);
   let notice = $state('');
   let failure = $state('');
@@ -181,13 +182,13 @@
       <p class="eyebrow">Frameleaf Desktop</p>
       <h1>Make yourself<br />at home.</h1>
       <p class="intro">Keep everything on this computer, or connect to your server and put your computer to work.</p>
-      <fieldset class="modes" disabled={busy || hostActive}>
+      <fieldset class="modes" disabled={busy || hostActive || hostMaintenance}>
         <legend>How would you like to use Frameleaf?</legend>
         <label class:selected={mode === 'client-worker'}><input type="radio" bind:group={mode} value="client-worker" /><span><strong>Connect to my server</strong><small>Photos, server management and help with AI processing.</small></span></label>
         <label class:selected={mode === 'local-server'}><input type="radio" bind:group={mode} value="local-server" /><span><strong>Run Frameleaf here</strong><small>Host your photo library on this computer.</small></span></label>
       </fieldset>
       {#if mode === 'local-server'}
-        <LocalHost onactive={(active) => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} />
+        <LocalHost onmaintenance={(active) => { hostMaintenance = active; }} onactive={(active) => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} />
       {:else}
         <form onsubmit={connect}>
           <label for="server">Server address</label><input id="server" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={busy} autocomplete="url" />
@@ -199,6 +200,11 @@
         </form>
       {/if}
     {/if}
-    {#key managerRevision}<ManagerPanel />{/key}
+    <fieldset class="manager-controls" disabled={hostMaintenance} aria-busy={hostMaintenance}>{#key managerRevision}<ManagerPanel />{/key}</fieldset>
+
   </main>
 </div>
+
+<style>
+  .manager-controls { border: 0; padding: 0; margin: 0; min-width: 0; }
+</style>

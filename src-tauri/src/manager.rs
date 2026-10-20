@@ -52,6 +52,13 @@ impl Action {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Command {
+    #[serde(rename_all = "camelCase")]
+    ApproveUpdate {
+        backup_operation_id: Uuid,
+        target_manifest_sha256: String,
+        migrations_approved: bool,
+        key: Uuid,
+    },
     Status {},
     Backups {},
     ReviewRestore {
@@ -285,8 +292,6 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             "no_installation" => "manager_no_installation",
             "rate_limited" => "manager_rate_limited",
             "invalid_credentials" => "manager_invalid_credentials",
-            "already_claimed" => "manager_already_claimed",
-            "invalid_claim_proof" => "manager_claim_proof_changed",
             "native_recovery_unavailable" | "desktop_route_unavailable" => {
                 "manager_recovery_unavailable"
             }
@@ -339,34 +344,6 @@ async fn session_response(response: Response) -> Result<Session, String> {
         cookie: cookie.ok_or("manager_response_invalid")?,
         csrf: value.csrf.clone(),
     })
-}
-pub(crate) async fn claim_local(
-    client: &Client,
-    origin: &str,
-    name: &str,
-    password: &str,
-    proof: &str,
-) -> Result<(), String> {
-    #[derive(Serialize)]
-    struct Claim<'a> {
-        name: &'a str,
-        password: &'a str,
-        proof: &'a str,
-    }
-    let response = client
-        .post(format!("{origin}/manager-api/claim"))
-        .header("origin", origin)
-        .json(&Claim {
-            name,
-            password,
-            proof,
-        })
-        .send()
-        .await
-        .map_err(|_| "manager_claim_interrupted")?;
-    let session = session_response(response).await?;
-    let _ = browser::<Value>(client, origin, &session, "logout", json!({})).await;
-    Ok(())
 }
 async fn browser<T: DeserializeOwned>(
     client: &Client,
@@ -427,17 +404,28 @@ fn validate_pairing(
     }
     Ok(())
 }
+fn requested_scopes(allow_recovery: bool, allow_updates: bool) -> Vec<Scope> {
+    let mut scopes = SCOPES.to_vec();
+    if allow_recovery {
+        scopes.push(Scope::Restore);
+    }
+    if allow_updates {
+        scopes.push(Scope::Update);
+    }
+    scopes
+}
 pub async fn pair(
     identity: &DeviceIdentity,
     origin: &str,
     password: String,
     certificate: Option<CertificateTrust>,
     allow_recovery: bool,
+    allow_updates: bool,
     persist: impl FnOnce(&SavedManager) -> Result<(), String>,
 ) -> Result<View, String> {
     canonical_origin(origin)?;
     let password = Zeroizing::new(password);
-    if password.is_empty() || password.len() > 256 {
+    if password.is_empty() || password.encode_utf16().count() > 256 {
         return Err("manager_login_details_invalid".into());
     }
     let client = manager_client(
@@ -445,10 +433,7 @@ pub async fn pair(
         certificate.as_ref().map(|value| value.sha256.as_str()),
     )?;
     let session = login(&client, origin, &password).await?;
-    let mut scopes = SCOPES.to_vec();
-    if allow_recovery {
-        scopes.push(Scope::Restore);
-    }
+    let scopes = requested_scopes(allow_recovery, allow_updates);
     let result=async{
         let approval:Pairing=browser(&client,origin,&session,"desktop-grants/approve",json!({"password":password.as_str(),"deviceId":identity.installation_id,"publicKey":identity.public_key(),"scopes":scopes})).await?;
         validate_pairing(&approval,identity,origin,clock()?,&scopes)?;
@@ -520,6 +505,25 @@ fn prepare(
         return Err("manager_credential_invalid".into());
     }
     let (scope, path, body) = match command {
+        Command::ApproveUpdate {
+            backup_operation_id,
+            target_manifest_sha256,
+            migrations_approved,
+            key,
+        } => {
+            if backup_operation_id.is_nil()
+                || key.is_nil()
+                || !*migrations_approved
+                || !hex(target_manifest_sha256, 64)
+            {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Update,
+                "/manager-api/desktop/approve-update",
+                json!({"backupOperationId":backup_operation_id,"targetManifestSha256":target_manifest_sha256,"migrationsApproved":true,"key":key}),
+            )
+        }
         Command::Status {} => (Scope::Status, "/manager-api/desktop/status", json!({})),
         Command::Backups {} => (Scope::Restore, "/manager-api/desktop/backups", json!({})),
         Command::Restore { review_id, key } => {
@@ -639,7 +643,7 @@ async fn grant_action(
 ) -> Result<(), String> {
     canonical_origin(&saved.origin)?;
     let password = Zeroizing::new(password);
-    if password.is_empty() || password.len() > 256 {
+    if password.is_empty() || password.encode_utf16().count() > 256 {
         return Err("manager_login_details_invalid".into());
     }
     let client = saved_client(saved)?;
@@ -797,6 +801,28 @@ fn validate_reply(
 ) -> Result<Value, String> {
     let invalid = || "manager_response_invalid".to_string();
     match command {
+        Command::ApproveUpdate {
+            backup_operation_id,
+            target_manifest_sha256,
+            key,
+            ..
+        } => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Reply {
+                approval: String,
+            }
+            let reply: Reply = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            crate::host_runtime::inspect_update_approval(
+                &reply.approval,
+                &saved.installation_id,
+                &key.to_string(),
+                &backup_operation_id.to_string(),
+                target_manifest_sha256,
+                clock()?,
+            )
+            .map_err(|_| invalid())?;
+        }
         Command::RestoreOperation { id } => {
             let operation: Operation<RestoreKind, 64> =
                 serde_json::from_value(value.clone()).map_err(|_| invalid())?;

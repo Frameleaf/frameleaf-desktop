@@ -538,6 +538,7 @@ export function hostEnvironment(c) {
     FRAMELEAF_RAW_DECODER_PATH: join(c.runtime, c.entryPoints.rawDecoder),
     FFMPEG_PATH: join(c.runtime, c.entryPoints.ffmpeg),
     FFPROBE_PATH: join(c.runtime, c.entryPoints.ffprobe),
+    FONTCONFIG_FILE: join(c.runtime, "server/resources/fonts/fonts.conf"),
     PATH: [
       dirname(join(c.runtime, c.entryPoints.ffmpeg)),
       dirname(join(c.runtime, c.entryPoints.rawRenderer)),
@@ -995,7 +996,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
         { PGPASSWORD: c.password },
       );
     if (restoreOnly) {
-      const input = await readHostRestoreInput(restoreSession.original, restoreSession.binding);
+      const input = await readPreparationInput(restoreSession.original, restoreSession.binding, restoreSession.update);
       await command([executable("pgRestore"), "--list", input.dump], {}, false, {quiet:true, timeout:7_200_000});
       await command([executable("pgRestore"), "--no-password", "--host", "127.0.0.1", "--port", String(c.databasePort),
         "--username", "frameleaf", "--dbname", "frameleaf", "--single-transaction", "--exit-on-error", "--no-owner", "--no-acl", input.dump],
@@ -1278,6 +1279,10 @@ function restoreInputRecovery(c, value) {
 
 /** Fixed-path staged input validation only; restore effects require the later exclusive controller operation. */
 export async function readHostRestoreInput(c, supplied, check = () => {}) {
+  return readRestoreInput(c, supplied, check, c);
+}
+
+async function readRestoreInput(c, supplied, check, markerRuntime) {
   try {
     check();
     validateConfig(c);
@@ -1285,7 +1290,7 @@ export async function readHostRestoreInput(c, supplied, check = () => {}) {
     const identities = new Map();
     for (const path of [c.state, root, target, input]) identities.set(path, await checkpointIdentity(path, true));
     const marker = await restoreInputJson(join(c.state, "host-state.json"));
-    const expected = { schemaVersion: 1, manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor };
+    const expected = { schemaVersion: 1, manifestSha256: markerRuntime.manifestSha256, sourceRevision: markerRuntime.sourceRevision, postgresMajor: markerRuntime.postgresMajor };
     if (Object.keys(marker).sort().join(",") !== Object.keys(expected).sort().join(",") || Object.entries(expected).some(([key, value]) => marker[key] !== value) ||
       (await fs.readdir(target)).sort().join(",") !== "input,restore-intent.json" || (await fs.readdir(input)).sort().join(",") !== "database.dump,recovery.json" ||
       JSON.stringify(restoreInputBinding(c, await restoreInputJson(join(target, "restore-intent.json")))) !== JSON.stringify(binding)) fail("host_restore_input_invalid");
@@ -1302,12 +1307,53 @@ export async function readHostRestoreInput(c, supplied, check = () => {}) {
 
 /** Prepare a fresh logical target; activation is a separate reviewed, exclusive controller operation. */
 export async function restoreHostDatabase(configuration, supplied, stopping) {
+  return prepareHostDatabase(configuration, supplied, stopping);
+}
+
+function updateRestoreRequest(c, value) {
+  try {
+    if (!value || Object.keys(value).sort().join(",") !== "kind,restore,schemaVersion,sourceCheckpoint,sourceEpoch,targetEpoch" ||
+      value.schemaVersion !== 1 || value.kind !== "native-update" || !Number.isSafeInteger(value.sourceEpoch) || value.sourceEpoch <= 0 ||
+      !Number.isSafeInteger(value.targetEpoch) || value.targetEpoch <= value.sourceEpoch ||
+      !value.sourceCheckpoint || value.sourceCheckpoint.protocolVersion !== 1 || value.sourceCheckpoint.state !== "checkpoint")
+      fail("host_update_input_invalid");
+    const {protocolVersion, state, ...disk} = value.sourceCheckpoint;
+    if (typeof disk.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(disk.manifestSha256) || disk.manifestSha256 === c.manifestSha256 ||
+      typeof disk.sourceRevision !== "string" || !/^[a-f0-9]{40}$/.test(disk.sourceRevision)) fail("host_update_input_invalid");
+    const checkpoint = retirementReceipt({...c, manifestSha256:disk.manifestSha256, sourceRevision:disk.sourceRevision}, disk);
+    return {schemaVersion:1, kind:"native-update", sourceEpoch:value.sourceEpoch, targetEpoch:value.targetEpoch,
+      sourceCheckpoint:{protocolVersion, state, ...checkpoint}, restore:restoreInputBinding(c, value.restore)};
+  } catch { fail("host_update_input_invalid"); }
+}
+
+/** The controller must authenticate and stage this request; this entry grants no selection authority. */
+export async function restoreHostUpdateDatabase(configuration, supplied, stopping) {
+  const update = updateRestoreRequest(configuration, supplied);
+  return prepareHostDatabase(configuration, update.restore, stopping, update);
+}
+
+async function readPreparationInput(c, binding, update, check = () => {}, selected = false) {
+  if (!update) return readHostRestoreInput(c, binding, check);
+  try {
+    // Installed updates retain source ownership until the controller publishes the verified target.
+    const input = await readRestoreInput(c, binding, check, selected ? c : update.sourceCheckpoint);
+    if (!isDeepStrictEqual(input.recovery.checkpoint, update.sourceCheckpoint) ||
+      input.recovery.installation.id !== input.binding.installationId || input.recovery.libraryId !== input.binding.libraryId)
+      fail("host_update_input_invalid");
+    return input;
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
+    fail("host_update_input_invalid");
+  }
+}
+
+async function prepareHostDatabase(configuration, supplied, stopping, update) {
   const c = {...configuration, entryPoints:{...configuration.entryPoints}};
   let cancelled = false;
   void stopping.then(() => {cancelled=true;});
-  const input = await readHostRestoreInput(c, supplied);
+  const input = await readPreparationInput(c, supplied, update);
   if (cancelled) fail("host_restore_cancelled");
-  if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision) fail("host_restore_runtime_required");
+  if (!update && input.recovery.checkpoint.sourceRevision !== c.sourceRevision) fail("host_restore_runtime_required");
   const profileIdentity = await checkpointIdentity(c.state, true);
   const root = join(c.state, "restore-targets"), operationRoot = join(root, input.binding.operationId);
   for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (!canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_restore_input_invalid");}
@@ -1316,20 +1362,20 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   const targetIdentity = await checkpointIdentity(target, true);
   const inner = {...c, state:target, mode:"server", databaseReference:undefined};
   await claimState(inner);
-  const intent = {schemaVersion:1, binding:input.binding, attemptId, profileIdentity, targetIdentity};
+  const intent = {schemaVersion:1, binding:input.binding, attemptId, profileIdentity, targetIdentity, ...(update ? {update} : {})};
   const record = await fs.open(join(target,"restore-target.json"),"wx",0o600);
   try {await record.writeFile(JSON.stringify(intent)+"\n");await record.sync();} finally {await record.close();}
   await checkpointSyncDirectory(target);await checkpointSyncDirectory(operationRoot);await checkpointSyncDirectory(root);
   if (cancelled) fail("host_restore_cancelled");
-  const session = {[RESTORE_SESSION]:true, original:c, binding:input.binding};
+  const session = {[RESTORE_SESSION]:true, original:c, binding:input.binding, update};
   let finish, prepared=false;
   const finished = new Promise(resolve => {finish=resolve;});
   await runHost(inner, Promise.race([stopping,finished]), () => {prepared=true;finish();}, session);
   if (!prepared || cancelled || !session.validation) fail("host_restore_cancelled");
   if (await checkpointIdentity(c.state,true) !== profileIdentity || await checkpointIdentity(target,true) !== targetIdentity) fail("host_restore_input_invalid");
-  await readHostRestoreInput(c,input.binding);
-  const receipt = {schemaVersion:1, state:"restore-prepared", binding:input.binding, attemptId, profileIdentity, targetIdentity,
-    databaseIdentity:await checkpointIdentity(join(target,"database"),true), validation:session.validation};
+  await readPreparationInput(c,input.binding,update);
+  const receipt = {schemaVersion:1, state:update ? "update-prepared" : "restore-prepared", binding:input.binding, attemptId, profileIdentity, targetIdentity,
+    databaseIdentity:await checkpointIdentity(join(target,"database"),true), validation:session.validation, ...(update ? {update} : {})};
   if (cancelled) fail("host_restore_cancelled");
   const result = await fs.open(join(target,"restore-result.json"),"wx",0o600);
   try {if (cancelled) fail("host_restore_cancelled");await result.writeFile(JSON.stringify(receipt)+"\n");await result.sync();} finally {await result.close();}
@@ -1385,6 +1431,33 @@ function preparedRestoreReceipt(c, supplied) {
 
 /** Recheck prepared evidence only; exclusive activation must still verify offline database state. */
 export async function readHostRestoreTarget(configuration, supplied, check = () => {}) {
+  return readPreparedTarget(configuration, supplied, check);
+}
+
+/** Update evidence stays distinct from ordinary restore and grants no activation authority. */
+export async function readHostUpdateTarget(configuration, supplied, check = () => {}) {
+  try {
+    const expected = structuredClone(supplied);
+    const update = updateRestoreRequest(configuration, expected?.update);
+    return await readPreparedTarget(configuration, expected, check, update);
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
+    fail("host_restore_target_invalid");
+  }
+}
+
+async function readSelectedHostUpdateTarget(configuration, supplied, check = () => {}) {
+  try {
+    const expected = structuredClone(supplied);
+    const update = updateRestoreRequest(configuration, expected?.update);
+    return await readPreparedTarget(configuration, expected, check, update, true);
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
+    fail("host_restore_target_invalid");
+  }
+}
+
+async function readPreparedTarget(configuration, supplied, check, update, selected = false) {
   try {
     const c = {
       ...configuration,
@@ -1392,7 +1465,12 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
     };
     check();
     validateConfig(c);
-    const receipt = preparedRestoreReceipt(c, supplied);
+    let receipt;
+    if (update) {
+      if (supplied?.state !== "update-prepared" || !isDeepStrictEqual(supplied.update, update)) fail("host_restore_target_invalid");
+      const {update: _, ...body} = supplied;
+      receipt = {...preparedRestoreReceipt(c, {...body, state:"restore-prepared"}), state:"update-prepared", update};
+    } else receipt = preparedRestoreReceipt(c, supplied);
     const root = join(c.state, "restore-targets"),
       operationRoot = join(root, receipt.binding.operationId);
     const target = join(operationRoot, receipt.attemptId),
@@ -1412,6 +1490,7 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
       attemptId: receipt.attemptId,
       profileIdentity: receipt.profileIdentity,
       targetIdentity: receipt.targetIdentity,
+      ...(update ? {update} : {}),
     };
     const marker = {
       schemaVersion: 1,
@@ -1453,8 +1532,8 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
         fail("host_restore_target_invalid");
     }
     await verifyRecords();
-    const input = await readHostRestoreInput(c, receipt.binding, check);
-    if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision)
+    const input = await readPreparationInput(c, receipt.binding, update, check, selected);
+    if (!update && input.recovery.checkpoint.sourceRevision !== c.sourceRevision)
       fail("host_restore_target_invalid");
     for (const [path, identity] of identities)
       if ((await checkpointIdentity(path, true)) !== identity)
@@ -1470,11 +1549,14 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
   }
 }
 /** Read-only evidence under the controller's exclusive leases; this never activates a database. */
-export async function verifyHostRestoreTarget(
-  configuration,
-  supplied,
-  stopping,
-) {
+export async function verifyHostRestoreTarget(configuration, supplied, stopping) {
+  return verifyPreparedTarget(configuration, supplied, stopping, readHostRestoreTarget);
+}
+/** Update receipts remain separate from ordinary restore/selection authority. */
+export async function verifyHostUpdateTarget(configuration, supplied, stopping) {
+  return verifyPreparedTarget(configuration, supplied, stopping, readHostUpdateTarget);
+}
+async function verifyPreparedTarget(configuration, supplied, stopping, readTarget) {
   let child,
     cancelled = false,
     spawnFailed = false;
@@ -1492,7 +1574,7 @@ export async function verifyHostRestoreTarget(
       entryPoints: { ...configuration.entryPoints },
     };
     const expected = structuredClone(supplied);
-    const checked = await readHostRestoreTarget(c, expected, check);
+    const checked = await readTarget(c, expected, check);
     check();
     const tool = c.entryPoints.pgChecksums;
     if (
@@ -1556,7 +1638,7 @@ export async function verifyHostRestoreTarget(
       fail("host_restore_offline_invalid");
     if (
       !isDeepStrictEqual(await tree(), before) ||
-      !isDeepStrictEqual(await readHostRestoreTarget(c, expected, check), checked)
+      !isDeepStrictEqual(await readTarget(c, expected, check), checked)
     )
       fail("host_restore_offline_invalid");
     check();
@@ -1579,11 +1661,22 @@ export async function verifyHostRestoreTarget(
 
 /** Offline checks surround an owned read-only SQL inspection; neither phase admits application writers. */
 export async function validateHostRestoreTarget(configuration, supplied, stopping) {
+  return validatePreparedTarget(configuration, supplied, stopping, verifyHostRestoreTarget);
+}
+export async function validateHostUpdateTarget(configuration, supplied, stopping) {
+  return validatePreparedTarget(configuration, supplied, stopping, verifyHostUpdateTarget);
+}
+/** Published updates require the target marker; this entry never restores or admits writers. */
+export async function validateSelectedHostUpdateTarget(configuration, supplied, stopping) {
+  return validatePreparedTarget(configuration, supplied, stopping,
+    (c, receipt, stopping) => verifyPreparedTarget(c, receipt, stopping, readSelectedHostUpdateTarget));
+}
+async function validatePreparedTarget(configuration, supplied, stopping, verifyTarget) {
   const c = {...configuration, entryPoints:{...configuration.entryPoints}}, expected = structuredClone(supplied);
   let cancelled = false;
   void stopping.then(() => { cancelled = true; });
   try {
-    const checked = await verifyHostRestoreTarget(c, expected, stopping);
+    const checked = await verifyTarget(c, expected, stopping);
     if (cancelled) fail("host_restore_cancelled");
     const session = {[RESTORE_VALIDATION]:true, original:c, prepared:checked.receipt};
     let finish, ready = false;
@@ -1591,7 +1684,7 @@ export async function validateHostRestoreTarget(configuration, supplied, stoppin
     await runHost({...c, state:checked.target, mode:"database", databaseReference:undefined}, Promise.race([stopping,finished]), () => {ready=true;finish();}, session);
     if (cancelled) fail("host_restore_cancelled");
     if (!ready || !session.validated) fail("host_restore_canonical_invalid");
-    const final = await verifyHostRestoreTarget(c, expected, stopping);
+    const final = await verifyTarget(c, expected, stopping);
     if (cancelled) fail("host_restore_cancelled");
     return {...final, schemaValidated:true};
   } catch (error) {

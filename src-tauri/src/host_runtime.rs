@@ -1,4 +1,8 @@
 //! Host packs have separate authority and component requirements from ML packs.
+mod metadata;
+pub(crate) use metadata::{package_metadata, PackageMetadata};
+mod update;
+mod update_approval;
 use crate::native_runtime::{digest_valid, relative, verify_files, Artifact};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -7,6 +11,9 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+pub use update::{HostUpdateReservation, HostUpdateReview};
+pub(crate) use update_approval::inspect_request as inspect_update_approval;
+pub use update_approval::{HostUpdateApproval, HostUpdateCandidate, HostUpdateInput};
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -89,21 +96,8 @@ struct HostManifest {
     files: BTreeMap<String, Artifact>,
 }
 
-pub struct VerifiedHostRuntime {
-    root: PathBuf,
-    manifest: HostManifest,
-    manifest_sha256: String,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BackupEngine {
-    pub executable: PathBuf,
-    pub sha256: String,
-}
-impl VerifiedHostRuntime {
-    /// Keys and rollback floor are supplied by compiled desktop release authority, never by a server.
-    pub fn verify(
-        root: &Path,
+impl HostManifest {
+    fn verify(
         raw: &[u8],
         signature: &[u8; 64],
         trusted: &[VerifyingKey],
@@ -177,6 +171,31 @@ impl VerifiedHostRuntime {
                 return Err("host_component_missing".into());
             }
         }
+        Ok(manifest)
+    }
+}
+
+pub struct VerifiedHostRuntime {
+    root: PathBuf,
+    manifest: HostManifest,
+    manifest_sha256: String,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupEngine {
+    pub executable: PathBuf,
+    pub sha256: String,
+}
+impl VerifiedHostRuntime {
+    /// Keys and rollback floor are supplied by compiled desktop release authority, never by a server.
+    pub fn verify(
+        root: &Path,
+        raw: &[u8],
+        signature: &[u8; 64],
+        trusted: &[VerifyingKey],
+        minimum_epoch: u64,
+    ) -> Result<Self, String> {
+        let manifest = HostManifest::verify(raw, signature, trusted, minimum_epoch)?;
         #[cfg(windows)]
         let stable_root = crate::windows_protection::stable_path(root)
             .map_err(|_| "host_runtime_path_unavailable")?;
@@ -191,6 +210,9 @@ impl VerifiedHostRuntime {
     }
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.manifest.epoch
     }
     pub fn source_revision(&self) -> &str {
         &self.manifest.source_revision
@@ -239,6 +261,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const AGENT: &str = include_str!("../../runtime/host-agent.mjs");
+const AGENT_BOOTSTRAP: &str = include_str!("../../runtime/host-bootstrap.mjs");
 
 pub(crate) fn checkpoint_operation_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| {
@@ -1009,6 +1032,11 @@ pub struct HostProcess {
     mode: HostMode,
 }
 fn direct_profile(state: &Path) -> Result<(), String> {
+    if state.exists() {
+        crate::host_state::no_update(&cap_std::fs::Dir::from_std_file(
+            crate::host_storage::directory(state)?,
+        ))?;
+    }
     // Controller-managed profiles must enter through their exact journal owner.
     match std::fs::symlink_metadata(state.join("controller-state.json")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1023,25 +1051,37 @@ impl VerifiedHostRuntime {
         password: &Zeroizing<String>,
         database_port: u16,
         api_port: u16,
+        execution: &crate::host_epochs::HostExecution<'_>,
     ) -> Result<HostProcess, String> {
         self.start_mode(
             state,
             password,
-            database_port,
-            api_port,
+            (database_port, api_port),
             HostMode::Server,
             None,
+            execution,
         )
     }
     pub(crate) fn start_mode(
         &self,
         state: &Path,
         password: &Zeroizing<String>,
-        database_port: u16,
-        api_port: u16,
+        ports: (u16, u16),
         mode: HostMode,
         mut owner: Option<&mut crate::host_state::Owner>,
+        execution: &crate::host_epochs::HostExecution<'_>,
     ) -> Result<HostProcess, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let agent_source = STANDARD.encode(AGENT);
+        if agent_source.len() > 262144 {
+            return Err("host_agent_source_invalid".into());
+        }
+        let (database_port, api_port) = ports;
+        if let Some(owner) = owner.as_ref() {
+            if owner.installation_identity() != Some(execution.installation_id()) {
+                return Err("host_installation_identity_changed".into());
+            }
+        }
         let (database_reference, controller_generation) = if let Some(owner) = owner.as_mut() {
             let (profile, reference, generation) =
                 owner.launch_state(&self.manifest_sha256, mode)?;
@@ -1115,7 +1155,7 @@ impl VerifiedHostRuntime {
         }
         let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
         command
-            .args(["--input-type=module", "--eval", AGENT])
+            .args(["--input-type=module", "--eval", AGENT_BOOTSTRAP])
             .env_clear()
             .env("FRAMELEAF_HOST_AGENT", "1")
             .current_dir(state)
@@ -1130,15 +1170,17 @@ impl VerifiedHostRuntime {
         command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
         code_lease.inherit(&mut command);
         crate::process_tree::configure(&mut command);
-        let mut child = command.spawn().map_err(|error| {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "host_agent_spawn: kind={:?} errno={:?}",
-                error.kind(),
-                error.raw_os_error()
-            );
-            let _ = error;
-            "host_agent_start_failed"
+        let mut child = execution.spawn(self, || {
+            command.spawn().map_err(|error| {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "host_agent_spawn: kind={:?} errno={:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                );
+                let _ = error;
+                "host_agent_start_failed".to_string()
+            })
         })?;
         let tree = match crate::process_tree::ProcessTree::attach(&child) {
             Ok(tree) => tree,
@@ -1221,7 +1263,9 @@ impl VerifiedHostRuntime {
             .input
             .as_mut()
             .ok_or("host_agent_pipe_failed")?
-            .write_all(&message)
+            .write_all(agent_source.as_bytes())
+            .and_then(|_| process.input.as_mut().unwrap().write_all(b"\n"))
+            .and_then(|_| process.input.as_mut().unwrap().write_all(&message))
             .and_then(|_| process.input.as_mut().unwrap().write_all(b"\n"))
             .map_err(|_| "host_agent_pipe_failed")?;
         Ok(process)

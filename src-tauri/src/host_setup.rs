@@ -14,6 +14,20 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingUpdate {
+    operation_id: String,
+    from_manifest_sha256: String,
+    to_manifest_sha256: String,
+    phase: String,
+    #[serde(skip)]
+    installation_id: String,
+    #[serde(skip)]
+    secure_installation_id: String,
+    #[serde(skip)]
+    record_sha256: String,
+}
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct View {
@@ -22,6 +36,7 @@ pub(crate) struct View {
     installation: Option<Installation>,
     origin: Option<String>,
     pub background_active: bool,
+    pending_update: Option<PendingUpdate>,
     profile_setup_available: bool,
     profile_requires_authorization: bool,
 }
@@ -33,11 +48,67 @@ impl Default for View {
             installation: None,
             origin: None,
             background_active: false,
-            profile_setup_available: cfg!(any(target_os = "linux", windows)),
-            profile_requires_authorization: cfg!(target_os = "linux"),
+            pending_update: None,
+            profile_setup_available: cfg!(any(target_os = "macos", target_os = "linux", windows)),
+            profile_requires_authorization: cfg!(any(target_os = "macos", target_os = "linux")),
         }
     }
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InstalledPackage {
+    #[serde(flatten)]
+    installation: Installation,
+    #[serde(flatten)]
+    metadata: Option<crate::host_runtime::PackageMetadata>,
+    code: Option<String>,
+}
+impl InstalledPackage {
+    fn described(
+        installation: Installation,
+        result: Result<crate::host_runtime::PackageMetadata, String>,
+    ) -> Self {
+        let (metadata, code) = match result {
+            Ok(metadata) => (Some(metadata), None),
+            Err(code) => (None, Some(code)),
+        };
+        Self {
+            installation,
+            metadata,
+            code,
+        }
+    }
+}
+pub(crate) fn installed_packages() -> Result<Vec<InstalledPackage>, String> {
+    Ok(crate::host_install::installed()?
+        .into_iter()
+        .map(|installation| {
+            let result = (|| {
+                let layout = installation.layout()?;
+                let manifest = layout.runtime.join("manifest.json");
+                let signature = layout.runtime.join("manifest.sig");
+                let package = layout.runtime.join("payload/server/package.json");
+                let mut seen = std::collections::BTreeSet::new();
+                for path in [&manifest, &signature, &package] {
+                    crate::manager_host::protect(path, &mut seen)?;
+                }
+                let raw = crate::runtime_store::read_bounded(&manifest, 16 * 1024 * 1024)?;
+                let sig: [u8; 64] = crate::runtime_store::read_bounded(&signature, 64)?
+                    .try_into()
+                    .map_err(|_| "host_signature_invalid")?;
+                let package = crate::runtime_store::read_bounded(&package, 64 * 1024)?;
+                crate::release_policy::host_package_metadata(
+                    &raw,
+                    &sig,
+                    &installation.manifest_sha256,
+                    &package,
+                )
+            })();
+            InstalledPackage::described(installation, result)
+        })
+        .collect())
+}
+
 struct Running {
     manager: NativeManager,
     configuration: Configuration,
@@ -63,8 +134,9 @@ impl HostSetup {
                 .map(|_| "https://127.0.0.1:9443".into()),
             installation,
             background_active: false,
-            profile_setup_available: cfg!(any(target_os = "linux", windows)),
-            profile_requires_authorization: cfg!(target_os = "linux"),
+            pending_update: None,
+            profile_setup_available: cfg!(any(target_os = "macos", target_os = "linux", windows)),
+            profile_requires_authorization: cfg!(any(target_os = "macos", target_os = "linux")),
         };
     }
     fn snapshot(&self) -> View {
@@ -81,7 +153,7 @@ impl HostSetup {
         if view.origin.as_deref() == Some(origin)
             && matches!(
                 view.state.as_str(),
-                "starting" | "stopping" | "provisioning"
+                "starting" | "stopping" | "provisioning" | "updating"
             )
         {
             return Err("native_host_busy".into());
@@ -107,7 +179,7 @@ impl HostSetup {
         Ok(self.snapshot())
     }
     pub(crate) async fn provision(&self, manifest: String) -> Result<View, String> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let record = Installation::read(&manifest)?;
             self.provision_record(record, crate::profile_elevation::provision)
@@ -119,13 +191,13 @@ impl HostSetup {
             self.provision_record(record, crate::windows_host_profile::prepare)
                 .await
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             let _ = manifest;
             Err("host_install_platform_unsupported".into())
         }
     }
-    #[cfg(any(target_os = "linux", windows, test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     async fn provision_record<F>(
         &self,
         installation: Installation,
@@ -224,7 +296,9 @@ impl HostSetup {
     pub(crate) async fn authorize(
         &self,
         password: zeroize::Zeroizing<String>,
+        administrator_name: Option<String>,
         allow_recovery: bool,
+        allow_updates: bool,
     ) -> Result<crate::manager::View, String> {
         require_password(&password)?;
         let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
@@ -232,10 +306,18 @@ impl HostSetup {
         running
             .manager
             .management_identity(&running.configuration)?;
+        if let Some(name) = administrator_name {
+            running
+                .manager
+                .create_administrator(&running.configuration, &name, &password)
+                .await?;
+        } else if !running.manager.claimed().await? {
+            return Err("manager_initialization_required".into());
+        }
         let identity = crate::credentials::identity()?;
         let existing =
             crate::credentials::load::<crate::manager::SavedManager>(crate::manager::CREDENTIAL)?;
-        // Confirm secure writes before claiming an administrator or issuing a grant.
+        // Confirm secure writes before issuing a management grant.
         crate::credentials::save("manager-pairing-check", &true)?;
         crate::credentials::delete("manager-pairing-check")?;
         authorize_owner(
@@ -244,6 +326,7 @@ impl HostSetup {
             &identity,
             password,
             allow_recovery,
+            allow_updates,
             existing,
             |saved| crate::credentials::save(crate::manager::CREDENTIAL, saved),
         )
@@ -273,17 +356,14 @@ impl HostSetup {
         };
         let record = Some(running.installation.clone());
         self.set("stopping", None, record.clone());
-        let result = async {
-            let mut proof = crate::host_state::Owner::acquire(&running.configuration.state, true)?;
-            proof.admit_idle(
-                &running.configuration.installation_id,
+        let result = running
+            .manager
+            .stop_idle(
+                &running.configuration,
                 &running.installation.manifest_sha256,
-            )?;
-            running.manager.shutdown(Duration::from_secs(10)).await?;
-            drop(proof);
-            Ok::<(), String>(())
-        }
-        .await;
+                Duration::from_secs(10),
+            )
+            .await;
         if let Err(error) = result {
             self.set("needs-attention", Some(error.clone()), record);
             return Err(error);
@@ -314,32 +394,13 @@ pub(crate) async fn photos_owner(
     // This selects the owned server address; only the photo UI can establish account readiness.
     local_photos_origin(configuration.api_port)
 }
-fn require_password(password: &str) -> Result<(), String> {
-    if password.chars().count() < 14
-        || password.len() > 256
+pub(crate) fn require_password(password: &str) -> Result<(), String> {
+    if !(14..=256).contains(&password.encode_utf16().count())
         || password.contains(['\r', '\n', '\0'])
     {
         return Err("manager_login_details_invalid".into());
     }
     Ok(())
-}
-fn claim_proof(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, String> {
-    use std::io::Read;
-    let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(path)?);
-    let file = directory
-        .open_with("claim-key", &crate::host_state::options(false))
-        .map_err(|_| "manager_claim_proof_changed")?
-        .into_std();
-    crate::host_state::valid_file(&file).map_err(|_| "manager_claim_proof_changed")?;
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
-    file.take(65)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "manager_claim_proof_changed")?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| "manager_claim_proof_changed")?;
-    if !crate::native_runtime::digest_valid(text, 64) {
-        return Err("manager_claim_proof_changed".into());
-    }
-    Ok(zeroize::Zeroizing::new(text.to_owned()))
 }
 fn local_grant(
     saved: &crate::manager::SavedManager,
@@ -360,12 +421,14 @@ fn local_grant(
     }
     Ok(view)
 }
+#[allow(clippy::too_many_arguments)] // Keep permission flags explicit at the authorization boundary.
 pub(crate) async fn authorize_owner(
     manager: &mut NativeManager,
     configuration: &Configuration,
     identity: &crate::connection::DeviceIdentity,
     password: zeroize::Zeroizing<String>,
     allow_recovery: bool,
+    allow_updates: bool,
     existing: Option<crate::manager::SavedManager>,
     persist: impl FnOnce(&crate::manager::SavedManager) -> Result<(), String>,
 ) -> Result<crate::manager::View, String> {
@@ -376,14 +439,16 @@ pub(crate) async fn authorize_owner(
         if allow_recovery && !view.scopes.contains(&crate::manager::Scope::Restore) {
             return Err("manager_recovery_approval_required".into());
         }
+        if allow_updates && !view.scopes.contains(&crate::manager::Scope::Update) {
+            return Err("manager_update_approval_required".into());
+        }
         crate::manager::reauthenticate(&saved, password.to_string()).await?;
         crate::manager::send(&saved, identity, crate::manager::Command::Status {}).await?;
         manager.management_identity(configuration)?;
         return Ok(view);
     }
     if !manager.claimed().await? {
-        let proof = claim_proof(&configuration.data)?;
-        manager.claim_local(&password, &proof).await?;
+        return Err("manager_initialization_required".into());
     }
     let fingerprint = certificate.sha256.clone();
     crate::manager::pair(
@@ -392,6 +457,7 @@ pub(crate) async fn authorize_owner(
         password.to_string(),
         Some(certificate),
         allow_recovery,
+        allow_updates,
         |saved| {
             manager.management_identity(configuration)?;
             local_grant(saved, identity, configuration, &fingerprint)?;
@@ -434,7 +500,7 @@ pub(crate) fn require_leaf(path: &std::path::Path) -> Result<(), String> {
     }
 }
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
-fn native_release(version: &str, revision: &str) -> Result<String, String> {
+pub(crate) fn native_release(version: &str, revision: &str) -> Result<String, String> {
     if version.split('.').count() != 3
         || !version.split('.').all(|part| {
             !part.is_empty() && part.len() <= 5 && part.bytes().all(|b| b.is_ascii_digit())
@@ -451,6 +517,76 @@ fn pin_profile_leaf(path: &std::path::Path) -> Result<Vec<std::fs::File>, String
         .map_err(|_| "host_install_windows_profile_required".into())
 }
 
+fn fresh_host_profiles(state: &std::path::Path, data: &std::path::Path) -> Result<(), String> {
+    for path in [state, data] {
+        require_leaf(path)?;
+        let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(path)?);
+        if directory
+            .entries()
+            .map_err(|_| "native_profile_unavailable")?
+            .next()
+            .is_some()
+        {
+            return Err("native_profile_recovery_required".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn installation_id(
+    record: &Installation,
+    user: &impl Serialize,
+    state: &std::path::Path,
+    data: &std::path::Path,
+    secure_id: &str,
+) -> Result<String, String> {
+    if let Some(id) = crate::manager_profile::configuration_id(state, data, secure_id)? {
+        return Ok(id);
+    }
+    // Legacy candidates remain provisional until the OS Profile validates their complete binding.
+    let identity = serde_json::to_vec(&(record, user)).map_err(|_| "native_host_setup_failed")?;
+    Ok(format!("{:x}", Sha256::digest(identity))[..12].into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn installed_runtime(
+    record: &Installation,
+) -> Result<
+    (
+        crate::host_install::Layout,
+        crate::host_runtime::VerifiedHostRuntime,
+    ),
+    String,
+> {
+    let current = Installation::read(&record.manifest_sha256)?;
+    if &current != record {
+        return Err("host_install_record_invalid".into());
+    }
+    let layout = record.layout()?;
+    let controller = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
+    if format!("{:x}", Sha256::digest(controller)) != record.controller_sha256 {
+        return Err("host_install_controller_changed".into());
+    }
+    let raw = crate::runtime_store::read_bounded(
+        &layout.runtime.join("manifest.json"),
+        16 * 1024 * 1024,
+    )?;
+    let signature: [u8; 64] =
+        crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
+            .try_into()
+            .map_err(|_| "host_signature_invalid")?;
+    let runtime = crate::release_policy::verify_host_runtime(
+        &layout.runtime.join("payload"),
+        &raw,
+        &signature,
+    )?;
+    if runtime.manifest_sha256() != record.manifest_sha256 {
+        return Err("host_install_runtime_changed".into());
+    }
+    Ok((layout, runtime))
+}
+
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -459,31 +595,7 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
     }
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
-        let current = Installation::read(&record.manifest_sha256)?;
-        if &current != record {
-            return Err("host_install_record_invalid".into());
-        }
-        let layout = record.layout()?;
-        let controller = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
-        if format!("{:x}", Sha256::digest(controller)) != record.controller_sha256 {
-            return Err("host_install_controller_changed".into());
-        }
-        let raw = crate::runtime_store::read_bounded(
-            &layout.runtime.join("manifest.json"),
-            16 * 1024 * 1024,
-        )?;
-        let signature: [u8; 64] =
-            crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
-                .try_into()
-                .map_err(|_| "host_signature_invalid")?;
-        let runtime = crate::release_policy::verify_host_runtime(
-            &layout.runtime.join("payload"),
-            &raw,
-            &signature,
-        )?;
-        if runtime.manifest_sha256() != record.manifest_sha256 {
-            return Err("host_install_runtime_changed".into());
-        }
+        let (layout, runtime) = installed_runtime(record)?;
         #[cfg(unix)]
         let uid = {
             let uid = unsafe { libc::geteuid() };
@@ -508,6 +620,19 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];
         require_leaf(&state)?;
         require_leaf(&data)?;
+        crate::host_state::no_update(&cap_std::fs::Dir::from_std_file(
+            crate::host_storage::directory(&state)?,
+        ))?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("native_manager_start_cancelled".into());
+        }
+        let installation_identity = crate::credentials::enroll_host_identity(|| {
+            if cancel.load(Ordering::Acquire) {
+                return Err("native_manager_start_cancelled".into());
+            }
+            fresh_host_profiles(&state, &data)
+        })?;
+
         let package: serde_json::Value =
             serde_json::from_slice(&crate::runtime_store::read_bounded(
                 &layout.runtime.join("payload/server/package.json"),
@@ -520,10 +645,16 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
                 .ok_or("native_host_version_invalid")?,
             runtime.source_revision(),
         )?;
-        let identity =
-            serde_json::to_vec(&(record, uid)).map_err(|_| "native_host_setup_failed")?;
+        let retained_id = installation_id(
+            record,
+            &uid,
+            &state,
+            &data,
+            &installation_identity.installation_id,
+        )?;
         let configuration = Configuration {
-            installation_id: format!("{:x}", Sha256::digest(identity))[..12].into(),
+            secure_installation_id: installation_identity.installation_id.clone(),
+            installation_id: retained_id,
             name: "My Frameleaf library".into(),
             release,
             controller: layout.controller,
@@ -606,8 +737,9 @@ mod tests {
             let view = serde_json::to_value(setup.snapshot()).unwrap();
             assert_eq!(
                 view["profileSetupAvailable"],
-                cfg!(any(target_os = "linux", windows))
+                cfg!(any(target_os = "macos", target_os = "linux", windows))
             );
+            assert_eq!(view["profileRequiresAuthorization"], cfg!(unix));
             assert_eq!(view["state"], state);
         }
     }
@@ -760,47 +892,159 @@ mod tests {
             "1234567890123",
             &"x".repeat(257),
             "long-password\ncontrol",
+            &"🌱".repeat(129),
         ] {
             assert!(require_password(password).is_err());
         }
         require_password("12345678901234").unwrap();
+        require_password(&"🌱".repeat(7)).unwrap();
+        require_password(&"🌱".repeat(128)).unwrap();
     }
     #[test]
-    fn local_claim_proof_is_private_bounded_and_never_follows_links() {
-        use std::io::Write;
+    fn first_host_identity_requires_completely_empty_private_profiles() {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
-            .join(format!("frameleaf-claim-proof-{}", uuid::Uuid::new_v4()));
+            .join(format!("frameleaf-first-host-{}", uuid::Uuid::new_v4()));
+        let state = root.join("state");
+        let data = root.join("manager");
         crate::runtime_store::private_directory(&root).unwrap();
-        let dir = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&root).unwrap());
-        for value in [
-            "a".repeat(64),
-            "a".repeat(65),
-            "A".repeat(64),
-            "short".into(),
+        crate::runtime_store::private_directory(&state).unwrap();
+        crate::runtime_store::private_directory(&data).unwrap();
+        fresh_host_profiles(&state, &data).unwrap();
+        for (directory, name) in [
+            (&state, "controller-state.json"),
+            (&data, ".setup.lock"),
+            (&data, ".host-profile"),
         ] {
-            let mut file = dir
-                .open_with("claim-key", &crate::host_state::options(true))
-                .unwrap();
-            file.write_all(value.as_bytes()).unwrap();
-            drop(file);
-            assert_eq!(claim_proof(&root).is_ok(), value == "a".repeat(64));
-            dir.remove_file("claim-key").unwrap();
+            std::fs::write(directory.join(name), b"existing profile evidence").unwrap();
+            assert_eq!(
+                fresh_host_profiles(&state, &data).unwrap_err(),
+                "native_profile_recovery_required"
+            );
+            assert_eq!(
+                std::fs::read(directory.join(name)).unwrap(),
+                b"existing profile evidence"
+            );
+            std::fs::remove_file(directory.join(name)).unwrap();
         }
-        let mut file = dir
-            .open_with("original", &crate::host_state::options(true))
-            .unwrap();
-        file.write_all("a".repeat(64).as_bytes()).unwrap();
-        drop(file);
-        std::fs::hard_link(root.join("original"), root.join("claim-key")).unwrap();
-        assert!(claim_proof(&root).is_err());
-        std::fs::remove_file(root.join("claim-key")).unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(root.join("original"), root.join("claim-key")).unwrap();
-            assert!(claim_proof(&root).is_err());
-        }
+        fresh_host_profiles(&state, &data).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn setup_preserves_persisted_id_across_receipt_changes_and_unclean_journals() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-stable-id-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let state = root.join("state");
+        let data = root.join("manager");
+        crate::runtime_store::private_directory(&state).unwrap();
+        crate::runtime_store::private_directory(&data).unwrap();
+        let secure = "11111111-1111-4111-8111-111111111111";
+        let old: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"b".repeat(64),"controllerSha256":"c".repeat(64)})).unwrap();
+        let new: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"d".repeat(64),"controllerSha256":"e".repeat(64)})).unwrap();
+        let id = installation_id(&old, &501u32, &state, &data, secure).unwrap();
+        assert_eq!(id, "eef2e1bdf1ac");
+        let config = Configuration {
+            installation_id: id.clone(),
+            secure_installation_id: secure.into(),
+            name: "Synthetic".into(),
+            release: "frameleaf-v3.0.0-1".into(),
+            controller: if cfg!(windows) {
+                std::env::current_exe().unwrap()
+            } else {
+                "/bin/echo".into()
+            },
+            state: state.clone(),
+            data: data.clone(),
+            origin: "https://127.0.0.1:9443".into(),
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let guard = crate::manager_profile::ProfileGuard::acquire(&config).unwrap();
+        let dir = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&data).unwrap());
+        use std::io::Write;
+        dir.open_with(".host-profile", &crate::host_state::options(true))
+            .unwrap()
+            .write_all("c".repeat(64).as_bytes())
+            .unwrap();
+        // Only synthetic marker bytes here; real Profile validation calls this before any Manager spawn.
+        guard
+            .persist_configuration(&config, &"c".repeat(64))
+            .unwrap();
+        drop(guard);
+        let record = std::fs::read(data.join(".host-configuration.json")).unwrap();
+        for journal in [b"active synthetic journal".as_slice(), b"{".as_slice()] {
+            std::fs::write(state.join("controller-state.json"), journal).unwrap();
+            assert_eq!(
+                installation_id(&new, &501u32, &state, &data, secure).unwrap(),
+                id
+            );
+            assert_eq!(
+                std::fs::read(state.join("controller-state.json")).unwrap(),
+                journal
+            );
+        }
+        assert_eq!(
+            std::fs::read(data.join(".host-configuration.json")).unwrap(),
+            record
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn fresh_windows_user_identity_keeps_the_historical_receipt_hash() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-fresh-id-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let state = root.join("state");
+        let data = root.join("manager");
+        crate::runtime_store::private_directory(&state).unwrap();
+        crate::runtime_store::private_directory(&data).unwrap();
+        let record: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"b".repeat(64),"controllerSha256":"c".repeat(64)})).unwrap();
+        assert_eq!(
+            installation_id(
+                &record,
+                &"S-1-5-21-1-2-3-1001",
+                &state,
+                &data,
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .unwrap(),
+            "75c61c7f59d0"
+        );
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[path = "host_setup_update.rs"]
+mod update;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(crate) use update::validate_update_request;
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(crate) use update::recovery::discover_status;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+pub(crate) use update::recovery::require_admitted_profile;
+
+#[cfg(test)]
+mod installed_package_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn package_metadata_failure_is_a_display_record_not_an_inventory_failure() {
+        let installation: Installation = serde_json::from_value(json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let record =
+            InstalledPackage::described(installation, Err("host_signature_invalid".into()));
+        assert_eq!(
+            serde_json::to_value(record).unwrap(),
+            json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64),"code":"host_signature_invalid"})
+        );
     }
 }

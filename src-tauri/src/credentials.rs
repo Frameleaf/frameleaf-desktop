@@ -1,5 +1,7 @@
+mod host_transition;
 use crate::connection::DeviceIdentity;
 use crate::worker::{persist_checkpoint, SavedWorker};
+use host_transition::transition_host_with;
 use keyring::{Entry, Error};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::{Mutex, MutexGuard};
@@ -166,6 +168,169 @@ impl crate::runtime_epochs::EpochAuthority for CredentialEpochAuthority {
     }
 }
 
+/// Explicit local-host setup may enroll only when its validated profiles are fresh.
+pub(crate) fn enroll_host_identity(
+    fresh_profiles: impl FnOnce() -> Result<(), String>,
+) -> Result<DeviceIdentity, String> {
+    let _lock = installation_lock()?;
+    enroll_host_identity_with(
+        || load_record("installation"),
+        |identity| save_record("installation", identity),
+        crate::identity_anchor::read,
+        crate::identity_anchor::write,
+        fresh_profiles,
+    )
+}
+fn enroll_host_identity_with(
+    load: impl FnOnce() -> Result<Option<DeviceIdentity>, String>,
+    save: impl FnOnce(&DeviceIdentity) -> Result<(), String>,
+    marker: impl FnOnce() -> Result<Option<String>, String>,
+    mark: impl FnOnce(&str) -> Result<(), String>,
+    fresh_profiles: impl FnOnce() -> Result<(), String>,
+) -> Result<DeviceIdentity, String> {
+    identity_with(
+        load,
+        |identity| {
+            fresh_profiles()?;
+            save(identity)
+        },
+        marker,
+        mark,
+    )
+}
+
+fn host_identity_with(
+    load: impl FnOnce() -> Result<Option<DeviceIdentity>, String>,
+    anchor: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<DeviceIdentity, String> {
+    let identity = load()?.ok_or("host_epoch_credential_missing")?;
+    let id = uuid::Uuid::parse_str(&identity.installation_id)
+        .map_err(|_| "host_epoch_identity_invalid")?;
+    if id.to_string() != identity.installation_id {
+        return Err("host_epoch_identity_invalid".into());
+    }
+    identity
+        .host_epochs
+        .as_ref()
+        .ok_or("host_epoch_recovery_required")?
+        .validate()?;
+    if let Some(history) = &identity.runtime_epochs {
+        history.validate()?;
+    }
+    if anchor()?.as_deref() != Some(identity.installation_id.as_str()) {
+        return Err("host_epoch_recovery_required".into());
+    }
+    Ok(identity)
+}
+
+fn with_host_admitted_with(
+    installation_id: &str,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    load: impl FnOnce() -> Result<Option<DeviceIdentity>, String>,
+    anchor: impl FnOnce() -> Result<Option<String>, String>,
+    operation: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let identity = host_identity_with(load, anchor)?;
+    if identity.installation_id != installation_id {
+        return Err("host_epoch_identity_changed".into());
+    }
+    identity
+        .host_epochs
+        .as_ref()
+        .ok_or("host_epoch_recovery_required")?
+        .require_admitted(runtime)?;
+    operation()
+}
+
+fn activate_host_with(
+    installation_id: &str,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    mut load: impl FnMut() -> Result<Option<DeviceIdentity>, String>,
+    mut anchor: impl FnMut() -> Result<Option<String>, String>,
+    save: impl FnOnce(&DeviceIdentity) -> Result<(), String>,
+    publish: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut identity = host_identity_with(&mut load, &mut anchor)?;
+    if identity.installation_id != installation_id {
+        return Err("host_epoch_identity_changed".into());
+    }
+    identity
+        .host_epochs
+        .as_mut()
+        .ok_or("host_epoch_recovery_required")?
+        .admit(runtime)?;
+    save(&identity)?;
+    let confirmed = host_identity_with(load, anchor)?;
+    let expected =
+        Zeroizing::new(serde_json::to_vec(&identity).map_err(|_| "host_epoch_record_invalid")?);
+    let actual =
+        Zeroizing::new(serde_json::to_vec(&confirmed).map_err(|_| "host_epoch_record_invalid")?);
+    if *actual != *expected {
+        return Err("host_epoch_persistence_unconfirmed".into());
+    }
+    publish()
+}
+
+impl crate::host_epochs::HostEpochAuthority for CredentialEpochAuthority {
+    fn transition(
+        &self,
+        installation_id: &str,
+        runtimes: [&crate::host_runtime::VerifiedHostRuntime; 2],
+        prepare: &mut dyn FnMut() -> Result<(), String>,
+        publish: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _lock = installation_lock()?;
+        transition_host_with(
+            installation_id,
+            runtimes,
+            || load_record("installation"),
+            crate::identity_anchor::read,
+            |identity| save_record("installation", identity),
+            prepare,
+            publish,
+        )
+    }
+    fn installation_id(&self) -> Result<String, String> {
+        let _lock = installation_lock()?;
+        Ok(
+            host_identity_with(|| load_record("installation"), crate::identity_anchor::read)?
+                .installation_id
+                .clone(),
+        )
+    }
+    fn with_admitted(
+        &self,
+        installation_id: &str,
+        runtime: &crate::host_runtime::VerifiedHostRuntime,
+        operation: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _lock = installation_lock()?;
+        with_host_admitted_with(
+            installation_id,
+            runtime,
+            || load_record("installation"),
+            crate::identity_anchor::read,
+            operation,
+        )
+    }
+    fn activate(
+        &self,
+        installation_id: &str,
+        runtime: &crate::host_runtime::VerifiedHostRuntime,
+        publish: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _lock = installation_lock()?;
+        activate_host_with(
+            installation_id,
+            runtime,
+            || load_record("installation"),
+            crate::identity_anchor::read,
+            |identity| save_record("installation", identity),
+            publish,
+        )
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 fn disposable(github: &str, environment: &str, opt_in: &str) -> Result<(), &'static str> {
     if github == "true" && environment == "github-hosted" && opt_in == "1" {
@@ -284,3 +449,7 @@ mod epoch_enrollment_tests {
         assert!(finished.get());
     }
 }
+
+#[cfg(test)]
+#[path = "host_credential_tests.rs"]
+mod host_tests;

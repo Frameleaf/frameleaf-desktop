@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use windows_sys::Win32::{
-    System::Com::CoTaskMemFree,
+    System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
     UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
 };
 
@@ -55,6 +55,19 @@ impl Profile {
 }
 fn known_folder() -> Result<PathBuf, String> {
     crate::windows_protection::process_user_sid()?;
+    struct Apartment(bool);
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+    let initialized = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32) };
+    let _apartment = Apartment(
+        crate::windows_protection::com_initialization_ownership(initialized)
+            .map_err(|_| REQUIRED)?,
+    );
     struct Folder(*mut u16);
     impl Drop for Folder {
         fn drop(&mut self) {
@@ -62,6 +75,13 @@ fn known_folder() -> Result<PathBuf, String> {
         }
     }
     let mut folder = Folder(std::ptr::null_mut());
+    #[cfg(test)]
+    unsafe {
+        use windows_sys::Win32::System::Com::{CoGetApartmentType, APTTYPEQUALIFIER_IMPLICIT_MTA};
+        let (mut kind, mut qualifier) = (0, 0);
+        assert_eq!(CoGetApartmentType(&mut kind, &mut qualifier), 0);
+        assert_ne!(qualifier, APTTYPEQUALIFIER_IMPLICIT_MTA);
+    }
     let result = unsafe {
         SHGetKnownFolderPath(
             &FOLDERID_LocalAppData,
@@ -70,6 +90,8 @@ fn known_folder() -> Result<PathBuf, String> {
             &mut folder.0,
         )
     };
+    #[cfg(test)]
+    eprintln!("known_folder_hresult={result:#010x}");
     if result != 0 || folder.0.is_null() {
         return Err(REQUIRED.into());
     }
@@ -160,6 +182,44 @@ mod tests {
             .is_err());
     }
     #[test]
+    fn known_folder_preserves_and_balances_existing_com_apartments() {
+        use windows_sys::Win32::System::Com::{
+            CoGetApartmentType, APTTYPEQUALIFIER_IMPLICIT_MTA, COINIT_APARTMENTTHREADED,
+        };
+        for model in [
+            None,
+            Some(COINIT_MULTITHREADED),
+            Some(COINIT_APARTMENTTHREADED),
+        ] {
+            std::thread::spawn(move || unsafe {
+                let (mut kind, mut qualifier) = (0, 0);
+                if let Some(model) = model {
+                    assert!(CoInitializeEx(std::ptr::null(), model as u32) >= 0);
+                    assert_eq!(CoGetApartmentType(&mut kind, &mut qualifier), 0);
+                }
+                let expected = (kind, qualifier);
+                for _ in 0..2 {
+                    known_folder().unwrap();
+                    if model.is_some() {
+                        assert_eq!(CoGetApartmentType(&mut kind, &mut qualifier), 0);
+                        assert_eq!((kind, qualifier), expected);
+                    }
+                }
+                if model.is_some() {
+                    CoUninitialize();
+                }
+                let result = CoGetApartmentType(&mut kind, &mut qualifier);
+                if result == 0 {
+                    assert_eq!(qualifier, APTTYPEQUALIFIER_IMPLICIT_MTA);
+                } else {
+                    assert_eq!(result as u32, 0x800401f0); // CO_E_NOTINITIALIZED
+                }
+            })
+            .join()
+            .unwrap();
+        }
+    }
+    #[test]
     fn os_location_ignores_environment_and_working_directory() {
         let base = known_folder().unwrap();
         if std::env::var_os("FRAMELEAF_PROFILE_LOCATOR_CHILD").is_some() {
@@ -173,7 +233,12 @@ mod tests {
             .env("APPDATA", r"Z:\untrusted")
             .env("USERPROFILE", r"Z:\untrusted")
             .current_dir(std::env::temp_dir()).output().unwrap();
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "KnownFolder child failed: {}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout)
             .contains(&format!("profile-location={}", base.display())));
     }

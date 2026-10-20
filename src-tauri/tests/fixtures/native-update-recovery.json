@@ -1,0 +1,32 @@
+{
+  "recovery": {
+    "schemaVersion": 1,
+    "runtime": "native",
+    "mediaIncluded": false,
+    "databaseFormat": "frameleaf-canonical",
+    "libraryId": "aaaaaaaaaaaa",
+    "createdAt": 1700000000000,
+    "installation": {
+      "id": "aaaaaaaaaaaa",
+      "name": "Synthetic update readback",
+      "release": "frameleaf-v3.0.0-1"
+    },
+    "checkpoint": {
+      "protocolVersion": 1,
+      "state": "checkpoint",
+      "schemaVersion": 1,
+      "operationId": "33333333-3333-4333-8333-333333333333",
+      "manifestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sourceRevision": "cccccccccccccccccccccccccccccccccccccccc",
+      "postgresMajor": "19",
+      "databaseFormat": "frameleaf-canonical",
+      "dump": {
+        "bytes": 38,
+        "sha256": "df84290f61245f3172ae14f0b12b0fdee0940588fe78d579d5121e92c8b1644d"
+      }
+    }
+  },
+  "raw": "{\"schemaVersion\":1,\"runtime\":\"native\",\"mediaIncluded\":false,\"databaseFormat\":\"frameleaf-canonical\",\"libraryId\":\"aaaaaaaaaaaa\",\"createdAt\":1700000000000,\"installation\":{\"id\":\"aaaaaaaaaaaa\",\"name\":\"Synthetic update readback\",\"release\":\"frameleaf-v3.0.0-1\"},\"checkpoint\":{\"protocolVersion\":1,\"state\":\"checkpoint\",\"schemaVersion\":1,\"operationId\":\"33333333-3333-4333-8333-333333333333\",\"manifestSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sourceRevision\":\"cccccccccccccccccccccccccccccccccccccccc\",\"postgresMajor\":\"19\",\"databaseFormat\":\"frameleaf-canonical\",\"dump\":{\"bytes\":38,\"sha256\":\"df84290f61245f3172ae14f0b12b0fdee0940588fe78d579d5121e92c8b1644d\"}}}",
+  "sha256": "ad739cfb4fc697b95e889c4ebd9f2f457df8f5e796c0f2b4b55bfe945e304b5b",
+  "dump": "PGDMP synthetic native update readback"
+}

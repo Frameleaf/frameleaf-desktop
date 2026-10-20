@@ -10,6 +10,7 @@ const POLICY: &str = include_str!("../../runtime/release-trust.json");
 struct Policy {
     schema_version: u32,
     minimum_runtime_epoch: u64,
+    minimum_host_epoch: u64,
     keys: Vec<Key>,
 }
 #[derive(Deserialize)]
@@ -18,10 +19,11 @@ struct Key {
     id: String,
     public_key_hex: String,
 }
-fn parse_policy(raw: &str) -> Result<(u64, Vec<VerifyingKey>), String> {
+fn parse_policy(raw: &str) -> Result<(u64, u64, Vec<VerifyingKey>), String> {
     let policy: Policy = serde_json::from_str(raw).map_err(|_| "release_policy_invalid")?;
     if policy.schema_version != 1
         || policy.minimum_runtime_epoch == 0
+        || policy.minimum_host_epoch == 0
         || policy.keys.is_empty()
         || policy.keys.len() > 16
     {
@@ -54,10 +56,31 @@ fn parse_policy(raw: &str) -> Result<(u64, Vec<VerifyingKey>), String> {
         }
         keys.push(VerifyingKey::from_bytes(&bytes).map_err(|_| "release_policy_invalid")?);
     }
-    Ok((policy.minimum_runtime_epoch, keys))
+    Ok((
+        policy.minimum_runtime_epoch,
+        policy.minimum_host_epoch,
+        keys,
+    ))
+}
+#[cfg(test)]
+static COREML_FIXTURE_KEY: std::sync::OnceLock<VerifyingKey> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn use_coreml_fixture_authority() {
+    COREML_FIXTURE_KEY
+        .get_or_init(|| ed25519_dalek::SigningKey::from_bytes(&[71; 32]).verifying_key());
 }
 pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
-    let (floor, keys) = parse_policy(POLICY)?;
+    #[cfg(test)]
+    if let Some(key) = COREML_FIXTURE_KEY.get() {
+        return RuntimeStore::new(
+            root,
+            vec![*key],
+            1,
+            std::sync::Arc::new(crate::credentials::CredentialEpochAuthority),
+        );
+    }
+
+    let (floor, _, keys) = parse_policy(POLICY)?;
     RuntimeStore::new(
         root,
         keys,
@@ -71,16 +94,52 @@ pub fn verify_host_runtime(
     manifest: &[u8],
     signature: &[u8; 64],
 ) -> Result<crate::host_runtime::VerifiedHostRuntime, String> {
-    let (floor, keys) = parse_policy(POLICY)?;
+    let (_, floor, keys) = parse_policy(POLICY)?;
     crate::host_runtime::VerifiedHostRuntime::verify(root, manifest, signature, &keys, floor)
+}
+pub(crate) fn host_package_metadata(
+    manifest: &[u8],
+    signature: &[u8; 64],
+    expected_manifest: &str,
+    package: &[u8],
+) -> Result<crate::host_runtime::PackageMetadata, String> {
+    let (_, floor, keys) = parse_policy(POLICY)?;
+    crate::host_runtime::package_metadata(
+        manifest,
+        signature,
+        &keys,
+        floor,
+        expected_manifest,
+        package,
+    )
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn host_and_ml_minimums_are_explicit_and_independent() {
+        let mut policy: serde_json::Value = serde_json::from_str(POLICY).unwrap();
+        policy["minimumRuntimeEpoch"] = serde_json::json!(99);
+        policy["minimumHostEpoch"] = serde_json::json!(2);
+        let (ml, host, _) = parse_policy(&policy.to_string()).unwrap();
+        assert_eq!((ml, host), (99, 2));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(true),
+            serde_json::json!("2"),
+        ] {
+            policy["minimumHostEpoch"] = value;
+            assert!(parse_policy(&policy.to_string()).is_err());
+        }
+        policy.as_object_mut().unwrap().remove("minimumHostEpoch");
+        assert!(parse_policy(&policy.to_string()).is_err());
+    }
+    #[test]
     fn public_policy_has_a_positive_floor_and_rejects_invalid_or_ambiguous_keys() {
-        let (floor, keys) = parse_policy(POLICY).unwrap();
+        let (floor, host_floor, keys) = parse_policy(POLICY).unwrap();
         assert!(floor > 0);
+        assert!(host_floor > 0);
         assert!(!keys.is_empty());
         let original: serde_json::Value = serde_json::from_str(POLICY).unwrap();
         let mut value = original.clone();
@@ -106,7 +165,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let (floor, keys) = parse_policy(POLICY).unwrap();
+        let (floor, _, keys) = parse_policy(POLICY).unwrap();
         let verified = crate::native_runtime::VerifiedRuntime::verify(
             &root.join("payload"),
             &raw,

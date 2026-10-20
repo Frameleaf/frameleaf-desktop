@@ -175,6 +175,35 @@ fn disposable_runner_epoch_persistence() {
         "separate controller must read the same key and saved rollback floor"
     );
     assert!(status.success(), "controller credential access failed");
+    #[cfg(target_os = "linux")]
+    {
+        let output = scratch
+            .0
+            .join("sanitized-controller-credential-receipt.json");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .unwrap();
+        let mut child = Command::new(&controller)
+            .args(["--qualify-credential-access", &installation_id])
+            .env_clear()
+            .env("GITHUB_ACTIONS", "true")
+            .env("RUNNER_ENVIRONMENT", "github-hosted")
+            .env("FRAMELEAF_TEST_DISPOSABLE_KEYSTORE", "1")
+            .stdout(file)
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        assert!(
+            wait_for_child(&mut child, "sanitized-separate-controller").success(),
+            "production-equivalent controller credential access failed"
+        );
+        let actual: serde_json::Value =
+            serde_json::from_slice(&crate::runtime_store::read_bounded(&output, 8192).unwrap())
+                .unwrap();
+        assert_eq!(actual, expected_receipt);
+    }
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

@@ -2,6 +2,14 @@
 #[cfg(windows)]
 // Node's default realpath walk cannot traverse the GLOBALROOT namespace.
 pub(crate) const NODE_PATH_OPTIONS: &str = "--preserve-symlinks --preserve-symlinks-main";
+pub(crate) fn com_initialization_ownership(result: i32) -> Result<bool, String> {
+    match result as u32 {
+        0 | 1 => Ok(true),
+        // RPC_E_CHANGED_MODE means the caller already owns a different apartment model.
+        0x80010106 => Ok(false),
+        _ => Err("windows_com_initialization_failed".into()),
+    }
+}
 fn stable_volume_root(path: &str) -> Option<&str> {
     let prefix = [
         r"\\?\GLOBALROOT\Device\HarddiskVolume",
@@ -571,6 +579,21 @@ pub(crate) use native::{durable_name, protect, stable_path};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn successful_com_initialization_must_be_balanced_even_when_already_initialized() {
+        assert_eq!(com_initialization_ownership(0), Ok(true));
+        assert_eq!(com_initialization_ownership(1), Ok(true));
+    }
+    #[test]
+    fn existing_other_apartment_is_borrowed_and_failed_initialization_refuses() {
+        assert_eq!(
+            com_initialization_ownership(0x80010106u32 as i32),
+            Ok(false)
+        );
+        for result in [0x8007000eu32 as i32, 0x80070057u32 as i32, -1, 2] {
+            assert!(com_initialization_ownership(result).is_err());
+        }
+    }
     #[test]
     fn extended_filesystem_spelling_keeps_long_unicode_nt_paths_and_refuses_aliases() {
         let tail = format!(

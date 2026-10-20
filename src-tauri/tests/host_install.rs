@@ -1,6 +1,35 @@
 use std::process::Command;
 
 #[test]
+fn windows_installer_protocol_is_read_only_and_platform_scoped() {
+    for extra in [None, Some("unexpected")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"));
+        command.arg("--installer-protocol");
+        if let Some(extra) = extra {
+            command.arg(extra);
+        }
+        let output = command.output().unwrap();
+        assert!(output.stderr.is_empty());
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if cfg!(windows) && extra.is_none() {
+            assert!(output.status.success());
+            assert_eq!(
+                receipt,
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "installerProtocolVersion": 1,
+                    "install": "--install-windows-package",
+                    "remove": "--remove-windows-package"
+                })
+            );
+        } else {
+            assert!(!output.status.success());
+            assert_eq!(receipt["code"], "host_control_arguments_invalid");
+        }
+    }
+}
+
+#[test]
 fn windows_profile_provisioning_is_explicit_bounded_and_platform_scoped() {
     for args in [
         vec!["invalid", "invalid"],
@@ -125,7 +154,7 @@ fn installer_cli_refuses_nonroot_execution_and_incomplete_arguments() {
         let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(
             receipt["code"],
-            if cfg!(target_os = "linux") {
+            if cfg!(any(target_os = "macos", target_os = "linux")) {
                 "host_install_root_required"
             } else {
                 "host_install_platform_unsupported"

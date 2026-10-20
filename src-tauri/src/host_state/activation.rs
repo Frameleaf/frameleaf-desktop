@@ -75,7 +75,7 @@ impl Intent {
         Ok(())
     }
 }
-fn sync_directory(root: &Dir) -> Result<(), String> {
+pub(super) fn sync_directory(root: &Dir) -> Result<(), String> {
     #[cfg(unix)]
     root.try_clone()
         .and_then(|root| root.into_std_file().sync_all())
@@ -178,7 +178,7 @@ fn database_identity(path: &Path) -> Result<String, String> {
     let root = Dir::from_std_file(crate::host_storage::directory(path)?);
     identity(&root)
 }
-fn media_identity(root: &Dir) -> Result<Option<String>, String> {
+pub(super) fn media_identity(root: &Dir) -> Result<Option<String>, String> {
     match root.symlink_metadata("media") {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
@@ -555,7 +555,8 @@ mod tests {
                 .unwrap()
                 .join(format!("frameleaf-selection-{}", Uuid::new_v4()));
             crate::runtime_store::private_directory(&path).unwrap();
-            let mut owner = Owner::acquire(&path, true).unwrap();
+            let mut owner =
+                Owner::acquire(&path, true, "11111111-1111-4111-8111-111111111111").unwrap();
             owner
                 .activate(
                     ID,
@@ -662,6 +663,43 @@ mod tests {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+    #[test]
+    fn changed_secure_uuid_cannot_select_finalize_or_reconcile_restore() {
+        for operation in ["select", "finalize", "reconcile"] {
+            let mut f = Fixture::new();
+            let proof = f.proof();
+            let safety = f.safety();
+            let proof = if operation == "reconcile" {
+                f.owner.select_restore(proof, safety.clone()).unwrap();
+                None
+            } else {
+                Some(proof)
+            };
+            let mut marker = f.owner.read().unwrap().unwrap();
+            marker.secure_installation_id = Some("22222222-2222-4222-8222-222222222222".into());
+            f.owner.write(&marker).unwrap();
+            let bytes = journal_bytes(&mut f.owner);
+            let global = fs::read(f.path.join(ACTIVATION)).ok();
+            let target = fs::read(f.target.join("activation-intent.json")).ok();
+            let refused = match operation {
+                "select" => f.owner.select_restore(proof.unwrap(), safety).is_err(),
+                "finalize" => f.owner.finalize_restore(proof.unwrap(), safety).is_err(),
+                _ => f.owner.reconcile_restore(ID, &"b".repeat(64)).is_err(),
+            };
+            assert!(refused, "{operation}");
+            assert_eq!(journal_bytes(&mut f.owner), bytes);
+            assert_eq!(fs::read(f.path.join(ACTIVATION)).ok(), global);
+            assert_eq!(
+                fs::read(f.target.join("activation-intent.json")).ok(),
+                target
+            );
+            assert_eq!(
+                fs::read(f.path.join("database/sentinel")).unwrap(),
+                b"original"
+            );
+        }
+    }
+
     #[test]
     fn fresh_final_validation_admits_only_the_selected_database_and_retains_recovery() {
         let mut f = Fixture::new();

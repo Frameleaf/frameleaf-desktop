@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "minimumRuntimeEpoch": 2,
+  "minimumHostEpoch": 2,
   "keys": [
     {
       "id": "desktop-release-2026-10",

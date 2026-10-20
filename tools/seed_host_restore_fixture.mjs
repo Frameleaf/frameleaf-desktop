@@ -7,6 +7,7 @@ import { readFile, writeFile, rm, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { claimState, runHost, hostEnvironment, canonicalHostPathMatches } from "../runtime/host-agent.mjs";
+import { qualifyUpdatePhoto } from "./update_photo_fixture.mjs";
 
 let input = "";
 for await (const part of process.stdin) {
@@ -14,7 +15,9 @@ for await (const part of process.stdin) {
   assert.ok(input.length < 64 * 1024);
 }
 const config = JSON.parse(input);
-const { root, manager, mode, ...c } = config;
+const { root, manager, mode, secureInstallationId, update, ...c } = config;
+assert.match(secureInstallationId, /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/);
+assert.notEqual(secureInstallationId, "00000000-0000-0000-0000-000000000000");
 assert.ok(canonicalHostPathMatches(await realpath(root), root));
 assert.equal(c.state, join(root, "profile"));
 assert.equal(resolve(c.runtime), c.runtime);
@@ -29,17 +32,48 @@ const sql = query => command("psql", [...connection, "-d", "frameleaf", "-XAt", 
 const stopDatabase = directory => command("pgCtl", ["-D", directory, "-m", "fast", "-w", "stop"]);
 const startDatabase = directory => command("pgCtl", ["-D", directory, "-l", join(root, "fixture-postgres.log"),
   "-o", `-h 127.0.0.1 -p ${c.databasePort}`, "-w", "start"]);
-if (mode === "selected") {
+if (mode === "approve-update") {
+  assert.match(update.backupKey, /^[A-Za-z0-9_-]{43}$/);
+  await assert.rejects(command("pgCtl", ["-D", database, "status"]), { code: 3 });
+  const { Store } = await import(pathToFileURL(join(manager, "store.js")));
+  const { digest } = await import(pathToFileURL(join(manager, "contracts.js")));
+  const { approveNativeUpdate } = await import(pathToFileURL(join(manager, "runtime/native-update-approval.js")));
+  const store = new Store(join(root, "manager"));
+  try {
+    const binding = store.get("native-installation");
+    assert.ok(binding && digest(binding.descriptor) === binding.fingerprint);
+    const installation = binding.descriptor.installation;
+    assert.equal(installation.state, c.state);
+    assert.equal(installation.manifestSha256, c.manifestSha256);
+    assert.equal(installation.secureInstallationId, secureInstallationId);
+    const runtime = { identity: { runtime: "native", installationId: installation.id, fingerprint: digest(installation) },
+      status: () => ({ state: "stopped" }) };
+    const result = await approveNativeUpdate(store, runtime, { managerFingerprint: binding.fingerprint, installation,
+      libraryId: installation.id, name: binding.descriptor.name, release: binding.descriptor.release }, update.backupKey,
+      { backupOperationId: update.backupOperationId, targetManifestSha256: update.targetManifestSha256, migrationsApproved: true, key: randomUUID() });
+    console.log(JSON.stringify(result));
+  } finally { store.close(); }
+} else if (mode === "selected-update") {
+  assert.equal(await sql("SELECT value->>'label' FROM system_metadata WHERE key='native-owner-qualification'"), "selected");
+  assert.equal(await sql("SELECT value->>'label' FROM system_metadata WHERE key='native-update-migration-qualification'"), "target-only");
+  await sql(`BEGIN; INSERT INTO system_metadata(key,value) VALUES('native-update-writer-qualification','{"label":"write-probe"}'); ROLLBACK;`);
+  assert.equal(await sql("SELECT count(*) FROM system_metadata WHERE key='native-update-writer-qualification'"), "0");
+  const proof = JSON.parse(await readFile(join(root, "photo-proof.json"), "utf8"));
+  const photos = await qualifyUpdatePhoto(`http://127.0.0.1:${c.apiPort}`, c.password, proof);
+  console.log(JSON.stringify({ selectedRows: true, targetMigration: true, writeTransaction: true, photos }));
+} else if (mode === "selected") {
   assert.equal(await sql("SELECT value->>'label' FROM system_metadata WHERE key='native-owner-qualification'"), "selected");
   console.log(JSON.stringify({ selectedRows: true }));
-} else if (mode === "original") {
+} else if (mode === "original" || mode === "original-update") {
   await startDatabase(database);
   try {
     assert.equal(await sql("SELECT value->>'label' FROM system_metadata WHERE key='native-owner-qualification'"), "original-current");
+    if (mode === "original-update") assert.equal(await sql("SELECT count(*) FROM system_metadata WHERE key='native-update-migration-qualification'"), "0");
   } finally { await stopDatabase(database); }
   console.log(JSON.stringify({ originalRows: true }));
 } else {
-  assert.equal(mode, "seed");
+  assert.ok(mode === "seed" || mode === "seed-update");
+  if (mode === "seed-update") assert.match(update.backupKey, /^[A-Za-z0-9_-]{43}$/);
   await claimState({ ...c, mode: "database" });
   await assert.rejects(readFile(join(database, "PG_VERSION")), { code: "ENOENT" });
   const load = name => import(pathToFileURL(join(manager, name)));
@@ -51,7 +85,7 @@ if (mode === "selected") {
   const { prepareNativeRestoreReview } = await load("runtime/native-restore-review.js");
   const { runNativeRestorePrebackup } = await load("runtime/native-restore-operation.js");
   const store = new Store(join(root, "manager"));
-  const installation = { runtime: "native", id: "a".repeat(12), controller: join(root, "unused-controller"),
+  const installation = { runtime: "native", id: "a".repeat(12), secureInstallationId, controller: join(root, "unused-controller"),
     candidate: c.runtime, state: c.state, manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision,
     certified: false, databasePort: c.databasePort, apiPort: c.apiPort };
   const identity = { runtime: "native", installationId: installation.id, fingerprint: digest(installation) };
@@ -61,8 +95,8 @@ if (mode === "selected") {
   const component = JSON.parse(await readFile(join(c.runtime, "backup/component.json"), "utf8"));
   assert.equal(component.name, "restic");
   assert.equal(executableSha, component.artifact.binarySha256);
-  const key = randomBytes(32).toString("base64url");
-  const backups = new Backups(join(root, "repository"), async () => key,
+  const key = mode === "seed-update" ? update.backupKey : randomBytes(32).toString("base64url");
+  const backups = new Backups(mode === "seed-update" ? join(root, "manager/backups/frameleaf-database") : join(root, "repository"), async () => key,
     (binary, args, options = {}) => backupCommand(binary, args, { ...options, executable,
       env: { HOME: root, XDG_CACHE_HOME: join(root, "cache"), PATH: "", GOMAXPROCS: "1",
         ...(process.platform === "win32" ? { SystemRoot: env.SystemRoot } : {}) } }));
@@ -71,8 +105,8 @@ if (mode === "selected") {
     const stopping = new Promise(resolve => { stop = resolve; });
     work = runHost({ ...c, mode }, stopping, value => {
       handler = value; phase = mode;
-      ready({ protocolVersion: 1, state: mode === "database" ? "database-ready" : "checkpoint-cleanup-ready",
-        manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, certified: false });
+      ready({ protocolVersion: 1, state: mode === "database" ? "database-ready" : mode === "server" ? "running" : "checkpoint-cleanup-ready",
+        secureInstallationId, manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, certified: false });
     });
     void work.catch(reject);
   });
@@ -100,12 +134,27 @@ if (mode === "selected") {
         FRAMELEAF_HDR_BINDING: join(c.runtime, c.entryPoints.hdr), UV_THREADPOOL_SIZE: "1" }, timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
     await sql(`INSERT INTO system_metadata(key,value) VALUES('native-owner-qualification','{"label":"selected"}')`);
     await stopDatabase(database);
+    if (mode === "seed-update") {
+      await startOwner("server");
+      try {
+        const proof = await qualifyUpdatePhoto(`http://127.0.0.1:${c.apiPort}`, c.password);
+        await writeFile(join(root, "photo-proof.json"), JSON.stringify(proof), { mode: 0o600, flag: "wx" });
+      } finally { await adapter.stop(); }
+    }
     const service = new NativeService(store, { protocolVersion: 2, installation, backupKey: key, password: c.password,
       controllerSha256: "e".repeat(64), backupEngine: { executable, sha256: executableSha },
       tls: { certificatePem: "synthetic certificate", privateKeyPem: "synthetic private key" }, name: context.name, release: context.release }, adapter, backups);
     const first = service.control("backup", randomUUID());
     assert.equal((await service.wait(first.id)).state, "complete");
     const snapshot = store.history()[0].receipts["native-backup-verified"];
+    if (mode === "seed-update") {
+      assert.equal(phase, "stopped");
+      const backupOperationId = first.id;
+      await startDatabase(database);
+      try { await sql(`UPDATE system_metadata SET value='{"label":"original-current"}' WHERE key='native-owner-qualification'`); }
+      finally { await stopDatabase(database); }
+      console.log(JSON.stringify({ backupOperationId, snapshotId: snapshot.snapshotId }));
+    } else {
     const review = await prepareNativeRestoreReview(store, backups, { installation, libraryId: installation.id, release: context.release }, snapshot.snapshotId);
     await startDatabase(database);
     await sql(`UPDATE system_metadata SET value='{"label":"original-current"}' WHERE key='native-owner-qualification'`);
@@ -118,6 +167,7 @@ if (mode === "selected") {
     const { protocolVersion, state: checkpointState, ...checkpoint } = result.recovery.checkpoint;
     console.log(JSON.stringify({ binding, safety: { snapshotId: result.snapshotId,
       recoverySha256: digest(result.recovery), checkpoint } }));
+    }
   } finally {
     await adapter.stop();
     store.close();

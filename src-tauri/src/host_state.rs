@@ -10,10 +10,18 @@ use std::{
 use uuid::Uuid;
 
 mod activation;
+mod update;
 pub(crate) use activation::SafetySnapshot;
+pub(crate) use update::{valid_update_history_name, UpdateSelection};
 
 const NAME: &str = "controller-state.json";
 const ACTIVATION: &str = "restore-activation.json";
+pub(crate) fn no_update(root: &Dir) -> Result<(), String> {
+    match root.symlink_metadata("host-update.json") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_update_pending".into()),
+    }
+}
 fn no_activation(root: &Dir) -> Result<(), String> {
     match root.symlink_metadata(ACTIVATION) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -30,6 +38,8 @@ pub(crate) enum Phase {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Marker {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_installation_id: Option<String>,
     pub installation_id: String,
     pub manifest_sha256: String,
     pub profile_identity: String,
@@ -49,6 +59,7 @@ pub(crate) struct Owner {
     profile_identity: String,
     active: Option<Marker>,
     writable: bool,
+    secure_installation_id: Option<String>,
 }
 struct TransientHostLease(File);
 impl Drop for TransientHostLease {
@@ -67,6 +78,9 @@ fn identity(root: &Dir) -> Result<String, String> {
     let value =
         crate::copy_source::root_identity(root).map_err(|_| "host_profile_identity_unavailable")?;
     Ok(format!("{:x}", Sha256::digest(value.as_bytes())))
+}
+pub(crate) fn valid_installation_id(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
 pub(crate) fn options(write: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
@@ -93,7 +107,7 @@ pub(crate) fn options(write: bool) -> OpenOptions {
 pub(crate) fn valid_file(file: &File) -> Result<(), String> {
     valid_sized_file(file, 4096)
 }
-fn valid_sized_file(file: &File, maximum: u64) -> Result<(), String> {
+pub(crate) fn valid_sized_file(file: &File, maximum: u64) -> Result<(), String> {
     let meta = file
         .metadata()
         .map_err(|_| "host_controller_state_invalid")?;
@@ -126,8 +140,45 @@ fn valid_sized_file(file: &File, maximum: u64) -> Result<(), String> {
     Ok(())
 }
 impl Owner {
-    pub fn acquire(path: &Path, writable: bool) -> Result<Self, String> {
-        if writable {
+    pub(crate) fn installation_identity(&self) -> Option<&str> {
+        self.secure_installation_id.as_deref()
+    }
+    pub fn acquire(
+        path: &Path,
+        writable: bool,
+        secure_installation_id: &str,
+    ) -> Result<Self, String> {
+        if !valid_installation_id(secure_installation_id) {
+            return Err("host_controller_identity_invalid".into());
+        }
+        Self::acquire_inner(path, writable, Some(secure_installation_id))
+    }
+    pub(crate) fn acquire_update(
+        path: &Path,
+        secure_installation_id: &str,
+    ) -> Result<Self, String> {
+        if !valid_installation_id(secure_installation_id) {
+            return Err("host_controller_identity_invalid".into());
+        }
+        Self::lease(path, true, Some(secure_installation_id), false)
+    }
+    fn acquire_inner(
+        path: &Path,
+        writable: bool,
+        secure_installation_id: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::lease(path, writable, secure_installation_id, writable)
+    }
+    fn lease(
+        path: &Path,
+        writable: bool,
+        secure_installation_id: Option<&str>,
+        initialize: bool,
+    ) -> Result<Self, String> {
+        if writable && secure_installation_id.is_none() {
+            return Err("host_controller_identity_invalid".into());
+        }
+        if writable && initialize {
             crate::runtime_store::private_directory(path)?;
         }
         #[cfg(windows)]
@@ -146,8 +197,10 @@ impl Owner {
                 return Err("host_state_not_private".into());
             }
         }
+        let mut file_options = options(writable);
+        file_options.create(writable && initialize);
         let file = root
-            .open_with(NAME, &options(writable))
+            .open_with(NAME, &file_options)
             .map_err(|_| "host_controller_state_unavailable")?
             .into_std();
         valid_file(&file)?;
@@ -167,6 +220,7 @@ impl Owner {
             profile_identity,
             active: None,
             writable,
+            secure_installation_id: secure_installation_id.map(str::to_owned),
         };
         owner.placement()?;
         Ok(owner)
@@ -216,8 +270,28 @@ impl Owner {
             .map_err(|_| "host_controller_state_invalid".into())
     }
     fn binding(&self, marker: &Marker, id: &str, sha: &str) -> Result<(), String> {
-        if marker.schema_version != 1
-            || marker.installation_id != id
+        match self.secure_installation_id.as_deref() {
+            Some(expected) => {
+                if marker.schema_version == 1 || marker.secure_installation_id.is_none() {
+                    return Err("host_recovery_requires_manager".into());
+                }
+                if marker.schema_version != 2
+                    || marker.secure_installation_id.as_deref() != Some(expected)
+                {
+                    return Err("host_controller_binding_changed".into());
+                }
+            }
+            // Only credential-free package liveness may inspect a legacy journal.
+            None => match (
+                marker.schema_version,
+                marker.secure_installation_id.as_deref(),
+            ) {
+                (1, None) => {}
+                (2, Some(id)) if valid_installation_id(id) => {}
+                _ => return Err("host_controller_binding_changed".into()),
+            },
+        }
+        if marker.installation_id != id
             || marker.manifest_sha256 != sha
             || marker.generation.is_nil()
         {
@@ -229,6 +303,7 @@ impl Owner {
         Ok(())
     }
     fn write(&mut self, marker: &Marker) -> Result<(), String> {
+        no_update(&self.root)?;
         if !self.writable {
             return Err("host_controller_read_only".into());
         }
@@ -248,6 +323,11 @@ impl Owner {
         sha: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(), String> {
+        let secure_installation_id = self
+            .secure_installation_id
+            .clone()
+            .ok_or("host_controller_identity_invalid")?;
+        no_update(&self.root)?;
         if mode == crate::host_runtime::HostMode::RestorePrepare {
             self.reconcile_restore(id, sha)?;
         }
@@ -287,7 +367,8 @@ impl Owner {
             }
         };
         let marker = Marker {
-            schema_version: 1,
+            schema_version: 2,
+            secure_installation_id: Some(secure_installation_id),
             installation_id: id.into(),
             manifest_sha256: sha.into(),
             profile_identity: self.profile_identity.clone(),
@@ -318,6 +399,7 @@ impl Owner {
         manifest_sha256: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(PathBuf, Option<crate::host_database::Reference>, Uuid), String> {
+        no_update(&self.root)?;
         if mode == crate::host_runtime::HostMode::Server {
             no_activation(&self.root)?;
         }
@@ -378,6 +460,7 @@ impl Owner {
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn package_idle(path: &Path) -> Result<(), String> {
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+        no_update(&root)?;
         no_activation(&root)?;
         match root.symlink_metadata(NAME) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -395,7 +478,7 @@ impl Owner {
             Err(_) => return Err("host_controller_state_invalid".into()),
             Ok(_) => {}
         }
-        let mut owner = Self::acquire(path, false)?;
+        let mut owner = Self::acquire_inner(path, false, None)?;
         match owner.read()? {
             None => owner.empty(),
             Some(marker) => {
@@ -414,6 +497,10 @@ impl Owner {
         }
     }
     pub fn inspect(&mut self, id: &str, sha: &str) -> Result<Marker, String> {
+        no_update(&self.root)?;
+        self.inspect_stopped(id, sha)
+    }
+    fn inspect_stopped(&mut self, id: &str, sha: &str) -> Result<Marker, String> {
         let marker = self.read()?.ok_or("host_recovery_requires_manager")?;
         self.binding(&marker, id, sha)?;
         if marker.phase != Phase::Stopped {
@@ -477,6 +564,108 @@ mod tests {
         "b".repeat(64)
     }
 
+    const SECURE_ID: &str = "11111111-1111-4111-8111-111111111111";
+    #[test]
+    fn secure_identity_is_validated_before_profile_io() {
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-invalid-owner-{}", Uuid::new_v4()));
+        for id in [
+            "",
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "11111111-1111-4111-8111-11111111111A",
+        ] {
+            assert!(Owner::acquire(&path, true, id).is_err());
+            assert!(!path.exists());
+        }
+    }
+    #[test]
+    fn secure_uuid_is_distinct_from_configuration_and_never_rebinds_existing_journal() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true, SECURE_ID).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        owner.clean_stop().unwrap();
+        drop(owner);
+        let original = fs::read(fixture.0.join(NAME)).unwrap();
+        let marker: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(marker["schemaVersion"], 2);
+        assert_eq!(marker["secureInstallationId"], SECURE_ID);
+        assert_eq!(marker["installationId"], ID);
+        let mut same = Owner::acquire(&fixture.0, false, SECURE_ID).unwrap();
+        assert_eq!(
+            same.inspect(ID, &sha()).unwrap().generation.to_string(),
+            marker["generation"]
+        );
+        drop(same);
+        let mut other =
+            Owner::acquire(&fixture.0, true, "22222222-2222-4222-8222-222222222222").unwrap();
+        assert!(other.inspect(ID, &sha()).is_err());
+        assert!(other.admit_idle(ID, &sha()).is_err());
+        assert!(other
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .is_err());
+        drop(other);
+        assert_eq!(fs::read(fixture.0.join(NAME)).unwrap(), original);
+    }
+    #[test]
+    fn credential_free_maintenance_owner_cannot_be_writable_or_activate() {
+        let fixture = Fixture::new();
+        assert!(Owner::acquire_inner(&fixture.0, true, None).is_err());
+        assert!(!fixture.0.join(NAME).exists());
+        let owner = Owner::acquire(&fixture.0, true, SECURE_ID).unwrap();
+        drop(owner);
+        let mut package = Owner::acquire_inner(&fixture.0, false, None).unwrap();
+        assert!(package
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .is_err());
+        drop(package);
+        assert!(fs::read(fixture.0.join(NAME)).unwrap().is_empty());
+    }
+    #[test]
+    fn legacy_or_missing_identity_requires_recovery_but_known_stopped_legacy_allows_package_liveness(
+    ) {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true, SECURE_ID).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        owner.clean_stop().unwrap();
+        drop(owner);
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.0.join(NAME)).unwrap()).unwrap();
+        for (schema, identity, package_ok) in [
+            (1, None, true),
+            (2, None, false),
+            (2, Some("bad"), false),
+            (1, Some(SECURE_ID), false),
+            (3, Some(SECURE_ID), false),
+        ] {
+            let mut marker = original.clone();
+            marker["schemaVersion"] = schema.into();
+            marker
+                .as_object_mut()
+                .unwrap()
+                .remove("secureInstallationId");
+            if let Some(id) = identity {
+                marker["secureInstallationId"] = id.into();
+            }
+            let bytes = serde_json::to_vec(&marker).unwrap();
+            fs::write(fixture.0.join(NAME), &bytes).unwrap();
+            let mut owner = Owner::acquire(&fixture.0, true, SECURE_ID).unwrap();
+            assert!(owner.inspect(ID, &sha()).is_err());
+            assert!(owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+                .is_err());
+            drop(owner);
+            assert_eq!(Owner::package_idle(&fixture.0).is_ok(), package_ok);
+            assert_eq!(fs::read(fixture.0.join(NAME)).unwrap(), bytes);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn transient_host_lease_releases_fork_style_descriptors_on_scope_exit() {
@@ -517,14 +706,16 @@ mod tests {
     #[test]
     fn owner_drop_releases_fork_style_descriptor_without_claiming_clean_shutdown() {
         let fixture = Fixture::new();
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
         let inherited = owner.file.try_clone().unwrap();
-        assert!(Owner::acquire(&fixture.0, true).is_err());
+        assert!(Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").is_err());
         drop(owner);
-        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        let mut inspector =
+            Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").unwrap();
         assert_eq!(
             inspector.inspect(ID, &sha()).unwrap_err(),
             "host_recovery_requires_manager"
@@ -536,14 +727,16 @@ mod tests {
     #[test]
     fn controller_lease_excludes_inspection_from_before_start_until_shutdown() {
         let fixture = Fixture::new();
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
-        assert!(Owner::acquire(&fixture.0, true).is_err());
-        assert!(Owner::acquire(&fixture.0, false).is_err());
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
+        assert!(Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").is_err());
+        assert!(Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").is_err());
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
         drop(owner);
-        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        let mut inspector =
+            Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").unwrap();
         assert_eq!(
             inspector.inspect(ID, &sha()).unwrap_err(),
             "host_recovery_requires_manager"
@@ -553,20 +746,23 @@ mod tests {
     #[test]
     fn only_matching_clean_stop_and_current_physical_root_can_be_inspected() {
         let fixture = Fixture::new();
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
         owner.clean_stop().unwrap();
         drop(owner);
-        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        let mut inspector =
+            Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").unwrap();
         assert_eq!(inspector.inspect(ID, &sha()).unwrap().phase, Phase::Stopped);
         assert!(inspector.inspect("cccccccccccc", &sha()).is_err());
         assert!(inspector.inspect(ID, &"d".repeat(64)).is_err());
         drop(inspector);
         let copy = Fixture::new();
         fs::copy(fixture.0.join(NAME), copy.0.join(NAME)).unwrap();
-        let mut inspector = Owner::acquire(&copy.0, false).unwrap();
+        let mut inspector =
+            Owner::acquire(&copy.0, false, "11111111-1111-4111-8111-111111111111").unwrap();
         assert_eq!(
             inspector.inspect(ID, &sha()).unwrap_err(),
             "host_profile_identity_changed"
@@ -576,9 +772,10 @@ mod tests {
     #[test]
     fn absent_torn_legacy_or_live_database_state_never_proves_stopped() {
         let fixture = Fixture::new();
-        assert!(Owner::acquire(&fixture.0, false).is_err());
+        assert!(Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").is_err());
         assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         fs::write(fixture.0.join("legacy-data"), b"retained").unwrap();
         assert_eq!(
             owner
@@ -595,7 +792,8 @@ mod tests {
         fs::create_dir(fixture.0.join("database")).unwrap();
         let pid = fixture.0.join("database/postmaster.pid");
         fs::write(&pid, b"not-a-pid-to-adopt").unwrap();
-        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        let mut inspector =
+            Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").unwrap();
         assert_eq!(
             inspector.inspect(ID, &sha()).unwrap_err(),
             "host_process_state_requires_review"
@@ -603,14 +801,16 @@ mod tests {
         assert_eq!(fs::read(&pid).unwrap(), b"not-a-pid-to-adopt");
         drop(inspector);
         fs::write(fixture.0.join(NAME), b"{").unwrap();
-        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        let mut inspector =
+            Owner::acquire(&fixture.0, false, "11111111-1111-4111-8111-111111111111").unwrap();
         assert!(inspector.inspect(ID, &sha()).is_err());
     }
 
     #[test]
     fn selected_database_survives_start_stop_and_idle_inspection_checks_its_pid() {
         let fixture = Fixture::new();
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
@@ -679,7 +879,8 @@ mod tests {
     #[test]
     fn controller_owner_pins_its_profile_until_the_journal_lease_is_released() {
         let fixture = Fixture::new();
-        let owner = Owner::acquire(&fixture.0, true).unwrap();
+        let owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         let moved = fixture.0.with_extension("moved");
         assert!(fs::rename(&fixture.0, &moved).is_err());
         fs::write(fixture.0.join("sentinel"), b"retained").unwrap();
@@ -695,12 +896,13 @@ mod tests {
         let external = fixture.0.with_extension("external");
         fs::write(&external, b"retained").unwrap();
         std::os::unix::fs::symlink(&external, fixture.0.join(NAME)).unwrap();
-        assert!(Owner::acquire(&fixture.0, true).is_err());
+        assert!(Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").is_err());
         fs::remove_file(fixture.0.join(NAME)).unwrap();
         fs::hard_link(&external, fixture.0.join(NAME)).unwrap();
-        assert!(Owner::acquire(&fixture.0, true).is_err());
+        assert!(Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").is_err());
         fs::remove_file(fixture.0.join(NAME)).unwrap();
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
@@ -716,9 +918,9 @@ mod tests {
     #[test]
     fn idle_shutdown_proof_holds_the_controller_lease_and_refuses_active_or_foreign_state() {
         let f = Fixture::new();
-        let mut owner = Owner::acquire(&f.0, true).unwrap();
+        let mut owner = Owner::acquire(&f.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner.admit_idle(ID, &sha()).unwrap();
-        assert!(Owner::acquire(&f.0, true).is_err());
+        assert!(Owner::acquire(&f.0, true, "11111111-1111-4111-8111-111111111111").is_err());
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
@@ -727,7 +929,7 @@ mod tests {
         owner.admit_idle(ID, &sha()).unwrap();
         assert!(owner.admit_idle("cccccccccccc", &sha()).is_err());
         let g = Fixture::new();
-        let mut other = Owner::acquire(&g.0, true).unwrap();
+        let mut other = Owner::acquire(&g.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         fs::write(g.0.join("unreviewed-data"), b"preserve").unwrap();
         assert!(other.admit_idle(ID, &sha()).is_err());
         assert_eq!(fs::read(g.0.join("unreviewed-data")).unwrap(), b"preserve");
@@ -736,7 +938,8 @@ mod tests {
     fn package_maintenance_requires_empty_or_clean_stopped_state_and_current_root() {
         let fixture = Fixture::new();
         Owner::package_idle(&fixture.0).unwrap();
-        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&fixture.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
@@ -745,7 +948,8 @@ mod tests {
         drop(owner);
         Owner::package_idle(&fixture.0).unwrap();
         let crashed = Fixture::new();
-        let mut owner = Owner::acquire(&crashed.0, true).unwrap();
+        let mut owner =
+            Owner::acquire(&crashed.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
@@ -756,7 +960,8 @@ mod tests {
     fn activation_intent_fences_writers_and_packages_but_keeps_read_only_recovery() {
         for contents in [b"{".as_slice(), b"{}", b""] {
             let f = Fixture::new();
-            let mut owner = Owner::acquire(&f.0, true).unwrap();
+            let mut owner =
+                Owner::acquire(&f.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
             owner
                 .activate(ID, &sha(), crate::host_runtime::HostMode::RestorePrepare)
                 .unwrap();
@@ -767,7 +972,8 @@ mod tests {
                 .is_err());
             drop(owner);
             assert!(Owner::package_idle(&f.0).is_err());
-            let mut owner = Owner::acquire(&f.0, true).unwrap();
+            let mut owner =
+                Owner::acquire(&f.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
             for mode in [
                 crate::host_runtime::HostMode::Database,
                 crate::host_runtime::HostMode::CheckpointCleanup,
@@ -778,7 +984,7 @@ mod tests {
             }
         }
         let f = Fixture::new();
-        let mut owner = Owner::acquire(&f.0, true).unwrap();
+        let mut owner = Owner::acquire(&f.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
             .unwrap();
@@ -790,7 +996,7 @@ mod tests {
     #[test]
     fn pending_selection_marker_alone_fences_writers_and_survives_read_only_maintenance() {
         let f = Fixture::new();
-        let mut owner = Owner::acquire(&f.0, true).unwrap();
+        let mut owner = Owner::acquire(&f.0, true, "11111111-1111-4111-8111-111111111111").unwrap();
         owner
             .activate(ID, &sha(), crate::host_runtime::HostMode::RestorePrepare)
             .unwrap();
@@ -811,5 +1017,58 @@ mod tests {
             .is_err());
         drop(owner);
         assert!(Owner::package_idle(&f.0).is_err());
+    }
+    fn journal_contents(owner: &mut Owner) -> Vec<u8> {
+        owner.file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        owner.file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+    #[test]
+    fn pending_update_fences_all_controller_modes_without_rewriting_the_journal() {
+        for mode in [
+            crate::host_runtime::HostMode::Server,
+            crate::host_runtime::HostMode::Database,
+            crate::host_runtime::HostMode::CheckpointCleanup,
+            crate::host_runtime::HostMode::RestorePrepare,
+        ] {
+            let f = Fixture::new();
+            let mut owner = Owner::acquire(&f.0, true, SECURE_ID).unwrap();
+            owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+                .unwrap();
+            owner.clean_stop().unwrap();
+            let before = journal_contents(&mut owner);
+            fs::write(f.0.join("host-update.json"), b"pending").unwrap();
+            assert!(
+                matches!(owner.activate(ID, &sha(), mode), Err(e) if e == "host_update_pending")
+            );
+            assert!(matches!(owner.inspect(ID, &sha()), Err(e) if e == "host_update_pending"));
+            assert_eq!(journal_contents(&mut owner), before);
+        }
+    }
+    #[test]
+    fn pending_update_fences_live_controller_writes_launch_and_package_maintenance() {
+        let f = Fixture::new();
+        let mut owner = Owner::acquire(&f.0, true, SECURE_ID).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        let before = journal_contents(&mut owner);
+        fs::write(f.0.join("host-update.json"), b"torn").unwrap();
+        assert!(matches!(owner.clean_stop(), Err(e) if e == "host_update_pending"));
+        for mode in [
+            crate::host_runtime::HostMode::Server,
+            crate::host_runtime::HostMode::Database,
+            crate::host_runtime::HostMode::CheckpointCleanup,
+            crate::host_runtime::HostMode::RestorePrepare,
+        ] {
+            assert!(
+                matches!(owner.launch_state(&sha(), mode), Err(e) if e == "host_update_pending")
+            );
+        }
+        drop(owner);
+        assert!(matches!(Owner::package_idle(&f.0), Err(e) if e == "host_update_pending"));
+        assert_eq!(fs::read(f.0.join(NAME)).unwrap(), before);
     }
 }

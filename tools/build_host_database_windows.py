@@ -79,6 +79,18 @@ def stage_dependencies(prefix: Path, dependencies: Path, dumpbin: str, env: dict
         if key in private and sha256(private[key]) != sha256(binary):
             raise BuildError("host_database_dll_collision")
         private[key] = binary
+    if any(name.startswith(("concrt140", "msvcp140", "vccorlib140", "vcruntime140")) for name in private):
+        license_file = ROOT / "runtime/licenses/microsoft-vc-runtime-2015-2022.docx"
+        regular(license_file)
+        if sha256(license_file) != "f1e3d56ceb2ad68aae0711b910375009e651ac5530fa0760f0dea6e81e54fae1":
+            raise BuildError("host_database_vc_license_changed")
+        notice = prefix / "licenses/microsoft-vc-runtime/LICENSE.docx"
+        notice.parent.mkdir(parents=True, exist_ok=True)
+        if notice.exists():
+            regular(notice)
+            if sha256(notice) != sha256(license_file):
+                raise BuildError("host_database_vc_license_changed")
+        shutil.copy2(license_file, notice)
     for binary in binaries:
         imports = re.findall(r"^\s+([\w.+-]+\.dll)\s*$", run(
             [dumpbin, "/nologo", "/dependents", binary], cwd=prefix, env=env

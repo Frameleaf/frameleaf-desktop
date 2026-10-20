@@ -19,7 +19,9 @@
           "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4",
           "f93c34d196955da3e2760c095c08b27ccbf53315"
         ],
-        "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"]
+        "linux-aarch64": [
+          "f93c34d196955da3e2760c095c08b27ccbf53315"
+        ]
       }
     },
     "coreml-ort": {
@@ -27,7 +29,25 @@
       "uv": "0.11.2",
       "extra": "cpu",
       "provider": "CoreMLExecutionProvider",
-      "targets": ["macos-aarch64"],
+      "targets": [
+        "macos-aarch64"
+      ],
+      "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11",
+      "additionalSources": {
+        "macos-aarch64": [
+          "b7b5756a3f9eaeec9e977460ab654cbbadee87e7"
+        ]
+      }
+    },
+    "cuda-ort": {
+      "python": "3.12.13",
+      "uv": "0.11.2",
+      "extra": "cuda",
+      "provider": "CUDAExecutionProvider",
+      "targets": [
+        "windows-x86_64",
+        "linux-x86_64"
+      ],
       "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11"
     }
   }

@@ -1,5 +1,9 @@
 //! Native-only Manager owner. No caller-supplied command, browser credentials or stored PID authority.
-use crate::{host_runtime::VerifiedHostRuntime, manager_tls::TlsIdentity};
+use crate::{
+    host_epochs::{HostEpochAuthority, HostExecution},
+    host_runtime::VerifiedHostRuntime,
+    manager_tls::TlsIdentity,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,6 +20,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(all(test, unix))]
+#[path = "manager_host_unix_tests.rs"]
+mod unix_tests;
 #[cfg(all(test, windows))]
 #[path = "manager_host_windows_tests.rs"]
 mod windows_tests;
@@ -127,6 +134,9 @@ impl Programs<'_> {
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     pub installation_id: String,
+    // Keep historical profile-account hashes stable; the bootstrap serializes UUID explicitly.
+    #[serde(skip)]
+    pub secure_installation_id: String,
     pub name: String,
     pub release: String,
     pub controller: PathBuf,
@@ -187,6 +197,7 @@ pub(crate) fn validate_paths(candidate: &Path, state: &Path, data: &Path) -> Res
 pub(crate) fn validate_configuration(config: &Configuration) -> Result<(), String> {
     let manager_port = local_origin(&config.origin)?;
     if !crate::native_runtime::digest_valid(&config.installation_id, 12)
+        || !crate::host_state::valid_installation_id(&config.secure_installation_id)
         || config.name.trim().is_empty()
         || config.name.len() > 120
         || config.release.len() > 256
@@ -243,9 +254,12 @@ fn ready(bytes: &[u8], id: &str, hash: &str, origin: &str) -> Result<(), String>
     Ok(())
 }
 pub struct NativeManager {
+    pub(crate) secure_installation_id: Option<String>,
     child: Child,
-    #[cfg(windows)]
     tree: crate::process_tree::ProcessTree,
+    shutdown_confirmed: bool,
+    #[cfg(unix)]
+    shutdown_signalled: bool,
     receipt: mpsc::Receiver<Result<Vec<u8>, String>>,
     installation_id: String,
     manifest_sha256: String,
@@ -256,12 +270,15 @@ pub struct NativeManager {
     certificate_pem: String,
     _code_lease: Option<crate::package_lease::CodeLease>,
     _profile_pins: Vec<fs::File>,
+    _profile_guard: Option<crate::manager_profile::ProfileGuard>,
 }
 #[derive(Default)]
-struct Leases {
+struct Leases<'a> {
+    execution: Option<(&'a HostExecution<'a>, &'a VerifiedHostRuntime)>,
     code: Option<crate::package_lease::CodeLease>,
     startup: Option<crate::host_state::Owner>,
     profiles: Vec<fs::File>,
+    profile: Option<crate::manager_profile::ProfileGuard>,
 }
 impl Programs<'_> {
     pub fn start_from_keystore(&self, config: &Configuration) -> Result<NativeManager, String> {
@@ -275,21 +292,38 @@ impl Programs<'_> {
         let candidate = self.root.parent().ok_or("native_manager_layout_invalid")?;
         validate_paths(candidate, &config.state, &config.data)?;
         let _code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
-        let profile = crate::manager_profile::Profile::from_keystore(
+        let mut profile = crate::manager_profile::Profile::from_keystore(
             config,
             candidate,
             self.runtime.manifest_sha256(),
         )?;
         let tls =
             TlsIdentity::from_keystore(&config.installation_id, &config.origin, profile.binding())?;
-        profile.require_current(config)?;
-        let lease = crate::host_state::Owner::acquire(&config.state, true)?;
+        let authority = crate::credentials::CredentialEpochAuthority;
+        authority.activate(&config.secure_installation_id, self.runtime, &mut || {
+            profile.require_current(config)
+        })?;
+        let execution = HostExecution::new(&authority, &config.secure_installation_id)?;
+        let lease = crate::host_state::Owner::acquire(
+            &config.state,
+            true,
+            profile.installation_identity()?,
+        )?;
+        let password = profile.password();
+        let backup_key = profile.backup_key()?;
+        let guard = profile.take_guard()?;
+        drop(profile);
         self.start_owned(
             config,
-            &profile.password(),
-            &profile.backup_key()?,
+            &password,
+            &backup_key,
             &tls,
-            Some(lease),
+            Leases {
+                execution: Some((&execution, self.runtime)),
+                startup: Some(lease),
+                profile: Some(guard),
+                ..Leases::default()
+            },
         )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
@@ -299,8 +333,18 @@ impl Programs<'_> {
         password: &Zeroizing<String>,
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
+        execution: &HostExecution<'_>,
     ) -> Result<NativeManager, String> {
-        self.start_owned(config, password, backup_key, tls, None)
+        self.start_owned(
+            config,
+            password,
+            backup_key,
+            tls,
+            Leases {
+                execution: Some((execution, self.runtime)),
+                ..Leases::default()
+            },
+        )
     }
     fn start_owned(
         &self,
@@ -308,9 +352,13 @@ impl Programs<'_> {
         password: &Zeroizing<String>,
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
-        startup_lease: Option<crate::host_state::Owner>,
+        mut leases: Leases<'_>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
+        let (execution, _) = leases.execution.ok_or("host_epoch_not_admitted")?;
+        if execution.installation_id() != config.secure_installation_id {
+            return Err("host_installation_identity_changed".into());
+        }
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
             return Err("native_backup_key_invalid".into());
         }
@@ -326,6 +374,16 @@ impl Programs<'_> {
         let profile_pins = protect_profile_parents(config)?;
         protect(&config.controller, &mut BTreeSet::new())?;
         let code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
+        if leases.profile.is_none() {
+            leases.profile = Some(crate::manager_profile::ProfileGuard::acquire(config)?);
+        }
+        validate_paths(candidate, &config.state, &config.data)?;
+        crate::manager_profile::check_start(config)?;
+        leases
+            .profile
+            .as_ref()
+            .ok_or("native_profile_unavailable")?
+            .require_current(config)?;
         let controller = crate::runtime_store::read_bounded(&config.controller, 256 * 1024 * 1024)?;
         let controller_hash = format!("{:x}", Sha256::digest(&controller));
         let client = reqwest::Client::builder()
@@ -345,6 +403,7 @@ impl Programs<'_> {
         struct Binding<'a> {
             runtime: &'a str,
             id: &'a str,
+            secure_installation_id: &'a str,
             controller: &'a Path,
             candidate: &'a Path,
             state: &'a Path,
@@ -372,6 +431,7 @@ impl Programs<'_> {
             installation: Binding {
                 runtime: "native",
                 id: &config.installation_id,
+                secure_installation_id: &config.secure_installation_id,
                 controller: &config.controller,
                 candidate,
                 state: &config.state,
@@ -409,6 +469,8 @@ impl Programs<'_> {
             .env("MANAGER_DATA", &config.data);
         #[cfg(windows)]
         command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
+        leases.code = Some(code_lease);
+        leases.profiles = profile_pins;
         let mut manager = NativeManager::spawn(
             &mut command,
             input,
@@ -416,11 +478,7 @@ impl Programs<'_> {
             self.runtime.manifest_sha256(),
             &config.origin,
             client,
-            Leases {
-                code: Some(code_lease),
-                startup: startup_lease,
-                profiles: profile_pins,
-            },
+            leases,
         )?;
         manager.certificate_pem = tls.certificate().into();
         Ok(manager)
@@ -434,20 +492,44 @@ impl NativeManager {
         hash: &str,
         origin: &str,
         client: reqwest::Client,
-        leases: Leases,
+        leases: Leases<'_>,
     ) -> Result<Self, String> {
+        #[cfg(unix)]
+        let mut leases = leases;
         if let Some(lease) = &leases.code {
             lease.inherit(command);
         }
-        #[cfg(windows)]
+        #[cfg(not(test))]
+        if leases.profile.is_none() {
+            return Err("native_profile_unavailable".into());
+        }
+        #[cfg(unix)]
+        if let Some(profile) = &leases.profile {
+            profile.inherit(command);
+        }
         crate::process_tree::configure(command);
-        let child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "native_manager_launch_failed")?;
-        #[cfg(windows)]
+        let launch = || {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| "native_manager_launch_failed".to_string())
+        };
+        let child = match leases.execution {
+            Some((execution, runtime)) => execution.spawn(runtime, launch)?,
+            #[cfg(test)]
+            None => {
+                let mut launch = launch;
+                launch()?
+            }
+            #[cfg(not(test))]
+            None => return Err("host_epoch_not_admitted".into()),
+        };
+        #[cfg(unix)]
+        if let Some(profile) = &mut leases.profile {
+            profile.child_spawned();
+        }
         let (child, tree) = {
             let mut child = child;
             match crate::process_tree::ProcessTree::attach(&child) {
@@ -461,9 +543,16 @@ impl NativeManager {
         };
         let (receipt_tx, receipt) = mpsc::channel();
         let mut owner = Self {
+            secure_installation_id: leases
+                .startup
+                .as_ref()
+                .and_then(|owner| owner.installation_identity())
+                .map(str::to_owned),
             child,
-            #[cfg(windows)]
             tree,
+            shutdown_confirmed: false,
+            #[cfg(unix)]
+            shutdown_signalled: false,
             receipt,
             installation_id: id.into(),
             manifest_sha256: hash.into(),
@@ -474,6 +563,7 @@ impl NativeManager {
             certificate_pem: String::new(),
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
+            _profile_guard: leases.profile,
         };
         let stdout = owner
             .child
@@ -503,12 +593,7 @@ impl NativeManager {
         });
         rx.recv_timeout(Duration::from_secs(5))
             .map_err(|_| "native_manager_bootstrap_timeout")??;
-        if owner
-            .child
-            .try_wait()
-            .map_err(|_| "native_manager_state_unavailable")?
-            .is_some()
-        {
+        if owner.child_exited()? {
             return Err("native_manager_exited".into());
         }
         Ok(owner)
@@ -526,13 +611,7 @@ impl NativeManager {
         let result = self.wait_ready_inner(timeout, cancel).await;
         if result.is_err() {
             self.verified_ready = false;
-            #[cfg(windows)]
-            self.cleanup_windows(Duration::from_secs(5))?;
-            #[cfg(not(windows))]
-            {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
+            self.cleanup_owned(Duration::from_secs(5))?;
         }
         self.startup_lease.take();
         result
@@ -548,12 +627,7 @@ impl NativeManager {
             if cancel.load(Ordering::Acquire) {
                 return Err("native_manager_start_cancelled".into());
             }
-            if self
-                .child
-                .try_wait()
-                .map_err(|_| "native_manager_state_unavailable")?
-                .is_some()
-            {
+            if self.child_exited()? {
                 return Err("native_manager_exited".into());
             }
             match self.receipt.try_recv() {
@@ -590,11 +664,7 @@ impl NativeManager {
         let status: serde_json::Value = crate::transport::json_limit(response, 16 * 1024).await?;
         if !status["claimed"].is_boolean()
             || cancel.load(Ordering::Acquire)
-            || self
-                .child
-                .try_wait()
-                .map_err(|_| "native_manager_state_unavailable")?
-                .is_some()
+            || self.child_exited()?
         {
             return Err("native_manager_https_unverified".into());
         }
@@ -631,67 +701,188 @@ impl NativeManager {
             .as_bool()
             .ok_or_else(|| "native_manager_receipt_invalid".into())
     }
-    pub(crate) async fn claim_local(&mut self, password: &str, proof: &str) -> Result<(), String> {
-        if !self.is_running()? || !crate::native_runtime::digest_valid(proof, 64) {
+    pub(crate) async fn create_administrator(
+        &mut self,
+        config: &Configuration,
+        name: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.encode_utf16().count() > 120
+            || name.chars().any(char::is_control)
+        {
+            return Err("manager_account_details_invalid".into());
+        }
+        crate::host_setup::require_password(password)?;
+        self.management_identity(config)?;
+        if self.claimed().await? {
+            return Err("manager_account_exists".into());
+        }
+        self.management_identity(config)?;
+        #[derive(Serialize)]
+        struct Account<'a> {
+            name: &'a str,
+            password: &'a str,
+        }
+        let response = self
+            .client
+            .post(format!("{}/manager-api/claim", self.origin))
+            .header(reqwest::header::ORIGIN, &self.origin)
+            .json(&Account { name, password })
+            .send()
+            .await
+            .map_err(|_| "native_manager_https_unverified")?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err("manager_account_exists".into());
+        }
+        if !response.status().is_success() {
+            return Err("manager_account_creation_failed".into());
+        }
+        let result: serde_json::Value = crate::transport::json_limit(response, 4096)
+            .await
+            .map_err(|_| "native_manager_receipt_invalid")?;
+        if !result["csrf"]
+            .as_str()
+            .is_some_and(|value| crate::native_runtime::digest_valid(value, 64))
+            || !self.claimed().await?
+        {
+            return Err("native_manager_receipt_invalid".into());
+        }
+        self.management_identity(config)?;
+        Ok(())
+    }
+    pub(crate) async fn stop_idle(
+        &mut self,
+        config: &Configuration,
+        manifest: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        validate_configuration(config)?;
+        if self.installation_id != config.installation_id
+            || self.secure_installation_id.as_deref()
+                != Some(config.secure_installation_id.as_str())
+            || self.manifest_sha256 != manifest
+            || self.origin != config.origin
+        {
             return Err("native_manager_not_ready".into());
         }
-        crate::manager::claim_local(
-            &self.client,
-            &self.origin,
-            "Local administrator",
-            password,
-            proof,
-        )
-        .await
+        self._profile_guard
+            .as_ref()
+            .ok_or("native_profile_recovery_required")?
+            .require_current(config)?;
+        let check = |proof: &mut crate::host_state::Owner, allow_reserved: bool| {
+            if proof.installation_identity() != Some(config.secure_installation_id.as_str()) {
+                return Err("host_installation_identity_changed".into());
+            }
+            match proof.admit_idle(&config.installation_id, manifest) {
+                Ok(()) => Ok(()),
+                // Cleanup of an already stopped or retained owner never clears the update fence.
+                Err(_) if allow_reserved => proof
+                    .review_reserved_update(&config.installation_id, manifest)
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            }
+        };
+        if let Some(proof) = self.startup_lease.as_mut() {
+            check(proof, true)?;
+        } else {
+            let mut proof = crate::host_state::Owner::acquire_update(
+                &config.state,
+                &config.secure_installation_id,
+            )?;
+            check(&mut proof, self.shutdown_confirmed)?;
+            self.startup_lease = Some(proof);
+        }
+        self.shutdown(timeout).await?;
+        self.startup_lease.take();
+        Ok(())
+    }
+    /// Retain the Manager profile and controller exclusions through the durable update fence.
+    pub async fn reserve_update(
+        &mut self,
+        source: &VerifiedHostRuntime,
+        target: &VerifiedHostRuntime,
+        config: &Configuration,
+        execution: &HostExecution<'_>,
+    ) -> Result<crate::host_runtime::HostUpdateReservation, String> {
+        validate_configuration(config)?;
+        if self.installation_id != config.installation_id
+            || self.secure_installation_id.as_deref()
+                != Some(config.secure_installation_id.as_str())
+            || self.manifest_sha256 != source.manifest_sha256()
+            || self.origin != config.origin
+            || self._code_lease.is_none()
+            || self.startup_lease.is_some()
+            || !self.is_running()?
+        {
+            return Err("native_manager_not_ready".into());
+        }
+        self._profile_guard
+            .as_ref()
+            .ok_or("native_profile_recovery_required")?
+            .require_current(config)?;
+        // Refuse unsupported targets or active database owners before stopping the live Manager.
+        source.update_candidate_paths(target, config)?;
+        source.review_update(target, &config.state, &config.installation_id, execution)?;
+        let mut owner =
+            crate::host_state::Owner::acquire_update(&config.state, execution.installation_id())?;
+        owner.admit_idle(&config.installation_id, source.manifest_sha256())?;
+        // Keep this in the owner before awaiting: cancellation must retain controller exclusion too.
+        self.startup_lease = Some(owner);
+        self.shutdown(Duration::from_secs(10)).await?;
+        let result = source.reserve_update_held(
+            target,
+            config,
+            execution,
+            self._profile_guard
+                .as_ref()
+                .ok_or("native_profile_recovery_required")?,
+            self.startup_lease
+                .as_mut()
+                .ok_or("native_manager_not_ready")?,
+        );
+        if result.is_ok() {
+            self.startup_lease.take();
+        }
+        result
     }
     pub(crate) fn has_exited(&mut self) -> Result<bool, String> {
-        self.child
-            .try_wait()
-            .map(|value| value.is_some())
-            .map_err(|_| "native_manager_state_unavailable".into())
+        if self.shutdown_confirmed {
+            return Ok(true);
+        }
+        let exited = self.child_exited()?;
+        if exited {
+            self.cleanup_owned(Duration::from_secs(5))?;
+        }
+        Ok(exited)
     }
     pub fn is_running(&mut self) -> Result<bool, String> {
-        Ok(self.verified_ready
-            && self
-                .child
-                .try_wait()
-                .map_err(|_| "native_manager_state_unavailable")?
-                .is_none())
+        Ok(self.verified_ready && !self.has_exited()?)
     }
     /// Database quiescence requires separate journal/lease proof before stopping the Manager.
     pub async fn shutdown(&mut self, timeout: Duration) -> Result<(), String> {
         self.verified_ready = false;
+        if self.shutdown_confirmed {
+            return Ok(());
+        }
         #[cfg(windows)]
         {
-            self.cleanup_windows(timeout)
+            self.cleanup_owned(timeout)
         }
         #[cfg(not(windows))]
         {
-            if self
-                .child
-                .try_wait()
-                .map_err(|_| "native_manager_state_unavailable")?
-                .is_some()
-            {
+            if self.has_exited()? {
                 return Ok(());
             }
             #[cfg(unix)]
             if unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) } != 0 {
                 return Err("native_manager_shutdown_unconfirmed".into());
             }
-            #[cfg(not(unix))]
-            self.child
-                .kill()
-                .map_err(|_| "native_manager_shutdown_unconfirmed")?;
             let deadline = Instant::now() + timeout;
             loop {
-                if self
-                    .child
-                    .try_wait()
-                    .map_err(|_| "native_manager_state_unavailable")?
-                    .is_some()
-                {
-                    return Ok(());
+                if self.child_exited()? {
+                    return self.cleanup_owned(timeout);
                 }
                 if Instant::now() >= deadline {
                     return Err("native_manager_shutdown_unconfirmed".into());
@@ -699,6 +890,54 @@ impl NativeManager {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+    fn child_exited(&mut self) -> Result<bool, String> {
+        #[cfg(windows)]
+        return self
+            .child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|_| "native_manager_state_unavailable".into());
+        #[cfg(unix)]
+        {
+            if self.shutdown_confirmed {
+                return Ok(true);
+            }
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id(),
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    return Ok(false);
+                }
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.shutdown_signalled = true;
+                }
+                return Err("native_manager_state_unavailable".into());
+            }
+            // Keep the leader unreaped until the owned group has received its final signal.
+            Ok(unsafe { info.assume_init().si_pid() } != 0)
+        }
+    }
+    fn cleanup_owned(&mut self, timeout: Duration) -> Result<(), String> {
+        if self.shutdown_confirmed {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        self.cleanup_windows(timeout)?;
+        #[cfg(unix)]
+        self.tree
+            .terminate_child_confirmed(&mut self.child, &mut self.shutdown_signalled, timeout)
+            .map_err(|_| "native_manager_shutdown_unconfirmed")?;
+        self.shutdown_confirmed = true;
+        Ok(())
     }
     #[cfg(windows)]
     fn cleanup_windows(&mut self, timeout: Duration) -> Result<(), String> {
@@ -713,20 +952,14 @@ impl NativeManager {
 }
 impl Drop for NativeManager {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        {
-            if self.cleanup_windows(Duration::from_secs(5)).is_err() {
-                // Retain maintenance/startup exclusion until process exit if cleanup is unproven.
-                std::mem::forget(self._code_lease.take());
-                std::mem::forget(self.startup_lease.take());
-                std::mem::forget(std::mem::take(&mut self._profile_pins));
-                let _ = self.child.kill();
-            }
-        }
-        #[cfg(not(windows))]
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+        if self.cleanup_owned(Duration::from_secs(5)).is_err() {
+            // Unproven descendant shutdown must retain every exclusion until this supervisor exits.
+            std::mem::forget(self._code_lease.take());
+            std::mem::forget(self.startup_lease.take());
+            std::mem::forget(self._profile_guard.take());
+            std::mem::forget(std::mem::take(&mut self._profile_pins));
+            #[cfg(windows)]
             let _ = self.child.kill();
-            let _ = self.child.wait();
         }
     }
 }
@@ -834,6 +1067,38 @@ mod tests {
         assert!(refused);
     }
     #[cfg(unix)]
+    #[test]
+    fn session_identity_survives_startup_lease_release_without_credential_access() {
+        let identity = "11111111-1111-4111-8111-111111111111";
+        let state = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "frameleaf-manager-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let startup = crate::host_state::Owner::acquire(&state, true, identity).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut manager = NativeManager::spawn(
+            &mut command,
+            Zeroizing::new(b"synthetic-private-input\n".to_vec()),
+            "aaaaaaaaaaaa",
+            &"b".repeat(64),
+            "https://127.0.0.1:9443",
+            reqwest::Client::new(),
+            Leases {
+                startup: Some(startup),
+                ..Leases::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(manager.secure_installation_id.as_deref(), Some(identity));
+        manager.startup_lease.take();
+        assert_eq!(manager.secure_installation_id.as_deref(), Some(identity));
+        drop(crate::host_state::Owner::acquire(&state, true, identity).unwrap());
+        drop(manager);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_timeout_and_bad_receipt_reap_only_the_owned_child() {
         for mode in ["cancel", "timeout", "bad-receipt"] {
@@ -861,8 +1126,20 @@ mod tests {
                 .canonicalize()
                 .unwrap()
                 .join(format!("frameleaf-startup-lease-{}", uuid::Uuid::new_v4()));
-            owner.startup_lease = Some(crate::host_state::Owner::acquire(&state, true).unwrap());
-            assert!(crate::host_state::Owner::acquire(&state, true).is_err());
+            owner.startup_lease = Some(
+                crate::host_state::Owner::acquire(
+                    &state,
+                    true,
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .unwrap(),
+            );
+            assert!(crate::host_state::Owner::acquire(
+                &state,
+                true,
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .is_err());
             assert!(!owner.is_running().unwrap());
             let result = owner
                 .wait_ready(
@@ -880,30 +1157,336 @@ mod tests {
             );
             assert!(owner.child.try_wait().unwrap().is_some());
             assert!(owner.startup_lease.is_none());
-            drop(crate::host_state::Owner::acquire(&state, true).unwrap());
+            drop(
+                crate::host_state::Owner::acquire(
+                    &state,
+                    true,
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .unwrap(),
+            );
             fs::remove_dir_all(state).unwrap();
         }
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn local_authorization_without_an_administrator_never_creates_an_account_or_grant() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("status request unavailable: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut bytes = [0; 4096];
+            let length = stream.read(&mut bytes).unwrap();
+            let request = String::from_utf8(bytes[..length].to_vec()).unwrap();
+            let body = r#"{"claimed":false}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            request
+        });
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = NativeManager::spawn(
+            &mut command,
+            Zeroizing::new(b"synthetic input\n".to_vec()),
+            "aaaaaaaaaaaa",
+            &"b".repeat(64),
+            &origin,
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap(),
+            Leases::default(),
+        )
+        .unwrap();
+        owner.verified_ready = true;
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+        owner.certificate_pem = wire["certificatePem"].as_str().unwrap().into();
+        let root = std::env::temp_dir().join(format!(
+            "frameleaf-existing-account-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let configuration = Configuration {
+            installation_id: "aaaaaaaaaaaa".into(),
+            secure_installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            name: "Synthetic existing account".into(),
+            release: "frameleaf-v3.0.0-1".into(),
+            controller: fs::canonicalize("/bin/echo").unwrap(),
+            state: root.join("state"),
+            data: root.join("data"),
+            origin,
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let persisted = std::cell::Cell::new(false);
+        let result = crate::host_setup::authorize_owner(
+            &mut owner,
+            &configuration,
+            &crate::connection::DeviceIdentity::generate(),
+            Zeroizing::new("synthetic existing password".into()),
+            false,
+            false,
+            None,
+            |_| {
+                persisted.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.err().unwrap(), "manager_initialization_required");
+        assert!(!persisted.get());
+        assert!(server
+            .join()
+            .unwrap()
+            .starts_with("GET /manager-api/status HTTP/1.1\r\n"));
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    fn account_owner(origin: &str) -> (NativeManager, Configuration) {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = NativeManager::spawn(
+            &mut command,
+            Zeroizing::new(b"synthetic input\n".to_vec()),
+            "aaaaaaaaaaaa",
+            &"b".repeat(64),
+            origin,
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap(),
+            Leases::default(),
+        )
+        .unwrap();
+        owner.verified_ready = true;
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+        owner.certificate_pem = wire["certificatePem"].as_str().unwrap().into();
+        let root = std::env::temp_dir().join(format!("frameleaf-account-{}", uuid::Uuid::new_v4()));
+        let config = Configuration {
+            installation_id: "aaaaaaaaaaaa".into(),
+            secure_installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            name: "Synthetic owner".into(),
+            release: "frameleaf-v3.0.0-1".into(),
+            controller: fs::canonicalize("/bin/echo").unwrap(),
+            state: root.join("state"),
+            data: root.join("data"),
+            origin: origin.into(),
+            database_port: 54329,
+            api_port: 2283,
+        };
+        (owner, config)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn password_account_creation_uses_only_explicit_credentials_and_never_overwrites_an_account(
+    ) {
+        for (case, responses, expected) in [
+            (
+                "created",
+                vec![
+                    (200, r#"{"claimed":false}"#.to_string()),
+                    (201, format!(r#"{{"csrf":"{}"}}"#, "a".repeat(64))),
+                    (200, r#"{"claimed":true}"#.to_string()),
+                ],
+                None,
+            ),
+            (
+                "exists",
+                vec![(200, r#"{"claimed":true}"#.to_string())],
+                Some("manager_account_exists"),
+            ),
+            (
+                "raced",
+                vec![
+                    (200, r#"{"claimed":false}"#.to_string()),
+                    (409, r#"{"code":"already_claimed"}"#.to_string()),
+                ],
+                Some("manager_account_exists"),
+            ),
+            (
+                "legacy-refused",
+                vec![
+                    (200, r#"{"claimed":false}"#.to_string()),
+                    (400, r#"{"code":"invalid_request"}"#.to_string()),
+                ],
+                Some("manager_account_creation_failed"),
+            ),
+            (
+                "malformed-success",
+                vec![
+                    (200, r#"{"claimed":false}"#.to_string()),
+                    (201, r#"{"csrf":"wrong"}"#.to_string()),
+                ],
+                Some("native_manager_receipt_invalid"),
+            ),
+            (
+                "not-created",
+                vec![
+                    (200, r#"{"claimed":false}"#.to_string()),
+                    (201, format!(r#"{{"csrf":"{}"}}"#, "a".repeat(64))),
+                    (200, r#"{"claimed":false}"#.to_string()),
+                ],
+                Some("native_manager_receipt_invalid"),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for (status, body) in responses {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(error) => panic!("account request missing: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut header = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length: ")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                        header.push_str(&line);
+                        assert!(header.len() < 8192);
+                    }
+                    assert!(length < 4096);
+                    let mut payload = vec![0; length];
+                    reader.read_exact(&mut payload).unwrap();
+                    write!(reader.get_mut(), "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    requests.push((header, payload));
+                }
+                requests
+            });
+            let (mut owner, config) = account_owner(&origin);
+            let result = owner
+                .create_administrator(&config, "  Test owner  ", "synthetic new password")
+                .await;
+            assert_eq!(result.err().as_deref(), expected, "{case}");
+            let requests = server.join().unwrap();
+            assert!(requests[0]
+                .0
+                .starts_with("GET /manager-api/status HTTP/1.1\r\n"));
+            if requests.len() > 1 {
+                assert!(requests[1]
+                    .0
+                    .starts_with("POST /manager-api/claim HTTP/1.1\r\n"));
+                assert!(requests[1]
+                    .0
+                    .to_ascii_lowercase()
+                    .contains(&format!("origin: {origin}\r\n")));
+                let payload: serde_json::Value = serde_json::from_slice(&requests[1].1).unwrap();
+                assert_eq!(
+                    payload,
+                    serde_json::json!({"name":"Test owner","password":"synthetic new password"})
+                );
+            }
+            assert!(!config.data.exists());
+            owner.shutdown(Duration::from_secs(1)).await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn password_account_creation_validates_details_and_owned_identity_before_network() {
+        let (mut owner, mut config) = account_owner("http://127.0.0.1:1");
+        for name in ["", "   ", "bad\nname", &"a".repeat(121), &"🌱".repeat(61)] {
+            assert_eq!(
+                owner
+                    .create_administrator(&config, name, "synthetic new password")
+                    .await
+                    .err()
+                    .as_deref(),
+                Some("manager_account_details_invalid")
+            );
+        }
+        assert_eq!(
+            owner
+                .create_administrator(&config, "Owner", "short")
+                .await
+                .err()
+                .as_deref(),
+            Some("manager_login_details_invalid")
+        );
+        config.installation_id = "cccccccccccc".into();
+        assert_eq!(
+            owner
+                .create_administrator(&config, "Owner", "synthetic new password")
+                .await
+                .err()
+                .as_deref(),
+            Some("native_manager_not_ready")
+        );
+        owner.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     #[ignore = "requires compiled Manager/private Node and new owned fixture directory; no installed authority or keychain claim"]
     async fn compiled_manager_runs_through_the_private_supervisor_owner() {
-        compiled_manager_owner(false, false).await;
+        compiled_manager_owner(false, false, false).await;
     }
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires compiled Manager/private Node and new owned fixture directory; no installed authority or keychain claim"]
     async fn compiled_manager_revokes_stale_device_grant() {
-        compiled_manager_owner(true, false).await;
+        compiled_manager_owner(true, false, false).await;
     }
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires compiled Manager/private Node and new owned fixture directory; no installed authority or keychain claim"]
     async fn compiled_manager_restore_review_is_scoped_and_refuses_unverified_execution() {
-        compiled_manager_owner(false, true).await;
+        compiled_manager_owner(false, true, false).await;
     }
     #[cfg(unix)]
-    async fn compiled_manager_owner(revoke_only: bool, recovery: bool) {
+    #[tokio::test]
+    #[ignore = "requires compiled code-free Manager/private Node and new isolated fixture directory"]
+    async fn compiled_manager_creates_password_only_account_then_pairs_and_retries_persistence() {
+        compiled_manager_owner(false, false, true).await;
+    }
+    #[cfg(unix)]
+    async fn compiled_manager_owner(revoke_only: bool, recovery: bool, create_account: bool) {
         let node = PathBuf::from(std::env::var("FRAMELEAF_TEST_NODE").unwrap());
         let manager = PathBuf::from(std::env::var("FRAMELEAF_TEST_MANAGER").unwrap());
         let output = PathBuf::from(std::env::var("FRAMELEAF_TEST_OUTPUT").unwrap());
@@ -919,6 +1502,33 @@ mod tests {
         fs::create_dir(&output).unwrap();
         let data = output.join("data");
         crate::runtime_store::private_directory(&data).unwrap();
+        let unicode_password = "🌱".repeat(128);
+        let password = if create_account {
+            unicode_password.as_str()
+        } else {
+            "synthetic local Manager password"
+        };
+        if !create_account {
+            // The isolated fixture starts with an existing administrator, like a configured server.
+            assert!(Command::new(&node)
+            .args(["--input-type=module", "-e", r#"
+              import {pathToFileURL} from 'node:url';
+              import {scryptSync} from 'node:crypto';
+              const {Store}=await import(pathToFileURL(process.argv[1]).href);
+              const store=new Store(process.argv[2]);
+              const salt='synthetic-fixture-salt';
+              if(!store.createOnce('administrator',{name:'Synthetic owner',salt,hash:scryptSync(process.argv[3],salt,64).toString('hex')}))process.exit(2);
+              store.db.close();
+            "#])
+            .arg(manager.join("build/store.js"))
+            .arg(&data)
+            .arg(password)
+            .env_clear()
+            .env("PATH", "")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status().unwrap().success());
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!(
             "https://127.0.0.1:{}",
@@ -930,7 +1540,7 @@ mod tests {
             TlsIdentity::load_or_create("aaaaaaaaaaaa", origin, || Ok(None), |_| Ok(())).unwrap();
         let controller = fs::canonicalize("/bin/echo").unwrap();
         let mut input=Zeroizing::new(serde_json::to_vec(&serde_json::json!({
-          "protocolVersion":2,"backupKey":"k".repeat(43),"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
+          "protocolVersion":2,"backupKey":"k".repeat(43),"installation":{"runtime":"native","id":"aaaaaaaaaaaa","secureInstallationId":"11111111-1111-4111-8111-111111111111","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
           "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"backupEngine":{"executable":controller,"sha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap()))},"name":"Synthetic owner fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":tls.wire()
         })).unwrap());
         input.push(b'\n');
@@ -964,15 +1574,26 @@ mod tests {
         )
         .unwrap();
         let state = output.join("state");
-        owner.startup_lease = Some(crate::host_state::Owner::acquire(&state, true).unwrap());
-        assert!(crate::host_state::Owner::acquire(&state, true).is_err());
+        owner.startup_lease = Some(
+            crate::host_state::Owner::acquire(&state, true, "11111111-1111-4111-8111-111111111111")
+                .unwrap(),
+        );
+        assert!(crate::host_state::Owner::acquire(
+            &state,
+            true,
+            "11111111-1111-4111-8111-111111111111"
+        )
+        .is_err());
         owner
             .wait_ready(Duration::from_secs(10), &AtomicBool::new(false))
             .await
             .unwrap();
         assert!(owner.is_running().unwrap());
         assert!(owner.startup_lease.is_none());
-        drop(crate::host_state::Owner::acquire(&state, true).unwrap());
+        drop(
+            crate::host_state::Owner::acquire(&state, true, "11111111-1111-4111-8111-111111111111")
+                .unwrap(),
+        );
         owner
             .wait_ready(Duration::from_secs(1), &AtomicBool::new(false))
             .await
@@ -980,6 +1601,7 @@ mod tests {
         owner.certificate_pem = tls.certificate().into();
         let configuration = Configuration {
             installation_id: "aaaaaaaaaaaa".into(),
+            secure_installation_id: "11111111-1111-4111-8111-111111111111".into(),
             name: "Synthetic owner fixture".into(),
             release: "frameleaf-v3.0.0-1".into(),
             controller: fs::canonicalize("/bin/echo").unwrap(),
@@ -989,14 +1611,30 @@ mod tests {
             database_port: 54329,
             api_port: 2283,
         };
+        if create_account {
+            assert!(!owner.claimed().await.unwrap());
+            owner
+                .create_administrator(&configuration, "Synthetic owner", password)
+                .await
+                .unwrap();
+            assert!(owner.claimed().await.unwrap());
+            assert_eq!(
+                owner
+                    .create_administrator(&configuration, "Replacement", password)
+                    .await
+                    .err()
+                    .as_deref(),
+                Some("manager_account_exists")
+            );
+        }
         let identity = crate::connection::DeviceIdentity::generate();
-        let password = "synthetic local Manager password";
         if !revoke_only {
             let interrupted = crate::host_setup::authorize_owner(
                 &mut owner,
                 &configuration,
                 &identity,
                 Zeroizing::new(password.into()),
+                false,
                 false,
                 None,
                 |_| Err("credential_store_locked_or_unavailable".into()),
@@ -1007,8 +1645,7 @@ mod tests {
                 "credential_store_locked_or_unavailable"
             );
             assert!(owner.claimed().await.unwrap());
-            // Retry after a committed claim must not read or replace the original proof/password.
-            fs::remove_file(data.join("claim-key")).unwrap();
+            // A persistence retry authenticates the existing account without replacing it.
         }
         let saved = std::cell::RefCell::new(None::<crate::manager::SavedManager>);
         let paired = crate::host_setup::authorize_owner(
@@ -1017,6 +1654,7 @@ mod tests {
             &identity,
             Zeroizing::new(password.into()),
             recovery,
+            false,
             None,
             |record| {
                 let encoded = Zeroizing::new(serde_json::to_string(record).unwrap());
@@ -1127,11 +1765,25 @@ mod tests {
             assert!(!owner.is_running().unwrap());
             return;
         }
+        let existing = serde_json::from_str(&encoded).unwrap();
+        let refused = crate::host_setup::authorize_owner(
+            &mut owner,
+            &configuration,
+            &identity,
+            Zeroizing::new(password.into()),
+            false,
+            true,
+            Some(existing),
+            |_| panic!("update permission must not replace an existing grant"),
+        )
+        .await;
+        assert_eq!(refused.err().unwrap(), "manager_update_approval_required");
         let again = crate::host_setup::authorize_owner(
             &mut owner,
             &configuration,
             &identity,
             Zeroizing::new(password.into()),
+            false,
             false,
             Some(stored),
             |_| panic!("existing grant must not be replaced"),
@@ -1176,6 +1828,7 @@ mod tests {
                 &configuration,
                 &identity,
                 Zeroizing::new(password.into()),
+                false,
                 false,
                 Some(existing),
                 |_| panic!("must preserve existing pairing"),
@@ -1223,6 +1876,7 @@ mod tests {
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let mut config = Configuration {
             installation_id: "a".repeat(12),
+            secure_installation_id: "11111111-1111-4111-8111-111111111111".into(),
             name: "Synthetic".into(),
             release: "frameleaf-v3.0.0-1".into(),
             controller: std::path::PathBuf::from("/bin/echo"),
@@ -1239,3 +1893,15 @@ mod tests {
         protect_profile_parents(&config).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "manager_admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(all(test, unix))]
+#[path = "manager_session_tests.rs"]
+mod session_tests;
+
+#[cfg(all(test, unix))]
+#[path = "manager_update_tests.rs"]
+mod update_tests;

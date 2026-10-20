@@ -23,6 +23,7 @@ struct BoundClient {
     model_key: String,
     entries: Value,
     kind: String,
+    startup_timeout: Duration,
 }
 fn execution_duration(task: &ClaimedTask) -> Result<Duration, String> {
     let parse = |value: &str| -> Result<i128, String> {
@@ -52,6 +53,13 @@ impl BoundClient {
             .as_str()
             .filter(|s| matches!(*s, "text" | "image"))
             .ok_or("worker_model_binding_invalid")?;
+        let startup_seconds = match spec.get("deadlineSeconds") {
+            None => 120,
+            Some(value) => value
+                .as_u64()
+                .filter(|seconds| (1..=600).contains(seconds))
+                .ok_or("worker_model_binding_invalid")?,
+        };
         Ok(Self {
             client: Client::builder()
                 .no_proxy()
@@ -65,6 +73,7 @@ impl BoundClient {
             model_key: model_key.into(),
             entries: spec["entries"].clone(),
             kind: kind.into(),
+            startup_timeout: Duration::from_secs(startup_seconds),
         })
     }
     async fn health(&self) -> Result<bool, String> {
@@ -185,6 +194,7 @@ async fn race_prediction<T>(
 pub struct NativePredictor {
     child: NativeSidecar,
     roles: Vec<BoundRole>,
+    prepared: bool,
 }
 struct BoundRole {
     client: BoundClient,
@@ -283,12 +293,48 @@ impl NativePredictor {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self { child, roles })
+        Ok(Self {
+            child,
+            roles,
+            prepared: false,
+        })
     }
     pub fn stop(&mut self) -> Result<(), String> {
         self.child.stop()
     }
-    async fn ready(&mut self, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
+    pub(crate) async fn prepare(
+        &mut self,
+        transport: &WorkerTransport,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        if self.prepared {
+            return Ok(());
+        }
+        let mut active = ActiveExecution {
+            predictor: self,
+            retain: false,
+        };
+        let outcome = active.predictor.ready(transport, cancel).await;
+        if outcome.is_err() {
+            active.predictor.stop()?;
+        }
+        active.retain = true;
+        outcome
+    }
+    async fn ready(
+        &mut self,
+        transport: &WorkerTransport,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        let timeout = Duration::from_secs(15)
+            + if self.prepared {
+                Duration::ZERO
+            } else {
+                self.roles
+                    .iter()
+                    .map(|role| role.client.startup_timeout)
+                    .sum()
+            };
         let wait = async {
             loop {
                 if !self.child.is_running()? {
@@ -300,13 +346,15 @@ impl NativePredictor {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        race_prediction(
-            wait,
-            std::future::pending(),
-            cancel,
-            Duration::from_secs(15),
-        )
-        .await
+        let maintain = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                transport.maintain_session().await?;
+            }
+        };
+        race_prediction(wait, maintain, cancel, timeout).await?;
+        self.prepared = true;
+        Ok(())
     }
     /// Execute one admitted job; empty NAS model grants cannot claim work.
     pub async fn execute_next(
@@ -353,7 +401,7 @@ impl NativePredictor {
         {
             return Err("worker_predictor_qualification_changed".into());
         }
-        self.ready(cancel).await?;
+        self.ready(transport, cancel).await?;
         let task = race_prediction(
             transport.claim_many(qualifications),
             std::future::pending(),
@@ -556,6 +604,14 @@ mod tests {
 
     fn client(port: u16) -> BoundClient {
         BoundClient::new(port, "a".repeat(64), &json!({"modelKey":"fixture-key","entries":{"clip":{"textual":{"modelName":"fixture"}}},"fixtureKind":"text"})).unwrap()
+    }
+
+    #[test]
+    fn startup_deadlines_must_bound_model_preloading() {
+        for deadline in [json!(0), json!(601), json!("120"), Value::Null] {
+            let spec = json!({"modelKey":"fixture-key","entries":{"clip":{}},"fixtureKind":"text","deadlineSeconds":deadline});
+            assert!(BoundClient::new(19999, "a".repeat(64), &spec).is_err());
+        }
     }
     fn read_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
         socket
@@ -818,6 +874,7 @@ mod tests {
             .unwrap();
         let mut predictor = NativePredictor {
             child,
+            prepared: false,
             roles: vec![BoundRole {
                 client: client(19998),
                 qualification_id: "fixture".into(),

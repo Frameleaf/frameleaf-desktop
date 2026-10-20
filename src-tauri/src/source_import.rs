@@ -20,6 +20,8 @@ struct Manifest {
     scope: String,
     files: Vec<SourceFile>,
     total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     skipped: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     availability: Option<crate::source_metadata::AvailabilitySummary>,
@@ -45,6 +47,8 @@ struct Cursor {
     manifest_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upload_budget: Option<UploadBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    export_budget: Option<UploadBudget>,
     position: usize,
     active: Option<Active>,
     state: String,
@@ -64,17 +68,52 @@ impl Cursor {
     fn new(manifest: &Manifest) -> Result<Self, String> {
         Ok(Self {
             manifest_hash: digest(manifest)?,
-            upload_budget: Some(UploadBudget {
+            export_budget: manifest.provider.as_ref().map(|_| UploadBudget {
                 used: 0,
-                limit: manifest
-                    .total_bytes
-                    .checked_mul(2)
-                    .ok_or("source_copy_budget_exceeded")?,
+                limit: manifest.total_bytes,
             }),
+            upload_budget: if manifest.provider.is_some() {
+                None
+            } else {
+                Some(UploadBudget {
+                    used: 0,
+                    limit: manifest
+                        .total_bytes
+                        .checked_mul(2)
+                        .ok_or("source_copy_budget_exceeded")?,
+                })
+            },
             position: 0,
             active: None,
             state: "ready".into(),
         })
+    }
+    fn reserve_export(&mut self, bytes: u64) -> Result<(), String> {
+        let budget = self
+            .export_budget
+            .as_mut()
+            .ok_or("photos_export_budget_required")?;
+        budget.used = budget
+            .used
+            .checked_add(bytes)
+            .filter(|n| *n <= budget.limit)
+            .ok_or("photos_export_budget_exhausted")?;
+        Ok(())
+    }
+    fn approve_export(&mut self, manifest: &Manifest) -> Result<(), String> {
+        if manifest.provider.is_none() || matches!(self.state.as_str(), "complete" | "cancelled") {
+            return Err("source_run_terminal".into());
+        }
+        let additional = view(manifest, self, "paused", None).additional_export_allowance;
+        let old = self.export_budget.as_ref();
+        let used = old.map_or(0, |b| b.used);
+        let limit = old
+            .map_or(0, |b| b.limit)
+            .checked_add(additional)
+            .ok_or("photos_export_budget_exhausted")?;
+        self.export_budget = Some(UploadBudget { used, limit });
+        self.state = "paused".into();
+        Ok(())
     }
     fn approve_upload(&mut self, manifest: &Manifest) -> Result<(), String> {
         if matches!(self.state.as_str(), "complete" | "cancelled") {
@@ -94,9 +133,13 @@ impl Cursor {
     }
     fn validate(&self, manifest: &Manifest) -> Result<(), String> {
         if self
-            .upload_budget
+            .export_budget
             .as_ref()
             .is_some_and(|budget| budget.used > budget.limit)
+            || self
+                .upload_budget
+                .as_ref()
+                .is_some_and(|budget| budget.used > budget.limit)
             || self.manifest_hash != digest(manifest)?
             || self.position > manifest.files.len()
             || !matches!(
@@ -228,6 +271,10 @@ pub struct ImportView {
     pub total: usize,
     pub completed: usize,
     pub logical_bytes: u64,
+    pub staged_bytes: Option<u64>,
+    pub export_remaining: Option<u64>,
+    pub additional_export_allowance: u64,
+    pub provider: Option<String>,
     pub upload_remaining: Option<u64>,
     pub additional_upload_allowance: u64,
     pub skipped: u64,
@@ -241,15 +288,34 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
         total: manifest.files.len(),
         completed: cursor.position,
         logical_bytes: manifest.total_bytes,
+        staged_bytes: cursor
+            .active
+            .as_ref()
+            .and_then(|a| a.copy.as_ref())
+            .map(|c| c.bytes),
+        export_remaining: cursor.export_budget.as_ref().map(|b| b.limit - b.used),
+        additional_export_allowance: manifest.files[cursor.position..]
+            .iter()
+            .map(|f| f.bytes)
+            .sum(),
+        provider: manifest.provider.clone(),
         upload_remaining: cursor
             .upload_budget
             .as_ref()
             .map(|budget| budget.limit - budget.used),
-        additional_upload_allowance: manifest.files[cursor.position..]
-            .iter()
-            .map(|file| file.bytes)
-            .sum::<u64>()
-            .saturating_mul(2),
+        additional_upload_allowance: if manifest.provider.is_some() {
+            cursor
+                .active
+                .as_ref()
+                .and_then(|a| a.copy.as_ref())
+                .map_or(0, |c| c.bytes.saturating_mul(2))
+        } else {
+            manifest.files[cursor.position..]
+                .iter()
+                .map(|f| f.bytes)
+                .sum::<u64>()
+                .saturating_mul(2)
+        },
         skipped: manifest.skipped,
         availability: manifest.availability.clone(),
         code,
@@ -277,7 +343,7 @@ fn manifest_for(
     if base.starts_with(approval.root()) || approval.root().starts_with(base) {
         return Err("source_staging_overlap".into());
     }
-    let scan = crate::photo_sources::scan(approval.root(), 10_000)?;
+    let scan = approval.files()?;
     if scan.inventory.truncated {
         return Err("source_inventory_partial".into());
     }
@@ -301,10 +367,19 @@ fn manifest_for(
         id: uuid::Uuid::new_v4().to_string(),
         source_id: consent.source_id().into(),
         scope: approval.fingerprint(),
+        provider: if approval.is_photos() {
+            Some(approval.kind().into())
+        } else {
+            None
+        },
         files: scan.files,
         total_bytes,
         skipped: scan.inventory.skipped,
-        availability: Some(scan.inventory.availability),
+        availability: if approval.is_photos() {
+            None
+        } else {
+            Some(scan.inventory.availability)
+        },
     })
 }
 fn load(
@@ -317,6 +392,8 @@ fn load(
     if !uuid(&manifest.id)
         || manifest.source_id != consent.source_id()
         || manifest.scope != consent.approval(saved, identity)?.fingerprint()
+        || manifest.provider.as_deref().unwrap_or("folder")
+            != consent.approval(saved, identity)?.kind()
     {
         return Err("source_journal_invalid".into());
     }
@@ -332,6 +409,7 @@ fn load(
             }
             let mut cursor = Cursor::new(&manifest)?;
             cursor.upload_budget = None;
+            cursor.export_budget = None;
             journal.write("cursor.json", &cursor, identity)?;
             cursor
         }
@@ -534,19 +612,32 @@ async fn execute(
                 journal.write("cursor.json", &cursor, identity)?;
             }
             if cursor.active.as_ref().unwrap().copy.is_none() {
-                let id = &cursor.active.as_ref().unwrap().stage_id;
                 let stage = journal.root.join("stage");
-                let copy = if stage.join(id).join("receipt.json").exists() {
-                    StagedCopy::restore(saved, identity, &stage, id)?
+                if manifest.provider.is_some() {
+                    let id = &cursor.active.as_ref().unwrap().stage_id;
+                    if stage.join(id).exists() && !stage.join(id).join("receipt.json").exists() {
+                        // Retain interrupted original bytes; retry into a fresh, independently accounted attempt.
+                        cursor.active.as_mut().unwrap().stage_id = uuid::Uuid::new_v4().to_string();
+                        journal.write("cursor.json", &cursor, identity)?;
+                    }
+                }
+                let id = cursor.active.as_ref().unwrap().stage_id.clone();
+                let copy = if stage.join(&id).join("receipt.json").exists() {
+                    StagedCopy::restore(saved, identity, &stage, &id)?
                 } else {
                     // The signed intent owns this attempt; never remove an existing signed receipt as an incomplete copy.
-                    crate::copy_source::release_stage(&stage, id)?;
+                    if manifest.provider.is_some() {
+                        cursor.reserve_export(entry.bytes)?;
+                        journal.write("cursor.json", &cursor, identity)?;
+                    } else {
+                        crate::copy_source::release_stage(&stage, &id)?;
+                    }
                     consent.approval(saved, identity)?.stage_to(
                         saved,
                         identity,
                         &entry.relative,
                         &stage,
-                        id,
+                        &id,
                         Some(entry.bytes),
                         cancel,
                         gate,
@@ -854,10 +945,11 @@ impl SourceJobs {
         *self.running.lock().await = Some(Running { cancel, task });
         Ok(value)
     }
-    pub async fn approve_upload(
+    pub async fn approve_budget(
         &self,
         base: &Path,
         saved: &SavedConnection,
+        export: bool,
     ) -> Result<ImportView, String> {
         self.stop().await;
         let identity = credentials::identity()?;
@@ -865,7 +957,11 @@ impl SourceJobs {
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
         let journal = Journal::new(base, consent.source_id())?;
         let (manifest, mut cursor) = load(&journal, &identity, &consent, saved)?;
-        cursor.approve_upload(&manifest)?;
+        if export {
+            cursor.approve_export(&manifest)?;
+        } else {
+            cursor.approve_upload(&manifest)?;
+        }
         journal.write("cursor.json", &cursor, &identity)?;
         let value = view(&manifest, &cursor, "paused", None);
         *self
@@ -928,6 +1024,47 @@ impl SourceJobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn photos_exports_reserve_the_full_attempt_before_reads_and_uploads_need_separate_approval() {
+        let manifest = Manifest {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_id: uuid::Uuid::new_v4().to_string(),
+            scope: "a".repeat(64),
+            provider: Some("apple-photos".into()),
+            files: vec![SourceFile {
+                relative: "0/original.HEIC".into(),
+                bytes: 256,
+            }],
+            total_bytes: 256,
+            skipped: 0,
+            availability: None,
+        };
+        let mut cursor = Cursor::new(&manifest).unwrap();
+        assert!(cursor.upload_budget.is_none());
+        assert_eq!(
+            view(&manifest, &cursor, "ready", None).additional_upload_allowance,
+            0
+        );
+        cursor.reserve_export(256).unwrap();
+        let encoded = serde_json::to_vec(&cursor).unwrap();
+        let mut restarted: Cursor = serde_json::from_slice(&encoded).unwrap();
+        restarted.validate(&manifest).unwrap();
+        assert_eq!(
+            restarted.reserve_export(256).unwrap_err(),
+            "photos_export_budget_exhausted"
+        );
+        restarted.approve_export(&manifest).unwrap();
+        assert_eq!(restarted.export_budget.as_ref().unwrap().used, 256);
+        assert_eq!(restarted.export_budget.as_ref().unwrap().limit, 512);
+        restarted.reserve_export(256).unwrap();
+        restarted.export_budget = None;
+        assert_eq!(
+            restarted.reserve_export(1).unwrap_err(),
+            "photos_export_budget_required"
+        );
+        restarted.state = "cancelled".into();
+        assert!(restarted.approve_export(&manifest).is_err());
+    }
     #[test]
     fn payload_allowance_survives_restart_and_refuses_sends_before_http() {
         tauri::async_runtime::block_on(async {
@@ -1088,6 +1225,7 @@ mod tests {
         crate::runtime_store::private_directory(&base).unwrap();
         let identity = DeviceIdentity::generate();
         let manifest = Manifest {
+            provider: None,
             id: uuid::Uuid::new_v4().to_string(),
             source_id: uuid::Uuid::new_v4().to_string(),
             scope: "a".repeat(64),

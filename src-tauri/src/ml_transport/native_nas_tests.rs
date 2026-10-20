@@ -5,6 +5,19 @@ use super::*;
 #[ignore = "changes the credential builder; run alone in its own test process"]
 fn isolated_keyring_retains_real_worker_checkpoints_without_os_storage() {
     install_test_keyring();
+    let directory = crate::credential_lock::fixture_directory().unwrap();
+    assert!(
+        directory.starts_with(std::env::temp_dir().canonicalize().unwrap()),
+        "memory credential fixtures must not touch account security state"
+    );
+    let identity = credentials::identity().unwrap();
+    assert_eq!(
+        crate::identity_anchor::read().unwrap().as_deref(),
+        Some(identity.installation_id.as_str())
+    );
+    assert!(directory.join("installation.json").is_file());
+    #[cfg(unix)]
+    assert_eq!(crate::credential_lock::directory().unwrap(), directory);
     let worker: SavedWorker = serde_json::from_value(serde_json::json!({
         "serverId":"synthetic-server","accountId":"synthetic-account","deviceId":"synthetic-device",
         "sessionId":"1117c1ca-0495-46e9-b579-f321520c2b1a","authorizationEpoch":2,
@@ -23,6 +36,7 @@ fn isolated_keyring_retains_real_worker_checkpoints_without_os_storage() {
     assert!(credentials::load::<SavedWorker>("worker-session")
         .unwrap()
         .is_none());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 type CredentialKey = (Option<String>, String, String);
@@ -83,6 +97,10 @@ impl keyring::credential::CredentialBuilderApi for MemoryCredentials {
     }
 }
 pub(crate) fn install_test_keyring() {
+    crate::credential_lock::isolate_for_fixture();
+    if std::env::var("FRAMELEAF_TEST_COREML_NAS").as_deref() == Ok("1") {
+        crate::release_policy::use_coreml_fixture_authority();
+    }
     keyring::set_default_credential_builder(Box::<MemoryCredentials>::default());
 }
 
@@ -198,6 +216,7 @@ fn actual_native_nas_library_jobs() {
             .set(worker.0.blocking_lock().client.clone())
             .unwrap();
         automatic_setup_job(saved, configuration.work_root, &mut input);
+        fs::remove_dir_all(crate::credential_lock::fixture_directory().unwrap()).unwrap();
         return;
     }
 
@@ -290,9 +309,10 @@ fn actual_native_nas_library_jobs() {
             .collect();
         let mut predictor =
             NativePredictor::start_many(&installed, &bindings, &cache, &root.0, port).unwrap();
+        let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+        predictor.prepare(&worker, &mut cancel).await.unwrap();
         println!("NATIVE_QUALIFIED {{\"roles\":{}}}", profiles.len());
         std::io::stdout().flush().unwrap();
-        let (_sender, mut cancel) = tokio::sync::watch::channel(false);
         let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
         assert_eq!(read_fixture_message(&mut input)["command"], "execute");
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -313,6 +333,7 @@ fn actual_native_nas_library_jobs() {
         credentials::delete("installation").unwrap();
         credentials::delete("connection").unwrap();
     });
+    fs::remove_dir_all(crate::credential_lock::fixture_directory().unwrap()).unwrap();
 }
 
 #[test]
@@ -382,6 +403,9 @@ fn automatic_setup_job(
     // Seed approved staged weights for this offline automatic-setup fixture.
     let pack = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
     let cache = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
+    let workload =
+        std::env::var("FRAMELEAF_FACTORY_TEST_WORKLOAD").unwrap_or_else(|_| "ocr".into());
+    assert!(matches!(workload.as_str(), "ocr" | "clip"));
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(pack.join("manifest.json")).unwrap()).unwrap();
     let catalogue: serde_json::Value =
@@ -391,7 +415,7 @@ fn automatic_setup_job(
         .unwrap()
         .iter()
         .find(|profile| {
-            profile["workload"] == "ocr"
+            profile["workload"] == workload
                 && profile["runtimeSourceRevision"] == manifest["sourceRevision"]
                 && profile["spec"]["provider"] == manifest["provider"]
         })
@@ -404,7 +428,7 @@ fn automatic_setup_job(
             ".staging-{}",
             profile["modelSnapshotRevision"].as_str().unwrap()
         ))
-        .join("ocr")
+        .join(&workload)
         .join(name);
     let mut directories = std::fs::DirBuilder::new();
     directories.recursive(true);
@@ -419,7 +443,7 @@ fn automatic_setup_job(
         }
         let destination = staged.join(artifact);
         directories.create(destination.parent().unwrap()).unwrap();
-        std::fs::copy(cache.join("ocr").join(name).join(artifact), destination).unwrap();
+        std::fs::copy(cache.join(&workload).join(name).join(artifact), destination).unwrap();
     }
     let setup = crate::worker_setup::WorkerSetup::default();
     tauri::async_runtime::block_on(async {
@@ -446,7 +470,7 @@ fn automatic_setup_job(
                 assert!(status
                     .workloads
                     .iter()
-                    .any(|item| item.workload == "ocr" && item.state == "ready"));
+                    .any(|item| item.workload == workload && item.state == "ready"));
                 break;
             }
             assert!(
@@ -455,7 +479,10 @@ fn automatic_setup_job(
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        println!("NATIVE_QUALIFIED {{\"roles\":1}}");
+        println!(
+            "NATIVE_QUALIFIED {{\"roles\":{}}}",
+            if workload == "clip" { 3 } else { 1 }
+        );
         std::io::stdout().flush().unwrap();
         assert_eq!(read_fixture_message(input)["command"], "execute");
         assert_eq!(read_fixture_message(input)["command"], "complete");
@@ -463,4 +490,39 @@ fn automatic_setup_job(
         println!("NATIVE_EXECUTED {{\"iteration\":1}}");
         std::io::stdout().flush().unwrap();
     });
+}
+
+#[test]
+#[ignore = "explicit test authority and memory credential builder; run alone"]
+fn coreml_fixture_authority_reaches_the_controller_runtime_store() {
+    use sha2::Digest;
+    assert_eq!(
+        std::env::var("FRAMELEAF_TEST_COREML_NAS").as_deref(),
+        Ok("1")
+    );
+    install_test_keyring();
+    credentials::identity().unwrap();
+    let root = OwnedRoot(
+        crate::credential_lock::fixture_directory()
+            .unwrap()
+            .to_path_buf(),
+    );
+    let payload = root.0.join("payload");
+    std::fs::create_dir(&payload).unwrap();
+    let bytes = b"owned fixture executable";
+    std::fs::write(payload.join("python"), bytes).unwrap();
+    let raw=serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider","sourceRevision":"a".repeat(40),"python":"python","files":{"python":{"bytes":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(bytes))}}})).unwrap();
+    use ed25519_dalek::Signer;
+    let signature = ed25519_dalek::SigningKey::from_bytes(&[71; 32])
+        .sign(&raw)
+        .to_bytes();
+    let store =
+        crate::release_policy::open_runtime_store(&root.0.join("controller-store")).unwrap();
+    store
+        .install_and_activate(&payload, &raw, &signature)
+        .expect("explicit fixture authority must reach the same store entry used by WorkerSetup");
+    assert_eq!(
+        store.load_active().unwrap().unwrap().source_revision(),
+        "a".repeat(40)
+    );
 }

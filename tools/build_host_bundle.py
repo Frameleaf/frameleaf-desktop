@@ -134,10 +134,13 @@ def backup_component(root: Path) -> dict:
 
 def host_manifest(payload: Path, revision: str, epoch: int) -> dict:
     policy = json.loads((ROOT / "runtime/release-trust.json").read_text())
+    floor = policy.get("minimumHostEpoch") if isinstance(policy, dict) else None
+    if type(floor) is not int or floor < 1:
+        raise BuildError("release_policy_invalid")
     if (
         not re.fullmatch(r"[a-f0-9]{40}", revision)
-        or not isinstance(epoch, int)
-        or epoch < policy["minimumRuntimeEpoch"]
+        or type(epoch) is not int
+        or epoch < floor
     ):
         raise BuildError("host_bundle_identity_invalid")
     files = inventory(payload)

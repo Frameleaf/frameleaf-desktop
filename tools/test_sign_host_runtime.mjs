@@ -20,13 +20,14 @@ import {
   HOST_REQUIRED,
 } from "./sign_host_runtime.mjs";
 
-async function fixture(t) {
+async function fixture(t, mlEpoch = 2) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "host-sign-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const keys = generateKeyPairSync("ed25519");
   const policy = {
     schemaVersion: 1,
-    minimumRuntimeEpoch: 2,
+    minimumRuntimeEpoch: mlEpoch,
+    minimumHostEpoch: 2,
     keys: [
       {
         id: "fixture",
@@ -69,7 +70,7 @@ async function fixture(t) {
     JSON.stringify({
       schemaVersion: 1,
       protocolVersion: 1,
-      epoch: 2,
+      epoch: mlEpoch,
       ...target,
       provider: "CPUExecutionProvider",
       python: "python",
@@ -122,6 +123,18 @@ async function fixture(t) {
   await save();
   return { root, pem, policy, manifest, save, artifact };
 }
+
+test("host release minimum is independent of the nested ML release minimum", async (t) => {
+  const f = await fixture(t, 99);
+  await signHostCandidate(f.root, f.pem, f.policy);
+  await verifySignedHostCandidate(f.root, f.policy);
+  f.policy.minimumHostEpoch = 3;
+  await assert.rejects(verifySignedHostCandidate(f.root, f.policy), /host_manifest_incompatible/);
+  for (const floor of [undefined, null, 0, true, "2", Number.MAX_SAFE_INTEGER + 1]) {
+    f.policy.minimumHostEpoch = floor;
+    await assert.rejects(verifySignedHostCandidate(f.root, f.policy), /release_policy_invalid/);
+  }
+});
 
 test("signs the complete host and verifies the nested ML authority without overwriting signatures", async (t) => {
   const f = await fixture(t);

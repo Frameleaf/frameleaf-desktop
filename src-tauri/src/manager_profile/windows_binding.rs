@@ -30,6 +30,7 @@ mod tests {
         let root = format!(r"\\?\GLOBALROOT\Device\HarddiskVolume{device}\Frameleaf");
         Configuration {
             installation_id: "a".repeat(12),
+            secure_installation_id: "11111111-1111-4111-8111-111111111111".into(),
             name: "Synthetic".into(),
             release: "frameleaf-v3.0.0-1".into(),
             controller: format!(r"{root}\controller.exe").into(),
@@ -51,6 +52,22 @@ mod tests {
             "manager-physical-identity".into(),
         ]
     }
+    #[test]
+    fn historical_windows_configuration_shape_stays_separate_from_secure_uuid() {
+        let mut configuration = config(1);
+        let binding = value(&configuration, &"b".repeat(64), identities(), names()).unwrap();
+        let names = names();
+        let historical = json!({"installationId":"a".repeat(12),"name":"Synthetic",
+            "release":"frameleaf-v3.0.0-1","controller":names[1],"state":names[2],"data":names[3],
+            "origin":"https://127.0.0.1:9443","databasePort":54329,"apiPort":2283});
+        assert_eq!(binding["configuration"], historical);
+        configuration.secure_installation_id = "22222222-2222-4222-8222-222222222222".into();
+        assert_eq!(
+            value(&configuration, &"b".repeat(64), identities(), names).unwrap(),
+            binding
+        );
+    }
+
     #[test]
     fn kernel_device_renumber_preserves_binding_without_persisting_kernel_paths() {
         let first = value(&config(1), &"b".repeat(64), identities(), names()).unwrap();

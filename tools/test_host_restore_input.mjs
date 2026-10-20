@@ -57,7 +57,7 @@ async function restoreFixture(t, run) {
   await writeFile(join(f.path,'input','recovery.json'),JSON.stringify(f.recovery),{mode:0o600});
   await writeFile(join(f.path,'restore-intent.json'),JSON.stringify(f.binding),{mode:0o600});
   await mkdir(join(f.c.state,'database'),{mode:0o700});await writeFile(join(f.c.state,'database','sentinel'),'original database must survive',{mode:0o600});
-  const calls=[];let pg,pgData,pgReadonly=false,exists=false,failRestore=false,canonical=true,failStop=false,badReceipt=false,failValidation=false,readOnlyProof=true,postgresMajor=19,vectorVersion='0.8.7';
+  const calls=[];let pg,pgData,pgReadonly=false,exists=false,failRestore=false,canonical=true,failStop=false,badReceipt=false,failValidation=false,failChecksums=false,readOnlyProof=true,postgresMajor=19,vectorVersion='0.8.7';
   const original=subprocess.spawn;
   subprocess.spawn=(file,args,options)=>{
    const name=basename(file).replace(/\.exe$/,'');calls.push({name,args,options});
@@ -69,6 +69,7 @@ async function restoreFixture(t, run) {
     if(name==='initdb'){mkdirSync(args[args.indexOf('-D')+1],{mode:0o700});writeFileSync(join(args[args.indexOf('-D')+1],'PG_VERSION'),'19');}
     if(name==='psql')child.stdout.write(args.at(-1).includes('pg_database')?(exists?'1\n':'\n'):JSON.stringify({postgresMajor,vectorVersion,canonical,...(args.at(-1).includes('transaction_read_only')?{readOnly:pgReadonly&&readOnlyProof}:{})})+'\n');
     if(name==='createdb')exists=true;
+    if(name==='pg_checksums'&&failChecksums){exit(1);return;}
     if(name==='pgRestore'&&!args.includes('--list')&&failRestore){failRestore=false;exit(1);return;}
     if(name==='node'){
      assert.deepEqual(args.slice(1),['frameleaf-admin',pgReadonly?'validate-restore':'restore-state']);
@@ -81,7 +82,7 @@ async function restoreFixture(t, run) {
    });
    return child;
   };syncBuiltinESMExports();
-  try{await run({...f,calls,failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;},invalidValidationReceipt:()=>{badReceipt=true;},failValidation:()=>{failValidation=true;},invalidReadOnly:()=>{readOnlyProof=false;},invalidPgVersion:()=>{postgresMajor=18;},invalidVector:()=>{vectorVersion='0.8.6';}});}
+  try{await run({...f,calls,failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;},invalidValidationReceipt:()=>{badReceipt=true;},failValidation:()=>{failValidation=true;},failChecksums:()=>{failChecksums=true;},invalidReadOnly:()=>{readOnlyProof=false;},invalidPgVersion:()=>{postgresMajor=18;},invalidVector:()=>{vectorVersion='0.8.6';}});}
   finally{subprocess.spawn=original;syncBuiltinESMExports();pg?.kill();}
  });
 }
@@ -750,4 +751,263 @@ test('canonical target validation never publishes proof for schema, helper, rece
       assert.equal(await readFile(join(f.c.state, 'database/sentinel'), 'utf8'), 'original database must survive');
     });
   }
+});
+
+
+async function updateFixture(t, run) {
+ await restoreFixture(t, async f => {
+  f.recovery.installation.id=f.binding.installationId;
+  f.recovery.checkpoint.sourceRevision='f'.repeat(40);
+  await writeFile(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.recovery.checkpoint.manifestSha256,sourceRevision:f.recovery.checkpoint.sourceRevision,postgresMajor:'19'}),{mode:0o600});
+  f.binding.recoverySha256=digest(f.recovery);
+  await writeFile(join(f.path,'input','recovery.json'),JSON.stringify(f.recovery),{mode:0o600});
+  await writeFile(join(f.path,'restore-intent.json'),JSON.stringify(f.binding),{mode:0o600});
+  const request={schemaVersion:1,kind:'native-update',sourceEpoch:1,targetEpoch:2,sourceCheckpoint:structuredClone(f.recovery.checkpoint),restore:structuredClone(f.binding)};
+  await run({...f,request});
+ });
+}
+
+test('update candidate uses target migrations and retains exact source provenance without enabling ordinary selection', async t => {
+ assert.equal(typeof owner.restoreHostUpdateDatabase,'function');
+ await updateFixture(t,async ({c,binding,request,recovery,path,calls})=>{
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),/host_restore_input_invalid/);
+  assert.deepEqual(calls,[]);
+  const sourceMarker=await readFile(join(c.state,'host-state.json'));
+  const before=await readFile(join(path,'input','recovery.json'));
+  const receipt=await owner.restoreHostUpdateDatabase(c,request,new Promise(()=>{}));
+  assert.equal(receipt.state,'update-prepared');assert.deepEqual(receipt.update,request);assert.deepEqual(receipt.binding,binding);
+  assert.deepEqual(await readFile(join(c.state,'host-state.json')),sourceMarker);
+  assert.equal(receipt.update.sourceCheckpoint.sourceRevision,'f'.repeat(40));
+  assert.notEqual(receipt.update.sourceCheckpoint.manifestSha256,c.manifestSha256);
+  const data=calls.find(x=>x.name==='postgres').args[1];
+  assert.ok(data.startsWith(join(c.state,'restore-targets',binding.operationId)));assert.notEqual(data,join(c.state,'database'));
+  assert.deepEqual(JSON.parse(await readFile(join(data,'..','host-state.json'),'utf8')),{schemaVersion:1,manifestSha256:c.manifestSha256,sourceRevision:c.sourceRevision,postgresMajor:'19'});
+  const migration=calls.find(x=>x.name==='node');
+  assert.deepEqual(migration.args,[join(c.runtime,c.entryPoints.server),'frameleaf-admin','restore-state']);
+  assert.equal(migration.options.env.FRAMELEAF_STUDIO_WORKER,'false');
+  assert.deepEqual(await readFile(join(path,'input','recovery.json')),before);
+  assert.deepEqual(JSON.parse(await readFile(join(data,'..','restore-result.json'),'utf8')),receipt);
+  assert.deepEqual(JSON.parse(await readFile(join(data,'..','restore-target.json'),'utf8')).update,request);
+  assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+  await assert.rejects(owner.readHostRestoreTarget(c,receipt),/host_restore_target_invalid/);
+  assert.equal(typeof owner.readHostUpdateTarget,'function');
+  await rm(join(data,'postmaster.pid'));
+  await filesystem.chmod(join(data,'PG_VERSION'),0o600);
+  const inspected=await owner.readHostUpdateTarget(c,receipt);
+  assert.deepEqual(inspected.receipt,receipt);
+  assert.equal(inspected.database,data);
+  assert.deepEqual(recovery.checkpoint,request.sourceCheckpoint);
+ });
+});
+
+test('update candidate rejects malformed epochs, source proof, target binding and installation before any process or attempt', async t=>{
+ assert.equal(typeof owner.restoreHostUpdateDatabase,'function');
+ for(const fault of ['unknown','schema','source-epoch','target-epoch','unsafe-epoch','checkpoint-unknown','dump','source-manifest','source-revision','source-operation','target','library','installation']) await updateFixture(t,async f=>{
+  const request=structuredClone(f.request);
+  switch(fault){
+   case 'unknown':request.path='/outside';break;
+   case 'schema':request.schemaVersion=2;break;
+   case 'source-epoch':request.sourceEpoch=0;break;
+   case 'target-epoch':request.targetEpoch=1;break;
+   case 'unsafe-epoch':request.targetEpoch=Number.MAX_SAFE_INTEGER+1;break;
+   case 'checkpoint-unknown':request.sourceCheckpoint.extra=true;break;
+   case 'dump':request.sourceCheckpoint.dump.sha256='0'.repeat(64);break;
+   case 'source-manifest':request.sourceCheckpoint.manifestSha256=f.c.manifestSha256;break;
+   case 'source-revision':request.sourceCheckpoint.sourceRevision='9'.repeat(40);break;
+   case 'source-operation':request.sourceCheckpoint.operationId='99999999-9999-4999-8999-999999999999';break;
+   case 'target':request.restore.manifestSha256='0'.repeat(64);break;
+   case 'library':request.restore.libraryId='9'.repeat(12);break;
+   case 'installation':{
+    f.recovery.installation.id='9'.repeat(12);f.binding.recoverySha256=digest(f.recovery);request.restore.recoverySha256=f.binding.recoverySha256;
+    await writeFile(join(f.path,'input','recovery.json'),JSON.stringify(f.recovery),{mode:0o600});
+    await writeFile(join(f.path,'restore-intent.json'),JSON.stringify(f.binding),{mode:0o600});break;
+   }
+  }
+  await assert.rejects(owner.restoreHostUpdateDatabase(f.c,request,new Promise(()=>{})),/host_update_input_invalid/);
+  assert.deepEqual(f.calls,[],fault);await assert.rejects(readFile(join(f.c.state,'restore-targets')),{code:'ENOENT'});
+  assert.equal(await readFile(join(f.c.state,'database','sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+test('update target inspection refuses foreign receipts, changed evidence and live targets without launching work',async t=>{
+ for(const fault of ['ordinary','extra','epoch','intent','result','pid','dump','source'])await updateFixture(t,async f=>{
+  const receipt=await owner.restoreHostUpdateDatabase(f.c,f.request,new Promise(()=>{}));
+  const database=f.calls.find(x=>x.name==='postgres').args[1],target=join(database,'..');
+  await rm(join(database,'postmaster.pid'));await filesystem.chmod(join(database,'PG_VERSION'),0o600);
+  const supplied=structuredClone(receipt);
+  if(fault==='ordinary')supplied.state='restore-prepared';
+  if(fault==='extra')supplied.secret='private diagnostic';
+  if(fault==='epoch')supplied.update.sourceEpoch=0;
+  if(fault==='intent')await writeFile(join(target,'restore-target.json'),JSON.stringify({...receipt,secret:'private'}),{mode:0o600});
+  if(fault==='result')await writeFile(join(target,'restore-result.json'),JSON.stringify({...receipt,targetIdentity:'0:0'}),{mode:0o600});
+  if(fault==='pid')await writeFile(join(database,'postmaster.pid'),'99999',{mode:0o600});
+  if(fault==='dump')await writeFile(join(f.path,'input','database.dump'),'changed bytes',{mode:0o600});
+  if(fault==='source')await writeFile(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.c.manifestSha256,sourceRevision:f.c.sourceRevision,postgresMajor:'19'}),{mode:0o600});
+  const calls=f.calls.length;
+  await assert.rejects(owner.readHostUpdateTarget(f.c,supplied),/host_restore_target_invalid/);
+  assert.equal(f.calls.length,calls);
+  assert.equal(await readFile(join(f.c.state,'database','sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+test('update candidate cancellation and failed preparation retain uncertain attempts and never publish prepared evidence',async t=>{
+ assert.equal(typeof owner.restoreHostUpdateDatabase,'function');
+ for(const fault of ['cancel','restore','stop'])await updateFixture(t,async f=>{
+  if(fault==='restore')f.failRestore();if(fault==='stop')f.failStop();
+  await assert.rejects(owner.restoreHostUpdateDatabase(f.c,f.request,fault==='cancel'?Promise.resolve():new Promise(()=>{})));
+  assert.equal(await readFile(join(f.c.state,'database','sentinel'),'utf8'),'original database must survive');
+  if(fault==='cancel'){assert.deepEqual(f.calls,[]);return;}
+  const first=f.calls.find(x=>x.name==='postgres').args[1];
+  await assert.rejects(readFile(join(first,'..','restore-result.json')),{code:'ENOENT'});
+  const receipt=await owner.restoreHostUpdateDatabase(f.c,f.request,new Promise(()=>{}));
+  assert.equal(receipt.state,'update-prepared');
+  const starts=f.calls.filter(x=>x.name==='postgres');assert.equal(starts.length,2);assert.notEqual(starts[1].args[1],first);
+  assert.equal(await readFile(join(first,'PG_VERSION'),'utf8'),'19');
+ });
+});
+
+
+test('update candidate requires the exact source-owned marker before allocation',async t=>{
+ for(const fault of ['target','manifest','revision','postgres','extra','missing'])await updateFixture(t,async f=>{
+  const marker={schemaVersion:1,manifestSha256:f.recovery.checkpoint.manifestSha256,sourceRevision:f.recovery.checkpoint.sourceRevision,postgresMajor:'19'};
+  if(fault==='target'){marker.manifestSha256=f.c.manifestSha256;marker.sourceRevision=f.c.sourceRevision;}
+  if(fault==='manifest')marker.manifestSha256='9'.repeat(64);
+  if(fault==='revision')marker.sourceRevision='9'.repeat(40);
+  if(fault==='postgres')marker.postgresMajor='18';
+  if(fault==='extra')marker.path='/outside';
+  if(fault==='missing')await rm(join(f.c.state,'host-state.json'));
+  else await writeFile(join(f.c.state,'host-state.json'),JSON.stringify(marker),{mode:0o600});
+  await assert.rejects(owner.restoreHostUpdateDatabase(f.c,f.request,new Promise(()=>{})),/host_update_input_invalid/);
+  assert.deepEqual(f.calls,[]);await assert.rejects(readFile(join(f.c.state,'restore-targets')),{code:'ENOENT'});
+ });
+});
+
+test('update candidate refuses a source marker changed during target migrations without publishing success',async t=>{
+ await updateFixture(t,async f=>{
+  const fakeSpawn=subprocess.spawn;
+  subprocess.spawn=(file,args,options)=>{
+   const child=fakeSpawn(file,args,options);
+   if(basename(file).replace(/\.exe$/,'')==='node')writeFileSync(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.c.manifestSha256,sourceRevision:f.c.sourceRevision,postgresMajor:'19'}));
+   return child;
+  };syncBuiltinESMExports();
+  try{
+   await assert.rejects(owner.restoreHostUpdateDatabase(f.c,f.request,new Promise(()=>{})),/host_update_input_invalid/);
+   const data=f.calls.find(x=>x.name==='postgres').args[1];
+   await assert.rejects(readFile(join(data,'..','restore-result.json')),{code:'ENOENT'});
+   assert.equal(await readFile(join(f.c.state,'database','sentinel'),'utf8'),'original database must survive');
+  }finally{subprocess.spawn=fakeSpawn;syncBuiltinESMExports();}
+ });
+});
+
+test('update candidate snapshots caller provenance before asynchronous input reads',async t=>{
+ await updateFixture(t,async f=>{
+  const expected=structuredClone(f.request);
+  const prepared=owner.restoreHostUpdateDatabase(f.c,f.request,new Promise(()=>{}));
+  f.request.sourceEpoch=100;f.request.targetEpoch=101;
+  f.request.sourceCheckpoint.dump.sha256='0'.repeat(64);f.request.restore.installationId='0'.repeat(12);
+  const receipt=await prepared;assert.deepEqual(receipt.update,expected);
+  assert.equal(await readFile(join(f.c.state,'database','sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+async function verifiedUpdateFixture(t,run) {
+ await updateFixture(t,async f=>{
+  const receipt=await owner.restoreHostUpdateDatabase(f.c,f.request,new Promise(()=>{}));
+  const database=f.calls.find(x=>x.name==='postgres').args[1],target=join(database,'..');
+  await rm(join(database,'postmaster.pid'));await filesystem.chmod(join(database,'PG_VERSION'),0o600);
+  f.c.entryPoints.pgChecksums='bin/pg_checksums'+(process.platform==='win32'?'.exe':'');
+  await run({...f,receipt,database,target});
+ });
+}
+test('update verification runs target checksums around read-only target schema inspection and keeps ordinary restore strict',async t=>{
+ assert.equal(typeof owner.validateHostUpdateTarget,'function');
+ await verifiedUpdateFixture(t,async f=>{
+  const marker=await readFile(join(f.c.state,'host-state.json'));
+  const before=f.calls.length;
+  await assert.rejects(owner.verifyHostRestoreTarget(f.c,f.receipt,new Promise(()=>{})),/host_restore_offline_invalid/);
+  assert.equal(f.calls.length,before);
+  const checked=await owner.validateHostUpdateTarget(f.c,f.receipt,new Promise(()=>{}));
+  assert.deepEqual(checked,{receipt:f.receipt,target:f.target,database:f.database,offlineChecksums:true,schemaValidated:true});
+  assert.deepEqual(f.calls.slice(before).map(x=>x.name),['pg_checksums','postgres','pgIsready','psql','psql','node','pgCtl','pg_checksums']);
+  for(const call of f.calls.slice(before).filter(x=>x.name==='pg_checksums'))assert.deepEqual(call.args,['--check','--pgdata',f.database]);
+  const pg=f.calls.slice(before).find(x=>x.name==='postgres');
+  assert.ok(pg.args.includes(f.database));assert.ok(pg.args.includes('default_transaction_read_only=on'));
+  const helper=f.calls.slice(before).find(x=>x.name==='node');
+  assert.deepEqual(helper.args,[join(f.c.runtime,f.c.entryPoints.server),'frameleaf-admin','validate-restore']);
+  assert.equal(helper.options.env.FRAMELEAF_STUDIO_WORKER,'false');
+  assert.deepEqual(await readFile(join(f.c.state,'host-state.json')),marker);
+  assert.equal(await readFile(join(f.c.state,'database/sentinel'),'utf8'),'original database must survive');
+  assert.deepEqual(JSON.parse(await readFile(join(f.target,'restore-result.json'),'utf8')),f.receipt);
+ });
+});
+test('update verification refuses checksum, schema, provenance, shutdown and cancellation failures',async t=>{
+ assert.equal(typeof owner.validateHostUpdateTarget,'function');
+ for(const fault of ['checksum','schema','helper','receipt','stop','cancel','cancel-during','cancel-helper','read-only','postgres','vector','tool','source-during','source-after','checksum-after','dump-after','result-after','dump','result'])await verifiedUpdateFixture(t,async f=>{
+  if(fault==='checksum')f.failChecksums();if(fault==='schema')f.invalidSchema();if(fault==='helper')f.failValidation();if(fault==='receipt')f.invalidValidationReceipt();if(fault==='stop')f.failStop();if(fault==='read-only')f.invalidReadOnly();if(fault==='postgres')f.invalidPgVersion();if(fault==='vector')f.invalidVector();
+  if(fault==='tool')f.c.entryPoints.pgChecksums='../pg_checksums';
+  if(fault==='dump')await writeFile(join(f.path,'input/database.dump'),'changed',{mode:0o600});
+  if(fault==='result')await writeFile(join(f.target,'restore-result.json'),'{}',{mode:0o600});
+  let stop;const stopping=fault==='cancel'?Promise.resolve():new Promise(resolve=>{stop=resolve;});
+  const original=subprocess.spawn;
+  subprocess.spawn=(file,args,options)=>{
+   if(basename(file).replace(/\.exe$/,'')==='pg_checksums'){
+    if(fault==='source-during')writeFileSync(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.c.manifestSha256,sourceRevision:f.c.sourceRevision,postgresMajor:'19'}));
+    if(fault==='cancel-during')stop();
+   }
+   if(basename(file).replace(/\.exe$/,'')==='node'&&args.at(-1)==='validate-restore'){
+    if(fault==='cancel-helper')stop();
+    if(fault==='checksum-after')f.failChecksums();
+    if(fault==='source-after')writeFileSync(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.c.manifestSha256,sourceRevision:f.c.sourceRevision,postgresMajor:'19'}));
+    if(fault==='dump-after')writeFileSync(join(f.path,'input/database.dump'),'changed after schema validation');
+    if(fault==='result-after')writeFileSync(join(f.target,'restore-result.json'),'{}');
+   }
+   return original(file,args,options);
+  };syncBuiltinESMExports();
+  const before=f.calls.length;
+  try{await assert.rejects(owner.validateHostUpdateTarget(f.c,f.receipt,stopping),/host_restore_(canonical_invalid|cancelled)/,fault);}
+  finally{subprocess.spawn=original;syncBuiltinESMExports();}
+  assert.ok(!f.calls.slice(before).some(x=>['initdb','createdb','pgRestore'].includes(x.name)),fault);
+  assert.equal(await readFile(join(f.c.state,'database/sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+test('selected update verification requires the published target marker and never restores again',async t=>{
+ assert.equal(typeof owner.validateSelectedHostUpdateTarget,'function');
+ await verifiedUpdateFixture(t,async f=>{
+  const before=f.calls.length;
+  await assert.rejects(owner.validateSelectedHostUpdateTarget(f.c,f.receipt,new Promise(()=>{})),/host_restore_canonical_invalid/);
+  assert.equal(f.calls.length,before);
+  const marker={schemaVersion:1,manifestSha256:f.c.manifestSha256,sourceRevision:f.c.sourceRevision,postgresMajor:'19'};
+  await writeFile(join(f.c.state,'host-state.json'),JSON.stringify(marker),{mode:0o600});
+  for(const verify of [owner.validateHostUpdateTarget,owner.validateHostRestoreTarget])await assert.rejects(verify(f.c,f.receipt,new Promise(()=>{})),/host_restore_canonical_invalid/);
+  assert.equal(f.calls.length,before);
+  const targets=await filesystem.readdir(join(f.c.state,'restore-targets',f.receipt.binding.operationId));
+  for(let i=0;i<2;i++){
+   const start=f.calls.length;
+   const result=await owner.validateSelectedHostUpdateTarget(f.c,f.receipt,new Promise(()=>{}));
+   assert.deepEqual(result,{receipt:f.receipt,target:f.target,database:f.database,offlineChecksums:true,schemaValidated:true});
+   assert.deepEqual(f.calls.slice(start).map(x=>x.name),['pg_checksums','postgres','pgIsready','psql','psql','node','pgCtl','pg_checksums']);
+   for(const call of f.calls.slice(start).filter(x=>x.name==='pg_checksums'))assert.deepEqual(call.args,['--check','--pgdata',f.database]);
+   assert.deepEqual(await filesystem.readdir(join(f.c.state,'restore-targets',f.receipt.binding.operationId)),targets);
+   assert.equal(await readFile(join(f.c.state,'database/sentinel'),'utf8'),'original database must survive');
+   assert.deepEqual(JSON.parse(await readFile(join(f.c.state,'host-state.json'),'utf8')),marker);
+  }
+ });
+});
+
+test('selected update verification refuses published marker drift during and after fresh checks',async t=>{
+ assert.equal(typeof owner.validateSelectedHostUpdateTarget,'function');
+ for(const phase of ['before','checksum','schema'])await verifiedUpdateFixture(t,async f=>{
+  await writeFile(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.c.manifestSha256,sourceRevision:f.c.sourceRevision,postgresMajor:'19'}),{mode:0o600});
+  const change=()=>writeFileSync(join(f.c.state,'host-state.json'),JSON.stringify({schemaVersion:1,manifestSha256:f.request.sourceCheckpoint.manifestSha256,sourceRevision:f.request.sourceCheckpoint.sourceRevision,postgresMajor:'19'}));
+  if(phase==='before')change();
+  const original=subprocess.spawn;
+  subprocess.spawn=(file,args,options)=>{
+   if((phase==='checksum'&&basename(file).replace(/\.exe$/,'')==='pg_checksums')||(phase==='schema'&&args.at(-1)==='validate-restore'))change();
+   return original(file,args,options);
+  };syncBuiltinESMExports();
+  try{await assert.rejects(owner.validateSelectedHostUpdateTarget(f.c,f.receipt,new Promise(()=>{})),/host_restore_canonical_invalid/);}
+  finally{subprocess.spawn=original;syncBuiltinESMExports();}
+  assert.equal(await readFile(join(f.c.state,'database/sentinel'),'utf8'),'original database must survive');
+ });
 });

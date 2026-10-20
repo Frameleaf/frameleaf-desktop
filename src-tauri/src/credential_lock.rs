@@ -1,4 +1,21 @@
 //! A process crash releases this lock; runtime-file restoration never chooses its location.
+#[cfg(test)]
+static FIXTURE_DIRECTORY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn isolate_for_fixture() {
+    FIXTURE_DIRECTORY.get_or_init(|| {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "frameleaf-memory-credentials-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::runtime_store::private_directory(&root).unwrap();
+        root
+    });
+}
+#[cfg(test)]
+pub(crate) fn fixture_directory() -> Option<&'static std::path::Path> {
+    FIXTURE_DIRECTORY.get().map(std::path::PathBuf::as_path)
+}
 #[cfg(unix)]
 pub(crate) struct Guard(std::fs::File);
 #[cfg(unix)]
@@ -39,6 +56,11 @@ pub(crate) fn acquire() -> Result<Guard, String> {
 }
 #[cfg(unix)]
 pub(crate) fn directory() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Some(directory) = fixture_directory() {
+        return Ok(directory.to_path_buf());
+    }
+
     let uid = unsafe { libc::geteuid() };
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buffer = vec![0u8; 65536];

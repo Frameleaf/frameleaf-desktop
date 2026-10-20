@@ -35,6 +35,7 @@
   let certificateApproved = $state(false);
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
+  let allowUpdates = $state(false);
   let backups = $state<BackupEntry[]>([]);
   let backupsChecked = $state(false);
   let selectedBackup = $state('');
@@ -127,7 +128,7 @@
     const secret = password; password = '';
     await perform(async () => {
       if (pem.trim() && (!certificateApproved || !fingerprint || pem !== fingerprintPem)) throw Error('manager_certificate_approval_required');
-      manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery });
+      manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery, allowUpdates });
       pem = ''; fingerprint = ''; fingerprintPem = ''; certificateApproved = false;
       pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager);
       await restore();
@@ -168,7 +169,7 @@
     await perform(async () => {
       if (authorization === 'disconnect') {
         await invoke('disconnect_manager', { password: secret });
-        manager = null; status = null; pending = null; operation = null; checkedAt = null; allowManagement = false; allowRecovery = false; backups = []; backupsChecked = false; recoveryIntent = null; recovery = null; selectedBackup = ''; restorePending = null; restoreOperation = null; restoreConfirmation = false; restoreApproved = false; restoreAuthorization = null;
+        manager = null; status = null; pending = null; operation = null; checkedAt = null; allowManagement = false; allowRecovery = false; allowUpdates = false; backups = []; backupsChecked = false; recoveryIntent = null; recovery = null; selectedBackup = ''; restorePending = null; restoreOperation = null; restoreConfirmation = false; restoreApproved = false; restoreAuthorization = null;
         notice = 'Manager access was revoked and removed from this computer.';
       } else {
         await invoke('reauthenticate_manager', { password: secret });
@@ -268,6 +269,7 @@
       <strong>{status?.installation.name || 'Paired Manager'}</strong>
       <span>{manager.origin}</span>
       <span>{checkedAt ? `Manager checked at ${new Date(checkedAt).toLocaleTimeString()}` : 'Manager connection has not been confirmed.'}</span>
+      <span>Server update requests: {manager.scopes.includes('update') ? 'allowed.' : 'not granted.'}</span>
       <span>Access expires {new Date(manager.expiresAt).toLocaleDateString()}.</span>
       {#if manager.certificateSha256}<span>Approved certificate <code>{manager.certificateSha256}</code></span>{/if}
     </div>
@@ -389,6 +391,7 @@
         </details>
         <label class="check"><input type="checkbox" bind:checked={allowManagement} required />Allow this computer to start, stop and restart this server, and create database backups.</label>
         <label class="check"><input type="checkbox" bind:checked={allowRecovery} />Also allow backup recovery reviews and restore operations.</label>
+        <label class="check"><input type="checkbox" bind:checked={allowUpdates} />Also allow requests for server updates.</label>
         <button class="primary" disabled={!allowManagement || (!!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
         <p class="footnote">Your Manager password is used for this sign-in and is not saved. The separate management grant stays in your computer’s secure credential store.</p>
       </fieldset>

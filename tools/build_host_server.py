@@ -25,7 +25,7 @@ from build_runtime import (
 
 def ignored(directory: str, names: list[str]) -> set[str]:
     return (
-        set(names) & {".bin", ".pnpm", ".modules.yaml"}
+        set(names) & {".bin", ".pnpm", ".modules.yaml", ".pnpm-workspace-state-v1.json"}
         if Path(directory).name == "node_modules"
         else set()
     )

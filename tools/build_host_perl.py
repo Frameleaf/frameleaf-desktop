@@ -111,7 +111,7 @@ def build(output: Path) -> None:
             ]
             report["configureArguments"] = arguments[2:]
             command(arguments, cwd=source)
-            command(["make", "-j4"], cwd=source)
+            command(["make", "-j1"], cwd=source)
             command(["make", "install"], cwd=source)
             staged = work / "staged"
             (staged / "bin").mkdir(parents=True, mode=0o700)

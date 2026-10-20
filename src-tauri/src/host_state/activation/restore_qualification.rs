@@ -1,5 +1,6 @@
 //! Opt-in real database proof; fixture signing never changes release trust.
 use super::*;
+use crate::host_epochs::host_authority;
 use crate::host_runtime::{HostMode, HostProcess, VerifiedHostRuntime};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
@@ -75,10 +76,10 @@ fn verified(
         .start_mode(
             state,
             password,
-            ports.0,
-            ports.1,
+            ports,
             HostMode::RestorePrepare,
             Some(owner),
+            &host_authority::Authority::admitted(runtime).execution(),
         )
         .unwrap();
     process.wait_ready(Duration::from_secs(30)).unwrap();
@@ -128,12 +129,19 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
     );
     drop((a, b));
     let id = "a".repeat(12);
-    let mut owner = Owner::acquire(&state, true).unwrap();
+    let mut owner = Owner::acquire(&state, true, "11111111-1111-4111-8111-111111111111").unwrap();
     owner
         .activate(&id, runtime.manifest_sha256(), HostMode::Server)
         .unwrap();
-    let config = json!({"root":root,"state":state,"runtime":pack.join("payload"),
-        "manager":pack.join("payload/manager/app/build"), "password":password.as_str(),
+    let manager = std::env::var_os("FRAMELEAF_TEST_MANAGER")
+        .map(PathBuf::from)
+        .map(|root| {
+            assert!(root.is_absolute() && root.join("build/main.js").is_file());
+            root.join("build")
+        })
+        .unwrap_or_else(|| pack.join("payload/manager/app/build"));
+    let config = json!({"root":root,"state":state,"secureInstallationId":owner.installation_identity().unwrap(),"runtime":pack.join("payload"),
+        "manager":manager, "password":password.as_str(),
         "manifestSha256":runtime.manifest_sha256(),"sourceRevision":runtime.source_revision(),
         "postgresMajor":"19","databasePort":ports.0,"apiPort":ports.1,"entryPoints":manifest["entryPoints"]});
     let node = pack
@@ -150,10 +158,10 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
         .start_mode(
             &state,
             &password,
-            ports.0,
-            ports.1,
+            ports,
             HostMode::RestorePrepare,
             Some(&mut owner),
+            &host_authority::Authority::admitted(&runtime).execution(),
         )
         .unwrap();
     process.wait_ready(Duration::from_secs(30)).unwrap();
@@ -208,10 +216,10 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
         .start_mode(
             &state,
             &password,
-            ports.0,
-            ports.1,
+            ports,
             HostMode::Server,
             Some(&mut owner),
+            &host_authority::Authority::admitted(&runtime).execution(),
         )
         .unwrap();
     process.wait_ready(Duration::from_secs(240)).unwrap();
@@ -221,7 +229,7 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
     assert_eq!(helper(&node, &config, "original")["originalRows"], true);
     let receipt = json!({"actualPostgres":true,"compiledController":true,"sealedProof":true,
         "selectionFenced":true,"independentFinalization":true,"lostAcknowledgementRetry":true,
-        "selectedWriterReady":true,"originalRowsRetained":true,"installedAcceptance":false,
+        "selectedWriterReady":true,"originalRowsRetained":true,"installedAcceptance":false,"managerBuild":manager,
         "sourceRevision":runtime.source_revision(),"manifestSha256":runtime.manifest_sha256()});
     fs::write(
         root.join("qualification.json"),

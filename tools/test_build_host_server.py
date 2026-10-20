@@ -99,6 +99,9 @@ class HostServerTests(unittest.TestCase):
             (source / "node_modules/.modules.yaml").write_text(
                 "storeDir: /developer/store"
             )
+            (source / "node_modules/.pnpm-workspace-state-v1.json").write_text(
+                '{"lastValidatedTimestamp":123,"projects":{"/developer/workspace":{}}}'
+            )
             destination = root / "runtime"
             files = stage_server(source, destination)
             self.assertEqual(
@@ -109,6 +112,8 @@ class HostServerTests(unittest.TestCase):
             self.assertFalse((destination / "node_modules/.bin").exists())
             self.assertFalse((destination / "node_modules/.pnpm").exists())
             self.assertFalse((destination / "node_modules/.modules.yaml").exists())
+            self.assertFalse((destination / "node_modules/.pnpm-workspace-state-v1.json").exists())
+            self.assertNotIn("node_modules/.pnpm-workspace-state-v1.json", files)
             with self.assertRaises(BuildError):
                 stage_server(source, destination)
             with self.assertRaises(BuildError):

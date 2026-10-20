@@ -128,6 +128,37 @@ class HostBundleTests(unittest.TestCase):
             ):
                 host_manifest(Path("/not-a-payload"), revision, epoch)
 
+    def test_host_epoch_uses_its_own_compiled_release_floor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "payload"
+            names = set(host_entries().values()) | set(REQUIRED_HOST_FILES)
+            for name in names:
+                path = payload / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+            policy_root = root / "policy"
+            (policy_root / "runtime").mkdir(parents=True)
+            policy_path = policy_root / "runtime/release-trust.json"
+            policy = {"schemaVersion": 1, "minimumRuntimeEpoch": 99, "minimumHostEpoch": 2}
+            policy_path.write_text(json.dumps(policy))
+            shutil.copyfile(ROOT / "runtime/host-database.json", policy_root / "runtime/host-database.json")
+            with patch("build_host_bundle.ROOT", policy_root):
+                self.assertEqual(host_manifest(payload, "a" * 40, 2)["epoch"], 2)
+                policy["minimumHostEpoch"] = 3
+                policy_path.write_text(json.dumps(policy))
+                with self.assertRaises(BuildError):
+                    host_manifest(payload, "a" * 40, 2)
+                for floor in [None, 0, True, "2"]:
+                    policy["minimumHostEpoch"] = floor
+                    policy_path.write_text(json.dumps(policy))
+                    with self.assertRaises(BuildError):
+                        host_manifest(payload, "a" * 40, 2)
+                policy["minimumHostEpoch"] = 1
+                policy_path.write_text(json.dumps(policy))
+                with self.assertRaises(BuildError):
+                    host_manifest(payload, "a" * 40, True)
+
     def test_malformed_manager_provenance_is_refused_before_creating_output(self):
         valid = {
             "schemaVersion": 1,

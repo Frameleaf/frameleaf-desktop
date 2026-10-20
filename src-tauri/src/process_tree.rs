@@ -37,6 +37,43 @@ pub fn configure(command: &mut Command) {
     }
 }
 impl ProcessTree {
+    #[cfg(unix)]
+    pub(crate) fn terminate_child_confirmed(
+        &self,
+        child: &mut Child,
+        signalled: &mut bool,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        if self.0 <= 1 || child.id() != self.0 as u32 {
+            return Err("runtime_process_shutdown_unconfirmed".into());
+        }
+        if !*signalled {
+            // The caller has kept the owned leader unreaped; never signal this ID again after reaping.
+            self.terminate();
+            *signalled = true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let reaped = child
+                .try_wait()
+                .map_err(|_| "runtime_process_shutdown_unconfirmed")?
+                .is_some();
+            let present = unsafe { libc::kill(-self.0, 0) };
+            let error = (present == -1)
+                .then(|| std::io::Error::last_os_error().raw_os_error())
+                .flatten();
+            let absent = present == -1 && error == Some(libc::ESRCH);
+            // macOS may deny a dying group query until its still-owned leader is reaped.
+            let exiting = !reaped && error == Some(libc::EPERM);
+            if reaped && absent {
+                return Ok(());
+            }
+            if (present == -1 && !absent && !exiting) || std::time::Instant::now() >= deadline {
+                return Err("runtime_process_shutdown_unconfirmed".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     #[cfg(windows)]
     pub(crate) fn terminate_confirmed(&self, timeout: std::time::Duration) -> Result<(), String> {
         use std::{os::windows::io::AsRawHandle, time::Instant};

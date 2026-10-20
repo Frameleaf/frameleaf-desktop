@@ -160,7 +160,7 @@ fn main(){
  assert_eq!(env::var("MACHINE_LEARNING_REQUEST_THREADS").unwrap(),"1");
  #[cfg(unix)] unsafe { unsafe extern "C" { fn getpriority(which:i32,who:u32)->i32; } assert!(getpriority(0,0)>=10); }
  #[cfg(windows)] unsafe { #[link(name="kernel32")] unsafe extern "system" { fn GetCurrentProcess()->*mut std::ffi::c_void; fn GetPriorityClass(process:*mut std::ffi::c_void)->u32; } assert_eq!(GetPriorityClass(GetCurrentProcess()),0x4000); }
- fs::write("ready",args[5].as_bytes()).unwrap();loop{thread::sleep(Duration::from_millis(20));}
+ fs::write("ready.tmp",args[5].as_bytes()).unwrap();fs::rename("ready.tmp","ready").unwrap();loop{thread::sleep(Duration::from_millis(20));}
 }
 "#).unwrap();
     let executable = if cfg!(windows) {

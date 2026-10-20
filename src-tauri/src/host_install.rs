@@ -1,5 +1,7 @@
 //! Fixed-path installer phases only; never starts a host or reads a user's library.
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+mod macos_bundle;
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -26,17 +28,17 @@ impl Layout {
         let base = windows::base()?;
         #[cfg(not(windows))]
         let base = PathBuf::from(BASE);
+        let mut controller_path = base.join("Controllers").join(manifest).join(controller);
+        controller_path.push(if cfg!(windows) {
+            "frameleaf-native-host.exe"
+        } else if cfg!(target_os = "macos") {
+            "Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host"
+        } else {
+            "frameleaf-native-host"
+        });
         Ok(Self {
             runtime: base.join("Runtimes").join(manifest),
-            controller: base
-                .join("Controllers")
-                .join(manifest)
-                .join(controller)
-                .join(if cfg!(windows) {
-                    "frameleaf-native-host.exe"
-                } else {
-                    "frameleaf-native-host"
-                }),
+            controller: controller_path,
             profiles: base.join("Profiles"),
         })
     }
@@ -47,19 +49,48 @@ pub(crate) struct Installation {
     schema_version: u32,
     pub manifest_sha256: String,
     pub controller_sha256: String,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    controller_bundle_version: Option<String>,
 }
 impl Installation {
     fn decode(raw: &[u8]) -> Result<Self, String> {
         let record: Self =
             serde_json::from_slice(raw).map_err(|_| "host_install_record_invalid")?;
-        if record.schema_version != 1 {
+        #[cfg(target_os = "macos")]
+        let valid = match (
+            record.schema_version,
+            record.controller_bundle_version.as_deref(),
+        ) {
+            (1, None) => true,
+            (2, Some(version)) => macos_bundle::info(version).is_ok(),
+            _ => false,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let valid = record.schema_version == 1;
+        if !valid {
             return Err("host_install_record_invalid".into());
         }
         record.layout()?;
         Ok(record)
     }
     pub(crate) fn layout(&self) -> Result<Layout, String> {
-        Layout::new(&self.manifest_sha256, &self.controller_sha256)
+        let layout = Layout::new(&self.manifest_sha256, &self.controller_sha256)?;
+        #[cfg(target_os = "macos")]
+        let layout = if self.schema_version == 1 {
+            Layout {
+                controller: layout
+                    .controller
+                    .ancestors()
+                    .nth(4)
+                    .ok_or("host_install_path_invalid")?
+                    .join("frameleaf-native-host"),
+                ..layout
+            }
+        } else {
+            layout
+        };
+        Ok(layout)
     }
     pub(crate) fn read(manifest: &str) -> Result<Self, String> {
         let candidate = Layout::new(manifest, &"0".repeat(64))?.runtime;
@@ -69,10 +100,17 @@ impl Installation {
         if record.manifest_sha256 != manifest {
             return Err("host_install_record_invalid".into());
         }
-        crate::manager_host::protect(
-            &record.layout()?.controller,
-            &mut std::collections::BTreeSet::new(),
-        )?;
+        let layout = record.layout()?;
+        crate::manager_host::protect(&layout.controller, &mut std::collections::BTreeSet::new())?;
+        #[cfg(target_os = "macos")]
+        if let Some(version) = &record.controller_bundle_version {
+            macos_bundle::verify(
+                &layout.controller,
+                &record.controller_sha256,
+                version,
+                |path| crate::manager_host::protect(path, &mut std::collections::BTreeSet::new()),
+            )?;
+        }
         Ok(record)
     }
 }
@@ -154,17 +192,32 @@ fn finalization_guard(
     Ok(guard)
 }
 
+fn controller_directory(layout: &Layout) -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    if layout
+        .controller
+        .ends_with("Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host")
+    {
+        return layout
+            .controller
+            .ancestors()
+            .nth(4)
+            .map(PathBuf::from)
+            .ok_or_else(|| "host_install_path_invalid".into());
+    }
+    layout
+        .controller
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| "host_install_path_invalid".into())
+}
+
 fn admit_versions(
     layout: &Layout,
     verify: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let paths = [
-        &layout.runtime,
-        layout
-            .controller
-            .parent()
-            .ok_or("host_install_path_invalid")?,
-    ];
+    let directory = controller_directory(layout)?;
+    let paths = [&layout.runtime, &directory];
     let mut present = 0;
     for path in paths {
         match std::fs::symlink_metadata(path) {
@@ -189,6 +242,28 @@ fn verify_resources(layout: &Layout, manifest: &str, controller: &str) -> Result
     let binary = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
     if format!("{:x}", Sha256::digest(binary)) != controller {
         return Err("host_install_controller_changed".into());
+    }
+    #[cfg(target_os = "macos")]
+    if layout
+        .controller
+        .ends_with("Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host")
+    {
+        let version = if receipt_present(&layout.runtime.join("installation.json"))? {
+            let record = Installation::read(manifest)?;
+            if record.layout()?.controller != layout.controller
+                || record.controller_sha256 != controller
+            {
+                return Err("host_install_record_invalid".into());
+            }
+            record
+                .controller_bundle_version
+                .ok_or("host_install_record_invalid")?
+        } else {
+            env!("CARGO_PKG_VERSION").to_owned()
+        };
+        macos_bundle::verify(&layout.controller, controller, &version, |path| {
+            protect(path, &mut BTreeSet::new())
+        })?;
     }
     let raw = crate::runtime_store::read_bounded(
         &layout.runtime.join("manifest.json"),
@@ -238,6 +313,39 @@ pub fn finalize_windows_package(
     #[cfg(windows)]
     {
         windows::package::finalize(manifest, controller)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+
+/// One elevated Windows installer transaction; the caller cannot select a machine destination.
+pub fn install_windows_package(
+    source: &std::path::Path,
+    manifest: &str,
+    controller: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        windows::package::install(source, manifest, controller)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, manifest, controller);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+
+/// Remove only this version's protected code, retaining every user profile and library.
+pub fn remove_windows_package(
+    manifest: &str,
+    controller: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        windows::package::remove(manifest, controller)
     }
     #[cfg(not(windows))]
     {
@@ -303,6 +411,16 @@ pub fn prepare_maintenance(manifest: &str, controller: &str) -> Result<serde_jso
     {
         posix::root()?;
         let layout = Layout::new(manifest, controller)?;
+        #[cfg(target_os = "macos")]
+        let layout = if receipt_present(&layout.runtime.join("installation.json"))? {
+            let record = Installation::read(manifest)?;
+            if record.controller_sha256 != controller {
+                return Err("host_install_record_invalid".into());
+            }
+            record.layout()?
+        } else {
+            layout
+        };
         verify_resources(&layout, manifest, controller)?;
         posix::fence(&layout)?;
         Ok(
@@ -321,6 +439,16 @@ pub fn prepare_repair(manifest: &str, controller: &str) -> Result<serde_json::Va
     {
         posix::root()?;
         let layout = Layout::new(manifest, controller)?;
+        #[cfg(target_os = "macos")]
+        let layout = if receipt_present(&layout.runtime.join("installation.json"))? {
+            let record = Installation::read(manifest)?;
+            if record.controller_sha256 != controller {
+                return Err("host_install_record_invalid".into());
+            }
+            record.layout()?
+        } else {
+            layout
+        };
         posix::repair(&layout, manifest, controller)?;
         Ok(
             serde_json::json!({"protocolVersion":1,"state":"repair-prepared","serverStarted":false,"runtimeQualified":false}),
@@ -455,15 +583,15 @@ fn repair_tree(
     }
     Ok(())
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn verify_for_profile(record: &Installation) -> Result<(), String> {
     let layout = record.layout()?;
     let _lease = crate::package_lease::CodeLease::acquire(&layout.runtime)?;
     verify_resources(&layout, &record.manifest_sha256, &record.controller_sha256)
 }
-/// Linux installers explicitly select the account; a package-manager process has no console user.
+/// Explicit user setup never finishes package maintenance or accesses user credentials.
 pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_json::Value, String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         posix::root()?;
         let uid = parse_linux_profile_uid(uid)?;
@@ -471,16 +599,16 @@ pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_js
         if record.controller_sha256 != controller {
             return Err("host_install_controller_changed".into());
         }
-        let user = posix::linux_user(uid)?;
+        let user = posix::profile_user(uid)?;
         posix::finalize(&record.layout()?, manifest, controller, Some(user), false)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (manifest, controller, uid);
         Err("host_install_platform_unsupported".into())
     }
 }
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn parse_linux_profile_uid(value: &str) -> Result<u32, String> {
     let uid: u32 = value
         .parse()
@@ -594,8 +722,11 @@ mod posix {
             Some((uid, gid))
         }
     }
-    #[cfg(target_os = "linux")]
-    pub(super) fn linux_user(uid: u32) -> Result<(u32, u32), String> {
+    pub(super) fn profile_user(uid: u32) -> Result<(u32, u32), String> {
+        #[cfg(target_os = "macos")]
+        if !(501..u32::MAX - 1).contains(&uid) {
+            return Err("host_install_profile_user_invalid".into());
+        }
         let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
         let mut buffer = vec![0u8; 64 * 1024];
         let mut result = std::ptr::null_mut();
@@ -650,13 +781,18 @@ mod posix {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let record = Installation {
-            schema_version: 1,
+            schema_version: if cfg!(target_os = "macos") { 2 } else { 1 },
             manifest_sha256: manifest.into(),
             controller_sha256: controller.into(),
+            #[cfg(target_os = "macos")]
+            controller_bundle_version: Some(env!("CARGO_PKG_VERSION").into()),
         };
         let path = layout.runtime.join("installation.json");
         if receipt_present(&path)? {
-            if Installation::read(manifest)? != record {
+            let previous = Installation::read(manifest)?;
+            if previous.controller_sha256 != controller
+                || previous.layout()?.controller != layout.controller
+            {
                 return Err("host_install_record_invalid".into());
             }
             return Ok(());
@@ -1254,6 +1390,39 @@ mod tests {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_receipts_preserve_legacy_layout_and_reject_missing_metadata() {
+        let legacy = serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)});
+        let old = Installation::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let flat = old.layout().unwrap().controller;
+        assert_eq!(flat.file_name().unwrap(), "frameleaf-native-host");
+        let mut bundled = legacy.clone();
+        bundled["schemaVersion"] = serde_json::json!(2);
+        bundled["controllerBundleVersion"] = serde_json::json!("0.1.0");
+        let new = Installation::decode(&serde_json::to_vec(&bundled).unwrap()).unwrap();
+        assert_eq!(
+            new.layout().unwrap().controller,
+            flat.parent()
+                .unwrap()
+                .join("Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host")
+        );
+        assert_eq!(
+            Layout::new(&"a".repeat(64), &"b".repeat(64))
+                .unwrap()
+                .controller,
+            new.layout().unwrap().controller
+        );
+        assert_eq!(serde_json::to_value(&old).unwrap(), legacy);
+        assert_eq!(serde_json::to_value(&new).unwrap(), bundled);
+        for value in ["", "0", "../escape", "0.1.0<", "0.1.0-beta"] {
+            bundled["controllerBundleVersion"] = serde_json::json!(value);
+            assert!(Installation::decode(&serde_json::to_vec(&bundled).unwrap()).is_err());
+        }
+        bundled["controllerBundleVersion"] = serde_json::json!("0.1.0");
+        bundled["schemaVersion"] = serde_json::json!(1);
+        assert!(Installation::decode(&serde_json::to_vec(&bundled).unwrap()).is_err());
+    }
     #[test]
     fn installer_layout_uses_only_fixed_versioned_system_paths() {
         let layout = Layout::new(&"a".repeat(64), &"b".repeat(64)).unwrap();
@@ -1273,6 +1442,8 @@ mod tests {
                 .join("b".repeat(64))
                 .join(if cfg!(windows) {
                     "frameleaf-native-host.exe"
+                } else if cfg!(target_os = "macos") {
+                    "Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host"
                 } else {
                     "frameleaf-native-host"
                 })
@@ -1301,14 +1472,14 @@ mod tests {
             assert!(parse_linux_profile_uid(value).is_err(), "{value:?}");
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn linux_profile_uses_the_system_account_database() {
         let uid = unsafe { libc::getuid() };
-        let account = posix::linux_user(uid).unwrap();
+        let account = posix::profile_user(uid).unwrap();
         assert_eq!(account.0, uid);
         assert_ne!(account.1, u32::MAX);
-        assert!(posix::linux_user(u32::MAX - 1).is_err());
+        assert!(posix::profile_user(u32::MAX - 1).is_err());
     }
     #[test]
     fn profile_provisioning_requires_root_before_any_system_write() {
@@ -1316,7 +1487,10 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        assert!(provision(&"a".repeat(64), &"b".repeat(64), "1000").is_err());
+        let error = provision(&"a".repeat(64), &"b".repeat(64), "1000").unwrap_err();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(error, "host_install_root_required");
+        }
     }
     #[test]
     fn nonroot_or_unsupported_installer_phase_refuses_before_any_system_write() {

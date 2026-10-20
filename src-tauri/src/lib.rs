@@ -1,4 +1,7 @@
+mod apple_photos;
 pub mod connection;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub mod controller_session;
 pub mod copy_source;
 pub mod copy_upload;
 mod credential_lock;
@@ -6,6 +9,7 @@ mod credentials;
 mod host_commands;
 pub mod host_control;
 mod host_database;
+pub mod host_epochs;
 pub mod host_install;
 pub mod host_runtime;
 mod host_setup;
@@ -26,7 +30,7 @@ pub mod native_runtime;
 mod package_lease;
 pub mod photo_sources;
 mod process_tree;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod profile_elevation;
 pub mod release_policy;
 mod resource_policy;
@@ -422,6 +426,8 @@ pub fn run() {
             host_commands::provision_local_host_profile,
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
+            host_commands::update_local_host,
+            host_commands::recover_local_host_update,
             connect_server,
             restore_connection,
             sign_out,
@@ -431,6 +437,7 @@ pub fn run() {
             control_worker,
             discover_onedrive,
             choose_photo_folder,
+            choose_apple_photos,
             approve_photo_folder,
             photo_source_status,
             revoke_photo_source,
@@ -634,6 +641,22 @@ async fn choose_photo_folder(
 }
 
 #[tauri::command]
+async fn choose_apple_photos(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    count: u32,
+) -> Result<source_consent::SelectedFolder, String> {
+    require_local(&window)?;
+    let generation = app.state::<source_consent::SourceConsent>().generation()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let selection = apple_photos::preview(count)?;
+        app.state::<source_consent::SourceConsent>()
+            .select_photos(generation, selection)
+    })
+    .await
+    .map_err(|_| "photos_metadata_invalid")?
+}
+#[tauri::command]
 async fn photo_source_status(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
@@ -655,6 +678,7 @@ async fn approve_photo_folder(
     state: State<'_, DesktopState>,
     selection_id: Option<String>,
     allow_download: bool,
+    allow_photos_hydration: Option<bool>,
 ) -> Result<source_consent::ConsentView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
@@ -664,13 +688,15 @@ async fn approve_photo_folder(
         if credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?.is_some() {
             return Err("source_remove_previous_approval".into());
         }
-        app.state::<source_consent::SourceConsent>().approve(
-            saved,
-            &identity,
-            &selection,
-            allow_download,
-            |value| credentials::save(source_consent::CREDENTIAL, value),
-        )?
+        app.state::<source_consent::SourceConsent>()
+            .approve_with_hydration(
+                saved,
+                &identity,
+                &selection,
+                allow_download,
+                allow_photos_hydration.unwrap_or(false),
+                |value| credentials::save(source_consent::CREDENTIAL, value),
+            )?
     } else {
         credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
             .ok_or("source_approval_required")?
@@ -761,9 +787,9 @@ async fn control_photo_import(
                 .start(app.clone(), base, saved.clone())
                 .await
         }
-        "approve-upload" => {
+        "approve-upload" | "approve-export" => {
             app.state::<source_import::SourceJobs>()
-                .approve_upload(&base, saved)
+                .approve_budget(&base, saved, action == "approve-export")
                 .await
         }
         "pause" | "cancel" => {

@@ -11,9 +11,19 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
+
+METAL_PACKAGE = "private/frameleaf_desktop_ml"
+METAL_FILES = (
+    "__init__.py",
+    "entry.py",
+    "metal_observer.py",
+    "metal_inference.py",
+    "_frameleaf_coreml_observer.dylib",
+)
 
 
 class BuildError(RuntimeError):
@@ -132,6 +142,8 @@ def manifest(
     architecture: str,
     provider: str,
     module_namespace: str = "immich_ml",
+    *,
+    metal_observer: bool = False,
 ) -> dict:
     relative(python)
     if (
@@ -143,6 +155,11 @@ def manifest(
         or not (
             provider == "CPUExecutionProvider"
             or (
+                provider == "CUDAExecutionProvider"
+                and system in {"windows", "linux"}
+                and architecture == "x86_64"
+            )
+            or (
                 provider == "CoreMLExecutionProvider"
                 and system == "macos"
                 and architecture == "aarch64"
@@ -153,6 +170,18 @@ def manifest(
     files = inventory(root)
     if python not in files:
         raise BuildError("runtime_interpreter_missing")
+    if metal_observer and (
+        system != "macos"
+        or architecture != "aarch64"
+        or provider != "CoreMLExecutionProvider"
+        or module_namespace != "frameleaf_ml"
+        or any(
+            f"{METAL_PACKAGE}/{name}" not in files
+            or not 0 < files[f"{METAL_PACKAGE}/{name}"]["bytes"] <= 4 * 1024 * 1024
+            for name in METAL_FILES
+        )
+    ):
+        raise BuildError("runtime_device_observer_invalid")
     return {
         "schemaVersion": 1,
         "protocolVersion": 1,
@@ -168,7 +197,39 @@ def manifest(
             else {}
         ),
         "files": files,
+        **({"deviceObserver": {"kind": "metal-v1"}} if metal_observer else {}),
     }
+
+
+def stage_metal_observer(payload: Path, component: Path) -> None:
+    files = inventory(component)
+    if set(files) != set(METAL_FILES) | {"provenance.json"}:
+        raise BuildError("runtime_device_observer_inventory_invalid")
+    provenance = json.loads((component / "provenance.json").read_text())
+    fields = dict(
+        zip(
+            METAL_FILES,
+            (
+                "packageInitSha256",
+                "entrySha256",
+                "loaderSha256",
+                "adapterSha256",
+                "librarySha256",
+            ),
+            strict=True,
+        )
+    )
+    if any(
+        files[name]["sha256"] != provenance.get(field) for name, field in fields.items()
+    ):
+        raise BuildError("runtime_device_observer_hash_invalid")
+    destination = payload / METAL_PACKAGE
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in METAL_FILES:
+        target = destination / name
+        shutil.copyfile(component / name, target)
+        if sha256(target) != provenance[fields[name]]:
+            raise BuildError("runtime_device_observer_hash_invalid")
 
 
 def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
@@ -200,7 +261,13 @@ def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
 
 def run(arguments: list[str | Path], *, cwd: Path, env: dict[str, str]) -> str:
     result = subprocess.run(
-        arguments, cwd=cwd, env=env, text=True, capture_output=True, timeout=1200
+        arguments,
+        check=False,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=1200,
     )
     if result.returncode:
         # Only approved, credential-free sources run here; keep detailed tool diagnostics local.
@@ -232,6 +299,7 @@ def git_blob(
         raise BuildError("runtime_source_file_too_large")
     result = subprocess.run(
         [git, "show", f"{revision}:{name}"],
+        check=False,
         cwd=root,
         env=env,
         capture_output=True,
@@ -286,10 +354,12 @@ def source_build_requirements(text: str) -> str:
     return requirement_block(text, "setuptools")
 
 
-def dependency_indexes(system: str, architecture: str) -> list[str]:
-    # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
+def dependency_indexes(system: str, architecture: str, extra: str = "cpu") -> list[str]:
+    if extra not in {"cpu", "cuda"}:
+        raise BuildError("runtime_profile_unknown")
+    # The pinned CUDA extra uses PyPI; the dedicated Linux feed contains CPU wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
-    if system == "linux" and architecture in {"x86_64", "aarch64"}:
+    if extra == "cpu" and system == "linux" and architecture in {"x86_64", "aarch64"}:
         indexes += [
             "--index",
             "https://download.pytorch.org/whl/cpu",
@@ -376,6 +446,12 @@ def build(
             env=env,
         ).splitlines()
         module_namespace = source_package(tracked)
+        metal_observer = profile["provider"] == "CoreMLExecutionProvider"
+        if metal_observer and (
+            module_namespace != "frameleaf_ml"
+            or "machine-learning/frameleaf_ml/native_device.py" not in tracked
+        ):
+            raise BuildError("runtime_observer_source_incompatible")
         uv_version = run([uv, "--version"], cwd=work, env=env)
         if uv_version.split()[1] != profile["uv"]:
             raise BuildError("runtime_uv_version_mismatch")
@@ -480,7 +556,7 @@ def build(
                     if build_tools.stat().st_size
                     else []
                 ),
-                *dependency_indexes(system, architecture),
+                *dependency_indexes(system, architecture, profile["extra"]),
                 "-r",
                 requirements,
             ],
@@ -518,6 +594,19 @@ def build(
             target = site / Path(name).relative_to("machine-learning")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(git_blob(git, source, revision, name, env))
+        if metal_observer:
+            component = work / "metal-observer"
+            run(
+                [
+                    sys.executable,
+                    Path(__file__).with_name("build_coreml_observer.py"),
+                    "--output",
+                    component,
+                ],
+                cwd=work,
+                env=env,
+            )
+            stage_metal_observer(payload, component)
         notices = payload / "licenses"
         notices.mkdir()
         (notices / "Frameleaf-AGPL-3.0.txt").write_bytes(
@@ -561,9 +650,11 @@ def build(
                     "-I",
                     "-B",
                     "-c",
-                    "import json,sys,onnxruntime; "
-                    f"import {module_namespace}.native_runtime,{module_namespace}.native_qualification; "
-                    "print(json.dumps({'prefix':sys.prefix,'providers':onnxruntime.get_available_providers()}))",
+                    (
+                        "import json,sys,onnxruntime; "
+                        f"import {module_namespace}.native_runtime,{module_namespace}.native_qualification; "
+                        "print(json.dumps({'prefix':sys.prefix,'providers':onnxruntime.get_available_providers()}))"
+                    ),
                 ],
                 cwd=work,
                 env=smoke_env,
@@ -583,6 +674,7 @@ def build(
             architecture,
             profile["provider"],
             module_namespace,
+            metal_observer=metal_observer,
         )
         (bundle / "manifest.json").write_text(
             json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"

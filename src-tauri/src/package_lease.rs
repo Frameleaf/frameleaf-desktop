@@ -203,7 +203,7 @@ impl Maintenance {
             _lease: file,
         })
     }
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     pub(crate) fn fence(&self) -> Result<(), String> {
         let file = open(&self.candidate, FENCE, true)?;
         file.sync_all()
@@ -216,7 +216,7 @@ impl Maintenance {
             _ => Err("host_package_maintenance".into()),
         }
     }
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     pub(crate) fn finish(&self) -> Result<(), String> {
         match fs::symlink_metadata(self.candidate.join(FENCE)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

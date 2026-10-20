@@ -1,5 +1,6 @@
 import hashlib
 import os
+import plistlib
 import shlex
 import subprocess
 import tempfile
@@ -22,7 +23,8 @@ class MacHostInstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             marker = root / 'called'
-            helper = root / 'frameleaf-native-host'
+            helper = root / 'Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host'
+            helper.parent.mkdir(parents=True)
             helper.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > ' + shlex.quote(str(marker)) + '\n')
             helper.chmod(0o755)
             for name, text in installer_scripts('a' * 64, 'b' * 64).items():
@@ -57,8 +59,52 @@ class MacHostInstallerTests(unittest.TestCase):
             self.assertEqual((runtime / 'payload' / 'node').read_bytes(), b'synthetic node')
             self.assertEqual((runtime / 'payload' / 'node').stat().st_mode & 0o777, 0o755)
             self.assertEqual((candidate / 'payload' / 'node').stat().st_mode & 0o777, 0o700)
-            self.assertEqual((base / 'Controllers' / ('a' * 64) / digest / 'frameleaf-native-host').read_bytes(), helper.read_bytes())
+            self.assertEqual((base / 'Controllers' / ('a' * 64) / digest / 'Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host').read_bytes(), helper.read_bytes())
             self.assertEqual(list((base / 'Profiles').iterdir()), [])
-            self.assertEqual((out / 'scripts' / 'frameleaf-native-host').read_bytes(), helper.read_bytes())
+            self.assertEqual((out / 'scripts/Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host').read_bytes(), helper.read_bytes())
             with self.assertRaises(BuildError):
                 stage_package(candidate, helper, out, 'a' * 64, digest)
+
+    def test_installer_uses_same_app_like_controller_in_payload_and_bootstrap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            candidate = root / 'candidate'
+            (candidate / 'payload').mkdir(parents=True)
+            (candidate / 'payload/node').write_bytes(b'node')
+            for name in ['manifest.json', 'manifest.sig']:
+                (candidate / name).write_bytes(b'fixture')
+            helper = root / 'controller'
+            helper.write_bytes(b'controller')
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            out = root / 'out'
+            stage_package(candidate, helper, out, 'a' * 64, digest)
+            suffix = Path('Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host')
+            version = out / 'root/Library/Application Support/Frameleaf/Controllers' / ('a' * 64) / digest
+            self.assertEqual((version / suffix).read_bytes(), helper.read_bytes())
+            self.assertEqual((out / 'scripts' / suffix).read_bytes(), helper.read_bytes())
+            self.assertEqual((version / suffix.parent.parent / 'Info.plist').read_bytes(), (out / 'scripts' / suffix.parent.parent / 'Info.plist').read_bytes())
+            self.assertFalse((version / 'frameleaf-native-host').exists())
+            self.assertIn('/Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host', (out / 'scripts/postinstall').read_text())
+
+    def test_package_pins_the_only_bundle_without_relocation_or_version_skipping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            candidate = root / 'candidate'
+            (candidate / 'payload').mkdir(parents=True)
+            (candidate / 'payload/node').write_bytes(b'synthetic node')
+            for name in ['manifest.json', 'manifest.sig']:
+                (candidate / name).write_bytes(b'synthetic metadata')
+            controller = root / 'controller'
+            controller.write_bytes(b'synthetic controller')
+            digest = hashlib.sha256(controller.read_bytes()).hexdigest()
+            out = root / 'out'
+            stage_package(candidate, controller, out, 'a' * 64, digest)
+            policy = out / 'components.plist'
+            self.assertTrue(policy.is_file(), 'component bundle policy is missing')
+            self.assertEqual(plistlib.loads(policy.read_bytes()), [{
+                'RootRelativeBundlePath': f'Library/Application Support/Frameleaf/Controllers/{"a" * 64}/{digest}/Frameleaf Native Host.app',
+                'BundleIsRelocatable': False,
+                'BundleIsVersionChecked': False,
+                'BundleHasStrictIdentifier': True,
+                'BundleOverwriteAction': 'upgrade',
+            }])

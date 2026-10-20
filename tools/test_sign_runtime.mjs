@@ -14,6 +14,36 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { signCandidate } from "./sign_runtime.mjs";
 
+test("signed Metal selection requires the fixed private package and rejects arbitrary entrypoints", async (t) => {
+  const f = await fixture(t);
+  const profile = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles["coreml-ort"];
+  const put = async (name, value) => {
+    const bytes = Buffer.from(value);
+    await mkdir(join(f.root, "payload", name, ".."), { recursive: true });
+    await writeFile(join(f.root, "payload", name), bytes);
+    f.manifest.files[name] = { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+  };
+  await put("provenance.json", JSON.stringify({ schemaVersion: 1, sourceRevision: profile.sourceRevision, sourceRepository: "Frameleaf/frameleaf-app", profile: "coreml-ort", python: profile.python }));
+  for (const name of ["__init__.py", "entry.py", "metal_observer.py", "metal_inference.py", "_frameleaf_coreml_observer.dylib"])
+    await put(`private/frameleaf_desktop_ml/${name}`, "owned fixture");
+  Object.assign(f.manifest, { provider: "CoreMLExecutionProvider", platform: "macos", architecture: "aarch64", moduleNamespace: "frameleaf_ml", sourceRevision: profile.sourceRevision, deviceObserver: { kind: "metal-v1" } });
+  const authored = structuredClone(f.manifest);
+  await writeFile(join(f.root, "manifest.json"), JSON.stringify(authored));
+  await signCandidate(f.root, join(f.root, "valid.sig"), f.privatePem, f.policy);
+  const malformed = [
+    { ...authored, deviceObserver: { kind: "arbitrary-module" } },
+    { ...authored, deviceObserver: { kind: "metal-v1", module: "os" } },
+    { ...authored, moduleNamespace: "immich_ml" },
+    { ...authored, architecture: "x86_64" },
+    { ...authored, provider: "CPUExecutionProvider" },
+    { ...authored, files: Object.fromEntries(Object.entries(authored.files).filter(([name]) => !name.endsWith("/entry.py"))) },
+  ];
+  for (let index = 0; index < malformed.length; index++) {
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(malformed[index]));
+    await assert.rejects(signCandidate(f.root, join(f.root, `invalid-${index}.sig`), f.privatePem, f.policy), /runtime_device_observer_invalid/);
+  }
+});
+
 async function fixture(t) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "frameleaf-sign-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -57,6 +87,7 @@ async function fixture(t) {
   const policy = {
     schemaVersion: 1,
     minimumRuntimeEpoch: 2,
+    minimumHostEpoch: 999,
     keys: [
       {
         id: "fixture",
@@ -414,7 +445,7 @@ test("current CPU source packages only on its qualified Linux and macOS ARM64 ta
     if (!["linux-aarch64", "macos-aarch64"].includes(target))
       assert(!sources.includes(source));
   }
-  assert.equal(profiles["coreml-ort"].additionalSources, undefined);
+  assert(!Object.values(profiles["coreml-ort"].additionalSources ?? {}).flat().includes(source));
   const f = await fixture(t);
   const provenance = JSON.parse(
     await readFile(join(f.root, "payload/provenance.json"), "utf8"),
@@ -447,4 +478,101 @@ test("current CPU source packages only on its qualified Linux and macOS ARM64 ta
     config.bundle.resources[join(f.root, "payload")],
     "native-runtime/payload",
   );
+});
+
+test("CUDA authoring signs only its declared desktop targets and provenance", async (t) => {
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  const profiles = JSON.parse(
+    await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
+  ).profiles;
+  const authored = profiles["cuda-ort"];
+  assert.equal(authored.extra, "cuda");
+  assert.deepEqual(authored.targets, ["windows-x86_64", "linux-x86_64"]);
+  for (const [platform, architecture, allowed] of [
+    ["windows", "x86_64", true],
+    ["linux", "x86_64", true],
+    ["macos", "aarch64", false],
+    ["windows", "aarch64", false],
+    ["linux", "aarch64", false],
+  ]) {
+    const f = await fixture(t);
+    const provenance = {
+      schemaVersion: 1,
+      sourceRevision: authored.sourceRevision,
+      sourceRepository: "Frameleaf/frameleaf-app",
+      profile: "cuda-ort",
+      python: authored.python,
+    };
+    const bytes = Buffer.from(JSON.stringify(provenance));
+    await writeFile(join(f.root, "payload/provenance.json"), bytes);
+    Object.assign(f.manifest, {
+      platform, architecture, provider: "CUDAExecutionProvider",
+      sourceRevision: authored.sourceRevision,
+    });
+    f.manifest.files["provenance.json"] = {
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    const sign = () => signCandidate(
+      f.root, join(f.root, "manifest.sig"), f.privatePem, f.policy,
+    );
+    if (!allowed) {
+      await assert.rejects(sign(), /runtime_profile_unapproved/);
+      continue;
+    }
+    await sign();
+    assert(verify(
+      null, await readFile(join(f.root, "manifest.json")), f.keys.publicKey,
+      await readFile(join(f.root, "manifest.sig")),
+    ));
+    const host = { win32: "windows", linux: "linux", darwin: "macos" }[process.platform];
+    if (host === platform && process.arch === "x64") {
+      const config = await packageConfiguration(f.root, f.policy);
+      assert.equal(config.bundle.resources[join(f.root, "payload")], "native-runtime/payload");
+    } else {
+      await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_target_mismatch/);
+    }
+  }
+  const f = await fixture(t);
+  Object.assign(f.manifest, {
+    platform: "windows", architecture: "x86_64", provider: "CUDAExecutionProvider",
+  });
+  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+  await assert.rejects(
+    signCandidate(f.root, join(f.root, "manifest.sig"), f.privatePem, f.policy),
+    /runtime_provenance_invalid/,
+  );
+});
+
+
+test("current CoreML desktop source packages only on qualified macOS ARM64", async (t) => {
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
+  const source = "b7b5756a3f9eaeec9e977460ab654cbbadee87e7";
+  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source] });
+  for (const [revision, provider, allowed] of [
+    [source, "CoreMLExecutionProvider", true],
+    ["db72dcde18d3a4ff4ab5cfed3fb650a6b3629353", "CoreMLExecutionProvider", false],
+    ["f".repeat(40), "CoreMLExecutionProvider", false],
+    [source, "CPUExecutionProvider", false],
+  ]) {
+    const f = await fixture(t);
+    const provenance = { schemaVersion: 1, sourceRepository: "Frameleaf/frameleaf-app", sourceRevision: revision,
+      profile: provider === "CoreMLExecutionProvider" ? "coreml-ort" : "cpu-ort", python: "3.12.13" };
+    const bytes = Buffer.from(JSON.stringify(provenance));
+    await writeFile(join(f.root, "payload/provenance.json"), bytes);
+    Object.assign(f.manifest, { platform: "macos", architecture: "aarch64", provider, sourceRevision: revision, moduleNamespace: "frameleaf_ml" });
+    f.manifest.files["provenance.json"] = { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    await signCandidate(f.root, join(f.root, "manifest.sig"), f.privatePem, f.policy);
+    if (process.platform !== "darwin" || process.arch !== "arm64") {
+      await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_target_mismatch/);
+    } else if (!allowed) {
+      await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_source_unapproved/);
+    } else {
+      const config = await packageConfiguration(f.root, f.policy);
+      assert.equal(config.bundle.resources[join(f.root, "payload")], "native-runtime/payload");
+    }
+  }
 });

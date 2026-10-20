@@ -1,4 +1,5 @@
 //! Private owner-pipe bridge for Manager. No listener, server token, shell command or PID authority.
+use crate::host_epochs::HostEpochAuthority;
 use crate::{native_runtime, release_policy};
 use serde::Deserialize;
 use serde_json::json;
@@ -21,6 +22,7 @@ struct Config {
     #[serde(default)]
     mode: crate::host_runtime::HostMode,
     installation_id: String,
+    secure_installation_id: String,
     candidate: PathBuf,
     state: PathBuf,
     manifest_sha256: String,
@@ -36,6 +38,7 @@ impl Drop for Config {
 fn config(raw: &[u8]) -> Result<Config, String> {
     let config: Config = serde_json::from_slice(raw).map_err(|_| "host_control_config_invalid")?;
     if config.protocol_version != 1
+        || !crate::host_state::valid_installation_id(&config.secure_installation_id)
         || !native_runtime::digest_valid(&config.installation_id, 12)
         || [&config.candidate, &config.state].iter().any(|path| {
             !path.is_absolute()
@@ -66,9 +69,22 @@ fn config(raw: &[u8]) -> Result<Config, String> {
 struct Inspection {
     protocol_version: u32,
     installation_id: String,
+    secure_installation_id: String,
     candidate: PathBuf,
     state: PathBuf,
     manifest_sha256: String,
+}
+fn require_expected_identity(
+    expected: &str,
+    read: impl FnOnce() -> Result<String, String>,
+) -> Result<(), String> {
+    if !crate::host_state::valid_installation_id(expected) {
+        return Err("host_controller_identity_invalid".into());
+    }
+    if read()? != expected {
+        return Err("host_controller_identity_changed".into());
+    }
+    Ok(())
 }
 fn physical_id(path: &Path) -> Result<String, String> {
     let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(path)?);
@@ -135,6 +151,7 @@ pub fn inspect_owner() -> Result<(), String> {
     let request: Inspection =
         serde_json::from_slice(&raw).map_err(|_| "host_control_config_invalid")?;
     if request.protocol_version != 1
+        || !crate::host_state::valid_installation_id(&request.secure_installation_id)
         || !native_runtime::digest_valid(&request.installation_id, 12)
         || !native_runtime::digest_valid(&request.manifest_sha256, 64)
         || [&request.candidate, &request.state].iter().any(|path| {
@@ -153,11 +170,16 @@ pub fn inspect_owner() -> Result<(), String> {
         return Err("host_control_config_invalid".into());
     }
     separate_paths(&request.candidate, &request.state)?;
-    let mut owner = crate::host_state::Owner::acquire(&request.state, false)?;
     let runtime = verify_candidate(&request.candidate, &request.manifest_sha256)?;
+    require_expected_identity(&request.secure_installation_id, || {
+        crate::credentials::CredentialEpochAuthority.installation_id()
+    })?;
+    let mut owner =
+        crate::host_state::Owner::acquire(&request.state, false, &request.secure_installation_id)?;
     let marker = owner.inspect(&request.installation_id, &request.manifest_sha256)?;
     emit(
         json!({"protocolVersion":1,"state":"quiescent","installationId":marker.installation_id,
+        "secureInstallationId":request.secure_installation_id,
         "manifestSha256":runtime.manifest_sha256(),"sourceRevision":runtime.source_revision(),
         "certified":runtime.certified(),"profileIdentity":marker.profile_identity,"generation":marker.generation}),
     )
@@ -404,7 +426,11 @@ pub fn run() -> Result<(), String> {
         }
         candidate_file(&config.state.join("host-state.json"), 4096)?;
     }
-    let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
+    require_expected_identity(&config.secure_installation_id, || {
+        crate::credentials::CredentialEpochAuthority.installation_id()
+    })?;
+    let mut owner =
+        crate::host_state::Owner::acquire(&config.state, true, &config.secure_installation_id)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
@@ -413,18 +439,24 @@ pub fn run() -> Result<(), String> {
     } else {
         crate::host_storage::check(&config.state)?;
     }
-    owner.activate(
-        &config.installation_id,
-        &config.manifest_sha256,
-        config.mode,
+    let execution = crate::host_epochs::HostExecution::new(
+        &crate::credentials::CredentialEpochAuthority,
+        &config.secure_installation_id,
     )?;
+    execution.with_admitted(&runtime, &mut || {
+        owner.activate(
+            &config.installation_id,
+            &config.manifest_sha256,
+            config.mode,
+        )
+    })?;
     let mut process = runtime.start_mode(
         &config.state,
         &password,
-        config.database_port,
-        config.api_port,
+        (config.database_port, config.api_port),
         config.mode,
         Some(&mut owner),
+        &execution,
     )?;
     if !process.wait_ready_or_cancel(Duration::from_secs(240), &cancelled)? {
         owner.clean_stop()?;
@@ -432,6 +464,7 @@ pub fn run() -> Result<(), String> {
     }
     if emit(
         json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
+        "secureInstallationId":config.secure_installation_id,
         "sourceRevision":runtime.source_revision(),"certified":runtime.certified()}),
     )
     .is_err()
@@ -773,12 +806,50 @@ mod tests {
     }
 
     #[test]
+    fn expected_identity_must_match_before_authority_can_be_used() {
+        let expected = "11111111-1111-4111-8111-111111111111";
+        for invalid in [
+            "",
+            "aabbccddeeff",
+            "00000000-0000-0000-0000-000000000000",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ] {
+            assert!(require_expected_identity(invalid, || panic!(
+                "invalid expected UUID must not read credentials"
+            ))
+            .is_err());
+        }
+        assert!(require_expected_identity(expected, || Ok(expected.into())).is_ok());
+        for actual in ["22222222-2222-4222-8222-222222222222", "", "malformed"] {
+            assert_eq!(
+                require_expected_identity(expected, || Ok(actual.into())).unwrap_err(),
+                "host_controller_identity_changed"
+            );
+        }
+        for error in [
+            "credential_store_locked_or_unavailable",
+            "credential_record_missing",
+        ] {
+            assert_eq!(
+                require_expected_identity(expected, || Err(error.into())).unwrap_err(),
+                error
+            );
+        }
+    }
+
+    #[test]
     fn controller_configuration_cannot_expand_authority_or_accept_invalid_identity() {
         let root = std::env::temp_dir().canonicalize().unwrap();
-        let good = json!({"protocolVersion":1,"installationId":"a".repeat(12),"candidate":root.join("candidate"),"state":root.join("state"),
+        let good = json!({"protocolVersion":1,"installationId":"a".repeat(12),"secureInstallationId":"11111111-1111-4111-8111-111111111111","candidate":root.join("candidate"),"state":root.join("state"),
             "manifestSha256":"a".repeat(64),"password":"synthetic-password-long-enough",
             "databasePort":54321,"apiPort":54322});
         assert!(config(&serde_json::to_vec(&good).unwrap()).is_ok());
+        let mut legacy = good.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("secureInstallationId");
+        assert!(config(&serde_json::to_vec(&legacy).unwrap()).is_err());
         assert_eq!(
             config(&serde_json::to_vec(&good).unwrap()).unwrap().mode,
             crate::host_runtime::HostMode::Server
@@ -819,6 +890,15 @@ mod tests {
         };
         for (field, value) in [
             ("protocolVersion", json!(2)),
+            ("secureInstallationId", json!(null)),
+            (
+                "secureInstallationId",
+                json!("00000000-0000-0000-0000-000000000000"),
+            ),
+            (
+                "secureInstallationId",
+                json!("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"),
+            ),
             ("candidate", json!("relative")),
             ("state", json!("relative")),
             ("state", parent_path("state")),

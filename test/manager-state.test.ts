@@ -37,6 +37,12 @@ test('remote or native diagnostic text is never echoed as a UI error',()=>{
  assert.match(managerError('credential_store_locked_or_unavailable'),/unlock/i);
  assert.ok(!managerError('private-token-in-a-diagnostic').includes('private-token'));
 });
+test('account creation failures explain validation and existing-account recovery without raw diagnostics',()=>{
+ assert.match(managerError('manager_account_exists'),/account.*already|already.*account/i);
+ assert.match(managerError('manager_account_exists'),/sign in/i);
+ assert.match(managerError('manager_account_details_invalid'),/name/i);
+ assert.match(managerError('manager_account_creation_failed'),/signing in|sign in/i);
+});
 test('prototype property names cannot become UI error content',()=>{
  for(const code of ['constructor','toString','__proto__'])assert.equal(typeof managerError(code),'string');
 });

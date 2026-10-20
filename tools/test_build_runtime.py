@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,100 @@ spec.loader.exec_module(builder)
 
 
 class RuntimeBuilderTests(unittest.TestCase):
+    def test_metal_component_staging_checks_hashes_and_keeps_entrypoint_in_private_package(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            component = root / "component"
+            component.mkdir()
+            fields = {
+                "__init__.py": "packageInitSha256",
+                "entry.py": "entrySha256",
+                "metal_observer.py": "loaderSha256",
+                "metal_inference.py": "adapterSha256",
+                "_frameleaf_coreml_observer.dylib": "librarySha256",
+            }
+            provenance = {}
+            for name, field in fields.items():
+                (component / name).write_bytes(b"owned fixture")
+                provenance[field] = builder.sha256(component / name)
+            (component / "provenance.json").write_text(json.dumps(provenance))
+            payload = root / "payload"
+            payload.mkdir()
+            builder.stage_metal_observer(payload, component)
+            self.assertEqual(
+                set(builder.inventory(payload)),
+                {"private/frameleaf_desktop_ml/" + name for name in fields},
+            )
+            self.assertEqual(
+                (payload / "private/frameleaf_desktop_ml/entry.py").read_bytes(),
+                b"owned fixture",
+            )
+            (component / "entry.py").write_bytes(b"changed")
+            fresh = root / "fresh"
+            fresh.mkdir()
+            with self.assertRaises(builder.BuildError):
+                builder.stage_metal_observer(fresh, component)
+            self.assertFalse((fresh / "private").exists())
+
+    def test_metal_manifest_requires_fixed_signed_entrypoint_files_and_namespace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "python").write_bytes(b"fixture")
+            names = [
+                "__init__.py",
+                "entry.py",
+                "metal_observer.py",
+                "metal_inference.py",
+                "_frameleaf_coreml_observer.dylib",
+            ]
+            package = root / "private/frameleaf_desktop_ml"
+            package.mkdir(parents=True)
+            for name in names:
+                (package / name).write_bytes(b"fixture")
+            value = builder.manifest(
+                root,
+                "python",
+                "a" * 40,
+                7,
+                "macos",
+                "aarch64",
+                "CoreMLExecutionProvider",
+                "frameleaf_ml",
+                metal_observer=True,
+            )
+            self.assertEqual(value["deviceObserver"], {"kind": "metal-v1"})
+            for provider, namespace in [
+                ("CPUExecutionProvider", "frameleaf_ml"),
+                ("CoreMLExecutionProvider", "immich_ml"),
+            ]:
+                with self.assertRaises(builder.BuildError):
+                    builder.manifest(
+                        root,
+                        "python",
+                        "a" * 40,
+                        7,
+                        "macos",
+                        "aarch64",
+                        provider,
+                        namespace,
+                        metal_observer=True,
+                    )
+            (package / "entry.py").unlink()
+            with self.assertRaises(builder.BuildError):
+                builder.manifest(
+                    root,
+                    "python",
+                    "a" * 40,
+                    7,
+                    "macos",
+                    "aarch64",
+                    "CoreMLExecutionProvider",
+                    "frameleaf_ml",
+                    metal_observer=True,
+                )
+
     def test_source_build_exception_is_only_used_by_the_locked_legacy_dependency(self):
         setuptools = "setuptools==80.9.0 --hash=sha256:" + "a" * 64 + "\n"
         antlr = "antlr4-python3-runtime==4.9.3 --hash=sha256:" + "b" * 64 + "\n"
@@ -74,6 +169,48 @@ class RuntimeBuilderTests(unittest.TestCase):
                     "CPUExecutionProvider",
                     "foreign",
                 )
+
+    def test_cuda_manifest_is_limited_to_windows_and_linux_x86_64(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "python").write_bytes(b"fixture")
+            for system in ["windows", "linux"]:
+                value = builder.manifest(
+                    root,
+                    "python",
+                    "a" * 40,
+                    7,
+                    system,
+                    "x86_64",
+                    "CUDAExecutionProvider",
+                )
+                self.assertEqual(value["provider"], "CUDAExecutionProvider")
+                self.assertEqual(value["files"], builder.inventory(root))
+            for system, architecture in [
+                ("macos", "aarch64"),
+                ("macos", "x86_64"),
+                ("windows", "aarch64"),
+                ("linux", "aarch64"),
+            ]:
+                with self.assertRaises(builder.BuildError):
+                    builder.manifest(
+                        root,
+                        "python",
+                        "a" * 40,
+                        7,
+                        system,
+                        architecture,
+                        "CUDAExecutionProvider",
+                    )
+
+    def test_cuda_dependency_sources_do_not_substitute_linux_cpu_wheels(self):
+        for system in ["windows", "linux"]:
+            self.assertEqual(
+                builder.dependency_indexes(system, "x86_64", "cuda"),
+                ["--default-index", "https://pypi.org/simple"],
+            )
+        with self.assertRaises(builder.BuildError):
+            builder.dependency_indexes("linux", "x86_64", "foreign")
 
     def test_coreml_manifest_is_limited_to_apple_silicon_macos(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -240,9 +377,9 @@ if __name__ == "__main__":
 
 class RuntimeFailureReceiptTests(unittest.TestCase):
     def test_inventory_reports_the_exact_case_collision(self):
+        import stat
         from types import SimpleNamespace
         from unittest.mock import patch
-        import stat
 
         root = Path("fixture")
         with (
@@ -255,11 +392,11 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 return_value=SimpleNamespace(st_mode=stat.S_IFREG, st_size=1),
             ),
             patch.object(builder, "sha256", return_value="a" * 64),
-        ):
-            with self.assertRaisesRegex(
+            self.assertRaisesRegex(
                 builder.BuildError, "runtime_case_collision.*python.h"
-            ):
-                builder.inventory(root)
+            ),
+        ):
+            builder.inventory(root)
 
     def test_private_headless_python_omits_terminal_database_but_keeps_licences(self):
         with tempfile.TemporaryDirectory() as temporary:

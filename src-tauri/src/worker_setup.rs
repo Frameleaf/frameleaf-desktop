@@ -897,13 +897,16 @@ async fn prepare(
                 }) {
                     continue 'qualification;
                 }
-                progress.set("working", None);
                 let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
                 let completed = cancellable(async {
                     tokio::select! {
                         biased;
                         reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
-                        result = predictor.execute_next_many(&worker, &accepted, &mut cancel) => result,
+                        result = async {
+                            predictor.prepare(&worker, &mut cancel).await?;
+                            progress.set("working", None);
+                            predictor.execute_next_many(&worker, &accepted, &mut cancel).await
+                        } => result,
                     }
                 }, &progress.cancelled).await;
                 match completed {

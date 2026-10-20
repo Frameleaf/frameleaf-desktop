@@ -46,6 +46,40 @@ class WindowsDataDllTests(unittest.TestCase):
 
 
 class WindowsDatabaseTests(unittest.TestCase):
+    def test_bundled_vc_runtime_retains_its_approved_license(self):
+        license_file = Path(__file__).resolve().parent.parent / 'runtime/licenses/microsoft-vc-runtime-2015-2022.docx'
+        for name in ['VCRUNTIME140.dll', 'msvcp140_atomic_wait.dll', 'icu.dll']:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                prefix, dependencies = root / 'pg', root / 'dependencies'
+                (prefix / 'bin').mkdir(parents=True)
+                (dependencies / 'bin').mkdir(parents=True)
+                (dependencies / 'bin' / name).write_bytes(b'synthetic private DLL')
+                with patch('build_host_database_windows.run', return_value='  KERNEL32.dll'):
+                    stage_dependencies(prefix, dependencies, 'dumpbin', {})
+                notice = prefix / 'licenses/microsoft-vc-runtime/LICENSE.docx'
+                if name != 'icu.dll':
+                    self.assertEqual(notice.read_bytes(), license_file.read_bytes())
+                else:
+                    self.assertFalse(notice.exists())
+
+    def test_changed_vc_runtime_license_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix, dependencies = root / 'pg', root / 'dependencies'
+            (prefix / 'bin').mkdir(parents=True)
+            (dependencies / 'bin').mkdir(parents=True)
+            (dependencies / 'bin/vcruntime140.dll').write_bytes(b'synthetic private DLL')
+            notice = root / 'runtime/licenses/microsoft-vc-runtime-2015-2022.docx'
+            notice.parent.mkdir(parents=True)
+            notice.write_bytes(b'changed terms')
+            with (
+                patch('build_host_database_windows.ROOT', root),
+                patch('build_host_database_windows.run', return_value='  KERNEL32.dll'),
+                self.assertRaisesRegex(BuildError, 'host_database_vc_license_changed'),
+            ):
+                stage_dependencies(prefix, dependencies, 'dumpbin', {})
+
     def test_private_pkgconf_wins_over_strawberry_pkg_config(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

@@ -24,6 +24,7 @@ pub(crate) fn manager_certificate_fingerprint(
     manager::certificate_fingerprint(&pem)
 }
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Named Tauri IPC fields preserve existing callers.
 pub(crate) async fn pair_manager(
     window: WebviewWindow,
     app: tauri::AppHandle,
@@ -32,6 +33,7 @@ pub(crate) async fn pair_manager(
     certificate: Option<manager::CertificateTrust>,
     allow_management: bool,
     allow_recovery: bool,
+    allow_updates: Option<bool>,
 ) -> Result<manager::View, String> {
     require_local(&window)?;
     if !allow_management {
@@ -55,6 +57,7 @@ pub(crate) async fn pair_manager(
         password,
         certificate,
         allow_recovery,
+        allow_updates.unwrap_or(false),
         |saved| credentials::save(manager::CREDENTIAL, saved),
     )
     .await

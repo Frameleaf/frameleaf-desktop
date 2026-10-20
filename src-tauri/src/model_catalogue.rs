@@ -1062,25 +1062,22 @@ mod tests {
             let name = raw["modelName"].as_str().unwrap();
             let entries = &raw["spec"]["entries"];
             let source = raw["runtimeSourceRevision"].as_str().unwrap();
-            let selected = approved_profile(name, entries, source, "CPUExecutionProvider")
+            let provider = raw["spec"]["provider"].as_str().unwrap();
+            let selected = approved_profile(name, entries, source, provider)
                 .unwrap()
                 .unwrap();
             assert_eq!(selected.model_key(), raw["modelKey"].as_str().unwrap());
             assert!(
-                approved_profile("ViT-B-32__openai", entries, source, "CPUExecutionProvider")
+                approved_profile("ViT-B-32__openai", entries, source, provider)
                     .unwrap()
                     .is_none()
             );
-            assert!(
-                approved_profile(name, &json!({}), source, "CPUExecutionProvider")
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                approved_profile(name, entries, &"0".repeat(40), "CPUExecutionProvider")
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(approved_profile(name, &json!({}), source, provider)
+                .unwrap()
+                .is_none());
+            assert!(approved_profile(name, entries, &"0".repeat(40), provider)
+                .unwrap()
+                .is_none());
             assert!(
                 approved_profile(name, entries, source, "CUDAExecutionProvider")
                     .unwrap()
@@ -1139,7 +1136,7 @@ mod tests {
     fn pr274_profiles_preserve_every_legacy_profile_and_use_distinct_new_identities() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 21);
+        assert_eq!(profiles.len(), 27);
         let legacy = Value::Array(profiles[..11].to_vec());
         assert_eq!(
             digest(&serde_json_canonicalizer::to_vec(&legacy).unwrap()),
@@ -1185,6 +1182,12 @@ mod tests {
             "31337c0063a85bdf957d27ef7ec581b34e65ee4a73f53215c238ff2c9342d40c",
             "75d39bab3c7ce04a0b3864ae8eb420664970faa66ab2f55a82c043a8d4c9ebc1",
             "eae6ee5d7291fec288026e79094c294de27187f769310e373625e80a18bab1c2",
+            "e60c7be1967dfa9f38df396ed3b3f2bcf4e309ba3e02290933a4f6d4e7419165",
+            "b218ecbe1dceac1f7dbe68f3ffd3558ae452964b42a46154c965e474e36a836f",
+            "c89f6440a4462fb75aaab690b76552b817ff7abd8d481df87e5662524eafaab8",
+            "546549421b4d0dc3f4a8601db9207befd4d82e3ecb9e0ad52849ed3199441be4",
+            "b2af0f4cba01a87d6b656a69f4aa7ab3cddba1bfb0bda4d4340c8ce484e16ef0",
+            "7b744d6547e885abcfdd845f914fe858bd5e13321783af9c3b26f679fdf95f76",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
@@ -1206,8 +1209,8 @@ mod tests {
             "2e8b52cf4107668d2df47eb0564398028cb75502d766a3403b4201a41c7b03a1"
         );
         let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
-        assert_eq!(profiles[16..].len(), 5);
-        for profile in &profiles[16..] {
+        assert_eq!(profiles[16..21].len(), 5);
+        for profile in &profiles[16..21] {
             assert_eq!(profile["runtimeSourceRevision"], source);
             assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
             assert_eq!(
@@ -1228,5 +1231,117 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+    #[test]
+    fn coreml_profiles_preserve_cpu_bindings_and_require_the_complete_clip_group() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        assert_eq!(profiles.len(), 27);
+        assert_eq!(
+            digest(
+                &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..21].to_vec())).unwrap()
+            ),
+            "93fe12352a13ce0f09ce231eabc2dd9e0fe5d2903f3a48dffba29e23ddc5b6c0"
+        );
+        let source = "db72dcde18d3a4ff4ab5cfed3fb650a6b3629353";
+        let selected = setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            source,
+            "CoreMLExecutionProvider",
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 3);
+        let keys: Vec<_> = selected
+            .iter()
+            .map(|profile| profile.model_key().to_owned())
+            .collect();
+        assert_eq!(
+            inventory_group("clip", &keys, source, "CoreMLExecutionProvider")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            inventory_group("clip", &keys[..2], source, "CoreMLExecutionProvider")
+                .unwrap()
+                .is_empty()
+        );
+        for provider in ["CPUExecutionProvider", "CUDAExecutionProvider"] {
+            assert!(
+                setup_profiles("ViT-B-16-SigLIP-384__webli", source, provider)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for (gpu, cpu) in profiles[21..24].iter().zip(&profiles[16..19]) {
+            for field in [
+                "modelKey",
+                "modelName",
+                "modelSnapshotRevision",
+                "fixtureBase64",
+                "artifactBytes",
+                "embeddingDimensions",
+            ] {
+                assert_eq!(gpu[field], cpu[field]);
+            }
+            let mut expected = cpu["spec"].clone();
+            expected["provider"] = json!("CoreMLExecutionProvider");
+            assert_eq!(gpu["spec"], expected);
+        }
+    }
+    #[test]
+    fn current_main_coreml_profiles_preserve_every_prior_binding() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        assert_eq!(catalogue["epoch"], 9);
+        assert_eq!(profiles.len(), 27);
+        assert_eq!(
+            digest(
+                &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..24].to_vec())).unwrap()
+            ),
+            "6e96b5643ee2da45f19a9ca0a7a2de20645cea56e1811f6a3cb8e12e8e5b9086"
+        );
+        let source = "b7b5756a3f9eaeec9e977460ab654cbbadee87e7";
+        let selected = setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            source,
+            "CoreMLExecutionProvider",
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 3);
+        let keys: Vec<_> = selected
+            .iter()
+            .map(|profile| profile.model_key().to_owned())
+            .collect();
+        assert_eq!(
+            inventory_group("clip", &keys, source, "CoreMLExecutionProvider")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            inventory_group("clip", &keys[..2], source, "CoreMLExecutionProvider")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            setup_profiles("ViT-B-16-SigLIP-384__webli", source, "CPUExecutionProvider")
+                .unwrap()
+                .is_empty()
+        );
+        for (current, old) in profiles[24..].iter().zip(&profiles[21..24]) {
+            let mut expected = old.clone();
+            expected["runtimeSourceRevision"] = json!(source);
+            assert_eq!(
+                current["spec"]["preprocessingSha256"],
+                "95c9a53b9b2cbd2d44c3ea386dc8dbb70e61d6f8a1206d5761fbbdc36d636bc7"
+            );
+            assert_ne!(current["modelKey"], old["modelKey"]);
+            expected["modelKey"] = current["modelKey"].clone();
+            expected["spec"]["modelKey"] = current["modelKey"].clone();
+            expected["spec"]["preprocessingSha256"] =
+                current["spec"]["preprocessingSha256"].clone();
+            assert_eq!(current, &expected);
+        }
     }
 }

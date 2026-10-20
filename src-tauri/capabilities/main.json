@@ -17,6 +17,7 @@
     "allow-control-worker",
     "allow-discover-onedrive",
     "allow-choose-photo-folder",
+    "allow-choose-apple-photos",
     "allow-approve-photo-folder",
     "allow-photo-source-status",
     "allow-revoke-photo-source",

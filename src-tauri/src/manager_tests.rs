@@ -4,6 +4,41 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::json;
 
+#[tokio::test]
+async fn unicode_manager_password_bound_reaches_certificate_validation_without_network() {
+    let certificate = CertificateTrust {
+        pem: "invalid certificate".into(),
+        sha256: "0".repeat(64),
+    };
+    let mut record = saved();
+    record.certificate_pem = Some("invalid certificate".into());
+    for (password, expected) in [
+        ("🌱".repeat(128), "manager_certificate_invalid"),
+        ("🌱".repeat(129), "manager_login_details_invalid"),
+        (String::new(), "manager_login_details_invalid"),
+    ] {
+        assert_eq!(
+            pair(
+                &identity(),
+                "https://manager.test:9443",
+                password.clone(),
+                Some(certificate.clone()),
+                false,
+                false,
+                |_| panic!("must not persist")
+            )
+            .await
+            .err()
+            .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            reauthenticate(&record, password).await.err().as_deref(),
+            Some(expected)
+        );
+    }
+}
+
 fn identity() -> DeviceIdentity {
     serde_json::from_value(
         json!({"installation_id":"11111111-1111-4111-8111-111111111111", "secret":vec![7u8;32]}),
@@ -244,6 +279,7 @@ fn actual_compiled_manager_pairs_signs_reauthenticates_and_cleans_failed_persist
             password.into(),
             Some(certificate.clone()),
             false,
+            false,
             |saved| {
                 *record.lock().unwrap() = Some(
                     serde_json::from_value::<SavedManager>(serde_json::to_value(saved).unwrap())
@@ -274,6 +310,7 @@ fn actual_compiled_manager_pairs_signs_reauthenticates_and_cleans_failed_persist
                 origin,
                 password.into(),
                 Some(certificate),
+                false,
                 false,
                 |value| {
                     *failed.lock().unwrap() = value.id.clone();
@@ -484,5 +521,119 @@ fn restore_execution_uses_explicit_scope_and_accepts_only_bound_public_restore_o
         let mut changed = operation.clone();
         changed[field] = value;
         assert!(validate_reply(&owner, &command, changed).is_err());
+    }
+}
+
+#[test]
+fn native_update_approval_command_requires_explicit_update_scope_and_consent() {
+    let value = json!({"kind":"approve-update","backupOperationId":"33333333-3333-4333-8333-333333333333","targetManifestSha256":"d".repeat(64),"migrationsApproved":true,"key":"11111111-1111-4111-8111-111111111111"});
+    let command: Command =
+        serde_json::from_value(value.clone()).expect("typed native approval request missing");
+    let mut grant = saved();
+    let device = identity();
+    assert!(prepare(
+        &grant,
+        &device,
+        &command,
+        1700000000000,
+        "55555555-5555-4555-8555-555555555555"
+    )
+    .is_err());
+    grant.scopes.push(Scope::Update);
+    let request = prepare(
+        &grant,
+        &device,
+        &command,
+        1700000000000,
+        "55555555-5555-4555-8555-555555555555",
+    )
+    .unwrap();
+    assert_eq!(request.path, "/manager-api/desktop/approve-update");
+    let mut expected = value;
+    expected.as_object_mut().unwrap().remove("kind");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.body).unwrap(),
+        expected
+    );
+    expected["kind"] = "approve-update".into();
+    expected["migrationsApproved"] = false.into();
+    let refused: Command = serde_json::from_value(expected).unwrap();
+    assert!(prepare(
+        &grant,
+        &device,
+        &refused,
+        1700000000000,
+        "55555555-5555-4555-8555-555555555555"
+    )
+    .is_err());
+}
+
+#[test]
+fn approval_reply_is_structurally_bound_but_never_treated_as_mac_or_apply_authority() {
+    let f: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/native-update-approval.json"
+    ))
+    .unwrap();
+    let now = clock().unwrap();
+    let mut payload = f["payload"].clone();
+    payload["issuedAt"] = now.into();
+    payload["expiresAt"] = (now + 300000).into();
+    let token = |value: &Value| {
+        format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string()),
+            "0".repeat(64)
+        )
+    };
+    let command:Command=serde_json::from_value(json!({"kind":"approve-update","backupOperationId":payload["backupOperationId"],"targetManifestSha256":payload["targetManifestSha256"],"migrationsApproved":true,"key":payload["approvalId"]})).unwrap();
+    let grant = saved();
+    let reply = json!({"approval":token(&payload)});
+    assert_eq!(
+        validate_reply(&grant, &command, reply.clone()).unwrap(),
+        reply
+    );
+    assert!(validate_reply(
+        &grant,
+        &command,
+        json!({"approval":token(&payload),"secret":"must not echo"})
+    )
+    .is_err());
+    assert!(validate_reply(&grant, &command, json!({"approval":"not-a-token"})).is_err());
+    for field in [
+        "approvalId",
+        "backupOperationId",
+        "targetManifestSha256",
+        "installationId",
+        "libraryId",
+    ] {
+        let mut changed = payload.clone();
+        changed[field] =
+            if field.ends_with("Id") && field != "installationId" && field != "libraryId" {
+                "55555555-5555-4555-8555-555555555555".into()
+            } else if field.ends_with("Sha256") {
+                "9".repeat(64).into()
+            } else {
+                "9".repeat(12).into()
+            };
+        assert!(
+            validate_reply(&grant, &command, json!({"approval":token(&changed)})).is_err(),
+            "accepted changed {field}"
+        );
+    }
+}
+
+#[test]
+fn update_and_recovery_scopes_require_separate_explicit_choices() {
+    for recovery in [false, true] {
+        for updates in [false, true] {
+            let scopes = requested_scopes(recovery, updates);
+            assert!(scopes.starts_with(&SCOPES));
+            assert_eq!(
+                scopes.len(),
+                SCOPES.len() + usize::from(recovery) + usize::from(updates)
+            );
+            assert_eq!(scopes.contains(&Scope::Restore), recovery);
+            assert_eq!(scopes.contains(&Scope::Update), updates);
+        }
     }
 }

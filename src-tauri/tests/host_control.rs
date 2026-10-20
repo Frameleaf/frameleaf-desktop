@@ -85,7 +85,7 @@ fn native_control_cannot_launch_an_unsigned_candidate() {
 }
 
 fn config(candidate: &std::path::Path, state: &std::path::Path) -> Value {
-    json!({"protocolVersion":1,"installationId":"a".repeat(12),"candidate":candidate,"state":state,
+    json!({"protocolVersion":1,"installationId":"a".repeat(12),"secureInstallationId":"11111111-1111-4111-8111-111111111111","candidate":candidate,"state":state,
         "manifestSha256":"c220a4b95333bf89673c48afd15bb9cc482a75c7211b2a551d063da65ebc5a8d",
         "password":"synthetic-controller-password-with-enough-length",
         "databasePort":54321,"apiPort":54322})
@@ -98,6 +98,8 @@ fn factory_host_control_stops_on_command_and_owner_eof_and_can_restart() {
     let state = PathBuf::from(std::env::var("FRAMELEAF_TEST_HOST_CONTROL_STATE").unwrap());
     assert!(candidate.is_absolute() && state.is_absolute() && !state.exists());
     let mut config = config(&candidate, &state);
+    config["secureInstallationId"] = json!(std::env::var("FRAMELEAF_NATIVE_INSTALLATION_ID")
+        .expect("requires enrolled disposable test identity"));
     let listeners = [
         std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
         std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
@@ -125,6 +127,10 @@ fn factory_host_control_stops_on_command_and_owner_eof_and_can_restart() {
             serde_json::from_str(&rx.recv_timeout(Duration::from_secs(300)).unwrap()).unwrap();
         assert_eq!(ready["state"], "running");
         assert_eq!(ready["manifestSha256"], config["manifestSha256"]);
+        assert_eq!(
+            ready["secureInstallationId"],
+            config["secureInstallationId"]
+        );
         assert_eq!(ready["protocolVersion"], 1);
         if let Some(command) = command {
             input.write_all(command.as_bytes()).unwrap();

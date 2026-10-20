@@ -81,22 +81,7 @@ impl TlsIdentity {
             .lock()
             .map_err(|_| "credential_store_unavailable")?;
         if let Some(saved) = load()? {
-            if saved.schema_version != 1
-                || saved.installation_id != installation_id
-                || saved.origin != origin
-            {
-                return Err("native_tls_identity_changed".into());
-            }
-            if saved.expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
-                return Err("native_tls_identity_expired".into());
-            }
-            if saved.certificate_pem.len() > 8192
-                || saved.private_key_pem.len() > 8192
-                || KeyPair::from_pem(&saved.private_key_pem).is_err()
-                || crate::manager::certificate_fingerprint(&saved.certificate_pem).is_err()
-            {
-                return Err("native_tls_identity_invalid".into());
-            }
+            saved.validate(installation_id, origin)?;
             return Ok(saved);
         }
         let key = KeyPair::generate().map_err(|_| "native_tls_generation_failed")?;
@@ -124,6 +109,26 @@ impl TlsIdentity {
         persist(&saved)?;
         Ok(saved)
     }
+    fn validate(&self, installation_id: &str, origin: &str) -> Result<(), String> {
+        hostname(installation_id, origin)?;
+        if self.schema_version != 1
+            || self.installation_id != installation_id
+            || self.origin != origin
+        {
+            return Err("native_tls_identity_changed".into());
+        }
+        if self.expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
+            return Err("native_tls_identity_expired".into());
+        }
+        if self.certificate_pem.len() > 8192
+            || self.private_key_pem.len() > 8192
+            || KeyPair::from_pem(&self.private_key_pem).is_err()
+            || crate::manager::certificate_fingerprint(&self.certificate_pem).is_err()
+        {
+            return Err("native_tls_identity_invalid".into());
+        }
+        Ok(())
+    }
     pub fn certificate(&self) -> &str {
         &self.certificate_pem
     }
@@ -133,6 +138,88 @@ impl TlsIdentity {
             certificate_pem: &self.certificate_pem,
             private_key_pem: &self.private_key_pem,
         }
+    }
+}
+
+pub(crate) struct TlsUpdate {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    source: TlsIdentity,
+    destination: String,
+}
+impl TlsUpdate {
+    pub(crate) fn existing(
+        id: &str,
+        origin: &str,
+        bindings: [&str; 2],
+        store: &mut impl crate::manager_profile::UpdateStore,
+    ) -> Result<Self, String> {
+        let lock = IDENTITY_LOCK
+            .lock()
+            .map_err(|_| "credential_store_unavailable")?;
+        let source: TlsIdentity = store
+            .load(&account_for_profile(bindings[0])?)?
+            .ok_or("native_tls_recovery_required")?;
+        source.validate(id, origin)?;
+        Ok(Self {
+            _lock: lock,
+            source,
+            destination: account_for_profile(bindings[1])?,
+        })
+    }
+    pub(crate) fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(self.source.certificate_pem.as_bytes())
+        )
+    }
+    pub(crate) fn commitment(&self, profile: &[u8]) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        // Profile includes the random 256-bit backup key; this binds retries without persisting secrets.
+        let mut hash = Sha256::new();
+        hash.update(b"frameleaf-update-credentials-v1\0");
+        hash.update((profile.len() as u64).to_be_bytes());
+        hash.update(profile);
+        let tls = zeroize::Zeroizing::new(
+            serde_json_canonicalizer::to_vec(&self.source)
+                .map_err(|_| "native_tls_identity_invalid")?,
+        );
+        hash.update(tls.as_slice());
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    pub(crate) fn copy(
+        &self,
+        store: &mut impl crate::manager_profile::UpdateStore,
+    ) -> Result<(), String> {
+        let expected = zeroize::Zeroizing::new(
+            serde_json::to_vec(&self.source).map_err(|_| "native_tls_identity_invalid")?,
+        );
+        let current: Option<TlsIdentity> = store.load(&self.destination)?;
+        if let Some(current) = current {
+            if zeroize::Zeroizing::new(
+                serde_json::to_vec(&current).map_err(|_| "native_tls_identity_invalid")?,
+            )
+            .as_slice()
+                != expected.as_slice()
+            {
+                return Err("native_tls_identity_changed".into());
+            }
+        } else {
+            store.save(&self.destination, &self.source)?;
+        }
+        let readback: TlsIdentity = store
+            .load(&self.destination)?
+            .ok_or("native_tls_recovery_required")?;
+        readback.validate(&self.source.installation_id, &self.source.origin)?;
+        if zeroize::Zeroizing::new(
+            serde_json::to_vec(&readback).map_err(|_| "native_tls_identity_invalid")?,
+        )
+        .as_slice()
+            != expected.as_slice()
+        {
+            return Err("native_tls_identity_changed".into());
+        }
+        Ok(())
     }
 }
 
