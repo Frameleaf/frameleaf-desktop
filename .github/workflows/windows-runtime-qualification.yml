@@ -113,7 +113,8 @@ jobs:
                       target.write_bytes(snapshot.encode('ascii'))
                   else:
                       url = 'https://models.frameleaf.cloud/frameleaf/' + urllib.parse.quote(name) + '/resolve/' + snapshot + '/' + urllib.parse.quote(name_in_model, safe='/')
-                      with urllib.request.urlopen(url, timeout=120) as response, target.open('xb') as stream:
+                      request = urllib.request.Request(url, headers={'User-Agent': 'FrameleafDesktopQualification/1.0'})
+                      with urllib.request.urlopen(request, timeout=120) as response, target.open('xb') as stream:
                           remaining = sizes[name_in_model]
                           while remaining:
                               chunk = response.read(min(1024**2, remaining))
