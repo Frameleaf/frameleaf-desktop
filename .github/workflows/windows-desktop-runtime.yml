@@ -36,6 +36,26 @@ jobs:
               result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               print(command, 'exit=', result.returncode, flush=True)
               print(result.stdout, flush=True)
+      - name: Attach cloud filter only to disposable test volumes
+        shell: python
+        run: |
+          import ntpath, os, re, subprocess, tempfile
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          inspector = ntpath.join(os.environ['SystemRoot'], 'System32', 'fltmc.exe')
+          volumes = set()
+          for path in [os.environ['RUNNER_TEMP'], tempfile.gettempdir()]:
+              volume, tail = ntpath.splitdrive(path)
+              assert re.fullmatch(r'[A-Za-z]:', volume) and ntpath.isabs(path)
+              volumes.add(volume.upper())
+          def attached(volume):
+              result = subprocess.run([inspector, 'instances', '-v', volume], check=True, capture_output=True, text=True)
+              print(result.stdout, flush=True)
+              return bool(re.search(r'^\s*CldFlt\s', result.stdout, re.I | re.M))
+          for volume in sorted(volumes):
+              if not attached(volume):
+                  subprocess.run([inspector, 'attach', 'CldFlt', volume], check=True)
+              assert attached(volume), 'Cloud filter did not attach to the disposable test volume'
       - name: Acquire and verify the exact signed Windows runtime
         shell: python
         env:
