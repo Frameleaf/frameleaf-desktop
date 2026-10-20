@@ -553,7 +553,7 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
   const { packageConfiguration } = await import("./package_desktop.mjs");
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   const source = "b7b5756a3f9eaeec9e977460ab654cbbadee87e7";
-  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source] });
+  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f"] });
   for (const [revision, provider, allowed] of [
     [source, "CoreMLExecutionProvider", true],
     ["db72dcde18d3a4ff4ab5cfed3fb650a6b3629353", "CoreMLExecutionProvider", false],
@@ -570,6 +570,42 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
     await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
     await signCandidate(f.root, join(f.root, "manifest.sig"), f.privatePem, f.policy);
     if (process.platform !== "darwin" || process.arch !== "arm64") {
+      await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_target_mismatch/);
+    } else if (!allowed) {
+      await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_source_unapproved/);
+    } else {
+      const config = await packageConfiguration(f.root, f.policy);
+      assert.equal(config.bundle.resources[join(f.root, "payload")], "native-runtime/payload");
+    }
+  }
+});
+
+
+test("current precision source is approved only for qualified Linux CPU and macOS CoreML targets", async (t) => {
+  const source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
+  const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
+  for (const [name, profile] of Object.entries(profiles)) {
+    const targets = Object.entries(profile.additionalSources ?? {}).filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
+    assert.deepEqual(targets, name === "cpu-ort" ? ["linux-x86_64"] : name === "coreml-ort" ? ["macos-aarch64"] : []);
+  }
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  for (const [platform, architecture, provider, allowed] of [
+    ["linux", "x86_64", "CPUExecutionProvider", true],
+    ["macos", "aarch64", "CPUExecutionProvider", false],
+    ["macos", "aarch64", "CoreMLExecutionProvider", true],
+  ]) {
+    const f = await fixture(t);
+    const provenance = { schemaVersion: 1, sourceRepository: "Frameleaf/frameleaf-app", sourceRevision: source,
+      profile: provider === "CoreMLExecutionProvider" ? "coreml-ort" : "cpu-ort", python: "3.12.13" };
+    const bytes = Buffer.from(JSON.stringify(provenance));
+    await writeFile(join(f.root, "payload/provenance.json"), bytes);
+    Object.assign(f.manifest, { platform, architecture, provider, sourceRevision: source, moduleNamespace: "frameleaf_ml" });
+    f.manifest.files["provenance.json"] = { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    await signCandidate(f.root, join(f.root, "manifest.sig"), f.privatePem, f.policy);
+    const hostPlatform = {darwin:"macos", win32:"windows", linux:"linux"}[process.platform];
+    const hostArchitecture = ({arm64:"aarch64", x64:"x86_64"})[process.arch];
+    if (hostPlatform !== platform || hostArchitecture !== architecture) {
       await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_target_mismatch/);
     } else if (!allowed) {
       await assert.rejects(packageConfiguration(f.root, f.policy), /runtime_bundle_source_unapproved/);
