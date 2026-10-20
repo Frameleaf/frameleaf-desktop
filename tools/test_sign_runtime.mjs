@@ -389,10 +389,8 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     profiles["cpu-ort"].sourceRevision,
     "25b22c16e47a27a2eb50017d838497abce850d11",
   );
-  assert.deepEqual(profiles["cpu-ort"].additionalSources, {
-    "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
-    "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"],
-  });
+  assert.deepEqual(profiles["cpu-ort"].additionalSources["macos-aarch64"], [source, "f93c34d196955da3e2760c095c08b27ccbf53315"]);
+  assert.deepEqual(profiles["cpu-ort"].additionalSources["linux-aarch64"], ["f93c34d196955da3e2760c095c08b27ccbf53315"]);
   assert.equal(
     profiles["coreml-ort"].sourceRevision,
     "25b22c16e47a27a2eb50017d838497abce850d11",
@@ -431,54 +429,59 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
   );
 });
 
-test("current CPU source packages only on its qualified Linux and macOS ARM64 targets", async (t) => {
-  const { packageConfiguration } = await import("./package_desktop.mjs");
-  const profiles = JSON.parse(
-    await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
-  ).profiles;
-  const source = "f93c34d196955da3e2760c095c08b27ccbf53315";
-  assert.deepEqual(profiles["cpu-ort"].additionalSources["linux-aarch64"], [source]);
-  assert(profiles["cpu-ort"].additionalSources["macos-aarch64"].includes(source));
-  for (const [target, sources] of Object.entries(
-    profiles["cpu-ort"].additionalSources,
-  )) {
-    if (!["linux-aarch64", "macos-aarch64"].includes(target))
-      assert(!sources.includes(source));
-  }
-  assert(!Object.values(profiles["coreml-ort"].additionalSources ?? {}).flat().includes(source));
-  const f = await fixture(t);
-  const provenance = JSON.parse(
-    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
-  );
-  provenance.sourceRevision = source;
-  const bytes = Buffer.from(JSON.stringify(provenance));
-  f.manifest.sourceRevision = source;
-  f.manifest.moduleNamespace = "frameleaf_ml";
-  f.manifest.files["provenance.json"] = {
-    bytes: bytes.length,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-  };
-  await writeFile(join(f.root, "payload/provenance.json"), bytes);
-  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
-  await signCandidate(
-    f.root,
-    join(f.root, "manifest.sig"),
-    f.privatePem,
-    f.policy,
-  );
-  if (!["linux", "darwin"].includes(process.platform) || process.arch !== "arm64") {
-    await assert.rejects(
-      packageConfiguration(f.root, f.policy),
-      /runtime_bundle_source_unapproved/,
+for (const [source, targets] of [
+  ["f93c34d196955da3e2760c095c08b27ccbf53315", ["linux-aarch64", "macos-aarch64"]],
+  ["0d9702c68f31ea3eea068ac59ca1cf36a2b520fc", ["linux-x86_64"]],
+]) {
+  test(`CPU source ${source} packages only on its qualified targets`, async (t) => {
+    const { packageConfiguration } = await import("./package_desktop.mjs");
+    const profiles = JSON.parse(
+      await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
+    ).profiles;
+    const approvedTargets = Object.entries(profiles["cpu-ort"].additionalSources)
+      .filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
+    assert.deepEqual(approvedTargets, [...targets].sort());
+    for (const [name, profile] of Object.entries(profiles)) {
+      if (name !== "cpu-ort") {
+        assert.notEqual(profile.sourceRevision, source);
+        assert(!Object.values(profile.additionalSources ?? {}).flat().includes(source));
+      }
+    }
+    const f = await fixture(t);
+    const provenance = JSON.parse(
+      await readFile(join(f.root, "payload/provenance.json"), "utf8"),
     );
-    return;
-  }
-  const config = await packageConfiguration(f.root, f.policy);
-  assert.equal(
-    config.bundle.resources[join(f.root, "payload")],
-    "native-runtime/payload",
-  );
-});
+    provenance.sourceRevision = source;
+    const bytes = Buffer.from(JSON.stringify(provenance));
+    f.manifest.sourceRevision = source;
+    f.manifest.moduleNamespace = "frameleaf_ml";
+    f.manifest.files["provenance.json"] = {
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    await writeFile(join(f.root, "payload/provenance.json"), bytes);
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    await signCandidate(
+      f.root,
+      join(f.root, "manifest.sig"),
+      f.privatePem,
+      f.policy,
+    );
+    const hostTarget = `${process.platform === "darwin" ? "macos" : process.platform}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
+    if (!targets.includes(hostTarget)) {
+      await assert.rejects(
+        packageConfiguration(f.root, f.policy),
+        /runtime_bundle_source_unapproved/,
+      );
+      return;
+    }
+    const config = await packageConfiguration(f.root, f.policy);
+    assert.equal(
+      config.bundle.resources[join(f.root, "payload")],
+      "native-runtime/payload",
+    );
+  });
+}
 
 test("CUDA authoring signs only its declared desktop targets and provenance", async (t) => {
   const { packageConfiguration } = await import("./package_desktop.mjs");

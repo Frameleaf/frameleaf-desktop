@@ -21,6 +21,9 @@
         ],
         "linux-aarch64": [
           "f93c34d196955da3e2760c095c08b27ccbf53315"
+        ],
+        "linux-x86_64": [
+          "0d9702c68f31ea3eea068ac59ca1cf36a2b520fc"
         ]
       }
     },
