@@ -42,6 +42,35 @@ class LinuxHostDebTests(unittest.TestCase):
                 self.assertIn('-xframeleaf-fixture', args)
                 self.assertNotIn('--ignore-missing-info', args)
 
+    def test_native_addon_sonames_keep_dependency_analysis_without_library_version_mapping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'tree'
+            tree.mkdir()
+            names = ['sharp-linux-x64-0.35.5.node', 'bare-fs@4.bare', 'bare-path@3.bare', 'bare-url@2.bare', 'bcrypt_lib.node']
+            for name in names:
+                (tree / name).write_bytes(b'\x7fELFfixture')
+            def command(args, **kwargs):
+                return '(SONAME) Library soname: [' + args[-1].name + ']' if args[0] == 'readelf' else 'shlibs:Depends=libc6 (>= 2.39)'
+            with patch('build_host_linux_deb.run', side_effect=command) as call:
+                self.assertIn('libc6', dependencies(tree, 'frameleaf-fixture', root / 'work'))
+                self.assertEqual((root / 'work/debian/shlibs.local').read_text(), '')
+                args = call.call_args.args[0]
+                self.assertEqual(sum(str(arg).startswith('-e') for arg in args), len(names))
+                self.assertNotIn('--ignore-missing-info', args)
+
+    def test_addon_sonames_refuse_paths_unknown_extensions_and_invalid_versions(self):
+        for name in ['/tmp/addon.node', 'addon.node/escape', 'bare-fs@bad.bare', 'unknown.plugin']:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                tree = root / 'tree'
+                tree.mkdir()
+                (tree / 'addon').write_bytes(b'\x7fELFfixture')
+                with patch('build_host_linux_deb.run', return_value='(SONAME) Library soname: [' + name + ']') as call:
+                    with self.assertRaisesRegex(BuildError, 'host_install_private_soname_unsupported'):
+                        dependencies(tree, 'frameleaf-fixture', root / 'work')
+                    self.assertEqual(call.call_count, 1)
+
     @unittest.skipUnless(os.name == 'posix' and os.getuid() != 0, 'requires ordinary POSIX account')
     def test_unmodified_hooks_refuse_nonroot_before_touching_installed_paths(self):
         with tempfile.TemporaryDirectory() as temp:
