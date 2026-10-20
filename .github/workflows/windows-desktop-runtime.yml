@@ -1,0 +1,158 @@
+name: Private Windows desktop with signed CPU runtime
+on:
+  workflow_call:
+    inputs:
+      runtime_signature_hex:
+        description: Detached signature of the qualified current Windows runtime manifest
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+          cache: npm
+      - name: Acquire and verify the exact signed Windows runtime
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_SIGNATURE_HEX: ${{ inputs.runtime_signature_hex }}
+        run: |
+          from pathlib import Path
+          import json, os, re, stat, subprocess, sys, zipfile
+          sys.path.insert(0, str(Path.cwd() / 'tools'))
+          from build_runtime import inventory, relative, sha256
+          signature = os.environ['RUNTIME_SIGNATURE_HEX']
+          assert re.fullmatch(r'[a-f0-9]{128}', signature)
+          source = 'f2c451a6bf71ca3f3aec986e07f0852937268e2f'
+          profiles = json.loads(Path('runtime/profiles.json').read_text())['profiles']
+          assert source in profiles['cpu-ort']['additionalSources']['windows-x86_64']
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-desktop'
+          output.mkdir()
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/' + path]))
+          run = api('actions/runs/39504442584')
+          head = '91203102137fcff723ff91525eb8ebf624f64f1a'
+          assert run['head_sha'] == head and run['status'] == 'completed' and run['conclusion'] == 'success'
+          artifact = api('actions/artifacts/12303032800')
+          assert artifact['workflow_run']['id'] == 39504442584 and artifact['workflow_run']['head_sha'] == head
+          assert artifact['name'] == 'cpu-runtime-candidate-Windows' and not artifact['expired']
+          assert 0 < artifact['size_in_bytes'] < 4 * 1024**3
+          archive = output / 'runtime.zip'
+          with archive.open('wb') as stream:
+              subprocess.run(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/actions/artifacts/12303032800/zip'], stdout=stream, check=True)
+          assert sha256(archive) == '496d637d57087b9057ea4c3dfcb81fa86ea893307cfe35e249964b9cb277809d'
+          candidate = output / 'runtime'
+          candidate.mkdir()
+          with zipfile.ZipFile(archive) as bundle:
+              entries = bundle.infolist()
+              assert 0 < len(entries) <= 100000 and sum(item.file_size for item in entries) < 12 * 1024**3
+              names = set()
+              for item in entries:
+                  name = relative(item.filename.rstrip('/'))
+                  assert name.lower() not in names and not item.flag_bits & 1
+                  names.add(name.lower())
+                  assert stat.S_IFMT(item.external_attr >> 16) in {0, stat.S_IFDIR if item.is_dir() else stat.S_IFREG}
+                  assert item.file_size < 4 * 1024**3
+              bundle.extractall(candidate)
+          assert sha256(candidate / 'manifest.json') == '95c6f4176699ef44ea7a7cc59052523b4e4a112b5a703606d733e20d6b27c5e4'
+          (candidate / 'manifest.sig').write_bytes(bytes.fromhex(signature))
+          verifier = Path('tools/sign_runtime.mjs').resolve().as_uri()
+          code = 'import(' + json.dumps(verifier) + ').then(async m=>console.log(JSON.stringify(await m.verifySignedCandidate(process.argv[1]))))'
+          checked = json.loads(subprocess.check_output(['node', '--input-type=module', '--eval', code, str(candidate)], text=True))
+          assert checked['keyId'] == 'desktop-release-2026-10'
+          manifest = checked['manifest']
+          assert manifest['platform'] == 'windows' and manifest['architecture'] == 'x86_64'
+          assert manifest['provider'] == 'CPUExecutionProvider' and manifest['sourceRevision'] == source
+          assert inventory(candidate / 'payload') == manifest['files']
+          (output / 'runtime-identity.json').write_text(json.dumps({'keyId': checked['keyId'], 'manifestSha256': checked['manifestSha256'], 'signatureSha256': sha256(candidate / 'manifest.sig')}, indent=2) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write('FRAMELEAF_SIGNED_RUNTIME=' + str(candidate) + '\n')
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Build the internal Windows desktop installer
+        shell: python
+        run: |
+          from pathlib import Path
+          import json, os, subprocess
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-desktop'
+          cli = Path('node_modules/@tauri-apps/cli/tauri.js').resolve()
+          assert subprocess.check_output(['node', str(cli), '--version'], text=True).strip() == 'tauri-cli 2.12.3'
+          module = Path('tools/package_desktop.mjs').resolve().as_uri()
+          code = 'import {packageConfiguration} from ' + json.dumps(module) + ';const c=await packageConfiguration(process.argv[1]);c.productName="Frameleaf Internal";c.bundle.targets=["nsis"];console.log(JSON.stringify(c));'
+          config = output / 'tauri-internal.json'
+          config.write_bytes(subprocess.check_output(['node', '--input-type=module', '--eval', code, os.environ['FRAMELEAF_SIGNED_RUNTIME']]))
+          subprocess.run(['node', str(cli), 'build', '--debug', '--config', str(config), '--', '--locked'], check=True, timeout=2700)
+      - name: Verify both Windows executables and the embedded normal-signed runtime
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, json, os, shutil, subprocess, sys
+          sys.path.insert(0, str(Path.cwd() / 'tools'))
+          from build_runtime import sha256
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-desktop'
+          target = Path('src-tauri/target/debug').resolve()
+          binaries = {}
+          for name in ['frameleaf-desktop.exe', 'frameleaf-native-host.exe']:
+              path = target / name
+              with path.open('rb') as stream:
+                  header = stream.read(64)
+                  offset = int.from_bytes(header[60:64], 'little')
+                  assert header[:2] == b'MZ' and 64 <= offset <= 1024**2
+                  stream.seek(offset)
+                  assert stream.read(6) == b'PE\0\0\x64\x86'
+              binaries[name] = sha256(path)
+          installers = list((target / 'bundle/nsis').glob('*.exe'))
+          assert len(installers) == 1
+          installer = installers[0]
+          sevenzip = shutil.which('7z')
+          assert sevenzip, 'archive inspector missing'
+          expanded = output / 'expanded-installer'
+          subprocess.run([sevenzip, 'x', str(installer), '-o' + str(expanded), '-y'], check=True, timeout=300)
+          extracted_executables = {sha256(path) for path in expanded.rglob('*.exe') if path.is_file()}
+          assert set(binaries.values()).issubset(extracted_executables), 'installer executable closure differs'
+          identity = json.loads((output / 'runtime-identity.json').read_text())
+          matches = [path.parent for path in expanded.rglob('manifest.json') if sha256(path) == identity['manifestSha256'] and (path.parent / 'manifest.sig').is_file()]
+          assert len(matches) == 1
+          verifier = Path('tools/sign_runtime.mjs').resolve().as_uri()
+          code = 'import(' + json.dumps(verifier) + ').then(async m=>console.log(JSON.stringify(await m.verifySignedCandidate(process.argv[1]))))'
+          checked = json.loads(subprocess.check_output(['node', '--input-type=module', '--eval', code, str(matches[0])], text=True))
+          assert checked['keyId'] == identity['keyId'] and checked['manifestSha256'] == identity['manifestSha256']
+          assert sha256(matches[0] / 'manifest.sig') == identity['signatureSha256']
+          receipt = {'state': 'Windows-desktop-installer-built-and-embedded-runtime-verified', 'platform': 'windows-x86_64',
+              'installer': installer.name, 'installerSha256': sha256(installer), 'binaries': binaries,
+              'runtime': identity, 'installedAcceptance': False, 'osCodeSigned': False, 'fullHostComponentsIncluded': False}
+          (output / 'result.json').write_text(json.dumps(receipt, indent=2) + '\n')
+      - name: Retain the private installer and verification receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-current-desktop-internal
+          path: |
+            src-tauri/target/debug/bundle/nsis/*.exe
+            ${{ runner.temp }}/fl-windows-desktop/result.json
+            ${{ runner.temp }}/fl-windows-desktop/runtime-identity.json
+          retention-days: 7
+          if-no-files-found: error
