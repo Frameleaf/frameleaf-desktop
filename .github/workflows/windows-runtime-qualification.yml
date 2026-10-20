@@ -88,9 +88,10 @@ jobs:
           payload = candidate / 'payload'
           assert inventory(payload) == manifest['files']
           before = inventory(candidate)
-          catalogue_path = Path('catalogue-source/server/resources/desktop/model-catalogue.json')
-          assert sha256(catalogue_path) == '27330f1a63b94fc6f9bd485b85773563bb0b662e583f0c88b96f10b06e36264c'
-          profiles = [p for p in json.loads(catalogue_path.read_text())['profiles']
+          catalogue = subprocess.check_output(['git', '-C', 'catalogue-source', 'show',
+              '9bbe7c64e720fceee2fcba0f72055c945f56b19a:server/resources/desktop/model-catalogue.json'])
+          assert hashlib.sha256(catalogue).hexdigest() == '27330f1a63b94fc6f9bd485b85773563bb0b662e583f0c88b96f10b06e36264c'
+          profiles = [p for p in json.loads(catalogue)['profiles']
                       if p['runtimeSourceRevision'] == revision and p['spec']['provider'] == 'CPUExecutionProvider']
           assert len(profiles) == 5 and len({p['modelKey'] for p in profiles}) == 5
           cache = output / 'cache'
