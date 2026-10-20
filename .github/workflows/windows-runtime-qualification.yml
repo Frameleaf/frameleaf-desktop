@@ -1,0 +1,170 @@
+name: Private Windows current CPU qualification
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: Artifact ID from the approved current Windows runtime build
+        required: true
+        type: string
+      artifact_sha256:
+        description: SHA-256 of the retained artifact ZIP
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-current-cpu-qualification-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
+          path: catalogue-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Verify and replay the retained runtime against all canonical CPU profiles
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_ARTIFACT_ID: ${{ inputs.artifact_id }}
+          INPUT_ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
+        run: |
+          from pathlib import Path
+          import base64, hashlib, json, os, re, stat, subprocess, sys, urllib.parse, urllib.request, zipfile
+          sys.path.insert(0, str(Path.cwd() / 'tools'))
+          from build_runtime import build_environment, inventory, relative, sha256
+          revision = 'f2c451a6bf71ca3f3aec986e07f0852937268e2f'
+          run_id = 39504442584
+          build_head = '91203102137fcff723ff91525eb8ebf624f64f1a'
+          artifact_id = os.environ['INPUT_ARTIFACT_ID']
+          artifact_sha = os.environ['INPUT_ARTIFACT_SHA256']
+          assert re.fullmatch(r'[1-9][0-9]{0,19}', artifact_id)
+          assert re.fullmatch(r'[a-f0-9]{64}', artifact_sha)
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-current-cpu-qualification'
+          output.mkdir()
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/' + path]))
+          run = api(f'actions/runs/{run_id}')
+          assert run['head_sha'] == build_head and run['event'] == 'workflow_dispatch'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          artifact = api(f'actions/artifacts/{artifact_id}')
+          assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == build_head
+          assert artifact['name'] == 'cpu-runtime-candidate-Windows' and not artifact['expired']
+          assert 0 < artifact['size_in_bytes'] < 4 * 1024**3
+          archive = output / 'input.zip'
+          with archive.open('wb') as stream:
+              subprocess.run(['gh', 'api', f'repos/Frameleaf/frameleaf-desktop/actions/artifacts/{artifact_id}/zip'], stdout=stream, check=True)
+          assert sha256(archive) == artifact_sha
+          candidate = output / 'candidate'
+          candidate.mkdir()
+          with zipfile.ZipFile(archive) as bundle:
+              entries = bundle.infolist()
+              assert 0 < len(entries) <= 100000 and sum(item.file_size for item in entries) < 12 * 1024**3
+              names = set()
+              for item in entries:
+                  name = relative(item.filename.rstrip('/'))
+                  assert name.lower() not in names and not item.flag_bits & 1
+                  names.add(name.lower())
+                  kind = stat.S_IFMT(item.external_attr >> 16)
+                  assert kind in {0, stat.S_IFDIR if item.is_dir() else stat.S_IFREG}
+                  assert item.file_size < 4 * 1024**3
+              bundle.extractall(candidate)
+          manifest = json.loads((candidate / 'manifest.json').read_text())
+          assert manifest['sourceRevision'] == revision and manifest['epoch'] == 15
+          assert manifest['platform'] == 'windows' and manifest['architecture'] == 'x86_64'
+          assert manifest['provider'] == 'CPUExecutionProvider' and manifest['moduleNamespace'] == 'frameleaf_ml'
+          assert manifest['python'] == 'python/python.exe'
+          payload = candidate / 'payload'
+          assert inventory(payload) == manifest['files']
+          before = inventory(candidate)
+          catalogue_path = Path('catalogue-source/server/resources/desktop/model-catalogue.json')
+          assert sha256(catalogue_path) == '27330f1a63b94fc6f9bd485b85773563bb0b662e583f0c88b96f10b06e36264c'
+          profiles = [p for p in json.loads(catalogue_path.read_text())['profiles']
+                      if p['runtimeSourceRevision'] == revision and p['spec']['provider'] == 'CPUExecutionProvider']
+          assert len(profiles) == 5 and len({p['modelKey'] for p in profiles}) == 5
+          cache = output / 'cache'
+          models = {}
+          for profile in profiles:
+              for model in profile['spec']['models']:
+                  key = (relative(model['task']), relative(model['name']))
+                  value = (model['artifacts'], profile['artifactBytes'], profile['modelSnapshotRevision'])
+                  assert key not in models or models[key] == value
+                  models[key] = value
+          for (task, name), (artifacts, sizes, snapshot) in models.items():
+              assert set(artifacts) == set(sizes) and re.fullmatch(r'[a-f0-9]{40}', snapshot)
+              root = cache / task / name
+              for name_in_model, digest in artifacts.items():
+                  target = root / relative(name_in_model)
+                  assert re.fullmatch(r'[a-f0-9]{64}', digest) and 0 < sizes[name_in_model] < 1024**3
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  if name_in_model == f'models--frameleaf--{name}/refs/main':
+                      target.write_bytes(snapshot.encode('ascii'))
+                  else:
+                      url = 'https://models.frameleaf.cloud/frameleaf/' + urllib.parse.quote(name) + '/resolve/' + snapshot + '/' + urllib.parse.quote(name_in_model, safe='/')
+                      with urllib.request.urlopen(url, timeout=120) as response, target.open('xb') as stream:
+                          remaining = sizes[name_in_model]
+                          while remaining:
+                              chunk = response.read(min(1024**2, remaining))
+                              assert chunk, 'model download truncated'
+                              stream.write(chunk)
+                              remaining -= len(chunk)
+                          assert not response.read(1), 'model download exceeds approved size'
+                  assert target.stat().st_size == sizes[name_in_model] and sha256(target) == digest
+              (root / '.frameleaf-staged.json').write_text(json.dumps(artifacts, sort_keys=True) + '\n')
+          env = build_environment(output, os.environ)
+          env.update(HF_HUB_OFFLINE='1', MACHINE_LEARNING_MODEL_DOWNLOADS='false',
+                     OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1',
+                     MACHINE_LEARNING_MODEL_INTER_OP_THREADS='1', MACHINE_LEARNING_MODEL_INTRA_OP_THREADS='1')
+          reports = []
+          for index, profile in enumerate(profiles):
+              fixture_root = output / f'profile-{index}'
+              fixture_root.mkdir()
+              spec = profile['spec']
+              spec_path = fixture_root / 'spec.json'
+              spec_path.write_bytes(json.dumps(spec, sort_keys=True, separators=(',', ':')).encode())
+              fixture = fixture_root / relative(spec['fixtureFile'])
+              fixture.parent.mkdir(parents=True, exist_ok=True)
+              fixture.write_bytes(base64.b64decode(profile['fixtureBase64'], validate=True))
+              assert sha256(fixture) == spec['fixtureSha256']
+              report_path = output / f'profile-{index}.json'
+              with (output / f'profile-{index}.log').open('w') as log:
+                  result = subprocess.run([str(payload / manifest['python']), '-I', '-B', '-m',
+                      'frameleaf_ml.native_qualification', '--spec', str(spec_path), '--cache-dir', str(cache),
+                      '--output', str(report_path)], cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT,
+                      timeout=spec['deadlineSeconds'] + 30)
+              report = json.loads(report_path.read_text())
+              assert result.returncode == 0 and report['state'] == 'ready-cpu', report
+              assert report['modelKey'] == profile['modelKey'] and report['provider'] == 'CPUExecutionProvider'
+              assert report['bindingSha256'] == sha256(spec_path) and report['fixtureSha256'] == spec['fixtureSha256']
+              assert report['preprocessingSha256'] == spec['preprocessingSha256']
+              assert report['execution'] and all(e['state'] == 'ready-cpu' and
+                  set(e['nodes']) == {'CPUExecutionProvider'} and e['nodes']['CPUExecutionProvider'] > 0 for e in report['execution'])
+              reports.append({'modelKey': profile['modelKey'], 'reportSha256': sha256(report_path)})
+          assert inventory(candidate) == before
+          (output / 'result.json').write_text(json.dumps({'state': 'all-five-Windows-CPU-profiles-qualified',
+              'runId': run_id, 'buildHead': build_head, 'artifactId': artifact_id, 'artifactSha256': artifact_sha,
+              'sourceRevision': revision, 'manifestSha256': sha256(candidate / 'manifest.json'),
+              'profiles': reports, 'runtimeUnchanged': True, 'referenceOutputOrToleranceChanged': False,
+              'installedAcceptance': False, 'gpuQualified': False}, indent=2) + '\n')
+      - name: Retain private qualification receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-current-cpu-qualification
+          path: |
+            ${{ runner.temp }}/fl-current-cpu-qualification/result.json
+            ${{ runner.temp }}/fl-current-cpu-qualification/profile-*.json
+            ${{ runner.temp }}/fl-current-cpu-qualification/profile-*.log
+          retention-days: 7
+          if-no-files-found: warn

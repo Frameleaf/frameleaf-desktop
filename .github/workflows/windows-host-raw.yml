@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 211b43ae79c57c639e3dfda33cd8b0af5fed510c
+          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
           fetch-depth: 2
           path: server-source
           persist-credentials: false
@@ -119,7 +119,7 @@ jobs:
         env:
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
-          python tools/build_host_raw.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 211b43ae79c57c639e3dfda33cd8b0af5fed510c --dependency-prefix "$env:MSYS2_LOCATION/ucrt64" --output "$env:RUNNER_TEMP/fl-windows-raw"
+          python tools/build_host_raw.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --dependency-prefix "$env:MSYS2_LOCATION/ucrt64" --output "$env:RUNNER_TEMP/fl-windows-raw"
           if ($LASTEXITCODE) { throw 'Native Windows RAW component qualification failed' }
       - name: Compile and verify the source-matched server consumer
         shell: pwsh
@@ -129,7 +129,7 @@ jobs:
           npm install --global pnpm@12.11.2
           if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
           $node = (Get-Command node).Source
-          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 211b43ae79c57c639e3dfda33cd8b0af5fed510c --node $node --output "$env:RUNNER_TEMP/fl-raw-server"
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --node $node --output "$env:RUNNER_TEMP/fl-raw-server"
           if ($LASTEXITCODE) { throw 'RAW server consumer qualification failed' }
       - name: Bind and qualify actual production RAW consumers
         shell: pwsh
