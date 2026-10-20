@@ -196,6 +196,7 @@ def closure(entries: dict[str, Path], library_dirs: list[Path], output: Path) ->
             "mode": source.stat().st_mode & 0o777,
             "sourceSha256": digest,
             "needed": needed,
+            "sourceSearchPaths": paths,
             "dependencies": dependencies,
         }
         pending.extend(
@@ -236,7 +237,7 @@ def closure(entries: dict[str, Path], library_dirs: list[Path], output: Path) ->
                     destination,
                 ]
             )
-        else:
+        elif item["sourceSearchPaths"]:
             run([tools["patchelf"], "--remove-rpath", destination])
         destination.chmod(item["mode"])
 
