@@ -30,6 +30,48 @@ class ExifToolEntryTests(unittest.TestCase):
 
 
 class HostBundleTests(unittest.TestCase):
+    def test_assembly_retains_root_license_bytes_in_the_final_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            host, ml, manager, backup = [root / name for name in ["host", "ml", "manager", "backup"]]
+            for path in [host, ml, manager, backup]:
+                path.mkdir()
+            for name in ["server", "pg", "libraries", "media", "build", "raw", "media-tools",
+                         "studio", "fonts", "browser", "perl"]:
+                (host / name).mkdir()
+                (host / name / "fixture").write_bytes(b"fixture")
+            (host / host_entries()["node"]).write_bytes(b"node fixture")
+            notices = {"licenses/node/LICENSE": b"Node upstream license\n",
+                       "licenses/system/library-copyright.txt": b"System library notices\n"}
+            for name, contents in notices.items():
+                path = host / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+            (manager / "component.json").write_text(json.dumps({
+                "schemaVersion": 1, "sourceRevision": "a" * 40, "nodeVersion": "26.11.1",
+                "lockfileSha256": "b" * 64, "runtimeQualified": False, "redistributable": False,
+            }))
+            (ml / "payload").mkdir()
+            (ml / "payload/fixture").write_bytes(b"fixture")
+            (backup / "LICENSE").write_bytes(b"backup fixture license")
+            for name in ["manifest.json", "manifest.sig"]:
+                (ml / name).write_bytes(b"fixture")
+            checked = {"platform": "fixture", "architecture": "fixture"}
+            with (
+                patch("build_host_bundle.backup_component", return_value={}),
+                patch("build_host_bundle.run", side_effect=["v26.11.1", json.dumps(checked), json.dumps(checked)]),
+                patch("build_host_bundle.host_manifest", side_effect=lambda payload, *_: {
+                    **checked, "files": inventory(payload),
+                }),
+            ):
+                assemble(host, ml, manager, backup, root / "output", "a" * 40, 2)
+            manifest = json.loads((root / "output/manifest.json").read_text())
+            for name, contents in notices.items():
+                self.assertEqual((root / "output/payload" / name).read_bytes(), contents)
+                self.assertEqual(manifest["files"][name], {
+                    "bytes": len(contents), "sha256": hashlib.sha256(contents).hexdigest(),
+                })
+
     def test_backup_component_is_bound_to_approved_binary_and_license(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
