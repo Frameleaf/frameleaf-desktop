@@ -941,9 +941,21 @@ impl NativeManager {
     }
     #[cfg(windows)]
     fn cleanup_windows(&mut self, timeout: Duration) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
+        };
+        let deadline = Instant::now() + timeout;
         self.tree
             .terminate_confirmed(timeout)
             .map_err(|_| "native_manager_shutdown_unconfirmed")?;
+        // Empty job accounting can precede the leader handle becoming signalled.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let milliseconds = remaining.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        if unsafe { WaitForSingleObject(self.child.as_raw_handle(), milliseconds) } != WAIT_OBJECT_0
+        {
+            return Err("native_manager_shutdown_unconfirmed".into());
+        }
         match self.child.try_wait() {
             Ok(Some(_)) => Ok(()),
             _ => Err("native_manager_shutdown_unconfirmed".into()),

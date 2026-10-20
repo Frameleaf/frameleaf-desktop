@@ -28,6 +28,14 @@ jobs:
         with:
           node-version: '26.11.1'
           cache: npm
+      - name: Record disposable runner cloud-filter state
+        shell: python
+        run: |
+          import subprocess
+          for command in [['sc.exe', 'query', 'cldflt'], ['fltmc.exe', 'filters']]:
+              result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(command, 'exit=', result.returncode, flush=True)
+              print(result.stdout, flush=True)
       - name: Acquire and verify the exact signed Windows runtime
         shell: python
         env:

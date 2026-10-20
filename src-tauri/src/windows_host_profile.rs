@@ -2,11 +2,18 @@
 use std::{
     ffi::OsString,
     fs,
-    os::windows::ffi::OsStringExt,
+    os::windows::{
+        ffi::OsStringExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::{Path, PathBuf},
 };
 use windows_sys::Win32::{
-    System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
+    Security::{TOKEN_IMPERSONATE, TOKEN_QUERY},
+    System::{
+        Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
+        Threading::{GetCurrentProcess, OpenProcessToken},
+    },
     UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
 };
 
@@ -82,11 +89,24 @@ fn known_folder() -> Result<PathBuf, String> {
         assert_eq!(CoGetApartmentType(&mut kind, &mut qualifier), 0);
         assert_ne!(qualifier, APTTYPEQUALIFIER_IMPLICIT_MTA);
     }
+    let mut raw = std::ptr::null_mut();
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_IMPERSONATE,
+            &mut raw,
+        )
+    } == 0
+        || raw.is_null()
+    {
+        return Err(REQUIRED.into());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
     let result = unsafe {
         SHGetKnownFolderPath(
             &FOLDERID_LocalAppData,
             0,
-            std::ptr::null_mut(),
+            token.as_raw_handle(),
             &mut folder.0,
         )
     };
@@ -226,21 +246,26 @@ mod tests {
             println!("profile-location={}", base.display());
             return;
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "windows_host_profile::tests::os_location_ignores_environment_and_working_directory", "--nocapture"])
-            .env("FRAMELEAF_PROFILE_LOCATOR_CHILD", "1")
-            .env("LOCALAPPDATA", r"Z:\untrusted")
-            .env("APPDATA", r"Z:\untrusted")
-            .env("USERPROFILE", r"Z:\untrusted")
-            .current_dir(std::env::temp_dir()).output().unwrap();
-        assert!(
-            output.status.success(),
-            "KnownFolder child failed: {}; {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout)
-            .contains(&format!("profile-location={}", base.display())));
+        let (fixture, _) = fixture();
+        fs::create_dir_all(fixture.0.join("AppData/Local")).unwrap();
+        fs::create_dir_all(fixture.0.join("AppData/Roaming")).unwrap();
+        for decoy in [PathBuf::from(r"Z:\untrusted"), fixture.0.clone()] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "windows_host_profile::tests::os_location_ignores_environment_and_working_directory", "--nocapture"])
+                .env("FRAMELEAF_PROFILE_LOCATOR_CHILD", "1")
+                .env("LOCALAPPDATA", decoy.join("AppData/Local"))
+                .env("APPDATA", decoy.join("AppData/Roaming"))
+                .env("USERPROFILE", &decoy)
+                .current_dir(std::env::temp_dir()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "KnownFolder child failed: {}; {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("profile-location={}", base.display())));
+        }
     }
     #[test]
     #[ignore = "requires a fresh disposable hosted Windows profile with explicit opt-in"]

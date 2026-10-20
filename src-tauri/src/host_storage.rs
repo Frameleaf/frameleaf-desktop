@@ -106,7 +106,24 @@ fn cloud_storage_check(_path: &Path, directory: &std::fs::File) -> Result<(), St
         )
     };
     #[cfg(test)]
-    eprintln!("native cloud-storage probe HRESULT: {result:#010x}");
+    {
+        eprintln!("native cloud-storage probe HRESULT: {result:#010x}");
+        if result as u32 == 0x80070001 {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::CloudFilters::CfGetSyncRootInfoByPath;
+            let path: Vec<u16> = _path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let by_path = unsafe {
+                CfGetSyncRootInfoByPath(
+                    path.as_ptr(),
+                    CF_SYNC_ROOT_INFO_BASIC,
+                    (&mut info as *mut CF_SYNC_ROOT_BASIC_INFO).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            eprintln!("native cloud-storage diagnostic path HRESULT: {by_path:#010x}");
+        }
+    }
     windows_sync_result(result)
 }
 
