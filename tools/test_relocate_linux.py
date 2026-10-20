@@ -11,6 +11,70 @@ from build_runtime import BuildError
 
 
 class LinuxRelocationTests(unittest.TestCase):
+    @unittest.skipUnless(
+        platform.system() == "Linux"
+        and all(shutil.which(tool) for tool in ["gcc", "readelf", "patchelf"]),
+        "requires Linux ELF linker tools",
+    )
+    def test_static_executable_runs_unchanged_after_source_removal(self):
+        from relocate_linux import closure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "main.c"
+            source.write_text("int main(void) {return 0;}")
+            executable = root / "static-app"
+            subprocess.run(
+                ["gcc", "-static", source, "-o", executable],
+                check=True,
+                capture_output=True,
+            )
+            executable.chmod(0o555)
+            original = executable.read_bytes()
+            output = root / "moved payload"
+            report = closure({"bin/app": executable}, [], output)
+            executable.unlink()
+            self.assertEqual(report["qualification"], "passed")
+            self.assertEqual(len(report["objects"]), 1)
+            self.assertEqual((output / "bin/app").read_bytes(), original)
+            self.assertEqual((output / "bin/app").stat().st_mode & 0o777, 0o555)
+            subprocess.run([output / "bin/app"], check=True, env={"PATH": os.defpath})
+
+    @unittest.skipUnless(
+        platform.system() == "Linux"
+        and all(shutil.which(tool) for tool in ["gcc", "readelf", "patchelf"]),
+        "requires Linux ELF linker tools",
+    )
+    def test_library_without_dependencies_loses_its_build_search_path(self):
+        from relocate_linux import closure, dynamic
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "answer.c"
+            source.write_text("int answer(void) {return 42;}")
+            library = root / "answer.so"
+            subprocess.run(
+                [
+                    "gcc",
+                    "-shared",
+                    "-fPIC",
+                    "-nostdlib",
+                    source,
+                    "-Wl,-rpath,/unavailable-build-directory",
+                    "-o",
+                    library,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            output = root / "payload"
+            report = closure({"answer.so": library}, [], output)
+            metadata = subprocess.check_output(
+                ["readelf", "-dW", output / "answer.so"], text=True
+            )
+            self.assertEqual(report["qualification"], "passed")
+            self.assertEqual(dynamic(metadata), ([], []))
+
     def test_dynamic_metadata_refuses_hidden_loader_features(self):
         from relocate_linux import dynamic
 
