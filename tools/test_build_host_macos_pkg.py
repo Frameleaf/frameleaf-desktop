@@ -65,6 +65,7 @@ class MacHostInstallerTests(unittest.TestCase):
             with self.assertRaises(BuildError):
                 stage_package(candidate, helper, out, 'a' * 64, digest)
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX file permissions')
     def test_installer_uses_same_app_like_controller_in_payload_and_bootstrap(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -86,6 +87,7 @@ class MacHostInstallerTests(unittest.TestCase):
             self.assertFalse((version / 'frameleaf-native-host').exists())
             self.assertIn('/Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host', (out / 'scripts/postinstall').read_text())
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX file permissions')
     def test_package_pins_the_only_bundle_without_relocation_or_version_skipping(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

@@ -49,7 +49,12 @@ class MetalInferenceTests(unittest.TestCase):
         spec.loader.exec_module(module)
         self.collector = Collector()
         self.adapter = module.MetalInference(self.collector)
-        self.model = Path("/owned/model.onnx")
+        self.model = Path(__file__).resolve().with_name("fixture-model.onnx")
+
+    def test_relative_model_bindings_are_refused_before_collector_entry(self):
+        with self.assertRaises(ValueError):
+            self.adapter.bind({Path("model.onnx"): "c" * 64})
+        self.assertEqual(self.collector.identifier, 0)
 
     def test_unbound_models_and_conflicting_bindings_are_refused(self):
         with self.assertRaises(ValueError), self.adapter.observe(self.model):
