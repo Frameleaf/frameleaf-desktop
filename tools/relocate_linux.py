@@ -103,6 +103,18 @@ def closure(entries: dict[str, Path], library_dirs: list[Path], output: Path) ->
     tools = {name: shutil.which(name) for name in ["readelf", "patchelf"]}
     if not all(tools.values()):
         raise BuildError("host_elf_tools_missing")
+    version = subprocess.run(
+        [tools["patchelf"], "--version"],
+        env={"PATH": os.defpath, "LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    match = re.fullmatch(r"patchelf (\d+)\.(\d+)\.(\d+)\s*", version.stdout)
+    # Older patchelf can leave DT_INIT pointing at overwritten code after relocation.
+    if version.returncode or not match or tuple(map(int, match.groups())) < (0, 19, 0):
+        raise BuildError("host_elf_patchelf_version_unsupported")
 
     def run(args: list) -> str:
         result = subprocess.run(
