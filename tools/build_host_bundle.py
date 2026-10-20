@@ -237,6 +237,7 @@ def assemble(
         "server",
         "pg",
         "libraries",
+        "licenses",
         "media",
         "build",
         "raw",
