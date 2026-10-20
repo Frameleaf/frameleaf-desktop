@@ -91,6 +91,16 @@ jobs:
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Qualify Windows package directory and receipt authority in the disposable runner
+        if: runner.environment == 'github-hosted'
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE) { throw 'Windows package test discovery failed' }
+          $fixtures = @($tests | Select-String '^host_install::windows::package::tests::disposable_runner_.*: test$')
+          if ($fixtures.Count -ne 3) { throw 'Windows package qualification fixtures are missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
+          if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build the internal Windows desktop installer
         shell: python
@@ -105,6 +115,15 @@ jobs:
           config = output / 'tauri-internal.json'
           config.write_bytes(subprocess.check_output(['node', '--input-type=module', '--eval', code, os.environ['FRAMELEAF_SIGNED_RUNTIME']]))
           subprocess.run(['node', str(cli), 'build', '--debug', '--config', str(config), '--', '--locked'], check=True, timeout=2700)
+      - name: Qualify final Windows controller dependencies without ambient runtime paths
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $inspectors = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe')
+          if ($LASTEXITCODE -or $inspectors.Count -lt 1) { throw 'Controller dependency inspector is missing' }
+          $controller = (Resolve-Path 'src-tauri/target/debug/frameleaf-native-host.exe').Path
+          python tools/qualify_windows_controller.py $controller $inspectors[0] | Tee-Object -FilePath "$env:RUNNER_TEMP/fl-windows-desktop/controller-qualification.json"
+          if ($LASTEXITCODE) { throw 'Windows controller dependency qualification failed' }
       - name: Verify both Windows executables and the embedded normal-signed runtime
         shell: python
         run: |
@@ -124,6 +143,9 @@ jobs:
                   stream.seek(offset)
                   assert stream.read(6) == b'PE\0\0\x64\x86'
               binaries[name] = sha256(path)
+          controller = json.loads((output / 'controller-qualification.json').read_text())
+          assert controller['controllerSha256'] == binaries['frameleaf-native-host.exe']
+          assert controller['systemOnlyDependencies'] is True and controller['sanitizedEntrypointQualified'] is True
           installers = list((target / 'bundle/nsis').glob('*.exe'))
           assert len(installers) == 1
           installer = installers[0]
@@ -142,7 +164,7 @@ jobs:
           assert checked['keyId'] == identity['keyId'] and checked['manifestSha256'] == identity['manifestSha256']
           assert sha256(matches[0] / 'manifest.sig') == identity['signatureSha256']
           receipt = {'state': 'Windows-desktop-installer-built-and-embedded-runtime-verified', 'platform': 'windows-x86_64',
-              'installer': installer.name, 'installerSha256': sha256(installer), 'binaries': binaries,
+              'installer': installer.name, 'installerSha256': sha256(installer), 'binaries': binaries, 'controller': controller,
               'runtime': identity, 'installedAcceptance': False, 'osCodeSigned': False, 'fullHostComponentsIncluded': False}
           (output / 'result.json').write_text(json.dumps(receipt, indent=2) + '\n')
       - name: Retain the private installer and verification receipts
@@ -154,5 +176,6 @@ jobs:
             src-tauri/target/debug/bundle/nsis/*.exe
             ${{ runner.temp }}/fl-windows-desktop/result.json
             ${{ runner.temp }}/fl-windows-desktop/runtime-identity.json
+            ${{ runner.temp }}/fl-windows-desktop/controller-qualification.json
           retention-days: 7
           if-no-files-found: error
