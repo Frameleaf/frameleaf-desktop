@@ -6,11 +6,35 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from build_runtime import BuildError
 
 
 class LinuxRelocationTests(unittest.TestCase):
+    def test_refuses_patchelf_versions_with_broken_init_relocation(self):
+        from relocate_linux import closure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for version in ["patchelf 0.18.0\n", "patchelf 0.17.2\n", "unknown\n"]:
+                with self.subTest(version=version), patch(
+                    "relocate_linux.platform.system", return_value="Linux"
+                ), patch(
+                    "relocate_linux.platform.machine", return_value="x86_64"
+                ), patch(
+                    "relocate_linux.shutil.which", side_effect=lambda name: "/tools/" + name
+                ), patch(
+                    "relocate_linux.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, version, ""),
+                ):
+                    output = root / "payload"
+                    with self.assertRaisesRegex(
+                        BuildError, "host_elf_patchelf_version_unsupported"
+                    ):
+                        closure({"bin/app": root / "app"}, [], output)
+                    self.assertFalse(output.exists())
+
     @unittest.skipUnless(
         platform.system() == "Linux"
         and all(shutil.which(tool) for tool in ["gcc", "readelf", "patchelf"]),

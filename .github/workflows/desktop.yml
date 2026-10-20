@@ -41,6 +41,17 @@ jobs:
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
+      - name: Linux ELF relocation tooling
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/frameleaf-patchelf"
+          mkdir -p "$tool_dir"
+          curl --fail --location --silent --show-error --output "$tool_dir/patchelf.tar.gz" https://github.com/NixOS/patchelf/releases/download/0.19.1/patchelf-0.19.1-x86_64.tar.gz
+          echo "a6818fef80128fb354423234ecacdcca3e993913d774e5d8346bc63f70fed4cf  $tool_dir/patchelf.tar.gz" | sha256sum --check --strict
+          tar -xzf "$tool_dir/patchelf.tar.gz" -C "$tool_dir"
+          echo "$tool_dir/bin" >> "$GITHUB_PATH"
       - name: Rust stable
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - run: npm ci
