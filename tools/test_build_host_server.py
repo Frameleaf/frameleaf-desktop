@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -6,11 +7,52 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import build_host_server
 from build_host_server import build, stage_server
 from build_runtime import BuildError, run as checked_run
 
 
 class HostServerTests(unittest.TestCase):
+    def test_runtime_metadata_keeps_versions_without_build_machine_paths(self):
+        for origin in ["file:///developer/private-build", "file:///C:/Users/builder/private-build"]:
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                dependencies = {}
+                for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+                    package = root / "node_modules" / name / "package.json"
+                    package.parent.mkdir(parents=True)
+                    package.write_text(json.dumps({"name": name, "version": "1.2.3-beta.1"}))
+                    dependencies[name] = name + "@" + origin + "/" + name
+                original = {"name": "frameleaf", "type": "module", "exports": {".": "./dist/main.js"}, "dependencies": dependencies}
+                (root / "package.json").write_text(json.dumps(original))
+                for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:
+                    path = root / name
+                    path.parent.mkdir(exist_ok=True)
+                    path.write_text("private build-only state")
+                (root / "dist/main.js").write_text("export const value = 42;")
+                retained = root / "node_modules/@frameleaf/plugin-sdk/pnpm-lock.yaml"
+                retained.write_text("dependency source provenance")
+                build_host_server.clean_runtime_metadata(root)
+                actual = json.loads((root / "package.json").read_text())
+                self.assertEqual(actual, {**original, "dependencies": {name: "1.2.3-beta.1" for name in dependencies}})
+                for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:
+                    self.assertFalse((root / name).exists())
+                self.assertEqual((root / "dist/main.js").read_text(), "export const value = 42;")
+                self.assertEqual(retained.read_text(), "dependency source provenance")
+
+    def test_runtime_metadata_refuses_wrong_or_unversioned_workspace_packages(self):
+        for invalid in [None, {"name": "other", "version": "1.2.3"}, {"name": "@frameleaf/plugin-sdk", "version": "file:///private-build"}]:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                original = {"dependencies": {"@frameleaf/plugin-sdk": "workspace:*", "@frameleaf/sql-tools": "workspace:*"}}
+                (root / "package.json").write_text(json.dumps(original))
+                package = root / "node_modules/@frameleaf/plugin-sdk/package.json"
+                package.parent.mkdir(parents=True)
+                package.write_text(json.dumps(invalid))
+                with self.assertRaises(BuildError):
+                    build_host_server.clean_runtime_metadata(root)
+                self.assertEqual(json.loads((root / "package.json").read_text()), original)
+
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_source_archive_preserves_canonical_bytes_with_windows_git_settings(self):
         git = shutil.which("git")

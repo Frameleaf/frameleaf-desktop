@@ -57,6 +57,37 @@ def stage_server(source: Path, destination: Path) -> dict:
     return inventory(destination)
 
 
+def clean_runtime_metadata(runtime: Path) -> None:
+    package = runtime / "package.json"
+    regular(package)
+    metadata = json.loads(package.read_text())
+    dependencies = metadata.get("dependencies") if isinstance(metadata, dict) else None
+    if not isinstance(dependencies, dict):
+        raise BuildError("host_server_package_metadata_invalid")
+    for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+        path = runtime / "node_modules" / name / "package.json"
+        regular(path)
+        workspace = json.loads(path.read_text())
+        version = workspace.get("version") if isinstance(workspace, dict) else None
+        if (
+            not isinstance(workspace, dict)
+            or name not in dependencies
+            or workspace.get("name") != name
+            or not isinstance(version, str)
+            or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version)
+        ):
+            raise BuildError("host_server_package_metadata_invalid")
+        dependencies[name] = version
+    # Source/lock identity stays in the build receipt, not deployer's local file URLs.
+    package.write_text(json.dumps(metadata, indent=2) + "\n")
+    for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:
+        path = runtime / name
+        if path.exists() or path.is_symlink():
+            if not stat.S_ISREG(regular(path).st_mode):
+                raise BuildError("host_server_package_metadata_invalid")
+            path.unlink()
+
+
 def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if not re.fullmatch("[0-9a-f]{40}", revision) or not all(
         path.is_absolute() for path in [source, node, output]
@@ -157,7 +188,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
                 ]
             )
             runtime = output / "server"
-            report["files"] = stage_server(deployed, runtime)
+            stage_server(deployed, runtime)
+            clean_runtime_metadata(runtime)
+            report["files"] = inventory(runtime)
             command(
                 [
                     node,
