@@ -604,8 +604,9 @@ does not imply the server change has merged.
 `/absolute/path/to/private-node tools/qualify_host_exiftool.mjs /absolute/path/to/exiftool-build-output`
 checks the actual packaged `MetadataRepository` with synthetic JPEGs: Unicode
 metadata read/write, location removal, original and decoded-pixel preservation,
-and refusal when the private Perl or Windows executable is missing. This passed on macOS ARM64 with Perl
-5.44.0 and exiftool-vendored 39.0.1. Component receipts remain non-redistributable;
+and refusal when the private Perl or Windows executable is missing. This passed on
+macOS ARM64 and in bare Ubuntu 24 x64 with private Perl 5.44.0 and
+exiftool-vendored 39.0.1. Component receipts remain non-redistributable;
 complete signed-host assembly and installed three-platform acceptance are pending.
 
 ### Private native RAW engine
@@ -621,7 +622,7 @@ require qualification; a successful component build is insufficient.
 
 `python3 tools/build_host_raw.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --dependency-prefix /opt/homebrew --output /absolute/path/to/new-raw-output`
 
-This macOS authoring builder checks the selected source's darktable, Lensfun,
+This macOS/Linux authoring builder checks the selected source's darktable, Lensfun,
 LibRaw and Frameleaf patch pins, builds the CPU engine, and stages its native
 closure, resources and license sources. Developer CMake, Ninja, pkg-config,
 autotools, intltool, xsltproc and the engine's build dependencies are required.
@@ -633,11 +634,14 @@ its original install directory unavailable.
 Stage the qualified RAW component under the assembled runtime’s `raw/` directory.
 The acceptance fixture uses those copied binaries, the packaged Frameleaf renderer and the host launch
 environment against a generated Bayer DNG. It checks profiled 16-bit output,
-exposure, repeatable pixels, JPEG preview, unchanged original and actual loaded
-native images. Host manifests must inventory both `rawRenderer`
+exposure, repeatable pixels, JPEG preview and unchanged original. On macOS it also
+checks actual loaded native images. Host manifests must inventory both `rawRenderer`
 (`darktable-cli`) and sibling `rawDecoder` (`dcraw_emu`); both are required before
-startup. These are macOS component checks. Full RAW format/recipe conformance,
-complete signed host assembly, installed Windows/Linux support, minimum OS and
+startup. These synthetic component checks passed on macOS ARM64 and in bare
+Ubuntu 24 x64. The Ubuntu check uses offline, read-only component inputs and an
+ephemeral fixture layout; it does not establish the installed host layout or a
+Linux dynamic-image audit. Full RAW format/recipe conformance, complete signed
+host assembly, installed Windows/Linux support, minimum OS and
 redistribution qualification remain pending.
 
 ### Native Studio worker draft
