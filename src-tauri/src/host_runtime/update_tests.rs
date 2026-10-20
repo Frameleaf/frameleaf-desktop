@@ -3111,6 +3111,7 @@ fn update_selection_refuses_source_database_replaced_at_the_publication_boundary
             .is_err(),
         "selection must bind the database from authenticated consumption, not a later replacement"
     );
+    drop(owner);
     assert_eq!(
         fs::read(state.join("controller-state.json")).unwrap(),
         before
