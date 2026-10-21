@@ -39,6 +39,8 @@ jobs:
       - name: Check signature admission and archive boundaries
         shell: pwsh
         run: |
+          node --test tools/test_host_agent.mjs tools/test_host_bootstrap.mjs tools/test_host_database.mjs
+          if ($LASTEXITCODE) { throw 'Host command and lifecycle guards failed' }
           foreach ($test in @('test_prepare_windows_host_qualification.py', 'test_assemble_windows_host_candidate.py', 'test_build_host_ffmpeg.py')) {
             python -m unittest discover -s tools -p $test -v
             if ($LASTEXITCODE) { throw "Host qualification guard failed: $test" }

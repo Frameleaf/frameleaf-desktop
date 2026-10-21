@@ -358,3 +358,36 @@ test(
     }
   },
 );
+
+test('failed host commands report only their component and exit status', async t => {
+  const { createServer } = await import('node:net');
+  const { basename, dirname } = await import('node:path');
+  const { runHost } = await import('../runtime/host-agent.mjs');
+  const diagnostics = [];
+  t.mock.method(process.stderr, 'write', chunk => { diagnostics.push(String(chunk)); return true; });
+  for (const missing of [true, false]) {
+    const state = await mkdtemp(join(tmpdir(), 'frameleaf-command-error-'));
+    const probes = [createServer(), createServer()];
+    for (const probe of probes) await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+    const ports = probes.map(probe => probe.address().port);
+    for (const probe of probes) await new Promise(resolve => probe.close(resolve));
+    const cfg = { ...config(state), databasePort: ports[0], apiPort: ports[1],
+      runtime: missing ? join(state, 'missing-runtime') : dirname(process.execPath) };
+    cfg.entryPoints.initdb = missing ? 'missing-initdb' : basename(process.execPath);
+    try {
+      diagnostics.length = 0;
+      await assert.rejects(runHost(cfg, new Promise(() => {}), () => assert.fail()), /host_command_failed/);
+      const report = JSON.parse(diagnostics.join(''));
+      assert.equal(report.state, 'host-command-failed');
+      assert.equal(report.component, cfg.entryPoints.initdb);
+      assert.equal(typeof report.exitCode, 'number');
+      assert.notEqual(report.exitCode, 0);
+      assert.equal(report.signal, null);
+      assert.equal(report.spawnCode, missing ? 'ENOENT' : null);
+      assert.equal(report.oversized, false);
+      for (const privateValue of [cfg.password, cfg.state, cfg.runtime, '--pwfile'])
+        assert.ok(!diagnostics.join('').includes(privateValue));
+      await assert.rejects(readFile(join(state, 'database-password.tmp')), { code: 'ENOENT' });
+    } finally { await rm(state, { recursive: true, force: true }); }
+  }
+});

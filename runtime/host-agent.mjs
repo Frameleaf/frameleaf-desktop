@@ -856,6 +856,13 @@ export async function runHost(c, stopping, ready, restoreSession) {
   }
   async function command(args, extra = {}, duringStop = false, options = {}) {
     const child = launch(args, extra, undefined, !options.quiet);
+    let spawnCode = null;
+    const closed = new Promise(resolve => {
+      child.once("error", error => {
+        spawnCode = /^[A-Z][A-Z0-9_]{0,31}$/.test(error.code ?? "") ? error.code : "UNKNOWN";
+      });
+      child.once("close", resolve);
+    });
     let output = "",
       oversized = false;
     if (options.quiet) child.stderr.resume();
@@ -877,7 +884,17 @@ export async function runHost(c, stopping, ready, restoreSession) {
         fail("host_command_timeout");
       }
     }
-    if (child.exitCode !== 0 || oversized) fail("host_command_failed");
+    // Failed spawns have no PID; their final status arrives with the close event.
+    if (!child.pid) await closed;
+    if (child.exitCode !== 0 || oversized) {
+      const component = basename(args[0]);
+      process.stderr.write(JSON.stringify({
+        state: "host-command-failed",
+        component: /^[A-Za-z0-9_.-]{1,64}$/.test(component) ? component : "unknown",
+        exitCode: child.exitCode, signal: child.signalCode, spawnCode, oversized,
+      }) + "\n");
+      fail("host_command_failed");
+    }
     if (!child.stdout.readableEnded && !child.stdout.destroyed)
       await new Promise((resolve) => child.stdout.once("end", resolve));
     return output;
