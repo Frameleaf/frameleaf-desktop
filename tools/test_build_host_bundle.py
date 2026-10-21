@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
 
 from build_host_bundle import REQUIRED_HOST_FILES, assemble, host_entries, host_manifest, backup_component
 from build_host_backup import ROOT, CONTRACT, artifact
@@ -56,21 +57,43 @@ class HostBundleTests(unittest.TestCase):
             (backup / "LICENSE").write_bytes(b"backup fixture license")
             for name in ["manifest.json", "manifest.sig"]:
                 (ml / name).write_bytes(b"fixture")
+            (host / "node").write_bytes(b"node fixture")
+            (host / "node.exe").write_bytes(b"node fixture")
             checked = {"platform": "fixture", "architecture": "fixture"}
-            with (
-                patch("build_host_bundle.backup_component", return_value={}),
-                patch("build_host_bundle.run", side_effect=["v26.11.1", json.dumps(checked), json.dumps(checked)]),
-                patch("build_host_bundle.host_manifest", side_effect=lambda payload, *_: {
-                    **checked, "files": inventory(payload),
-                }),
-            ):
-                assemble(host, ml, manager, backup, root / "output", "a" * 40, 2)
-            manifest = json.loads((root / "output/manifest.json").read_text())
-            for name, contents in notices.items():
-                self.assertEqual((root / "output/payload" / name).read_bytes(), contents)
-                self.assertEqual(manifest["files"][name], {
-                    "bytes": len(contents), "sha256": hashlib.sha256(contents).hexdigest(),
-                })
+            for label, os_name, empty in [('current', os.name, False),
+                                          ('windows-empty', 'nt', True),
+                                          ('windows-populated', 'nt', False),
+                                          ('posix-empty', 'posix', True)]:
+                library = host / 'libraries/fixture'
+                if empty:
+                    library.unlink(missing_ok=True)
+                else:
+                    library.write_bytes(b'private library')
+                output = root / label
+                with (
+                    self.subTest(label=label),
+                    patch("build_host_bundle.os", SimpleNamespace(name=os_name)),
+                    patch("build_host_bundle.backup_component", return_value={}),
+                    patch("build_host_bundle.run", side_effect=["v26.11.1", json.dumps(checked), json.dumps(checked)]),
+                    patch("build_host_bundle.host_manifest", side_effect=lambda payload, *_: {
+                        **checked, "files": inventory(payload),
+                    }),
+                ):
+                    if empty and os_name != 'nt':
+                        with self.assertRaisesRegex(BuildError, 'runtime_inventory_empty'):
+                            assemble(host, ml, manager, backup, output, "a" * 40, 2)
+                        self.assertFalse((output / 'manifest.json').exists())
+                        continue
+                    assemble(host, ml, manager, backup, output, "a" * 40, 2)
+                    manifest = json.loads((output / "manifest.json").read_text())
+                    for name, contents in notices.items():
+                        self.assertEqual((output / "payload" / name).read_bytes(), contents)
+                        self.assertEqual(manifest["files"][name], {
+                            "bytes": len(contents), "sha256": hashlib.sha256(contents).hexdigest(),
+                        })
+                    self.assertEqual('libraries/fixture' in manifest['files'], not empty)
+                    if not empty:
+                        self.assertEqual((output / 'payload/libraries/fixture').read_bytes(), b'private library')
 
     def test_backup_component_is_bound_to_approved_binary_and_license(self):
         with tempfile.TemporaryDirectory() as temporary:

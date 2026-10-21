@@ -254,6 +254,11 @@ def assemble(
     if os.name != "nt":
         directories.append("perl")
     for name in directories:
+        # Windows components keep their private DLLs beside their executables.
+        if name == "libraries" and os.name == "nt":
+            source = host / name
+            if stat.S_ISDIR(regular(source).st_mode) and not any(source.iterdir()):
+                continue
         stage_server(host / name, payload / name)
     stage_server(manager, payload / "manager")
     stage_server(backup, payload / "backup")
