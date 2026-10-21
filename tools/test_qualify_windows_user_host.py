@@ -40,13 +40,25 @@ from qualify_windows_user_host import run_restricted
 sys.exit(run_restricted([sys.executable,'-c','import sys; print("owned restricted child"); sys.exit(7)'], {'SystemRoot':__import__('os').environ['SystemRoot']}, __import__('os').getcwd()))
 """
         result = run_probe([sys.executable,'-c',code], cwd=Path(__file__).parent, timeout=15)
-        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         facts = json.loads(result.stdout.splitlines()[0])
         self.assertTrue(facts['sameUser'])
         self.assertFalse(facts['administratorsEnabled'])
         self.assertFalse(facts['powerUsersEnabled'])
         self.assertIn('integrityRid',facts)
         self.assertIn('elevated',facts)
+        self.assertIn('owned restricted child',result.stdout)
+
+    @unittest.skipUnless(os.name == 'nt', 'requires Windows token and Job APIs')
+    def test_restricted_system_child_preserves_output_and_exit(self):
+        code = """import os,sys
+assert sys.stdin.buffer.read(1)==b'1'
+from qualify_windows_user_host import run_restricted
+from pathlib import Path
+sys.exit(run_restricted([str(Path(os.environ['SystemRoot'])/'System32/cmd.exe'),'/d','/c','echo owned restricted child&exit /b 7'], {'SystemRoot':os.environ['SystemRoot']}, os.getcwd()))
+"""
+        result = run_probe([sys.executable,'-c',code], cwd=Path(__file__).parent, timeout=15)
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         self.assertIn('owned restricted child',result.stdout)
 
 

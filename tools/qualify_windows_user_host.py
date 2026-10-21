@@ -57,6 +57,8 @@ def run_restricted(command, environment, cwd):
     definitions = [
         (kernel, 'GetCurrentProcess', [], w.HANDLE),
         (kernel, 'GetStdHandle', [w.DWORD], w.HANDLE),
+        (kernel, 'GetHandleInformation', [w.HANDLE, ctypes.POINTER(w.DWORD)], w.BOOL),
+        (kernel, 'GetFileType', [w.HANDLE], w.DWORD),
         (kernel, 'CloseHandle', [w.HANDLE], w.BOOL),
         (kernel, 'LocalFree', [ctypes.c_void_p], ctypes.c_void_p),
         (kernel, 'ResumeThread', [w.HANDLE], w.DWORD),
@@ -162,14 +164,26 @@ def run_restricted(command, environment, cwd):
         child_token = w.HANDLE()
         check(security.OpenProcessToken(process.process, 0x000a, ctypes.byref(child_token)))
         own(child_token)
-        print(json.dumps(facts(child_token)), flush=True)
-        if kernel.ResumeThread(process.thread) == 0xffffffff:
+        observed = facts(child_token)
+        inherited = []
+        for handle in [startup.stdin, startup.stdout, startup.stderr]:
+            flags = w.DWORD()
+            check(kernel.GetHandleInformation(handle, ctypes.byref(flags)))
+            inherited.append(bool(flags.value & 1))
+        observed['standardHandlesInheritable'] = inherited
+        observed['standardHandleTypes'] = [kernel.GetFileType(handle) for handle in [startup.stdin, startup.stdout, startup.stderr]]
+        print(json.dumps(observed), flush=True)
+        resumed = kernel.ResumeThread(process.thread)
+        if resumed == 0xffffffff:
             raise ctypes.WinError(ctypes.get_last_error())
-        if kernel.WaitForSingleObject(process.process, 900000) != 0:
+        waited = kernel.WaitForSingleObject(process.process, 900000)
+        if waited != 0:
             raise RuntimeError('host_test_wait_failed')
         completed = True
         code = w.DWORD()
         check(kernel.GetExitCodeProcess(process.process, ctypes.byref(code)))
+        print(json.dumps({'state':'restricted-child-exited', 'resumeCount':resumed,
+                          'waitResult':waited, 'rawExitCode':code.value}), flush=True)
         return code.value
 
 
