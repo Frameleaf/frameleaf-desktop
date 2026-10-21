@@ -13,6 +13,36 @@ from build_runtime import BuildError, inventory
 
 
 class WindowsHostAssemblyTests(unittest.TestCase):
+    def test_source_equivalence_is_checked_before_any_component_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with (patch.object(assembler.platform, 'system', return_value='Windows'),
+                  patch.object(assembler.platform, 'machine', return_value='AMD64'),
+                  patch.object(assembler.shutil, 'which', return_value='git'),
+                  patch.object(assembler, 'verify_reused_source', side_effect=BuildError('reused_source_changed')) as verify,
+                  patch.object(assembler, 'api') as api,
+                  self.assertRaisesRegex(BuildError, 'reused_source_changed')):
+                assembler.build(root, root / 'output', '1', 'a' * 64, 'b' * 40, 'ab' * 64)
+            verify.assert_called_once()
+            api.assert_not_called()
+
+    def test_reused_components_require_only_the_rebuilt_server_schema_to_change(self):
+        expected = ['server/src/utils/environment-schema.spec.ts',
+                    'server/src/utils/environment-schema.ts']
+        for changed in [expected, expected + ['web/src/routes/+page.svelte'],
+                        expected + ['pnpm-lock.yaml'], expected[:1], []]:
+            with self.subTest(changed=changed), patch.object(assembler, 'run', return_value='\n'.join(changed)) as run:
+                if changed == expected:
+                    receipt = assembler.verify_reused_source('git', Path('/source'), {})
+                    self.assertEqual(receipt['currentSourceRevision'], assembler.SOURCE)
+                    self.assertEqual(receipt['baseSourceRevision'], assembler.COMPONENT_SOURCE)
+                    self.assertEqual(receipt['changedPaths'], expected)
+                    self.assertIn('--no-ext-diff', run.call_args.args[0])
+                    self.assertIn('--no-renames', run.call_args.args[0])
+                else:
+                    with self.assertRaisesRegex(BuildError, 'reused_source_changed'):
+                        assembler.verify_reused_source('git', Path('/source'), {})
+
     def test_geodata_capture_preserves_checksum_and_removes_failed_partial_files(self):
         content = b'pinned geodata'
         digest = hashlib.sha256(content).hexdigest()
@@ -65,6 +95,10 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             record = {'qualification': 'passed', 'sourceRevision': assembler.SOURCE,
                       'files': inventory(root / 'component')}
             receipt = root / 'qualification.json'
+            receipt.write_text(json.dumps(record | {'sourceRevision': assembler.COMPONENT_SOURCE}))
+            assembler.qualified_files(root, 'component', assembler.COMPONENT_SOURCE)
+            with self.assertRaisesRegex(BuildError, 'component_unqualified'):
+                assembler.qualified_files(root, 'component')
             receipt.write_text(json.dumps(record))
             self.assertEqual(assembler.qualified_files(root, 'component'), record)
             asset.write_bytes(b'changed')

@@ -18,10 +18,23 @@ from build_host_bundle import assemble
 from build_host_database import download
 from build_host_ffmpeg import unpack
 from build_host_server import stage_server
-from build_runtime import BuildError, build_environment, git_blob, inventory, sha256
+from build_runtime import BuildError, build_environment, git_blob, inventory, run, sha256
 
-SOURCE = '9bbe7c64e720fceee2fcba0f72055c945f56b19a'
+SOURCE = 'aadd5f59ab68c4621885f852ee6953f23b55e556'
+COMPONENT_SOURCE = '9bbe7c64e720fceee2fcba0f72055c945f56b19a'
 REPOSITORY = 'repos/Frameleaf/frameleaf-desktop/'
+
+
+def verify_reused_source(git: str, source: Path, env: dict) -> dict:
+    # Only the rebuilt server consumes these two changed files; all reused inputs must be identical.
+    changed = run([git, 'diff', '--name-only', '--no-ext-diff', '--no-textconv',
+                   '--no-renames', '--ignore-submodules=none', COMPONENT_SOURCE, SOURCE, '--'],
+                  cwd=source, env=env).splitlines()
+    if changed != ['server/src/utils/environment-schema.spec.ts',
+                   'server/src/utils/environment-schema.ts']:
+        raise BuildError('host_assembly_reused_source_changed')
+    return {'baseSourceRevision': COMPONENT_SOURCE, 'currentSourceRevision': SOURCE,
+            'changedPaths': changed}
 
 
 def download_geodata(destination: Path, digest: str, capture: str) -> str:
@@ -97,6 +110,8 @@ def build(source: Path, output: Path, assets_id: str, assets_sha: str,
     work = output / 'work'
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
+    reused = verify_reused_source(git, source, env)
+    (work / 'reused-source-producer.json').write_text(json.dumps(reused, indent=2) + '\n')
     def blob(name: str) -> bytes:
         return git_blob(git, source, SOURCE, name, env)
     host = work / 'host'
@@ -123,9 +138,9 @@ def build(source: Path, output: Path, assets_id: str, assets_sha: str,
         for name, item in report['sourceFiles'].items()):
         raise BuildError('host_assembly_hdr_source_changed')
     stage_server(hdr / 'media', host / 'media')
-    server = obtain(work, 'server', 12319854302,
-        '90471ce82b214d41843d4805a20017fb3ec7bc05de6be34b72cd14fac174fbf9',
-        39541951524, '6490a66e8931670f88bcb1be2009fb978cce6411')
+    server = obtain(work, 'server', 12335762035,
+        '99967c23dee780e09324473907b8596a66e76b58da7f530d1016c2285251dade',
+        39578744325, '71b794f09ba745a064359683bec60cb65e818e7f')
     original = qualified_files(server / 'fl-windows-server', 'server')
     metadata_root = server / 'fl-windows-metadata'
     metadata = json.loads((metadata_root / 'qualification.json').read_text())
@@ -141,7 +156,7 @@ def build(source: Path, output: Path, assets_id: str, assets_sha: str,
     raw = obtain(work, 'raw', 12308277388,
         '52e67a2c23dac0bb4eeca8242ce6dc33d1c47aff69a6dcd792f127a02be77156',
         39514367004, '4f88cb18e4afe64b14f733e4e0b7eb828c88af95')
-    qualified_files(raw / 'fl-windows-raw', 'raw')
+    qualified_files(raw / 'fl-windows-raw', 'raw', COMPONENT_SOURCE)
     stage_server(raw / 'fl-windows-raw/raw', host / 'raw')
     asset_metadata = api(f'actions/artifacts/{assets_id}')
     assets = obtain(work, 'assets', int(assets_id), assets_sha,
@@ -151,7 +166,7 @@ def build(source: Path, output: Path, assets_id: str, assets_sha: str,
         ('web', 'www', 'build/www'), ('plugin', 'plugin', 'build/plugins/immich-plugin-core'),
         ('studio', 'studio-worker', None), ('media-tools', 'media', 'media-tools')]:
         root = assets / ('fl-windows-' + component)
-        qualified_files(root, directory)
+        qualified_files(root, directory, COMPONENT_SOURCE)
         if destination:
             stage_server(root / directory, host / destination)
         else:
@@ -208,7 +223,7 @@ def build(source: Path, output: Path, assets_id: str, assets_sha: str,
     if sha256(ml / 'manifest.json') != '95c6f4176699ef44ea7a7cc59052523b4e4a112b5a703606d733e20d6b27c5e4':
         raise BuildError('host_assembly_ml_manifest_changed')
     (ml / 'manifest.sig').write_bytes(bytes.fromhex(signature))
-    assemble(host, ml, manager / 'manager', backup, output / 'bundle', SOURCE, 16)
+    assemble(host, ml, manager / 'manager', backup, output / 'bundle', SOURCE, 17)
 
 
 if __name__ == '__main__':

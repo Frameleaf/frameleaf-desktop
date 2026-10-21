@@ -28,7 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
+          ref: aadd5f59ab68c4621885f852ee6953f23b55e556
+          fetch-depth: 2
           path: server-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1

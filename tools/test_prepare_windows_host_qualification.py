@@ -56,7 +56,7 @@ class WindowsHostQualificationTests(unittest.TestCase):
         candidate = root / 'bundle'
         candidate.mkdir()
         manifest = {'sourceRevision': prepare.SOURCE, 'platform': 'windows',
-                    'architecture': 'x86_64', 'epoch': 16}
+                    'architecture': 'x86_64', 'epoch': 17}
         (candidate / 'manifest.json').write_text(json.dumps(manifest))
         digest = hashlib.sha256((candidate / 'manifest.json').read_bytes()).hexdigest()
         report = {'qualification': 'passed', 'sourceRevision': prepare.SOURCE,
@@ -65,7 +65,7 @@ class WindowsHostQualificationTests(unittest.TestCase):
                   'ml': {'manifestSha256': prepare.ML_MANIFEST}}
         (candidate / 'qualification.json').write_text(json.dumps(report))
         verified = {'keyId': 'desktop-release-2026-10', 'manifestSha256': digest,
-                    'sourceRevision': prepare.SOURCE, 'epoch': 16, 'certified': False}
+                    'sourceRevision': prepare.SOURCE, 'epoch': 17, 'certified': False}
         return candidate, report, verified
 
     def test_signature_and_complete_inventory_verifier_precede_any_execution(self):
@@ -107,3 +107,16 @@ class WindowsHostQualificationTests(unittest.TestCase):
             with (patch.object(prepare, 'run', return_value=json.dumps(verified | {'keyId': 'fixture'})),
                   self.assertRaises(BuildError)):
                 prepare.admit(candidate, 'ab' * 64, Path('/unused'), {})
+
+    def test_previous_host_epoch_is_refused_before_signature_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, report, _ = self.fixture(Path(temporary))
+            path = candidate / 'manifest.json'
+            manifest = json.loads(path.read_text()) | {'epoch': 16}
+            path.write_text(json.dumps(manifest))
+            report['manifestSha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+            (candidate / 'qualification.json').write_text(json.dumps(report))
+            with patch.object(prepare, 'run') as run, self.assertRaises(BuildError):
+                prepare.admit(candidate, 'ab' * 64, Path('/unused'), {})
+            run.assert_not_called()
+            self.assertFalse((candidate / 'manifest.sig').exists())

@@ -31,7 +31,7 @@ def admit(candidate: Path, signature: str, node: Path, env: dict) -> dict:
         or any(report.get(key) is not False for key in ['signaturePresent', 'runtimeQualified', 'redistributable'])
         or report.get('ml', {}).get('manifestSha256') != ML_MANIFEST
         or manifest.get('sourceRevision') != SOURCE or manifest.get('platform') != 'windows'
-        or manifest.get('architecture') != 'x86_64' or manifest.get('epoch') != 16):
+        or manifest.get('architecture') != 'x86_64' or manifest.get('epoch') != 17):
         raise BuildError('host_qualification_receipt_invalid')
     with (candidate / 'manifest.sig').open('xb') as stream:
         stream.write(bytes.fromhex(signature))
@@ -40,7 +40,7 @@ def admit(candidate: Path, signature: str, node: Path, env: dict) -> dict:
     checked = json.loads(run([node, '--input-type=module', '--eval', code, candidate], cwd=candidate.parent, env=env))
     if (checked.get('keyId') != 'desktop-release-2026-10'
         or checked.get('manifestSha256') != report['manifestSha256']
-        or checked.get('sourceRevision') != SOURCE or checked.get('epoch') != 16
+        or checked.get('sourceRevision') != SOURCE or checked.get('epoch') != 17
         or checked.get('certified') is not False):
         raise BuildError('host_qualification_authority_invalid')
     return checked
