@@ -43,6 +43,7 @@ def adapt_authoring_command(name: str, source: str) -> str:
              "import { fileURLToPath, pathToFileURL } from 'node:url'"),
             ("import(engineRequire.resolve('@tailwindcss/vite'))",
              "import(pathToFileURL(engineRequire.resolve('@tailwindcss/vite')).href)"),
+            ("source.startsWith('/')", "path.isAbsolute(source)"),
             ("!importer.startsWith(here) || importer.startsWith(engine)",
              "!normalizeVitePath(importer).startsWith(normalizeVitePath(here)) || normalizeVitePath(importer).startsWith(normalizeVitePath(engine))"),
             ("this.resolve(source, path.join(engine, 'src/main.tsx'),",

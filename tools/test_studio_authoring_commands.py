@@ -24,6 +24,7 @@ const persistenceModule = engine + String.raw`\src\features\timeline\stores\time
 const upstreamWorkspaceDouble = engine + String.raw`\src\in-memory-handle.ts`;
 const adapterWorkspaceDouble = here + String.raw`\test\in-memory-handle.ts`;
 async function resolveFromEngine(source, importer, options) {
+  if (!importer || source.startsWith('.') || source.startsWith('/') || source.startsWith('\\0')) return null
   if (!importer.startsWith(here) || importer.startsWith(engine)) return null
   return this.resolve(source, path.join(engine, 'src/main.tsx'), { ...options, skipSelf: true })
 }
@@ -102,6 +103,9 @@ const resolver = { resolve: async (source, from) => ({ id: source, importer: fro
 const react = await resolveFromEngine.call(resolver, 'react', importer, {});
 assert.equal(react?.id, 'react');
 assert.equal(react.importer, forward(engine) + '/src/main.tsx');
+for (const absolute of [forward(persistenceModule), persistenceModule, String.raw`\\server\share\timeline-persistence.ts`]) {
+  assert.equal(await resolveFromEngine.call(resolver, absolute, forward(persistenceShim), {}), null);
+}
 assert.equal(await resolveFromEngine.call(resolver, 'react', forward(engine) + '/src/main.tsx', {}), null);
 const persistence = { resolve: async () => ({ id: forward(persistenceModule) }) };
 assert.equal(await gatePersistence.call(persistence, 'timeline-persistence', importer, {}), forward(persistenceShim));
@@ -113,7 +117,9 @@ assert.equal(await workspaceDouble.call({resolve: async () => null}, 'in-memory-
 """
         with tempfile.TemporaryDirectory() as temporary:
             script = Path(temporary) / 'config.mjs'
-            script.write_text(adapt_authoring_command('vite.config.mjs', CONFIG_FIXTURE + checks))
+            config = adapt_authoring_command('vite.config.mjs', CONFIG_FIXTURE + checks)
+            config = config.replace("import path from 'node:path'", "import nativePath from 'node:path'; const path = nativePath.win32;")
+            script.write_text(config)
             module = Path(temporary) / 'plugin.mjs'
             module.write_text('export default 42;')
             result = subprocess.run([shutil.which('node'), script, module], capture_output=True, text=True)
