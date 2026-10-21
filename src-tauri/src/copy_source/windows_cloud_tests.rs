@@ -5,12 +5,22 @@ use std::{
     os::windows::ffi::OsStrExt,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicI32, AtomicU64},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU64},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::Storage::{
-    CloudFilters::*,
-    FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO},
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, GetLastError, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
+        ERROR_OPERATION_ABORTED,
+    },
+    Storage::{
+        CloudFilters::*,
+        FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO},
+    },
+    System::{
+        Threading::{CreateEventW, WaitForSingleObject},
+        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+    },
 };
 
 static DATA: [u8; 65_536] = [0x5a; 65_536];
@@ -36,6 +46,8 @@ fn require_disposable_runner() {
 }
 #[derive(Default)]
 struct Context {
+    hold: AtomicBool,
+    cancellations: AtomicU64,
     fetches: AtomicU64,
     delivered: AtomicU64,
     failure: AtomicI32,
@@ -53,6 +65,9 @@ unsafe extern "system" fn fetch(
     }
     let context = unsafe { &*(info.CallbackContext.cast::<Context>()) };
     context.fetches.fetch_add(1, Ordering::AcqRel);
+    if context.hold.load(Ordering::Acquire) {
+        return;
+    }
     let request = unsafe { (*parameters).Anonymous.FetchData };
     let offset = usize::try_from(request.RequiredFileOffset).ok();
     let length = usize::try_from(request.RequiredLength).ok();
@@ -101,6 +116,19 @@ unsafe extern "system" fn fetch(
         context
             .delivered
             .fetch_add(request.RequiredLength as u64, Ordering::AcqRel);
+    }
+}
+unsafe extern "system" fn cancel_fetch(
+    info: *const CF_CALLBACK_INFO,
+    _: *const CF_CALLBACK_PARAMETERS,
+) {
+    if info.is_null() {
+        return;
+    }
+    let info = unsafe { &*info };
+    if !info.CallbackContext.is_null() {
+        let context = unsafe { &*(info.CallbackContext.cast::<Context>()) };
+        context.cancellations.fetch_add(1, Ordering::AcqRel);
     }
 }
 struct Provider {
@@ -155,6 +183,10 @@ impl Provider {
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_FETCH_DATA,
                 Callback: Some(fetch),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+                Callback: Some(cancel_fetch),
             },
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NONE,
@@ -255,6 +287,91 @@ fn hydrate_explicit_range(path: &Path) -> Result<(), String> {
     success(result)
 }
 
+fn cancel_pending_hydration(path: &Path, context: &Context) -> Result<(), String> {
+    let path = wide(path);
+    let mut protected = std::ptr::null_mut();
+    success(unsafe {
+        CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut protected)
+    })?;
+    if protected.is_null() {
+        return Err("missing protected handle".into());
+    }
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        unsafe {
+            CfCloseHandle(protected);
+        }
+        return Err("could not create the hydration event".into());
+    }
+    if !unsafe { CfReferenceProtectedHandle(protected) } {
+        unsafe {
+            CloseHandle(event);
+            CfCloseHandle(protected);
+        }
+        return Err("protected handle reference failed".into());
+    }
+    let borrowed = unsafe { CfGetWin32HandleFromProtectedHandle(protected) };
+    let mut overlapped = OVERLAPPED {
+        hEvent: event,
+        ..Default::default()
+    };
+    let started = unsafe {
+        CfHydratePlaceholder(
+            borrowed,
+            0,
+            DATA.len() as i64,
+            CF_HYDRATE_FLAG_NONE,
+            &mut overlapped,
+        )
+    };
+    let pending = (0x80070000u32 | ERROR_IO_PENDING) as i32;
+    if started != pending {
+        unsafe {
+            CfReleaseProtectedHandle(protected);
+            CfCloseHandle(protected);
+            CloseHandle(event);
+        }
+        return Err(format!("expected pending hydration, got {started:#010x}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while context.fetches.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let fetched = context.fetches.load(Ordering::Acquire) > 0;
+    let cancelled = unsafe { CancelIoEx(borrowed, &overlapped) } != 0;
+    let cancel_error = if cancelled {
+        0
+    } else {
+        unsafe { GetLastError() }
+    };
+    let mut transferred = 0;
+    let aborted = loop {
+        if unsafe { GetOverlappedResult(borrowed, &overlapped, &mut transferred, 0) } != 0 {
+            break false;
+        }
+        match unsafe { GetLastError() } {
+            ERROR_OPERATION_ABORTED => break true,
+            ERROR_IO_INCOMPLETE => unsafe {
+                WaitForSingleObject(event, 100);
+            },
+            _ => {
+                // Do not unwind while the kernel might still own OVERLAPPED; the parent joins this process.
+                std::process::exit(2);
+            }
+        }
+    };
+    // Cancellation is only a request; borrowed handle, event and OVERLAPPED live through terminal readback.
+    unsafe {
+        CfReleaseProtectedHandle(protected);
+        CfCloseHandle(protected);
+        CloseHandle(event);
+    }
+    if !fetched || !aborted || (!cancelled && cancel_error != ERROR_NOT_FOUND) {
+        return Err("pending provider hydration did not confirm cancellation".into());
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "registers a synthetic cloud provider only on a disposable hosted Windows runner"]
 fn cloud_provider_child() {
@@ -298,6 +415,24 @@ fn cloud_provider_child() {
     assert!(context.delivered.load(Ordering::Acquire) >= DATA.len() as u64);
     assert_eq!(context.failure.load(Ordering::Acquire), 0);
     println!("real CfApi placeholder: metadata fetched no originals; explicit hydration delivered verified bytes");
+    let cancel_root = base.join("cancel-source");
+    let mut provider = Provider::create(&cancel_root).unwrap();
+    provider
+        .context
+        .as_ref()
+        .unwrap()
+        .hold
+        .store(true, Ordering::Release);
+    cancel_pending_hydration(
+        &cancel_root.join(FILE_NAME),
+        provider.context.as_ref().unwrap(),
+    )
+    .unwrap();
+    provider.close().unwrap();
+    let context = provider.context.as_ref().unwrap();
+    assert!(context.cancellations.load(Ordering::Acquire) > 0);
+    assert_eq!(context.delivered.load(Ordering::Acquire), 0);
+    println!("real CfApi pending hydration: CancelIoEx confirmed terminal cancellation without delivering bytes");
 }
 
 #[test]
@@ -331,8 +466,10 @@ fn disposable_cloud_provider_qualification() {
         std::thread::sleep(Duration::from_millis(100));
     };
     // The child has exited, so its provider callbacks cannot retain fixture memory or handles.
-    unsafe {
-        CfUnregisterSyncRoot(wide(&base.join("source")).as_ptr());
+    for name in ["source", "cancel-source"] {
+        unsafe {
+            CfUnregisterSyncRoot(wide(&base.join(name)).as_ptr());
+        }
     }
     fs::remove_dir_all(&base).unwrap();
     assert!(
