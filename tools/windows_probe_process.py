@@ -1,8 +1,52 @@
 """Run a stdin-gated diagnostic inside an owned Windows process tree."""
 import ctypes
+import csv
 import os
+from pathlib import Path
+import re
 import subprocess
 import time
+
+
+def create_probe_directory(path):
+    """Create-only private fixture state with the same user ACE as the native owner."""
+    if os.name != 'nt':
+        raise OSError('Windows probe state requires Windows')
+    from ctypes import wintypes
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError('probe_directory_not_absolute')
+    identity = subprocess.check_output(
+        [str(Path(os.environ['SystemRoot']) / 'System32/whoami.exe'), '/user', '/fo', 'csv', '/nh'],
+        text=True, timeout=10)
+    rows = list(csv.reader(identity.splitlines()))
+    if len(rows) != 1 or len(rows[0]) != 2 or not re.fullmatch(r'S-1-5-21-(?:[0-9]+-){3}[0-9]+', rows[0][1]):
+        raise ValueError('probe_user_identity_invalid')
+    sid = rows[0][1]
+
+    class Attributes(ctypes.Structure):
+        _fields_ = [('length', wintypes.DWORD), ('descriptor', ctypes.c_void_p),
+                    ('inherit', wintypes.BOOL)]
+
+    security = ctypes.WinDLL('advapi32', use_last_error=True)
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(Attributes)]
+    kernel.CreateDirectoryW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    descriptor = ctypes.c_void_p()
+    sddl = f'O:{sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})'
+    if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = Attributes(ctypes.sizeof(Attributes), descriptor, False)
+        if not kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if kernel.LocalFree(descriptor):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def run_probe(command, *, timeout, cwd=None):

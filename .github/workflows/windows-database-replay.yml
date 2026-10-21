@@ -36,7 +36,7 @@ jobs:
           sys.path.insert(0, str(Path.cwd() / 'tools'))
           from build_runtime import build_environment
           from build_host_database_windows import qualify
-          from windows_probe_process import run_probe
+          from windows_probe_process import create_probe_directory, run_probe
           subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_windows_probe_process.py'], check=True)
           output = Path(os.environ['RUNNER_TEMP']) / 'fl-database-replay'
           output.mkdir()
@@ -138,15 +138,15 @@ jobs:
               assert shell.SHGetFolderPathW(None, 0x001c, None, 0, profile) == 0
               probe_root = Path(profile.value) / ('Frameleaf-DatabaseLoaderProbe-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
               assert probe_root.is_absolute()
-              probe_root.mkdir(mode=0o700)
+              create_probe_directory(probe_root)
               probes = [('ordinary',str(prefix.resolve()),{}),
                         ('captured-device','\\\\.\\GLOBALROOT'+captured,{}),
                         ('ordinary-build-environment',str(prefix.resolve()),{'probeEnvironment':env}),
                         ('ordinary-runner-directory',str(prefix.resolve()),{'probeWorkingDirectory':str(output)})]
               for spelling, runtime, overrides in probes:
                   state = probe_root / spelling
-                  state.mkdir(mode=0o700)
-                  (state / 'home').mkdir(mode=0o700)
+                  create_probe_directory(state)
+                  create_probe_directory(state / 'home')
                   configuration = {'runtime':runtime,'state':str(state),'entryPoints':entries,**overrides}
                   result = run_probe(['node','--input-type=module','--eval',script,json.dumps(configuration)],
                                      cwd=output, timeout=120)

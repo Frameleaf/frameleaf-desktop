@@ -5,11 +5,21 @@ import sys
 import tempfile
 import unittest
 
-from windows_probe_process import run_probe
+from windows_probe_process import create_probe_directory, run_probe
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires Windows Job Objects')
 class OwnedProbeTests(unittest.TestCase):
+    def test_private_state_creation_refuses_existing_directory(self):
+        with tempfile.TemporaryDirectory() as state:
+            directory = Path(state) / 'owned-state'
+            create_probe_directory(directory)
+            marker = directory / 'marker'
+            marker.write_text('preserved')
+            with self.assertRaises(FileExistsError):
+                create_probe_directory(directory)
+            self.assertEqual(marker.read_text(), 'preserved')
+
     def test_normal_exit_removes_lingering_descendant(self):
         code = """import subprocess,sys
 assert sys.stdin.buffer.read(1) == b'1'
