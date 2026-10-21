@@ -184,6 +184,25 @@ impl Progress {
             Event::Error { code, .. } => {
                 self.finished = true;
                 if let Some((api, hresult)) = code.split_once(':') {
+                    if api == "source_item_changed"
+                        && matches!(
+                            hresult,
+                            "admission"
+                                | "parent-version"
+                                | "protected-open"
+                                | "oplock"
+                                | "before-read"
+                                | "read-length"
+                                | "after-read"
+                                | "completion"
+                                | "borrowed-handle"
+                                | "unexpected-eof"
+                        )
+                    {
+                        #[cfg(debug_assertions)]
+                        eprintln!("source_reader/version-check:{hresult}");
+                        return Err("source_item_changed".into());
+                    }
                     if matches!(
                         api,
                         "source_cloud_open_failed" | "source_cloud_hydration_failed"
@@ -577,6 +596,34 @@ mod tests {
                     })
                     .unwrap_err(),
                 "source_copy_interrupted"
+            );
+        }
+    }
+
+    #[test]
+    fn version_diagnostics_accept_only_fixed_stages() {
+        let request = request();
+        for (code, expected) in [
+            ("source_item_changed:admission", "source_item_changed"),
+            ("source_item_changed:after-read", "source_item_changed"),
+            ("source_item_changed:oplock", "source_item_changed"),
+            (
+                "source_item_changed:private-path",
+                "source_copy_interrupted",
+            ),
+            (
+                "source_item_changed:after-read/secret",
+                "source_copy_interrupted",
+            ),
+        ] {
+            assert_eq!(
+                Progress::new(&request)
+                    .accept(Event::Error {
+                        operation_id: request.operation_id.clone(),
+                        code: code.into(),
+                    })
+                    .unwrap_err(),
+                expected
             );
         }
     }

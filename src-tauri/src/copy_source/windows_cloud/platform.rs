@@ -302,14 +302,14 @@ impl Protected {
     }
     fn reference(&self) -> Result<Reference<'_>, String> {
         if !unsafe { CfReferenceProtectedHandle(self.0) } {
-            return Err("source_item_changed".into());
+            return Err("source_item_changed:oplock".into());
         }
         let reference = Reference {
             owner: self,
             raw: unsafe { CfGetWin32HandleFromProtectedHandle(self.0) },
         };
         if reference.raw.is_null() {
-            return Err("source_item_changed".into());
+            return Err("source_item_changed:borrowed-handle".into());
         }
         Ok(reference)
     }
@@ -362,7 +362,7 @@ impl Operation {
             }
             match unsafe { GetLastError() } {
                 ERROR_OPERATION_ABORTED => return Err("source_copy_interrupted".into()),
-                ERROR_HANDLE_EOF => return Err("source_item_changed".into()),
+                ERROR_HANDLE_EOF => return Err("source_item_changed:unexpected-eof".into()),
                 ERROR_IO_INCOMPLETE => {}
                 // This isolated process exits without freeing memory still possibly owned by the kernel.
                 _ => std::process::exit(2),
@@ -395,9 +395,16 @@ pub(super) fn copy(
         &request.root_identity,
         &request.relative,
         Some(request.bytes),
-    )?;
+    )
+    .map_err(|code| {
+        if code == "source_item_changed" {
+            "source_item_changed:admission".into()
+        } else {
+            code
+        }
+    })?;
     if source.version.stamp() != request.source_stamp {
-        return Err("source_item_changed".into());
+        return Err("source_item_changed:parent-version".into());
     }
     let (staging, _) = directories(Path::new(&request.staging), false)?;
     if source.overlaps(&staging)? {
@@ -415,7 +422,7 @@ pub(super) fn copy(
     )?;
     let file = Protected::open(&source.protected_path()?)?;
     if Version::read(file.reference()?.raw)? != source.version {
-        return Err("source_item_changed".into());
+        return Err("source_item_changed:protected-open".into());
     }
     source.release_leaf();
     let mut options = OpenOptions::new();
@@ -434,7 +441,7 @@ pub(super) fn copy(
         let length = (request.bytes - copied).min(CHUNK_BYTES) as usize;
         let reference = file.reference()?;
         if Version::read(reference.raw)? != source.version {
-            return Err("source_item_changed".into());
+            return Err("source_item_changed:before-read".into());
         }
         if source.leaf_cloud {
             let mut hydrate = Operation::new(copied)?;
@@ -485,8 +492,11 @@ pub(super) fn copy(
                 std::process::exit(2);
             }
         })? as usize;
-        if bytes != length || Version::read(reference.raw)? != source.version {
-            return Err("source_item_changed".into());
+        if bytes != length {
+            return Err("source_item_changed:read-length".into());
+        }
+        if Version::read(reference.raw)? != source.version {
+            return Err("source_item_changed:after-read".into());
         }
         drop(reference);
         output
@@ -500,7 +510,7 @@ pub(super) fn copy(
         })?;
     }
     if Version::read(file.reference()?.raw)? != source.version {
-        return Err("source_item_changed".into());
+        return Err("source_item_changed:completion".into());
     }
     output.sync_all().map_err(|_| "source_stage_write_failed")?;
     let stamp = source.version.stamp();
