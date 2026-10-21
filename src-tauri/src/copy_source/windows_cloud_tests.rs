@@ -1,0 +1,343 @@
+//! Real CfApi qualification confined to a disposable hosted Windows runner.
+use super::*;
+use std::{
+    mem::{offset_of, size_of},
+    os::windows::ffi::OsStrExt,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicI32, AtomicU64},
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::Storage::{
+    CloudFilters::*,
+    FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO},
+};
+
+static DATA: [u8; 65_536] = [0x5a; 65_536];
+const FILE_IDENTITY: [u8; 4] = *b"FL01";
+const FILE_NAME: &str = "旅行-original.jpg";
+
+fn wide(value: &Path) -> Vec<u16> {
+    value.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+fn success(code: i32) -> Result<(), String> {
+    if code >= 0 {
+        Ok(())
+    } else {
+        Err(format!("CfApi HRESULT {code:#010x}"))
+    }
+}
+fn require_disposable_runner() {
+    assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+    assert_eq!(
+        std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+        Ok("github-hosted")
+    );
+}
+#[derive(Default)]
+struct Context {
+    fetches: AtomicU64,
+    delivered: AtomicU64,
+    failure: AtomicI32,
+}
+unsafe extern "system" fn fetch(
+    info: *const CF_CALLBACK_INFO,
+    parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if info.is_null() || parameters.is_null() {
+        return;
+    }
+    let info = unsafe { &*info };
+    if info.CallbackContext.is_null() {
+        return;
+    }
+    let context = unsafe { &*(info.CallbackContext.cast::<Context>()) };
+    context.fetches.fetch_add(1, Ordering::AcqRel);
+    let request = unsafe { (*parameters).Anonymous.FetchData };
+    let offset = usize::try_from(request.RequiredFileOffset).ok();
+    let length = usize::try_from(request.RequiredLength).ok();
+    let bytes = offset.zip(length).and_then(|(start, count)| {
+        start
+            .checked_add(count)
+            .and_then(|end| DATA.get(start..end))
+    });
+    let identity_matches = info.FileIdentityLength == FILE_IDENTITY.len() as u32
+        && !info.FileIdentity.is_null()
+        && unsafe {
+            std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), FILE_IDENTITY.len())
+        } == FILE_IDENTITY;
+    let valid = identity_matches && bytes.is_some_and(|data| !data.is_empty());
+    let operation = CF_OPERATION_INFO {
+        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
+        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
+        ConnectionKey: info.ConnectionKey,
+        TransferKey: info.TransferKey,
+        RequestKey: info.RequestKey,
+        ..Default::default()
+    };
+    let mut parameters = CF_OPERATION_PARAMETERS {
+        ParamSize: (offset_of!(CF_OPERATION_PARAMETERS, Anonymous)
+            + size_of::<CF_OPERATION_PARAMETERS_0_0>()) as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            TransferData: CF_OPERATION_PARAMETERS_0_0 {
+                Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                CompletionStatus: if valid { 0 } else { 0xc000000du32 as i32 },
+                Buffer: if valid {
+                    bytes.unwrap().as_ptr().cast()
+                } else {
+                    std::ptr::null()
+                },
+                Offset: request.RequiredFileOffset,
+                Length: request.RequiredLength,
+            },
+        },
+    };
+    let result = unsafe { CfExecute(&operation, &mut parameters) };
+    if result < 0 || !valid {
+        context
+            .failure
+            .store(if result < 0 { result } else { -1 }, Ordering::Release);
+    } else {
+        context
+            .delivered
+            .fetch_add(request.RequiredLength as u64, Ordering::AcqRel);
+    }
+}
+struct Provider {
+    root: Vec<u16>,
+    context: Option<Box<Context>>,
+    connection: Option<CF_CONNECTION_KEY>,
+    registered: bool,
+}
+impl Provider {
+    fn create(root: &Path) -> Result<Self, String> {
+        require_disposable_runner();
+        crate::windows_protection::new_private_directory(root)?;
+        let mut provider = Self {
+            root: wide(root),
+            context: Some(Box::default()),
+            connection: None,
+            registered: false,
+        };
+        let name: Vec<u16> = "Frameleaf disposable CfApi test"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let version: Vec<u16> = "1".encode_utf16().chain(Some(0)).collect();
+        let registration = CF_SYNC_REGISTRATION {
+            StructSize: size_of::<CF_SYNC_REGISTRATION>() as u32,
+            ProviderName: name.as_ptr(),
+            ProviderVersion: version.as_ptr(),
+            ..Default::default()
+        };
+        let policies = CF_SYNC_POLICIES {
+            StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
+            Hydration: CF_HYDRATION_POLICY {
+                Primary: CF_HYDRATION_POLICY_PARTIAL,
+                Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
+            },
+            Population: CF_POPULATION_POLICY {
+                Primary: CF_POPULATION_POLICY_FULL,
+                Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
+            },
+            ..Default::default()
+        };
+        success(unsafe {
+            CfRegisterSyncRoot(
+                provider.root.as_ptr(),
+                &registration,
+                &policies,
+                CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT,
+            )
+        })?;
+        provider.registered = true;
+        let callbacks = [
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_FETCH_DATA,
+                Callback: Some(fetch),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NONE,
+                Callback: None,
+            },
+        ];
+        let mut connection = CF_CONNECTION_KEY::default();
+        success(unsafe {
+            CfConnectSyncRoot(
+                provider.root.as_ptr(),
+                callbacks.as_ptr(),
+                (&**provider.context.as_ref().unwrap() as *const Context).cast(),
+                CF_CONNECT_FLAG_BLOCK_SELF_IMPLICIT_HYDRATION,
+                &mut connection,
+            )
+        })?;
+        provider.connection = Some(connection);
+        let filename = wide(Path::new(FILE_NAME));
+        let mut placeholder = CF_PLACEHOLDER_CREATE_INFO {
+            RelativeFileName: filename.as_ptr(),
+            FsMetadata: CF_FS_METADATA {
+                BasicInfo: FILE_BASIC_INFO {
+                    FileAttributes: FILE_ATTRIBUTE_NORMAL,
+                    ..Default::default()
+                },
+                FileSize: DATA.len() as i64,
+            },
+            FileIdentity: FILE_IDENTITY.as_ptr().cast(),
+            FileIdentityLength: FILE_IDENTITY.len() as u32,
+            Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+            ..Default::default()
+        };
+        let mut processed = 0;
+        success(unsafe {
+            CfCreatePlaceholders(
+                provider.root.as_ptr(),
+                &mut placeholder,
+                1,
+                CF_CREATE_FLAG_NONE,
+                &mut processed,
+            )
+        })?;
+        success(placeholder.Result)?;
+        if processed != 1 {
+            return Err("placeholder was not created".into());
+        }
+        Ok(provider)
+    }
+    fn close(&mut self) -> Result<(), String> {
+        if let Some(connection) = self.connection {
+            success(unsafe { CfDisconnectSyncRoot(connection) })?;
+            self.connection = None;
+        }
+        if self.registered {
+            success(unsafe { CfUnregisterSyncRoot(self.root.as_ptr()) })?;
+            self.registered = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for Provider {
+    fn drop(&mut self) {
+        if self.close().is_err() && self.connection.is_some() {
+            // Keep callback state alive until this isolated test process exits if disconnect failed.
+            if let Some(context) = self.context.take() {
+                let _ = Box::leak(context);
+            }
+        }
+    }
+}
+fn hydrate_explicit_range(path: &Path) -> Result<(), String> {
+    let path = wide(path);
+    let mut protected = std::ptr::null_mut();
+    success(unsafe {
+        CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut protected)
+    })?;
+    if protected.is_null() {
+        return Err("missing protected handle".into());
+    }
+    if !unsafe { CfReferenceProtectedHandle(protected) } {
+        unsafe { CfCloseHandle(protected) };
+        return Err("protected handle reference failed".into());
+    }
+    let borrowed = unsafe { CfGetWin32HandleFromProtectedHandle(protected) };
+    let result = unsafe {
+        CfHydratePlaceholder(
+            borrowed,
+            0,
+            DATA.len() as i64,
+            CF_HYDRATE_FLAG_NONE,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        CfReleaseProtectedHandle(protected);
+        CfCloseHandle(protected);
+    }
+    success(result)
+}
+
+#[test]
+#[ignore = "registers a synthetic cloud provider only on a disposable hosted Windows runner"]
+fn cloud_provider_child() {
+    require_disposable_runner();
+    let base = PathBuf::from(
+        std::env::var_os("FRAMELEAF_CFAPI_CHILD_ROOT").expect("parent-owned fixture"),
+    );
+    assert!(base.starts_with(std::env::temp_dir()));
+    assert!(base
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("frameleaf-cfapi-"));
+    let root = base.join("source");
+    let mut provider = Provider::create(&root).unwrap();
+    let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+    let before = dir.symlink_metadata(FILE_NAME).unwrap();
+    let observation = crate::source_metadata::probe(&dir, Path::new(FILE_NAME), &before).unwrap();
+    assert_eq!(before.len(), DATA.len() as u64);
+    assert!(!observation.excluded && !observation.unsupported_reparse);
+    assert_ne!(
+        observation.availability,
+        crate::source_metadata::Availability::Available
+    );
+    assert_eq!(
+        provider
+            .context
+            .as_ref()
+            .unwrap()
+            .fetches
+            .load(Ordering::Acquire),
+        0,
+        "metadata triggered hydration"
+    );
+    hydrate_explicit_range(&root.join(FILE_NAME)).unwrap();
+    assert_eq!(fs::read(root.join(FILE_NAME)).unwrap(), DATA);
+    drop(dir);
+    provider.close().unwrap();
+    let context = provider.context.as_ref().unwrap();
+    assert!(context.fetches.load(Ordering::Acquire) > 0);
+    assert!(context.delivered.load(Ordering::Acquire) >= DATA.len() as u64);
+    assert_eq!(context.failure.load(Ordering::Acquire), 0);
+    println!("real CfApi placeholder: metadata fetched no originals; explicit hydration delivered verified bytes");
+}
+
+#[test]
+#[ignore = "isolated real CfApi provider qualification; requires disposable hosted Windows"]
+fn disposable_cloud_provider_qualification() {
+    require_disposable_runner();
+    let base = std::env::temp_dir().join(format!("frameleaf-cfapi-{}", Uuid::new_v4()));
+    crate::windows_protection::new_private_directory(&base).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "copy_source::windows_cloud_tests::cloud_provider_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("FRAMELEAF_CFAPI_CHILD_ROOT", &base)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait().unwrap(), true);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // The child has exited, so its provider callbacks cannot retain fixture memory or handles.
+    unsafe {
+        CfUnregisterSyncRoot(wide(&base.join("source")).as_ptr());
+    }
+    fs::remove_dir_all(&base).unwrap();
+    assert!(
+        !timed_out,
+        "CfApi child exceeded90seconds and was terminated"
+    );
+    assert!(status.success(), "CfApi child failed: {status}");
+}

@@ -131,6 +131,16 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
           if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Qualify an isolated synthetic Windows cloud provider
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $test = 'copy_source::windows_cloud_tests::disposable_cloud_provider_qualification'
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($tests -match "^${test}: test$")) { throw 'The real CfApi qualification test is missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib $test -- --exact --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build the internal Windows desktop installer
         shell: python
         run: |

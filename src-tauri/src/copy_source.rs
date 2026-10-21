@@ -1106,6 +1106,9 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg(all(windows, test))]
+mod windows_cloud_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
