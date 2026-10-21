@@ -8,6 +8,7 @@ on:
       - 'tools/build_host_ffmpeg.py'
       - 'tools/test_host_source_archives.py'
       - 'tools/test_studio_authoring_commands.py'
+      - 'tools/test_build_runtime.py'
       - 'tools/test_build_host_web.py'
       - 'tools/test_build_host_plugin.py'
       - 'tools/test_build_host_studio.py'
@@ -58,7 +59,7 @@ jobs:
       - name: Check existing asset builders and canonical source archives
         shell: pwsh
         run: |
-          foreach ($test in @('test_host_source_archives.py', 'test_studio_authoring_commands.py', 'test_build_host_web.py', 'test_build_host_plugin.py', 'test_build_host_studio.py', 'test_build_host_ffmpeg.py')) {
+          foreach ($test in @('test_build_runtime.py', 'test_host_source_archives.py', 'test_studio_authoring_commands.py', 'test_build_host_web.py', 'test_build_host_plugin.py', 'test_build_host_studio.py', 'test_build_host_ffmpeg.py')) {
             python -m unittest discover -s tools -p $test -v
             if ($LASTEXITCODE) { throw "Asset packaging tests failed: $test" }
           }

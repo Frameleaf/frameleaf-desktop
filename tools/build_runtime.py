@@ -262,6 +262,12 @@ def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
     if os.name == "nt" and system_root:
         env["SystemRoot"] = system_root
         env["PATH"] = str(Path(system_root) / "System32")
+    if os.name == "nt":
+        # Known-folder APIs require these directories in the isolated Windows profile.
+        for key, suffix in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+            directory = home / "AppData" / suffix
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            env[key] = str(directory)
     return env
 
 

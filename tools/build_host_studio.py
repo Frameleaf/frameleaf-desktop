@@ -20,6 +20,7 @@ from build_runtime import BuildError, build_environment, run, sha256
 _WINDOWS_AUTHORING_INPUTS = {
     "engine.mjs": "d52283295d8437229289c3956679e2daca9cea49d1386dbcd8a63e54f80ae627",
     "adapter.mjs": "d6670c9e97d2176734200f82a6c680e38807578761584f178760332d8d7d9581",
+    "vite.config.mjs": "055c98e461916cf58ffcbc93c78f3c50dd72a0f28d35b1dbcdc0f234f26357cb",
 }
 
 
@@ -35,6 +36,12 @@ def adapt_authoring_command(name: str, source: str) -> str:
             ("execFileSync(vp, vpArgs,",
              "execFileSync(process.execPath, [vp, ...vpArgs],"),
         ],
+        "vite.config.mjs": [
+            ("import { fileURLToPath } from 'node:url'",
+             "import { fileURLToPath, pathToFileURL } from 'node:url'"),
+            ("import(engineRequire.resolve('@tailwindcss/vite'))",
+             "import(pathToFileURL(engineRequire.resolve('@tailwindcss/vite')).href)"),
+        ],
     }
     if name not in replacements:
         raise BuildError("host_studio_authoring_source_changed")
@@ -48,13 +55,13 @@ def adapt_authoring_command(name: str, source: str) -> str:
 def bind_authoring_commands(snapshot: Path) -> dict:
     staged = {}
     for name, expected in _WINDOWS_AUTHORING_INPUTS.items():
-        source = snapshot / "studio/tools" / name
+        directory = "studio/adapters/web" if name == "vite.config.mjs" else "studio/tools"
+        source = snapshot / directory / name
         if sha256(source) != expected:
             raise BuildError("host_studio_authoring_source_changed")
-        staged[name] = adapt_authoring_command(name, source.read_text(encoding="utf-8")).encode("utf-8")
+        staged[name] = (source, adapt_authoring_command(name, source.read_text(encoding="utf-8")).encode("utf-8"))
     report = {}
-    for name, data in staged.items():
-        source = snapshot / "studio/tools" / name
+    for name, (source, data) in staged.items():
         source.write_bytes(data)
         report[name] = {"originalSha256": _WINDOWS_AUTHORING_INPUTS[name],
                         "adaptedSha256": sha256(source)}

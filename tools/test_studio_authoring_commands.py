@@ -45,6 +45,22 @@ process.stdout.write(npm);
                                              env={**os.environ, 'npm_execpath': str(cli)})
             self.assertEqual(result, '12.2.0')
 
+    @unittest.skipUnless(shutil.which('node'), 'requires authoring Node')
+    def test_vite_config_imports_resolved_modules_as_file_urls(self):
+        with tempfile.TemporaryDirectory(prefix='studio config # ') as temporary:
+            root = Path(temporary).resolve()
+            module = root / 'plugin # %.mjs'
+            module.write_text('export default 42;')
+            source = """import { fileURLToPath } from 'node:url'
+const engineRequire = { resolve: () => process.argv[2] };
+const tailwind = await import(engineRequire.resolve('@tailwindcss/vite'))
+process.stdout.write(String(tailwind.default));
+"""
+            script = root / 'vite.config.mjs'
+            script.write_text(adapt_authoring_command('vite.config.mjs', source))
+            result = subprocess.check_output([shutil.which('node'), script, module], text=True)
+            self.assertEqual(result, '42')
+
     def test_changed_authoring_inputs_are_rejected_before_any_rewrite(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

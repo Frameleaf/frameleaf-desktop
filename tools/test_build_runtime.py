@@ -450,6 +450,52 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 ["--default-index", "https://pypi.org/simple"],
             )
 
+    def test_windows_build_profile_has_private_application_data_directories(self):
+        import os
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(builder, "os", SimpleNamespace(name="nt", defpath=os.defpath)):
+                environment = builder.build_environment(root, {
+                    "APPDATA": "untrusted-roaming", "LOCALAPPDATA": "untrusted-local"
+                })
+            for key, suffix in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+                expected = root / "home/AppData" / suffix
+                self.assertEqual(environment.get(key), str(expected))
+                self.assertTrue(expected.is_dir())
+
+    @unittest.skipUnless(__import__('os').name == 'nt', 'requires Windows known-folder API')
+    def test_windows_known_folders_resolve_inside_the_isolated_build_profile(self):
+        import os
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = builder.build_environment(root, os.environ)
+            script = r"""
+import ctypes, json, uuid
+shell = ctypes.WinDLL('shell32')
+free = ctypes.WinDLL('ole32').CoTaskMemFree
+shell.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+free.argtypes = [ctypes.c_void_p]
+paths = []
+for value in ['3EB685DB-65F9-4CF6-A03A-E3EF65729F3D', 'F1B32785-6FBA-4FCF-9D55-7B8E7F157091']:
+    guid = ctypes.create_string_buffer(uuid.UUID(value).bytes_le)
+    output = ctypes.c_void_p()
+    result = shell.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(output))
+    assert result == 0, f'known-folder resolution failed: {result}'
+    try:
+        paths.append(ctypes.wstring_at(output))
+    finally:
+        free(output)
+print(json.dumps(paths))
+"""
+            paths = json.loads(subprocess.check_output([sys.executable, '-c', script], env=environment, text=True))
+            self.assertEqual([Path(p) for p in paths], [Path(environment[k]) for k in ['APPDATA', 'LOCALAPPDATA']])
+
     def test_windows_system_root_survives_uppercase_environment_keys(self):
         import os
         from types import SimpleNamespace
