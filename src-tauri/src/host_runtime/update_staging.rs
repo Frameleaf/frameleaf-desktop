@@ -131,6 +131,8 @@ impl Directory {
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| BAD)?;
+        // Readback denies write sharing on Windows.
+        drop(file);
         self.verify(
             name,
             bytes.len() as u64,
