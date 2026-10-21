@@ -41,7 +41,7 @@ jobs:
         run: |
           node --test tools/test_host_agent.mjs tools/test_host_bootstrap.mjs tools/test_host_database.mjs
           if ($LASTEXITCODE) { throw 'Host command and lifecycle guards failed' }
-          foreach ($test in @('test_windows_probe_process.py', 'test_prepare_windows_host_qualification.py', 'test_assemble_windows_host_candidate.py', 'test_build_host_ffmpeg.py')) {
+          foreach ($test in @('test_qualify_windows_user_host.py', 'test_windows_probe_process.py', 'test_prepare_windows_host_qualification.py', 'test_assemble_windows_host_candidate.py', 'test_build_host_ffmpeg.py')) {
             python -m unittest discover -s tools -p $test -v
             if ($LASTEXITCODE) { throw "Host qualification guard failed: $test" }
           }
@@ -102,7 +102,9 @@ jobs:
         env:
           FRAMELEAF_TEST_HOST_CANDIDATE: ${{ runner.temp }}/fl-windows-full-host-qualification/input/bundle
         run: |
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --test host_runtime factory_signed_host_starts_and_restarts_through_compiled_authority -- --exact --ignored --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/fl-windows-full-host-qualification/lifecycle.log"
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --test host_runtime --no-run --message-format=json | Out-File "$env:RUNNER_TEMP/fl-windows-full-host-qualification/test-build.jsonl" -Encoding utf8
+          if ($LASTEXITCODE) { throw 'Compiled Windows full host test build failed' }
+          python tools/qualify_windows_user_host.py --build-receipts "$env:RUNNER_TEMP/fl-windows-full-host-qualification/test-build.jsonl" --log "$env:RUNNER_TEMP/fl-windows-full-host-qualification/lifecycle.log"
           if ($LASTEXITCODE) { throw 'Compiled Windows full host lifecycle failed' }
           $log = Get-Content "$env:RUNNER_TEMP/fl-windows-full-host-qualification/lifecycle.log" -Raw
           if ($log -notmatch '(?m)^test result: ok\. 1 passed; 0 failed;') { throw 'The real host lifecycle fixture did not execute exactly once' }
