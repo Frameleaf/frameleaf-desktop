@@ -1,5 +1,6 @@
 import bz2
 import hashlib
+import json
 from pathlib import Path
 import stat
 import tempfile
@@ -37,6 +38,34 @@ class BackupEngineTests(unittest.TestCase):
                 with self.assertRaisesRegex(BuildError, 'host_backup_binary_digest_mismatch'):
                     build(root / 'candidate')
                 qualify.assert_not_called()
+
+    def test_license_bytes_must_match_before_engine_qualification(self):
+        expected = (Path(__file__).resolve().parent.parent / 'runtime/host-backup-LICENSE.txt').read_bytes()
+        for license_bytes, valid in [(expected, True), (expected.replace(b'\n', b'\r\n'), False), (expected + b'changed', False)]:
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                (root / 'runtime').mkdir()
+                (root / 'runtime/host-backup-LICENSE.txt').write_bytes(license_bytes)
+                archive = bz2.compress(b'engine fixture')
+                pin = {'url': 'https://github.com/restic/restic/releases/download/v0.18.1/restic.bz2',
+                       'sha256': hashlib.sha256(archive).hexdigest(),
+                       'binarySha256': hashlib.sha256(b'engine fixture').hexdigest()}
+
+                def downloaded(_url, destination, _digest):
+                    destination.write_bytes(archive)
+
+                output = root / 'candidate'
+                with patch('build_host_backup.ROOT', root), patch('build_host_backup.artifact', return_value=pin), patch('build_host_backup.download', side_effect=downloaded), patch('build_host_backup.qualify', return_value={}) as qualify:
+                    if valid:
+                        build(output)
+                        qualify.assert_called_once()
+                        self.assertEqual((output / 'backup/LICENSE').read_bytes(), expected)
+                    else:
+                        with self.assertRaisesRegex(BuildError, 'host_backup_license_digest_mismatch'):
+                            build(output)
+                        qualify.assert_not_called()
+                        self.assertEqual(json.loads((output / 'qualification.json').read_text())['qualification'], 'failed')
+                        self.assertFalse((output / 'backup/component.json').exists())
 
     def test_digest_is_checked_before_decompression_or_destination_creation(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -132,6 +132,8 @@ def build(output):
         if sha256(binary) != pin['binarySha256']:
             raise BuildError('host_backup_binary_digest_mismatch')
         shutil.copyfile(ROOT / 'runtime/host-backup-LICENSE.txt', component / 'LICENSE')
+        if sha256(component / 'LICENSE') != CONTRACT['licenseSha256']:
+            raise BuildError('host_backup_license_digest_mismatch')
         receipt['checks'] = qualify(binary, work, env)
         receipt['files'] = inventory(component)
         receipt['qualification'] = 'passed'
