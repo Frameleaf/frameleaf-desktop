@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
       - name: Replay the exact retained component with private loader diagnostics
         shell: python
         env:
@@ -74,6 +77,47 @@ jobs:
                                                 'stdout': result.stdout, 'stderr': result.stderr})
               (output / 'loader-report.json').write_text(json.dumps(report, indent=2))
               report['fixture'] = qualify(prefix, output, lock, env)
+              # Compare loader behavior without changing captured-path execution authority.
+              import ctypes
+              from ctypes import wintypes
+              kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+              kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+              kernel.CreateFileW.restype = wintypes.HANDLE
+              kernel.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+              kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+              kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+              kernel.CloseHandle.restype = wintypes.BOOL
+              handle = kernel.CreateFileW(str(prefix.resolve()), 0x80, 7, None, 3, 0x02200000, None)
+              assert handle != ctypes.c_void_p(-1).value
+              try:
+                  buffer = ctypes.create_unicode_buffer(32768)
+                  size = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 2)
+                  assert 0 < size < len(buffer)
+                  captured = buffer.value
+                  assert captured.startswith('\\Device\\HarddiskVolume')
+              finally:
+                  assert kernel.CloseHandle(handle)
+              agent = (Path.cwd() / 'runtime/host-agent.mjs').as_uri()
+              script = f'''import {{spawnSync}} from 'node:child_process';
+              import {{join}} from 'node:path';
+              const {{hostEnvironment}}=await import({json.dumps(agent)});
+              const c=JSON.parse(process.argv[1]);
+              const rows=[];
+              for(const name of ['initdb','postgres','psql']){{
+                const r=spawnSync(join(c.runtime,'bin',name+'.exe'),['--version'],{{env:hostEnvironment(c),cwd:process.cwd(),encoding:'utf8',timeout:15000,maxBuffer:65536,windowsHide:true}});
+                rows.push({{name,exitCode:r.status,signal:r.signal,spawnCode:r.error?.code??null,stdout:(r.stdout??'').slice(0,2048),stderr:(r.stderr??'').slice(0,2048)}});
+              }}
+              console.log(JSON.stringify(rows));'''
+              entries = {'node':'node.exe','postgres':'bin/postgres.exe','ffmpeg':'unused/ffmpeg.exe',
+                         'ffprobe':'unused/ffprobe.exe','rawRenderer':'unused/darktable-cli.exe',
+                         'rawDecoder':'unused/dcraw_emu.exe','studioBrowser':'unused/chrome.exe'}
+              report['pathSpellingProbes'] = []
+              for spelling, runtime in [('ordinary',str(prefix.resolve())), ('captured-device','\\\\.\\GLOBALROOT'+captured), ('captured-extended','\\\\?\\GLOBALROOT'+captured)]:
+                  configuration = {'runtime':runtime,'state':str(output / 'probe-state'),'entryPoints':entries}
+                  result = subprocess.run(['node','--input-type=module','--eval',script,json.dumps(configuration)],
+                                          cwd=output, capture_output=True, text=True, timeout=60)
+                  assert result.returncode == 0 and len(result.stdout) < 16384
+                  report['pathSpellingProbes'].append({'spelling':spelling,'entrypoints':json.loads(result.stdout)})
               report['qualification'] = 'passed'
           finally:
               (output / 'loader-report.json').write_text(json.dumps(report, indent=2))
