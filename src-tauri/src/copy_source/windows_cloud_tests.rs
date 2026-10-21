@@ -15,7 +15,11 @@ use windows_sys::Win32::{
     },
     Storage::{
         CloudFilters::*,
-        FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO},
+        FileSystem::{
+            GetFinalPathNameByHandleW, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
+            FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+        },
     },
     System::{
         Threading::{CreateEventW, WaitForSingleObject},
@@ -288,6 +292,64 @@ fn hydrate_explicit_range(path: &Path) -> Result<(), String> {
         CfCloseHandle(protected);
     }
     success(result)
+}
+
+fn qualify_path_spellings(dir: &Dir, path: &Path) {
+    use cap_std::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(1)
+        .custom_flags(FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_OPEN_REPARSE_POINT);
+    let metadata = dir.open_with(FILE_NAME, &options).unwrap();
+    let expected = windows_file_id(metadata.as_raw_handle()).unwrap();
+    let mut paths = vec![("ordinary", wide(path))];
+    for (label, flags) in [
+        ("extended-dos", VOLUME_NAME_DOS),
+        ("volume-guid", VOLUME_NAME_GUID),
+    ] {
+        let mut name = vec![0u16; 32_768];
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                metadata.as_raw_handle(),
+                name.as_mut_ptr(),
+                name.len() as u32,
+                flags,
+            )
+        } as usize;
+        assert!(length > 0 && length < name.len());
+        name.truncate(length + 1);
+        name[length] = 0;
+        if flags == VOLUME_NAME_DOS {
+            assert!(name.starts_with(&[92, 92, 63, 92]));
+            paths.push(("handle-dos-without-prefix", name[4..].to_vec()));
+        }
+        paths.push((label, name));
+    }
+    for (label, path) in paths {
+        let mut protected = std::ptr::null_mut();
+        let result = unsafe {
+            CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut protected)
+        };
+        println!("CfApi path spelling {label}: hresult={result:08x}");
+        if result >= 0 {
+            assert!(!protected.is_null());
+            assert!(unsafe { CfReferenceProtectedHandle(protected) });
+            let actual =
+                windows_file_id(unsafe { CfGetWin32HandleFromProtectedHandle(protected) }).unwrap();
+            unsafe {
+                CfReleaseProtectedHandle(protected);
+                CfCloseHandle(protected);
+            }
+            assert_eq!(actual.VolumeSerialNumber, expected.VolumeSerialNumber);
+            assert_eq!(actual.FileId.Identifier, expected.FileId.Identifier);
+        } else {
+            assert!(protected.is_null());
+            assert_ne!(label, "ordinary", "the known-working path must open");
+        }
+    }
 }
 
 fn cancel_pending_hydration(path: &Path, context: &Context) -> Result<(), String> {
@@ -702,6 +764,16 @@ fn cloud_provider_child() {
             .load(Ordering::Acquire),
         0,
         "metadata triggered hydration"
+    );
+    qualify_path_spellings(&dir, &root.join(FILE_NAME));
+    assert_eq!(
+        provider
+            .context
+            .as_ref()
+            .unwrap()
+            .fetches
+            .load(Ordering::Acquire),
+        0
     );
     hydrate_explicit_range(&root.join(FILE_NAME)).unwrap();
     assert_eq!(fs::read(root.join(FILE_NAME)).unwrap(), DATA);
