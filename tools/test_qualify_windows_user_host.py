@@ -45,6 +45,7 @@ sys.exit(run_restricted([sys.executable,'-c','import sys; print("owned restricte
         self.assertTrue(facts['sameUser'])
         self.assertFalse(facts['administratorsEnabled'])
         self.assertFalse(facts['powerUsersEnabled'])
+        self.assertTrue(facts['defaultDaclUserAccessAdded'])
         self.assertIn('integrityRid',facts)
         self.assertIn('elevated',facts)
         self.assertIn('owned restricted child',result.stdout)

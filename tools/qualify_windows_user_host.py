@@ -52,6 +52,13 @@ def run_restricted(command, environment, cwd):
     class Process(ctypes.Structure):
         _fields_ = [('process', w.HANDLE), ('thread', w.HANDLE), ('pid', w.DWORD), ('tid', w.DWORD)]
 
+    class Trustee(ctypes.Structure):
+        _fields_ = [('multiple', ctypes.c_void_p), ('operation', ctypes.c_int),
+                    ('form', ctypes.c_int), ('kind', ctypes.c_int), ('sid', ctypes.c_void_p)]
+
+    class Access(ctypes.Structure):
+        _fields_ = [('mask', w.DWORD), ('mode', ctypes.c_int), ('inherit', w.DWORD), ('trustee', Trustee)]
+
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     security = ctypes.WinDLL('advapi32', use_last_error=True)
     definitions = [
@@ -71,6 +78,8 @@ def run_restricted(command, environment, cwd):
         (security, 'DuplicateToken', [w.HANDLE, ctypes.c_int, ctypes.POINTER(w.HANDLE)], w.BOOL),
         (security, 'CheckTokenMembership', [w.HANDLE, ctypes.c_void_p, ctypes.POINTER(w.BOOL)], w.BOOL),
         (security, 'GetTokenInformation', [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)], w.BOOL),
+        (security, 'SetTokenInformation', [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD], w.BOOL),
+        (security, 'SetEntriesInAclW', [w.ULONG, ctypes.POINTER(Access), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)], w.DWORD),
         (security, 'GetLengthSid', [ctypes.c_void_p], w.DWORD),
         (security, 'IsValidSid', [ctypes.c_void_p], w.BOOL),
         (security, 'ConvertStringSidToSidW', [w.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)], w.BOOL),
@@ -108,7 +117,7 @@ def run_restricted(command, environment, cwd):
         if not member.value:
             raise RuntimeError('host_test_job_owner_required')
         original = w.HANDLE()
-        check(security.OpenProcessToken(kernel.GetCurrentProcess(), 0x2000b, ctypes.byref(original)))
+        check(security.OpenProcessToken(kernel.GetCurrentProcess(), 0x2008b, ctypes.byref(original)))
         own(original)
         sids = []
         for text in ['S-1-5-32-544', 'S-1-5-32-547']:
@@ -120,6 +129,33 @@ def run_restricted(command, environment, cwd):
         token = w.HANDLE()
         check(security.CreateRestrictedToken(original, 1, 2, disabled, 0, None, 0, None, ctypes.byref(token)))
         own(token)
+        # Keep new kernel objects accessible to the user after disabling administrator groups.
+        user_info = token_info(token, 1)
+        default_info = token_info(token, 6)
+        old_acl = ctypes.c_void_p.from_buffer(default_info).value
+        if not old_acl:
+            raise RuntimeError('host_test_default_acl_missing')
+        access = Access(0x10000000, 1, 1, Trustee(None, 0, 0, 1, SidAttributes.from_buffer(user_info).sid))
+        new_acl = ctypes.c_void_p()
+        status = security.SetEntriesInAclW(1, ctypes.byref(access), old_acl, ctypes.byref(new_acl))
+        if status:
+            raise ctypes.WinError(status)
+        owner.callback(lambda: check(not kernel.LocalFree(new_acl)))
+
+        def acl_bytes(pointer):
+            if not pointer:
+                raise RuntimeError('host_test_default_acl_missing')
+            header = ctypes.string_at(pointer, 8)
+            size = int.from_bytes(header[2:4], 'little')
+            if not 8 <= size <= 65535:
+                raise RuntimeError('host_test_default_acl_invalid')
+            return ctypes.string_at(pointer, size)
+
+        expected_acl = acl_bytes(new_acl)
+        check(security.SetTokenInformation(token, 6, ctypes.byref(new_acl), ctypes.sizeof(new_acl)))
+        checked_default = token_info(token, 6)
+        if acl_bytes(ctypes.c_void_p.from_buffer(checked_default).value) != expected_acl:
+            raise RuntimeError('host_test_default_acl_changed')
 
         def facts(candidate):
             impersonation = w.HANDLE()
@@ -132,9 +168,13 @@ def run_restricted(command, environment, cwd):
             same = sid_bytes(token_info(original, 1)) == sid_bytes(token_info(candidate, 1))
             if not same or any(enabled):
                 raise RuntimeError('host_test_token_not_restricted')
+            candidate_default = token_info(candidate, 6)
+            if acl_bytes(ctypes.c_void_p.from_buffer(candidate_default).value) != expected_acl:
+                raise RuntimeError('host_test_child_default_acl_changed')
             integrity = sid_bytes(token_info(candidate, 25))
             return {'sameUser': same, 'administratorsEnabled': enabled[0],
                     'powerUsersEnabled': enabled[1], 'integrityRid': int.from_bytes(integrity[-4:], 'little'),
+                    'defaultDaclUserAccessAdded': True,
                     'elevated': bool(int.from_bytes(token_info(candidate, 20).raw[:4], 'little')),
                     'installedUserAcceptance': False}
 
