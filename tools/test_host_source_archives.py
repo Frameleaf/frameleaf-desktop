@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import tarfile
@@ -9,13 +10,14 @@ from unittest.mock import patch
 import build_host_plugin
 import build_host_studio
 import build_host_web
-from build_runtime import BuildError, run as checked_run
+from build_runtime import BuildError, build_environment, run as checked_run
 
 
 class HostSourceArchiveTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('git'), 'requires Git')
     def test_source_and_license_bytes_survive_windows_git_settings(self):
         git = shutil.which('git')
+        find_tool = shutil.which
         for builder in [build_host_web, build_host_plugin, build_host_studio]:
             with self.subTest(builder=builder.__name__), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
@@ -46,8 +48,20 @@ class HostSourceArchiveTests(unittest.TestCase):
                 revision = subprocess.check_output([git, 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
                 node = root / 'node'
                 node.write_bytes(b'fixture')
+                system_tools = root / 'system-tools'
+                system_tools.mkdir()
+                probe = system_tools / 'frameleaf-system-probe.exe'
+                probe.write_bytes(b'fixture')
+                probe.chmod(0o755)
+
+                def isolated_environment(work, inherited):
+                    env = build_environment(work, inherited)
+                    env['PATH'] = str(system_tools)
+                    return env
 
                 def command(arguments, *, cwd, env):
+                    self.assertEqual(find_tool(probe.name, path=env['PATH']), str(probe))
+                    self.assertIn(str(Path(git).parent), env['PATH'].split(os.pathsep))
                     if arguments[0] == node:
                         return 'v26.11.1'
                     self.assertIn('archive', arguments)
@@ -60,5 +74,6 @@ class HostSourceArchiveTests(unittest.TestCase):
 
                 with (patch.object(builder.shutil, 'which', side_effect=lambda name: git if name == 'git' else str(root / name)),
                       patch.object(builder, 'run', side_effect=command),
+                      patch.object(builder, 'build_environment', side_effect=isolated_environment),
                       self.assertRaisesRegex(BuildError, 'canonical_archive_checked_before_build')):
                     builder.build(source, revision, node, root / 'output')

@@ -63,7 +63,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
     env["PATH"] = os.pathsep.join(
-        [str(node.parent), str(Path(pnpm).parent), os.defpath]
+        [str(node.parent), str(Path(pnpm).parent), str(Path(git).parent), env["PATH"]]
     )
     env["FRAMELEAF_BUILD_ERROR_LOG"] = str(output / "command-error.log")
     package = json.loads(git_blob(git, source, revision, "package.json", env))

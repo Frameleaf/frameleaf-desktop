@@ -45,7 +45,8 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             str(node.parent),
             str(Path(pnpm).parent),
             str(Path(bootstrap).parent),
-            os.defpath,
+            str(Path(git).parent),
+            env["PATH"],
         ]
     )
     env["FRAMELEAF_BUILD_ERROR_LOG"] = str(output / "command-error.log")
