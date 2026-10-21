@@ -15,6 +15,52 @@ from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, run, sha256
 
 
+
+# Pin the authoring adapters separately; the prepared engine and its attestation stay unchanged.
+_WINDOWS_AUTHORING_INPUTS = {
+    "engine.mjs": "d52283295d8437229289c3956679e2daca9cea49d1386dbcd8a63e54f80ae627",
+    "adapter.mjs": "d6670c9e97d2176734200f82a6c680e38807578761584f178760332d8d7d9581",
+}
+
+
+def adapt_authoring_command(name: str, source: str) -> str:
+    replacements = {
+        "engine.mjs": [
+            ("execFileSync('npm', ['--version'],",
+             "execFileSync(process.execPath, [process.env.npm_execpath, '--version'],"),
+        ],
+        "adapter.mjs": [
+            ("path.join(workspace, 'node_modules/.bin/vp')",
+             "path.join(workspace, 'node_modules/vite-plus/bin/vp')"),
+            ("execFileSync(vp, vpArgs,",
+             "execFileSync(process.execPath, [vp, ...vpArgs],"),
+        ],
+    }
+    if name not in replacements:
+        raise BuildError("host_studio_authoring_source_changed")
+    for before, after in replacements[name]:
+        if source.count(before) != 1:
+            raise BuildError("host_studio_authoring_source_changed")
+        source = source.replace(before, after)
+    return source
+
+
+def bind_authoring_commands(snapshot: Path) -> dict:
+    staged = {}
+    for name, expected in _WINDOWS_AUTHORING_INPUTS.items():
+        source = snapshot / "studio/tools" / name
+        if sha256(source) != expected:
+            raise BuildError("host_studio_authoring_source_changed")
+        staged[name] = adapt_authoring_command(name, source.read_text(encoding="utf-8")).encode("utf-8")
+    report = {}
+    for name, data in staged.items():
+        source = snapshot / "studio/tools" / name
+        source.write_bytes(data)
+        report[name] = {"originalSha256": _WINDOWS_AUTHORING_INPUTS[name],
+                        "adaptedSha256": sha256(source)}
+    return {"sourceRevision": "9bbe7c64e720fceee2fcba0f72055c945f56b19a", "scripts": report}
+
+
 def stage_studio(source: Path, destination: Path) -> dict:
     files = stage_server(source, destination)
     required = {
@@ -180,6 +226,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             report["npmCliSha256"] = sha256(npm)
             report["npmToolchainLockfileSha256"] = sha256(tools / "package-lock.json")
             env["PATH"] = str(tools / "node_modules/.bin") + os.pathsep + env["PATH"]
+            if os.name == "nt":
+                env["npm_execpath"] = str(npm)
+                report["windowsAuthoringCommands"] = bind_authoring_commands(snapshot)
             command([node, "studio/tools/engine.mjs", "prepare"])
             command(
                 [

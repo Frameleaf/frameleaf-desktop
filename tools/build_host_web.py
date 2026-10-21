@@ -11,6 +11,7 @@ import tarfile
 from pathlib import Path
 
 from build_host_server import stage_server
+from build_host_studio import bind_authoring_commands
 from build_runtime import BuildError, build_environment, git_blob, run, sha256
 
 
@@ -147,6 +148,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             report["npmCliSha256"] = sha256(npm)
             report["npmToolchainLockfileSha256"] = sha256(tools / "package-lock.json")
             env["PATH"] = str(tools / "node_modules/.bin") + os.pathsep + env["PATH"]
+            if os.name == "nt":
+                env["npm_execpath"] = str(npm)
+                report["windowsAuthoringCommands"] = bind_authoring_commands(snapshot)
             command([node, "studio/tools/engine.mjs", "prepare"])
             report["studioSourceSha256"] = json.loads(
                 (snapshot / "studio/engine/frameleaf-source.json").read_text()
