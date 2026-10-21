@@ -1,0 +1,98 @@
+name: Private Windows host assets candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_web.py'
+      - 'tools/build_host_plugin.py'
+      - 'tools/build_host_studio.py'
+      - 'tools/build_host_ffmpeg.py'
+      - 'tools/test_host_source_archives.py'
+      - 'tools/test_build_host_web.py'
+      - 'tools/test_build_host_plugin.py'
+      - 'tools/test_build_host_studio.py'
+      - 'tools/test_build_host_ffmpeg.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_runtime.py'
+      - 'runtime/studio-browser-guard*'
+      - '.github/workflows/windows-host-assets.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-assets-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  assets:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      RAYON_NUM_THREADS: '1'
+      UV_THREADPOOL_SIZE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
+          path: server-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Prepare source-matched package manager
+        shell: pwsh
+        run: |
+          $package = Get-Content server-source/package.json -Raw | ConvertFrom-Json
+          if ($package.packageManager -ne 'pnpm@12.11.2') { throw 'Source package manager mismatch' }
+          npm install --global pnpm@12.11.2
+          if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
+      - name: Check existing asset builders and canonical source archives
+        shell: pwsh
+        run: |
+          foreach ($test in @('test_host_source_archives.py', 'test_build_host_web.py', 'test_build_host_plugin.py', 'test_build_host_studio.py', 'test_build_host_ffmpeg.py')) {
+            python -m unittest discover -s tools -p $test -v
+            if ($LASTEXITCODE) { throw "Asset packaging tests failed: $test" }
+          }
+      - name: Build the source-matched photo UI, workflow plugin and Studio worker
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          foreach ($component in @('web', 'plugin', 'studio')) {
+            python "tools/build_host_$component.py" --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --node $node --output "$env:RUNNER_TEMP/fl-windows-$component"
+            if ($LASTEXITCODE) { throw "Windows asset build failed: $component" }
+          }
+      - name: Stage source-pinned portable media tools and qualify CPU codecs
+        shell: pwsh
+        run: |
+          python tools/build_host_ffmpeg.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --output "$env:RUNNER_TEMP/fl-windows-media-tools"
+          if ($LASTEXITCODE) { throw 'Native media tools qualification failed' }
+      - name: Retain private components and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-private-host-assets-candidate
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/fl-windows-web/www/
+            ${{ runner.temp }}/fl-windows-web/qualification.json
+            ${{ runner.temp }}/fl-windows-web/build.log
+            ${{ runner.temp }}/fl-windows-web/command-error.log
+            ${{ runner.temp }}/fl-windows-plugin/plugin/
+            ${{ runner.temp }}/fl-windows-plugin/qualification.json
+            ${{ runner.temp }}/fl-windows-plugin/build.log
+            ${{ runner.temp }}/fl-windows-plugin/command-error.log
+            ${{ runner.temp }}/fl-windows-studio/studio-worker/
+            ${{ runner.temp }}/fl-windows-studio/qualification.json
+            ${{ runner.temp }}/fl-windows-studio/build.log
+            ${{ runner.temp }}/fl-windows-studio/command-error.log
+            ${{ runner.temp }}/fl-windows-media-tools/media/
+            ${{ runner.temp }}/fl-windows-media-tools/qualification.json
+            ${{ runner.temp }}/fl-windows-media-tools/command-error.log
+          retention-days: 7
+          if-no-files-found: warn
