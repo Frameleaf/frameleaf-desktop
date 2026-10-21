@@ -10,6 +10,13 @@ use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Mutex};
 
 pub const CREDENTIAL: &str = "photo-source-copy";
+fn registration_path(photos: bool) -> &'static str {
+    if photos {
+        "api/photo-sources/apple-photos"
+    } else {
+        "api/photo-sources"
+    }
+}
 #[derive(Default)]
 pub struct SourceConsent {
     pending: Mutex<Pending>,
@@ -284,7 +291,10 @@ impl Consent {
             .ok_or("source_server_update_required")?;
         let base = normalize_server(&saved.server)?;
         let response = client
-            .post(base.join("api/photo-sources").unwrap())
+            .post(
+                base.join(registration_path(self.approval.is_photos()))
+                    .unwrap(),
+            )
             .bearer_auth(&saved.token)
             .json(&self.request(saved))
             .send()
@@ -327,6 +337,11 @@ impl Consent {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[test]
+    fn apple_registration_uses_the_additive_endpoint_and_preserves_the_folder_route() {
+        assert_eq!(registration_path(false), "api/photo-sources");
+        assert_eq!(registration_path(true), "api/photo-sources/apple-photos");
+    }
     fn saved() -> SavedConnection {
         SavedConnection {
             server: "https://nas.test/".into(),
