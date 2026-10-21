@@ -353,6 +353,27 @@ class RuntimeBuilderTests(unittest.TestCase):
                 builder.git_blob(git, root, revision, "module.py", env), b"value = 1\n"
             )
 
+    def test_child_git_patch_preserves_canonical_bytes_despite_local_crlf_settings(self):
+        import os
+        import shutil
+        git = shutil.which('git')
+        if not git:
+            self.skipTest('requires Git')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = builder.build_environment(root, os.environ)
+            for arguments in [['init', '-q'], ['config', 'core.autocrlf', 'true'],
+                              ['config', 'core.eol', 'crlf']]:
+                builder.run([git, *arguments], cwd=root, env=environment)
+            asset = root / 'asset.txt'
+            asset.write_bytes(b'old\n')
+            patch = root / 'change.patch'
+            patch.write_bytes(b'--- a/asset.txt\n+++ b/asset.txt\n@@ -1 +1 @@\n-old\n+new\n')
+            builder.run([git, 'apply', patch], cwd=root, env=environment)
+            self.assertEqual(asset.read_bytes(), b'new\n')
+            self.assertEqual(builder.run([git, 'config', '--get', 'core.autocrlf'], cwd=root, env=environment), 'false')
+            self.assertEqual(builder.run([git, 'config', '--get', 'core.eol'], cwd=root, env=environment), 'lf')
+
     def test_build_environment_does_not_inherit_cloud_or_python_authority(self):
         with tempfile.TemporaryDirectory() as temporary:
             environment = builder.build_environment(

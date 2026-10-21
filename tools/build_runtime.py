@@ -248,6 +248,12 @@ def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
         "TEMP": str(work),
         "HF_HOME": str(work / "huggingface"),
         "HF_HUB_DISABLE_TELEMETRY": "1",
+        # Child Git patching must preserve the same canonical bytes as source archives.
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.autocrlf",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.eol",
+        "GIT_CONFIG_VALUE_1": "lf",
     }
     # Python normalizes Windows environment keys to uppercase.
     system_root = next(
