@@ -1,0 +1,65 @@
+name: Private unsigned Windows full host
+on:
+  workflow_call:
+    inputs:
+      assets_artifact_id:
+        required: true
+        type: string
+      assets_sha256:
+        required: true
+        type: string
+      assets_build_head:
+        required: true
+        type: string
+      runtime_signature_hex:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  assemble:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
+          path: server-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Check host input provenance and archive boundaries
+        shell: pwsh
+        run: |
+          foreach ($test in @('test_assemble_windows_host_candidate.py', 'test_build_host_ffmpeg.py', 'test_build_host_bundle.py')) {
+            python -m unittest discover -s tools -p $test -v
+            if ($LASTEXITCODE) { throw "Host assembly tests failed: $test" }
+          }
+      - name: Assemble the unsigned host from exact verified components
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSETS_ID: ${{ inputs.assets_artifact_id }}
+          ASSETS_SHA: ${{ inputs.assets_sha256 }}
+          ASSETS_HEAD: ${{ inputs.assets_build_head }}
+          RUNTIME_SIGNATURE: ${{ inputs.runtime_signature_hex }}
+        run: |
+          python tools/assemble_windows_host_candidate.py --source "$env:GITHUB_WORKSPACE/server-source" --output "$env:RUNNER_TEMP/fl-windows-host-bundle" --assets-id "$env:ASSETS_ID" --assets-sha "$env:ASSETS_SHA" --assets-head "$env:ASSETS_HEAD" --runtime-signature "$env:RUNTIME_SIGNATURE"
+          if ($LASTEXITCODE) { throw 'Unsigned Windows host assembly failed' }
+      - name: Retain the private unsigned candidate and provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-unsigned-full-host-candidate
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/fl-windows-host-bundle/bundle/
+            ${{ runner.temp }}/fl-windows-host-bundle/work/*-producer.json
+          retention-days: 7
+          if-no-files-found: warn
