@@ -49,6 +49,8 @@ struct Cursor {
     upload_budget: Option<UploadBudget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     export_budget: Option<UploadBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_read_budget: Option<UploadBudget>,
     position: usize,
     active: Option<Active>,
     state: String,
@@ -83,10 +85,41 @@ impl Cursor {
                         .ok_or("source_copy_budget_exceeded")?,
                 })
             },
+            source_read_budget: manifest.provider.is_none().then_some(UploadBudget {
+                used: 0,
+                limit: manifest.total_bytes,
+            }),
             position: 0,
             active: None,
             state: "ready".into(),
         })
+    }
+    fn reserve_read(&mut self, bytes: u64) -> Result<(), String> {
+        let budget = self
+            .source_read_budget
+            .as_mut()
+            .ok_or("source_read_budget_required")?;
+        budget.used = budget
+            .used
+            .checked_add(bytes)
+            .filter(|n| *n <= budget.limit)
+            .ok_or("source_read_budget_exhausted")?;
+        Ok(())
+    }
+    fn approve_read(&mut self, manifest: &Manifest) -> Result<(), String> {
+        if manifest.provider.is_some() || matches!(self.state.as_str(), "complete" | "cancelled") {
+            return Err("source_run_terminal".into());
+        }
+        let additional = view(manifest, self, "paused", None).additional_source_read_allowance;
+        let old = self.source_read_budget.as_ref();
+        let used = old.map_or(0, |b| b.used);
+        let limit = old
+            .map_or(0, |b| b.limit)
+            .checked_add(additional)
+            .ok_or("source_read_budget_exhausted")?;
+        self.source_read_budget = Some(UploadBudget { used, limit });
+        self.state = "paused".into();
+        Ok(())
     }
     fn reserve_export(&mut self, bytes: u64) -> Result<(), String> {
         let budget = self
@@ -140,6 +173,10 @@ impl Cursor {
                 .upload_budget
                 .as_ref()
                 .is_some_and(|budget| budget.used > budget.limit)
+            || self
+                .source_read_budget
+                .as_ref()
+                .is_some_and(|b| b.used > b.limit || manifest.provider.is_some())
             || self.manifest_hash != digest(manifest)?
             || self.position > manifest.files.len()
             || !matches!(
@@ -272,6 +309,8 @@ pub struct ImportView {
     pub completed: usize,
     pub logical_bytes: u64,
     pub staged_bytes: Option<u64>,
+    pub source_read_remaining: Option<u64>,
+    pub additional_source_read_allowance: u64,
     pub export_remaining: Option<u64>,
     pub additional_export_allowance: u64,
     pub provider: Option<String>,
@@ -293,6 +332,15 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
             .as_ref()
             .and_then(|a| a.copy.as_ref())
             .map(|c| c.bytes),
+        source_read_remaining: cursor.source_read_budget.as_ref().map(|b| b.limit - b.used),
+        additional_source_read_allowance: if manifest.provider.is_none() {
+            manifest.files[cursor.position..]
+                .iter()
+                .map(|f| f.bytes)
+                .sum()
+        } else {
+            0
+        },
         export_remaining: cursor.export_budget.as_ref().map(|b| b.limit - b.used),
         additional_export_allowance: manifest.files[cursor.position..]
             .iter()
@@ -410,6 +458,7 @@ fn load(
             let mut cursor = Cursor::new(&manifest)?;
             cursor.upload_budget = None;
             cursor.export_budget = None;
+            cursor.source_read_budget = None;
             journal.write("cursor.json", &cursor, identity)?;
             cursor
         }
@@ -417,6 +466,28 @@ fn load(
     };
     cursor.validate(&manifest)?;
     Ok((manifest, cursor))
+}
+fn recover_staging(
+    journal: &Journal,
+    identity: &DeviceIdentity,
+    saved: &SavedConnection,
+    manifest: &Manifest,
+    cursor: &mut Cursor,
+) -> Result<(), String> {
+    if let Some(active) = cursor.active.as_mut() {
+        let stage = journal.root.join("stage");
+        if active.copy.is_none() && stage.join(&active.stage_id).join("receipt.json").exists() {
+            let copy = StagedCopy::restore(saved, identity, &stage, &active.stage_id)?;
+            let entry = &manifest.files[cursor.position];
+            if !copy.matches_entry(&entry.relative, entry.bytes)
+                || copy.source_id() != manifest.source_id
+            {
+                return Err("source_item_changed".into());
+            }
+            active.copy = Some(copy);
+        }
+    }
+    Ok(())
 }
 struct SourceApi<'a> {
     client: &'a Client,
@@ -630,6 +701,8 @@ async fn execute(
                         cursor.reserve_export(entry.bytes)?;
                         journal.write("cursor.json", &cursor, identity)?;
                     } else {
+                        cursor.reserve_read(entry.bytes)?;
+                        journal.write("cursor.json", &cursor, identity)?;
                         crate::copy_source::release_stage(&stage, &id)?;
                     }
                     consent.approval(saved, identity)?.stage_to(
@@ -811,7 +884,8 @@ impl SourceJobs {
             return Ok(None);
         }
         let journal = Journal::new(base, consent.source_id())?;
-        let (manifest, cursor) = load(&journal, &identity, &consent, saved)?;
+        let (manifest, mut cursor) = load(&journal, &identity, &consent, saved)?;
+        recover_staging(&journal, &identity, saved, &manifest, &mut cursor)?;
         Ok(Some(view(
             &manifest,
             &cursor,
@@ -837,7 +911,7 @@ impl SourceJobs {
             return Err("source_staging_overlap".into());
         }
         let journal = Journal::new(base, consent.source_id())?;
-        let (manifest, cursor) = if journal.root.join("manifest.json").exists()
+        let (manifest, mut cursor) = if journal.root.join("manifest.json").exists()
             || journal.root.join("cursor.json").exists()
         {
             load(&journal, &identity, &consent, saved)?
@@ -848,6 +922,7 @@ impl SourceJobs {
             journal.write("cursor.json", &cursor, &identity)?;
             (manifest, cursor)
         };
+        recover_staging(&journal, &identity, saved, &manifest, &mut cursor)?;
         let value = view(
             &manifest,
             &cursor,
@@ -949,7 +1024,7 @@ impl SourceJobs {
         &self,
         base: &Path,
         saved: &SavedConnection,
-        export: bool,
+        action: &str,
     ) -> Result<ImportView, String> {
         self.stop().await;
         let identity = credentials::identity()?;
@@ -957,10 +1032,11 @@ impl SourceJobs {
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
         let journal = Journal::new(base, consent.source_id())?;
         let (manifest, mut cursor) = load(&journal, &identity, &consent, saved)?;
-        if export {
-            cursor.approve_export(&manifest)?;
-        } else {
-            cursor.approve_upload(&manifest)?;
+        match action {
+            "approve-read" => cursor.approve_read(&manifest)?,
+            "approve-export" => cursor.approve_export(&manifest)?,
+            "approve-upload" => cursor.approve_upload(&manifest)?,
+            _ => return Err("source_control_invalid".into()),
         }
         journal.write("cursor.json", &cursor, &identity)?;
         let value = view(&manifest, &cursor, "paused", None);
@@ -1025,6 +1101,206 @@ impl SourceJobs {
 mod tests {
     use super::*;
     #[test]
+    fn folder_original_read_allowance_is_explicit_in_new_signed_checkpoints() {
+        let f = Fixture::new();
+        let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+        let value = serde_json::to_value(&cursor).unwrap();
+        assert_eq!(value["sourceReadBudget"], json!({"used": 0, "limit": 10}));
+        let encoded = serde_json::to_vec(&cursor).unwrap();
+        let restored: Cursor = serde_json::from_slice(&encoded).unwrap();
+        restored.validate(&f.manifest).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["sourceReadBudget"],
+            value["sourceReadBudget"]
+        );
+    }
+
+    #[test]
+    fn missing_or_exhausted_original_read_allowance_refuses_before_opening_source_contents() {
+        tauri::async_runtime::block_on(async {
+            for legacy in [true, false] {
+                let f = Fixture::new();
+                let mut value: Value = f.journal.read("cursor.json", &f.identity).unwrap();
+                if legacy {
+                    value.as_object_mut().unwrap().remove("sourceReadBudget");
+                } else {
+                    value["sourceReadBudget"] = json!({"used": 0, "limit": 9});
+                }
+                f.journal.write("cursor.json", &value, &f.identity).unwrap();
+                // If the allowance is not checked first, this produces source_item_unavailable.
+                fs::remove_file(f.base.join("source/photo.jpg")).unwrap();
+                let server = Server::new(vec![
+                    preflight()[0].clone(),
+                    f.run_ack("open"),
+                    f.state_ack("open"),
+                    f.run_ack("open"),
+                ]);
+                assert_eq!(
+                    f.run(&server, &|| Ok(())).await.err().as_deref(),
+                    Some(if legacy {
+                        "source_read_budget_required"
+                    } else {
+                        "source_read_budget_exhausted"
+                    })
+                );
+                assert!(!f.journal.root.join("stage").join(&f.stage).exists());
+                let stored: Value = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(
+                    stored.get("sourceReadBudget"),
+                    value.get("sourceReadBudget")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_failed_original_read_charges_the_full_attempt_across_restart() {
+        tauri::async_runtime::block_on(async {
+            let f = Fixture::new();
+            fs::remove_file(f.base.join("source/photo.jpg")).unwrap();
+            for code in ["source_item_unavailable", "source_read_budget_exhausted"] {
+                let server = Server::new(vec![
+                    preflight()[0].clone(),
+                    f.run_ack("open"),
+                    f.state_ack("open"),
+                    f.run_ack("open"),
+                ]);
+                assert_eq!(
+                    f.run(&server, &|| Ok(())).await.err().as_deref(),
+                    Some(code)
+                );
+                let stored: Value = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(stored["sourceReadBudget"], json!({"used": 10, "limit": 10}));
+            }
+        });
+    }
+
+    #[test]
+    fn restored_signed_staging_does_not_spend_another_original_read_allowance() {
+        tauri::async_runtime::block_on(async {
+            for legacy in [true, false] {
+                let f = Fixture::new();
+                f.consent
+                    .approval(&f.saved, &f.identity)
+                    .unwrap()
+                    .stage_to(
+                        &f.saved,
+                        &f.identity,
+                        "photo.jpg",
+                        &f.journal.root.join("stage"),
+                        &f.stage,
+                        Some(10),
+                        &AtomicBool::new(false),
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+                let mut value: Value = f.journal.read("cursor.json", &f.identity).unwrap();
+                if legacy {
+                    value.as_object_mut().unwrap().remove("sourceReadBudget");
+                } else {
+                    value["sourceReadBudget"] = json!({"used": 10, "limit": 10});
+                }
+                f.journal.write("cursor.json", &value, &f.identity).unwrap();
+                fs::remove_file(f.base.join("source/photo.jpg")).unwrap();
+                let (manifest, recovered) =
+                    load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
+                let mut recovered = recovered;
+                recover_staging(&f.journal, &f.identity, &f.saved, &manifest, &mut recovered)
+                    .unwrap();
+                assert_eq!(
+                    view(&manifest, &recovered, "paused", None).staged_bytes,
+                    Some(10)
+                );
+                let server = Server::new(f.replies(f.receipt(), false, false));
+                f.run(&server, &|| Ok(())).await.unwrap();
+                let stored: Value = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(
+                    stored.get("sourceReadBudget"),
+                    value.get("sourceReadBudget")
+                );
+                assert_eq!(stored["state"], "complete");
+            }
+        });
+    }
+
+    #[test]
+    fn failed_read_accounting_checkpoint_never_opens_the_original() {
+        tauri::async_runtime::block_on(async {
+            let f = Fixture::new();
+            let failed = AtomicBool::new(false);
+            let gate = || {
+                if !failed.load(Ordering::Acquire) {
+                    let cursor: Cursor = f.journal.read("cursor.json", &f.identity)?;
+                    if cursor.state == "open" {
+                        fs::rename(
+                            f.journal.root.join("cursor.json"),
+                            f.journal.root.join("cursor.previous"),
+                        )
+                        .unwrap();
+                        fs::create_dir(f.journal.root.join("cursor.json")).unwrap();
+                        failed.store(true, Ordering::Release);
+                    }
+                }
+                Ok(())
+            };
+            let server = Server::new(vec![
+                preflight()[0].clone(),
+                f.run_ack("open"),
+                f.state_ack("open"),
+                f.run_ack("open"),
+            ]);
+            assert_eq!(
+                f.run(&server, &gate).await.err().as_deref(),
+                Some("source_journal_write_failed")
+            );
+            assert!(failed.load(Ordering::Acquire));
+            assert!(!f.journal.root.join("stage").join(&f.stage).exists());
+            assert_eq!(
+                fs::read(f.base.join("source/photo.jpg")).unwrap(),
+                b"abcdefghij"
+            );
+        });
+    }
+
+    #[test]
+    fn original_read_approval_preserves_spending_and_other_allowances() {
+        let f = Fixture::new();
+        let (mut manifest, mut cursor) =
+            load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
+        cursor.reserve_read(10).unwrap();
+        let upload = serde_json::to_value(&cursor.upload_budget).unwrap();
+        cursor.approve_read(&manifest).unwrap();
+        assert_eq!(cursor.source_read_budget.as_ref().unwrap().used, 10);
+        assert_eq!(cursor.source_read_budget.as_ref().unwrap().limit, 20);
+        assert_eq!(serde_json::to_value(&cursor.upload_budget).unwrap(), upload);
+        assert!(cursor.export_budget.is_none());
+        let shown = view(&manifest, &cursor, "paused", None);
+        assert_eq!(shown.source_read_remaining, Some(10));
+        assert_eq!(shown.additional_source_read_allowance, 10);
+        cursor.source_read_budget = None;
+        cursor.approve_read(&manifest).unwrap();
+        assert_eq!(cursor.source_read_budget.as_ref().unwrap().limit, 10);
+        cursor.source_read_budget.as_mut().unwrap().limit = u64::MAX;
+        assert_eq!(
+            cursor.approve_read(&manifest).unwrap_err(),
+            "source_read_budget_exhausted"
+        );
+        for state in ["complete", "cancelled"] {
+            cursor.state = state.into();
+            assert_eq!(
+                cursor.approve_read(&manifest).unwrap_err(),
+                "source_run_terminal"
+            );
+        }
+        cursor.state = "paused".into();
+        manifest.provider = Some("apple-photos".into());
+        assert_eq!(
+            cursor.approve_read(&manifest).unwrap_err(),
+            "source_run_terminal"
+        );
+    }
+
+    #[test]
     fn photos_exports_reserve_the_full_attempt_before_reads_and_uploads_need_separate_approval() {
         let manifest = Manifest {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1041,6 +1317,10 @@ mod tests {
         };
         let mut cursor = Cursor::new(&manifest).unwrap();
         assert!(cursor.upload_budget.is_none());
+        assert!(serde_json::to_value(&cursor)
+            .unwrap()
+            .get("sourceReadBudget")
+            .is_none());
         assert_eq!(
             view(&manifest, &cursor, "ready", None).additional_upload_allowance,
             0
@@ -1602,6 +1882,13 @@ mod tests {
         assert!(
             cursor.upload_budget.is_none(),
             "missing accounting must not mint an allowance"
+        );
+        assert!(
+            serde_json::to_value(&cursor)
+                .unwrap()
+                .get("sourceReadBudget")
+                .is_none(),
+            "missing read accounting must not mint an allowance"
         );
         fs::write(f.journal.root.join("cursor.json"), b"corrupt").unwrap();
         assert!(load(&f.journal, &f.identity, &f.consent, &f.saved).is_err());

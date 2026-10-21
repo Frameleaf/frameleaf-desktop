@@ -11,8 +11,9 @@
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
   type Consent = { allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
-  type CopyJob = { provider: string | null; stagedBytes: number | null; exportRemaining: number | null; additionalExportAllowance: number; sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
+  type CopyJob = { sourceReadRemaining: number | null; additionalSourceReadAllowance: number; provider: string | null; stagedBytes: number | null; exportRemaining: number | null; additionalExportAllowance: number; sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
+  let sourceReadApprovalNeeded = $derived(job !== null && !job.provider && job.stagedBytes === null && (job.sourceReadRemaining === null || job.sourceReadRemaining === 0 || ['source_read_budget_required', 'source_read_budget_exhausted'].includes(job.code ?? '')));
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowHydration = $state(false);
@@ -59,6 +60,8 @@
     source_journal_write_failed: 'Copy progress could not be saved. Check local disk space and access before resuming; staged originals are retained.',
     source_stop_confirmation_pending: 'Copying stopped on this computer. The server could not confirm its stop yet; existing server copies are kept.',
     source_cache_cleanup_pending: 'The verified copy is on your server, but its local staging cache could not be cleared. Check local file access before resuming.',
+    source_read_budget_required: 'Reading another original needs an allowance. Approve the displayed amount, then resume. Already staged copies are kept.',
+    source_read_budget_exhausted: 'The original-read allowance was used, including interrupted attempts. Approve more original reads to retry; staged copies are kept.',
     source_upload_budget_required: 'This saved copy needs an upload allowance before it can send original data. Approve the displayed amount, then resume.',
     source_upload_budget_exhausted: 'This copy reached its upload allowance. Staged originals are kept. Approve more upload data to retry.',
     source_copy_cancelled: 'Copying is paused. Resume when you are ready.',
@@ -126,7 +129,7 @@
     catch (error) { message = explain(error); }
     finally { busy = false; }
   }
-  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload' | 'approve-export') {
+  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload' | 'approve-export' | 'approve-read') {
     busy = true; message = '';
     try { job = await invoke<CopyJob>('control_photo_import', { action }); }
     catch (error) { message = explain(error); }
@@ -219,6 +222,12 @@
             {#if job.stagedBytes !== null}<p class="footnote">Current verified staged original: {size(job.stagedBytes)}. Upload approval is separate from Photos export.</p>{/if}
             {#if job.code === 'photos_export_budget_exhausted' || job.code === 'photos_export_budget_required'}<button class="secondary" disabled={busy} onclick={() => controlCopy('approve-export')}>Approve {size(job.additionalExportAllowance)} more export data</button>{/if}
           {/if}
+          {#if !job.provider}
+            <p class="footnote">{job.sourceReadRemaining === null ? 'New reads of originals need approval. Already staged copies can resume.' : `${size(job.sourceReadRemaining)} of original reads remaining.`} Each attempt counts the full original, including retries and cached files. This allowance covers logical file data; cloud-provider traffic can be larger.</p>
+            {#if !['complete', 'cancelled', 'copying'].includes(job.state) && sourceReadApprovalNeeded}
+              <button class="secondary" disabled={busy} onclick={() => controlCopy('approve-read')}>Approve {size(job.additionalSourceReadAllowance)} more original reads</button>
+            {/if}
+          {/if}
           <p class="footnote">{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
           {#if !['complete', 'cancelled', 'copying'].includes(job.state) && (!job.provider || job.stagedBytes !== null) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted')}
             <button class="secondary" disabled={busy} onclick={() => controlCopy('approve-upload')}>Approve {size(job.additionalUploadAllowance)} more upload data</button>
@@ -226,7 +235,7 @@
           {#if job.availability}<p class="footnote" aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
           {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
           {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
-            <button class="secondary" disabled={busy || (!job.provider && job.uploadRemaining === null) || (job.provider && job.stagedBytes !== null && job.uploadRemaining === null) || job.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job.provider && job.stagedBytes === null ? 'Export next original within allowance' : job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
+            <button class="secondary" disabled={busy || (!job.provider && job.uploadRemaining === null) || (job.provider && job.stagedBytes !== null && job.uploadRemaining === null) || job.code === 'source_upload_budget_exhausted' || sourceReadApprovalNeeded} onclick={() => controlCopy('resume')}>{job.provider && job.stagedBytes === null ? 'Export next original within allowance' : job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
           {/if}
           {#if job.state === 'copying'}<button class="secondary" disabled={busy} onclick={() => controlCopy('pause')}>Pause copy</button>{/if}
           {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}

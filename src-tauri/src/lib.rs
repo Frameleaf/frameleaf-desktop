@@ -787,9 +787,9 @@ async fn control_photo_import(
                 .start(app.clone(), base, saved.clone())
                 .await
         }
-        "approve-upload" | "approve-export" => {
+        "approve-upload" | "approve-export" | "approve-read" => {
             app.state::<source_import::SourceJobs>()
-                .approve_budget(&base, saved, action == "approve-export")
+                .approve_budget(&base, saved, &action)
                 .await
         }
         "pause" | "cancel" => {
