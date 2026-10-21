@@ -52,7 +52,7 @@ class WindowsHostInstallerTests(unittest.TestCase):
     def test_payload_dollars_remain_literal_and_sources_use_numbered_files(self):
         script = builder.installer_script('a' * 64, 'b' * 64, ['payload/$PLUGINSDIR/${evil}/hello$.txt'])
         self.assertIn('SetOutPath "$PLUGINSDIR\\candidate\\payload\\$$PLUGINSDIR\\$${evil}"', script)
-        self.assertIn('File "/oname=hello$$.txt" "files/0"', script)
+        self.assertIn('File "/oname=hello$$.txt" "files\\0"', script)
         self.assertNotIn('!include "${evil}', script)
 
     @unittest.skipUnless(shutil.which('makensis'), 'requires the pinned NSIS compiler')

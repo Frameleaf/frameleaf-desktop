@@ -109,7 +109,7 @@ Section
         destination = '\\candidate' + ('\\' + parent.replace('/', '\\') if parent else '')
         # Only the fixed NSIS variable is interpreted; every payload-controlled byte is escaped.
         text += '  SetOutPath "$PLUGINSDIR' + quote(destination)[1:] + '\n'
-        text += '  File ' + quote('/oname=' + basename) + ' "files/' + str(index) + '"\n  IfErrors failed\n'
+        text += '  File ' + quote('/oname=' + basename) + ' "files\\' + str(index) + '"\n  IfErrors failed\n'
     ids = manifest + ' ' + controller
     text += '''  SetOutPath "$PLUGINSDIR"
   ClearErrors
