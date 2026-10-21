@@ -106,23 +106,7 @@ pub(crate) fn opened_stamp(file: &cap_std::fs::File) -> Result<String, String> {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
-        };
-        // ReFS identity needs all 128 bits; a legacy 64-bit file index can collide.
-        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::zeroed();
-        if unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                FileIdInfo,
-                info.as_mut_ptr().cast(),
-                std::mem::size_of::<FILE_ID_INFO>() as u32,
-            )
-        } == 0
-        {
-            return Err("source_identity_unavailable".into());
-        }
-        let info = unsafe { info.assume_init() };
+        let info = windows_file_id(file.as_raw_handle())?;
         let id: String = info
             .FileId
             .Identifier
@@ -173,6 +157,59 @@ fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String,
             return Err("source_item_changed".into());
         }
         opened_stamp(&file)
+    }
+}
+#[cfg(windows)]
+fn windows_file_id(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+    let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::zeroed();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err("source_identity_unavailable".into());
+    }
+    Ok(unsafe { info.assume_init() })
+}
+#[cfg(any(windows, test))]
+fn windows_file_identity(volume: u64, identifier: &[u8; 16]) -> String {
+    let id: String = identifier
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{volume}:file-id-v2:{id}")
+}
+fn check_source_root(approved: &str, current: &str) -> Result<(), String> {
+    if approved == current {
+        Ok(())
+    } else if current.contains(":file-id-v2:") && !approved.contains(":file-id-v2:") {
+        Err("source_approval_upgrade_required".into())
+    } else {
+        Err("source_root_changed".into())
+    }
+}
+fn source_root_identity(dir: &Dir) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        root_identity(dir)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let info = windows_file_id(dir.as_raw_handle())?;
+        Ok(windows_file_identity(
+            info.VolumeSerialNumber,
+            &info.FileId.Identifier,
+        ))
     }
 }
 pub(crate) fn root_identity(dir: &Dir) -> Result<String, String> {
@@ -426,7 +463,7 @@ impl CopyApproval {
             device_id: saved.device_id.clone().unwrap(),
             installation_id: identity.installation_id.clone(),
             root: root.to_str().ok_or("source_root_invalid")?.into(),
-            root_identity: root_identity(&dir)?,
+            root_identity: source_root_identity(&dir)?,
             max_item_bytes,
             allow_download,
             photos: None,
@@ -600,9 +637,7 @@ impl CopyApproval {
         }
         let dir = Dir::open_ambient_dir(root, ambient_authority())
             .map_err(|_| "source_root_unavailable")?;
-        if root_identity(&dir)? != self.scope.root_identity {
-            return Err("source_root_changed".into());
-        }
+        check_source_root(&self.scope.root_identity, &source_root_identity(&dir)?)?;
         let root_meta = dir.dir_metadata().map_err(|_| "source_root_unavailable")?;
         if crate::source_metadata::probe(&dir, Path::new("."), &root_meta)?.excluded {
             return Err("source_item_excluded".into());
@@ -1075,6 +1110,32 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 mod tests {
     use super::*;
     #[test]
+    fn source_root_admission_requires_all_windows_identity_bits_and_explicit_legacy_reapproval() {
+        let mut low = [0u8; 16];
+        low[0] = 7;
+        let mut high = low;
+        high[15] = 1;
+        let first = windows_file_identity(42, &low);
+        let second = windows_file_identity(42, &high);
+        assert_ne!(first, second);
+        assert_ne!(first, windows_file_identity(43, &low));
+        assert_eq!(first.split(':').next(), Some("42"));
+        assert!(check_source_root(&first, &first).is_ok());
+        assert_eq!(
+            check_source_root(&first, &second).unwrap_err(),
+            "source_root_changed"
+        );
+        assert_eq!(
+            check_source_root("42:0:7", &first).unwrap_err(),
+            "source_approval_upgrade_required"
+        );
+        assert_eq!(
+            check_source_root("unix-old", "unix-new").unwrap_err(),
+            "source_root_changed"
+        );
+    }
+
+    #[test]
     fn photos_consent_binds_resource_snapshot_hydration_device_and_creation_metadata() {
         let saved = SavedConnection {
             server: "https://nas.test/".into(),
@@ -1131,6 +1192,30 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("photos"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_directory_identity_is_full_width_stable_and_distinct() {
+        let path = std::env::temp_dir().join(format!("frameleaf-source-id-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let _cleanup = Partial(Some(path.clone()));
+        fs::create_dir(path.join("sibling")).unwrap();
+        let dir = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
+        let reopened = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
+        let current = source_root_identity(&dir).unwrap();
+        assert_eq!(current, source_root_identity(&reopened).unwrap());
+        assert_eq!(current.split(":file-id-v2:").nth(1).unwrap().len(), 32);
+        assert_ne!(
+            current,
+            source_root_identity(&dir.open_dir("sibling").unwrap()).unwrap()
+        );
+        let legacy = root_identity(&dir).unwrap();
+        assert_eq!(legacy.split(':').count(), 3);
+        assert_eq!(
+            check_source_root(&legacy, &current).unwrap_err(),
+            "source_approval_upgrade_required"
+        );
     }
 
     #[cfg(windows)]
