@@ -37,10 +37,22 @@ def adapt_authoring_command(name: str, source: str) -> str:
              "execFileSync(process.execPath, [vp, ...vpArgs],"),
         ],
         "vite.config.mjs": [
+            ("import path from 'node:path'",
+             "import path from 'node:path'\nconst normalizeVitePath = value => value.replaceAll('\\\\', '/')"),
             ("import { fileURLToPath } from 'node:url'",
              "import { fileURLToPath, pathToFileURL } from 'node:url'"),
             ("import(engineRequire.resolve('@tailwindcss/vite'))",
              "import(pathToFileURL(engineRequire.resolve('@tailwindcss/vite')).href)"),
+            ("!importer.startsWith(here) || importer.startsWith(engine)",
+             "!normalizeVitePath(importer).startsWith(normalizeVitePath(here)) || normalizeVitePath(importer).startsWith(normalizeVitePath(engine))"),
+            ("this.resolve(source, path.join(engine, 'src/main.tsx'),",
+             "this.resolve(source, normalizeVitePath(path.join(engine, 'src/main.tsx')),"),
+            ("importer === persistenceShim",
+             "normalizeVitePath(importer) === normalizeVitePath(persistenceShim)"),
+            ("resolved?.id === persistenceModule",
+             "resolved && normalizeVitePath(resolved.id) === normalizeVitePath(persistenceModule)"),
+            ("resolved?.id === upstreamWorkspaceDouble",
+             "resolved && normalizeVitePath(resolved.id) === normalizeVitePath(upstreamWorkspaceDouble)"),
         ],
     }
     if name not in replacements:
