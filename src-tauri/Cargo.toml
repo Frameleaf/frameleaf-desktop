@@ -9,6 +9,10 @@ default-run = "frameleaf-desktop"
 name = "frameleaf_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Qualified in disposable Windows tests before becoming the default reader.
+windows-cloud-copy = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

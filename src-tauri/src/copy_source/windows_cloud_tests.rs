@@ -23,7 +23,7 @@ use windows_sys::Win32::{
     },
 };
 
-static DATA: [u8; 65_536] = [0x5a; 65_536];
+static DATA: [u8; 65_553] = [0x5a; 65_553];
 const FILE_IDENTITY: [u8; 4] = *b"FL01";
 const FILE_NAME: &str = "旅行-original.jpg";
 
@@ -47,6 +47,7 @@ fn require_disposable_runner() {
 #[derive(Default)]
 struct Context {
     hold: AtomicBool,
+    fail: AtomicBool,
     cancellations: AtomicU64,
     fetches: AtomicU64,
     delivered: AtomicU64,
@@ -81,7 +82,9 @@ unsafe extern "system" fn fetch(
         && unsafe {
             std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), FILE_IDENTITY.len())
         } == FILE_IDENTITY;
-    let valid = identity_matches && bytes.is_some_and(|data| !data.is_empty());
+    let valid = identity_matches
+        && bytes.is_some_and(|data| !data.is_empty())
+        && !context.fail.load(Ordering::Acquire);
     let operation = CF_OPERATION_INFO {
         StructSize: size_of::<CF_OPERATION_INFO>() as u32,
         Type: CF_OPERATION_TYPE_TRANSFER_DATA,
@@ -372,6 +375,229 @@ fn cancel_pending_hydration(path: &Path, context: &Context) -> Result<(), String
     Ok(())
 }
 
+#[cfg(feature = "windows-cloud-copy")]
+fn qualify_staged_copy(base: &Path) {
+    let saved = SavedConnection {
+        server: "https://nas.test/".into(),
+        server_id: "nas".into(),
+        account_id: "owner".into(),
+        name: "Synthetic".into(),
+        token: "synthetic-session".into(),
+        device_name: "Synthetic".into(),
+        mode: "client-worker".into(),
+        device_id: Some("device".into()),
+    };
+    let identity = DeviceIdentity::generate();
+    let staging = base.join("staging");
+    crate::windows_protection::new_private_directory(&staging).unwrap();
+    let root = base.join("copy-source");
+    let mut provider = Provider::create(&root).unwrap();
+    let context = provider.context.as_ref().unwrap();
+    let approval =
+        CopyApproval::approve(&saved, &identity, &root, DATA.len() as u64, true).unwrap();
+    assert_eq!(
+        context.fetches.load(Ordering::Acquire),
+        0,
+        "approval recalled an original"
+    );
+    let stopped = AtomicBool::new(false);
+    let replacement = base.join("replacement-root");
+    fs::create_dir(&replacement).unwrap();
+    fs::write(replacement.join(FILE_NAME), DATA).unwrap();
+    let replaced_approval =
+        CopyApproval::approve(&saved, &identity, &replacement, DATA.len() as u64, true).unwrap();
+    fs::rename(&replacement, base.join("retained-old-root")).unwrap();
+    fs::create_dir(&replacement).unwrap();
+    fs::write(replacement.join(FILE_NAME), DATA).unwrap();
+    let rejected_id = Uuid::new_v4().to_string();
+    assert_eq!(
+        replaced_approval
+            .stage_to(
+                &saved,
+                &identity,
+                FILE_NAME,
+                &staging,
+                &rejected_id,
+                Some(DATA.len() as u64),
+                &stopped,
+                &|| Ok(())
+            )
+            .err()
+            .as_deref(),
+        Some("source_root_changed")
+    );
+    assert!(!staging.join(&rejected_id).exists());
+    let alias = root.join("outside-link.jpg");
+    std::os::windows::fs::symlink_file(replacement.join(FILE_NAME), &alias).unwrap();
+    assert!(matches!(
+        approval
+            .stage_to(
+                &saved,
+                &identity,
+                "outside-link.jpg",
+                &staging,
+                &rejected_id,
+                Some(DATA.len() as u64),
+                &stopped,
+                &|| Ok(())
+            )
+            .err()
+            .as_deref(),
+        Some("source_item_excluded" | "source_item_invalid")
+    ));
+    fs::remove_file(alias).unwrap();
+    assert_eq!(context.fetches.load(Ordering::Acquire), 0);
+    assert!(!staging.join(&rejected_id).exists());
+    let id = Uuid::new_v4().to_string();
+    assert_eq!(
+        approval
+            .stage_to(
+                &saved,
+                &identity,
+                FILE_NAME,
+                &staging,
+                &id,
+                Some(DATA.len() as u64),
+                &stopped,
+                &|| Err("metered_network".into())
+            )
+            .err()
+            .as_deref(),
+        Some("metered_network")
+    );
+    assert_eq!(context.fetches.load(Ordering::Acquire), 0);
+    assert!(!staging.join(&id).exists());
+    let denied = CopyApproval::approve(&saved, &identity, &root, DATA.len() as u64, false).unwrap();
+    assert_eq!(
+        denied
+            .stage_to(
+                &saved,
+                &identity,
+                FILE_NAME,
+                &staging,
+                &id,
+                Some(DATA.len() as u64),
+                &stopped,
+                &|| Ok(())
+            )
+            .err()
+            .as_deref(),
+        Some("source_download_permission_required")
+    );
+    assert_eq!(context.fetches.load(Ordering::Acquire), 0);
+    let copy = approval
+        .stage_to(
+            &saved,
+            &identity,
+            FILE_NAME,
+            &staging,
+            &id,
+            Some(DATA.len() as u64),
+            &stopped,
+            &|| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(copy.bytes, DATA.len() as u64);
+    assert_eq!(copy.sha256, format!("{:x}", Sha256::digest(DATA)));
+    let mut file = copy.verify(&saved, &identity, &staging).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, DATA);
+    drop(file);
+    let fetches = context.fetches.load(Ordering::Acquire);
+    assert!(fetches > 0);
+    let cached_id = Uuid::new_v4().to_string();
+    let cached = approval
+        .stage_to(
+            &saved,
+            &identity,
+            FILE_NAME,
+            &staging,
+            &cached_id,
+            Some(DATA.len() as u64),
+            &stopped,
+            &|| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(cached.sha256, copy.sha256);
+    assert_eq!(
+        context.fetches.load(Ordering::Acquire),
+        fetches,
+        "cached copy recalled original data again"
+    );
+    assert!(copy.source_stamp.starts_with("cloud-file-v1:"));
+    provider.close().unwrap();
+    fs::remove_file(root.join(FILE_NAME)).unwrap();
+    let restored = StagedCopy::restore(&saved, &identity, &staging, &id).unwrap();
+    let mut file = restored.verify(&saved, &identity, &staging).unwrap();
+    let mut recovered = Vec::new();
+    file.read_to_end(&mut recovered).unwrap();
+    assert_eq!(recovered, DATA);
+    drop(file);
+    println!("integrated stage_to: denied reads0fetch; unaligned Unicode copy and cached retry verified; signed recovery works after source removal");
+    let cancel_root = base.join("copy-cancel-source");
+    let mut provider = Provider::create(&cancel_root).unwrap();
+    let context = provider.context.as_ref().unwrap();
+    context.hold.store(true, Ordering::Release);
+    let approval =
+        CopyApproval::approve(&saved, &identity, &cancel_root, DATA.len() as u64, true).unwrap();
+    let id = Uuid::new_v4().to_string();
+    let gate = || {
+        if context.fetches.load(Ordering::Acquire) > 0 {
+            Err("metered_network".into())
+        } else {
+            Ok(())
+        }
+    };
+    assert_eq!(
+        approval
+            .stage_to(
+                &saved,
+                &identity,
+                FILE_NAME,
+                &staging,
+                &id,
+                Some(DATA.len() as u64),
+                &stopped,
+                &gate
+            )
+            .err()
+            .as_deref(),
+        Some("metered_network")
+    );
+    assert!(!staging.join(&id).exists());
+    assert!(context.fetches.load(Ordering::Acquire) > 0);
+    assert_eq!(context.delivered.load(Ordering::Acquire), 0);
+    provider.close().unwrap();
+    println!("integrated stage_to: policy revocation joined the reader Job and removed only its incomplete stage");
+    let failure_root = base.join("copy-failure-source");
+    let mut provider = Provider::create(&failure_root).unwrap();
+    let context = provider.context.as_ref().unwrap();
+    context.fail.store(true, Ordering::Release);
+    let approval =
+        CopyApproval::approve(&saved, &identity, &failure_root, DATA.len() as u64, true).unwrap();
+    let id = Uuid::new_v4().to_string();
+    assert!(approval
+        .stage_to(
+            &saved,
+            &identity,
+            FILE_NAME,
+            &staging,
+            &id,
+            Some(DATA.len() as u64),
+            &stopped,
+            &|| Ok(())
+        )
+        .is_err());
+    assert!(!staging.join(&id).exists());
+    assert!(context.fetches.load(Ordering::Acquire) > 0);
+    assert_eq!(context.delivered.load(Ordering::Acquire), 0);
+    provider.close().unwrap();
+    assert!(StagedCopy::restore(&saved, &identity, &staging, &copy.id).is_ok());
+    assert!(StagedCopy::restore(&saved, &identity, &staging, &cached.id).is_ok());
+    println!("integrated stage_to: failed provider published no receipt and retained earlier verified copies");
+}
+
 #[test]
 #[ignore = "registers a synthetic cloud provider only on a disposable hosted Windows runner"]
 fn cloud_provider_child() {
@@ -433,6 +659,8 @@ fn cloud_provider_child() {
     assert!(context.cancellations.load(Ordering::Acquire) > 0);
     assert_eq!(context.delivered.load(Ordering::Acquire), 0);
     println!("real CfApi pending hydration: CancelIoEx confirmed terminal cancellation without delivering bytes");
+    #[cfg(feature = "windows-cloud-copy")]
+    qualify_staged_copy(&base);
 }
 
 #[test]
@@ -466,7 +694,13 @@ fn disposable_cloud_provider_qualification() {
         std::thread::sleep(Duration::from_millis(100));
     };
     // The child has exited, so its provider callbacks cannot retain fixture memory or handles.
-    for name in ["source", "cancel-source"] {
+    for name in [
+        "source",
+        "cancel-source",
+        "copy-source",
+        "copy-cancel-source",
+        "copy-failure-source",
+    ] {
         unsafe {
             CfUnregisterSyncRoot(wide(&base.join(name)).as_ptr());
         }

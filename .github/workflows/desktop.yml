@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      windows_cloud_probe:
+        description: Qualify explicit cloud-original copying with a disposable Windows provider
+        type: boolean
+        default: false
       directory_probe:
         description: Run only Windows directory and shared-cache qualification
         type: boolean
@@ -49,11 +53,11 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: desktop-${{ github.ref }}${{ inputs.windows_runtime_signature_hex != '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' && '-windows-gui' || '' }}
+  group: desktop-${{ github.ref }}${{ inputs.windows_cloud_probe && '-windows-cloud' || '' }}${{ inputs.windows_runtime_signature_hex != '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' && '-windows-gui' || '' }}
   cancel-in-progress: true
 jobs:
   check:
-    if: ${{ !inputs.directory_probe && !inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
+    if: ${{ !inputs.windows_cloud_probe && !inputs.directory_probe && !inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -145,7 +149,7 @@ jobs:
           if-no-files-found: error
 
   directory-probe:
-    if: ${{ inputs.directory_probe && !inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
+    if: ${{ !inputs.windows_cloud_probe && inputs.directory_probe && !inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -203,7 +207,7 @@ jobs:
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   keystore-probe:
-    if: ${{ inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
+    if: ${{ !inputs.windows_cloud_probe && inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -276,7 +280,7 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib credentials::qualification::disposable_runner_epoch_persistence -- --exact --ignored
 
   package-windows-runtime:
-    if: inputs.windows_runtime_signature_hex != '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == ''
+    if: ${{ !inputs.windows_cloud_probe && (inputs.windows_runtime_signature_hex != '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '') }}
     permissions:
       contents: read
       actions: read
@@ -285,7 +289,7 @@ jobs:
       runtime_signature_hex: ${{ inputs.windows_runtime_signature_hex }}
 
   assemble-windows-host:
-    if: inputs.windows_host_assets_artifact_id != '' && inputs.windows_host_candidate_artifact_id == ''
+    if: ${{ !inputs.windows_cloud_probe && (inputs.windows_host_assets_artifact_id != '' && inputs.windows_host_candidate_artifact_id == '') }}
     permissions:
       contents: read
       actions: read
@@ -297,7 +301,7 @@ jobs:
       runtime_signature_hex: ${{ inputs.windows_runtime_signature_hex }}
 
   qualify-windows-host:
-    if: inputs.windows_host_candidate_artifact_id != ''
+    if: ${{ !inputs.windows_cloud_probe && (inputs.windows_host_candidate_artifact_id != '') }}
     permissions:
       contents: read
       actions: read
@@ -307,3 +311,9 @@ jobs:
       artifact_sha256: ${{ inputs.windows_host_candidate_sha256 }}
       build_head: ${{ inputs.windows_host_candidate_build_head }}
       signature_hex: ${{ inputs.windows_host_candidate_signature_hex }}
+
+  windows-cloud-probe:
+    if: ${{ inputs.windows_cloud_probe && !inputs.directory_probe && !inputs.keystore_probe && inputs.windows_runtime_signature_hex == '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-cloud-source.yml

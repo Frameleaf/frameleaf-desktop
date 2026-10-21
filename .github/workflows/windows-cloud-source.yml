@@ -1,0 +1,62 @@
+name: Disposable Windows cloud-original qualification
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  cloud-copy:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Attach cloud filter only to disposable test volumes
+        shell: python
+        run: |
+          import ntpath, os, re, subprocess, tempfile
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          inspector = ntpath.join(os.environ['SystemRoot'], 'System32', 'fltmc.exe')
+          volumes = set()
+          for path in [os.environ['RUNNER_TEMP'], tempfile.gettempdir()]:
+              volume, tail = ntpath.splitdrive(path)
+              assert re.fullmatch(r'[A-Za-z]:', volume) and ntpath.isabs(path)
+              volumes.add(volume.upper())
+          def attached(volume):
+              result = subprocess.run([inspector, 'instances', '-v', volume], check=True, capture_output=True, text=True)
+              print(result.stdout, flush=True)
+              return bool(re.search(r'^\s*CldFlt\s', result.stdout, re.I | re.M))
+          for volume in sorted(volumes):
+              if not attached(volume):
+                  subprocess.run([inspector, 'attach', 'CldFlt', volume], check=True)
+              assert attached(volume), 'Cloud filter did not attach to the disposable test volume'
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Build the real reader executable with experimental cloud copy
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --bins --features windows-cloud-copy
+      - name: Check shared source policy and cloud message validation
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --features windows-cloud-copy
+      - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --features windows-cloud-copy -- -D warnings
+      - name: Qualify consent, explicit hydration, staged recovery and cancellation
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $test = 'copy_source::windows_cloud_tests::disposable_cloud_provider_qualification'
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --features windows-cloud-copy -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($tests -match "^${test}: test$")) { throw 'The real CfApi qualification test is missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --features windows-cloud-copy $test -- --exact --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

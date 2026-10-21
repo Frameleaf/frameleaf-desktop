@@ -334,6 +334,11 @@ fn relative_path(path: &str) -> Result<&Path, String> {
     }
     Ok(path)
 }
+#[cfg(windows)]
+pub fn run_cloud_reader_child() -> Result<(), String> {
+    windows_cloud::run_child()
+}
+
 impl CopyApproval {
     pub(crate) fn is_photos(&self) -> bool {
         self.scope.photos.is_some()
@@ -437,13 +442,18 @@ impl CopyApproval {
         // Reuse the preview's broad-root and package refusals, without opening media.
         crate::photo_sources::inventory(root, 1)?;
         #[cfg(windows)]
-        crate::native_runtime::absolute_directory(root).map_err(|code| {
-            if code == "runtime_link_forbidden" {
-                "source_cloud_copy_pending".into()
-            } else {
-                code
-            }
-        })?;
+        let selected = if windows_cloud::enabled() {
+            Some(windows_cloud::approval_root(root)?)
+        } else {
+            crate::native_runtime::absolute_directory(root).map_err(|code| {
+                if code == "runtime_link_forbidden" {
+                    "source_cloud_copy_pending".into()
+                } else {
+                    code
+                }
+            })?;
+            None
+        };
         if saved.server_id.is_empty()
             || saved.account_id.is_empty()
             || saved.device_id.as_deref().is_none_or(str::is_empty)
@@ -452,6 +462,13 @@ impl CopyApproval {
         {
             return Err("source_approval_invalid".into());
         }
+        #[cfg(windows)]
+        let dir = match selected {
+            Some(dir) => dir,
+            None => Dir::open_ambient_dir(root, ambient_authority())
+                .map_err(|_| "source_root_unavailable")?,
+        };
+        #[cfg(not(windows))]
         let dir = Dir::open_ambient_dir(root, ambient_authority())
             .map_err(|_| "source_root_unavailable")?;
         let scope = CopyScope {
@@ -630,6 +647,19 @@ impl CopyApproval {
         }
         let relative_path = relative_path(relative)?;
         let root = Path::new(&self.scope.root);
+        #[cfg(windows)]
+        if let Some(copy) = windows_cloud::stage(
+            self,
+            identity,
+            relative,
+            destination,
+            stage_id,
+            expected_bytes,
+            cancelled,
+            gate,
+        )? {
+            return Ok(copy);
+        }
         crate::native_runtime::absolute_directory(root)?;
         crate::native_runtime::absolute_directory(destination)?;
         if destination.starts_with(root) || root.starts_with(destination) {
@@ -784,22 +814,7 @@ impl CopyApproval {
             approval,
             signature: String::new(),
         };
-        result.signature = result.sign(identity)?;
-        let data = serde_json::to_vec(&result).map_err(|_| "source_stage_write_failed")?;
-        let mut receipt = fs::OpenOptions::new();
-        receipt.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            receipt.mode(0o600);
-        }
-        let mut receipt = receipt
-            .open(path.join("receipt.json"))
-            .map_err(|_| "source_stage_write_failed")?;
-        receipt
-            .write_all(&data)
-            .and_then(|_| receipt.sync_all())
-            .map_err(|_| "source_stage_write_failed")?;
+        result.publish(identity, &path)?;
         cleanup.0.take();
         Ok(result)
     }
@@ -887,6 +902,25 @@ impl StagedCopy {
         }
         copy.verify(saved, identity, destination)?;
         Ok(copy)
+    }
+    fn publish(&mut self, identity: &DeviceIdentity, path: &Path) -> Result<(), String> {
+        self.signature = self.sign(identity)?;
+        let data = serde_json::to_vec(self).map_err(|_| "source_stage_write_failed")?;
+        let mut receipt = fs::OpenOptions::new();
+        receipt.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            receipt.mode(0o600);
+        }
+        let mut receipt = receipt
+            .open(path.join("receipt.json"))
+            .map_err(|_| "source_stage_write_failed")?;
+        receipt
+            .write_all(&data)
+            .and_then(|_| receipt.sync_all())
+            .map_err(|_| "source_stage_write_failed")?;
+        Ok(())
     }
     fn sign(&self, identity: &DeviceIdentity) -> Result<String, String> {
         signed(
@@ -1105,6 +1139,9 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
     }
     Ok(())
 }
+
+#[cfg(any(windows, test))]
+mod windows_cloud;
 
 #[cfg(all(windows, test))]
 mod windows_cloud_tests;

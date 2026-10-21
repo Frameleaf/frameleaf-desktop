@@ -51,6 +51,8 @@
     source_identity_unavailable: 'The filesystem could not provide a reliable file identity. Copying stopped; staged originals are kept. Try an ordinary local photo folder.',
     source_approval_upgrade_required: 'This folder permission uses an older Windows file identity. Remove the source permission and choose the folder again before reading more originals. Verified staged copies are kept.',
     source_item_changed: 'A selected file changed after the scan. This copy is paused; the original and staged data are kept.',
+    source_cloud_provider_unavailable: 'The cloud provider could not deliver this original. Check the provider and network before approving another read attempt.',
+    source_copy_shutdown_unconfirmed: 'The source reader could not confirm a clean stop. Private staging was kept. Restart Frameleaf before retrying.',
     source_cloud_copy_pending: 'This Windows cloud folder can be previewed, but copying its placeholders is still being implemented. Export originals to an ordinary local folder for now.',
     source_capacity_unavailable: 'Available storage space could not be checked. Reconnect the photo-source and app-storage volumes, then resume.',
     source_capacity_insufficient: 'There is not enough free space for this original and its staged copy. Free space on the photo-source and app-storage volumes, then resume.',
