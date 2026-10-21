@@ -290,11 +290,11 @@ struct Protected(HANDLE);
 impl Protected {
     fn open(path: &[u16]) -> Result<Self, String> {
         let mut handle = std::ptr::null_mut();
-        if unsafe { CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut handle) }
-            < 0
-            || handle.is_null()
-        {
-            return Err("source_cloud_provider_unavailable".into());
+        let result = unsafe {
+            CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut handle)
+        };
+        if result < 0 || handle.is_null() {
+            return Err(format!("source_cloud_open_failed:{result:08x}"));
         }
         Ok(Self(handle))
     }
@@ -457,7 +457,7 @@ pub(super) fn copy(
                     }
                 })?;
             } else if result < 0 {
-                return Err("source_cloud_provider_unavailable".into());
+                return Err(format!("source_cloud_hydration_failed:{result:08x}"));
             }
         }
         let mut read = Operation::new(copied)?;

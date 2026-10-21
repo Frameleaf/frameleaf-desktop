@@ -177,6 +177,20 @@ impl Progress {
             }
             Event::Error { code, .. } => {
                 self.finished = true;
+                if let Some((api, hresult)) = code.split_once(':') {
+                    if matches!(
+                        api,
+                        "source_cloud_open_failed" | "source_cloud_hydration_failed"
+                    ) && hresult.len() == 8
+                        && hresult
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                    {
+                        #[cfg(debug_assertions)]
+                        eprintln!("source_reader/{api}:hresult={hresult}");
+                        return Err("source_cloud_provider_unavailable".into());
+                    }
+                }
                 match code.as_str() {
                     "source_item_changed"
                     | "source_root_changed"
@@ -513,6 +527,41 @@ mod tests {
         }
         assert!(state.accept(event).is_err());
     }
+    #[test]
+    fn safe_api_diagnostics_do_not_escape_as_user_errors() {
+        let request = request();
+        for code in [
+            "source_cloud_open_failed:80070020",
+            "source_cloud_hydration_failed:80070057",
+        ] {
+            assert_eq!(
+                Progress::new(&request)
+                    .accept(Event::Error {
+                        operation_id: request.operation_id.clone(),
+                        code: code.into()
+                    })
+                    .unwrap_err(),
+                "source_cloud_provider_unavailable"
+            );
+        }
+        for code in [
+            "source_cloud_open_failed:private path",
+            "source_cloud_open_failed:80070020/secret",
+            "source_cloud_open_failed:8007002",
+            "unrecognized:80070020",
+        ] {
+            assert_eq!(
+                Progress::new(&request)
+                    .accept(Event::Error {
+                        operation_id: request.operation_id.clone(),
+                        code: code.into()
+                    })
+                    .unwrap_err(),
+                "source_copy_interrupted"
+            );
+        }
+    }
+
     #[test]
     fn incomplete_forged_or_oversized_progress_cannot_publish_a_copy() {
         let request = request();

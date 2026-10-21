@@ -112,6 +112,7 @@ pub(super) fn run(
         let mut progress = Progress::new(request);
         let mut complete = None;
         let mut eof = false;
+        let mut failed_exit = None;
         let mut next_gate = Instant::now();
         loop {
             super::super::cancel(cancelled)?;
@@ -122,9 +123,12 @@ pub(super) fn run(
             let status = child.try_wait().map_err(|_| "source_copy_interrupted")?;
             if let Some(status) = status {
                 if !status.success() {
-                    return Err("source_copy_interrupted".into());
-                }
-                if eof {
+                    // Drain a flushed error without waiting on descendants that may hold stdout.
+                    let exited = failed_exit.get_or_insert_with(Instant::now);
+                    if eof || exited.elapsed() >= Duration::from_millis(500) {
+                        return Err("source_copy_interrupted".into());
+                    }
+                } else if eof {
                     return complete.ok_or_else(|| "source_copy_interrupted".into());
                 }
             }
