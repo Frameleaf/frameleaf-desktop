@@ -54,6 +54,14 @@ jobs:
         run: |
           python tools/prepare_windows_host_qualification.py --output "$env:RUNNER_TEMP/fl-windows-full-host-qualification" --artifact "$env:HOST_ARTIFACT" --digest "$env:HOST_DIGEST" --head "$env:HOST_HEAD" --signature "$env:HOST_SIGNATURE"
           if ($LASTEXITCODE) { throw 'Full host signature or inventory was refused' }
+      - name: Select a fresh state under the runner account's private profile
+        shell: pwsh
+        run: |
+          $base = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+          if (-not $base -or -not [IO.Path]::IsPathFullyQualified($base)) { throw 'Private account profile is unavailable' }
+          $state = Join-Path $base "Frameleaf-HostQualification-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $state) { throw 'Qualification state must be new' }
+          "FRAMELEAF_TEST_HOST_STATE=$state" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Record disposable runner cloud-filter state
         shell: python
         run: |
@@ -70,7 +78,7 @@ jobs:
           assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
           inspector = ntpath.join(os.environ['SystemRoot'], 'System32', 'fltmc.exe')
           volumes = set()
-          for path in [os.environ['RUNNER_TEMP'], tempfile.gettempdir()]:
+          for path in [os.environ['RUNNER_TEMP'], tempfile.gettempdir(), os.environ['FRAMELEAF_TEST_HOST_STATE']]:
               volume, tail = ntpath.splitdrive(path)
               assert re.fullmatch(r'[A-Za-z]:', volume) and ntpath.isabs(path)
               volumes.add(volume.upper())
@@ -91,7 +99,6 @@ jobs:
         shell: pwsh
         env:
           FRAMELEAF_TEST_HOST_CANDIDATE: ${{ runner.temp }}/fl-windows-full-host-qualification/input/bundle
-          FRAMELEAF_TEST_HOST_STATE: ${{ runner.temp }}/fl-windows-full-host-qualification/state
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --test host_runtime factory_signed_host_starts_and_restarts_through_compiled_authority -- --exact --ignored --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/fl-windows-full-host-qualification/lifecycle.log"
           if ($LASTEXITCODE) { throw 'Compiled Windows full host lifecycle failed' }
@@ -127,6 +134,24 @@ jobs:
           report = json.loads((output / 'result.json').read_text())
           report.update(state='compiled-lifecycle-and-installer-authoring-passed', compiledLifecycleQualified=True, freshStarts=1, restarts=1, controller=checked, installerSha256=sha256(installer), osCodeSigned=False)
           (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+      - name: Retain bounded disposable host diagnostics
+        if: always()
+        shell: python
+        run: |
+          import os, stat
+          from pathlib import Path
+          state = os.environ.get('FRAMELEAF_TEST_HOST_STATE')
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-full-host-qualification'
+          if state and output.is_dir():
+              for name in ['agent.log', 'host.log']:
+                  source = Path(state) / name
+                  if not source.exists():
+                      continue
+                  info = source.lstat()
+                  assert stat.S_ISREG(info.st_mode) and not info.st_file_attributes & 0x400
+                  with source.open('rb') as stream:
+                      stream.seek(max(0, info.st_size - 65536))
+                      (output / ('tail-' + name)).write_bytes(stream.read(65536))
       - name: Retain private installer and bounded receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -138,6 +163,8 @@ jobs:
             ${{ runner.temp }}/fl-windows-full-host-qualification/controller.json
             ${{ runner.temp }}/fl-windows-full-host-qualification/input-producer.json
             ${{ runner.temp }}/fl-windows-full-host-qualification/lifecycle.log
+            ${{ runner.temp }}/fl-windows-full-host-qualification/tail-agent.log
+            ${{ runner.temp }}/fl-windows-full-host-qualification/tail-host.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/command-error.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/input/command-error.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/installer/FrameleafNativeHost-internal.exe
