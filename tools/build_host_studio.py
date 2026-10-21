@@ -53,6 +53,9 @@ def adapt_authoring_command(name: str, source: str) -> str:
              "resolved && normalizeVitePath(resolved.id) === normalizeVitePath(persistenceModule)"),
             ("resolved?.id === upstreamWorkspaceDouble",
              "resolved && normalizeVitePath(resolved.id) === normalizeVitePath(upstreamWorkspaceDouble)"),
+            ("? persistenceShim : null", "? normalizeVitePath(persistenceShim) : null"),
+            ("? adapterWorkspaceDouble : null", "? normalizeVitePath(adapterWorkspaceDouble) : null"),
+            ("closeBundle() {", "writeBundle() {"),
         ],
     }
     if name not in replacements:

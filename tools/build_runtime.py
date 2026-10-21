@@ -288,7 +288,7 @@ def run(arguments: list[str | Path], *, cwd: Path, env: dict[str, str]) -> str:
                 "FRAMELEAF_BUILD_ERROR_LOG",
                 str(Path(env["HOME"]).parent / "command-error.log"),
             )
-        ).write_text(result.stderr[-32_768:])
+        ).write_text(result.stdout[-32_768:] + "\n" + result.stderr[-32_768:])
         raise BuildError(
             f"runtime_build_command_failed:{Path(arguments[0]).name}:{result.returncode}"
         )

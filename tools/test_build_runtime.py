@@ -450,6 +450,20 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 ["--default-index", "https://pypi.org/simple"],
             )
 
+    def test_failed_commands_retain_bounded_stdout_and_stderr(self):
+        import sys
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = builder.build_environment(root, {})
+            command = "import sys; print('x' * 40000 + 'original build failure'); print('cleanup failure', file=sys.stderr); sys.exit(1)"
+            with self.assertRaisesRegex(builder.BuildError, 'runtime_build_command_failed'):
+                builder.run([sys.executable, '-c', command], cwd=root, env=environment)
+            report = (root / 'command-error.log').read_text()
+            self.assertIn('original build failure', report)
+            self.assertIn('cleanup failure', report)
+            self.assertLessEqual(len(report), 65537)
+
     def test_windows_build_profile_has_private_application_data_directories(self):
         import os
         from types import SimpleNamespace

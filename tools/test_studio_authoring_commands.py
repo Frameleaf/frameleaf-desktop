@@ -11,6 +11,12 @@ from build_host_studio import adapt_authoring_command, bind_authoring_commands
 
 CONFIG_FIXTURE = r"""import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { writeFileSync } from 'node:fs';
+let outDir;
+const frameManifest = () => ({
+  name: 'frameleaf-frame-manifest',
+  closeBundle() { writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify({built: true})); },
+});
 const here = String.raw`D:\repo\studio\adapters\web`;
 const engine = String.raw`D:\repo\studio\engine`;
 const persistenceShim = here + String.raw`\src\shims\timeline-persistence.ts`;
@@ -98,11 +104,11 @@ assert.equal(react?.id, 'react');
 assert.equal(react.importer, forward(engine) + '/src/main.tsx');
 assert.equal(await resolveFromEngine.call(resolver, 'react', forward(engine) + '/src/main.tsx', {}), null);
 const persistence = { resolve: async () => ({ id: forward(persistenceModule) }) };
-assert.equal(await gatePersistence.call(persistence, 'timeline-persistence', importer, {}), persistenceShim);
+assert.equal(await gatePersistence.call(persistence, 'timeline-persistence', importer, {}), forward(persistenceShim));
 assert.equal(await gatePersistence.call(persistence, 'timeline-persistence', forward(persistenceShim), {}), null);
 assert.equal(await gatePersistence.call({resolve: async () => null}, 'timeline-persistence', importer, {}), null);
 const workspace = { resolve: async () => ({ id: forward(upstreamWorkspaceDouble) }) };
-assert.equal(await workspaceDouble.call(workspace, 'in-memory-handle', importer, {}), adapterWorkspaceDouble);
+assert.equal(await workspaceDouble.call(workspace, 'in-memory-handle', importer, {}), forward(adapterWorkspaceDouble));
 assert.equal(await workspaceDouble.call({resolve: async () => null}, 'in-memory-handle', importer, {}), null);
 """
         with tempfile.TemporaryDirectory() as temporary:
@@ -111,6 +117,41 @@ assert.equal(await workspaceDouble.call({resolve: async () => null}, 'in-memory-
             module = Path(temporary) / 'plugin.mjs'
             module.write_text('export default 42;')
             result = subprocess.run([shutil.which('node'), script, module], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'requires authoring Node')
+    def test_manifest_is_written_after_success_without_masking_a_build_failure(self):
+        try:
+            vite = subprocess.check_output([shutil.which('node'), '-p', "require.resolve('vite')"],
+                                           cwd=Path(__file__).resolve().parent.parent,
+                                           text=True, stderr=subprocess.DEVNULL).strip()
+        except subprocess.CalledProcessError:
+            self.skipTest('requires the installed desktop Vite development dependency')
+        checks = r"""
+import assert from 'node:assert/strict';
+import { writeFile, readFile } from 'node:fs/promises';
+const engineRequire = { resolve: () => process.argv[2] };
+const tailwind = await import(engineRequire.resolve('@tailwindcss/vite'));
+const { build } = await import(pathToFileURL(process.argv[3]).href);
+outDir = process.argv[4];
+const input = path.join(path.dirname(outDir), 'input.js');
+const options = { configFile: false, root: path.dirname(outDir), logLevel: 'silent', plugins: [frameManifest()],
+  build: { outDir, lib: {entry: input, formats: ['es'], fileName: 'fixture'} } };
+await writeFile(input, "import './missing-module.js';");
+await assert.rejects(build(options), error => /missing-module/.test(error.message));
+await assert.rejects(readFile(path.join(outDir, 'manifest.json')), {code: 'ENOENT'});
+await writeFile(input, 'export const fixture = 1;');
+await build(options);
+assert.deepEqual(JSON.parse(await readFile(path.join(outDir, 'manifest.json'), 'utf8')), {built: true});
+"""
+        with tempfile.TemporaryDirectory(prefix='vite manifest ') as temporary:
+            root = Path(temporary)
+            script = root / 'config.mjs'
+            script.write_text(adapt_authoring_command('vite.config.mjs', CONFIG_FIXTURE + checks))
+            module = root / 'plugin.mjs'
+            module.write_text('export default 42;')
+            result = subprocess.run([shutil.which('node'), script, module, vite, root / 'output'],
+                                    capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_changed_authoring_inputs_are_rejected_before_any_rewrite(self):
