@@ -52,7 +52,8 @@ time.sleep(120)
             self.assertEqual(ctypes.get_last_error(), 87)
             return
         try:
-            self.assertEqual(kernel.WaitForSingleObject(handle, 0), 0)
+            # Job termination is asynchronous; require the process object to signal.
+            self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0)
         finally:
             self.assertTrue(kernel.CloseHandle(handle))
 
