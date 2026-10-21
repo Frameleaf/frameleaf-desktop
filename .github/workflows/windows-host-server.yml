@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
+          ref: aadd5f59ab68c4621885f852ee6953f23b55e556
           path: server-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -66,8 +66,31 @@ jobs:
         shell: pwsh
         run: |
           $node = (Get-Command node).Source
-          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision aadd5f59ab68c4621885f852ee6953f23b55e556 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
           if ($LASTEXITCODE) { throw 'Windows production server qualification failed' }
+      - name: Check native paths through the compiled Windows environment schema
+        shell: pwsh
+        run: |
+          @'
+          import assert from 'node:assert/strict';
+          import { pathToFileURL } from 'node:url';
+          assert.equal(process.platform, 'win32');
+          const { EnvSchema } = await import(pathToFileURL(process.argv[2]).href);
+          const keys = ['FRAMELEAF_MEDIA_LOCATION', 'FRAMELEAF_PLUGINS_INSTALL_FOLDER',
+            'FRAMELEAF_STUDIO_WORKER_TRUST_DIR', 'FRAMELEAF_IMPORT_ROOTS'];
+          for (const key of keys) {
+            for (const value of [String.raw`C:\Frameleaf Data`, 'C:/Frameleaf/media',
+              String.raw`\\server\share\media`,
+              String.raw`\\.\GLOBALROOT\Device\HarddiskVolume5\Frameleaf\media`]) {
+              assert.equal(EnvSchema.safeParse({ [key]: value }).success, true, `${key}: ${value}`);
+            }
+            for (const value of ['relative/media', './media', 'C:media', 'file:///media']) {
+              assert.equal(EnvSchema.safeParse({ [key]: value }).success, false, `${key}: ${value}`);
+            }
+          }
+          console.log('Compiled Windows environment schema: all four path fields passed');
+          '@ | node --input-type=module - "$env:RUNNER_TEMP/fl-windows-server/server/dist/utils/environment-schema.js"
+          if ($LASTEXITCODE) { throw 'Compiled Windows environment path checks failed' }
       - name: Bind and qualify private Windows metadata runtime
         shell: pwsh
         run: |
@@ -79,7 +102,7 @@ jobs:
         shell: pwsh
         run: |
           $node = (Get-Command node).Source
-          python tools/build_host_manager.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --node $node --output "$env:RUNNER_TEMP/fl-windows-manager"
+          python tools/build_host_manager.py --source "$env:GITHUB_WORKSPACE/server-source" --revision aadd5f59ab68c4621885f852ee6953f23b55e556 --node $node --output "$env:RUNNER_TEMP/fl-windows-manager"
           if ($LASTEXITCODE) { throw 'Windows production Manager qualification failed' }
       - name: Qualify the current private encrypted backup runtime
         shell: pwsh
