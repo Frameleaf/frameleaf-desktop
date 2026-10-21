@@ -19,6 +19,7 @@ class WindowsHostQualificationTests(unittest.TestCase):
                       patch.object(prepare.platform, 'machine', return_value='AMD64'),
                       patch.object(prepare.shutil, 'which', return_value=str(root / 'node.exe')),
                       patch.object(prepare, 'sha256', return_value='a619e2e09eb0d50ef4c733d678b4d22689d2afef138cd67fd3fa107b535f8819'),
+                      patch.object(prepare, 'create_probe_directory', side_effect=lambda path: path.mkdir()) as create,
                       patch.object(prepare, 'api', return_value={'name': name, 'workflow_run': {'id': 55}}),
                       patch.object(prepare, 'obtain', return_value=root) as obtain,
                       patch.object(prepare, 'admit', return_value=verified) as admit):
@@ -34,6 +35,22 @@ class WindowsHostQualificationTests(unittest.TestCase):
                         self.assertEqual(obtain.call_args.args, (root / 'output', 'input', 1, 'b' * 64, 55, 'c' * 40))
                         self.assertEqual(obtain.call_args.kwargs, {'maximum_bytes': 12 * 1024**3})
                         self.assertEqual(admit.call_args.args[0], candidate)
+                    create.assert_called_once_with(root / 'output')
+
+    def test_existing_output_is_refused_before_acl_creation_or_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / 'marker'
+            marker.write_text('preserved')
+            with (patch.object(prepare.platform, 'system', return_value='Windows'),
+                  patch.object(prepare.platform, 'machine', return_value='AMD64'),
+                  patch.object(prepare, 'create_probe_directory') as create,
+                  patch.object(prepare, 'api') as api,
+                  self.assertRaises(BuildError)):
+                prepare.prepare(root, '1', 'b' * 64, 'c' * 40, 'ab' * 64)
+            create.assert_not_called()
+            api.assert_not_called()
+            self.assertEqual(marker.read_text(), 'preserved')
 
     def fixture(self, root):
         candidate = root / 'bundle'

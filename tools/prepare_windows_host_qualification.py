@@ -11,6 +11,7 @@ from pathlib import Path
 
 from assemble_windows_host_candidate import SOURCE, api, obtain
 from build_runtime import BuildError, build_environment, regular, run, sha256
+from windows_probe_process import create_probe_directory
 
 ROOT = Path(__file__).resolve().parent.parent
 ML_MANIFEST = '95c6f4176699ef44ea7a7cc59052523b4e4a112b5a703606d733e20d6b27c5e4'
@@ -56,7 +57,8 @@ def prepare(output: Path, artifact: str, digest: str, head: str, signature: str)
     node_path = shutil.which('node')
     if not node_path or sha256(Path(node_path)) != 'a619e2e09eb0d50ef4c733d678b4d22689d2afef138cd67fd3fa107b535f8819':
         raise BuildError('host_qualification_node_unapproved')
-    output.mkdir(mode=0o700)
+    # PostgreSQL's restricted child must retain the user's access to staged DLLs.
+    create_probe_directory(output)
     env = build_environment(output, os.environ)
     metadata = api(f'actions/artifacts/{artifact}')
     if metadata['name'] != 'frameleaf-windows-unsigned-full-host-candidate':
