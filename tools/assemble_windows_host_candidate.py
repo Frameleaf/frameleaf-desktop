@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urlsplit
 
 from build_host_bundle import assemble
 from build_host_database import download
@@ -20,6 +22,25 @@ from build_runtime import BuildError, build_environment, git_blob, inventory, sh
 
 SOURCE = '9bbe7c64e720fceee2fcba0f72055c945f56b19a'
 REPOSITORY = 'repos/Frameleaf/frameleaf-desktop/'
+
+
+def download_geodata(destination: Path, digest: str, capture: str) -> str:
+    url = urlsplit(capture)
+    partial = destination.with_name(destination.name + '.part')
+    if (url.scheme != 'https' or url.netloc not in {'web.archive.org', 'raw.githubusercontent.com'}
+        or url.query or url.fragment or not re.fullmatch(r'[a-f0-9]{64}', digest)
+        or not re.fullmatch(r'[A-Za-z0-9_.-]+', destination.name)
+        or destination.exists() or destination.is_symlink() or partial.exists() or partial.is_symlink()):
+        raise BuildError('host_assembly_geodata_inputs_invalid')
+    for source in ['https://static.frameleaf.cloud/geodata/2026-10-11/' + destination.name, capture]:
+        try:
+            download(source, partial, digest)
+        except (URLError, TimeoutError, BuildError):
+            partial.unlink(missing_ok=True)
+            continue
+        partial.rename(destination)
+        return source
+    raise BuildError('host_assembly_geodata_sources_unavailable:' + destination.name)
 
 
 def qualified_files(root: Path, directory: str, revision: str = SOURCE) -> dict:
@@ -166,13 +187,15 @@ def build(source: Path, output: Path, assets_id: str, assets_sha: str,
     if (re.findall(r'^ARG GEODATA_SNAPSHOT=(\S+)$', dockerfile, re.M) != ['2026-10-11']
         or re.findall(r'^ARG GEODATA_DATE=(\S+)$', dockerfile, re.M) != ['2026-10-10T00:00:00+00:00']):
         raise BuildError('host_assembly_geodata_pin_changed')
+    geodata_sources = {}
     for line in lock.decode().splitlines():
         if not line or line.startswith('#'):
             continue
-        digest, name, _ = line.split()
+        digest, name, capture = line.split()
         if not re.fullmatch(r'[a-f0-9]{64}', digest) or not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
             raise BuildError('host_assembly_geodata_lock_invalid')
-        download('https://static.frameleaf.cloud/geodata/2026-10-11/' + name, geodata / name, digest)
+        geodata_sources[name] = download_geodata(geodata / name, digest, capture)
+    (work / 'geodata-producer.json').write_text(json.dumps(geodata_sources, indent=2) + '\n')
     with zipfile.ZipFile(geodata / 'cities500.zip') as cities:
         if cities.namelist() != ['cities500.txt'] or cities.getinfo('cities500.txt').file_size > 128 * 1024**2:
             raise BuildError('host_assembly_geodata_archive_invalid')

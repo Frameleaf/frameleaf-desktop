@@ -4,6 +4,7 @@ import json
 import zipfile
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,49 @@ from build_runtime import BuildError, inventory
 
 
 class WindowsHostAssemblyTests(unittest.TestCase):
+    def test_geodata_capture_preserves_checksum_and_removes_failed_partial_files(self):
+        content = b'pinned geodata'
+        digest = hashlib.sha256(content).hexdigest()
+        capture = 'https://web.archive.org/web/pinnedid_/https://download.geonames.org/asset'
+        for primary in ['forbidden', 'wrong-checksum', 'correct']:
+            with tempfile.TemporaryDirectory() as temporary, self.subTest(primary=primary):
+                destination = Path(temporary) / 'cities500.zip'
+                first = HTTPError('primary', 403, 'Forbidden', {}, None) if primary == 'forbidden' else io.BytesIO(content if primary == 'correct' else b'wrong')
+                with patch('build_host_database.urllib.request.urlopen', side_effect=[first, io.BytesIO(content)]) as request:
+                    source = assembler.download_geodata(destination, digest, capture)
+                self.assertEqual(destination.read_bytes(), content)
+                self.assertEqual(len(list(Path(temporary).iterdir())), 1)
+                self.assertEqual(request.call_count, 1 if primary == 'correct' else 2)
+                self.assertEqual(source, request.call_args.args[0])
+                self.assertEqual(source, 'https://static.frameleaf.cloud/geodata/2026-10-11/cities500.zip' if primary == 'correct' else capture)
+
+    def test_geodata_never_accepts_wrong_bytes_or_replaces_existing_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / 'cities500.zip'
+            capture = 'https://web.archive.org/web/pinnedid_/https://download.geonames.org/asset'
+            with (patch('build_host_database.urllib.request.urlopen', side_effect=[io.BytesIO(b'wrong'), io.BytesIO(b'wrong')]),
+                  self.assertRaises(BuildError)):
+                assembler.download_geodata(destination, 'a' * 64, capture)
+            self.assertEqual(list(root.iterdir()), [])
+            destination.write_bytes(b'keep')
+            with patch('build_host_database.urllib.request.urlopen') as request, self.assertRaises(BuildError):
+                assembler.download_geodata(destination, 'a' * 64, capture)
+            request.assert_not_called()
+            self.assertEqual(destination.read_bytes(), b'keep')
+            destination.unlink()
+            partial = destination.with_name(destination.name + '.part')
+            partial.write_bytes(b'keep partial')
+            with patch('build_host_database.urllib.request.urlopen') as request, self.assertRaises(BuildError):
+                assembler.download_geodata(destination, 'a' * 64, capture)
+            request.assert_not_called()
+            self.assertEqual(partial.read_bytes(), b'keep partial')
+            partial.unlink()
+            for capture in ['http://other.invalid/asset', 'https://user:password@web.archive.org/asset']:
+                with patch('build_host_database.urllib.request.urlopen') as request, self.assertRaises(BuildError):
+                    assembler.download_geodata(destination, 'a' * 64, capture)
+                request.assert_not_called()
+
     def test_component_must_match_passed_source_and_every_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
