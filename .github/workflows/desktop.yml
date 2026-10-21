@@ -49,7 +49,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: desktop-${{ github.ref }}
+  group: desktop-${{ github.ref }}${{ inputs.windows_runtime_signature_hex != '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_artifact_id == '' && '-windows-gui' || '' }}
   cancel-in-progress: true
 jobs:
   check:
