@@ -1,0 +1,145 @@
+name: Private Windows full host lifecycle and installer
+on:
+  workflow_call:
+    inputs:
+      artifact_id:
+        required: true
+        type: string
+      artifact_sha256:
+        required: true
+        type: string
+      build_head:
+        required: true
+        type: string
+      signature_hex:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  qualify:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+          cache: npm
+      - name: Check signature admission and archive boundaries
+        shell: pwsh
+        run: |
+          foreach ($test in @('test_prepare_windows_host_qualification.py', 'test_assemble_windows_host_candidate.py', 'test_build_host_ffmpeg.py')) {
+            python -m unittest discover -s tools -p $test -v
+            if ($LASTEXITCODE) { throw "Host qualification guard failed: $test" }
+          }
+      - name: Admit the exact full host using only its public detached signature
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_ARTIFACT: ${{ inputs.artifact_id }}
+          HOST_DIGEST: ${{ inputs.artifact_sha256 }}
+          HOST_HEAD: ${{ inputs.build_head }}
+          HOST_SIGNATURE: ${{ inputs.signature_hex }}
+        run: |
+          python tools/prepare_windows_host_qualification.py --output "$env:RUNNER_TEMP/fl-windows-full-host-qualification" --artifact "$env:HOST_ARTIFACT" --digest "$env:HOST_DIGEST" --head "$env:HOST_HEAD" --signature "$env:HOST_SIGNATURE"
+          if ($LASTEXITCODE) { throw 'Full host signature or inventory was refused' }
+      - name: Record disposable runner cloud-filter state
+        shell: python
+        run: |
+          import subprocess
+          for command in [['sc.exe', 'query', 'cldflt'], ['fltmc.exe', 'filters']]:
+              result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(command, 'exit=', result.returncode, flush=True)
+              print(result.stdout, flush=True)
+      - name: Attach cloud filter only to disposable test volumes
+        shell: python
+        run: |
+          import ntpath, os, re, subprocess, tempfile
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          inspector = ntpath.join(os.environ['SystemRoot'], 'System32', 'fltmc.exe')
+          volumes = set()
+          for path in [os.environ['RUNNER_TEMP'], tempfile.gettempdir()]:
+              volume, tail = ntpath.splitdrive(path)
+              assert re.fullmatch(r'[A-Za-z]:', volume) and ntpath.isabs(path)
+              volumes.add(volume.upper())
+          def attached(volume):
+              result = subprocess.run([inspector, 'instances', '-v', volume], check=True, capture_output=True, text=True)
+              print(result.stdout, flush=True)
+              return bool(re.search(r'^\s*CldFlt\s', result.stdout, re.I | re.M))
+          for volume in sorted(volumes):
+              if not attached(volume):
+                  subprocess.run([inspector, 'attach', 'CldFlt', volume], check=True)
+              assert attached(volume), 'Cloud filter did not attach to the disposable test volume'
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - run: npm ci
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Start, stop and restart through the genuine compiled Windows authority
+        shell: pwsh
+        env:
+          FRAMELEAF_TEST_HOST_CANDIDATE: ${{ runner.temp }}/fl-windows-full-host-qualification/input/bundle
+          FRAMELEAF_TEST_HOST_STATE: ${{ runner.temp }}/fl-windows-full-host-qualification/state
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --test host_runtime factory_signed_host_starts_and_restarts_through_compiled_authority -- --exact --ignored --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/fl-windows-full-host-qualification/lifecycle.log"
+          if ($LASTEXITCODE) { throw 'Compiled Windows full host lifecycle failed' }
+          $log = Get-Content "$env:RUNNER_TEMP/fl-windows-full-host-qualification/lifecycle.log" -Raw
+          if ($log -notmatch '(?m)^test result: ok\. 1 passed; 0 failed;') { throw 'The real host lifecycle fixture did not execute exactly once' }
+      - name: Compile the package controller from the same source
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host
+      - name: Qualify the controller and author the installer without executing it
+        shell: python
+        run: |
+          import json, os, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd() / 'tools'))
+          from build_host_database import download
+          from build_host_ffmpeg import unpack
+          from build_host_windows_nsis import build
+          from build_runtime import sha256
+          from qualify_windows_controller import qualify
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-full-host-qualification'
+          vswhere = Path(os.environ['ProgramFiles(x86)']) / 'Microsoft Visual Studio/Installer/vswhere.exe'
+          inspectors = subprocess.check_output([str(vswhere), '-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-find', 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe'], text=True).splitlines()
+          assert inspectors, 'MSVC dependency inspector is missing'
+          controller = Path('src-tauri/target/debug/frameleaf-native-host.exe').resolve(strict=True)
+          checked = qualify(controller, Path(inspectors[0]))
+          (output / 'controller.json').write_text(json.dumps(checked, indent=2) + '\n')
+          archive = output / 'nsis.zip'
+          download('https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip', archive, 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1')
+          unpack(archive, output / 'authoring')
+          os.environ['PATH'] = str(output / 'authoring/nsis-3.11') + os.pathsep + os.environ['PATH']
+          subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_build_host_windows_nsis.py', '-v'], check=True)
+          build(output / 'input/bundle', controller, output / 'installer', checked['controllerSha256'])
+          installer = output / 'installer/FrameleafNativeHost-internal.exe'
+          report = json.loads((output / 'result.json').read_text())
+          report.update(state='compiled-lifecycle-and-installer-authoring-passed', compiledLifecycleQualified=True, freshStarts=1, restarts=1, controller=checked, installerSha256=sha256(installer), osCodeSigned=False)
+          (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+      - name: Retain private installer and bounded receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-full-host-installer-candidate
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/fl-windows-full-host-qualification/result.json
+            ${{ runner.temp }}/fl-windows-full-host-qualification/controller.json
+            ${{ runner.temp }}/fl-windows-full-host-qualification/input-producer.json
+            ${{ runner.temp }}/fl-windows-full-host-qualification/lifecycle.log
+            ${{ runner.temp }}/fl-windows-full-host-qualification/command-error.log
+            ${{ runner.temp }}/fl-windows-full-host-qualification/input/command-error.log
+            ${{ runner.temp }}/fl-windows-full-host-qualification/installer/FrameleafNativeHost-internal.exe
+          retention-days: 7
+          if-no-files-found: warn

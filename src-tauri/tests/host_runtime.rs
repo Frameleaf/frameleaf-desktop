@@ -686,10 +686,10 @@ fn factory_signed_host_starts_and_restarts_through_compiled_authority() {
     let database_port = listeners[0].local_addr().unwrap().port();
     let api_port = listeners[1].local_addr().unwrap().port();
     drop(listeners);
-    fs::create_dir(&state).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let password = Zeroizing::new(format!("synthetic-{}", Uuid::new_v4()));

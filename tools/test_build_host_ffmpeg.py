@@ -25,6 +25,20 @@ class FfmpegPackageTests(unittest.TestCase):
             with self.assertRaises(BuildError):
                 ffmpeg_contract(lock, changed, "windows-x64")
 
+    def test_expanded_limit_is_explicit_bounded_and_checked_before_extraction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / 'input.zip'
+            with zipfile.ZipFile(archive, 'w') as bundle:
+                bundle.writestr('asset', b'four')
+            for index, maximum in enumerate([3, 0, -1, 12 * 1024**3 + 1, True]):
+                destination = root / str(index)
+                with self.subTest(maximum=maximum), self.assertRaises(BuildError):
+                    unpack(archive, destination, maximum_bytes=maximum)
+                self.assertFalse(destination.exists())
+            unpack(archive, root / 'valid', maximum_bytes=4)
+            self.assertEqual((root / 'valid/asset').read_bytes(), b'four')
+
     def test_zip_rejects_traversal_links_and_duplicates_before_extracting(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

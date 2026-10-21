@@ -36,7 +36,7 @@ def api(path: str) -> dict:
 
 
 def obtain(work: Path, name: str, artifact: int, digest: str, run: int, head: str,
-           conclusion: str = 'success') -> Path:
+           conclusion: str = 'success', *, maximum_bytes: int = 2 * 1024**3) -> Path:
     metadata = api(f'actions/artifacts/{artifact}')
     producer = api(f'actions/runs/{run}')
     if (metadata['workflow_run']['id'] != run or metadata['workflow_run']['head_sha'] != head
@@ -52,7 +52,7 @@ def obtain(work: Path, name: str, artifact: int, digest: str, run: int, head: st
         raise BuildError('host_assembly_archive_changed')
     destination = work / name
     destination.mkdir()
-    unpack(archive, destination)
+    unpack(archive, destination, maximum_bytes=maximum_bytes)
     archive.unlink()
     (work / (name + '-producer.json')).write_text(json.dumps(
         {'artifact': metadata, 'run': producer, 'archiveSha256': digest}, indent=2) + '\n')

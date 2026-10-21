@@ -44,13 +44,15 @@ def ffmpeg_contract(lock: dict, descriptor: dict, target: str) -> dict:
     return pin
 
 
-def unpack(archive: Path, destination: Path) -> None:
+def unpack(archive: Path, destination: Path, *, maximum_bytes: int = 2 * 1024**3) -> None:
+    if type(maximum_bytes) is not int or not 0 < maximum_bytes <= 12 * 1024**3:
+        raise BuildError("host_ffmpeg_archive_limit")
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as contents:
             entries = contents.infolist()
             if (
                 len(entries) > 100_000
-                or sum(entry.file_size for entry in entries) > 2 * 1024**3
+                or sum(entry.file_size for entry in entries) > maximum_bytes
             ):
                 raise BuildError("host_ffmpeg_archive_limit")
             names = set()
@@ -67,7 +69,7 @@ def unpack(archive: Path, destination: Path) -> None:
             entries = contents.getmembers()
             if (
                 len(entries) > 100_000
-                or sum(entry.size for entry in entries) > 2 * 1024**3
+                or sum(entry.size for entry in entries) > maximum_bytes
             ):
                 raise BuildError("host_ffmpeg_archive_limit")
             contents.extractall(destination, filter="data")
