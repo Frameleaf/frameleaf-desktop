@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 const MAX_ORIGINAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CHUNK_BYTES: u64 = 65_536;
+fn valid_cloud_path(path: &[u16]) -> bool {
+    path.len() <= 32_768
+        && path
+            .split_last()
+            .is_some_and(|(&last, name)| last == 0 && !name.is_empty() && !name.contains(&0))
+}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {
@@ -392,6 +398,19 @@ pub(super) fn stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cloud_paths_require_one_bounded_terminated_name_before_ffi() {
+        assert!(valid_cloud_path(&[67, 58, 92, 26053, 0]));
+        for path in [
+            vec![],
+            vec![0],
+            vec![67, 58],
+            vec![67, 0, 92, 0],
+            vec![67; 32_769],
+        ] {
+            assert!(!valid_cloud_path(&path));
+        }
+    }
     fn request() -> Request {
         Request {
             version: 1,

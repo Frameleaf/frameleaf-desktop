@@ -166,7 +166,6 @@ pub(super) struct Source {
     _leaf: Option<File>,
     leaf_cloud: bool,
     pub(super) version: Version,
-    path: Vec<u16>,
     pub(super) cloud: bool,
 }
 impl Source {
@@ -235,34 +234,33 @@ impl Source {
         if version.bytes > MAX_ORIGINAL_BYTES {
             return Err("source_copy_budget_exceeded".into());
         }
-        let mut name = vec![0u16; 32_768];
-        if cloud {
-            let count = unsafe {
-                GetFinalPathNameByHandleW(
-                    leaf.as_raw_handle(),
-                    name.as_mut_ptr(),
-                    name.len() as u32,
-                    // CfApi rejected the volume-GUID spelling with ERROR_INVALID_NAME.
-                    VOLUME_NAME_DOS,
-                )
-            } as usize;
-            if count == 0 || count >= name.len() {
-                return Err("source_identity_unavailable".into());
-            }
-            name.truncate(count + 1);
-            name[count] = 0;
-        } else {
-            name.clear();
-        }
         Ok(Self {
             held,
             root,
             _leaf: Some(leaf),
             leaf_cloud,
             version,
-            path: name,
             cloud,
         })
+    }
+    fn protected_path(&self) -> Result<Vec<u16>, String> {
+        let leaf = self._leaf.as_ref().ok_or("source_identity_unavailable")?;
+        let mut name = vec![0u16; 32_768];
+        // A placeholder can become resident between the parent and reader's metadata observations.
+        let count = unsafe {
+            GetFinalPathNameByHandleW(
+                leaf.as_raw_handle(),
+                name.as_mut_ptr(),
+                name.len() as u32,
+                VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if count == 0 || count >= name.len() {
+            return Err("source_identity_unavailable".into());
+        }
+        name.truncate(count + 1);
+        name[count] = 0;
+        Ok(name)
     }
     pub(super) fn release_leaf(&mut self) {
         drop(self._leaf.take());
@@ -290,6 +288,9 @@ impl Source {
 struct Protected(HANDLE);
 impl Protected {
     fn open(path: &[u16]) -> Result<Self, String> {
+        if !super::valid_cloud_path(path) {
+            return Err("source_identity_unavailable".into());
+        }
         let mut handle = std::ptr::null_mut();
         let result = unsafe {
             CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut handle)
@@ -412,7 +413,7 @@ pub(super) fn copy(
         source.version.volume == stage_info.VolumeSerialNumber,
         true,
     )?;
-    let file = Protected::open(&source.path)?;
+    let file = Protected::open(&source.protected_path()?)?;
     if Version::read(file.reference()?.raw)? != source.version {
         return Err("source_item_changed".into());
     }
@@ -512,4 +513,56 @@ pub(super) fn copy(
         created_at_ms: created,
         modified_at_ms: modified,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admitted_reader_keeps_a_terminated_handle_path_when_the_file_is_resident() {
+        let base = std::env::temp_dir().join(format!(
+            "frameleaf-resident-reader-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::windows_protection::new_private_directory(&base).unwrap();
+        let root = base.join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("旅行-original.jpg"), b"verified resident bytes").unwrap();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let staging = base.join(&operation_id);
+        crate::windows_protection::new_private_directory(&staging).unwrap();
+        let request = {
+            let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+            let root_identity = super::super::super::source_root_identity(&directory).unwrap();
+            let source = Source::open(
+                root.to_str().unwrap(),
+                &root_identity,
+                "旅行-original.jpg",
+                None,
+            )
+            .unwrap();
+            assert!(!source.cloud && !source.leaf_cloud);
+            assert!(super::super::valid_cloud_path(
+                &source.protected_path().unwrap()
+            ));
+            Request {
+                version: 1,
+                operation_id,
+                root: root.to_str().unwrap().into(),
+                root_identity,
+                source_stamp: source.version.stamp(),
+                relative: "旅行-original.jpg".into(),
+                staging: staging.to_str().unwrap().into(),
+                bytes: source.version.bytes,
+            }
+        };
+        let copied = copy(&request, &mut |_| Ok(())).unwrap();
+        let original = std::fs::read(root.join("旅行-original.jpg")).unwrap();
+        assert_eq!(std::fs::read(staging.join("original")).unwrap(), original);
+        assert_eq!(copied.sha256, format!("{:x}", Sha256::digest(&original)));
+        assert_eq!(copied.bytes, original.len() as u64);
+        assert_eq!(copied.source_stamp, request.source_stamp);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }
