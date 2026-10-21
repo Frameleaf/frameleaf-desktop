@@ -156,6 +156,13 @@ jobs:
                   with source.open('rb') as stream:
                       stream.seek(max(0, info.st_size - 65536))
                       (output / ('tail-' + name)).write_bytes(stream.read(65536))
+          compiler_log = output / 'installer/nsis-compiler.log'
+          if compiler_log.exists():
+              info = compiler_log.lstat()
+              assert stat.S_ISREG(info.st_mode) and not info.st_file_attributes & 0x400
+              with compiler_log.open('rb') as stream:
+                  stream.seek(max(0, info.st_size - 65536))
+                  (output / 'tail-nsis-compiler.log').write_bytes(stream.read(65536))
       - name: Retain private installer and bounded receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -169,6 +176,7 @@ jobs:
             ${{ runner.temp }}/fl-windows-full-host-qualification/lifecycle.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/tail-agent.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/tail-host.log
+            ${{ runner.temp }}/fl-windows-full-host-qualification/tail-nsis-compiler.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/command-error.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/input/command-error.log
             ${{ runner.temp }}/fl-windows-full-host-qualification/installer/FrameleafNativeHost-internal.exe

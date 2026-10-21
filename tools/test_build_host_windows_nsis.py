@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -52,7 +53,7 @@ class WindowsHostInstallerTests(unittest.TestCase):
     def test_payload_dollars_remain_literal_and_sources_use_numbered_files(self):
         script = builder.installer_script('a' * 64, 'b' * 64, ['payload/$PLUGINSDIR/${evil}/hello$.txt'])
         self.assertIn('SetOutPath "$PLUGINSDIR\\candidate\\payload\\$$PLUGINSDIR\\$${evil}"', script)
-        self.assertIn('File "/oname=hello$$.txt" "files\\0"', script)
+        self.assertIn('File "/oname=hello$$.txt" "files\\0\\0"', script)
         self.assertNotIn('!include "${evil}', script)
 
     @unittest.skipUnless(shutil.which('makensis'), 'requires the pinned NSIS compiler')
@@ -64,12 +65,15 @@ class WindowsHostInstallerTests(unittest.TestCase):
             (root / 'files').mkdir()
             names = ['manifest.json', 'payload/licenses/a spaced $.txt']
             for index in range(len(names)):
-                (root / 'files' / str(index)).write_bytes(b'synthetic compiler fixture only')
+                staged = root / builder.numbered_source(index)
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                staged.write_bytes(b'synthetic compiler fixture only')
             (root / 'controller.bin').write_bytes(b'synthetic controller fixture only')
             (root / 'installer.nsi').write_text(builder.installer_script('a' * 64, 'b' * 64, names))
-            result = subprocess.run([compiler, '-NOCONFIG', '-V2', 'installer.nsi'], cwd=root,
+            result = subprocess.run([compiler, '-NOCONFIG', '-V4', '-Onsis-compiler.log', 'installer.nsi'], cwd=root,
                                     capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((root / 'nsis-compiler.log').is_file())
             self.assertEqual((root / 'FrameleafNativeHost-internal.exe').read_bytes()[:2], b'MZ')
 
     def test_extraction_and_execution_fail_closed_and_hold_bootstrap_handles(self):
@@ -115,11 +119,34 @@ class WindowsHostInstallerTests(unittest.TestCase):
             with patch.object(builder, 'run') as command:
                 names = builder.stage(candidate, controller, root / 'out', manifest, approved)
                 command.assert_not_called()
-            self.assertEqual((root / 'out/files' / str(names.index('payload/licenses/third-party.txt'))).read_bytes(),
+            self.assertEqual((root / 'out' / builder.numbered_source(names.index('payload/licenses/third-party.txt'))).read_bytes(),
                              (candidate / 'payload/licenses/third-party.txt').read_bytes())
             self.assertEqual((root / 'out/controller.bin').read_bytes(), controller.read_bytes())
             self.assertFalse((root / 'out/qualification.json').exists())
             self.assertEqual(set(names), {'manifest.json', 'manifest.sig', 'payload/licenses/third-party.txt'})
+
+    def test_large_inventory_bounds_each_compiler_source_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            controller, approved = self.controller(root)
+            candidate, _ = self.fixture(root)
+            metadata = json.loads((candidate / 'manifest.json').read_text())
+            for index in range(513):
+                name = f'licenses/item{index:04d}.txt'
+                data = f'synthetic license{index}'.encode()
+                (candidate / 'payload' / name).write_bytes(data)
+                metadata['files'][name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+            (candidate / 'manifest.json').write_text(json.dumps(metadata))
+            manifest = hashlib.sha256((candidate / 'manifest.json').read_bytes()).hexdigest()
+            out = root / 'out'
+            names = builder.stage(candidate, controller, out, manifest, approved)
+            directories = [out / 'files', *[p for p in (out / 'files').iterdir() if p.is_dir()]]
+            self.assertLessEqual(max(sum(p.is_file() for p in d.iterdir()) for d in directories), 16)
+            script = (out / 'installer.nsi').read_text()
+            sources = re.findall(r'^  File "/oname=.*?" "(files[^\n]+)"$', script, re.M)
+            self.assertEqual(len(sources), len(names))
+            for name, source in zip(names, sources):
+                self.assertEqual((out / source.replace('\\', '/')).read_bytes(), (candidate / name).read_bytes())
 
     def test_rejects_staging_paths_links_existing_output_and_changed_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,13 +208,14 @@ class WindowsHostInstallerTests(unittest.TestCase):
                     return 'v3.11'
                 if args[0] == '/trusted/node':
                     return json.dumps(checked)
-                self.assertEqual(args, ['/trusted/makensis', '-NOCONFIG', '-V2', 'installer.nsi'])
+                self.assertEqual(args, ['/trusted/makensis', '-NOCONFIG', '-V4', '-Onsis-compiler.log', 'installer.nsi'])
                 (out / 'FrameleafNativeHost-internal.exe').write_bytes(b'synthetic compiler output')
                 return ''
             with patch.object(builder.shutil, 'which', side_effect=lambda name: '/trusted/' + name), patch.object(builder, 'run', side_effect=command), patch.object(builder, 'build_environment', wraps=builder.build_environment) as environment:
                 builder.build(candidate, controller, out, approved)
                 self.assertIs(environment.call_args.args[1], builder.os.environ)
             self.assertEqual(len(calls), 4)
+            self.assertIn('-Onsis-compiler.log', calls[-1])
             self.assertEqual(calls[1][-1], candidate)
             self.assertEqual(calls[2][-1], out / 'checked-candidate')
             self.assertTrue(all(args[0] != str(controller) for args in calls))

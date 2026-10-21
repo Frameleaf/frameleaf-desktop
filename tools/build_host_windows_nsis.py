@@ -18,6 +18,7 @@ from build_host_macos_pkg import validate_identities
 from build_runtime import BuildError, build_environment, regular, run, sha256
 
 ROOT = Path(__file__).resolve().parent.parent
+FILES_PER_DIRECTORY = 16
 
 
 def windows_name(name: str) -> str:
@@ -53,6 +54,11 @@ def inspect_controller(controller: Path, approved: str) -> None:
     policy = (ROOT / 'runtime/release-trust.json').read_bytes()
     if policy not in raw or any(mode not in raw for mode in [b'--install-windows-package', b'--remove-windows-package']):
         raise BuildError('host_install_controller_trust_mismatch')
+
+
+def numbered_source(index: int) -> Path:
+    # NSIS enumerates the containing directory for every File command.
+    return Path('files') / str(index // FILES_PER_DIRECTORY) / str(index)
 
 
 def installer_script(manifest: str, controller: str, names: list[str]) -> str:
@@ -109,7 +115,7 @@ Section
         destination = '\\candidate' + ('\\' + parent.replace('/', '\\') if parent else '')
         # Only the fixed NSIS variable is interpreted; every payload-controlled byte is escaped.
         text += '  SetOutPath "$PLUGINSDIR' + quote(destination)[1:] + '\n'
-        text += '  File ' + quote('/oname=' + basename) + ' "files\\' + str(index) + '"\n  IfErrors failed\n'
+        text += '  File ' + quote('/oname=' + basename) + ' ' + quote(numbered_source(index).as_posix().replace('/', '\\')) + '\n  IfErrors failed\n'
     ids = manifest + ' ' + controller
     text += '''  SetOutPath "$PLUGINSDIR"
   ClearErrors
@@ -152,8 +158,11 @@ def stage(candidate: Path, controller: Path, output: Path, manifest: str, approv
         source = candidate / name
         if not stat.S_ISREG(regular(source).st_mode):
             raise BuildError('host_install_inventory_invalid')
-        shutil.copyfile(source, output / 'files' / str(index))
-        if sha256(source) != sha256(output / 'files' / str(index)):
+        destination = output / numbered_source(index)
+        if index % FILES_PER_DIRECTORY == 0:
+            destination.parent.mkdir()
+        shutil.copyfile(source, destination)
+        if sha256(source) != sha256(destination):
             raise BuildError('host_install_staged_runtime_changed')
     shutil.copyfile(controller, output / 'controller.bin')
     inspect_controller(output / 'controller.bin', approved)
@@ -182,10 +191,10 @@ def build(candidate: Path, controller: Path, output: Path, approved: str) -> Non
     for index, name in enumerate(names):
         target = staged / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(output / 'files' / str(index), target)
+        shutil.copyfile(output / numbered_source(index), target)
     if json.loads(run([*command, staged], cwd=output, env=env)) != checked:
         raise BuildError('host_install_staged_runtime_changed')
-    run([makensis, '-NOCONFIG', '-V2', 'installer.nsi'], cwd=output, env=env)
+    run([makensis, '-NOCONFIG', '-V4', '-Onsis-compiler.log', 'installer.nsi'], cwd=output, env=env)
     package = output / 'FrameleafNativeHost-internal.exe'
     if not stat.S_ISREG(regular(package).st_mode):
         raise BuildError('host_install_package_missing')
