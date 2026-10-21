@@ -376,6 +376,45 @@ fn cancel_pending_hydration(path: &Path, context: &Context) -> Result<(), String
 }
 
 #[cfg(feature = "windows-cloud-copy")]
+fn foreground_writer_breaks_idle_protected_handle(path: &Path) {
+    let mut protected = std::ptr::null_mut();
+    success(unsafe {
+        CfOpenFileWithOplock(
+            wide(path).as_ptr(),
+            CF_OPEN_FILE_FLAG_EXCLUSIVE,
+            &mut protected,
+        )
+    })
+    .unwrap();
+    assert!(!protected.is_null());
+    let path = path.to_owned();
+    let writer = std::thread::spawn(move || {
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
+        file.write_all(&[0x59])?;
+        file.sync_all()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !writer.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !writer.is_finished() {
+        // The isolated parent owns fixture cleanup; never leave a blocked writer in this process.
+        std::process::exit(2);
+    }
+    let result = writer.join();
+    let still_valid = unsafe { CfReferenceProtectedHandle(protected) };
+    if still_valid {
+        unsafe { CfReleaseProtectedHandle(protected) };
+    }
+    unsafe { CfCloseHandle(protected) };
+    result.unwrap().unwrap();
+    assert!(
+        !still_valid,
+        "foreground writer did not invalidate the old protected handle"
+    );
+}
+
+#[cfg(feature = "windows-cloud-copy")]
 fn qualify_staged_copy(base: &Path) {
     let saved = SavedConnection {
         server: "https://nas.test/".into(),
@@ -526,6 +565,30 @@ fn qualify_staged_copy(base: &Path) {
         "cached copy recalled original data again"
     );
     assert!(copy.source_stamp.starts_with("cloud-file-v1:"));
+    foreground_writer_breaks_idle_protected_handle(&root.join(FILE_NAME));
+    let changed_id = Uuid::new_v4().to_string();
+    let changed = approval
+        .stage_to(
+            &saved,
+            &identity,
+            FILE_NAME,
+            &staging,
+            &changed_id,
+            Some(DATA.len() as u64),
+            &stopped,
+            &|| Ok(()),
+        )
+        .unwrap();
+    let mut changed_data = DATA.to_vec();
+    changed_data[0] = 0x59;
+    assert_ne!(changed.source_stamp, copy.source_stamp);
+    assert_eq!(
+        changed.sha256,
+        format!("{:x}", Sha256::digest(&changed_data))
+    );
+    assert_eq!(context.fetches.load(Ordering::Acquire), fetches);
+    assert!(copy.verify(&saved, &identity, &staging).is_ok());
+    println!("real CfApi foreground writer: idle protected handle broke; new copy bound the changed version; old independent copy retained");
     provider.close().unwrap();
     fs::remove_file(root.join(FILE_NAME)).unwrap();
     let restored = StagedCopy::restore(&saved, &identity, &staging, &id).unwrap();
