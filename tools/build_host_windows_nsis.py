@@ -66,7 +66,7 @@ def installer_script(manifest: str, controller: str, names: list[str]) -> str:
     text = r'''Unicode true
 RequestExecutionLevel admin
 CRCCheck force
-SetCompressor /SOLID lzma
+SetCompressor zlib
 Name "Frameleaf native host - internal candidate"
 OutFile "FrameleafNativeHost-internal.exe"
 !include "FileFunc.nsh"
