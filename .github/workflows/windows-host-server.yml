@@ -6,6 +6,9 @@ on:
       - 'tools/test_build_host_server.py'
       - 'tools/build_host_manager.py'
       - 'tools/test_build_host_manager.py'
+      - 'tools/build_host_backup.py'
+      - 'tools/test_build_host_backup.py'
+      - 'runtime/host-backup*'
       - 'tools/build_host_exiftool_windows.py'
       - 'tools/test_build_host_exiftool_windows.py'
       - 'tools/qualify_host_exiftool.mjs'
@@ -57,6 +60,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Private ExifTool binding tests failed' }
           python -m unittest discover -s tools -p test_build_host_manager.py -v
           if ($LASTEXITCODE) { throw 'Manager packaging tests failed' }
+          python -m unittest discover -s tools -p test_build_host_backup.py -v
+          if ($LASTEXITCODE) { throw 'Backup packaging tests failed' }
       - name: Compile and verify the actual private production server
         shell: pwsh
         run: |
@@ -76,6 +81,11 @@ jobs:
           $node = (Get-Command node).Source
           python tools/build_host_manager.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9bbe7c64e720fceee2fcba0f72055c945f56b19a --node $node --output "$env:RUNNER_TEMP/fl-windows-manager"
           if ($LASTEXITCODE) { throw 'Windows production Manager qualification failed' }
+      - name: Qualify the current private encrypted backup runtime
+        shell: pwsh
+        run: |
+          python tools/build_host_backup.py --output "$env:RUNNER_TEMP/fl-windows-backup"
+          if ($LASTEXITCODE) { throw 'Windows backup runtime qualification failed' }
       - name: Retain private server package and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -92,5 +102,7 @@ jobs:
             ${{ runner.temp }}/fl-windows-manager/qualification.json
             ${{ runner.temp }}/fl-windows-manager/build.log
             ${{ runner.temp }}/fl-windows-manager/command-error.log
+            ${{ runner.temp }}/fl-windows-backup/backup/
+            ${{ runner.temp }}/fl-windows-backup/qualification.json
           retention-days: 7
           if-no-files-found: warn

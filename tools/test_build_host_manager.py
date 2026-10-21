@@ -1,11 +1,14 @@
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
-from build_host_manager import stage_manager
-from build_runtime import BuildError
+from build_host_manager import stage_manager, build
+from build_runtime import BuildError, run as checked_run
 
 
 class HostManagerTests(unittest.TestCase):
@@ -42,6 +45,46 @@ class HostManagerTests(unittest.TestCase):
         (dependency / "package.json").write_text('{"name":"example","version":"1.0.0"}')
         (dependency / "index.js").write_text("export const value = true;")
         return source
+
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_source_archive_preserves_lockfile_and_license_under_windows_git_settings(self):
+        git = shutil.which("git")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "source"
+            source.mkdir()
+            canonical = b'{"lockfileVersion":3}\n'
+            fixtures = {"manager/package.json": b'{}\n', "manager/package-lock.json": canonical,
+                        "LICENSE": b"fixture license\n", ".github/frameleaf-release.cjs": b"fixture\n",
+                        ".github/verify-release-bundle.cjs": b"fixture\n", "cosign.pub": b"fixture\n"}
+            for name, content in fixtures.items():
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            for arguments in [["init", "-q"], ["add", "."],
+                              ["-c", "user.name=AJ Taylor", "-c", "user.email=aj@ajtaylor.net",
+                               "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + str(root / "no-hooks"),
+                               "commit", "-q", "-m", "fixture"],
+                              ["config", "core.autocrlf", "true"], ["config", "core.eol", "crlf"]]:
+                subprocess.run([git, *arguments], cwd=source, check=True, capture_output=True)
+            revision = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=source, text=True).strip()
+            node = root / "node"
+            node.write_bytes(b"fixture")
+            output = root / "output"
+
+            def command(arguments, *, cwd, env):
+                if arguments[0] == node:
+                    return "v26.11.1"
+                if "archive" in arguments:
+                    return checked_run(arguments, cwd=cwd, env=env)
+                for name in ["manager/package-lock.json", "LICENSE"]:
+                    self.assertEqual((output / "work/source" / name).read_bytes(), fixtures[name])
+                raise BuildError("canonical_archive_checked_before_build")
+
+            with (patch("build_host_manager.shutil.which", side_effect=lambda name: git if name == "git" else str(root / "npm")),
+                  patch("build_host_manager.run", side_effect=command),
+                  self.assertRaisesRegex(BuildError, "canonical_archive_checked_before_build")):
+                build(source, revision, node, output)
 
     def test_stages_only_production_manager_with_bound_source_and_licenses(self):
         with tempfile.TemporaryDirectory() as temporary:
