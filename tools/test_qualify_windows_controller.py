@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -6,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from build_runtime import BuildError
-from qualify_windows_controller import qualify
+from qualify_windows_controller import qualify, nsis_gui_sha256
 from test_relocate_windows import pe
 
 
@@ -77,3 +78,21 @@ class ControllerQualificationTests(unittest.TestCase):
     def test_loader_failure_wrong_receipt_and_unexpected_output_never_qualify(self):
         for probe in [subprocess.CompletedProcess([], 0, b'{}', b''), subprocess.CompletedProcess([], 1, b'{}', b''), subprocess.CompletedProcess([], 1, b'not json', b''), subprocess.CompletedProcess([], 1, b'x' * 4097, b''), subprocess.CompletedProcess([], 1, b'{}', b'loader error')]:
             self.exercise(probe=probe, failure='controller_entrypoint_failed')
+
+
+class NsisGuiIdentityTests(unittest.TestCase):
+    def test_expected_digest_changes_only_the_single_upstream_bundle_marker(self):
+        original = b"PE-prefix __TAURI_BUNDLE_TYPE_VAR_UNK suffix"
+        bundled = b"PE-prefix __TAURI_BUNDLE_TYPE_VAR_NSS suffix"
+        self.assertEqual(nsis_gui_sha256(original), hashlib.sha256(bundled).hexdigest())
+        self.assertNotEqual(nsis_gui_sha256(original), hashlib.sha256(original).hexdigest())
+        self.assertEqual(original, b"PE-prefix __TAURI_BUNDLE_TYPE_VAR_UNK suffix")
+
+    def test_absent_or_ambiguous_original_markers_are_refused(self):
+        for image in [b"missing", b"__TAURI_BUNDLE_TYPE_VAR_NSS", b"__TAURI_BUNDLE_TYPE_VAR_UNK" * 2]:
+            with self.assertRaisesRegex(BuildError, "desktop_bundle_marker_invalid"):
+                nsis_gui_sha256(image)
+
+    def test_unrelated_executable_changes_cannot_share_the_expected_digest(self):
+        original = b"PE-prefix __TAURI_BUNDLE_TYPE_VAR_UNK suffix"
+        self.assertNotEqual(nsis_gui_sha256(original), nsis_gui_sha256(original + b"tamper"))

@@ -117,6 +117,7 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+      - run: python -m unittest discover -s tools -p test_qualify_windows_controller.py -v
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Qualify Windows package directory and receipt authority in the disposable runner
@@ -159,6 +160,7 @@ jobs:
           import hashlib, json, os, shutil, subprocess, sys
           sys.path.insert(0, str(Path.cwd() / 'tools'))
           from build_runtime import sha256
+          from qualify_windows_controller import nsis_gui_sha256
           output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-desktop'
           target = Path('src-tauri/target/debug').resolve()
           binaries = {}
@@ -182,7 +184,9 @@ jobs:
           expanded = output / 'expanded-installer'
           subprocess.run([sevenzip, 'x', str(installer), '-o' + str(expanded), '-y'], check=True, timeout=300)
           extracted_executables = {sha256(path) for path in expanded.rglob('*.exe') if path.is_file()}
-          assert set(binaries.values()).issubset(extracted_executables), 'installer executable closure differs'
+          packaged_binaries = dict(binaries)
+          packaged_binaries['frameleaf-desktop.exe'] = nsis_gui_sha256((target / 'frameleaf-desktop.exe').read_bytes())
+          assert set(packaged_binaries.values()).issubset(extracted_executables), 'installer executable closure differs'
           identity = json.loads((output / 'runtime-identity.json').read_text())
           matches = [path.parent for path in expanded.rglob('manifest.json') if sha256(path) == identity['manifestSha256'] and (path.parent / 'manifest.sig').is_file()]
           assert len(matches) == 1
@@ -192,7 +196,7 @@ jobs:
           assert checked['keyId'] == identity['keyId'] and checked['manifestSha256'] == identity['manifestSha256']
           assert sha256(matches[0] / 'manifest.sig') == identity['signatureSha256']
           receipt = {'state': 'Windows-desktop-installer-built-and-embedded-runtime-verified', 'platform': 'windows-x86_64',
-              'installer': installer.name, 'installerSha256': sha256(installer), 'binaries': binaries, 'controller': controller,
+              'installer': installer.name, 'installerSha256': sha256(installer), 'binaries': binaries, 'packagedBinaries': packaged_binaries, 'controller': controller,
               'runtime': identity, 'installedAcceptance': False, 'osCodeSigned': False, 'fullHostComponentsIncluded': False}
           (output / 'result.json').write_text(json.dumps(receipt, indent=2) + '\n')
       - name: Retain the private installer and verification receipts
@@ -202,6 +206,8 @@ jobs:
           name: frameleaf-windows-current-desktop-internal
           path: |
             src-tauri/target/debug/bundle/nsis/*.exe
+            src-tauri/target/debug/frameleaf-desktop.exe
+            src-tauri/target/debug/frameleaf-native-host.exe
             ${{ runner.temp }}/fl-windows-desktop/result.json
             ${{ runner.temp }}/fl-windows-desktop/runtime-identity.json
             ${{ runner.temp }}/fl-windows-desktop/controller-qualification.json

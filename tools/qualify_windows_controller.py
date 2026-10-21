@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import platform
 import re
@@ -11,6 +12,14 @@ from pathlib import Path
 
 from build_runtime import BuildError, regular, sha256
 from relocate_windows import PLATFORM_DLLS, pe_imports
+
+
+def nsis_gui_sha256(image: bytes) -> str:
+    # Tauri 2.12.3 patches this marker for NSIS, then restores the loose executable.
+    marker = b"__TAURI_BUNDLE_TYPE_VAR_UNK"
+    if image.count(marker) != 1:
+        raise BuildError("desktop_bundle_marker_invalid")
+    return hashlib.sha256(image.replace(marker, b"__TAURI_BUNDLE_TYPE_VAR_NSS", 1)).hexdigest()
 
 
 def system_directory() -> Path:
