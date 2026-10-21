@@ -242,7 +242,8 @@ impl Source {
                     leaf.as_raw_handle(),
                     name.as_mut_ptr(),
                     name.len() as u32,
-                    VOLUME_NAME_GUID,
+                    // CfApi rejected the volume-GUID spelling with ERROR_INVALID_NAME.
+                    VOLUME_NAME_DOS,
                 )
             } as usize;
             if count == 0 || count >= name.len() {
