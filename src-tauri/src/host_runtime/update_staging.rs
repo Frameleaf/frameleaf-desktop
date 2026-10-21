@@ -51,18 +51,27 @@ impl Directory {
     }
     fn child(&self, name: &str, fresh: bool) -> Result<Self, String> {
         self.check()?;
-        let builder = cap_std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        let builder = {
-            use cap_std::fs::DirBuilderExt;
-            let mut builder = builder;
-            builder.mode(0o700);
-            builder
-        };
-        match self.dir.create_dir_with(name, &builder) {
-            Ok(()) => {}
-            Err(error) if !fresh && error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(BAD.into()),
+        #[cfg(windows)]
+        if fresh {
+            crate::windows_protection::new_private_directory(&self.path.join(name))?;
+        } else {
+            crate::windows_protection::private_directory(&self.path.join(name))?;
+        }
+        #[cfg(not(windows))]
+        {
+            let builder = cap_std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                use cap_std::fs::DirBuilderExt;
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            match self.dir.create_dir_with(name, &builder) {
+                Ok(()) => {}
+                Err(error) if !fresh && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(BAD.into()),
+            }
         }
         let result = Self::open(self.path.join(name))?;
         let (anchored, _) =

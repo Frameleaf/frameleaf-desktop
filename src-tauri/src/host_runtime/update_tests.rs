@@ -2340,6 +2340,14 @@ fn update_input_staging_preserves_source_and_returns_exact_target_binding_with_f
         let operation = binding["operationId"].as_str().unwrap();
         assert!(operations.insert(operation.to_owned()));
         let path = f.f.config.state.join("restore-input").join(operation);
+        #[cfg(windows)]
+        for directory in [
+            path.parent().unwrap().to_path_buf(),
+            path.clone(),
+            path.join("input"),
+        ] {
+            crate::windows_protection::require_private_directory(&directory).unwrap();
+        }
         assert_eq!(fs::read(path.join("input/database.dump")).unwrap(), dump);
         assert_eq!(fs::read(path.join("input/recovery.json")).unwrap(), raw);
         assert_eq!(
@@ -2498,6 +2506,33 @@ fn update_input_staging_never_follows_or_repairs_an_unsafe_staging_root() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn update_input_staging_refuses_existing_inherited_acl_without_repair() {
+    use std::sync::atomic::AtomicBool;
+    let (mut f, _, _) = input_staging_fixture();
+    let path = f.f.config.state.join("restore-input");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("original"), b"keep").unwrap();
+    assert!(crate::windows_protection::require_private_directory(&path).is_err());
+    assert!(f
+        .f
+        .source
+        .current
+        .stage_update_input_test(
+            &f.f.source.next,
+            [&f.f.config, &f.destination],
+            &f.f.source.authority.execution(),
+            &AtomicBool::new(false),
+            &mut f.store,
+            |_, _, _| panic!("unsafe root reached backup"),
+        )
+        .is_err());
+    assert!(crate::windows_protection::require_private_directory(&path).is_err());
+    assert_eq!(fs::read(path.join("original")).unwrap(), b"keep");
+    assert_eq!(fs::read_dir(path).unwrap().count(), 1);
 }
 
 #[cfg(unix)]
