@@ -372,6 +372,14 @@ fn cancel_pending_hydration(path: &Path, context: &Context) -> Result<(), String
     if !fetched || !aborted || (!cancelled && cancel_error != ERROR_NOT_FOUND) {
         return Err("pending provider hydration did not confirm cancellation".into());
     }
+    // Provider callbacks are asynchronous; observe cancellation before disconnecting the provider.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while context.cancellations.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if context.cancellations.load(Ordering::Acquire) == 0 {
+        return Err("provider cancellation notification timed out".into());
+    }
     Ok(())
 }
 
