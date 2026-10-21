@@ -331,7 +331,7 @@ pub(super) fn stage(
     if !meta.is_file() || super::link(&meta) || meta.len() != request.bytes {
         return Err("source_stage_invalid".into());
     }
-    crate::runtime_store::private_file(&path.join("original"))?;
+    crate::windows_protection::require_private_directory(&path)?;
     let mut bytes = 0;
     let mut hash = sha2::Sha256::new();
     let mut buffer = [0u8; 65_536];
