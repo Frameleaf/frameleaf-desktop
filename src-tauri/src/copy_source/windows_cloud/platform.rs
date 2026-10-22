@@ -300,9 +300,9 @@ impl Protected {
         }
         Ok(Self(handle))
     }
-    fn reference(&self) -> Result<Reference<'_>, String> {
+    fn reference(&self, phase: &'static str) -> Result<Reference<'_>, String> {
         if !unsafe { CfReferenceProtectedHandle(self.0) } {
-            return Err("source_item_changed:oplock".into());
+            return Err(format!("source_item_changed:oplock-{phase}"));
         }
         let reference = Reference {
             owner: self,
@@ -421,7 +421,7 @@ pub(super) fn copy(
         true,
     )?;
     let file = Protected::open(&source.protected_path()?)?;
-    if Version::read(file.reference()?.raw)? != source.version {
+    if Version::read(file.reference("open")?.raw)? != source.version {
         return Err("source_item_changed:protected-open".into());
     }
     source.release_leaf();
@@ -439,7 +439,11 @@ pub(super) fn copy(
     let mut hash = Sha256::new();
     while copied < request.bytes {
         let length = (request.bytes - copied).min(CHUNK_BYTES) as usize;
-        let reference = file.reference()?;
+        let reference = file.reference(if copied == 0 {
+            "first-read"
+        } else {
+            "next-read"
+        })?;
         if Version::read(reference.raw)? != source.version {
             return Err("source_item_changed:before-read".into());
         }
@@ -509,7 +513,7 @@ pub(super) fn copy(
             bytes: copied,
         })?;
     }
-    if Version::read(file.reference()?.raw)? != source.version {
+    if Version::read(file.reference("complete")?.raw)? != source.version {
         return Err("source_item_changed:completion".into());
     }
     output.sync_all().map_err(|_| "source_stage_write_failed")?;

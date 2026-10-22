@@ -191,6 +191,10 @@ impl Progress {
                                 | "parent-version"
                                 | "protected-open"
                                 | "oplock"
+                                | "oplock-open"
+                                | "oplock-first-read"
+                                | "oplock-next-read"
+                                | "oplock-complete"
                                 | "before-read"
                                 | "read-length"
                                 | "after-read"
@@ -607,6 +611,16 @@ mod tests {
             ("source_item_changed:admission", "source_item_changed"),
             ("source_item_changed:after-read", "source_item_changed"),
             ("source_item_changed:oplock", "source_item_changed"),
+            ("source_item_changed:oplock-open", "source_item_changed"),
+            (
+                "source_item_changed:oplock-first-read",
+                "source_item_changed",
+            ),
+            (
+                "source_item_changed:oplock-next-read",
+                "source_item_changed",
+            ),
+            ("source_item_changed:oplock-complete", "source_item_changed"),
             (
                 "source_item_changed:private-path",
                 "source_copy_interrupted",
