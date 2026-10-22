@@ -24,7 +24,9 @@
   type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: { workload: string; state: string; modelNames: string[]; code: string | null }[] };
   let setup = $state<SetupStatus | null>(null);
   const setupState = $derived(setup?.state || connection?.state || '');
-  const setupDetail = $derived(runtimeRecoveryMessage(setup?.code ?? null) ?? (setup?.code === 'runtime_pack_unavailable'
+  const setupDetail = $derived(runtimeRecoveryMessage(setup?.code ?? null) ?? (setup?.code === 'worker_shutdown_unconfirmed'
+    ? 'AI work could not confirm it stopped. Your saved sign-in is kept, and no new AI work will start.'
+    : setup?.code === 'runtime_pack_unavailable'
     ? 'This build does not include a signed AI runtime yet. Photos remain available.'
     : setup?.state === 'model-download-required'
     ? 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks.'
@@ -54,9 +56,10 @@
     ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : ''));
   const native = isTauri();
   const errors: Record<string, string> = {
+    worker_shutdown_unconfirmed: 'AI work could not confirm it stopped. Your saved sign-in has been kept, and no new AI work will start.',
     source_read_shutdown_unconfirmed: 'Photo-source work could not confirm it stopped. Your saved sign-in has been kept, and no new source work will start.',
     source_copy_shutdown_unconfirmed: 'Photo-source work could not confirm it stopped. Your saved sign-in has been kept, and no new source work will start.',
-    source_read_shutting_down: 'Photo-source work is stopping before Frameleaf quits.',
+    source_read_shutting_down: 'Background work is stopping before Frameleaf quits.',
     local_host_active: 'Stop local management before connecting to another server.',
     worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
     server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
@@ -82,7 +85,7 @@
         const workerListener = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
         if (disposed) { workerListener(); return; }
         unlisten.push(workerListener);
-        const exitListener = await listen('source-read-exit-blocked', () => { failure = 'Frameleaf is keeping this window open because photo-source work could not confirm it stopped. Your files and saved sign-in have been kept.'; });
+        const exitListener = await listen('source-read-exit-blocked', () => { failure = 'Frameleaf is keeping this window open because background work could not confirm it stopped. Your files and saved sign-in have been kept.'; });
         if (disposed) { exitListener(); return; }
         unlisten.push(exitListener);
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
@@ -169,18 +172,18 @@
         {/if}
         {#if setup?.state === 'model-download-required'}<button class="secondary" disabled={busy} onclick={() => prepareModels(true)}>Download selected AI models</button>{/if}
         {#if connection.state === 'awaiting-approval'}<button class="secondary" disabled={busy || !native} onclick={checkApproval}>Check approval</button>{/if}
-        {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
+        {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy || setup?.code === 'worker_shutdown_unconfirmed'} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
         {#if connection.mode === 'client-worker' && connection.features.workerSession}
           <div class="actions" aria-label="AI worker controls">
             {#if setup?.control === 'paused' || setup?.control === 'stopped'}
-              <button class="secondary" disabled={busy} onclick={() => controlWorker('running')}>Resume AI processing</button>
+              <button class="secondary" disabled={busy || setup?.code === 'worker_shutdown_unconfirmed'} onclick={() => controlWorker('running')}>Resume AI processing</button>
             {:else}
-              <button class="secondary" disabled={busy} onclick={() => controlWorker('paused')}>Pause after current task</button>
+              <button class="secondary" disabled={busy || setup?.code === 'worker_shutdown_unconfirmed'} onclick={() => controlWorker('paused')}>Pause after current task</button>
             {/if}
-            <button class="text-button" disabled={busy || setup?.control === 'stopped'} onclick={() => controlWorker('stopped')}>Stop now</button>
+            <button class="text-button" disabled={busy || setup?.control === 'stopped' || setup?.code === 'worker_shutdown_unconfirmed'} onclick={() => controlWorker('stopped')}>Stop now</button>
           </div>
         {/if}
-        <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>{setupState === 'working' ? 'Available' : setupState === 'pausing' ? 'Finishing current task' : 'Not running'}</strong></div></div>
+        <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>{setup?.code === 'worker_shutdown_unconfirmed' ? 'Stop unconfirmed' : setupState === 'working' ? 'Available' : setupState === 'pausing' ? 'Finishing current task' : 'Not running'}</strong></div></div>
       </section>
       <div class="actions"><button class="primary" onclick={photos} disabled={busy || connection.state === 'identity-changed'}>Open Frameleaf Photos</button><button class="secondary" onclick={signOut} disabled={busy}>Sign out</button></div>
       <p class="footnote">Server administration uses your existing Frameleaf permissions inside Photos. Host controls require a separately paired Manager.</p>

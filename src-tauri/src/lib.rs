@@ -180,6 +180,7 @@ async fn connect_server(
 ) -> Result<ConnectionView, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<worker_setup::WorkerSetup>().check_available()?;
     if app.state::<host_setup::HostSetup>().background_active() {
         return Err("local_host_active".into());
     }
@@ -248,8 +249,9 @@ async fn stop_sources(app: &tauri::AppHandle) -> Result<(), String> {
 }
 async fn stop_connection_work(app: &tauri::AppHandle) -> Result<(), String> {
     let worker = app.state::<worker_setup::WorkerSetup>();
-    let (sources, ()) = tokio::join!(stop_sources(app), worker.stop());
-    sources
+    let (sources, worker) = tokio::join!(stop_sources(app), worker.stop());
+    sources?;
+    worker
 }
 
 #[tauri::command]
@@ -475,6 +477,7 @@ pub fn run() {
                     let _ = window.hide();
                 } else if window.state::<source_reads::Requests>().is_active()
                     || window.state::<source_import::SourceJobs>().is_active()
+                    || window.state::<worker_setup::WorkerSetup>().is_active()
                 {
                     api.prevent_close();
                     window.app_handle().exit(0);
@@ -501,6 +504,7 @@ pub fn run() {
                     }
                 } else if app.state::<source_reads::Requests>().is_active()
                     || app.state::<source_import::SourceJobs>().is_active()
+                    || app.state::<worker_setup::WorkerSetup>().is_active()
                 {
                     api.prevent_exit();
                     if app.state::<source_reads::Requests>().request_shutdown() {
@@ -511,9 +515,9 @@ pub fn run() {
                             let reads = handle.state::<source_reads::Requests>();
                             let copies = handle.state::<source_import::SourceJobs>();
                             let worker = handle.state::<worker_setup::WorkerSetup>();
-                            let (read_result, copy_result, ()) =
+                            let (read_result, copy_result, worker_result) =
                                 tokio::join!(reads.shutdown(), copies.stop(), worker.stop());
-                            if read_result.is_ok() && copy_result.is_ok() {
+                            if read_result.is_ok() && copy_result.is_ok() && worker_result.is_ok() {
                                 handle.exit(0);
                             } else if let Some(window) = handle.get_webview_window("main") {
                                 let _ = window.show();
@@ -532,9 +536,15 @@ async fn start_worker_setup(
     saved: &SavedConnection,
     allow_download: bool,
 ) -> Result<(), String> {
+    app.state::<source_reads::Requests>()
+        .check_available()
+        .await?;
     let control = worker_control::load(saved)?;
     if control != worker_control::WorkerControl::Running {
-        let status = app.state::<worker_setup::WorkerSetup>().hold(control).await;
+        let status = app
+            .state::<worker_setup::WorkerSetup>()
+            .hold(control)
+            .await?;
         let _ = app.emit_to("main", "worker-setup", status);
         return Ok(());
     }
@@ -560,7 +570,7 @@ async fn start_worker_setup(
                 let _ = handle.emit_to("main", "worker-setup", status);
             }),
         )
-        .await;
+        .await?;
     Ok(())
 }
 
@@ -600,27 +610,30 @@ async fn control_worker(
     let mut current = state.0.lock().await;
     let saved = current.as_mut().ok_or("sign_in_required")?;
     let setup = app.state::<worker_setup::WorkerSetup>();
+    app.state::<source_reads::Requests>()
+        .check_available()
+        .await?;
     match control {
         worker_control::WorkerControl::Paused => {
-            let status = setup.pause();
+            let status = setup.pause()?;
             worker_control::save(saved, control)?;
             Ok(status)
         }
         worker_control::WorkerControl::Stopped => {
-            let status = setup.hold(control).await;
+            let status = setup.hold(control).await?;
             worker_control::save(saved, control)?;
             Ok(status)
         }
         worker_control::WorkerControl::Running => {
             let previous = worker_control::load(saved)?;
-            setup.stop().await;
+            setup.stop().await?;
             let view = prepare(saved).await;
             if view.state != "preparing" || !view.features.worker_session {
-                setup.hold(previous).await;
+                setup.hold(previous).await?;
                 return Err("worker_setup_unavailable".into());
             }
             if let Err(error) = worker_control::save(saved, control) {
-                setup.hold(previous).await;
+                setup.hold(previous).await?;
                 return Err(error);
             }
             start_worker_setup(&app, saved, false).await?;

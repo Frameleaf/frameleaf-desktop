@@ -592,13 +592,16 @@ impl VerifiedRuntime {
             exit_status: None,
             lease: self.lease.clone(),
         };
-        owner
+        let gate = owner
             .child
             .stdin
             .as_mut()
-            .ok_or("runtime_gate_failed")?
-            .write_all(START)
-            .map_err(|_| "runtime_gate_failed")?;
+            .ok_or("runtime_gate_failed")
+            .and_then(|pipe| pipe.write_all(START).map_err(|_| "runtime_gate_failed"));
+        if let Err(error) = gate {
+            owner.stop()?;
+            return Err(error.into());
+        }
         Ok(owner)
     }
 }
@@ -708,9 +711,11 @@ impl VerifiedRuntime {
         let ends = Instant::now() + Duration::from_secs(deadline);
         while child.is_running()? {
             if cancel.load(Ordering::Acquire) {
+                child.stop()?;
                 return Err("runtime_cancelled".into());
             }
             if Instant::now() >= ends {
+                child.stop()?;
                 return Err("runtime_qualification_timeout".into());
             }
             std::thread::sleep(Duration::from_millis(20));

@@ -281,7 +281,7 @@ impl NativePredictor {
             }
         }
         let proofs: Vec<_> = bindings.iter().map(|(qualified, _)| *qualified).collect();
-        let child = installed.start_bound_sidecar(&proofs, cache, private_root, port)?;
+        let mut child = installed.start_bound_sidecar(&proofs, cache, private_root, port)?;
         let roles = bindings
             .iter()
             .map(|(qualified, accepted)| {
@@ -292,7 +292,14 @@ impl NativePredictor {
                     qualification_id: accepted.id().into(),
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, String>>();
+        let roles = match roles {
+            Ok(roles) => roles,
+            Err(error) => {
+                child.stop()?;
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             roles,

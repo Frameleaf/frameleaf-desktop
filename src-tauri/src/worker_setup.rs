@@ -77,21 +77,50 @@ impl Progress {
 }
 struct Running {
     cancel: Arc<AtomicBool>,
-    task: tauri::async_runtime::JoinHandle<()>,
+    notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
+    task: tauri::async_runtime::JoinHandle<Result<(), String>>,
 }
 #[derive(Default)]
 pub(crate) struct WorkerSetup {
+    failed: Arc<AtomicBool>,
     user_paused: Arc<AtomicBool>,
     running: tokio::sync::Mutex<Option<Running>>,
     status: Arc<Mutex<SetupStatus>>,
 }
 impl WorkerSetup {
-    pub fn status(&self) -> SetupStatus {
-        self.status.lock().unwrap().clone()
+    pub fn check_available(&self) -> Result<(), String> {
+        let _ = self.status();
+        if self.failed.load(Ordering::Acquire) {
+            return Err("worker_shutdown_unconfirmed".into());
+        }
+        Ok(())
     }
-    pub fn pause(&self) -> SetupStatus {
+    pub fn is_active(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+            || self
+                .running
+                .try_lock()
+                .map_or(true, |running| running.is_some())
+    }
+    pub fn status(&self) -> SetupStatus {
+        if self.failed.load(Ordering::Acquire) {
+            return shutdown_status();
+        }
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| {
+                self.failed.store(true, Ordering::Release);
+                shutdown_status()
+            })
+    }
+    pub fn pause(&self) -> Result<SetupStatus, String> {
+        self.check_available()?;
         self.user_paused.store(true, Ordering::Release);
-        let mut status = self.status.lock().unwrap();
+        let mut status = self.status.lock().map_err(|_| {
+            self.failed.store(true, Ordering::Release);
+            "worker_shutdown_unconfirmed"
+        })?;
         status.control = crate::worker_control::WorkerControl::Paused;
         status.state = if matches!(
             status.state.as_str(),
@@ -102,10 +131,13 @@ impl WorkerSetup {
             "paused".into()
         };
         status.code = Some("user_paused".into());
-        status.clone()
+        Ok(status.clone())
     }
-    pub async fn hold(&self, control: crate::worker_control::WorkerControl) -> SetupStatus {
-        self.stop().await;
+    pub async fn hold(
+        &self,
+        control: crate::worker_control::WorkerControl,
+    ) -> Result<SetupStatus, String> {
+        self.stop().await?;
         self.user_paused.store(
             control == crate::worker_control::WorkerControl::Paused,
             Ordering::Release,
@@ -121,29 +153,59 @@ impl WorkerSetup {
             control,
             workloads: Vec::new(),
         };
-        *self.status.lock().unwrap() = status.clone();
-        status
+        *self.status.lock().map_err(|_| {
+            self.failed.store(true, Ordering::Release);
+            "worker_shutdown_unconfirmed"
+        })? = status.clone();
+        Ok(status)
     }
-    async fn start_work<F, Fut>(&self, notify: Arc<dyn Fn(SetupStatus) + Send + Sync>, work: F)
+    async fn drain(&self, running: &mut Option<Running>) -> Result<(), String> {
+        if let Some(previous) = running.as_mut() {
+            previous.cancel.store(true, Ordering::Release);
+            let notify = previous.notify.clone();
+            let result = (&mut previous.task).await;
+            running.take();
+            if !matches!(&result, Ok(Ok(())))
+                && !matches!(&result, Ok(Err(code)) if !shutdown_uncertain(code))
+                && !self.failed.swap(true, Ordering::AcqRel)
+            {
+                notify(shutdown_status());
+            }
+        }
+        self.check_available()
+    }
+    async fn start_work<F, Fut>(
+        &self,
+        notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
+        work: F,
+    ) -> Result<(), String>
     where
         F: FnOnce(Progress) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let mut running = self.running.lock().await;
-        if let Some(previous) = running.as_mut() {
-            previous.cancel.store(true, Ordering::Release);
-            let _ = (&mut previous.task).await;
-        }
+        self.drain(&mut running).await?;
         self.user_paused.store(false, Ordering::Release);
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Progress {
             user_paused: self.user_paused.clone(),
             cancelled: cancel.clone(),
             status: self.status.clone(),
-            notify,
+            notify: notify.clone(),
         };
+        let failed = self.failed.clone();
         let task = tauri::async_runtime::spawn(async move {
-            match work(progress.clone()).await {
+            let result = work(progress.clone()).await;
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|code| shutdown_uncertain(code))
+            {
+                failed.store(true, Ordering::Release);
+                (progress.notify)(shutdown_status());
+                return result;
+            }
+            match &result {
                 Ok(()) => progress.set("qualified", None),
                 Err(code) => {
                     let state = if code == "model_download_permission_required" {
@@ -156,24 +218,30 @@ impl WorkerSetup {
                             .bytes()
                             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
                     {
-                        code
+                        code.clone()
                     } else {
                         "worker_setup_failed".into()
                     };
                     progress.set(state, Some(safe));
                 }
             }
+            result
         });
-        *running = Some(Running { cancel, task });
+        *running = Some(Running {
+            cancel,
+            task,
+            notify,
+        });
+        Ok(())
     }
-    pub async fn stop(&self) {
+    pub async fn stop(&self) -> Result<(), String> {
         let mut running = self.running.lock().await;
-        if let Some(previous) = running.as_mut() {
-            previous.cancel.store(true, Ordering::Release);
-            let _ = (&mut previous.task).await;
-        }
-        running.take();
-        *self.status.lock().unwrap() = SetupStatus::default();
+        self.drain(&mut running).await?;
+        *self.status.lock().map_err(|_| {
+            self.failed.store(true, Ordering::Release);
+            "worker_shutdown_unconfirmed"
+        })? = SetupStatus::default();
+        Ok(())
     }
     pub async fn start(
         &self,
@@ -181,7 +249,7 @@ impl WorkerSetup {
         paths: SetupPaths,
         allow_download: bool,
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
-    ) {
+    ) -> Result<(), String> {
         self.start_work(notify, move |progress| async move {
             reconnect(&progress, |refresh| {
                 let saved = saved.clone();
@@ -197,7 +265,23 @@ impl WorkerSetup {
             })
             .await
         })
-        .await;
+        .await
+    }
+}
+fn shutdown_uncertain(code: &str) -> bool {
+    matches!(
+        code,
+        "worker_shutdown_unconfirmed"
+            | "runtime_process_shutdown_unconfirmed"
+            | "runtime_process_status_failed"
+            | "runtime_process_stop_failed"
+    )
+}
+fn shutdown_status() -> SetupStatus {
+    SetupStatus {
+        state: "setup-needs-attention".into(),
+        code: Some("worker_shutdown_unconfirmed".into()),
+        ..SetupStatus::default()
     }
 }
 
@@ -448,13 +532,13 @@ async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), 
         Ok(result) => {
             return result
                 .map(|value| (value, None))
-                .map_err(|_| "runtime_qualification_failed".into())
+                .map_err(|_| "worker_shutdown_unconfirmed".into())
         }
         Err(reason) => Some(reason),
     };
     stop.store(true, Ordering::Release);
     // Dropping a blocking task leaves it running; join before resuming or signing out.
-    let value = task.await.map_err(|_| "runtime_qualification_failed")?;
+    let value = task.await.map_err(|_| "worker_shutdown_unconfirmed")?;
     Ok((value, reason))
 }
 pub(crate) fn inventory_profiles(
@@ -620,7 +704,7 @@ async fn prepare(
         Ok::<_, String>((installed, attestation))
     })
     .await
-    .map_err(|_| "runtime_preparation_failed")??;
+    .map_err(|_| "worker_shutdown_unconfirmed")??;
     let client = transport::client()?;
     let caps = cancellable(
         transport::capabilities(&client, &saved),
@@ -741,6 +825,11 @@ async fn prepare(
                 )
                 .await?;
                 installed = runtime;
+                if let Err(code) = &qualified {
+                    if shutdown_uncertain(code) {
+                        return Err(code.clone());
+                    }
+                }
                 check_cancel(&progress.cancelled)?;
                 if clock.observe(std::time::SystemTime::now()) {
                     progress.set("paused", Some("system_resumed".into()));
@@ -829,7 +918,7 @@ async fn prepare(
             )
         })
         .await
-        .map_err(|_| "worker_cache_publish_failed")??;
+        .map_err(|_| "worker_shutdown_unconfirmed")??;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
@@ -862,9 +951,10 @@ async fn prepare(
                     Ok::<_, String>((installed, prepared, predictor))
                 })
                 .await
-                .map_err(|_| "runtime_start_failed")??;
+                .map_err(|_| "worker_shutdown_unconfirmed")??;
             installed = runtime;
             prepared = proofs;
+            let restart = async {
             check_cancel(&progress.cancelled)?;
             let (_sender, mut cancel) = tokio::sync::watch::channel(false);
             let clock = WakeClock::new();
@@ -876,27 +966,24 @@ async fn prepare(
                         .map_err(|_| "resource_status_unavailable")?;
                 check_cancel(&progress.cancelled)?;
                 if clock.observe(std::time::SystemTime::now()) {
-                    predictor.stop()?;
                     progress.set("paused", Some("system_resumed".into()));
-                    continue 'qualification;
+                    return Ok::<bool, String>(true);
                 }
                 if progress.user_paused.load(Ordering::Acquire) {
-                    predictor.stop()?;
                     progress.set("paused", Some("user_paused".into()));
-                    break;
+                    return Ok(false);
                 }
                 if let Some(reason) = resources.refusal(required_memory) {
                     // Release model memory before waiting, otherwise the warm process can prevent recovery.
-                    predictor.stop()?;
                     progress.set("paused", Some(reason.into()));
-                    break;
+                    return Ok(false);
                 }
                 let now =
                     (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
                 if prepared.iter().any(|(proof, accepted)| {
                     accepted.validate_runtime(proof, now + 60_000).is_err()
                 }) {
-                    continue 'qualification;
+                    return Ok::<bool, String>(true);
                 }
                 let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
                 let completed = cancellable(async {
@@ -924,15 +1011,19 @@ async fn prepare(
                         .await?;
                     }
                     Err(reason) if reason.starts_with("resource_") => {
-                        predictor.stop()?;
-                        progress.set("paused", Some(reason[9..].into()));
+                            progress.set("paused", Some(reason[9..].into()));
                         if reason == "resource_system_resumed" {
-                            continue 'qualification;
+                            return Ok::<bool, String>(true);
                         }
-                        break;
+                        return Ok(false);
                     }
                     Err(reason) => return Err(reason),
                 }
+            }
+            }.await;
+            predictor.stop()?;
+            if restart? {
+                continue 'qualification;
             }
         }
     }
@@ -1108,6 +1199,74 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn uncertain_helper_shutdown_blocks_replacement_and_keeps_attention_status() {
+        for code in [
+            "runtime_process_shutdown_unconfirmed",
+            "runtime_process_status_failed",
+        ] {
+            let setup = WorkerSetup::default();
+            let _ = setup
+                .start_work(Arc::new(|_| {}), move |_| async move { Err(code.into()) })
+                .await;
+            assert_eq!(
+                setup.stop().await.unwrap_err(),
+                "worker_shutdown_unconfirmed"
+            );
+            assert!(setup.is_active());
+            assert!(setup.pause().is_err());
+            assert_eq!(
+                setup.status().code.as_deref(),
+                Some("worker_shutdown_unconfirmed")
+            );
+            let started = Arc::new(AtomicBool::new(false));
+            let seen = started.clone();
+            let _ = setup
+                .start_work(Arc::new(|_| {}), move |_| async move {
+                    seen.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .await;
+            tokio::task::yield_now().await;
+            assert!(!started.load(Ordering::Acquire));
+            let _ = setup
+                .hold(crate::worker_control::WorkerControl::Paused)
+                .await;
+            assert_eq!(
+                setup.status().code.as_deref(),
+                Some("worker_shutdown_unconfirmed")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn panicked_helper_shutdown_is_not_reported_as_stopped() {
+        let setup = WorkerSetup::default();
+        let _ = setup
+            .start_work(Arc::new(|_| {}), |_| async {
+                panic!("synthetic helper failure")
+            })
+            .await;
+        assert_eq!(
+            setup.stop().await.unwrap_err(),
+            "worker_shutdown_unconfirmed"
+        );
+        assert!(setup.is_active());
+        assert_eq!(
+            setup.status().code.as_deref(),
+            Some("worker_shutdown_unconfirmed")
+        );
+    }
+    #[tokio::test]
+    async fn panicked_preparation_preserves_shutdown_uncertainty() {
+        let result: Result<((), Option<String>), String> = monitored_preparation(
+            |_| panic!("synthetic preparation failure"),
+            std::future::pending(),
+            || async { Ok(()) },
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "worker_shutdown_unconfirmed");
+    }
+    #[tokio::test]
     async fn cancelled_helper_drain_keeps_ownership_for_stop_and_replacement() {
         for replacement in [false, true] {
             let setup = WorkerSetup::default();
@@ -1122,17 +1281,19 @@ mod tests {
                     let _ = wait.await;
                     Ok(())
                 })
-                .await;
+                .await
+                .unwrap();
             let replaced = Arc::new(AtomicBool::new(false));
             let proof = replaced.clone();
-            let mut drain: std::pin::Pin<Box<dyn Future<Output = ()> + '_>> = if replacement {
-                Box::pin(setup.start_work(Arc::new(|_| {}), move |_| async move {
-                    proof.store(true, Ordering::Release);
-                    Ok(())
-                }))
-            } else {
-                Box::pin(setup.stop())
-            };
+            let mut drain: std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + '_>> =
+                if replacement {
+                    Box::pin(setup.start_work(Arc::new(|_| {}), move |_| async move {
+                        proof.store(true, Ordering::Release);
+                        Ok(())
+                    }))
+                } else {
+                    Box::pin(setup.stop())
+                };
             tokio::select! {
                 _ = &mut drain => panic!("drain returned before the worker finished"),
                 result = stopping => result.unwrap(),
@@ -1145,7 +1306,7 @@ mod tests {
                 .await
                 .is_err());
             finish.send(()).unwrap();
-            stop.await;
+            stop.await.unwrap();
             assert!(setup.running.lock().await.is_none());
         }
     }
@@ -1168,9 +1329,10 @@ mod tests {
                     .await
                 },
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(rx.recv().await.unwrap().state, "reconnecting");
-        setup.stop().await;
+        setup.stop().await.unwrap();
         assert_eq!(count.load(Ordering::Acquire), 1);
     }
     #[tokio::test]
@@ -1192,11 +1354,12 @@ mod tests {
                     .await
                 },
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(rx.recv().await.unwrap().state, "reconnecting");
-        setup.pause();
+        setup.pause().unwrap();
         tokio::time::sleep(Duration::from_millis(2100)).await;
-        setup.stop().await;
+        setup.stop().await.unwrap();
         assert_eq!(count.load(Ordering::Acquire), 1);
     }
     #[test]
@@ -1250,11 +1413,12 @@ mod tests {
                     Ok(())
                 },
             )
-            .await;
+            .await
+            .unwrap();
         started.await.unwrap();
         assert_eq!(status.recv().await.unwrap().state, "working");
         assert_eq!(
-            setup.pause().control,
+            setup.pause().unwrap().control,
             crate::worker_control::WorkerControl::Paused
         );
         finish_tx.send(()).unwrap();
@@ -1266,7 +1430,8 @@ mod tests {
         assert_eq!(jobs.load(Ordering::Acquire), 1);
         setup
             .hold(crate::worker_control::WorkerControl::Stopped)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(setup.status().state, "stopped");
         assert_eq!(jobs.load(Ordering::Acquire), 1);
         let (resumed_tx, resumed) = tokio::sync::oneshot::channel();
@@ -1276,12 +1441,13 @@ mod tests {
                 resumed_tx.send(()).unwrap();
                 Ok(())
             })
-            .await;
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), resumed)
             .await
             .unwrap()
             .unwrap();
-        setup.stop().await;
+        setup.stop().await.unwrap();
     }
     #[tokio::test]
     async fn completed_acquisition_waits_for_inflight_token_rotation_checkpoint() {
@@ -1563,13 +1729,14 @@ mod tests {
                     Ok(())
                 },
             )
-            .await;
+            .await
+            .unwrap();
         let status = tokio::time::timeout(Duration::from_secs(7), rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(status.state, "paused");
-        setup.stop().await;
+        setup.stop().await.unwrap();
         assert!(!touched.load(Ordering::Acquire));
         assert!(renewals.load(Ordering::Acquire) > 0);
         assert_eq!(setup.status(), SetupStatus::default());
@@ -1630,13 +1797,14 @@ mod tests {
                 progress.set("qualified", None);
                 Ok(())
             })
-            .await;
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), started)
             .await
             .expect("setup did not start")
             .unwrap();
         assert_eq!(setup.status().state, "downloading-models");
-        setup.stop().await;
+        setup.stop().await.unwrap();
         assert!(cleaned.load(Ordering::Acquire));
         assert_eq!(setup.status(), SetupStatus::default());
     }
@@ -1651,13 +1819,14 @@ mod tests {
                 }),
                 |_| async { Err("runtime_pack_unavailable".into()) },
             )
-            .await;
+            .await
+            .unwrap();
         let status = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(status.state, "setup-needs-attention");
         assert_eq!(status.code.as_deref(), Some("runtime_pack_unavailable"));
-        setup.stop().await;
+        setup.stop().await.unwrap();
     }
 }

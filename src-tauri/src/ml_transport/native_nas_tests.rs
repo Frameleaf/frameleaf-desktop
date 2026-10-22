@@ -459,7 +459,8 @@ fn automatic_setup_job(
                     eprintln!("automatic setup: {} {:?}", status.state, status.code);
                 }),
             )
-            .await;
+            .await
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(900);
         loop {
             let status = setup.status();
@@ -486,7 +487,7 @@ fn automatic_setup_job(
         std::io::stdout().flush().unwrap();
         assert_eq!(read_fixture_message(input)["command"], "execute");
         assert_eq!(read_fixture_message(input)["command"], "complete");
-        setup.stop().await;
+        setup.stop().await.unwrap();
         println!("NATIVE_EXECUTED {{\"iteration\":1}}");
         std::io::stdout().flush().unwrap();
     });
