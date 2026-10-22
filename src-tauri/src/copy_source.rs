@@ -828,6 +828,17 @@ impl Drop for Partial {
     }
 }
 impl StagedCopy {
+    pub(crate) fn validate_current(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<(), String> {
+        self.approval.validate_current(saved, identity)
+    }
+    pub(crate) fn scope_fingerprint(&self) -> String {
+        self.approval.fingerprint()
+    }
+
     pub(crate) fn matches_entry(&self, relative: &str, bytes: u64) -> bool {
         self.relative == relative
             && if self.approval.is_photos() {

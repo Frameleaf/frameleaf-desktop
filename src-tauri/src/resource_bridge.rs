@@ -3,11 +3,22 @@ use crate::connection::{normalize_server, DeviceIdentity, SavedConnection};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io::Read,
+    path::Path,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    task::{Context, Poll},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 const MAX_SEQUENCE: u32 = 2_147_483_647;
 const MAX_TIMESTAMP: u64 = 9_007_199_254_740_991;
+const MAX_DELIVERY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -370,6 +381,9 @@ fn source_request(
     operation: SourceOperation,
     payload: &str,
 ) -> Result<reqwest::RequestBuilder, String> {
+    if matches!(operation, SourceOperation::Deliver) {
+        return Err("source_binary_delivery_required".into());
+    }
     let mut proof = reqwest::header::HeaderValue::from_str(&signed.proof.header()?)
         .map_err(|_| "source_proof_invalid")?;
     proof.set_sensitive(true);
@@ -525,6 +539,296 @@ impl ReadClaim {
         Ok(())
     }
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryMetadata<'a> {
+    request_id: &'a str,
+    claim_fence: u32,
+    claim_token: &'a str,
+    resource_key: &'a str,
+    version: &'a str,
+    sha256: &'a str,
+    bytes: u64,
+}
+fn delivery_metadata(claim: &ReadClaim) -> Result<zeroize::Zeroizing<String>, String> {
+    serde_json::to_string(&DeliveryMetadata {
+        request_id: &claim.id,
+        claim_fence: claim.claim_fence,
+        claim_token: &claim.claim_token,
+        resource_key: &claim.resource_key,
+        version: &claim.version,
+        sha256: &claim.sha256,
+        bytes: claim.bytes,
+    })
+    .map(zeroize::Zeroizing::new)
+    .map_err(|_| "source_read_payload_invalid".into())
+}
+fn delivery_request(
+    signed: &SignedSourceRequest,
+    payload: &str,
+    bytes: u64,
+    body: reqwest::Body,
+    timeout_ms: u64,
+) -> Result<reqwest::RequestBuilder, String> {
+    let metadata = zeroize::Zeroizing::new(STANDARD.encode(payload.as_bytes()));
+    if metadata.len() > 4096
+        || bytes == 0
+        || bytes > MAX_DELIVERY_BYTES
+        || timeout_ms == 0
+        || timeout_ms > 600_000
+    {
+        return Err("source_read_payload_invalid".into());
+    }
+    let mut proof = reqwest::header::HeaderValue::from_str(&signed.proof.header()?)
+        .map_err(|_| "source_proof_invalid")?;
+    proof.set_sensitive(true);
+    let mut metadata = reqwest::header::HeaderValue::from_str(&metadata)
+        .map_err(|_| "source_read_payload_invalid")?;
+    metadata.set_sensitive(true);
+    Ok(crate::transport::client()?
+        .put(
+            normalize_server(&signed.source.server)?
+                .join("api/source-resources/deliver")
+                .map_err(|_| "source_request_invalid")?,
+        )
+        .bearer_auth(signed.token.as_str())
+        .header("x-frameleaf-source-proof", proof)
+        .header("x-frameleaf-source-payload", metadata)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .header(reqwest::header::CONTENT_LENGTH, bytes)
+        .timeout(Duration::from_millis(timeout_ms))
+        .body(body))
+}
+
+type DeliveryChunk = Result<Vec<u8>, std::io::Error>;
+type DeliveryGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+struct DeliveryShutdown {
+    receiver: Arc<Mutex<tokio::sync::mpsc::Receiver<DeliveryChunk>>>,
+    stopped: Arc<AtomicBool>,
+}
+impl DeliveryShutdown {
+    fn close(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close();
+    }
+}
+impl Drop for DeliveryShutdown {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+struct DeliveryStream {
+    receiver: Arc<Mutex<tokio::sync::mpsc::Receiver<DeliveryChunk>>>,
+}
+impl futures_core::Stream for DeliveryStream {
+    type Item = DeliveryChunk;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .poll_recv(cx)
+    }
+}
+fn produce_delivery(
+    mut file: std::fs::File,
+    expected: u64,
+    checksum: &str,
+    sender: tokio::sync::mpsc::Sender<DeliveryChunk>,
+    stop: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    gate: DeliveryGate,
+) -> Result<(), String> {
+    let check = || {
+        if stop.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
+            return Err("source_delivery_interrupted".into());
+        }
+        gate()
+    };
+    let result: Result<(), String> = (|| {
+        let mut hash = Sha256::new();
+        let mut copied = 0;
+        while copied < expected {
+            check()?;
+            let mut chunk = vec![0u8; (expected - copied).min(65_536) as usize];
+            file.read_exact(&mut chunk)
+                .map_err(|_| "source_stage_changed")?;
+            copied += chunk.len() as u64;
+            hash.update(&chunk);
+            if copied == expected {
+                let mut extra = [0];
+                if file.read(&mut extra).map_err(|_| "source_stage_changed")? != 0
+                    || format!("{:x}", hash.clone().finalize()) != checksum
+                {
+                    return Err("source_stage_changed".into());
+                }
+                // Withhold the last bytes until local integrity and current permission have passed.
+                check()?;
+            }
+            sender
+                .blocking_send(Ok(chunk))
+                .map_err(|_| "source_delivery_interrupted")?;
+        }
+        Ok(())
+    })();
+    if let Err(code) = &result {
+        let _ = sender.blocking_send(Err(std::io::Error::other(code.clone())));
+    }
+    result
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryResponse {
+    accepted: bool,
+}
+
+/// Owns an independently verified descriptor and source-bound proof; never deserialize a NAS path into this type.
+pub struct PreparedDelivery {
+    signed: SignedSourceRequest,
+    payload: zeroize::Zeroizing<String>,
+    file: std::fs::File,
+    bytes: u64,
+    checksum: String,
+    lease_until: u64,
+    until: u64,
+}
+/// Blocking stage verification belongs on the coordinator's file worker, before starting an upload.
+pub fn prepare_delivery(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    claim: &ReadClaim,
+    copy: &crate::copy_source::StagedCopy,
+    staging: &Path,
+    max_bytes: u64,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<PreparedDelivery, String> {
+    gate()?;
+    let payload = delivery_metadata(claim)?;
+    let signed = reserve_source_proof(
+        saved,
+        identity,
+        &claim.source_id,
+        SourceOperation::Deliver,
+        &payload,
+    )?;
+    claim.validate(&signed.source, max_bytes, now()?)?;
+    if claim.bytes > MAX_DELIVERY_BYTES
+        || copy.source_id() != claim.source_id
+        || copy.scope_fingerprint() != claim.scope_fingerprint
+        || copy.resource_key() != claim.resource_key
+        || copy.version() != claim.version
+        || copy.bytes != claim.bytes
+        || copy.sha256 != claim.sha256
+    {
+        return Err("source_read_request_invalid".into());
+    }
+    copy.validate_current(saved, identity)?;
+    let file = copy.verify(saved, identity, staging)?.into_std();
+    gate()?;
+    claim.validate(&signed.source, max_bytes, now()?)?;
+    let until = expires_at(&claim.deadline)
+        .ok_or("source_read_request_invalid")?
+        .min(expires_at(&signed.source.expires_at).ok_or("source_credential_invalid")?);
+    Ok(PreparedDelivery {
+        signed,
+        payload,
+        file,
+        until,
+        lease_until: expires_at(&claim.lease_until).ok_or("source_read_request_invalid")?,
+        bytes: claim.bytes,
+        checksum: claim.sha256.clone(),
+    })
+}
+async fn wait_delivery<T>(
+    future: impl std::future::Future<Output = Result<T, String>>,
+    cancelled: &AtomicBool,
+    gate: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<T, String> {
+    let check = || {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("source_delivery_interrupted".into());
+        }
+        gate()
+    };
+    check()?;
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => check()?,
+            result = &mut future => { check()?; return result; }
+        }
+    }
+}
+/// The coordinator supplies a live consent/version gate, including its stop and sign-out state.
+pub async fn deliver(
+    prepared: PreparedDelivery,
+    cancelled: Arc<AtomicBool>,
+    gate: DeliveryGate,
+) -> Result<bool, String> {
+    gate()?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err("source_delivery_interrupted".into());
+    }
+    let PreparedDelivery {
+        signed,
+        payload,
+        file,
+        bytes,
+        checksum,
+        lease_until,
+        until,
+    } = prepared;
+    let timestamp = now()?;
+    if lease_until <= timestamp
+        || timestamp < signed.proof.timestamp
+        || timestamp - signed.proof.timestamp > 120_000
+    {
+        return Err("source_read_request_invalid".into());
+    }
+    let timeout_ms = until
+        .checked_sub(timestamp)
+        .filter(|value| *value > 0 && *value <= 600_000)
+        .ok_or("source_read_request_invalid")?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let stop = Arc::new(AtomicBool::new(false));
+    let shutdown = DeliveryShutdown {
+        receiver: receiver.clone(),
+        stopped: stop.clone(),
+    };
+    let body = reqwest::Body::wrap_stream(DeliveryStream {
+        receiver: receiver.clone(),
+    });
+    let request = delivery_request(&signed, &payload, bytes, body, timeout_ms)?;
+    let stopped = stop.clone();
+    let cancel = cancelled.clone();
+    let read_gate = gate.clone();
+    let producer = tokio::task::spawn_blocking(move || {
+        produce_delivery(file, bytes, &checksum, sender, stopped, cancel, read_gate)
+    });
+    let response = wait_delivery(
+        async move {
+            request
+                .send()
+                .await
+                .map_err(|_| String::from("source_delivery_interrupted"))
+        },
+        &cancelled,
+        &*gate,
+    )
+    .await;
+    // Close even if an early HTTP response leaves its request body alive in the connection task.
+    shutdown.close();
+    let produced = producer.await.map_err(|_| "source_delivery_interrupted")?;
+    let result: DeliveryResponse =
+        wait_delivery(crate::transport::json(response?), &cancelled, &*gate).await?;
+    produced?;
+    Ok(result.accepted)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PollResponse {
@@ -939,5 +1243,333 @@ mod tests {
             )
             .unwrap();
         assert_eq!(claim.lease_until, "2027-01-15T08:01:30.000Z");
+    }
+    #[test]
+    fn original_delivery_is_binary_put_with_sensitive_metadata_and_no_url_credentials() {
+        let (wire, saved, identity) = fixture();
+        let mut source = bind(&wire, &saved, &identity);
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/source-read-v1.json")).unwrap();
+        let claim: ReadClaim = serde_json::from_value(fixture["request"].clone()).unwrap();
+        let payload = delivery_metadata(&claim).unwrap();
+        let proof = reserve_at(
+            &mut source,
+            &saved,
+            &identity,
+            SourceOperation::Deliver,
+            &payload,
+            |_| Ok(()),
+            wire["request"]["timestamp"].as_u64().unwrap(),
+        )
+        .unwrap();
+        let signed = SignedSourceRequest {
+            token: zeroize::Zeroizing::new(source.source_token.clone()),
+            proof,
+            source,
+        };
+        let body = vec![0, 255, 128, 10];
+        let request = delivery_request(
+            &signed,
+            &payload,
+            body.len() as u64,
+            reqwest::Body::from(body.clone()),
+            10_000,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.method(), reqwest::Method::PUT);
+        assert_eq!(
+            request.url().as_str(),
+            "https://synthetic.test/api/source-resources/deliver"
+        );
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), body);
+        assert_eq!(
+            request.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(request.headers()["content-length"], "4");
+        assert!(request.headers()["authorization"].is_sensitive());
+        assert!(request.headers()["x-frameleaf-source-proof"].is_sensitive());
+        assert!(request.headers()["x-frameleaf-source-payload"].is_sensitive());
+        assert_eq!(
+            STANDARD
+                .decode(request.headers()["x-frameleaf-source-payload"].as_bytes())
+                .unwrap(),
+            payload.as_bytes()
+        );
+        assert_eq!(request.timeout().unwrap().as_millis(), 10_000);
+        let metadata: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(metadata["requestId"], claim.id);
+        assert_eq!(metadata["claimToken"], claim.claim_token);
+        assert_eq!(metadata["resourceKey"], claim.resource_key);
+        assert_eq!(metadata["version"], claim.version);
+        assert_eq!(metadata["sha256"], claim.sha256);
+        assert_eq!(metadata["bytes"], claim.bytes);
+        assert_eq!(metadata.as_object().unwrap().len(), 7);
+    }
+
+    struct DeliveryFile(std::path::PathBuf);
+    impl DeliveryFile {
+        fn new(bytes: &[u8]) -> Self {
+            let root = std::env::temp_dir().join(format!("frameleaf-delivery-{}", Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("input"), bytes).unwrap();
+            Self(root)
+        }
+        fn open(&self) -> std::fs::File {
+            std::fs::File::open(self.0.join("input")).unwrap()
+        }
+    }
+    impl Drop for DeliveryFile {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn delivery_body_is_bounded_verified_and_joined_before_completion() {
+        let bytes = vec![42; 150_000];
+        let fixture = DeliveryFile::new(&bytes);
+        let file = fixture.open();
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let producer = tokio::task::spawn_blocking(move || {
+            produce_delivery(
+                file,
+                150_000,
+                &checksum,
+                sender,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|| Ok(())),
+            )
+        });
+        let mut received = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= 65_536);
+            received.extend(chunk);
+        }
+        producer.await.unwrap().unwrap();
+        assert_eq!(received, bytes);
+    }
+    #[tokio::test]
+    async fn delivery_never_releases_its_last_bytes_on_integrity_or_permission_failure() {
+        for failure in ["short", "long", "checksum", "cancelled", "revoked"] {
+            let bytes: &[u8] = match failure {
+                "short" => b"hell",
+                "long" => b"helloo",
+                _ => b"hello",
+            };
+            let fixture = DeliveryFile::new(bytes);
+            let file = fixture.open();
+            let checksum = if failure == "checksum" {
+                "0".repeat(64)
+            } else {
+                format!("{:x}", Sha256::digest(b"hello"))
+            };
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+            let producer = tokio::task::spawn_blocking(move || {
+                produce_delivery(
+                    file,
+                    5,
+                    &checksum,
+                    sender,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(failure == "cancelled")),
+                    Arc::new(move || {
+                        if failure == "revoked" {
+                            Err("source_approval_required".into())
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                )
+            });
+            let mut count = 0;
+            while let Some(chunk) = receiver.recv().await {
+                if let Ok(chunk) = chunk {
+                    count += chunk.len();
+                }
+            }
+            assert!(producer.await.unwrap().is_err(), "{failure}");
+            assert_eq!(count, 0, "{failure}");
+        }
+    }
+    #[tokio::test]
+    async fn delivery_checks_current_permission_again_before_exposing_the_final_chunk() {
+        let bytes = vec![42; 100_000];
+        let fixture = DeliveryFile::new(&bytes);
+        let file = fixture.open();
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let producer = tokio::task::spawn_blocking(move || {
+            produce_delivery(
+                file,
+                100_000,
+                &checksum,
+                sender,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(move || {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                        Err("source_approval_required".into())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            )
+        });
+        let mut count = 0;
+        while let Some(chunk) = receiver.recv().await {
+            if let Ok(chunk) = chunk {
+                count += chunk.len();
+            }
+        }
+        assert!(producer.await.unwrap().is_err());
+        assert_eq!(count, 65_536);
+    }
+    #[tokio::test]
+    async fn dropping_an_upload_wakes_a_backpressured_reader_and_allows_it_to_close() {
+        let bytes = vec![42; 1_000_000];
+        let fixture = DeliveryFile::new(&bytes);
+        let file = fixture.open();
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let shutdown = DeliveryShutdown {
+            receiver,
+            stopped: stopped.clone(),
+        };
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let ready = Mutex::new(Some(ready));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let gate: DeliveryGate = Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                let _ = ready.lock().unwrap().take().unwrap().send(());
+            }
+            Ok(())
+        });
+        let producer = tokio::task::spawn_blocking(move || {
+            produce_delivery(
+                file,
+                1_000_000,
+                &checksum,
+                sender,
+                stopped,
+                Arc::new(AtomicBool::new(false)),
+                gate,
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(shutdown);
+        assert!(tokio::time::timeout(Duration::from_secs(2), producer)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+    }
+    #[test]
+    fn delivery_response_and_control_path_cannot_silently_accept_another_contract() {
+        for value in [
+            "{}",
+            "null",
+            "{\"accepted\":true,\"path\":\"/private\"}",
+            "{\"accepted\":\"true\"}",
+        ] {
+            assert!(serde_json::from_str::<DeliveryResponse>(value).is_err());
+        }
+        assert!(
+            !serde_json::from_str::<DeliveryResponse>("{\"accepted\":false}")
+                .unwrap()
+                .accepted
+        );
+        let (wire, saved, identity) = fixture();
+        let mut source = bind(&wire, &saved, &identity);
+        let payload = "{}";
+        let proof = reserve_at(
+            &mut source,
+            &saved,
+            &identity,
+            SourceOperation::Deliver,
+            payload,
+            |_| Ok(()),
+            wire["request"]["timestamp"].as_u64().unwrap(),
+        )
+        .unwrap();
+        let mut signed = SignedSourceRequest {
+            token: zeroize::Zeroizing::new(source.source_token.clone()),
+            proof,
+            source,
+        };
+        assert!(source_request(&signed, SourceOperation::Deliver, payload).is_err());
+        for (length, timeout) in [(0, 1), (MAX_DELIVERY_BYTES + 1, 1), (1, 0), (1, 600_001)] {
+            assert!(delivery_request(
+                &signed,
+                payload,
+                length,
+                reqwest::Body::from(vec![0]),
+                timeout
+            )
+            .is_err());
+        }
+        assert!(delivery_request(
+            &signed,
+            &"x".repeat(4096),
+            1,
+            reqwest::Body::from(vec![0]),
+            1
+        )
+        .is_err());
+        signed.source.server = "http://synthetic.test/".into();
+        assert!(delivery_request(&signed, payload, 1, reqwest::Body::from(vec![0]), 1).is_err());
+    }
+    #[tokio::test]
+    async fn a_late_delivery_reply_cannot_outlive_cancellation_or_current_permission() {
+        for revoke in [false, true] {
+            let changed = AtomicBool::new(false);
+            let other = AtomicBool::new(false);
+            let cancelled = if revoke { &other } else { &changed };
+            let result = wait_delivery(
+                async {
+                    changed.store(true, Ordering::Release);
+                    Ok(true)
+                },
+                cancelled,
+                &|| {
+                    if revoke && changed.load(Ordering::Acquire) {
+                        Err("source_approval_required".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn a_stalled_delivery_reply_stops_when_the_coordinator_cancels() {
+        let cancelled = AtomicBool::new(false);
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                wait_delivery(
+                    std::future::pending::<Result<(), String>>(),
+                    &cancelled,
+                    &|| Ok(())
+                )
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cancelled.store(true, Ordering::Release);
+            }
+        );
+        assert_eq!(result.unwrap().unwrap_err(), "source_delivery_interrupted");
     }
 }
