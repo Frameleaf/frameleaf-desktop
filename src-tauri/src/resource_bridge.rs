@@ -513,6 +513,9 @@ pub struct ReadClaim {
     deadline: String,
 }
 impl ReadClaim {
+    pub(crate) fn resource_binding(&self) -> (&str, &str, &str) {
+        (&self.source_id, &self.resource_key, &self.version)
+    }
     pub(crate) fn matches_resource(&self, copy: &crate::copy_source::StagedCopy) -> bool {
         copy.source_id() == self.source_id
             && copy.scope_fingerprint() == self.scope_fingerprint

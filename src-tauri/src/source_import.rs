@@ -852,11 +852,45 @@ pub(crate) struct SourceJobs {
     status: Arc<Mutex<ImportView>>,
 }
 impl SourceJobs {
-    pub async fn stop(&self) {
-        if let Some(running) = self.running.lock().await.take() {
-            running.cancel.store(true, Ordering::Release);
-            let _ = running.task.await;
+    pub fn is_active(&self) -> bool {
+        let status = self.status.lock();
+        if status.as_ref().is_err()
+            || status.as_ref().is_ok_and(|view| {
+                view.state == "copying"
+                    || view.code.as_deref() == Some("source_copy_shutdown_unconfirmed")
+            })
+        {
+            return true;
         }
+        self.running
+            .try_lock()
+            .map_or(true, |running| running.is_some())
+    }
+    pub async fn stop(&self) -> Result<(), String> {
+        let mut running = self.running.lock().await;
+        if let Some(previous) = running.take() {
+            previous.cancel.store(true, Ordering::Release);
+            if previous.task.await.is_err() {
+                let mut status = self
+                    .status
+                    .lock()
+                    .map_err(|_| "source_copy_shutdown_unconfirmed")?;
+                status.state = "needs-attention".into();
+                status.code = Some("source_copy_shutdown_unconfirmed".into());
+                return Err("source_copy_shutdown_unconfirmed".into());
+            }
+        }
+        if self
+            .status
+            .lock()
+            .map_err(|_| "source_copy_shutdown_unconfirmed")?
+            .code
+            .as_deref()
+            == Some("source_copy_shutdown_unconfirmed")
+        {
+            return Err("source_copy_shutdown_unconfirmed".into());
+        }
+        Ok(())
     }
     pub fn status(
         &self,
@@ -902,7 +936,7 @@ impl SourceJobs {
         base: &Path,
         saved: &SavedConnection,
     ) -> Result<ImportView, String> {
-        self.stop().await;
+        self.stop().await?;
         let identity = credentials::identity()?;
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
@@ -945,7 +979,7 @@ impl SourceJobs {
         base: PathBuf,
         saved: SavedConnection,
     ) -> Result<ImportView, String> {
-        self.stop().await;
+        self.stop().await?;
         let value = self
             .status(&base, &saved)?
             .ok_or("source_manifest_required")?;
@@ -1026,7 +1060,7 @@ impl SourceJobs {
         saved: &SavedConnection,
         action: &str,
     ) -> Result<ImportView, String> {
-        self.stop().await;
+        self.stop().await?;
         let identity = credentials::identity()?;
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
@@ -1052,7 +1086,7 @@ impl SourceJobs {
         saved: &SavedConnection,
         cancel: bool,
     ) -> Result<ImportView, String> {
-        self.stop().await;
+        self.stop().await?;
         let identity = credentials::identity()?;
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
@@ -1099,6 +1133,33 @@ impl SourceJobs {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn reported_copy_shutdown_failure_stays_fenced_after_its_task_returns() {
+        let jobs = super::SourceJobs::default();
+        jobs.status.lock().unwrap().code = Some("source_copy_shutdown_unconfirmed".into());
+        assert!(jobs.stop().await.is_err());
+        assert!(jobs.is_active());
+        assert!(jobs.stop().await.is_err());
+    }
+    #[tokio::test]
+    async fn panic_shutdown_fences_the_copy_owner_instead_of_silently_succeeding() {
+        let jobs = super::SourceJobs::default();
+        let task = tauri::async_runtime::spawn(async {
+            panic!("synthetic source owner failure");
+        });
+        *jobs.running.lock().await = Some(super::Running {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            task,
+        });
+        let _ = jobs.stop().await;
+        assert_eq!(
+            jobs.status.lock().unwrap().code.as_deref(),
+            Some("source_copy_shutdown_unconfirmed")
+        );
+        assert!(jobs.is_active());
+        assert!(jobs.stop().await.is_err());
+    }
+
     use super::*;
     #[test]
     fn folder_original_read_allowance_is_explicit_in_new_signed_checkpoints() {

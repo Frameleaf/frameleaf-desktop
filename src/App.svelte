@@ -54,6 +54,9 @@
     ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : ''));
   const native = isTauri();
   const errors: Record<string, string> = {
+    source_read_shutdown_unconfirmed: 'Photo-source work could not confirm it stopped. Your saved sign-in has been kept, and no new source work will start.',
+    source_copy_shutdown_unconfirmed: 'Photo-source work could not confirm it stopped. Your saved sign-in has been kept, and no new source work will start.',
+    source_read_shutting_down: 'Photo-source work is stopping before Frameleaf quits.',
     local_host_active: 'Stop local management before connecting to another server.',
     worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
     server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
@@ -72,12 +75,16 @@
   onMount(() => {
     if (!native) return;
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
+    const unlisten: UnlistenFn[] = [];
     void (async () => {
       busy = true;
       try {
-        unlisten = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
-        if (disposed) { unlisten(); return; }
+        const workerListener = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
+        if (disposed) { workerListener(); return; }
+        unlisten.push(workerListener);
+        const exitListener = await listen('source-read-exit-blocked', () => { failure = 'Frameleaf is keeping this window open because photo-source work could not confirm it stopped. Your files and saved sign-in have been kept.'; });
+        if (disposed) { exitListener(); return; }
+        unlisten.push(exitListener);
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
         hostActive = host.backgroundActive;
         if (hostActive) mode = 'local-server';
@@ -86,7 +93,7 @@
       } catch (error) { failure = explain(error); }
       finally { busy = false; }
     })();
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; for (const stop of unlisten) stop(); };
   });
   async function connect(event: SubmitEvent) {
     event.preventDefault(); busy = true; failure = ''; notice = '';

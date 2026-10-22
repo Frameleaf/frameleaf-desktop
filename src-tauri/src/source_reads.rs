@@ -1,10 +1,12 @@
 //! One source-owned original read, with durable allowances and locally signed resource selection.
+mod owner;
 use crate::{
     connection::{DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,
     source_import::Journal,
 };
 use cap_std::{ambient_authority, fs::Dir};
+pub use owner::{Requests, View};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -403,7 +405,11 @@ async fn keep_alive<T>(
         };
         if let Err(error) = result {
             operation.stop.store(true, Ordering::Release);
-            let _ = work.await;
+            if let Err(code) = work.await {
+                if owner::unconfirmed(&code) {
+                    return Err(code);
+                }
+            }
             return Err(error);
         }
     }
@@ -507,7 +513,9 @@ impl Job {
                 })
         });
         let copy = keep_alive(&operation, &mut claim, async move {
-            stage.await.map_err(|_| "source_delivery_interrupted")?
+            stage
+                .await
+                .map_err(|_| "source_read_shutdown_unconfirmed")?
         })
         .await?;
         operation.renew(&mut claim).await?;
@@ -525,7 +533,7 @@ impl Job {
         let (copy, verified) = keep_alive(&operation, &mut claim, async move {
             preparation
                 .await
-                .map_err(|_| "source_delivery_interrupted")?
+                .map_err(|_| "source_read_shutdown_unconfirmed")?
         })
         .await?;
         operation.renew(&mut claim).await?;
@@ -548,7 +556,7 @@ impl Job {
             )
         })
         .await
-        .map_err(|_| "source_delivery_interrupted")??;
+        .map_err(|_| "source_read_shutdown_unconfirmed")??;
         let upload = operation.clone();
         let delivery = crate::resource_bridge::deliver(
             prepared,
@@ -573,7 +581,7 @@ impl Job {
                 job.journal.write("state.json", &state, &cleanup.identity)
             })
             .await
-            .map_err(|_| "source_delivery_interrupted")??;
+            .map_err(|_| "source_read_shutdown_unconfirmed")??;
         }
         Ok(accepted)
     }
@@ -876,6 +884,47 @@ mod tests {
         assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 0);
         assert_eq!(job.state(&f.saved, &f.identity).unwrap().upload.used, 0);
         assert!(job.begin().is_ok());
+    }
+    #[tokio::test]
+    async fn draining_preserves_unconfirmed_shutdown_over_the_cancel_error() {
+        let f = Fixture::new();
+        let job = Arc::new(f.job(10, 20));
+        for code in [
+            "source_copy_shutdown_unconfirmed",
+            "source_read_shutdown_unconfirmed",
+            "server_http_500",
+        ] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let operation = Arc::new(Operation {
+                owner: job.begin().unwrap(),
+                saved: f.saved.clone(),
+                identity: serde_json::from_slice(&serde_json::to_vec(&f.identity).unwrap())
+                    .unwrap(),
+                cancelled: Arc::new(AtomicBool::new(true)),
+                stop: stop.clone(),
+                lease: std::sync::atomic::AtomicU64::new(
+                    crate::resource_bridge::now().unwrap() + 60_000,
+                ),
+                epoch: 1,
+                started: crate::resource_bridge::now().unwrap(),
+                policy: std::sync::Mutex::new((std::time::Instant::now(), None)),
+            });
+            let mut claim:crate::resource_bridge::ReadClaim=serde_json::from_value(serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"sourceId":f.resource.source_id(),"scopeFingerprint":f.resource.scope_fingerprint(),"authorizationEpoch":1,"resourceKey":f.resource.resource_key(),"version":f.resource.version(),"sha256":f.resource.sha256,"bytes":10,"claimFence":1,"claimToken":"a".repeat(64),"leaseUntil":"2026-10-22T00:01:00Z","deadline":"2026-10-22T00:05:00Z"})).unwrap();
+            let result = keep_alive(&operation, &mut claim, async {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                assert!(stop.load(Ordering::Acquire));
+                Err::<(), String>(code.into())
+            })
+            .await;
+            assert_eq!(
+                result.unwrap_err(),
+                if code == "server_http_500" {
+                    "source_delivery_interrupted"
+                } else {
+                    code
+                }
+            );
+        }
     }
     #[test]
     fn verification_checks_stop_before_returning_the_owned_file() {

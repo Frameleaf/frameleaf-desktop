@@ -239,6 +239,19 @@ async fn sign_in(
     Ok((saved, view))
 }
 
+async fn stop_sources(app: &tauri::AppHandle) -> Result<(), String> {
+    let reads = app.state::<source_reads::Requests>();
+    let copies = app.state::<source_import::SourceJobs>();
+    let (reads, copies) = tokio::join!(reads.stop(), copies.stop());
+    reads?;
+    copies
+}
+async fn stop_connection_work(app: &tauri::AppHandle) -> Result<(), String> {
+    let worker = app.state::<worker_setup::WorkerSetup>();
+    let (sources, ()) = tokio::join!(stop_sources(app), worker.stop());
+    sources
+}
+
 #[tauri::command]
 async fn restore_connection(
     window: WebviewWindow,
@@ -250,8 +263,7 @@ async fn restore_connection(
     if app.state::<host_setup::HostSetup>().background_active() {
         return Ok(None);
     }
-    app.state::<source_import::SourceJobs>().stop().await;
-    app.state::<worker_setup::WorkerSetup>().stop().await;
+    stop_connection_work(&app).await?;
     let Some(mut saved) = credentials::load::<SavedConnection>("connection")? else {
         return Ok(None);
     };
@@ -293,9 +305,8 @@ async fn sign_out(
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
-    app.state::<source_import::SourceJobs>().stop().await;
+    stop_connection_work(&app).await?;
     app.state::<source_consent::SourceConsent>().clear()?;
-    app.state::<worker_setup::WorkerSetup>().stop().await;
     let saved = current
         .clone()
         .or(credentials::load::<SavedConnection>("connection")?);
@@ -419,6 +430,7 @@ pub fn run() {
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
+        .manage(source_reads::Requests::default())
         .invoke_handler(tauri::generate_handler![
             host_commands::open_local_photos,
             host_commands::authorize_local_manager,
@@ -454,12 +466,18 @@ pub fn run() {
             manager_commands::disconnect_manager
         ])
         .on_window_event(|window, event| {
-            if window.label() == "main"
-                && window.state::<host_setup::HostSetup>().background_active()
-            {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.state::<host_setup::HostSetup>().background_active() {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if window.state::<source_reads::Requests>().is_active()
+                    || window.state::<source_import::SourceJobs>().is_active()
+                {
+                    api.prevent_close();
+                    window.app_handle().exit(0);
                 }
             }
         })
@@ -480,6 +498,29 @@ pub fn run() {
                         let _ = window.show();
                         let _ = window.set_focus();
                         let _ = window.emit("native-host-exit-blocked", ());
+                    }
+                } else if app.state::<source_reads::Requests>().is_active()
+                    || app.state::<source_import::SourceJobs>().is_active()
+                {
+                    api.prevent_exit();
+                    if app.state::<source_reads::Requests>().request_shutdown() {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let desktop = handle.state::<DesktopState>();
+                            let _current = desktop.0.lock().await;
+                            let reads = handle.state::<source_reads::Requests>();
+                            let copies = handle.state::<source_import::SourceJobs>();
+                            let worker = handle.state::<worker_setup::WorkerSetup>();
+                            let (read_result, copy_result, ()) =
+                                tokio::join!(reads.shutdown(), copies.stop(), worker.stop());
+                            if read_result.is_ok() && copy_result.is_ok() {
+                                handle.exit(0);
+                            } else if let Some(window) = handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                                let _ = window.emit("source-read-exit-blocked", ());
+                            }
+                        });
                     }
                 }
             }
@@ -684,6 +725,9 @@ async fn approve_photo_folder(
 ) -> Result<source_consent::ConsentView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
+    app.state::<source_reads::Requests>()
+        .check_available()
+        .await?;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let identity = credentials::identity()?;
     let mut consent = if let Some(selection) = selection_id {
@@ -715,7 +759,7 @@ async fn revoke_photo_source(
 ) -> Result<bool, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
-    app.state::<source_import::SourceJobs>().stop().await;
+    stop_sources(&app).await?;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
     // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
@@ -767,6 +811,9 @@ async fn prepare_photo_import(
 ) -> Result<source_import::ImportView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
+    app.state::<source_reads::Requests>()
+        .check_available()
+        .await?;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     app.state::<source_import::SourceJobs>()
         .prepare(&import_base(&app)?, saved)
@@ -781,6 +828,9 @@ async fn control_photo_import(
 ) -> Result<source_import::ImportView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
+    app.state::<source_reads::Requests>()
+        .check_available()
+        .await?;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let base = import_base(&app)?;
     match action.as_str() {
