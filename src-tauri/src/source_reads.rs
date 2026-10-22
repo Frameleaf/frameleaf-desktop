@@ -1,5 +1,6 @@
 //! One source-owned original read, with durable allowances and locally signed resource selection.
 mod owner;
+mod preparation;
 use crate::{
     connection::{DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,
@@ -667,6 +668,110 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn prepared_stage_is_handed_off_without_granting_or_spending_more_reads() {
+        let f = Fixture::new();
+        let job = Arc::new(f.job(0, 0));
+        job.adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| Ok(()))
+            .unwrap();
+        assert!(!f.root.join("seed").join(&f.resource.id).exists());
+        let state = job.state(&f.saved, &f.identity).unwrap();
+        assert_eq!(state.stage.as_deref(), Some(f.resource.id.as_str()));
+        assert_eq!(
+            (
+                state.read.used,
+                state.read.limit,
+                state.upload.used,
+                state.upload.limit
+            ),
+            (0, 0, 0, 0)
+        );
+        job.adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| Ok(()))
+            .unwrap();
+        let copy = job
+            .stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(copy.sha256, f.resource.sha256);
+        assert_eq!(
+            fs::read(f.root.join("source/original.jpg")).unwrap(),
+            b"abcdefghij"
+        );
+    }
+    #[test]
+    fn prepared_stage_corruption_and_unknown_destinations_are_retained() {
+        for unknown_destination in [false, true] {
+            let f = Fixture::new();
+            let job = Arc::new(f.job(0, 0));
+            let source = f.root.join("seed").join(&f.resource.id);
+            let target = job.journal.root.join("stage").join(&f.resource.id);
+            if unknown_destination {
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("unknown"), b"keep").unwrap();
+            } else {
+                fs::write(source.join("original"), b"corruption").unwrap();
+            }
+            assert!(job
+                .adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| Ok(()))
+                .is_err());
+            assert!(source.exists());
+            if unknown_destination {
+                assert_eq!(fs::read(target.join("unknown")).unwrap(), b"keep");
+            }
+            assert!(job.state(&f.saved, &f.identity).unwrap().stage.is_none());
+        }
+    }
+    #[test]
+    fn prepared_stage_handoff_recovers_after_a_late_stop_without_original_reads() {
+        let f = Fixture::new();
+        let job = Arc::new(f.job(0, 0));
+        let target = job.journal.root.join("stage").join(&f.resource.id);
+        assert!(job
+            .adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| {
+                if target.exists() {
+                    Err("source_copy_cancelled".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        assert!(target.join("original").is_file());
+        job.adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| Ok(()))
+            .unwrap();
+        assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 0);
+    }
+    #[test]
+    fn prepared_stage_with_unexpected_files_is_not_transferred() {
+        let f = Fixture::new();
+        let job = Arc::new(f.job(0, 0));
+        let unknown = f.root.join("seed").join(&f.resource.id).join("unknown");
+        fs::write(&unknown, b"keep").unwrap();
+        assert!(job
+            .adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| Ok(()))
+            .is_err());
+        assert_eq!(fs::read(unknown).unwrap(), b"keep");
+        assert!(job.state(&f.saved, &f.identity).unwrap().stage.is_none());
+    }
+    #[test]
+    fn prepared_stage_survives_job_restart_with_unchanged_allowances() {
+        let f = Fixture::new();
+        let job = Arc::new(f.job(0, 0));
+        job.adopt(&f.saved, &f.identity, &f.root.join("seed"), &|| Ok(()))
+            .unwrap();
+        drop(job);
+        let job = Job::open(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.resource.source_id(),
+            &f.resource.resource_key(),
+            &f.resource.version(),
+            None,
+        )
+        .unwrap();
+        job.stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 0);
     }
     #[test]
     fn a_request_selects_only_the_exact_signed_local_resource() {
