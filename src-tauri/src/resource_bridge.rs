@@ -363,6 +363,72 @@ pub fn reserve_source_proof(
     })
 }
 
+#[derive(Deserialize, zeroize::ZeroizeOnDrop)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadClaim {
+    id: String,
+    source_id: String,
+    scope_fingerprint: String,
+    authorization_epoch: u32,
+    resource_key: String,
+    version: String,
+    sha256: String,
+    bytes: u64,
+    claim_fence: u32,
+    claim_token: String,
+    lease_until: String,
+    deadline: String,
+}
+impl ReadClaim {
+    pub fn validate(
+        &self,
+        source: &SavedSource,
+        max_bytes: u64,
+        timestamp: u64,
+    ) -> Result<(), String> {
+        let lease = expires_at(&self.lease_until);
+        let deadline = expires_at(&self.deadline);
+        if timestamp == 0
+            || timestamp > MAX_TIMESTAMP
+            || max_bytes == 0
+            || max_bytes > MAX_TIMESTAMP
+            || !uuid(&self.id)
+            || !uuid(&self.source_id)
+            || self.source_id != source.source_id
+            || self.scope_fingerprint != source.scope_fingerprint
+            || self.authorization_epoch != source.authorization_epoch
+            || self.authorization_epoch == 0
+            || self.authorization_epoch > MAX_SEQUENCE
+            || self.claim_fence == 0
+            || self.claim_fence > MAX_SEQUENCE
+            || self.bytes == 0
+            || self.bytes > max_bytes
+            || [
+                &self.scope_fingerprint,
+                &self.resource_key,
+                &self.version,
+                &self.sha256,
+                &self.claim_token,
+            ]
+            .iter()
+            .any(|value| !crate::native_runtime::digest_valid(value, 64))
+            || expires_at(&source.expires_at).is_none_or(|expiry| expiry <= timestamp)
+            || lease.is_none_or(|lease| lease <= timestamp || lease > timestamp + 120_000)
+            || deadline.is_none_or(|deadline| deadline > timestamp + 600_000)
+            || !matches!((lease, deadline), (Some(lease), Some(deadline)) if lease <= deadline)
+        {
+            return Err("source_read_request_invalid".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PollResponse {
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub request: Option<ReadClaim>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +663,68 @@ mod tests {
             credential_key(&saved, &DeviceIdentity::generate(), source_id).unwrap()
         );
         assert!(credential_key(&saved, &identity, "../other").is_err());
+    }
+    #[test]
+    fn source_read_reply_matches_the_server_contract_and_refuses_foreign_or_unbounded_work() {
+        let (wire, saved, identity) = fixture();
+        let source = bind(&wire, &saved, &identity);
+        let timestamp = wire["request"]["timestamp"].as_u64().unwrap();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/source-read-v1.json")).unwrap();
+        let parsed: PollResponse = serde_json::from_value(fixture.clone()).unwrap();
+        assert!(parsed
+            .request
+            .unwrap()
+            .validate(&source, 200_000, timestamp)
+            .is_ok());
+        for (key, value) in [
+            ("id", json!("../private")),
+            ("sourceId", json!("77777777-7777-4777-8777-777777777777")),
+            ("scopeFingerprint", json!("f".repeat(64))),
+            ("authorizationEpoch", json!(8)),
+            ("resourceKey", json!("/private/original.jpg")),
+            ("version", json!("C".repeat(64))),
+            ("sha256", json!("not-a-digest")),
+            ("bytes", json!(0)),
+            ("bytes", json!(200_001)),
+            ("claimFence", json!(0)),
+            ("claimFence", json!(2_147_483_648u32)),
+            ("claimToken", json!("E".repeat(64))),
+            ("leaseUntil", json!("2027-01-15T08:00:00.000Z")),
+            ("leaseUntil", json!("2027-01-15T08:03:00.000Z")),
+            ("deadline", json!("2027-01-15T08:00:30.000Z")),
+            ("deadline", json!("2027-01-15T08:10:01.000Z")),
+        ] {
+            let mut changed = fixture.clone();
+            changed["request"][key] = value;
+            let parsed: PollResponse = serde_json::from_value(changed).unwrap();
+            assert!(
+                parsed
+                    .request
+                    .unwrap()
+                    .validate(&source, 200_000, timestamp)
+                    .is_err(),
+                "{key}"
+            );
+        }
+        let parsed: PollResponse = serde_json::from_value(fixture.clone()).unwrap();
+        let claim = parsed.request.unwrap();
+        assert!(claim.validate(&source, 0, timestamp).is_err());
+        assert!(claim
+            .validate(&source, 9_007_199_254_740_992, timestamp)
+            .is_err());
+        assert!(claim
+            .validate(&source, 200_000, timestamp + 3_600_000)
+            .is_err());
+        let mut unexpected = fixture.clone();
+        unexpected["request"]["path"] = json!("/private");
+        assert!(serde_json::from_value::<PollResponse>(unexpected).is_err());
+        assert!(serde_json::from_value::<PollResponse>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<PollResponse>(json!({"request":null}))
+                .unwrap()
+                .request
+                .is_none()
+        );
     }
 }
