@@ -1,5 +1,4 @@
-//! Durable source-input reservations. Drop never frees capacity or deletes staged bytes.
-// shortcut: source inputs only; include owned ML memory/scratch before claiming an app-wide limit.
+//! Durable private-input reservations. Drop never frees capacity or deletes staged bytes.
 use crate::{connection::DeviceIdentity, source_import::Journal};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
@@ -8,6 +7,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+mod worker;
+pub(crate) use worker::WorkerInputs;
 
 pub(crate) const LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
@@ -17,6 +18,11 @@ struct Allocation {
     source: String,
     id: String,
     bytes: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    worker: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +126,7 @@ impl<'a> InputBudget<'a> {
                 || !uuid(&entry.id)
                 || !ids.insert(&entry.id)
                 || entry.bytes == 0
+                || (entry.worker && entry.source != self.identity.installation_id)
             {
                 return Err("source_input_budget_invalid".into());
             }
@@ -141,17 +148,29 @@ impl<'a> InputBudget<'a> {
                 .sum::<u64>())
     }
     pub(crate) fn reserve(&mut self, source: &str, id: &str, bytes: u64) -> Result<(), String> {
+        self.reserve_kind(source, id, bytes, false)
+    }
+    fn reserve_kind(
+        &mut self,
+        source: &str,
+        id: &str,
+        bytes: u64,
+        worker: bool,
+    ) -> Result<(), String> {
         if !uuid(source) || !uuid(id) || bytes == 0 || bytes > LIMIT {
             return Err("source_input_budget_invalid".into());
         }
         let mut ledger = self.read()?;
         self.staged(&ledger)?;
         if let Some(old) = ledger.allocations.iter().find(|entry| entry.id == id) {
-            return if old.source == source && old.bytes == bytes {
+            return if old.source == source && old.bytes == bytes && old.worker == worker {
                 Ok(())
             } else {
                 Err("source_input_budget_invalid".into())
             };
+        }
+        if worker && ledger.allocations.iter().any(|entry| entry.worker) {
+            return Err("worker_shutdown_unconfirmed".into());
         }
         if ledger.allocations.len() == MAX_RECORDS
             || bytes
@@ -168,6 +187,7 @@ impl<'a> InputBudget<'a> {
             source: source.into(),
             id: id.into(),
             bytes,
+            worker,
         });
         self.check()?;
         self.journal.write("budget.json", &ledger, self.identity)
@@ -177,7 +197,7 @@ impl<'a> InputBudget<'a> {
         let entry = ledger
             .allocations
             .iter_mut()
-            .find(|entry| entry.source == source && entry.id == id)
+            .find(|entry| entry.source == source && entry.id == id && !entry.worker)
             .ok_or("source_input_budget_invalid")?;
         if bytes == 0 || bytes > entry.bytes {
             return Err("source_input_budget_invalid".into());
@@ -189,15 +209,23 @@ impl<'a> InputBudget<'a> {
     }
     /// Caller must first join all producers/readers and confirm cleanup with authoritative job state.
     pub(crate) fn release(&mut self, source: &str, id: &str) -> Result<(), String> {
+        self.release_kind(source, id, false)
+    }
+    fn release_kind(&mut self, source: &str, id: &str, worker: bool) -> Result<(), String> {
         if !uuid(source) || !uuid(id) {
             return Err("source_input_budget_invalid".into());
+        }
+        if worker {
+            worker::completed(&self.base, self.identity, id)?;
         }
         let mut ledger = self.read()?;
         if self.staged(&ledger)?.contains(id) {
             return Err("source_cache_cleanup_pending".into());
         }
         if let Some(index) = ledger.allocations.iter().position(|entry| entry.id == id) {
-            if ledger.allocations[index].source != source {
+            if ledger.allocations[index].source != source
+                || ledger.allocations[index].worker != worker
+            {
                 return Err("source_input_budget_invalid".into());
             }
             ledger.allocations.remove(index);
@@ -207,6 +235,7 @@ impl<'a> InputBudget<'a> {
         Ok(())
     }
     fn staged(&self, ledger: &Ledger) -> Result<HashSet<String>, String> {
+        worker::audit(&self.base, self.identity, ledger)?;
         let mut seen = HashSet::new();
         let mut count = 0usize;
         for (prefix, reads) in [
@@ -283,7 +312,7 @@ fn inspect_stage(
         let allocation = ledger
             .allocations
             .iter()
-            .find(|entry| entry.source == source && entry.id == id)
+            .find(|entry| entry.source == source && entry.id == id && !entry.worker)
             .ok_or("source_input_budget_untracked")?;
         if !seen.insert(id.into()) {
             return Err("source_input_budget_invalid".into());

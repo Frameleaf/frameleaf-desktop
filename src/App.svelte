@@ -74,7 +74,7 @@
     account_identity_changed: 'This session no longer matches the saved account. Sign out before continuing.',
     device_details_invalid: 'Enter a computer name between 1 and 128 characters.',
   };
-  function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check your connection and try again.'; }
+  function explain(error: unknown) { return runtimeRecoveryMessage(String(error)) ?? errors[String(error)] ?? 'This operation could not finish. Check your connection and try again.'; }
   onMount(() => {
     if (!native) return;
     let disposed = false;

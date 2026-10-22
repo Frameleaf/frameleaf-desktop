@@ -731,6 +731,22 @@ async fn prepare(
         return Err("worker_no_eligible_workloads".into());
     }
     let profiles: Vec<_> = groups.iter().flatten().cloned().collect();
+    if paths.data.file_name().and_then(|name| name.to_str()) != Some("worker") {
+        return Err("source_input_budget_invalid".into());
+    }
+    let input_base = paths
+        .data
+        .parent()
+        .ok_or("source_input_budget_invalid")?
+        .to_path_buf();
+    let input_identity = crate::credentials::identity()?;
+    let input_bindings = profiles.len();
+    let inputs = tauri::async_runtime::spawn_blocking(move || {
+        crate::private_inputs::WorkerInputs::acquire(&input_base, input_identity, input_bindings)
+    })
+    .await
+    .map_err(|_| "worker_shutdown_unconfirmed")??;
+    let outcome = async {
     let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
         .await
         .map_err(|_| "resource_status_unavailable")?;
@@ -787,6 +803,7 @@ async fn prepare(
                 })
                 .await?;
                 progress.set("qualifying", None);
+                inputs.check()?;
                 let challenge = match cancellable(
                     worker.request_qualification(
                         profile,
@@ -929,6 +946,7 @@ async fn prepare(
                 continue 'qualification;
             }
             progress.set("starting-worker", None);
+            inputs.check()?;
             let scratch = paths.data.join("scratch");
             let cache = cache.clone();
             let (runtime, proofs, mut predictor) =
@@ -991,6 +1009,7 @@ async fn prepare(
                         biased;
                         reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
                         result = async {
+                            inputs.check()?;
                             predictor.prepare(&worker, &mut cancel).await?;
                             progress.set("working", None);
                             predictor.execute_next_many(&worker, &accepted, &mut cancel).await
@@ -1027,6 +1046,18 @@ async fn prepare(
             }
         }
     }
+    }.await;
+    if outcome
+        .as_ref()
+        .err()
+        .is_some_and(|code| shutdown_uncertain(code))
+    {
+        return outcome;
+    }
+    tauri::async_runtime::spawn_blocking(move || inputs.finish())
+        .await
+        .map_err(|_| "worker_shutdown_unconfirmed")??;
+    outcome
 }
 
 #[cfg(test)]

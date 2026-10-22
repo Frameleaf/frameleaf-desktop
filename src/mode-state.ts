@@ -26,6 +26,14 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
 
 export function runtimeRecoveryMessage(code: string | null): string | null {
   switch (code) {
+    case 'source_staging_budget_exceeded':
+      return 'Private input capacity is full. Finish existing source work or stop AI processing before retrying. Retained files are kept.';
+    case 'source_input_budget_busy':
+      return 'Another operation is reserving private input capacity. Wait for it to finish, then retry.';
+    case 'source_input_budget_invalid':
+    case 'source_input_budget_untracked':
+    case 'source_cache_cleanup_pending':
+      return 'Private input storage needs recovery before more AI work can start. Retained files are kept. Photos remain available.';
     case 'runtime_epoch_credential_missing':
     case 'runtime_epoch_identity_changed':
     case 'runtime_epoch_recovery_required':
