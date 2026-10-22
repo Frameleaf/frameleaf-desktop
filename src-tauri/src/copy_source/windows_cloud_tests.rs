@@ -264,6 +264,91 @@ impl Drop for Provider {
         }
     }
 }
+fn change_observation(path: &Path) -> (i64, i64) {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FileBasicInfo, GetFileInformationByHandleEx},
+        System::{
+            Ioctl::{FSCTL_READ_FILE_USN_DATA, READ_FILE_USN_DATA},
+            IO::DeviceIoControl,
+        },
+    };
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .unwrap();
+    let supported = READ_FILE_USN_DATA {
+        MinMajorVersion: 2,
+        MaxMajorVersion: 3,
+    };
+    let mut record = [0u8; 1024];
+    let mut returned = 0;
+    assert_ne!(
+        unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_READ_FILE_USN_DATA,
+                (&supported as *const READ_FILE_USN_DATA).cast(),
+                size_of::<READ_FILE_USN_DATA>() as u32,
+                record.as_mut_ptr().cast(),
+                record.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "synthetic file USN read failed: {}",
+        unsafe { GetLastError() }
+    );
+    assert!(returned as usize <= record.len() && returned >= 8);
+    let length = u32::from_le_bytes(record[..4].try_into().unwrap());
+    assert!(length <= returned);
+    let (offset, minimum) = match u16::from_le_bytes(record[4..6].try_into().unwrap()) {
+        2 => (24, 60),
+        3 => (40, 76),
+        _ => panic!("unsupported synthetic file USN record"),
+    };
+    assert!(length >= minimum);
+    let usn = i64::from_le_bytes(record[offset..offset + 8].try_into().unwrap());
+    let mut basic = FILE_BASIC_INFO::default();
+    assert_ne!(
+        unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        },
+        0
+    );
+    (usn, basic.ChangeTime)
+}
+
+fn timestamp_preserving_writer_changes_journal(base: &Path) {
+    let path = base.join("timestamp-preserved-original.bin");
+    fs::write(&path, DATA).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let before = change_observation(&path);
+    {
+        let mut writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(&[0x59]).unwrap();
+        writer.set_modified(modified).unwrap();
+        writer.sync_all().unwrap();
+    }
+    let after = change_observation(&path);
+    let metadata = fs::metadata(&path).unwrap();
+    assert_eq!(metadata.modified().unwrap(), modified);
+    assert_eq!(metadata.len(), DATA.len() as u64);
+    assert!(
+        before.0 > 0 && after.0 > before.0,
+        "journal must detect the timestamp-preserving fixture write: {before:?} -> {after:?}"
+    );
+    println!("timestamp-preserving fixture write: USN/ChangeTime {before:?} -> {after:?}");
+}
+
 fn hydrate_explicit_range(path: &Path) -> Result<(), String> {
     let path = wide(path);
     let mut protected = std::ptr::null_mut();
@@ -775,8 +860,13 @@ fn cloud_provider_child() {
             .load(Ordering::Acquire),
         0
     );
+    let change_before = change_observation(&root.join(FILE_NAME));
     hydrate_explicit_range(&root.join(FILE_NAME)).unwrap();
+    let change_hydrated = change_observation(&root.join(FILE_NAME));
     assert_eq!(fs::read(root.join(FILE_NAME)).unwrap(), DATA);
+    let change_after = change_observation(&root.join(FILE_NAME));
+    println!("explicit hydration: USN/ChangeTime {change_before:?} -> {change_hydrated:?}; resident read -> {change_after:?}");
+    timestamp_preserving_writer_changes_journal(&base);
     drop(dir);
     provider.close().unwrap();
     let context = provider.context.as_ref().unwrap();
