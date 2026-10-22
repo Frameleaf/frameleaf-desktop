@@ -33,6 +33,7 @@ mod process_tree;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod profile_elevation;
 pub mod release_policy;
+pub mod resource_bridge;
 mod resource_policy;
 pub mod runtime_epochs;
 pub mod runtime_store;
