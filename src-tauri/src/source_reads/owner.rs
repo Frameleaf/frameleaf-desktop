@@ -1,7 +1,9 @@
 //! The application owns one poller and drains its current read before changing authority.
+mod preparation;
 use super::Job;
 use crate::connection::{DeviceIdentity, SavedConnection};
 use cap_std::{ambient_authority, fs::Dir};
+pub use preparation::PreparationAction;
 use serde::Serialize;
 use std::{
     future::Future,
@@ -450,6 +452,147 @@ mod tests {
     };
     fn notify() -> Arc<dyn Fn(View) + Send + Sync> {
         Arc::new(|_| {})
+    }
+    fn prepared() -> super::super::PreparationView {
+        super::super::PreparationView {
+            source_id: "source".into(),
+            maximum_bytes: 10,
+            export: false,
+            spent: 10,
+            remaining: 0,
+            prepared: true,
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_preparation_reply_cancels_but_retains_blocking_owner_until_drain() {
+        let owner = Arc::new(Requests::default());
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (observed, stopping) = tokio::sync::oneshot::channel();
+        let (finish, wait) = std::sync::mpsc::channel();
+        let caller_owner = owner.clone();
+        let caller = tokio::spawn(async move {
+            caller_owner
+                .prepare_owned("source".into(), notify(), move |_, check| {
+                    ready.send(()).unwrap();
+                    while check().is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    observed.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(prepared())
+                })
+                .await
+        });
+        started.await.unwrap();
+        caller.abort();
+        assert!(caller.await.is_err_and(|error| error.is_cancelled()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owner.is_active());
+        let mut stop = Box::pin(owner.stop());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut stop)
+                .await
+                .is_err()
+        );
+        assert!(owner.is_active());
+        finish.send(()).unwrap();
+        stop.await.unwrap();
+        assert!(!owner.is_active());
+    }
+    #[tokio::test]
+    async fn stopping_preparation_drains_before_reply_and_preserves_unknown_failure() {
+        for unknown in [false, true] {
+            let owner = Arc::new(Requests::default());
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let (observed, stopping) = tokio::sync::oneshot::channel();
+            let (finish, wait) = std::sync::mpsc::channel();
+            let caller_owner = owner.clone();
+            let caller = tokio::spawn(async move {
+                caller_owner
+                    .prepare_owned("source".into(), notify(), move |_, check| {
+                        ready.send(()).unwrap();
+                        while check().is_ok() {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        observed.send(()).unwrap();
+                        wait.recv().unwrap();
+                        if unknown {
+                            Err("source_copy_shutdown_unconfirmed".into())
+                        } else {
+                            Ok(prepared())
+                        }
+                    })
+                    .await
+            });
+            started.await.unwrap();
+            let stop_owner = owner.clone();
+            let stop = tokio::spawn(async move { stop_owner.stop().await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), stopping)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!caller.is_finished());
+            assert!(!stop.is_finished());
+            finish.send(()).unwrap();
+            assert_eq!(
+                caller.await.unwrap().err().as_deref(),
+                Some(if unknown {
+                    "source_copy_shutdown_unconfirmed"
+                } else {
+                    "source_delivery_interrupted"
+                })
+            );
+            assert_eq!(
+                stop.await.unwrap().err().as_deref(),
+                if unknown {
+                    Some("source_read_shutdown_unconfirmed")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(owner.is_active(), unknown);
+        }
+    }
+    #[tokio::test]
+    async fn preparation_panic_reports_unknown_and_fences_replacement() {
+        let owner = Requests::default();
+        assert_eq!(
+            owner
+                .prepare_owned("source".into(), notify(), |_, _| {
+                    panic!("synthetic blocking preparation panic")
+                })
+                .await
+                .err()
+                .as_deref(),
+            Some("source_read_shutdown_unconfirmed")
+        );
+        assert_eq!(
+            owner.stop().await.err().as_deref(),
+            Some("source_read_shutdown_unconfirmed")
+        );
+        assert!(owner.is_active());
+        assert!(owner
+            .prepare_owned("next".into(), notify(), |_, _| Ok(prepared()))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn preparation_result_is_returned_only_after_owned_work_finishes() {
+        let owner = Requests::default();
+        let view = owner
+            .prepare_owned("source".into(), notify(), |_, check| {
+                check()?;
+                Ok(prepared())
+            })
+            .await
+            .unwrap();
+        assert!(view.prepared);
+        assert_eq!(view.spent, 10);
+        owner.stop().await.unwrap();
+        assert!(!owner.is_active());
     }
     #[tokio::test]
     async fn cancelled_stop_retains_the_owned_task_until_a_later_drain() {

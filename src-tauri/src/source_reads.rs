@@ -8,7 +8,7 @@ use crate::{
     source_import::Journal,
 };
 use cap_std::{ambient_authority, fs::Dir};
-pub use owner::{Requests, View};
+pub use owner::{PreparationAction, Requests, View};
 pub use planner::{Preparation, PreparationView};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -670,6 +670,54 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn reference_preparation_pipeline_resumes_after_move_with_lost_reply() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        let stop_after_move = || {
+            let state: serde_json::Value =
+                prep.journal.read("preparation-state.json", &f.identity)?;
+            if let Some(id) = state["resource"]["id"].as_str() {
+                if !prep.journal.root.join("stage").join(id).exists() {
+                    return Err("source_copy_cancelled".into());
+                }
+            }
+            Ok(())
+        };
+        assert!(prep
+            .finish_with(
+                &f.saved,
+                &f.identity,
+                &AtomicBool::new(false),
+                &stop_after_move
+            )
+            .is_err());
+        assert_eq!(
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(true), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_copy_cancelled")
+        );
+        let view = prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert!(view.prepared);
+        assert_eq!((view.spent, view.remaining), (10, 0));
     }
     #[test]
     fn reference_preparation_requires_budget_and_preserves_spending_after_restart() {

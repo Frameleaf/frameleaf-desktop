@@ -17,7 +17,7 @@ struct Progress {
     attempt: Option<String>,
     resource: Option<StagedCopy>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreparationView {
     pub source_id: String,
@@ -268,6 +268,39 @@ impl Preparation {
             self.current(saved, identity)?;
             gate()
         })
+    }
+    pub fn stage_and_handoff(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        cancelled: &AtomicBool,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<PreparationView, String> {
+        self.finish_with(saved, identity, cancelled, &|| {
+            self.current(saved, identity)?;
+            gate()
+        })
+    }
+    pub(super) fn finish_with(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        cancelled: &AtomicBool,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<PreparationView, String> {
+        let check = || {
+            if cancelled.load(Ordering::Acquire) {
+                return Err("source_copy_cancelled".into());
+            }
+            gate()
+        };
+        check()?;
+        // A lost reply may leave the verified cache in its read job already.
+        if self.progress(saved, identity)?.resource.is_none() {
+            self.stage_with(saved, identity, cancelled, &check)?;
+        }
+        self.handoff_with(saved, identity, &check)?;
+        self.view(saved, identity)
     }
     /// Moves the prepared cache into a read job with no additional read or upload authority.
     pub fn handoff(
