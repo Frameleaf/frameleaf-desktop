@@ -191,6 +191,7 @@ impl Progress {
                                 | "parent-version"
                                 | "protected-open"
                                 | "oplock"
+                                | "oplock-hydrate"
                                 | "oplock-open"
                                 | "oplock-first-read"
                                 | "oplock-next-read"
@@ -612,6 +613,7 @@ mod tests {
             ("source_item_changed:after-read", "source_item_changed"),
             ("source_item_changed:oplock", "source_item_changed"),
             ("source_item_changed:oplock-open", "source_item_changed"),
+            ("source_item_changed:oplock-hydrate", "source_item_changed"),
             (
                 "source_item_changed:oplock-first-read",
                 "source_item_changed",

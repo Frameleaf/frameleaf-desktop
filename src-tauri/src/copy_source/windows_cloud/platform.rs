@@ -420,6 +420,67 @@ pub(super) fn copy(
         source.version.volume == stage_info.VolumeSerialNumber,
         true,
     )?;
+    if source.leaf_cloud {
+        source.release_leaf();
+        let mut offset = 0;
+        while offset < request.bytes {
+            let length = (request.bytes - offset).min(CHUNK_BYTES) as usize;
+            let mut current = Source::open(
+                &request.root,
+                &request.root_identity,
+                &request.relative,
+                Some(request.bytes),
+            )?;
+            if current.version != source.version {
+                return Err("source_item_changed:before-read".into());
+            }
+            let file = Protected::open(&current.protected_path()?)?;
+            let reference = file.reference("hydrate")?;
+            if Version::read(reference.raw)? != source.version {
+                return Err("source_item_changed:before-read".into());
+            }
+            current.release_leaf();
+            let mut hydrate = Operation::new(offset)?;
+            let result = unsafe {
+                CfHydratePlaceholder(
+                    reference.raw,
+                    offset as i64,
+                    length as i64,
+                    CF_HYDRATE_FLAG_NONE,
+                    &mut *hydrate.overlapped,
+                )
+            };
+            if result == (0x80070000u32 | ERROR_IO_PENDING) as i32 {
+                hydrate.wait(reference.raw, &mut || {
+                    if emit(Event::Error {
+                        operation_id: request.operation_id.clone(),
+                        code: "source_cloud_provider_unavailable".into(),
+                    })
+                    .is_err()
+                    {
+                        std::process::exit(2);
+                    }
+                })?;
+            } else if result < 0 {
+                return Err(format!("source_cloud_hydration_failed:{result:08x}"));
+            }
+            if Version::read(reference.raw)? != source.version {
+                return Err("source_item_changed:after-read".into());
+            }
+            offset += length as u64;
+        }
+        let hydrated = Source::open(
+            &request.root,
+            &request.root_identity,
+            &request.relative,
+            Some(request.bytes),
+        )?;
+        if hydrated.version != source.version {
+            return Err("source_item_changed:before-read".into());
+        }
+        source = hydrated;
+    }
+    // Copy only after hydration, under one oplock that no between-chunk writer can bypass.
     let file = Protected::open(&source.protected_path()?)?;
     if Version::read(file.reference("open")?.raw)? != source.version {
         return Err("source_item_changed:protected-open".into());
@@ -446,32 +507,6 @@ pub(super) fn copy(
         })?;
         if Version::read(reference.raw)? != source.version {
             return Err("source_item_changed:before-read".into());
-        }
-        if source.leaf_cloud {
-            let mut hydrate = Operation::new(copied)?;
-            let result = unsafe {
-                CfHydratePlaceholder(
-                    reference.raw,
-                    copied as i64,
-                    length as i64,
-                    CF_HYDRATE_FLAG_NONE,
-                    &mut *hydrate.overlapped,
-                )
-            };
-            if result == (0x80070000u32 | ERROR_IO_PENDING) as i32 {
-                hydrate.wait(reference.raw, &mut || {
-                    if emit(Event::Error {
-                        operation_id: request.operation_id.clone(),
-                        code: "source_cloud_provider_unavailable".into(),
-                    })
-                    .is_err()
-                    {
-                        std::process::exit(2);
-                    }
-                })?;
-            } else if result < 0 {
-                return Err(format!("source_cloud_hydration_failed:{result:08x}"));
-            }
         }
         let mut read = Operation::new(copied)?;
         let started = unsafe {
@@ -578,6 +613,88 @@ mod tests {
         assert_eq!(copied.sha256, format!("{:x}", Sha256::digest(&original)));
         assert_eq!(copied.bytes, original.len() as u64);
         assert_eq!(copied.source_stamp, request.source_stamp);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn timestamp_preserving_writer_between_chunks_cannot_publish_a_mixed_copy() {
+        let base = std::env::temp_dir().join(format!(
+            "frameleaf-reader-mutation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::windows_protection::new_private_directory(&base).unwrap();
+        let root = base.join("source");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("original.bin");
+        std::fs::write(&path, vec![0x5a; CHUNK_BYTES as usize * 3 + 17]).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let root_identity = super::super::super::source_root_identity(&directory).unwrap();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let staging = base.join(&operation_id);
+        crate::windows_protection::new_private_directory(&staging).unwrap();
+        let request = {
+            let source =
+                Source::open(root.to_str().unwrap(), &root_identity, "original.bin", None).unwrap();
+            Request {
+                version: 1,
+                operation_id,
+                root: root.to_str().unwrap().into(),
+                root_identity,
+                source_stamp: source.version.stamp(),
+                relative: "original.bin".into(),
+                staging: staging.to_str().unwrap().into(),
+                bytes: source.version.bytes,
+            }
+        };
+        let mut writer = None;
+        let result = copy(&request, &mut |event| {
+            if matches!(event, Event::Progress { bytes, .. } if bytes == CHUNK_BYTES) {
+                let path = path.clone();
+                let (started, ready) = std::sync::mpsc::sync_channel(0);
+                writer = Some(std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+                    file.write_all(&[0x59])?;
+                    file.set_modified(modified)?;
+                    file.sync_all()
+                }));
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                // Give the competing open time to queue its break while this chunk still owns a reference.
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(!writer.as_ref().unwrap().is_finished());
+            }
+            Ok(())
+        });
+        let writer = writer.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writer.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !writer.is_finished() {
+            std::process::exit(2);
+        }
+        writer.join().unwrap().unwrap();
+        assert!(result
+            .err()
+            .is_some_and(|code| code.starts_with("source_item_changed:")));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(
+            Source::open(
+                &request.root,
+                &request.root_identity,
+                &request.relative,
+                Some(request.bytes)
+            )
+            .unwrap()
+            .version
+            .stamp(),
+            request.source_stamp
+        );
+        drop(directory);
         std::fs::remove_dir_all(base).unwrap();
     }
 }
