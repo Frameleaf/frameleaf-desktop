@@ -243,6 +243,17 @@ impl Source {
             cloud,
         })
     }
+    pub(super) fn validate_read_permission(&self, relative: &str) -> Result<(), String> {
+        let path = super::super::relative_path(relative)?;
+        let name = path.file_name().ok_or("source_item_invalid")?;
+        let dir = self.held.last().ok_or("source_item_unavailable")?;
+        let file = super::super::windows_permission::open_current(dir, Path::new(name))?;
+        attributes(file.as_raw_handle(), true, true)?;
+        if Version::read(file.as_raw_handle())?.stamp() != self.version.stamp() {
+            return Err("source_item_changed".into());
+        }
+        Ok(())
+    }
     fn protected_path(&self) -> Result<Vec<u16>, String> {
         let leaf = self._leaf.as_ref().ok_or("source_identity_unavailable")?;
         let mut name = vec![0u16; 32_768];

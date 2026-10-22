@@ -259,6 +259,22 @@ pub(super) fn approval_root(path: &std::path::Path) -> Result<cap_std::fs::Dir, 
     held.pop().ok_or_else(|| "source_root_unavailable".into())
 }
 #[cfg(windows)]
+pub(super) fn validate_current(copy: &super::StagedCopy) -> Result<(), String> {
+    if !enabled() {
+        return Err("source_cloud_copy_pending".into());
+    }
+    let source = platform::Source::open(
+        &copy.approval.scope.root,
+        &copy.approval.scope.root_identity,
+        &copy.relative,
+        Some(copy.bytes),
+    )?;
+    if source.version.stamp() != copy.source_stamp {
+        return Err("source_item_changed".into());
+    }
+    source.validate_read_permission(&copy.relative)
+}
+#[cfg(windows)]
 pub(super) fn run_child() -> Result<(), String> {
     use std::io::{Read, Write};
     if !enabled() {

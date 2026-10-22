@@ -727,6 +727,7 @@ pub fn prepare_delivery(
     }
     copy.validate_current(saved, identity)?;
     let file = copy.verify(saved, identity, staging)?.into_std();
+    copy.validate_current(saved, identity)?;
     gate()?;
     claim.validate(&signed.source, max_bytes, now()?)?;
     let until = expires_at(&claim.deadline)

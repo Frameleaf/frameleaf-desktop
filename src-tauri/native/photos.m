@@ -72,6 +72,23 @@ char *fl_photos_preview(unsigned int count) { @autoreleasepool {
     if (@available(macOS 11.0, *)) return preview(count);
     return json(@{@"error":@"photos_macos_update_required"});
 } }
+// Metadata only: never request authorization, resource data or network hydration.
+int fl_photos_current(const char *description) { @autoreleasepool {
+    if (@available(macOS 11.0, *)) {
+        if (!authorized()) return 1;
+        NSData *data = [[NSString stringWithUTF8String:description] dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *expected = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![expected isKindOfClass:NSDictionary.class] || ![expected[@"asset"] isKindOfClass:NSString.class] ||
+            ![expected[@"index"] isKindOfClass:NSNumber.class]) return 2;
+        PHAsset *asset = [PHAsset fetchAssetsWithLocalIdentifiers:@[expected[@"asset"]] options:nil].firstObject;
+        if (!asset || asset.hidden) return 2;
+        NSArray<PHAssetResource *> *all = [PHAssetResource assetResourcesForAsset:asset];
+        NSUInteger index = [expected[@"index"] unsignedIntegerValue];
+        if (index >= all.count || !original(all[index]) || ![describe(asset, all[index], index) isEqual:expected]) return 2;
+        return authorized() ? 0 : 1;
+    }
+    return 1;
+} }
 // A NULL/zero-length callback is a local policy/cancellation check, never media data.
 static int export_resource(const char *description, bool allow_hydration, FLPhotosSink sink, void *context) API_AVAILABLE(macos(11.0)) { @autoreleasepool {
     if (!authorized()) return 1;

@@ -82,6 +82,7 @@ impl Selection {
 unsafe extern "C" {
     fn fl_photos_preview(count: u32) -> *mut std::ffi::c_char;
     fn fl_photos_authorized() -> bool;
+    fn fl_photos_current(description: *const std::ffi::c_char) -> i32;
     fn fl_photos_export(
         description: *const std::ffi::c_char,
         allow_hydration: bool,
@@ -100,6 +101,25 @@ pub(crate) fn authorized() -> Result<(), String> {
         "photos_macos_required"
     }
     .into())
+}
+pub(crate) fn validate_current(resource: &Resource) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let description = std::ffi::CString::new(
+            serde_json::to_string(resource).map_err(|_| "photos_metadata_invalid")?,
+        )
+        .map_err(|_| "photos_metadata_invalid")?;
+        match unsafe { fl_photos_current(description.as_ptr()) } {
+            0 => Ok(()),
+            1 => Err("photos_permission_required".into()),
+            _ => Err("photos_scope_changed".into()),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = resource;
+        Err("photos_macos_required".into())
+    }
 }
 pub(crate) fn preview(count: u32) -> Result<Selection, String> {
     if !(1..=100).contains(&count) {

@@ -160,6 +160,8 @@ fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String,
     }
 }
 #[cfg(windows)]
+mod windows_permission;
+#[cfg(windows)]
 fn windows_file_id(
     handle: windows_sys::Win32::Foundation::HANDLE,
 ) -> Result<windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO, String> {
@@ -833,7 +835,64 @@ impl StagedCopy {
         saved: &SavedConnection,
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
-        self.approval.validate_current(saved, identity)
+        self.validate_receipt(saved, identity)?;
+        if let Some(photos) = &self.approval.scope.photos {
+            let resource = photos.resource(&self.relative)?;
+            if serde_json::to_string(resource).map_err(|_| "photos_metadata_invalid")?
+                != self.source_stamp
+            {
+                return Err("source_item_changed".into());
+            }
+            return crate::apple_photos::validate_current(resource);
+        }
+        #[cfg(windows)]
+        if self.source_stamp.starts_with("cloud-file-v1:") {
+            return windows_cloud::validate_current(self);
+        }
+        let root = self.approval.root();
+        crate::native_runtime::absolute_directory(root)?;
+        let dir = Dir::open_ambient_dir(root, ambient_authority())
+            .map_err(|_| "source_root_unavailable")?;
+        check_source_root(
+            &self.approval.scope.root_identity,
+            &source_root_identity(&dir)?,
+        )?;
+        let meta = dir.dir_metadata().map_err(|_| "source_root_unavailable")?;
+        if crate::source_metadata::probe(&dir, Path::new("."), &meta)?.excluded {
+            return Err("source_item_excluded".into());
+        }
+        let (dir, name) = parent_dir(&dir, relative_path(&self.relative)?)?;
+        let meta = dir
+            .symlink_metadata(&name)
+            .map_err(|_| "source_item_unavailable")?;
+        if !meta.is_file()
+            || link(&meta)
+            || meta.len() != self.bytes
+            || path_stamp(&dir, &name, &meta)? != self.source_stamp
+        {
+            return Err("source_item_changed".into());
+        }
+        if crate::source_metadata::probe(&dir, &name, &meta)?.excluded {
+            return Err("source_item_excluded".into());
+        }
+        #[cfg(windows)]
+        if opened_stamp(&windows_permission::open_current(&dir, &name)?)? != self.source_stamp {
+            return Err("source_item_changed".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+            let name = std::ffi::CString::new(name.as_os_str().as_bytes())
+                .map_err(|_| "source_item_invalid")?;
+            // Check effective read permission without opening or hydrating the original.
+            if unsafe {
+                libc::faccessat(dir.as_raw_fd(), name.as_ptr(), libc::R_OK, libc::AT_EACCESS)
+            } != 0
+            {
+                return Err("source_item_unavailable".into());
+            }
+        }
+        Ok(())
     }
     pub(crate) fn scope_fingerprint(&self) -> String {
         self.approval.fingerprint()
@@ -949,12 +1008,11 @@ impl StagedCopy {
             ),
         )
     }
-    pub fn verify(
+    fn validate_receipt(
         &self,
         saved: &SavedConnection,
         identity: &DeviceIdentity,
-        destination: &Path,
-    ) -> Result<cap_std::fs::File, String> {
+    ) -> Result<(), String> {
         self.approval.validate(saved, identity)?;
         if Uuid::parse_str(&self.id)
             .map_err(|_| "source_stage_invalid")?
@@ -965,6 +1023,15 @@ impl StagedCopy {
         {
             return Err("source_stage_invalid".into());
         }
+        Ok(())
+    }
+    pub fn verify(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        destination: &Path,
+    ) -> Result<cap_std::fs::File, String> {
+        self.validate_receipt(saved, identity)?;
         crate::native_runtime::absolute_directory(destination)?;
         let dir = Dir::open_ambient_dir(destination, ambient_authority())
             .map_err(|_| "source_stage_unavailable")?;
@@ -1160,6 +1227,101 @@ mod windows_cloud_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_source_recheck_rejects_changes_missing_roots_links_and_forged_receipts() {
+        let path = std::env::temp_dir().join(format!("frameleaf-current-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let _cleanup = Partial(Some(path.clone()));
+        let path = fs::canonicalize(path).unwrap();
+        let root = path.join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("photo.jpg"), b"original").unwrap();
+        let saved = SavedConnection {
+            server: "https://nas.test/".into(),
+            server_id: "nas".into(),
+            account_id: "owner".into(),
+            name: "Synthetic".into(),
+            token: "synthetic".into(),
+            device_name: "Synthetic".into(),
+            mode: "client-worker".into(),
+            device_id: Some("device".into()),
+        };
+        let identity = DeviceIdentity::generate();
+        let approval = CopyApproval::approve(&saved, &identity, &root, 1024, true).unwrap();
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let meta = dir.symlink_metadata("photo.jpg").unwrap();
+        let mut copy = StagedCopy {
+            id: Uuid::new_v4().to_string(),
+            bytes: 8,
+            sha256: format!("{:x}", Sha256::digest(b"original")),
+            file_created_at_ms: 0,
+            file_modified_at_ms: 0,
+            source_signature: approval.signature.clone(),
+            source_stamp: path_stamp(&dir, Path::new("photo.jpg"), &meta).unwrap(),
+            relative: "photo.jpg".into(),
+            approval,
+            signature: String::new(),
+        };
+        copy.signature = copy.sign(&identity).unwrap();
+        copy.validate_current(&saved, &identity).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } != 0 {
+                fs::set_permissions(root.join("photo.jpg"), fs::Permissions::from_mode(0o000))
+                    .unwrap();
+                // Keep the fixture's metadata current to exercise the permission check itself.
+                let meta = dir.symlink_metadata("photo.jpg").unwrap();
+                copy.source_stamp = path_stamp(&dir, Path::new("photo.jpg"), &meta).unwrap();
+                copy.signature = copy.sign(&identity).unwrap();
+                assert_eq!(
+                    copy.validate_current(&saved, &identity).unwrap_err(),
+                    "source_item_unavailable"
+                );
+                fs::set_permissions(root.join("photo.jpg"), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                let meta = dir.symlink_metadata("photo.jpg").unwrap();
+                copy.source_stamp = path_stamp(&dir, Path::new("photo.jpg"), &meta).unwrap();
+                copy.signature = copy.sign(&identity).unwrap();
+                copy.validate_current(&saved, &identity).unwrap();
+            }
+        }
+        let mut forged = copy.clone();
+        forged.relative = "elsewhere.jpg".into();
+        assert_eq!(
+            forged.validate_current(&saved, &identity).unwrap_err(),
+            "source_stage_invalid"
+        );
+        fs::write(root.join("photo.jpg"), b"modified").unwrap();
+        assert_eq!(
+            copy.validate_current(&saved, &identity).unwrap_err(),
+            "source_item_changed"
+        );
+        fs::rename(root.join("photo.jpg"), root.join("held.jpg")).unwrap();
+        assert!(copy.validate_current(&saved, &identity).is_err());
+        fs::write(root.join("photo.jpg"), b"original").unwrap();
+        assert_eq!(
+            copy.validate_current(&saved, &identity).unwrap_err(),
+            "source_item_changed"
+        );
+        fs::remove_file(root.join("photo.jpg")).unwrap();
+        fs::rename(root.join("held.jpg"), root.join("photo.jpg")).unwrap();
+        #[cfg(unix)]
+        {
+            fs::rename(root.join("photo.jpg"), root.join("held.jpg")).unwrap();
+            std::os::unix::fs::symlink("held.jpg", root.join("photo.jpg")).unwrap();
+            assert!(copy.validate_current(&saved, &identity).is_err());
+        }
+        drop(dir);
+        fs::rename(&root, path.join("offline")).unwrap();
+        assert!(copy.validate_current(&saved, &identity).is_err());
+        fs::create_dir(&root).unwrap();
+        assert_eq!(
+            copy.validate_current(&saved, &identity).unwrap_err(),
+            "source_root_changed"
+        );
+    }
+
     #[test]
     fn source_root_admission_requires_all_windows_identity_bits_and_explicit_legacy_reapproval() {
         let mut low = [0u8; 16];
