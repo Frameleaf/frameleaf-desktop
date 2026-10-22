@@ -334,6 +334,7 @@ pub async fn issue_grant(
 pub struct SignedSourceRequest {
     pub token: zeroize::Zeroizing<String>,
     pub proof: SourceProof,
+    source: SavedSource,
 }
 pub fn reserve_source_proof(
     saved: &SavedConnection,
@@ -360,7 +361,88 @@ pub fn reserve_source_proof(
     Ok(SignedSourceRequest {
         token: zeroize::Zeroizing::new(source.source_token.clone()),
         proof,
+        source,
     })
+}
+
+fn source_request(
+    signed: &SignedSourceRequest,
+    operation: SourceOperation,
+    payload: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    let mut proof = reqwest::header::HeaderValue::from_str(&signed.proof.header()?)
+        .map_err(|_| "source_proof_invalid")?;
+    proof.set_sensitive(true);
+    Ok(crate::transport::client()?
+        .post(
+            normalize_server(&signed.source.server)?
+                .join(&format!("api/source-resources/{}", operation.name()))
+                .map_err(|_| "source_request_invalid")?,
+        )
+        .bearer_auth(signed.token.as_str())
+        .header("x-frameleaf-source-proof", proof)
+        .json(&serde_json::json!({"payload": payload})))
+}
+
+pub async fn poll(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    source_id: &str,
+    max_bytes: u64,
+) -> Result<Option<ReadClaim>, String> {
+    if max_bytes == 0 || max_bytes > MAX_TIMESTAMP {
+        return Err("source_read_capacity_invalid".into());
+    }
+    let payload = serde_json::to_string(&serde_json::json!({"maxBytes": max_bytes}))
+        .map_err(|_| "source_read_payload_invalid")?;
+    let signed = reserve_source_proof(saved, identity, source_id, SourceOperation::Poll, &payload)?;
+    let response: PollResponse = crate::transport::json(
+        source_request(&signed, SourceOperation::Poll, &payload)?
+            .send()
+            .await
+            .map_err(|_| "source_poll_interrupted")?,
+    )
+    .await?;
+    if let Some(claim) = &response.request {
+        claim.validate(&signed.source, max_bytes, now()?)?;
+    }
+    Ok(response.request)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadLease {
+    lease_until: String,
+    deadline: String,
+}
+
+pub async fn heartbeat(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    source_id: &str,
+    max_bytes: u64,
+    claim: &mut ReadClaim,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(&serde_json::json!({
+        "requestId": &claim.id, "claimFence": claim.claim_fence, "claimToken": &claim.claim_token,
+    }))
+    .map_err(|_| "source_read_payload_invalid")?;
+    let signed = reserve_source_proof(
+        saved,
+        identity,
+        source_id,
+        SourceOperation::Heartbeat,
+        &payload,
+    )?;
+    claim.validate(&signed.source, max_bytes, now()?)?;
+    let response: ReadLease = crate::transport::json(
+        source_request(&signed, SourceOperation::Heartbeat, &payload)?
+            .send()
+            .await
+            .map_err(|_| "source_heartbeat_interrupted")?,
+    )
+    .await?;
+    claim.renew(&signed.source, response, max_bytes, now()?)
 }
 
 #[derive(Deserialize, zeroize::ZeroizeOnDrop)]
@@ -380,6 +462,27 @@ pub struct ReadClaim {
     deadline: String,
 }
 impl ReadClaim {
+    fn renew(
+        &mut self,
+        source: &SavedSource,
+        lease: ReadLease,
+        max_bytes: u64,
+        timestamp: u64,
+    ) -> Result<(), String> {
+        if lease.deadline != self.deadline
+            || !matches!((expires_at(&lease.lease_until), expires_at(&self.lease_until)),
+                (Some(next), Some(previous)) if next >= previous)
+        {
+            return Err("source_read_request_invalid".into());
+        }
+        let previous = std::mem::replace(&mut self.lease_until, lease.lease_until);
+        if let Err(error) = self.validate(source, max_bytes, timestamp) {
+            self.lease_until = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn validate(
         &self,
         source: &SavedSource,
@@ -726,5 +829,115 @@ mod tests {
                 .request
                 .is_none()
         );
+    }
+    #[test]
+    fn source_control_requests_use_only_the_bound_https_origin_and_source_proof() {
+        let (wire, saved, identity) = fixture();
+        let mut source = bind(&wire, &saved, &identity);
+        let payload = "{\"maxBytes\":200000}";
+        let proof = reserve_at(
+            &mut source,
+            &saved,
+            &identity,
+            SourceOperation::Poll,
+            payload,
+            |_| Ok(()),
+            wire["request"]["timestamp"].as_u64().unwrap(),
+        )
+        .unwrap();
+        let mut signed = SignedSourceRequest {
+            token: zeroize::Zeroizing::new(source.source_token.clone()),
+            proof,
+            source,
+        };
+        let request = source_request(&signed, SourceOperation::Poll, payload)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "https://synthetic.test/api/source-resources/poll"
+        );
+        assert_eq!(
+            request.headers()["authorization"].to_str().unwrap(),
+            format!("Bearer {}", signed.token.as_str())
+        );
+        assert_ne!(
+            request.headers()["authorization"].to_str().unwrap(),
+            format!("Bearer {}", saved.token)
+        );
+        assert!(request.headers()["x-frameleaf-source-proof"].is_sensitive());
+        assert_eq!(
+            request.headers()["x-frameleaf-source-proof"],
+            signed.proof.header().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(request.body().unwrap().as_bytes().unwrap()).unwrap(),
+            json!({"payload":payload})
+        );
+        signed.source.server = "http://synthetic.test/".into();
+        assert!(source_request(&signed, SourceOperation::Poll, payload).is_err());
+    }
+    #[test]
+    fn renewal_cannot_change_deadlines_or_install_invalid_lease_authority() {
+        let (wire, saved, identity) = fixture();
+        let source = bind(&wire, &saved, &identity);
+        let timestamp = wire["request"]["timestamp"].as_u64().unwrap();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/source-read-v1.json")).unwrap();
+        for (until, deadline, capacity) in [
+            (
+                "2027-01-15T08:00:30.000Z",
+                "2027-01-15T08:10:00.000Z",
+                200_000,
+            ),
+            (
+                "2027-01-15T08:03:00.000Z",
+                "2027-01-15T08:10:00.000Z",
+                200_000,
+            ),
+            ("invalid", "2027-01-15T08:10:00.000Z", 200_000),
+            (
+                "2027-01-15T08:01:30.000Z",
+                "2027-01-15T08:11:00.000Z",
+                200_000,
+            ),
+            ("2027-01-15T08:01:30.000Z", "2027-01-15T08:10:00.000Z", 1),
+        ] {
+            let mut claim = serde_json::from_value::<PollResponse>(fixture.clone())
+                .unwrap()
+                .request
+                .unwrap();
+            let before = claim.lease_until.clone();
+            assert!(claim
+                .renew(
+                    &source,
+                    ReadLease {
+                        lease_until: until.into(),
+                        deadline: deadline.into()
+                    },
+                    capacity,
+                    timestamp
+                )
+                .is_err());
+            assert_eq!(claim.lease_until, before);
+        }
+        let mut claim = serde_json::from_value::<PollResponse>(fixture)
+            .unwrap()
+            .request
+            .unwrap();
+        claim
+            .renew(
+                &source,
+                ReadLease {
+                    lease_until: "2027-01-15T08:01:30.000Z".into(),
+                    deadline: claim.deadline.clone(),
+                },
+                200_000,
+                timestamp,
+            )
+            .unwrap();
+        assert_eq!(claim.lease_until, "2027-01-15T08:01:30.000Z");
     }
 }
