@@ -130,9 +130,9 @@ impl WorkerSetup {
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let mut running = self.running.lock().await;
-        if let Some(previous) = running.take() {
+        if let Some(previous) = running.as_mut() {
             previous.cancel.store(true, Ordering::Release);
-            let _ = previous.task.await;
+            let _ = (&mut previous.task).await;
         }
         self.user_paused.store(false, Ordering::Release);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -168,10 +168,11 @@ impl WorkerSetup {
     }
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
-        if let Some(previous) = running.take() {
+        if let Some(previous) = running.as_mut() {
             previous.cancel.store(true, Ordering::Release);
-            let _ = previous.task.await;
+            let _ = (&mut previous.task).await;
         }
+        running.take();
         *self.status.lock().unwrap() = SetupStatus::default();
     }
     pub async fn start(
@@ -1104,6 +1105,48 @@ mod tests {
             .await;
             assert_eq!(result.unwrap_err(), error);
             assert_eq!(attempts.load(Ordering::Acquire), 1);
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_helper_drain_keeps_ownership_for_stop_and_replacement() {
+        for replacement in [false, true] {
+            let setup = WorkerSetup::default();
+            let (observed, stopping) = tokio::sync::oneshot::channel();
+            let (finish, wait) = tokio::sync::oneshot::channel();
+            setup
+                .start_work(Arc::new(|_| {}), move |progress| async move {
+                    while !progress.cancelled.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    let _ = observed.send(());
+                    let _ = wait.await;
+                    Ok(())
+                })
+                .await;
+            let replaced = Arc::new(AtomicBool::new(false));
+            let proof = replaced.clone();
+            let mut drain: std::pin::Pin<Box<dyn Future<Output = ()> + '_>> = if replacement {
+                Box::pin(setup.start_work(Arc::new(|_| {}), move |_| async move {
+                    proof.store(true, Ordering::Release);
+                    Ok(())
+                }))
+            } else {
+                Box::pin(setup.stop())
+            };
+            tokio::select! {
+                _ = &mut drain => panic!("drain returned before the worker finished"),
+                result = stopping => result.unwrap(),
+            }
+            drop(drain);
+            assert!(setup.running.lock().await.is_some());
+            assert!(!replaced.load(Ordering::Acquire));
+            let mut stop = Box::pin(setup.stop());
+            assert!(tokio::time::timeout(Duration::from_millis(10), &mut stop)
+                .await
+                .is_err());
+            finish.send(()).unwrap();
+            stop.await;
+            assert!(setup.running.lock().await.is_none());
         }
     }
     #[tokio::test]
