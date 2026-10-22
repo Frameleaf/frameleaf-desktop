@@ -25,7 +25,7 @@ fn digest(value: &str) -> String {
 fn uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
-fn now() -> Result<u64, String> {
+pub(crate) fn now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "source_clock_invalid")?
@@ -225,15 +225,12 @@ impl SourceProof {
         Ok(STANDARD.encode(serde_json::to_vec(self).map_err(|_| "source_proof_invalid")?))
     }
 }
-fn reserve_at(
-    source: &mut SavedSource,
+fn validate_source_at(
+    source: &SavedSource,
     saved: &SavedConnection,
     identity: &DeviceIdentity,
-    operation: SourceOperation,
-    payload: &str,
-    persist: impl FnOnce(&SavedSource) -> Result<(), String>,
     timestamp: u64,
-) -> Result<SourceProof, String> {
+) -> Result<(), String> {
     if !connection_valid(saved)
         || normalize_server(&saved.server)?.as_str() != source.server
         || source.server_id != saved.server_id
@@ -250,11 +247,51 @@ fn reserve_at(
         || source.authorization_epoch > MAX_SEQUENCE
         || source.next_sequence == 0
         || source.next_sequence > MAX_SEQUENCE
-        || payload.len() > 65_536
         || timestamp == 0
         || timestamp > MAX_TIMESTAMP
         || expires_at(&source.expires_at).is_none_or(|expiry| expiry <= timestamp)
     {
+        return Err("source_credential_invalid".into());
+    }
+    Ok(())
+}
+fn load_current_source(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    source_id: &str,
+) -> Result<SavedSource, String> {
+    let source: SavedSource =
+        crate::credentials::load(&credential_key(saved, identity, source_id)?)?
+            .ok_or("source_grant_required")?;
+    validate_source_at(&source, saved, identity, now()?)?;
+    if source.source_id != source_id {
+        return Err("source_credential_invalid".into());
+    }
+    Ok(source)
+}
+pub(crate) fn require_current_source(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    copy: &crate::copy_source::StagedCopy,
+    epoch: u32,
+) -> Result<(), String> {
+    let source = load_current_source(saved, identity, copy.source_id())?;
+    if source.scope_fingerprint != copy.scope_fingerprint() || source.authorization_epoch != epoch {
+        return Err("source_credential_invalid".into());
+    }
+    Ok(())
+}
+fn reserve_at(
+    source: &mut SavedSource,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    operation: SourceOperation,
+    payload: &str,
+    persist: impl FnOnce(&SavedSource) -> Result<(), String>,
+    timestamp: u64,
+) -> Result<SourceProof, String> {
+    validate_source_at(source, saved, identity, timestamp)?;
+    if payload.len() > 65_536 {
         return Err("source_credential_invalid".into());
     }
     let mut proof = SourceProof {
@@ -459,7 +496,7 @@ pub async fn heartbeat(
     claim.renew(&signed.source, response, max_bytes, now()?)
 }
 
-#[derive(Deserialize, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, Deserialize, zeroize::ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadClaim {
     id: String,
@@ -476,6 +513,20 @@ pub struct ReadClaim {
     deadline: String,
 }
 impl ReadClaim {
+    pub(crate) fn matches_resource(&self, copy: &crate::copy_source::StagedCopy) -> bool {
+        copy.source_id() == self.source_id
+            && copy.scope_fingerprint() == self.scope_fingerprint
+            && copy.resource_key() == self.resource_key
+            && copy.version() == self.version
+            && copy.bytes == self.bytes
+            && copy.sha256 == self.sha256
+    }
+    pub(crate) fn authorization_epoch(&self) -> u32 {
+        self.authorization_epoch
+    }
+    pub(crate) fn lease_expiry(&self) -> Result<u64, String> {
+        expires_at(&self.lease_until).ok_or_else(|| "source_read_request_invalid".into())
+    }
     fn renew(
         &mut self,
         source: &SavedSource,
@@ -695,6 +746,78 @@ pub struct PreparedDelivery {
     lease_until: u64,
     until: u64,
 }
+/// Contains no request proof: slow verification may safely overlap claim renewal.
+pub(crate) struct VerifiedDelivery {
+    file: std::fs::File,
+    copy: crate::copy_source::StagedCopy,
+}
+pub(crate) fn verify_delivery(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    copy: &crate::copy_source::StagedCopy,
+    staging: &Path,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<VerifiedDelivery, String> {
+    gate()?;
+    if copy.bytes == 0 || copy.bytes > MAX_DELIVERY_BYTES {
+        return Err("source_read_request_invalid".into());
+    }
+    copy.validate_current(saved, identity)?;
+    let file = copy
+        .verify_with_gate(saved, identity, staging, gate)?
+        .into_std();
+    copy.validate_current(saved, identity)?;
+    gate()?;
+    Ok(VerifiedDelivery {
+        file,
+        copy: copy.clone(),
+    })
+}
+fn bind_verified(
+    claim: &ReadClaim,
+    verified: VerifiedDelivery,
+    max_bytes: u64,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
+    reserve: impl FnOnce(&str) -> Result<SignedSourceRequest, String>,
+) -> Result<PreparedDelivery, String> {
+    gate()?;
+    if !claim.matches_resource(&verified.copy) {
+        return Err("source_read_request_invalid".into());
+    }
+    let payload = delivery_metadata(claim)?;
+    let signed = reserve(&payload)?;
+    claim.validate(&signed.source, max_bytes, now()?)?;
+    let until = expires_at(&claim.deadline)
+        .ok_or("source_read_request_invalid")?
+        .min(expires_at(&signed.source.expires_at).ok_or("source_credential_invalid")?);
+    Ok(PreparedDelivery {
+        signed,
+        payload,
+        file: verified.file,
+        until,
+        lease_until: claim.lease_expiry()?,
+        bytes: claim.bytes,
+        checksum: claim.sha256.clone(),
+    })
+}
+pub(crate) fn bind_delivery(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    claim: &ReadClaim,
+    verified: VerifiedDelivery,
+    max_bytes: u64,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<PreparedDelivery, String> {
+    bind_verified(claim, verified, max_bytes, gate, |payload| {
+        reserve_source_proof(
+            saved,
+            identity,
+            &claim.source_id,
+            SourceOperation::Deliver,
+            payload,
+        )
+    })
+}
 /// Blocking stage verification belongs on the coordinator's file worker, before starting an upload.
 pub fn prepare_delivery(
     saved: &SavedConnection,
@@ -706,44 +829,18 @@ pub fn prepare_delivery(
     gate: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<PreparedDelivery, String> {
     gate()?;
-    let payload = delivery_metadata(claim)?;
-    let signed = reserve_source_proof(
-        saved,
-        identity,
-        &claim.source_id,
-        SourceOperation::Deliver,
-        &payload,
+    claim.validate(
+        &load_current_source(saved, identity, &claim.source_id)?,
+        max_bytes,
+        now()?,
     )?;
-    claim.validate(&signed.source, max_bytes, now()?)?;
-    if claim.bytes > MAX_DELIVERY_BYTES
-        || copy.source_id() != claim.source_id
-        || copy.scope_fingerprint() != claim.scope_fingerprint
-        || copy.resource_key() != claim.resource_key
-        || copy.version() != claim.version
-        || copy.bytes != claim.bytes
-        || copy.sha256 != claim.sha256
-    {
+    if !claim.matches_resource(copy) {
         return Err("source_read_request_invalid".into());
     }
-    copy.validate_current(saved, identity)?;
-    let file = copy.verify(saved, identity, staging)?.into_std();
-    copy.validate_current(saved, identity)?;
-    gate()?;
-    claim.validate(&signed.source, max_bytes, now()?)?;
-    let until = expires_at(&claim.deadline)
-        .ok_or("source_read_request_invalid")?
-        .min(expires_at(&signed.source.expires_at).ok_or("source_credential_invalid")?);
-    Ok(PreparedDelivery {
-        signed,
-        payload,
-        file,
-        until,
-        lease_until: expires_at(&claim.lease_until).ok_or("source_read_request_invalid")?,
-        bytes: claim.bytes,
-        checksum: claim.sha256.clone(),
-    })
+    let verified = verify_delivery(saved, identity, copy, staging, gate)?;
+    bind_delivery(saved, identity, claim, verified, max_bytes, gate)
 }
-async fn wait_delivery<T>(
+pub(crate) async fn wait_delivery<T>(
     future: impl std::future::Future<Output = Result<T, String>>,
     cancelled: &AtomicBool,
     gate: &(dyn Fn() -> Result<(), String> + Send + Sync),
@@ -872,6 +969,112 @@ mod tests {
             wire["request"]["timestamp"].as_u64().unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn heartbeat_during_file_verification_precedes_the_delivery_proof_and_renewed_lease() {
+        let (wire, saved, identity) = fixture();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-proof-order-{}", Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        for name in ["source", "stage"] {
+            crate::runtime_store::private_directory(&root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("source/original.jpg"), b"abcdefghij").unwrap();
+        let copy = crate::copy_source::CopyApproval::approve(
+            &saved,
+            &identity,
+            &root.join("source"),
+            1024,
+            true,
+        )
+        .unwrap()
+        .stage(
+            &saved,
+            &identity,
+            "original.jpg",
+            &root.join("stage"),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let timestamp = now().unwrap();
+        let date = |millis: u64| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let mut source = bind(&wire, &saved, &identity);
+        source.source_id = copy.source_id().into();
+        source.scope_fingerprint = copy.scope_fingerprint();
+        source.expires_at = date(timestamp + 3_600_000);
+        let source = Mutex::new(source);
+        let during_verification = || {
+            let mut source = source.lock().unwrap();
+            reserve_at(
+                &mut source,
+                &saved,
+                &identity,
+                SourceOperation::Heartbeat,
+                "synthetic-heartbeat",
+                |_| Ok(()),
+                timestamp,
+            )?;
+            Ok(())
+        };
+        let verified = verify_delivery(
+            &saved,
+            &identity,
+            &copy,
+            &root.join("stage"),
+            &during_verification,
+        )
+        .unwrap();
+        let mut source = source.into_inner().unwrap();
+        let last_heartbeat = source.next_sequence - 1;
+        assert!(last_heartbeat >= 2);
+        let mut claim:ReadClaim=serde_json::from_value(json!({"id":Uuid::new_v4().to_string(),"sourceId":copy.source_id(),
+            "scopeFingerprint":copy.scope_fingerprint(),"authorizationEpoch":source.authorization_epoch,
+            "resourceKey":copy.resource_key(),"version":copy.version(),"sha256":copy.sha256,"bytes":copy.bytes,
+            "claimFence":1,"claimToken":"a".repeat(64),"leaseUntil":date(timestamp+45_000),"deadline":date(timestamp+300_000)})).unwrap();
+        claim
+            .renew(
+                &source,
+                ReadLease {
+                    lease_until: date(timestamp + 90_000),
+                    deadline: claim.deadline.clone(),
+                },
+                copy.bytes,
+                timestamp,
+            )
+            .unwrap();
+        let prepared = bind_verified(&claim, verified, copy.bytes, &|| Ok(()), |payload| {
+            let proof = reserve_at(
+                &mut source,
+                &saved,
+                &identity,
+                SourceOperation::Deliver,
+                payload,
+                |_| Ok(()),
+                timestamp,
+            )?;
+            Ok(SignedSourceRequest {
+                token: zeroize::Zeroizing::new(source.source_token.clone()),
+                proof,
+                source: source.clone(),
+            })
+        })
+        .unwrap();
+        assert_eq!(prepared.signed.proof.sequence, last_heartbeat + 1);
+        assert_eq!(prepared.lease_until, timestamp + 90_000);
     }
     #[test]
     fn native_signatures_match_the_servers_shared_utf8_vector() {

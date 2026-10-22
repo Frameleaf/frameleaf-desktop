@@ -40,6 +40,7 @@ pub mod runtime_store;
 mod source_consent;
 mod source_import;
 mod source_metadata;
+pub mod source_reads;
 mod transport;
 mod upload_budget;
 #[cfg(windows)]

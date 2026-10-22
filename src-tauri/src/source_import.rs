@@ -196,8 +196,8 @@ impl Cursor {
         Ok(())
     }
 }
-struct Journal {
-    root: PathBuf,
+pub(crate) struct Journal {
+    pub(crate) root: PathBuf,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -226,7 +226,7 @@ impl Journal {
             digest(value)?
         )))
     }
-    fn write(
+    pub(crate) fn write(
         &self,
         name: &str,
         value: &impl Serialize,
@@ -271,7 +271,7 @@ impl Journal {
         }
         result
     }
-    fn read<T: DeserializeOwned + Serialize>(
+    pub(crate) fn read<T: DeserializeOwned + Serialize>(
         &self,
         name: &str,
         identity: &DeviceIdentity,
@@ -369,7 +369,7 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
         code,
     }
 }
-fn current(
+pub(crate) fn current(
     saved: &SavedConnection,
     identity: &DeviceIdentity,
     source: &str,

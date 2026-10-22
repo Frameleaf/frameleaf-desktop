@@ -199,7 +199,7 @@ fn check_source_root(approved: &str, current: &str) -> Result<(), String> {
         Err("source_root_changed".into())
     }
 }
-fn source_root_identity(dir: &Dir) -> Result<String, String> {
+pub(crate) fn source_root_identity(dir: &Dir) -> Result<String, String> {
     #[cfg(unix)]
     {
         root_identity(dir)
@@ -894,6 +894,51 @@ impl StagedCopy {
         }
         Ok(())
     }
+    pub(crate) fn read_cost(&self) -> u64 {
+        if self.approval.is_photos() {
+            self.approval.scope.max_item_bytes
+        } else {
+            self.bytes
+        }
+    }
+    pub(crate) fn staging_root(&self, root: &Path) -> Result<(), String> {
+        if !self.approval.is_photos()
+            && (root.starts_with(self.approval.root()) || self.approval.root().starts_with(root))
+        {
+            return Err("source_staging_overlap".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn stage_again(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        destination: &Path,
+        id: &str,
+        cancelled: &AtomicBool,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<Self, String> {
+        self.validate_current(saved, identity)?;
+        let copy = self.approval.stage_to(
+            saved,
+            identity,
+            &self.relative,
+            destination,
+            id,
+            Some(self.read_cost()),
+            cancelled,
+            gate,
+        )?;
+        if copy.resource_key() != self.resource_key()
+            || copy.version() != self.version()
+            || copy.bytes != self.bytes
+            || copy.sha256 != self.sha256
+        {
+            return Err("source_item_changed".into());
+        }
+        copy.validate_current(saved, identity)?;
+        Ok(copy)
+    }
     pub(crate) fn scope_fingerprint(&self) -> String {
         self.approval.fingerprint()
     }
@@ -948,6 +993,16 @@ impl StagedCopy {
         destination: &Path,
         id: &str,
     ) -> Result<Self, String> {
+        Self::restore_with_gate(saved, identity, destination, id, &|| Ok(()))
+    }
+    pub(crate) fn restore_with_gate(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        destination: &Path,
+        id: &str,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<Self, String> {
+        gate()?;
         if Uuid::parse_str(id)
             .map_err(|_| "source_stage_invalid")?
             .to_string()
@@ -970,7 +1025,7 @@ impl StagedCopy {
         if copy.id != id {
             return Err("source_stage_invalid".into());
         }
-        copy.verify(saved, identity, destination)?;
+        copy.verify_with_gate(saved, identity, destination, gate)?;
         Ok(copy)
     }
     fn publish(&mut self, identity: &DeviceIdentity, path: &Path) -> Result<(), String> {
@@ -1031,6 +1086,16 @@ impl StagedCopy {
         identity: &DeviceIdentity,
         destination: &Path,
     ) -> Result<cap_std::fs::File, String> {
+        self.verify_with_gate(saved, identity, destination, &|| Ok(()))
+    }
+    pub(crate) fn verify_with_gate(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        destination: &Path,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<cap_std::fs::File, String> {
+        gate()?;
         self.validate_receipt(saved, identity)?;
         crate::native_runtime::absolute_directory(destination)?;
         let dir = Dir::open_ambient_dir(destination, ambient_authority())
@@ -1041,7 +1106,12 @@ impl StagedCopy {
         let mut hash = Sha256::new();
         let mut bytes = 0u64;
         let mut buffer = [0u8; 65536];
+        let mut checked = std::time::Instant::now();
         loop {
+            if checked.elapsed() >= std::time::Duration::from_millis(100) {
+                gate()?;
+                checked = std::time::Instant::now();
+            }
             let count = file
                 .read(&mut buffer)
                 .map_err(|_| "source_stage_unavailable")?;
@@ -1058,6 +1128,7 @@ impl StagedCopy {
             return Err("source_stage_changed".into());
         }
         file.rewind().map_err(|_| "source_stage_unavailable")?;
+        gate()?;
         Ok(file)
     }
 }
