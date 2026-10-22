@@ -212,6 +212,14 @@ impl Job {
             .map_err(|_| "source_journal_invalid")?
             .into_std();
         crate::host_state::valid_file(&owner)?;
+        if owner
+            .metadata()
+            .map_err(|_| "source_journal_invalid")?
+            .len()
+            != 0
+        {
+            return Err("source_journal_invalid".into());
+        }
         owner
             .try_lock()
             .map_err(|_| "source_read_already_running")?;
@@ -255,14 +263,16 @@ impl Job {
         {
             return Err("source_journal_invalid".into());
         }
-        Ok(Self {
+        let result = Self {
             journal,
             resource: state.resource,
             _owner: owner,
             source_root,
             source_identity,
             busy: AtomicBool::new(false),
-        })
+        };
+        result.require_owner()?;
+        Ok(result)
     }
     fn require_owner(&self) -> Result<(), String> {
         crate::native_runtime::absolute_directory(&self.source_root)?;
@@ -272,6 +282,17 @@ impl Job {
             return Err("source_journal_invalid".into());
         }
         crate::host_state::valid_file(&self._owner)?;
+        let named = dir
+            .open_with(".owner.lock", &crate::host_state::options(false))
+            .map_err(|_| "source_journal_invalid")?;
+        let held = cap_std::fs::File::from_std(
+            self._owner
+                .try_clone()
+                .map_err(|_| "source_journal_invalid")?,
+        );
+        if crate::copy_source::opened_stamp(&named)? != crate::copy_source::opened_stamp(&held)? {
+            return Err("source_journal_invalid".into());
+        }
         if self
             ._owner
             .metadata()
@@ -741,6 +762,75 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn read_owner_replacement_refuses_before_staging_or_spending() {
+        let f = Fixture::new();
+        let job = f.job(10, 0);
+        let named = job.source_root.join(".owner.lock");
+        let retained = job.source_root.join(".retained-owner.lock");
+        fs::rename(&named, &retained).unwrap();
+        let dir = Dir::open_ambient_dir(&job.source_root, ambient_authority()).unwrap();
+        let replacement = dir
+            .open_with(".owner.lock", &crate::host_state::options(true))
+            .unwrap()
+            .into_std();
+        replacement.try_lock().unwrap();
+        assert_eq!(
+            job.stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_journal_invalid")
+        );
+        let state: State = job.journal.read("state.json", &f.identity).unwrap();
+        assert_eq!(state.read.used, 0);
+        assert!(state.stage.is_none());
+        assert_eq!(
+            fs::read_dir(job.journal.root.join("stage"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(replacement);
+        fs::remove_file(&named).unwrap();
+        fs::rename(&retained, &named).unwrap();
+        job.require_owner().unwrap();
+        let copy = job
+            .stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(copy.bytes, 10);
+        assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 10);
+        assert_eq!(
+            fs::read(f.root.join("source/original.jpg")).unwrap(),
+            b"abcdefghij"
+        );
+    }
+    #[test]
+    fn read_owner_nonempty_lock_refuses_before_creating_a_budget_checkpoint() {
+        let f = Fixture::new();
+        let source_root = f.root.join("data/photo-reads").join(f.resource.source_id());
+        crate::runtime_store::private_directory(&f.root.join("data/photo-reads")).unwrap();
+        crate::runtime_store::private_directory(&source_root).unwrap();
+        let dir = Dir::open_ambient_dir(&source_root, ambient_authority()).unwrap();
+        let mut owner = dir
+            .open_with(".owner.lock", &crate::host_state::options(true))
+            .unwrap();
+        std::io::Write::write_all(&mut owner, b"unknown").unwrap();
+        drop(owner);
+        let result = Job::open(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.resource.source_id(),
+            &f.resource.resource_key(),
+            &f.resource.version(),
+            Some(State::new(f.resource.clone(), 10, 0).unwrap()),
+        );
+        assert_eq!(result.err().as_deref(), Some("source_journal_invalid"));
+        assert!(!source_root
+            .join(job_key(&f.resource.resource_key(), &f.resource.version()))
+            .exists());
     }
     #[test]
     fn reference_capacity_requires_idle_owner_and_positive_cleanup_without_original_access() {
