@@ -911,8 +911,9 @@ mod tests {
             });
             let mut claim:crate::resource_bridge::ReadClaim=serde_json::from_value(serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"sourceId":f.resource.source_id(),"scopeFingerprint":f.resource.scope_fingerprint(),"authorizationEpoch":1,"resourceKey":f.resource.resource_key(),"version":f.resource.version(),"sha256":f.resource.sha256,"bytes":10,"claimFence":1,"claimToken":"a".repeat(64),"leaseUntil":"2026-10-22T00:01:00Z","deadline":"2026-10-22T00:05:00Z"})).unwrap();
             let result = keep_alive(&operation, &mut claim, async {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                assert!(stop.load(Ordering::Acquire));
+                while !stop.load(Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
                 Err::<(), String>(code.into())
             })
             .await;

@@ -892,74 +892,22 @@ impl NativeManager {
         }
     }
     fn child_exited(&mut self) -> Result<bool, String> {
-        #[cfg(windows)]
-        return self
-            .child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|_| "native_manager_state_unavailable".into());
-        #[cfg(unix)]
-        {
-            if self.shutdown_confirmed {
-                return Ok(true);
-            }
-            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    self.child.id(),
-                    info.as_mut_ptr(),
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    return Ok(false);
-                }
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    self.shutdown_signalled = true;
-                }
-                return Err("native_manager_state_unavailable".into());
-            }
-            // Keep the leader unreaped until the owned group has received its final signal.
-            Ok(unsafe { info.assume_init().si_pid() } != 0)
+        if self.shutdown_confirmed {
+            return Ok(true);
         }
+        self.tree
+            .child_exited(&mut self.child, &mut self.shutdown_signalled)
+            .map_err(|_| "native_manager_state_unavailable".into())
     }
     fn cleanup_owned(&mut self, timeout: Duration) -> Result<(), String> {
         if self.shutdown_confirmed {
             return Ok(());
         }
-        #[cfg(windows)]
-        self.cleanup_windows(timeout)?;
-        #[cfg(unix)]
         self.tree
             .terminate_child_confirmed(&mut self.child, &mut self.shutdown_signalled, timeout)
             .map_err(|_| "native_manager_shutdown_unconfirmed")?;
         self.shutdown_confirmed = true;
         Ok(())
-    }
-    #[cfg(windows)]
-    fn cleanup_windows(&mut self, timeout: Duration) -> Result<(), String> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::{
-            Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
-        };
-        let deadline = Instant::now() + timeout;
-        self.tree
-            .terminate_confirmed(timeout)
-            .map_err(|_| "native_manager_shutdown_unconfirmed")?;
-        // Empty job accounting can precede the leader handle becoming signalled.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let milliseconds = remaining.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-        if unsafe { WaitForSingleObject(self.child.as_raw_handle(), milliseconds) } != WAIT_OBJECT_0
-        {
-            return Err("native_manager_shutdown_unconfirmed".into());
-        }
-        match self.child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            _ => Err("native_manager_shutdown_unconfirmed".into()),
-        }
     }
 }
 impl Drop for NativeManager {

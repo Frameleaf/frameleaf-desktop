@@ -25,7 +25,6 @@ pub struct RuntimeStore {
 }
 pub struct InstalledRuntime {
     runtime: VerifiedRuntime,
-    lease: Arc<File>,
     epochs: Arc<dyn crate::runtime_epochs::EpochAuthority>,
     installation_id: String,
 }
@@ -308,14 +307,14 @@ impl RuntimeStore {
         let Some(active) = self.active()? else {
             return Ok(None);
         };
-        let runtime = self.read_release(&active.manifest_sha256, active.epoch)?;
+        let mut runtime = self.read_release(&active.manifest_sha256, active.epoch)?;
         if runtime.epoch() != active.epoch {
             return Err("runtime_active_epoch_changed".into());
         }
         self.epochs.check(&self.installation_id, &runtime)?;
+        runtime.hold_lease(lease);
         Ok(Some(InstalledRuntime {
             runtime,
-            lease,
             epochs: self.epochs.clone(),
             installation_id: self.installation_id.clone(),
         }))
@@ -409,9 +408,7 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        let mut child = self.checked(|| self.runtime.start_sidecar(cache, private_root, port))?;
-        child.hold_lease(self.lease.clone());
-        Ok(child)
+        self.checked(|| self.runtime.start_sidecar(cache, private_root, port))
     }
     pub fn start_qualified_sidecar(
         &self,
@@ -420,12 +417,10 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        let mut child = self.checked(|| {
+        self.checked(|| {
             self.runtime
                 .start_qualified_sidecar(qualified, cache, private_root, port)
-        })?;
-        child.hold_lease(self.lease.clone());
-        Ok(child)
+        })
     }
     pub fn start_bound_sidecar(
         &self,
@@ -434,12 +429,10 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        let mut child = self.checked(|| {
+        self.checked(|| {
             self.runtime
                 .start_bound_sidecar(qualified, cache, private_root, port)
-        })?;
-        child.hold_lease(self.lease.clone());
-        Ok(child)
+        })
     }
     pub fn qualify(
         &self,

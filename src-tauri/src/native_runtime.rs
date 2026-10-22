@@ -1,5 +1,7 @@
 //! Signed private runtimes; no shell, ambient Python or server-selected executable.
 mod metal;
+#[cfg(all(test, unix))]
+mod sidecar_tests;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -149,6 +151,7 @@ pub struct VerifiedRuntime {
     root: PathBuf,
     manifest: Manifest,
     manifest_sha256: String,
+    lease: Option<std::sync::Arc<File>>,
 }
 impl VerifiedRuntime {
     /// Trusted keys and rollback floor come from the app/release authority, never the NAS or pack itself.
@@ -199,12 +202,16 @@ impl VerifiedRuntime {
             root: root.to_path_buf(),
             manifest,
             manifest_sha256: format!("{:x}", Sha256::digest(raw)),
+            lease: None,
         };
         verified.check_files()?;
         Ok(verified)
     }
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+    pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
+        self.lease = Some(lease);
     }
     pub(crate) fn epoch(&self) -> u64 {
         self.manifest.epoch
@@ -323,13 +330,11 @@ pub struct NativeSidecar {
     scratch: PathBuf,
     token: zeroize::Zeroizing<String>,
     stopped: bool,
+    shutdown_signalled: bool,
     exit_status: Option<std::process::ExitStatus>,
     lease: Option<std::sync::Arc<File>>,
 }
 impl NativeSidecar {
-    pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
-        self.lease = Some(lease);
-    }
     pub fn working_dir(&self) -> &Path {
         &self.scratch
     }
@@ -340,25 +345,28 @@ impl NativeSidecar {
         if self.stopped {
             return Ok(false);
         }
-        if let Some(status) = self
-            .child
-            .try_wait()
-            .map_err(|_| "runtime_process_status_failed")?
+        if self
+            .tree
+            .child_exited(&mut self.child, &mut self.shutdown_signalled)?
         {
-            self.tree.terminate();
-            self.exit_status = Some(status);
-            self.stopped = true;
+            self.stop()?;
             return Ok(false);
         }
         Ok(true)
     }
     pub fn stop(&mut self) -> Result<(), String> {
         if !self.stopped {
-            self.tree.terminate();
-            let _ = self.child.kill();
-            self.child
-                .wait()
-                .map_err(|_| "runtime_process_stop_failed")?;
+            self.tree.terminate_child_confirmed(
+                &mut self.child,
+                &mut self.shutdown_signalled,
+                std::time::Duration::from_secs(5),
+            )?;
+            self.exit_status = Some(
+                self.child
+                    .try_wait()
+                    .map_err(|_| "runtime_process_shutdown_unconfirmed")?
+                    .ok_or("runtime_process_shutdown_unconfirmed")?,
+            );
             self.stopped = true;
         }
         Ok(())
@@ -366,8 +374,12 @@ impl NativeSidecar {
 }
 impl Drop for NativeSidecar {
     fn drop(&mut self) {
-        let _ = self.stop();
-        let _ = fs::remove_dir_all(&self.scratch);
+        if self.stop().is_ok() {
+            let _ = fs::remove_dir_all(&self.scratch);
+        } else {
+            // Unproven descendants retain their runtime exclusion until this supervisor exits.
+            std::mem::forget(self.lease.take());
+        }
     }
 }
 impl VerifiedRuntime {
@@ -576,8 +588,9 @@ impl VerifiedRuntime {
             scratch,
             token,
             stopped: false,
+            shutdown_signalled: false,
             exit_status: None,
-            lease: None,
+            lease: self.lease.clone(),
         };
         owner
             .child
@@ -880,6 +893,7 @@ mod tests {
                 "provider":"CPUExecutionProvider","python":"python", "sourceRevision":"a".repeat(40),"files":{}
             })).unwrap(),
             manifest_sha256: "a".repeat(64),
+            lease: None,
         };
         let qualified = QualifiedRuntime {
             spec: vec![],

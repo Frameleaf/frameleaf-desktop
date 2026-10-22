@@ -37,6 +37,44 @@ pub fn configure(command: &mut Command) {
     }
 }
 impl ProcessTree {
+    pub(crate) fn child_exited(
+        &self,
+        child: &mut Child,
+        _signalled: &mut bool,
+    ) -> Result<bool, String> {
+        #[cfg(windows)]
+        return child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|_| "runtime_process_status_failed".into());
+        #[cfg(unix)]
+        {
+            if self.0 <= 1 || child.id() != self.0 as u32 {
+                return Err("runtime_process_status_failed".into());
+            }
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    return Ok(false);
+                }
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    *_signalled = true;
+                }
+                return Err("runtime_process_status_failed".into());
+            }
+            // Reserve the leader's group ID until its final signal has been sent.
+            Ok(unsafe { info.assume_init().si_pid() } != 0)
+        }
+    }
     #[cfg(unix)]
     pub(crate) fn terminate_child_confirmed(
         &self,
@@ -48,6 +86,7 @@ impl ProcessTree {
             return Err("runtime_process_shutdown_unconfirmed".into());
         }
         if !*signalled {
+            self.child_exited(child, signalled)?;
             // The caller has kept the owned leader unreaped; never signal this ID again after reaping.
             self.terminate();
             *signalled = true;
@@ -72,6 +111,30 @@ impl ProcessTree {
                 return Err("runtime_process_shutdown_unconfirmed".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    #[cfg(windows)]
+    pub(crate) fn terminate_child_confirmed(
+        &self,
+        child: &mut Child,
+        _signalled: &mut bool,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        self.terminate_confirmed(timeout)?;
+        // Empty job accounting can precede the leader handle becoming signalled.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let milliseconds = remaining.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        if unsafe { WaitForSingleObject(child.as_raw_handle(), milliseconds) } != WAIT_OBJECT_0 {
+            return Err("runtime_process_shutdown_unconfirmed".into());
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            _ => Err("runtime_process_shutdown_unconfirmed".into()),
         }
     }
     #[cfg(windows)]
