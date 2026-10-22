@@ -625,7 +625,7 @@ mod tests {
         crate::windows_protection::new_private_directory(&base).unwrap();
         let root = base.join("source");
         std::fs::create_dir(&root).unwrap();
-        let path = root.join("original.bin");
+        let path = root.join("original.jpg");
         std::fs::write(&path, vec![0x5a; CHUNK_BYTES as usize * 3 + 17]).unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
@@ -635,14 +635,14 @@ mod tests {
         crate::windows_protection::new_private_directory(&staging).unwrap();
         let request = {
             let source =
-                Source::open(root.to_str().unwrap(), &root_identity, "original.bin", None).unwrap();
+                Source::open(root.to_str().unwrap(), &root_identity, "original.jpg", None).unwrap();
             Request {
                 version: 1,
                 operation_id,
                 root: root.to_str().unwrap().into(),
                 root_identity,
                 source_stamp: source.version.stamp(),
-                relative: "original.bin".into(),
+                relative: "original.jpg".into(),
                 staging: staging.to_str().unwrap().into(),
                 bytes: source.version.bytes,
             }
