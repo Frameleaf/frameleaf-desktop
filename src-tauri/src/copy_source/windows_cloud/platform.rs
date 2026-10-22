@@ -502,7 +502,6 @@ pub(super) fn copy(
         if Version::read(reference.raw)? != source.version {
             return Err("source_item_changed:after-read".into());
         }
-        drop(reference);
         output
             .write_all(&data[..bytes])
             .map_err(|_| "source_stage_write_failed")?;
@@ -512,9 +511,11 @@ pub(super) fn copy(
             operation_id: request.operation_id.clone(),
             bytes: copied,
         })?;
-    }
-    if Version::read(file.reference("complete")?.raw)? != source.version {
-        return Err("source_item_changed:completion".into());
+        // Finish this bounded chunk before acknowledging an oplock break, including the final version check.
+        if copied == request.bytes && Version::read(reference.raw)? != source.version {
+            return Err("source_item_changed:completion".into());
+        }
+        drop(reference);
     }
     output.sync_all().map_err(|_| "source_stage_write_failed")?;
     let stamp = source.version.stamp();
