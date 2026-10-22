@@ -868,9 +868,11 @@ impl SourceJobs {
     }
     pub async fn stop(&self) -> Result<(), String> {
         let mut running = self.running.lock().await;
-        if let Some(previous) = running.take() {
+        if let Some(previous) = running.as_mut() {
             previous.cancel.store(true, Ordering::Release);
-            if previous.task.await.is_err() {
+            let result = (&mut previous.task).await;
+            running.take();
+            if result.is_err() {
                 let mut status = self
                     .status
                     .lock()
@@ -1133,6 +1135,39 @@ impl SourceJobs {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_stop_retains_the_owned_task_until_a_later_drain() {
+        let jobs = super::SourceJobs::default();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = cancel.clone();
+        let (observed, stopping) = tokio::sync::oneshot::channel();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let task = tauri::async_runtime::spawn(async move {
+            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let _ = observed.send(());
+            let _ = wait.await;
+        });
+        *jobs.running.lock().await = Some(super::Running { cancel, task });
+        let mut stop = Box::pin(jobs.stop());
+        tokio::select! {
+            result = &mut stop => panic!("stop returned before worker finished: {result:?}"),
+            result = stopping => result.unwrap(),
+        }
+        drop(stop);
+        assert!(jobs.running.lock().await.is_some());
+        assert!(jobs.is_active());
+        let mut stop = Box::pin(jobs.stop());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut stop)
+                .await
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        stop.await.unwrap();
+        assert!(!jobs.is_active());
+    }
     #[tokio::test]
     async fn reported_copy_shutdown_failure_stays_fenced_after_its_task_returns() {
         let jobs = super::SourceJobs::default();

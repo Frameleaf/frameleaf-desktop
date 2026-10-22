@@ -132,9 +132,11 @@ impl Requests {
         if owner.failed {
             return Err("source_read_shutdown_unconfirmed".into());
         }
-        if let Some(previous) = owner.running.take() {
+        if let Some(previous) = owner.running.as_mut() {
             previous.stop.request();
-            match previous.task.await {
+            let result = (&mut previous.task).await;
+            owner.running.take();
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(code)) if !unconfirmed(&code) => {}
                 _ => {
@@ -448,6 +450,40 @@ mod tests {
     };
     fn notify() -> Arc<dyn Fn(View) + Send + Sync> {
         Arc::new(|_| {})
+    }
+    #[tokio::test]
+    async fn cancelled_stop_retains_the_owned_task_until_a_later_drain() {
+        let owner = Requests::default();
+        let (observed, stopping) = tokio::sync::oneshot::channel();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        owner
+            .install("source".into(), notify(), move |_, signal| async move {
+                while !signal.cancelled.load(Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                let _ = observed.send(());
+                let _ = wait.await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut stop = Box::pin(owner.stop());
+        tokio::select! {
+            result = &mut stop => panic!("stop returned before worker finished: {result:?}"),
+            result = stopping => result.unwrap(),
+        }
+        drop(stop);
+        assert!(owner.owner.lock().await.running.is_some());
+        assert!(owner.is_active());
+        let mut stop = Box::pin(owner.stop());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut stop)
+                .await
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        stop.await.unwrap();
+        assert!(!owner.is_active());
     }
     #[tokio::test]
     async fn stop_waits_for_owned_blocking_work_and_excludes_replacement() {
