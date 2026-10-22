@@ -521,6 +521,13 @@ impl Preparation {
             },
             None => None,
         };
+        let base = self
+            .journal
+            .root
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("source_journal_invalid")?;
+        let mut budget = crate::private_inputs::InputBudget::open(base, identity)?;
         let copy = if let Some(id) = existing {
             if !stage.join(id).join("receipt.json").exists() {
                 return Err("source_cache_cleanup_pending".into());
@@ -530,11 +537,12 @@ impl Preparation {
             if state.resource.is_some() {
                 return Err("source_stage_unavailable".into());
             }
-            let maximum = state.reserve_attempt(entry, self.plan.export)?;
+            let maximum = state.reserve_attempt(entry, self.plan.export, budget.remaining()?)?;
             let id = state.attempt.as_ref().ok_or("source_journal_invalid")?;
             self.journal
                 .write("preparation-state.json", &state, identity)?;
             check()?;
+            budget.reserve(&self.plan.source, id, maximum)?;
             self.approval.stage_to(
                 saved,
                 identity,
@@ -543,7 +551,10 @@ impl Preparation {
                 id,
                 Some(maximum),
                 cancelled,
-                &check,
+                &|| {
+                    check()?;
+                    budget.check()
+                },
             )?
         };
         if copy.source_id() != self.plan.source
@@ -561,6 +572,7 @@ impl Preparation {
         }
         copy.validate_current(saved, identity)?;
         check()?;
+        budget.shrink(&self.plan.source, &copy.id, copy.bytes)?;
         state.resource = Some(copy.clone());
         self.journal
             .write("preparation-state.json", &state, identity)?;

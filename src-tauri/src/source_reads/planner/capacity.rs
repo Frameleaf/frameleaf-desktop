@@ -89,6 +89,14 @@ fn cache_retained(
     }
     let Some(id) = state.stage else {
         return if first.is_none() {
+            let base = source_root
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("source_journal_invalid")?;
+            crate::private_inputs::InputBudget::open(base, identity)?.release(
+                &plan.source,
+                state.cleaned.as_deref().unwrap_or(&resource.id),
+            )?;
             Ok(false)
         } else {
             Err("source_cache_cleanup_pending".into())

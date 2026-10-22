@@ -696,16 +696,24 @@ async fn execute(
                 let copy = if stage.join(&id).join("receipt.json").exists() {
                     StagedCopy::restore(saved, identity, &stage, &id)?
                 } else {
+                    let base = journal
+                        .root
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or("source_journal_invalid")?;
+                    let mut budget = crate::private_inputs::InputBudget::open(base, identity)?;
                     // The signed intent owns this attempt; never remove an existing signed receipt as an incomplete copy.
                     if manifest.provider.is_some() {
                         cursor.reserve_export(entry.bytes)?;
-                        journal.write("cursor.json", &cursor, identity)?;
                     } else {
                         cursor.reserve_read(entry.bytes)?;
-                        journal.write("cursor.json", &cursor, identity)?;
+                    }
+                    budget.reserve(&manifest.source_id, &id, entry.bytes)?;
+                    journal.write("cursor.json", &cursor, identity)?;
+                    if manifest.provider.is_none() {
                         crate::copy_source::release_stage(&stage, &id)?;
                     }
-                    consent.approval(saved, identity)?.stage_to(
+                    let copy = consent.approval(saved, identity)?.stage_to(
                         saved,
                         identity,
                         &entry.relative,
@@ -713,8 +721,13 @@ async fn execute(
                         &id,
                         Some(entry.bytes),
                         cancel,
-                        gate,
-                    )?
+                        &|| {
+                            gate()?;
+                            budget.check()
+                        },
+                    )?;
+                    budget.shrink(&manifest.source_id, &id, copy.bytes)?;
+                    copy
                 };
                 if !copy.matches_entry(&entry.relative, entry.bytes)
                     || copy.source_id() != manifest.source_id
@@ -812,6 +825,13 @@ async fn execute(
             )?;
             gate()?;
             copy.release(saved, identity, &journal.root.join("stage"))?;
+            let base = journal
+                .root
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("source_journal_invalid")?;
+            crate::private_inputs::InputBudget::open(base, identity)?
+                .release(&manifest.source_id, &copy.id)?;
             cursor.position += 1;
             cursor.active = None;
             journal.write("cursor.json", &cursor, identity)?;
@@ -1276,6 +1296,11 @@ mod tests {
         tauri::async_runtime::block_on(async {
             for legacy in [true, false] {
                 let f = Fixture::new();
+                let mut budget =
+                    crate::private_inputs::InputBudget::open(&f.base.join("data"), &f.identity)
+                        .unwrap();
+                budget.reserve(f.consent.source_id(), &f.stage, 10).unwrap();
+                drop(budget);
                 f.consent
                     .approval(&f.saved, &f.identity)
                     .unwrap()
@@ -1679,17 +1704,25 @@ mod tests {
             consent.registered = true;
             let manifest = manifest_for(&consent, &saved, &identity, &base.join("data")).unwrap();
             let journal = Journal::new(&base.join("data"), consent.source_id()).unwrap();
+            let probe_id = uuid::Uuid::new_v4().to_string();
+            let mut budget =
+                crate::private_inputs::InputBudget::open(&base.join("data"), &identity).unwrap();
+            budget.reserve(consent.source_id(), &probe_id, 10).unwrap();
             let probe = consent
                 .approval(&saved, &identity)
                 .unwrap()
-                .stage(
+                .stage_to(
                     &saved,
                     &identity,
                     "photo.jpg",
                     &journal.root.join("stage"),
+                    &probe_id,
+                    Some(10),
                     &AtomicBool::new(false),
+                    &|| budget.check(),
                 )
                 .unwrap();
+            drop(budget);
             let item = uuid::Uuid::new_v4().to_string();
             let stage = uuid::Uuid::new_v4().to_string();
             let mut cursor = Cursor::new(&manifest).unwrap();

@@ -44,6 +44,8 @@ struct State {
     read: Budget,
     upload: Budget,
     stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleaned: Option<String>,
 }
 impl State {
     fn new(resource: StagedCopy, read: u64, upload: u64) -> Result<Self, String> {
@@ -63,6 +65,7 @@ impl State {
                 limit: upload,
             },
             stage: None,
+            cleaned: None,
         };
         state.validate()?;
         Ok(state)
@@ -76,6 +79,10 @@ impl State {
             || self.read.used > self.read.limit
             || self.upload.used > self.upload.limit
             || self.stage.as_ref().is_some_and(|id| !canonical_uuid(id))
+            || self
+                .cleaned
+                .as_ref()
+                .is_some_and(|id| !canonical_uuid(id) || self.stage.as_ref() == Some(id))
         {
             return Err("source_read_budget_invalid".into());
         }
@@ -333,6 +340,17 @@ impl Job {
         gate()?;
         let mut state = self.state(saved, identity)?;
         let stage = self.journal.root.join("stage");
+        if let Some(id) = &state.cleaned {
+            let base = self
+                .source_root
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("source_journal_invalid")?;
+            crate::private_inputs::InputBudget::open(base, identity)?
+                .release(self.resource.source_id(), id)?;
+            state.cleaned = None;
+            self.journal.write("state.json", &state, identity)?;
+        }
         if let Some(id) = &state.stage {
             match fs::symlink_metadata(stage.join(id)) {
                 Ok(_) => {
@@ -355,6 +373,15 @@ impl Job {
                 Err(_) => return Err("source_cache_cleanup_pending".into()),
             }
         }
+        let base = self
+            .source_root
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("source_journal_invalid")?;
+        let mut budget = crate::private_inputs::InputBudget::open(base, identity)?;
+        if budget.remaining()? < self.resource.bytes {
+            return Err("source_staging_budget_exceeded".into());
+        }
         state
             .read
             .reserve(self.resource.read_cost(), "source_read_budget_exhausted")?;
@@ -362,8 +389,13 @@ impl Job {
         state.stage = Some(id.clone());
         self.journal.write("state.json", &state, identity)?;
         gate()?;
+        budget.reserve(self.resource.source_id(), &id, self.resource.bytes)?;
         self.resource
-            .stage_again(saved, identity, &stage, &id, cancelled, gate)
+            .stage_again(saved, identity, &stage, &id, cancelled, &|| {
+                gate()?;
+                self.require_owner()?;
+                budget.check()
+            })
     }
 }
 struct Busy(Arc<Job>);
@@ -637,7 +669,15 @@ impl Job {
                     &job.journal.root.join("stage"),
                 )?;
                 state.stage = None;
-                job.journal.write("state.json", &state, &cleanup.identity)
+                state.cleaned = Some(copy.id.clone());
+                job.journal.write("state.json", &state, &cleanup.identity)?;
+                let base = job
+                    .source_root
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or("source_journal_invalid")?;
+                crate::private_inputs::InputBudget::open(base, &cleanup.identity)?
+                    .release(job.resource.source_id(), &copy.id)
             })
             .await
             .map_err(|_| "source_read_shutdown_unconfirmed")??;
@@ -807,6 +847,142 @@ mod tests {
         );
     }
     #[test]
+    fn quota_recovery_shrinks_a_completed_receipt_before_handoff_without_new_reads() {
+        let f = Fixture::new();
+        let prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            },
+            true,
+        )
+        .unwrap();
+        let mut budget =
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity).unwrap();
+        budget
+            .reserve(f.approval.source_id(), &f.resource.id, 20)
+            .unwrap();
+        drop(budget);
+        fs::rename(
+            f.root.join("seed").join(&f.resource.id),
+            prep.journal.root.join("stage").join(&f.resource.id),
+        )
+        .unwrap();
+        let mut progress: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        progress["attempt"] = serde_json::json!(f.resource.id);
+        progress["read"] = serde_json::json!({"used": 10, "limit": 10});
+        prep.journal
+            .write("preparation-state.json", &progress, &f.identity)
+            .unwrap();
+        let view = prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!((view.spent, view.remaining, view.completed), (10, 0, 1));
+        assert_eq!(
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                .unwrap()
+                .remaining()
+                .unwrap(),
+            crate::private_inputs::LIMIT - 10
+        );
+        assert_eq!(
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap()
+                .spent,
+            10
+        );
+    }
+    #[test]
+    fn quota_recovery_remembers_the_actual_cleaned_stage_after_restage() {
+        let f = Fixture::new();
+        let job = f.job(10, 0);
+        let copy = job
+            .stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_ne!(copy.id, job.resource.id);
+        copy.release(&f.saved, &f.identity, &job.journal.root.join("stage"))
+            .unwrap();
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.stage = None;
+        state.cleaned = Some(copy.id);
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        assert_eq!(
+            job.stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_read_budget_exhausted")
+        );
+        assert_eq!(
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                .unwrap()
+                .remaining()
+                .unwrap(),
+            crate::private_inputs::LIMIT
+        );
+        assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 10);
+    }
+    #[test]
+    fn shared_input_limit_precedes_preparation_and_read_attempts() {
+        for prepare in [true, false] {
+            let f = Fixture::new();
+            let other_source = uuid::Uuid::new_v4().to_string();
+            let other_input = uuid::Uuid::new_v4().to_string();
+            let mut budget =
+                crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                    .unwrap();
+            budget
+                .reserve(&other_source, &other_input, crate::private_inputs::LIMIT)
+                .unwrap();
+            drop(budget);
+            if prepare {
+                let mut prep = Preparation::open_with(
+                    &f.root.join("data"),
+                    &f.saved,
+                    &f.identity,
+                    f.approval.clone(),
+                    crate::photo_sources::SourceFile {
+                        relative: "original.jpg".into(),
+                        bytes: 10,
+                    },
+                    true,
+                )
+                .unwrap();
+                prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+                assert_eq!(
+                    prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                        .err()
+                        .as_deref(),
+                    Some("source_staging_budget_exceeded")
+                );
+                assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 0);
+            } else {
+                let job = f.job(10, 0);
+                assert_eq!(
+                    job.stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                        .err()
+                        .as_deref(),
+                    Some("source_staging_budget_exceeded")
+                );
+                let state = job.state(&f.saved, &f.identity).unwrap();
+                assert_eq!(state.read.used, 0);
+                assert!(state.stage.is_none());
+            }
+            assert_eq!(
+                fs::read(f.root.join("source/original.jpg")).unwrap(),
+                b"abcdefghij"
+            );
+        }
+    }
+    #[test]
     fn read_owner_nonempty_lock_refuses_before_creating_a_budget_checkpoint() {
         let f = Fixture::new();
         let source_root = f.root.join("data/photo-reads").join(f.resource.source_id());
@@ -952,6 +1128,12 @@ mod tests {
             ceiling
         );
         let job = f.prepared_job(&prep);
+        let mut budget =
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity).unwrap();
+        budget
+            .reserve(f.approval.source_id(), &job.resource.id, job.resource.bytes)
+            .unwrap();
+        drop(budget);
         crate::runtime_store::private_directory(&cache).unwrap();
         fs::write(cache.join("original"), b"abcdefghij").unwrap();
         fs::write(cache.join("receipt.json"), receipt).unwrap();

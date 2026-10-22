@@ -931,7 +931,7 @@ impl StagedCopy {
             &self.relative,
             destination,
             id,
-            Some(self.read_cost()),
+            Some(self.bytes),
             cancelled,
             gate,
         )?;

@@ -61,8 +61,11 @@ impl Progress {
         &mut self,
         entry: &SourceFile,
         export: bool,
+        available: u64,
     ) -> Result<u64, String> {
-        let remaining = STAGING_LIMIT.saturating_sub(self.retained_bytes());
+        let remaining = STAGING_LIMIT
+            .saturating_sub(self.retained_bytes())
+            .min(available);
         let maximum = if export {
             entry.bytes.min(remaining)
         } else {
@@ -220,7 +223,12 @@ mod tests {
             "completion": {"position": 1, "stagedBytes": STAGING_LIMIT - 6}
         }))
         .unwrap();
-        assert_eq!(progress.reserve_attempt(&plan.entry, true).unwrap(), 6);
+        assert_eq!(
+            progress
+                .reserve_attempt(&plan.entry, true, STAGING_LIMIT)
+                .unwrap(),
+            6
+        );
         assert_eq!(progress.read.used, STAGING_LIMIT * 2);
         assert_eq!(progress.attempt_bytes, Some(6));
         // A partial export cannot free its reservation on restart or trigger another unapproved read.
@@ -233,7 +241,9 @@ mod tests {
         });
         assert_eq!(resumed.reservation(&plan).unwrap(), 6);
         assert_eq!(
-            resumed.reserve_attempt(&plan.entry, true).unwrap_err(),
+            resumed
+                .reserve_attempt(&plan.entry, true, STAGING_LIMIT)
+                .unwrap_err(),
             "source_read_budget_exhausted"
         );
         assert_eq!(resumed.attempt, progress.attempt);
@@ -256,12 +266,16 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            progress.reserve_attempt(&plan.entry, false).unwrap_err(),
+            progress
+                .reserve_attempt(&plan.entry, false, STAGING_LIMIT)
+                .unwrap_err(),
             "source_staging_budget_exceeded"
         );
         progress.completion.as_mut().unwrap().staged_bytes = STAGING_LIMIT;
         assert_eq!(
-            progress.reserve_attempt(&plan.entry, true).unwrap_err(),
+            progress
+                .reserve_attempt(&plan.entry, true, STAGING_LIMIT)
+                .unwrap_err(),
             "source_staging_budget_exceeded"
         );
         assert_eq!(progress.read.used, 0);

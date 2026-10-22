@@ -29,6 +29,7 @@ pub mod native_predictor;
 pub mod native_runtime;
 mod package_lease;
 pub mod photo_sources;
+mod private_inputs;
 mod process_tree;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod profile_elevation;

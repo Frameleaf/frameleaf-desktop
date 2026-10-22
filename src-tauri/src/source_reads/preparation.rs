@@ -27,6 +27,13 @@ impl Job {
         gate()?;
         let mut state = self.state(saved, identity)?;
         let id = &self.resource.id;
+        let base = self
+            .source_root
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("source_journal_invalid")?;
+        let mut budget = crate::private_inputs::InputBudget::open(base, identity)?;
+        budget.reserve(self.resource.source_id(), id, self.resource.bytes)?;
         let target = self.journal.root.join("stage");
         self.resource.staging_root(from)?;
         if !from.is_absolute()
