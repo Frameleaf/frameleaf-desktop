@@ -461,6 +461,9 @@ mod tests {
             spent: 10,
             remaining: 0,
             prepared: true,
+            resources: 1,
+            completed: 1,
+            staging_remaining: 2 * 1024 * 1024 * 1024 - 10,
         }
     }
     #[tokio::test]

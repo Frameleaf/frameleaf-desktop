@@ -4,6 +4,7 @@ use crate::source_reads::{Preparation, PreparationView};
 /// Local user actions; a NAS claim never selects a path or grants an allowance.
 pub enum PreparationAction {
     Plan { relative: String },
+    Selection { relatives: Vec<String> },
     Read { additional: u64 },
 }
 impl Requests {
@@ -29,6 +30,14 @@ impl Requests {
                     Preparation::plan(&base, &saved, &identity, &selected_source, &relative)?
                         .view(&saved, &identity)
                 }
+                PreparationAction::Selection { relatives } => Preparation::plan_selection(
+                    &base,
+                    &saved,
+                    &identity,
+                    &selected_source,
+                    &relatives,
+                )?
+                .view(&saved, &identity),
                 PreparationAction::Read { additional } => {
                     let mut preparation =
                         Preparation::resume(&base, &saved, &identity, &selected_source)?;

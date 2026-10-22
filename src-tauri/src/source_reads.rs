@@ -9,7 +9,7 @@ use crate::{
 };
 use cap_std::{ambient_authority, fs::Dir};
 pub use owner::{PreparationAction, Requests, View};
-pub use planner::{Preparation, PreparationView};
+pub use planner::{Preparation, PreparationView, PreparedResource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -670,6 +670,330 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn reference_selection_recovers_record_written_before_cursor_checkpoint() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let before: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let record = fs::read(prep.journal.root.join("prepared-0.json")).unwrap();
+        // Recreate the crash cutpoint after the record write and before cursor advancement.
+        prep.journal
+            .write("preparation-state.json", &before, &f.identity)
+            .unwrap();
+        drop(prep);
+        let prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            false,
+        )
+        .unwrap();
+        let done = prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            (
+                done.completed,
+                done.spent,
+                done.remaining,
+                done.staging_remaining
+            ),
+            (1, 10, 0, 2 * 1024 * 1024 * 1024 - 10)
+        );
+        assert_eq!(
+            fs::read(prep.journal.root.join("prepared-0.json")).unwrap(),
+            record
+        );
+    }
+    #[test]
+    fn reference_selection_keeps_legacy_single_resource_allowance_and_receipt() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let plan: serde_json::Value = prep
+            .journal
+            .read("preparation-plan.json", &f.identity)
+            .unwrap();
+        let state: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        assert!(plan.get("additional").is_none());
+        assert!(state.get("completion").is_none());
+        prep.journal
+            .write("preparation-plan.json", &plan, &f.identity)
+            .unwrap();
+        prep.journal
+            .write("preparation-state.json", &state, &f.identity)
+            .unwrap();
+        drop(prep);
+        let prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            false,
+        )
+        .unwrap();
+        let done = prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!((done.completed, done.spent, done.remaining), (1, 10, 0));
+    }
+    #[test]
+    fn reference_selection_rejects_replayed_inventory_records_without_resetting_progress() {
+        let f = Fixture::new();
+        fs::write(f.root.join("source/second.jpg"), b"second").unwrap();
+        let base = f.root.join("data");
+        let entries = vec![
+            crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            },
+            crate::photo_sources::SourceFile {
+                relative: "second.jpg".into(),
+                bytes: 6,
+            },
+        ];
+        let mut prep = Preparation::open_selection(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 16).unwrap();
+        for _ in 0..2 {
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+        }
+        fs::copy(
+            prep.journal.root.join("prepared-0.json"),
+            prep.journal.root.join("prepared-1.json"),
+        )
+        .unwrap();
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 16);
+        let journal = prep.journal.root.clone();
+        drop(prep);
+        assert!(Preparation::open_selection(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries,
+            false
+        )
+        .is_err());
+        let state: serde_json::Value = Journal { root: journal }
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        assert_eq!(state["read"]["used"], 16);
+        assert_eq!(state["completion"]["position"], 2);
+    }
+    #[test]
+    fn reference_selection_budget_and_progress_survive_restart() {
+        let f = Fixture::new();
+        fs::write(f.root.join("source/second.jpg"), b"second").unwrap();
+        let base = f.root.join("data");
+        let entries = vec![
+            crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            },
+            crate::photo_sources::SourceFile {
+                relative: "second.jpg".into(),
+                bytes: 6,
+            },
+        ];
+        let mut prep = Preparation::open_selection(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().remaining, 0);
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        let first = prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            (
+                first.completed,
+                first.resources,
+                first.spent,
+                first.remaining
+            ),
+            (1, 2, 10, 0)
+        );
+        assert!(!first.prepared);
+        drop(prep);
+        let mut prep = Preparation::open_selection(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_read_budget_exhausted")
+        );
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 10);
+        prep.approve_with(&f.saved, &f.identity, 6).unwrap();
+        for _ in 0..2 {
+            let done = prep
+                .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+            assert_eq!(
+                (done.completed, done.resources, done.spent, done.remaining),
+                (2, 2, 16, 0)
+            );
+            assert!(done.prepared);
+        }
+        let completed: Vec<serde_json::Value> = (0..2)
+            .map(|index| {
+                prep.journal
+                    .read(&format!("prepared-{index}.json"), &f.identity)
+                    .unwrap()
+            })
+            .collect();
+        assert_ne!(
+            completed[0]["resource"]["resourceKey"],
+            completed[1]["resource"]["resourceKey"]
+        );
+    }
+    #[test]
+    fn reference_selection_staging_cap_precedes_another_original_read() {
+        let f = Fixture::new();
+        let ceiling = 2 * 1024 * 1024 * 1024;
+        let entries = vec![
+            crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            },
+            crate::photo_sources::SourceFile {
+                relative: "missing.jpg".into(),
+                bytes: ceiling - 5,
+            },
+        ];
+        let mut prep = Preparation::open_selection(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries,
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, ceiling + 5)
+            .unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_staging_budget_exceeded")
+        );
+        let view = prep.view(&f.saved, &f.identity).unwrap();
+        assert_eq!(
+            (view.completed, view.spent, view.staging_remaining),
+            (1, 10, ceiling - 10)
+        );
+    }
+    #[test]
+    fn reference_selection_is_frozen_and_rejects_duplicate_entries() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let a = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let b = crate::photo_sources::SourceFile {
+            relative: "second.jpg".into(),
+            bytes: 6,
+        };
+        assert!(Preparation::open_selection(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            vec![a.clone(), a.clone()],
+            true
+        )
+        .is_err());
+        let prep = Preparation::open_selection(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            vec![a.clone(), b.clone()],
+            true,
+        )
+        .unwrap();
+        drop(prep);
+        assert_eq!(
+            Preparation::open_selection(
+                &base,
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                vec![b, a],
+                true
+            )
+            .err()
+            .as_deref(),
+            Some("source_approval_changed")
+        );
     }
     #[test]
     fn reference_preparation_pipeline_resumes_after_move_with_lost_reply() {
