@@ -342,6 +342,13 @@ pub fn run_cloud_reader_child() -> Result<(), String> {
 }
 
 impl CopyApproval {
+    fn export_maximum(&self, expected_bytes: Option<u64>) -> Result<u64, String> {
+        expected_bytes
+            .filter(|bytes| {
+                self.scope.allow_download && *bytes > 0 && *bytes <= self.scope.max_item_bytes
+            })
+            .ok_or("source_download_permission_required".into())
+    }
     pub(crate) fn is_photos(&self) -> bool {
         self.scope.photos.is_some()
     }
@@ -501,6 +508,7 @@ impl CopyApproval {
         relative: &str,
         destination: &Path,
         stage_id: &str,
+        maximum: u64,
         cancelled: &AtomicBool,
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<StagedCopy, String> {
@@ -539,8 +547,7 @@ impl CopyApproval {
         crate::apple_photos::export(resource, photos.allow_hydration, &mut |chunk| {
             cancel(cancelled)?;
             gate()?;
-            let next =
-                crate::apple_photos::admitted_bytes(bytes, chunk.len(), self.scope.max_item_bytes)?;
+            let next = crate::apple_photos::admitted_bytes(bytes, chunk.len(), maximum)?;
             output
                 .write_all(chunk)
                 .map_err(|_| "source_stage_write_failed")?;
@@ -630,9 +637,7 @@ impl CopyApproval {
         self.validate(saved, identity)?;
         cancel(cancelled)?;
         if let Some(photos) = &self.scope.photos {
-            if !self.scope.allow_download || expected_bytes != Some(self.scope.max_item_bytes) {
-                return Err("source_download_permission_required".into());
-            }
+            let maximum = self.export_maximum(expected_bytes)?;
             return self.stage_photos(
                 photos,
                 saved,
@@ -640,6 +645,7 @@ impl CopyApproval {
                 relative,
                 destination,
                 stage_id,
+                maximum,
                 cancelled,
                 gate,
             );
@@ -1459,6 +1465,23 @@ mod tests {
         };
         approval.validate(&saved, &identity).unwrap();
         assert_eq!(approval.kind(), "apple-photos");
+        assert_eq!(approval.export_maximum(Some(6)).unwrap(), 6);
+        assert_eq!(
+            approval
+                .export_maximum(Some(crate::apple_photos::RESOURCE_CEILING))
+                .unwrap(),
+            crate::apple_photos::RESOURCE_CEILING
+        );
+        for maximum in [
+            None,
+            Some(0),
+            Some(crate::apple_photos::RESOURCE_CEILING + 1),
+        ] {
+            assert!(approval.export_maximum(maximum).is_err());
+        }
+        let mut denied = approval.clone();
+        denied.scope.allow_download = false;
+        assert!(denied.export_maximum(Some(6)).is_err());
         let mut widened = approval.clone();
         widened.scope.photos.as_mut().unwrap().allow_hydration = true;
         assert!(widened.validate(&saved, &identity).is_err());

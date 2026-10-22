@@ -35,6 +35,49 @@ impl Plan {
     }
 }
 impl Progress {
+    pub(super) fn reservation(&self, plan: &Plan) -> Result<u64, String> {
+        if let Some(bytes) = self.attempt_bytes {
+            if !plan.export
+                || self.attempt.is_none()
+                || bytes == 0
+                || bytes > plan.entry_at(self.position())?.bytes
+                || self
+                    .resource
+                    .as_ref()
+                    .is_some_and(|copy| copy.bytes > bytes)
+            {
+                return Err("source_journal_invalid".into());
+            }
+        }
+        match (&self.resource, &self.attempt) {
+            (Some(copy), _) => Ok(copy.bytes),
+            (None, Some(_)) => Ok(self
+                .attempt_bytes
+                .unwrap_or(plan.entry_at(self.position())?.bytes)),
+            _ => Ok(0),
+        }
+    }
+    pub(super) fn reserve_attempt(
+        &mut self,
+        entry: &SourceFile,
+        export: bool,
+    ) -> Result<u64, String> {
+        let remaining = STAGING_LIMIT.saturating_sub(self.retained_bytes());
+        let maximum = if export {
+            entry.bytes.min(remaining)
+        } else {
+            entry.bytes
+        };
+        if maximum == 0 || maximum > remaining {
+            return Err("source_staging_budget_exceeded".into());
+        }
+        // The original/hydration allowance remains the full ceiling, even when cache space is smaller.
+        self.read
+            .reserve(entry.bytes, "source_read_budget_exhausted")?;
+        self.attempt = Some(uuid::Uuid::new_v4().to_string());
+        self.attempt_bytes = (maximum < entry.bytes).then_some(maximum);
+        Ok(maximum)
+    }
     pub(super) fn retained_bytes(&self) -> u64 {
         self.staged_bytes() - self.released_bytes.unwrap_or(0)
     }
@@ -145,7 +188,95 @@ impl Preparation {
         });
         state.resource = None;
         state.attempt = None;
+        state.attempt_bytes = None;
         self.journal
             .write("preparation-state.json", &state, identity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn export_plan() -> Plan {
+        Plan {
+            source: "source".into(),
+            scope: "scope".into(),
+            entry: SourceFile {
+                relative: "0/original.HEIC".into(),
+                bytes: STAGING_LIMIT,
+            },
+            export: true,
+            additional: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn export_admission_uses_remaining_space_but_spends_the_full_read_ceiling() {
+        let plan = export_plan();
+        let mut progress: Progress = serde_json::from_value(serde_json::json!({
+            "planHash": "signed-plan", "read": {"used": STAGING_LIMIT, "limit": STAGING_LIMIT * 2},
+            "attempt": null, "resource": null,
+            "completion": {"position": 1, "stagedBytes": STAGING_LIMIT - 6}
+        }))
+        .unwrap();
+        assert_eq!(progress.reserve_attempt(&plan.entry, true).unwrap(), 6);
+        assert_eq!(progress.read.used, STAGING_LIMIT * 2);
+        assert_eq!(progress.attempt_bytes, Some(6));
+        // A partial export cannot free its reservation on restart or trigger another unapproved read.
+        let mut resumed: Progress =
+            serde_json::from_value(serde_json::to_value(&progress).unwrap()).unwrap();
+        let mut plan = plan;
+        plan.additional.push(SourceFile {
+            relative: "1/original.HEIC".into(),
+            bytes: STAGING_LIMIT,
+        });
+        assert_eq!(resumed.reservation(&plan).unwrap(), 6);
+        assert_eq!(
+            resumed.reserve_attempt(&plan.entry, true).unwrap_err(),
+            "source_read_budget_exhausted"
+        );
+        assert_eq!(resumed.attempt, progress.attempt);
+        assert_eq!(resumed.attempt_bytes, Some(6));
+        assert!(resumed
+            .reservation(&Plan {
+                export: false,
+                ..plan
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn full_cache_and_exact_folder_size_refuse_before_spending() {
+        let plan = export_plan();
+        let mut progress: Progress = serde_json::from_value(serde_json::json!({
+            "planHash": "signed-plan", "read": {"used": 0, "limit": STAGING_LIMIT},
+            "attempt": null, "resource": null,
+            "completion": {"position": 1, "stagedBytes": STAGING_LIMIT - 6}
+        }))
+        .unwrap();
+        assert_eq!(
+            progress.reserve_attempt(&plan.entry, false).unwrap_err(),
+            "source_staging_budget_exceeded"
+        );
+        progress.completion.as_mut().unwrap().staged_bytes = STAGING_LIMIT;
+        assert_eq!(
+            progress.reserve_attempt(&plan.entry, true).unwrap_err(),
+            "source_staging_budget_exceeded"
+        );
+        assert_eq!(progress.read.used, 0);
+        assert!(progress.attempt.is_none());
+    }
+
+    #[test]
+    fn export_attempt_capacity_survives_serialization_without_refunding_reads() {
+        let record = serde_json::json!({
+            "planHash": "signed-plan", "read": {"used": STAGING_LIMIT, "limit": STAGING_LIMIT},
+            "attempt": uuid::Uuid::new_v4().to_string(), "resource": null,
+            "completion": {"position": 1, "stagedBytes": 10},
+            "attemptBytes": STAGING_LIMIT - 10
+        });
+        let progress: Progress = serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(serde_json::to_value(progress).unwrap(), record);
     }
 }

@@ -24,6 +24,8 @@ struct Progress {
     completion: Option<Completion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     released_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_bytes: Option<u64>,
 }
 const STAGING_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -216,6 +218,7 @@ impl Preparation {
                     resource: None,
                     completion: None,
                     released_bytes: None,
+                    attempt_bytes: None,
                 },
                 identity,
             )?;
@@ -285,6 +288,7 @@ impl Preparation {
         {
             return Err("source_journal_invalid".into());
         }
+        state.reservation(&self.plan)?;
         Ok(state)
     }
     fn current(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
@@ -301,11 +305,7 @@ impl Preparation {
         identity: &DeviceIdentity,
     ) -> Result<PreparationView, String> {
         let state = self.progress(saved, identity)?;
-        let reserved = match (&state.resource, &state.attempt) {
-            (Some(copy), _) => copy.bytes,
-            (None, Some(_)) => self.plan.entry_at(state.position())?.bytes,
-            _ => 0,
-        };
+        let reserved = state.reservation(&self.plan)?;
         let staging_remaining = STAGING_LIMIT.saturating_sub(
             state
                 .retained_bytes()
@@ -530,18 +530,8 @@ impl Preparation {
             if state.resource.is_some() {
                 return Err("source_stage_unavailable".into());
             }
-            if state
-                .retained_bytes()
-                .checked_add(entry.bytes)
-                .is_none_or(|bytes| bytes > STAGING_LIMIT)
-            {
-                return Err("source_staging_budget_exceeded".into());
-            }
-            state
-                .read
-                .reserve(entry.bytes, "source_read_budget_exhausted")?;
-            let id = uuid::Uuid::new_v4().to_string();
-            state.attempt = Some(id.clone());
+            let maximum = state.reserve_attempt(entry, self.plan.export)?;
+            let id = state.attempt.as_ref().ok_or("source_journal_invalid")?;
             self.journal
                 .write("preparation-state.json", &state, identity)?;
             check()?;
@@ -550,8 +540,8 @@ impl Preparation {
                 identity,
                 &entry.relative,
                 &stage,
-                &id,
-                Some(entry.bytes),
+                id,
+                Some(maximum),
                 cancelled,
                 &check,
             )?
@@ -559,6 +549,7 @@ impl Preparation {
         if copy.source_id() != self.plan.source
             || copy.scope_fingerprint() != self.plan.scope
             || !copy.matches_entry(&entry.relative, entry.bytes)
+            || copy.bytes > state.attempt_bytes.unwrap_or(entry.bytes)
             || state.resource.as_ref().is_some_and(|old| {
                 old.resource_key() != copy.resource_key()
                     || old.version() != copy.version()
