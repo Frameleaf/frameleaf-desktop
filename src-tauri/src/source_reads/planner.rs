@@ -1,3 +1,4 @@
+mod capacity;
 mod inventory;
 use super::*;
 use crate::{copy_source::CopyApproval, photo_sources::SourceFile};
@@ -21,6 +22,8 @@ struct Progress {
     resource: Option<StagedCopy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completion: Option<Completion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    released_bytes: Option<u64>,
 }
 const STAGING_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -212,6 +215,7 @@ impl Preparation {
                     attempt: None,
                     resource: None,
                     completion: None,
+                    released_bytes: None,
                 },
                 identity,
             )?;
@@ -268,10 +272,11 @@ impl Preparation {
             || state.completion.as_ref().is_some_and(|done| {
                 done.position == 0
                     || done.staged_bytes < done.position as u64
-                    || done.staged_bytes > STAGING_LIMIT
+                    || done.staged_bytes > self.total_bytes
             })
             || (state.position() == self.plan.count()
                 && (state.resource.is_some() || state.attempt.is_some()))
+            || state.released_bytes.unwrap_or(0) > state.staged_bytes()
             || state.attempt.as_ref().is_some_and(|id| !canonical_uuid(id))
             || state
                 .resource
@@ -301,10 +306,12 @@ impl Preparation {
             (None, Some(_)) => self.plan.entry_at(state.position())?.bytes,
             _ => 0,
         };
-        let staging_remaining = STAGING_LIMIT
-            .checked_sub(state.staged_bytes())
-            .and_then(|bytes| bytes.checked_sub(reserved))
-            .ok_or("source_journal_invalid")?;
+        let staging_remaining = STAGING_LIMIT.saturating_sub(
+            state
+                .retained_bytes()
+                .checked_add(reserved)
+                .ok_or("source_journal_invalid")?,
+        );
         Ok(PreparationView {
             source_id: self.plan.source.clone(),
             maximum_bytes: self.total_bytes,
@@ -316,6 +323,27 @@ impl Preparation {
             completed: state.position(),
             staging_remaining,
         })
+    }
+    /// Reclaims only reservations whose signed job and empty staging prove cleanup completed.
+    pub fn reconcile_capacity(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<PreparationView, String> {
+        let _owner = self.reconcile_with(saved, identity, &|| {
+            self.current(saved, identity)?;
+            gate()
+        })?;
+        self.view(saved, identity)
+    }
+    pub(super) fn reconcile_with(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<Option<Job>, String> {
+        capacity::reconcile(self, saved, identity, gate)
     }
     /// An additional local approval never replaces the already spent amount.
     pub fn approve(
@@ -472,6 +500,7 @@ impl Preparation {
             gate()
         };
         check()?;
+        let _capacity_owner = self.reconcile_with(saved, identity, &check)?;
         let mut state = self.progress(saved, identity)?;
         let entry = self.plan.entry_at(state.position())?;
         let stage = self.journal.root.join("stage");
@@ -501,9 +530,8 @@ impl Preparation {
             if state.resource.is_some() {
                 return Err("source_stage_unavailable".into());
             }
-            // shortcut: retain completed cache reservations until positive job-owner cleanup can reclaim them.
             if state
-                .staged_bytes()
+                .retained_bytes()
                 .checked_add(entry.bytes)
                 .is_none_or(|bytes| bytes > STAGING_LIMIT)
             {

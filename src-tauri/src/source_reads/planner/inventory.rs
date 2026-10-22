@@ -35,6 +35,9 @@ impl Plan {
     }
 }
 impl Progress {
+    pub(super) fn retained_bytes(&self) -> u64 {
+        self.staged_bytes() - self.released_bytes.unwrap_or(0)
+    }
     pub(super) fn position(&self) -> usize {
         self.completion.as_ref().map_or(0, |done| done.position)
     }
@@ -125,12 +128,19 @@ impl Preparation {
         } else {
             self.journal.write(&name, &record, identity)?;
         }
+        if state
+            .retained_bytes()
+            .checked_add(copy.bytes)
+            .is_none_or(|bytes| bytes > STAGING_LIMIT)
+        {
+            return Err("source_staging_budget_exceeded".into());
+        }
         state.completion = Some(Completion {
             position: index + 1,
             staged_bytes: state
                 .staged_bytes()
                 .checked_add(copy.bytes)
-                .filter(|bytes| *bytes <= STAGING_LIMIT)
+                .filter(|bytes| *bytes <= self.total_bytes)
                 .ok_or("source_staging_budget_exceeded")?,
         });
         state.resource = None;

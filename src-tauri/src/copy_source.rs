@@ -1063,7 +1063,7 @@ impl StagedCopy {
             ),
         )
     }
-    fn validate_receipt(
+    pub(crate) fn validate_receipt(
         &self,
         saved: &SavedConnection,
         identity: &DeviceIdentity,

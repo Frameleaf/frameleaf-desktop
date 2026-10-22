@@ -91,6 +91,11 @@ fn job_key(key: &str, version: &str) -> String {
 fn canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
+enum OpenMode {
+    Create(Box<State>),
+    Read,
+    Inspect,
+}
 /// A locally approved resource and one OS-owned source lease; no original path comes from a request.
 pub struct Job {
     journal: Journal,
@@ -157,6 +162,32 @@ impl Job {
         version: &str,
         initial: Option<State>,
     ) -> Result<Self, String> {
+        Self::open_owned(
+            base,
+            saved,
+            identity,
+            source,
+            key,
+            version,
+            initial
+                .map(|state| OpenMode::Create(Box::new(state)))
+                .unwrap_or(OpenMode::Read),
+        )
+    }
+    fn open_owned(
+        base: &Path,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        source: &str,
+        key: &str,
+        version: &str,
+        mode: OpenMode,
+    ) -> Result<Self, String> {
+        let inspect = matches!(&mode, OpenMode::Inspect);
+        let initial = match mode {
+            OpenMode::Create(state) => Some(*state),
+            _ => None,
+        };
         if !canonical_uuid(source)
             || !crate::native_runtime::digest_valid(key, 64)
             || !crate::native_runtime::digest_valid(version, 64)
@@ -212,7 +243,11 @@ impl Job {
         }
         let state: State = journal.read("state.json", identity)?;
         state.validate()?;
-        state.resource.validate_current(saved, identity)?;
+        if inspect {
+            state.resource.validate_receipt(saved, identity)?;
+        } else {
+            state.resource.validate_current(saved, identity)?;
+        }
         state.resource.staging_root(base)?;
         if state.resource.source_id() != source
             || state.resource.resource_key() != key
@@ -665,11 +700,217 @@ mod tests {
             )
             .unwrap()
         }
+        fn prepared_job(&self, prep: &Preparation) -> Arc<Job> {
+            let record: serde_json::Value = prep
+                .journal
+                .read("prepared-0.json", &self.identity)
+                .unwrap();
+            let resource: PreparedResource =
+                serde_json::from_value(record["resource"].clone()).unwrap();
+            Arc::new(
+                Job::open(
+                    &self.root.join("data"),
+                    &self.saved,
+                    &self.identity,
+                    self.approval.source_id(),
+                    &resource.resource_key,
+                    &resource.version,
+                    None,
+                )
+                .unwrap(),
+            )
+        }
+        fn finish_cache(&self, job: &Arc<Job>) {
+            let mut state = job.state(&self.saved, &self.identity).unwrap();
+            let copy = StagedCopy::restore(
+                &self.saved,
+                &self.identity,
+                &job.journal.root.join("stage"),
+                state.stage.as_ref().unwrap(),
+            )
+            .unwrap();
+            copy.release(&self.saved, &self.identity, &job.journal.root.join("stage"))
+                .unwrap();
+            state.stage = None;
+            job.journal
+                .write("state.json", &state, &self.identity)
+                .unwrap();
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn reference_capacity_requires_idle_owner_and_positive_cleanup_without_original_access() {
+        let f = Fixture::new();
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let job = f.prepared_job(&prep);
+        assert_eq!(
+            prep.reconcile_with(&f.saved, &f.identity, &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_read_already_running")
+        );
+        job.resource
+            .release(&f.saved, &f.identity, &job.journal.root.join("stage"))
+            .unwrap();
+        drop(job);
+        drop(
+            prep.reconcile_with(&f.saved, &f.identity, &|| Ok(()))
+                .unwrap(),
+        );
+        assert_eq!(
+            prep.view(&f.saved, &f.identity).unwrap().staging_remaining,
+            2 * 1024 * 1024 * 1024 - 10
+        );
+        let job = f.prepared_job(&prep);
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.stage = None;
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        drop(job);
+        fs::remove_file(f.root.join("source/original.jpg")).unwrap();
+        assert_eq!(
+            prep.reconcile_with(&f.saved, &f.identity, &|| {
+                let progress: serde_json::Value =
+                    prep.journal.read("preparation-state.json", &f.identity)?;
+                if progress["releasedBytes"] == 10 {
+                    Err("source_copy_cancelled".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .err()
+            .as_deref(),
+            Some("source_copy_cancelled")
+        );
+        for _ in 0..2 {
+            drop(
+                prep.reconcile_with(&f.saved, &f.identity, &|| Ok(()))
+                    .unwrap(),
+            );
+        }
+        let view = prep.view(&f.saved, &f.identity).unwrap();
+        assert_eq!(
+            (
+                view.spent,
+                view.remaining,
+                view.completed,
+                view.staging_remaining
+            ),
+            (10, 0, 1, 2 * 1024 * 1024 * 1024)
+        );
+        let record: serde_json::Value = prep.journal.read("prepared-0.json", &f.identity).unwrap();
+        assert_eq!(record["resource"]["bytes"], 10);
+    }
+    #[test]
+    fn reference_capacity_rechecks_repopulated_cache_before_another_original_attempt() {
+        let f = Fixture::new();
+        let ceiling = 2 * 1024 * 1024 * 1024;
+        let entries = vec![
+            crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            },
+            crate::photo_sources::SourceFile {
+                relative: "missing.jpg".into(),
+                bytes: ceiling - 5,
+            },
+        ];
+        let mut prep = Preparation::open_selection(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries,
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, ceiling + 5)
+            .unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let job = f.prepared_job(&prep);
+        let cache = job.journal.root.join("stage").join(&job.resource.id);
+        let receipt = fs::read(cache.join("receipt.json")).unwrap();
+        f.finish_cache(&job);
+        drop(job);
+        drop(
+            prep.reconcile_with(&f.saved, &f.identity, &|| Ok(()))
+                .unwrap(),
+        );
+        assert_eq!(
+            prep.view(&f.saved, &f.identity).unwrap().staging_remaining,
+            ceiling
+        );
+        let job = f.prepared_job(&prep);
+        crate::runtime_store::private_directory(&cache).unwrap();
+        fs::write(cache.join("original"), b"abcdefghij").unwrap();
+        fs::write(cache.join("receipt.json"), receipt).unwrap();
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.stage = Some(job.resource.id.clone());
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        drop(job);
+        assert_eq!(
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_staging_budget_exceeded")
+        );
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 10);
+    }
+    #[test]
+    fn reference_capacity_keeps_unknown_staging_and_never_credits_it() {
+        let f = Fixture::new();
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let job = f.prepared_job(&prep);
+        f.finish_cache(&job);
+        let unknown = job.journal.root.join("stage/unknown");
+        fs::write(&unknown, b"keep").unwrap();
+        drop(job);
+        assert!(prep
+            .reconcile_with(&f.saved, &f.identity, &|| Ok(()))
+            .is_err());
+        assert_eq!(
+            prep.view(&f.saved, &f.identity).unwrap().staging_remaining,
+            2 * 1024 * 1024 * 1024 - 10
+        );
+        assert_eq!(fs::read(&unknown).unwrap(), b"keep");
     }
     #[test]
     fn reference_selection_recovers_record_written_before_cursor_checkpoint() {

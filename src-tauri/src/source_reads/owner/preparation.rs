@@ -6,6 +6,7 @@ pub enum PreparationAction {
     Plan { relative: String },
     Selection { relatives: Vec<String> },
     Read { additional: u64 },
+    Reconcile,
 }
 impl Requests {
     /// Uses the same application owner drained by source revocation, sign-out and quit.
@@ -38,6 +39,10 @@ impl Requests {
                     &relatives,
                 )?
                 .view(&saved, &identity),
+                PreparationAction::Reconcile => {
+                    Preparation::resume(&base, &saved, &identity, &selected_source)?
+                        .reconcile_capacity(&saved, &identity, stop)
+                }
                 PreparationAction::Read { additional } => {
                     let mut preparation =
                         Preparation::resume(&base, &saved, &identity, &selected_source)?;
