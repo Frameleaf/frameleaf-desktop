@@ -1,5 +1,6 @@
 //! One source-owned original read, with durable allowances and locally signed resource selection.
 mod owner;
+mod planner;
 mod preparation;
 use crate::{
     connection::{DeviceIdentity, SavedConnection},
@@ -8,6 +9,7 @@ use crate::{
 };
 use cap_std::{ambient_authority, fs::Dir};
 pub use owner::{Requests, View};
+pub use planner::{Preparation, PreparationView};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -668,6 +670,257 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn reference_preparation_requires_budget_and_preserves_spending_after_restart() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().remaining, 0);
+        assert_eq!(
+            prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_read_budget_exhausted")
+        );
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        fs::remove_file(f.root.join("source/original.jpg")).unwrap();
+        assert!(prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .is_err());
+        drop(prep);
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            false,
+        )
+        .unwrap();
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 10);
+        fs::write(f.root.join("source/original.jpg"), b"abcdefghij").unwrap();
+        assert_eq!(
+            prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_read_budget_exhausted")
+        );
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        let copy = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let again = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(copy.id, again.id);
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 20);
+    }
+    #[test]
+    fn reference_preparation_recovers_receipt_after_late_stop_and_hands_off_once() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        let stage = prep.journal.root.join("stage");
+        assert!(prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| {
+                if fs::read_dir(&stage)
+                    .unwrap()
+                    .any(|entry| entry.unwrap().path().join("receipt.json").exists())
+                {
+                    Err("source_copy_cancelled".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 10);
+        drop(prep);
+        let prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            false,
+        )
+        .unwrap();
+        let copy = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let job = prep
+            .handoff_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        drop(job);
+        let job = prep
+            .handoff_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        assert!(prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .is_err());
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 10);
+        assert_eq!(
+            job.stage(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap()
+                .sha256,
+            copy.sha256
+        );
+        assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 0);
+    }
+    #[test]
+    fn reference_preparation_rejects_rebound_selection_and_parallel_owner() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            Preparation::open_with(
+                &base,
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                entry,
+                true
+            )
+            .err()
+            .as_deref(),
+            Some("source_read_already_running")
+        );
+        drop(prep);
+        let other = crate::photo_sources::SourceFile {
+            relative: "other.jpg".into(),
+            bytes: 10,
+        };
+        assert_eq!(
+            Preparation::open_with(
+                &base,
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                other,
+                true
+            )
+            .err()
+            .as_deref(),
+            Some("source_approval_changed")
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn reference_preparation_retains_dangling_attempt_without_spending() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 20).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut state: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        state["attempt"] = serde_json::json!(id);
+        state["read"]["used"] = serde_json::json!(10);
+        prep.journal
+            .write("preparation-state.json", &state, &f.identity)
+            .unwrap();
+        let path = prep.journal.root.join("stage").join(&id);
+        std::os::unix::fs::symlink(f.root.join("missing"), &path).unwrap();
+        assert_eq!(
+            prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_cache_cleanup_pending")
+        );
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 10);
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+    #[test]
+    fn reference_preparation_keeps_unknown_stage_and_refuses_missing_budget_checkpoint() {
+        let f = Fixture::new();
+        let base = f.root.join("data");
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        let stage = prep.journal.root.join("stage");
+        fs::create_dir(stage.join("unknown")).unwrap();
+        assert_eq!(
+            prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .err()
+                .as_deref(),
+            Some("source_cache_cleanup_pending")
+        );
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 0);
+        let journal = prep.journal.root.clone();
+        drop(prep);
+        fs::remove_file(journal.join("preparation-state.json")).unwrap();
+        assert!(Preparation::open_with(
+            &base,
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry,
+            true
+        )
+        .is_err());
+        assert!(stage.join("unknown").exists());
     }
     #[test]
     fn prepared_stage_is_handed_off_without_granting_or_spending_more_reads() {

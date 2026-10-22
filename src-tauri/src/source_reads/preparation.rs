@@ -110,7 +110,7 @@ impl Job {
         gate()
     }
 }
-fn present(path: &Path) -> Result<bool, String> {
+pub(super) fn present(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
