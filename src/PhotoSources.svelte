@@ -14,7 +14,7 @@
   type Consent = { allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
   type CopyJob = { sourceReadRemaining: number | null; additionalSourceReadAllowance: number; provider: string | null; stagedBytes: number | null; exportRemaining: number | null; additionalExportAllowance: number; sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
-  let approvals = $derived(job ? sourceCopyApprovals(job) : { read: false, export: false, upload: false, canResume: false });
+  let approvals = $derived(job ? sourceCopyApprovals(job) : { read: false, export: false, upload: false, canResumeWithoutUpload: false, canResume: false });
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowHydration = $state(false);
@@ -245,8 +245,9 @@
           {#if job.availability}<p class="footnote" aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
           {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
           {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
-            <button class="secondary" disabled={busy || !approvals.canResume} onclick={() => controlCopy('resume')}>{job.provider && job.stagedBytes === null ? 'Export next original within allowance' : job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
+            <button class="secondary" disabled={busy || !approvals.canResume} onclick={() => controlCopy('resume')}>{approvals.canResumeWithoutUpload ? 'Resume without more upload data' : job.provider && job.stagedBytes === null ? 'Export next original within allowance' : job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
           {/if}
+          {#if approvals.canResumeWithoutUpload}<p class="footnote">Already received copies can finish without more upload data. Sending additional original data still needs upload approval; existing read and export allowances remain in effect.</p>{/if}
           {#if job.state === 'copying'}<button class="secondary" disabled={busy} onclick={() => controlCopy('pause')}>Pause copy</button>{/if}
           {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}
           {#if job.state === 'cancelled'}<p class="footnote">Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</p>{/if}
