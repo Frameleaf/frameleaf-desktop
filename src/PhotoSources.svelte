@@ -99,11 +99,12 @@
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
   async function loadConsent() {
+    const previous = consent;
     try {
       const current = await invoke<Consent | null>('photo_source_status');
-      if (alive) { consent = current; blockedConsent = false; }
+      if (alive && consent === previous) { consent = current; blockedConsent = false; }
     } catch (error) {
-      if (alive) {
+      if (alive && consent === previous) {
         blockedConsent = ['source_photo_session_changed', 'source_approval_invalid', 'credential_record_invalid', 'photos_permission_required', 'photos_macos_required'].includes(String(error));
         message = explain(error);
       }
@@ -117,8 +118,14 @@
         if (!alive) { unlisten(); return; }
         await loadConsent();
         if (consent?.registered) {
-          const current = await invoke<CopyJob | null>('photo_import_status');
-          if (alive) job = current;
+          const source = consent;
+          const previous = job;
+          // A permission change or live progress event supersedes this snapshot.
+          const isCurrent = () => alive && consent === source && job === previous;
+          try {
+            const current = await invoke<CopyJob | null>('photo_import_status');
+            if (isCurrent() && (!current || current.sourceId === source.id)) job = current;
+          } catch (error) { if (isCurrent()) message = explain(error); }
         }
       } catch (error) { if (alive) message = explain(error); }
     })();
