@@ -63,7 +63,7 @@ impl ChallengeAuthority {
     }
 }
 
-/// Bound to a compiled profile and a locally verified signed runtime; no NAS-selected code or fixture.
+/// Bound to a compiled profile and a locally verified signed runtime; no server-selected code or fixture.
 /// ```compile_fail
 /// let _: frameleaf_desktop::ml_transport::QualificationChallenge = serde_json::from_str("{}").unwrap();
 /// ```

@@ -1,4 +1,4 @@
-//! Opt-in real NAS fixture; credentials live only in this test process.
+//! Opt-in remote Frameleaf Library Server fixture; credentials live only in this test process.
 use super::*;
 
 #[test]

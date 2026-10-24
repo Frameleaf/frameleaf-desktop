@@ -374,7 +374,7 @@
     <form onsubmit={pair}>
       <fieldset disabled={busy || !native}>
         <label for="manager-origin">Manager HTTPS address</label>
-        <input id="manager-origin" type="url" bind:value={origin} placeholder="https://nas.home.example:9443" required autocomplete="url" />
+        <input id="manager-origin" type="url" bind:value={origin} placeholder="https://server.home.example:9443" required autocomplete="url" />
         <label for="manager-password">Manager password</label>
         <input id="manager-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" />
         <details>
