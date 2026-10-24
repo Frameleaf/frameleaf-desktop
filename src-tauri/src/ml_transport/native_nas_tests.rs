@@ -405,7 +405,7 @@ fn automatic_setup_job(
     let cache = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
     let workload =
         std::env::var("FRAMELEAF_FACTORY_TEST_WORKLOAD").unwrap_or_else(|_| "ocr".into());
-    assert!(matches!(workload.as_str(), "ocr" | "clip"));
+    assert!(matches!(workload.as_str(), "ocr" | "clip" | "face"));
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(pack.join("manifest.json")).unwrap()).unwrap();
     let catalogue: serde_json::Value =
@@ -421,6 +421,7 @@ fn automatic_setup_job(
         })
         .unwrap();
     let name = profile["modelName"].as_str().unwrap();
+    let task = profile["spec"]["models"][0]["task"].as_str().unwrap();
     let staged = root
         .0
         .join("worker/models")
@@ -428,7 +429,7 @@ fn automatic_setup_job(
             ".staging-{}",
             profile["modelSnapshotRevision"].as_str().unwrap()
         ))
-        .join(&workload)
+        .join(task)
         .join(name);
     let mut directories = std::fs::DirBuilder::new();
     directories.recursive(true);
@@ -443,7 +444,7 @@ fn automatic_setup_job(
         }
         let destination = staged.join(artifact);
         directories.create(destination.parent().unwrap()).unwrap();
-        std::fs::copy(cache.join(&workload).join(name).join(artifact), destination).unwrap();
+        std::fs::copy(cache.join(task).join(name).join(artifact), destination).unwrap();
     }
     let setup = crate::worker_setup::WorkerSetup::default();
     tauri::async_runtime::block_on(async {

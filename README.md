@@ -235,12 +235,12 @@ This covers the login sequence and native processing, while runtime/model setup 
 the installed window and fresh-install Windows/macOS/Linux journeys remain separate
 acceptance gates.
 
-The same fixture accepts `FRAMELEAF_FACTORY_AUTOMATIC_SETUP=1` with the OCR workload.
+The same fixture accepts `FRAMELEAF_FACTORY_AUTOMATIC_SETUP=1` with OCR, CLIP or face recognition.
 That mode hands the enrolled connection to `WorkerSetup`, which installs the signed
 runtime, acquires the selected models, qualifies them and starts its own job loop.
 It requires real external power, an unmetered connection and sufficient memory;
-the fixture does not override those checks. Its dedicated server configuration enables
-OCR only. The private HTTPS fixture client is available only under Rust's test
+the fixture does not override those checks. Each run enables only its selected workload
+in the test server configuration. The private HTTPS fixture client is available only under Rust's test
 configuration and cannot alter the installed application's certificate policy.
 
 ### Local photo-source preview
