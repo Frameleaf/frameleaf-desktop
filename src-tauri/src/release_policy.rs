@@ -177,4 +177,61 @@ mod tests {
         assert!(verified.epoch() >= floor);
         eprintln!("PASS: factory-signed private runtime verified against the app's compiled release authority");
     }
+    #[test]
+    #[ignore = "requires a factory-signed runtime, owned OCR cache and real GPU preparation"]
+    fn factory_signed_runtime_qualifies_with_observed_memory() {
+        use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
+        let root = PathBuf::from(std::env::var_os("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
+        let cache = PathBuf::from(std::env::var_os("FRAMELEAF_FACTORY_TEST_CACHE").unwrap());
+        let output = PathBuf::from(std::env::var_os("FRAMELEAF_FACTORY_TEST_WORK").unwrap());
+        let signature: [u8; 64] = fs::read(root.join("manifest.sig"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let (floor, _, keys) = parse_policy(POLICY).unwrap();
+        let runtime = crate::native_runtime::VerifiedRuntime::verify(
+            &root.join("payload"),
+            &fs::read(root.join("manifest.json")).unwrap(),
+            &signature,
+            &keys,
+            floor,
+        )
+        .unwrap();
+        let profiles = crate::model_catalogue::setup_profiles(
+            "PP-OCRv5_mobile",
+            runtime.source_revision(),
+            runtime.provider(),
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        let (spec, fixture) = profile
+            .challenge(&uuid::Uuid::new_v4().to_string())
+            .unwrap();
+        let work = output.join(format!("qualification-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&work).unwrap();
+        let qualified = runtime
+            .qualify(&cache, &work, &spec, &fixture, &AtomicBool::new(false))
+            .unwrap();
+        let report = qualified.report();
+        let envelope =
+            crate::memory_admission::envelope(profile.minimum_memory(), &[report]).unwrap();
+        assert!(envelope.startup > envelope.running);
+        assert!(envelope.running >= profile.minimum_memory());
+        let mut missing = report.clone();
+        missing.as_object_mut().unwrap().remove("memory");
+        assert_eq!(
+            crate::memory_admission::envelope(profile.minimum_memory(), &[&missing]).unwrap_err(),
+            "runtime_memory_measurement_required"
+        );
+        fs::write(output.join("native-memory-qualification.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "sourceRevision": runtime.source_revision(), "manifestSha256": runtime.manifest_sha256(),
+            "compiledReleaseAuthorityVerified": true, "freshNativeQualification": true,
+            "report": report, "startupFreeMemoryBytes": envelope.startup,
+            "runningFreeMemoryBytes": envelope.running, "missingMemoryRefused": true,
+            "installedAcceptance": false, "nasLeaseExecuted": false,
+        })).unwrap()).unwrap();
+        assert!(fs::read_dir(&work).unwrap().next().is_none());
+        fs::remove_dir(&work).unwrap();
+    }
 }
