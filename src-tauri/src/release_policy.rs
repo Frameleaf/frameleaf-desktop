@@ -189,9 +189,10 @@ mod tests {
             .try_into()
             .unwrap();
         let (floor, _, keys) = parse_policy(POLICY).unwrap();
+        let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
         let runtime = crate::native_runtime::VerifiedRuntime::verify(
             &root.join("payload"),
-            &fs::read(root.join("manifest.json")).unwrap(),
+            &manifest_bytes,
             &signature,
             &keys,
             floor,
@@ -229,6 +230,172 @@ mod tests {
             "compiledReleaseAuthorityVerified": true, "freshNativeQualification": true,
             "report": report, "startupFreeMemoryBytes": envelope.startup,
             "runningFreeMemoryBytes": envelope.running, "missingMemoryRefused": true,
+            "installedAcceptance": false, "nasLeaseExecuted": false,
+        })).unwrap()).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut sidecar = runtime
+            .start_qualified_sidecar(&qualified, &cache, &work, port)
+            .unwrap();
+        let scratch = sidecar.working_dir().to_path_buf();
+        let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+        let engine = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outputs = engine.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .pool_max_idle_per_host(0)
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap();
+            let base = format!("http://127.0.0.1:{port}");
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(spec["deadlineSeconds"].as_u64().unwrap() + 15);
+            loop {
+                if client
+                    .get(format!("{base}/ping"))
+                    .bearer_auth(sidecar.authorization())
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+                {
+                    break;
+                }
+                assert!(
+                    sidecar.is_running().unwrap(),
+                    "owned sidecar exited during preload"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned sidecar preload deadline"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let form = |entries: &serde_json::Value, image: Vec<u8>| {
+                reqwest::multipart::Form::new()
+                    .text("entries", entries.to_string())
+                    .part(
+                        "image",
+                        reqwest::multipart::Part::bytes(image)
+                            .file_name("fixture.png")
+                            .mime_str("image/png")
+                            .unwrap(),
+                    )
+            };
+            assert_eq!(
+                client
+                    .post(format!("{base}/predict"))
+                    .multipart(form(&spec["entries"], fixture.clone()))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+            let mut changed = spec["entries"].clone();
+            changed["ocr"]["detection"]["options"]["minScore"] = serde_json::json!(0.6);
+            assert_eq!(
+                client
+                    .post(format!("{base}/predict"))
+                    .bearer_auth(sidecar.authorization())
+                    .multipart(form(&changed, fixture.clone()))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::CONFLICT
+            );
+            let mut oversized = fixture.clone();
+            assert_eq!(&oversized[..8], b"\x89PNG\r\n\x1a\n");
+            oversized[16..20].copy_from_slice(&8193_u32.to_be_bytes());
+            assert_eq!(
+                client
+                    .post(format!("{base}/predict"))
+                    .bearer_auth(sidecar.authorization())
+                    .multipart(form(&spec["entries"], oversized))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE
+            );
+            let mut outputs = Vec::new();
+            for _ in 0..2 {
+                let response = client
+                    .post(format!("{base}/predict"))
+                    .bearer_auth(sidecar.authorization())
+                    .multipart(form(&spec["entries"], fixture.clone()))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    response.status().is_success(),
+                    "bound OCR prediction refused"
+                );
+                let bytes = response.bytes().await.unwrap();
+                assert!(bytes.len() <= 4 * 1024 * 1024);
+                outputs.push(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+            }
+            outputs
+        });
+        sidecar.stop().unwrap();
+        drop(sidecar);
+        assert!(!scratch.exists());
+        // Use the packaged production comparator so this test cannot drift from its output contract.
+        use std::process::{Child, Command, Stdio};
+        struct Comparator(Child);
+        impl Drop for Comparator {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let comparison = work.join("comparison.json");
+        fs::write(
+            &comparison,
+            serde_json::to_vec(&serde_json::json!({
+                "actual": outputs, "expected": spec["expectedOutput"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        crate::native_runtime::VerifiedRuntime::verify(
+            &root.join("payload"),
+            &manifest_bytes,
+            &signature,
+            &keys,
+            floor,
+        )
+        .unwrap();
+        let mut comparator = Comparator(Command::new(root.join("payload").join(manifest["python"].as_str().unwrap()))
+            .env_clear().args(["-I", "-B", "-c", "import json,sys;from frameleaf_ml.qualification import compare_output;v=json.load(open(sys.argv[1]));[compare_output(x,v['expected']) for x in v['actual']]"])
+            .arg(&comparison).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = comparator.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "packaged comparator rejected native HTTP output"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "packaged comparator deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(comparator);
+        fs::remove_file(comparison).unwrap();
+        fs::write(output.join("native-bound-http.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "sourceRevision": runtime.source_revision(), "manifestSha256": runtime.manifest_sha256(),
+            "authenticatedCanonicalComparisons": 2, "unauthorizedRefused": true,
+            "unboundConfigurationRefused": true, "oversizedImageRefused": true,
+            "sidecarStopped": true, "scratchRemoved": true,
             "installedAcceptance": false, "nasLeaseExecuted": false,
         })).unwrap()).unwrap();
         assert!(fs::read_dir(&work).unwrap().next().is_none());
