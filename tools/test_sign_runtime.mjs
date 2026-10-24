@@ -389,7 +389,7 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     profiles["cpu-ort"].sourceRevision,
     "25b22c16e47a27a2eb50017d838497abce850d11",
   );
-  assert.deepEqual(profiles["cpu-ort"].additionalSources["macos-aarch64"], [source, "f93c34d196955da3e2760c095c08b27ccbf53315"]);
+  assert.deepEqual(profiles["cpu-ort"].additionalSources["macos-aarch64"], [source, "f93c34d196955da3e2760c095c08b27ccbf53315", "088560702a69022b6eee705d8a67306f1075cea0"]);
   assert.deepEqual(profiles["cpu-ort"].additionalSources["linux-aarch64"], ["f93c34d196955da3e2760c095c08b27ccbf53315"]);
   assert.equal(
     profiles["coreml-ort"].sourceRevision,
@@ -553,7 +553,7 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
   const { packageConfiguration } = await import("./package_desktop.mjs");
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   const source = "b7b5756a3f9eaeec9e977460ab654cbbadee87e7";
-  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f"] });
+  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0"] });
   for (const [revision, provider, allowed] of [
     [source, "CoreMLExecutionProvider", true],
     ["db72dcde18d3a4ff4ab5cfed3fb650a6b3629353", "CoreMLExecutionProvider", false],
@@ -581,19 +581,20 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
 });
 
 
-test("current precision source is approved only for qualified Linux and Windows CPU and macOS CoreML targets", async (t) => {
-  const source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
+test("runtime sources are approved only for their qualified provider and platform targets", async (t) => {
+  for (const source of ["f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0"]) {
+  const memoryReportSource = source === "088560702a69022b6eee705d8a67306f1075cea0";
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   for (const [name, profile] of Object.entries(profiles)) {
     const targets = Object.entries(profile.additionalSources ?? {}).filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
-    assert.deepEqual(targets, name === "cpu-ort" ? ["linux-x86_64", "windows-x86_64"] : name === "coreml-ort" ? ["macos-aarch64"] : []);
+    assert.deepEqual(targets, memoryReportSource ? (name === "cuda-ort" ? [] : ["macos-aarch64"]) : name === "cpu-ort" ? ["linux-x86_64", "windows-x86_64"] : name === "coreml-ort" ? ["macos-aarch64"] : []);
   }
   const { packageConfiguration } = await import("./package_desktop.mjs");
   for (const [platform, architecture, provider, allowed] of [
-    ["linux", "x86_64", "CPUExecutionProvider", true],
-    ["windows", "x86_64", "CPUExecutionProvider", true],
+    ["linux", "x86_64", "CPUExecutionProvider", !memoryReportSource],
+    ["windows", "x86_64", "CPUExecutionProvider", !memoryReportSource],
     ["macos", "x86_64", "CPUExecutionProvider", false],
-    ["macos", "aarch64", "CPUExecutionProvider", false],
+    ["macos", "aarch64", "CPUExecutionProvider", memoryReportSource],
     ["macos", "aarch64", "CoreMLExecutionProvider", true],
   ]) {
     const f = await fixture(t);
@@ -615,5 +616,6 @@ test("current precision source is approved only for qualified Linux and Windows 
       const config = await packageConfiguration(f.root, f.policy);
       assert.equal(config.bundle.resources[join(f.root, "payload")], "native-runtime/payload");
     }
+  }
   }
 });
