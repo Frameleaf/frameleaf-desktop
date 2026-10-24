@@ -430,9 +430,7 @@ async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
     let capabilities = crate::transport::capabilities(&client, saved)
         .await?
         .ok_or("desktop_protocol_unsupported")?;
-    if !capabilities.features.worker_session {
-        return Err("desktop_worker_session_unavailable".into());
-    }
+    capabilities.features.require_worker_qualification()?;
     // Issue rechecks the existing device and photo session; recovery must never re-enroll a revoked device.
     let worker = crate::transport::issue_worker_session(&client, saved).await?;
     crate::credentials::save("worker-session", &worker)
@@ -712,9 +710,7 @@ async fn prepare(
     )
     .await?
     .ok_or("desktop_protocol_unsupported")?;
-    if !caps.features.worker_session {
-        return Err("desktop_worker_session_unavailable".into());
-    }
+    caps.features.require_worker_qualification()?;
     let worker = WorkerTransport::load(&saved)?;
     let inventory = cancellable(
         worker.model_inventory(installed.source_revision(), installed.provider()),

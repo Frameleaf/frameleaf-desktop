@@ -83,6 +83,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
         enrollment: false,
         worker: false,
         worker_session: false,
+        qualification_memory: false,
         sources: false,
         native_host: false,
     };
@@ -101,6 +102,7 @@ async fn prepare_with_client(
         enrollment: false,
         worker: false,
         worker_session: false,
+        qualification_memory: false,
         sources: false,
         native_host: false,
     };

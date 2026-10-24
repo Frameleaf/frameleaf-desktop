@@ -163,8 +163,21 @@ pub struct Features {
     pub worker: bool,
     #[serde(default)]
     pub worker_session: bool,
+    #[serde(default)]
+    pub qualification_memory: bool,
     pub sources: bool,
     pub native_host: bool,
+}
+impl Features {
+    pub(crate) fn require_worker_qualification(&self) -> Result<(), String> {
+        if !self.worker_session {
+            return Err("desktop_worker_session_unavailable".into());
+        }
+        if !self.qualification_memory {
+            return Err("desktop_worker_memory_unavailable".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -229,4 +242,30 @@ pub fn native_origin_allowed(label: &str, url: &Url, development_build: bool) ->
         && url.host_str() == Some("localhost")
         && url.port() == Some(1420);
     label == "main" && (packaged || development)
+}
+
+#[cfg(test)]
+mod memory_capability_tests {
+    use super::*;
+    #[test]
+    fn older_server_keeps_photo_enrollment_but_cannot_start_memory_qualification() {
+        let mut value = serde_json::json!({"enrollment":true,"worker":false,"workerSession":true,
+            "sources":false,"nativeHost":false});
+        let older: Features = serde_json::from_value(value.clone()).unwrap();
+        assert!(older.enrollment);
+        assert!(!older.qualification_memory);
+        assert_eq!(
+            older.require_worker_qualification().unwrap_err(),
+            "desktop_worker_memory_unavailable"
+        );
+        value["qualificationMemory"] = serde_json::json!(true);
+        let current: Features = serde_json::from_value(value.clone()).unwrap();
+        current.require_worker_qualification().unwrap();
+        value["workerSession"] = serde_json::json!(false);
+        let disabled: Features = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            disabled.require_worker_qualification().unwrap_err(),
+            "desktop_worker_session_unavailable"
+        );
+    }
 }

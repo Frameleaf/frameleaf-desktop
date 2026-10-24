@@ -72,3 +72,10 @@ test('memory measurement failures require a runtime update without claiming read
     assert.match(runtimeRecoveryMessage(code)!, /Photos remain available/);
   }
 });
+
+
+test('older qualification servers need an update while Photos remain available', async () => {
+  const { runtimeRecoveryMessage } = await import('../src/mode-state.ts');
+  assert.match(runtimeRecoveryMessage('desktop_worker_memory_unavailable')!, /server.*update/i);
+  assert.match(runtimeRecoveryMessage('desktop_worker_memory_unavailable')!, /Photos remain available/);
+});

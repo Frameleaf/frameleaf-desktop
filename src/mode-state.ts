@@ -26,6 +26,8 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
 
 export function runtimeRecoveryMessage(code: string | null): string | null {
   switch (code) {
+    case 'desktop_worker_memory_unavailable':
+      return 'Your server needs an update before this computer can qualify AI memory use. Photos remain available.';
     case 'runtime_memory_measurement_required':
     case 'runtime_memory_measurement_invalid':
       return 'AI processing needs an updated signed runtime with verified memory measurements. Photos remain available.';
