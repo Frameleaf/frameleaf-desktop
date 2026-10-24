@@ -22,7 +22,7 @@ function component() {
     svelte: { onMount: (callback: typeof mount) => { mount = callback; } },
     './source-copy-state': {},
   };
-  const code = ts.transpileModule(`${script}\nexport { revoke, loadConsent }; export const current = () => ({ consent, job, message, blockedConsent });`, {
+  const code = ts.transpileModule(`${script}\nexport { revoke, loadConsent, prepareCopy, controlCopy }; export const current = () => ({ consent, job, message, blockedConsent });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, require: (name: string) => {
@@ -32,6 +32,7 @@ function component() {
   return { ...exports, pending, mount: () => mount(), emit: (payload: unknown) => event({ payload }) } as unknown as {
     current: () => { consent: typeof source | null; job: typeof job | null; message: string; blockedConsent: boolean };
     revoke: () => Promise<void>; loadConsent: () => Promise<void>;
+    prepareCopy: () => Promise<void>; controlCopy: (action: string) => Promise<void>;
     pending: typeof pending; mount: () => () => void; emit: (payload: unknown) => void;
   };
 }
@@ -99,3 +100,55 @@ test('permission refresh replies and errors cannot supersede completed revocatio
     unmount();
   }
 });
+
+const copyActions = ['prepare', 'resume', 'pause', 'cancel', 'approve-upload', 'approve-export', 'approve-read'];
+for (const action of copyActions) {
+  test(`${action} replies cannot replace newer live copy progress`, async () => {
+    const { view, unmount } = await loadingJob();
+    view.pending.get('photo_import_status')!.resolve(job);
+    await setImmediate();
+    const command = action === 'prepare' ? view.prepareCopy() : view.controlCopy(action);
+    const progress = { ...job, completed: 2 };
+    view.emit(progress);
+    view.pending.get(action === 'prepare' ? 'prepare_photo_import' : 'control_photo_import')!.resolve(job);
+    await command;
+    assert.equal(view.current().job, progress);
+    unmount();
+  });
+  test(`${action} accepts a current reply but refuses another source`, async () => {
+    for (const sourceId of [source.id, 'source-b']) {
+      const { view, unmount } = await loadingJob();
+      view.pending.get('photo_import_status')!.resolve(null);
+      await setImmediate();
+      const command = action === 'prepare' ? view.prepareCopy() : view.controlCopy(action);
+      const reply = { ...job, sourceId, completed: 1 };
+      view.pending.get(action === 'prepare' ? 'prepare_photo_import' : 'control_photo_import')!.resolve(reply);
+      await command;
+      assert.equal(view.current().job, sourceId === source.id ? reply : null);
+      unmount();
+    }
+  });
+}
+
+for (const action of copyActions) {
+  test(`${action} replies and errors cannot supersede revocation`, async () => {
+    for (const fails of [false, true]) {
+      const { view, unmount } = await loadingJob();
+      view.pending.get('photo_import_status')!.resolve(job);
+      await setImmediate();
+      const command = action === 'prepare' ? view.prepareCopy() : view.controlCopy(action);
+      const revoke = view.revoke();
+      view.pending.get('revoke_photo_source')!.resolve(true);
+      await revoke;
+      const message = view.current().message;
+      const reply = view.pending.get(action === 'prepare' ? 'prepare_photo_import' : 'control_photo_import')!;
+      if (fails) reply.reject('source_approval_invalid');
+      else reply.resolve(job);
+      await command;
+      assert.equal(view.current().consent, null);
+      assert.equal(view.current().job, null);
+      assert.equal(view.current().message, message);
+      unmount();
+    }
+  });
+}

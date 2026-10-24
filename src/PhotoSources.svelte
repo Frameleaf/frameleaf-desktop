@@ -141,15 +141,25 @@
     return `${value.available.toLocaleString()} OS-reported available; ${value.needsDownload.toLocaleString()} need downloading (${size(value.downloadBytes)} in originals); ${value.notReady.toLocaleString()} provider not ready; ${value.unknown.toLocaleString()} unknown. ${value.pinned.toLocaleString()} request pinning. These are metadata snapshots; pinning does not prove a complete local original. Unknown files may also need downloading.`;
   }
   async function prepareCopy() {
+    const source = consent;
+    const previous = job;
     busy = true; message = '';
-    try { job = await invoke<CopyJob>('prepare_photo_import'); }
-    catch (error) { message = explain(error); }
+    try {
+      const current = await invoke<CopyJob>('prepare_photo_import');
+      if (alive && consent === source && job === previous && current.sourceId === source?.id) job = current;
+    }
+    catch (error) { if (alive && consent === source) message = explain(error); }
     finally { busy = false; }
   }
   async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload' | 'approve-export' | 'approve-read') {
+    const source = consent;
+    const previous = job;
     busy = true; message = '';
-    try { job = await invoke<CopyJob>('control_photo_import', { action }); }
-    catch (error) { message = explain(error); }
+    try {
+      const current = await invoke<CopyJob>('control_photo_import', { action });
+      if (alive && consent === source && job === previous && current.sourceId === source?.id) job = current;
+    }
+    catch (error) { if (alive && consent === source) message = explain(error); }
     finally { busy = false; }
   }
   async function approve(retry = false) {
