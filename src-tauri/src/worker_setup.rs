@@ -924,6 +924,8 @@ async fn prepare(
             *memory = (*memory).max(profile.minimum_memory());
         }
         let required_memory = memory_by_cache.values().sum();
+        let reports: Vec<_> = prepared.iter().map(|(proof, _)| proof.report()).collect();
+        let memory = crate::memory_admission::envelope(required_memory, &reports)?;
         let combined = paths.data.join("model-sets");
         let cancelled = progress.cancelled.clone();
         let cache = tauri::async_runtime::spawn_blocking(move || {
@@ -937,7 +939,7 @@ async fn prepare(
         .await
         .map_err(|_| "worker_shutdown_unconfirmed")??;
         loop {
-            wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
+            wait_for_capacity(memory.startup, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
             if prepared
                 .iter()
@@ -991,7 +993,7 @@ async fn prepare(
                     progress.set("paused", Some("user_paused".into()));
                     return Ok(false);
                 }
-                if let Some(reason) = resources.refusal(required_memory) {
+                if let Some(reason) = resources.refusal(memory.running) {
                     // Release model memory before waiting, otherwise the warm process can prevent recovery.
                     progress.set("paused", Some(reason.into()));
                     return Ok(false);
@@ -1007,7 +1009,7 @@ async fn prepare(
                 let completed = cancellable(async {
                     tokio::select! {
                         biased;
-                        reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
+                        reason = resource_loss(memory.running, &clock) => Err(format!("resource_{reason}")),
                         result = async {
                             inputs.check()?;
                             predictor.prepare(&worker, &mut cancel).await?;

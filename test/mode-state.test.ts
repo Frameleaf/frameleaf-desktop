@@ -63,3 +63,12 @@ test('runtime history failures explain recovery without suggesting a network ret
   assert.equal(runtimeRecoveryMessage('server_unreachable'), null);
   assert.equal(runtimeRecoveryMessage('runtime_epoch_unknown'), null);
 });
+
+
+test('memory measurement failures require a runtime update without claiming readiness', async () => {
+  const { runtimeRecoveryMessage } = await import('../src/mode-state.ts');
+  for (const code of ['runtime_memory_measurement_required', 'runtime_memory_measurement_invalid']) {
+    assert.match(runtimeRecoveryMessage(code)!, /updated.*runtime/i);
+    assert.match(runtimeRecoveryMessage(code)!, /Photos remain available/);
+  }
+});

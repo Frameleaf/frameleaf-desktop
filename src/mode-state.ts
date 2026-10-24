@@ -26,6 +26,9 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
 
 export function runtimeRecoveryMessage(code: string | null): string | null {
   switch (code) {
+    case 'runtime_memory_measurement_required':
+    case 'runtime_memory_measurement_invalid':
+      return 'AI processing needs an updated signed runtime with verified memory measurements. Photos remain available.';
     case 'source_staging_budget_exceeded':
       return 'Private input capacity is full. Finish existing source work or stop AI processing before retrying. Retained files are kept.';
     case 'source_input_budget_busy':

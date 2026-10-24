@@ -22,6 +22,7 @@ mod manager_commands;
 pub mod manager_host;
 mod manager_profile;
 pub mod manager_tls;
+mod memory_admission;
 pub mod ml_transport;
 mod model_cache;
 pub mod model_catalogue;
