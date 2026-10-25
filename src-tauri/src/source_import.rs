@@ -387,7 +387,7 @@ fn manifest_for(
     identity: &DeviceIdentity,
     base: &Path,
 ) -> Result<Manifest, String> {
-    let approval = consent.approval(saved, identity)?;
+    let approval = consent.copy_approval(saved, identity)?;
     if base.starts_with(approval.root()) || approval.root().starts_with(base) {
         return Err("source_staging_overlap".into());
     }
@@ -439,9 +439,9 @@ fn load(
     let manifest: Manifest = journal.read("manifest.json", identity)?;
     if !uuid(&manifest.id)
         || manifest.source_id != consent.source_id()
-        || manifest.scope != consent.approval(saved, identity)?.fingerprint()
+        || manifest.scope != consent.copy_approval(saved, identity)?.fingerprint()
         || manifest.provider.as_deref().unwrap_or("folder")
-            != consent.approval(saved, identity)?.kind()
+            != consent.copy_approval(saved, identity)?.kind()
     {
         return Err("source_journal_invalid".into());
     }
@@ -713,7 +713,7 @@ async fn execute(
                     if manifest.provider.is_none() {
                         crate::copy_source::release_stage(&stage, &id)?;
                     }
-                    let copy = consent.approval(saved, identity)?.stage_to(
+                    let copy = consent.copy_approval(saved, identity)?.stage_to(
                         saved,
                         identity,
                         &entry.relative,
@@ -962,7 +962,7 @@ impl SourceJobs {
         let identity = credentials::identity()?;
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
-        let approval = consent.approval(saved, &identity)?;
+        let approval = consent.copy_approval(saved, &identity)?;
         if base.starts_with(approval.root()) || approval.root().starts_with(base) {
             return Err("source_staging_overlap".into());
         }
@@ -1155,6 +1155,34 @@ impl SourceJobs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_consent_cannot_prepare_a_managed_copy_manifest() {
+        let f = Fixture::new();
+        let picker = crate::source_consent::SourceConsent::default();
+        let selected = picker
+            .select(picker.generation().unwrap(), f.base.join("source"))
+            .unwrap();
+        let mut consent = picker
+            .approve_with_hydration(
+                &f.saved,
+                &f.identity,
+                &selected.selection_id,
+                crate::source_consent::SourceMode::Reference,
+                true,
+                false,
+                |_| Ok(()),
+            )
+            .unwrap();
+        consent.registered = true;
+        let target = f.base.join("reference-plan");
+        assert_eq!(
+            manifest_for(&consent, &f.saved, &f.identity, &target)
+                .err()
+                .as_deref(),
+            Some("source_copy_mode_required")
+        );
+        assert!(!target.exists());
+    }
     #[tokio::test]
     async fn cancelled_stop_retains_the_owned_task_until_a_later_drain() {
         let jobs = super::SourceJobs::default();
@@ -1302,7 +1330,7 @@ mod tests {
                 budget.reserve(f.consent.source_id(), &f.stage, 10).unwrap();
                 drop(budget);
                 f.consent
-                    .approval(&f.saved, &f.identity)
+                    .copy_approval(&f.saved, &f.identity)
                     .unwrap()
                     .stage_to(
                         &f.saved,
@@ -1709,7 +1737,7 @@ mod tests {
                 crate::private_inputs::InputBudget::open(&base.join("data"), &identity).unwrap();
             budget.reserve(consent.source_id(), &probe_id, 10).unwrap();
             let probe = consent
-                .approval(&saved, &identity)
+                .copy_approval(&saved, &identity)
                 .unwrap()
                 .stage_to(
                     &saved,
@@ -1951,7 +1979,7 @@ mod tests {
         let attempt = uuid::Uuid::new_v4().to_string();
         assert_eq!(
             f.consent
-                .approval(&f.saved, &f.identity)
+                .copy_approval(&f.saved, &f.identity)
                 .unwrap()
                 .stage_to(
                     &f.saved,

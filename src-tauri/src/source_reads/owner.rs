@@ -334,7 +334,7 @@ impl PollLease {
 fn authority(base: &Path, saved: &SavedConnection, source: &str) -> Result<DeviceIdentity, String> {
     let identity = crate::credentials::identity()?;
     let consent = crate::source_import::current(saved, &identity, source)?;
-    let approval = consent.approval(saved, &identity)?;
+    let approval = consent.reference_approval(saved, &identity)?;
     if !approval.is_photos()
         && (base.starts_with(approval.root()) || approval.root().starts_with(base))
     {

@@ -739,6 +739,7 @@ async fn approve_photo_folder(
     selection_id: Option<String>,
     allow_download: bool,
     allow_photos_hydration: Option<bool>,
+    mode: Option<source_consent::SourceMode>,
 ) -> Result<source_consent::ConsentView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
@@ -756,6 +757,7 @@ async fn approve_photo_folder(
                 saved,
                 &identity,
                 &selection,
+                mode.unwrap_or_default(),
                 allow_download,
                 allow_photos_hydration.unwrap_or(false),
                 |value| credentials::save(source_consent::CREDENTIAL, value),
@@ -764,6 +766,9 @@ async fn approve_photo_folder(
         credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
             .ok_or("source_approval_required")?
     };
+    if mode.is_some_and(|mode| mode != consent.mode) {
+        return Err("source_approval_changed".into());
+    }
     consent.register(saved, &identity).await?;
     credentials::save(source_consent::CREDENTIAL, &consent)?;
     Ok(consent.view())

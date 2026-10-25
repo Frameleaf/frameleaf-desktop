@@ -11,7 +11,9 @@ impl Job {
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<(), String> {
         let consent = crate::source_import::current(saved, identity, self.resource.source_id())?;
-        if consent.approval(saved, identity)?.fingerprint() != self.resource.scope_fingerprint() {
+        if consent.reference_approval(saved, identity)?.fingerprint()
+            != self.resource.scope_fingerprint()
+        {
             return Err("source_approval_changed".into());
         }
         self.adopt(saved, identity, from, gate)

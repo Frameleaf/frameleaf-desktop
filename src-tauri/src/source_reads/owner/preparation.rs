@@ -10,7 +10,7 @@ pub enum PreparationAction {
 }
 impl Requests {
     /// Uses the same application owner drained by source revocation, sign-out and quit.
-    /// Reference registration remains disabled until the complete consumer integration exists.
+    /// The reference controls remain hidden until publication and recovery are connected.
     pub async fn prepare_reference(
         &self,
         base: PathBuf,

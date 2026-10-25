@@ -11,7 +11,7 @@
   function nativePlatform() { return typeof navigator !== 'undefined' && /Mac/.test(navigator.platform); }
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
+  type Consent = { mode?: 'copy' | 'reference'; allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
   type CopyJob = { sourceReadRemaining: number | null; additionalSourceReadAllowance: number; provider: string | null; stagedBytes: number | null; exportRemaining: number | null; additionalExportAllowance: number; sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
   let approvals = $derived(job ? sourceCopyApprovals(job) : { read: false, export: false, upload: false, canResumeWithoutUpload: false, canResume: false });
@@ -74,6 +74,8 @@
     source_read_budget_exhausted: 'The original-read allowance was used, including interrupted attempts. Approve more original reads to retry; staged copies are kept.',
     source_upload_budget_required: 'This saved copy needs an upload allowance before it can send original data. Approve the displayed amount, then resume.',
     source_upload_budget_exhausted: 'This copy reached its upload allowance. Staged originals are kept. Approve more upload data to retry.',
+    source_copy_mode_required: 'This source permission does not allow copying. Remove it before approving a copy.',
+    source_reference_mode_required: 'This source permission does not allow serving originals to the server.',
     source_copy_cancelled: 'Copying is paused. Resume when you are ready.',
     metered_network: 'Copying is paused on this metered connection. Resume on an unmetered network.',
     network_unknown: 'Network cost could not be determined. Resume when an unmetered connection is available.',
@@ -98,11 +100,12 @@
     source_account_unavailable: 'This OneDrive folder moved or is unavailable. Choose its new location.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
+  function copyAllowed() { return !!consent && (consent.mode ?? 'copy') === 'copy'; }
   async function loadConsent() {
     const previous = consent;
     try {
       const current = await invoke<Consent | null>('photo_source_status');
-      if (alive && consent === previous) { consent = current; blockedConsent = false; }
+      if (alive && consent === previous) { consent = current; blockedConsent = false; if (!copyAllowed()) job = null; }
     } catch (error) {
       if (alive && consent === previous) {
         blockedConsent = ['source_photo_session_changed', 'source_approval_invalid', 'credential_record_invalid', 'photos_permission_required', 'photos_macos_required'].includes(String(error));
@@ -114,10 +117,10 @@
     let unlisten: UnlistenFn | undefined;
     if (native) void (async () => {
       try {
-        unlisten = await listen<CopyJob>('photo-import', event => { if (alive && event.payload.sourceId === consent?.id) job = event.payload; });
+        unlisten = await listen<CopyJob>('photo-import', event => { if (alive && copyAllowed() && event.payload.sourceId === consent?.id) job = event.payload; });
         if (!alive) { unlisten(); return; }
         await loadConsent();
-        if (consent?.registered) {
+        if (consent?.registered && copyAllowed()) {
           const source = consent;
           const previous = job;
           // A permission change or live progress event supersedes this snapshot.
@@ -141,6 +144,7 @@
     return `${value.available.toLocaleString()} OS-reported available; ${value.needsDownload.toLocaleString()} need downloading (${size(value.downloadBytes)} in originals); ${value.notReady.toLocaleString()} provider not ready; ${value.unknown.toLocaleString()} unknown. ${value.pinned.toLocaleString()} request pinning. These are metadata snapshots; pinning does not prove a complete local original. Unknown files may also need downloading.`;
   }
   async function prepareCopy() {
+    if (!copyAllowed()) { message = errors.source_copy_mode_required; return; }
     const source = consent;
     const previous = job;
     busy = true; message = '';
@@ -152,6 +156,7 @@
     finally { busy = false; }
   }
   async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload' | 'approve-export' | 'approve-read') {
+    if (!copyAllowed()) { message = errors.source_copy_mode_required; return; }
     const source = consent;
     const previous = job;
     busy = true; message = '';
@@ -235,11 +240,11 @@
       {#if consent.kind === 'apple-photos'}<p class="footnote">{consent.allowPhotosHydration ? 'Photos-managed iCloud downloads are allowed. They can exceed the export/staging ceiling.' : 'Photos network downloads are disabled. Cloud-only originals will stop safely until you remove this permission and approve hydration in a new selection.'}</p>{/if}
       <p>{consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</p>
       {#if !consent.registered}<button class="secondary" disabled={busy} onclick={() => approve(true)}>Retry server registration</button>{/if}
-      {#if consent.registered && !job}
+      {#if consent.registered && copyAllowed() && !job}
         <p>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</p>
         <button class="secondary" disabled={busy} onclick={prepareCopy}>Prepare copy</button>
       {/if}
-      {#if job}
+      {#if job && copyAllowed()}
         <div class="copy-job" aria-label="Photo copy progress">
           <p role="status">{job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'}: {job.completed.toLocaleString()} of {job.total.toLocaleString()} copies confirmed.</p>
           <progress max={Math.max(1, job.total)} value={job.completed} aria-label="Copies verified on your server"></progress>

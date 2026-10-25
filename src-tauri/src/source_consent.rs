@@ -17,6 +17,13 @@ fn registration_path(photos: bool) -> &'static str {
         "api/photo-sources"
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceMode {
+    #[default]
+    Copy,
+    Reference,
+}
 #[derive(Default)]
 pub struct SourceConsent {
     pending: Mutex<Pending>,
@@ -38,6 +45,8 @@ pub struct SelectedFolder {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Consent {
+    #[serde(default)]
+    pub(crate) mode: SourceMode,
     approval: CopyApproval,
     session_signature: String,
     name: String,
@@ -47,6 +56,7 @@ pub struct Consent {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsentView {
+    mode: SourceMode,
     id: String,
     name: String,
     path: String,
@@ -137,7 +147,15 @@ impl SourceConsent {
         allow_download: bool,
         persist: impl FnOnce(&Consent) -> Result<(), String>,
     ) -> Result<Consent, String> {
-        self.approve_with_hydration(saved, identity, selection, allow_download, false, persist)
+        self.approve_with_hydration(
+            saved,
+            identity,
+            selection,
+            SourceMode::Copy,
+            allow_download,
+            false,
+            persist,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub fn approve_with_hydration(
@@ -145,6 +163,7 @@ impl SourceConsent {
         saved: &SavedConnection,
         identity: &DeviceIdentity,
         selection: &str,
+        mode: SourceMode,
         allow_download: bool,
         allow_photos_hydration: bool,
         persist: impl FnOnce(&Consent) -> Result<(), String>,
@@ -186,8 +205,9 @@ impl SourceConsent {
             )
         };
         let consent = Consent {
+            mode,
             approval,
-            session_signature: session_signature(saved, identity),
+            session_signature: session_signature(saved, identity, mode),
             name,
             allow_download,
             registered: false,
@@ -216,12 +236,19 @@ fn source_label(raw: &str) -> String {
         name.into()
     }
 }
-fn session_signature(saved: &SavedConnection, identity: &DeviceIdentity) -> String {
-    identity.sign(&format!(
-        "frameleaf-desktop/photo-source-session/v1\n{}",
-        saved.token
-    ))
+fn session_signature(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    mode: SourceMode,
+) -> String {
+    // Preserve legacy copy credentials; a reference grant signs a distinct, explicit intent.
+    let domain = match mode {
+        SourceMode::Copy => "frameleaf-desktop/photo-source-session/v1",
+        SourceMode::Reference => "frameleaf-desktop/photo-source-session/v2\nreference",
+    };
+    identity.sign(&format!("{domain}\n{}", saved.token))
 }
+
 impl Consent {
     pub(crate) fn approval(
         &self,
@@ -234,6 +261,28 @@ impl Consent {
         }
         Ok(&self.approval)
     }
+    pub(crate) fn copy_approval(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<&CopyApproval, String> {
+        let approval = self.approval(saved, identity)?;
+        if self.mode != SourceMode::Copy {
+            return Err("source_copy_mode_required".into());
+        }
+        Ok(approval)
+    }
+    pub(crate) fn reference_approval(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<&CopyApproval, String> {
+        let approval = self.approval(saved, identity)?;
+        if self.mode != SourceMode::Reference {
+            return Err("source_reference_mode_required".into());
+        }
+        Ok(approval)
+    }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()
     }
@@ -243,13 +292,14 @@ impl Consent {
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
         self.approval.validate_current(saved, identity)?;
-        if self.session_signature != session_signature(saved, identity) {
+        if self.session_signature != session_signature(saved, identity, self.mode) {
             return Err("source_photo_session_changed".into());
         }
         Ok(())
     }
     pub fn view(&self) -> ConsentView {
         ConsentView {
+            mode: self.mode,
             id: self.approval.source_id().into(),
             name: self.name.clone(),
             path: if self.approval.is_photos() {
@@ -264,7 +314,7 @@ impl Consent {
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
-        json!({"id":self.approval.source_id(),"deviceId":saved.device_id,"kind":self.approval.kind(),"mode":"copy","name":source_label(&self.name),"scopeFingerprint":self.approval.fingerprint()})
+        json!({"id":self.approval.source_id(),"deviceId":saved.device_id,"kind":self.approval.kind(),"mode":self.mode,"name":source_label(&self.name),"scopeFingerprint":self.approval.fingerprint()})
     }
     fn accept(&self, saved: &SavedConnection, ack: &Value) -> Result<(), String> {
         let request = self.request(saved);
@@ -408,6 +458,116 @@ mod tests {
         assert!(consent.require(&replaced, &identity).is_err());
         state.clear().unwrap();
         assert!(state.select(generation, root.clone()).is_err());
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn copy_mode_round_trips_explicit_and_legacy_credentials() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-consent-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let identity = DeviceIdentity::generate();
+        let state = SourceConsent::default();
+        let selected = state
+            .select(state.generation().unwrap(), root.clone())
+            .unwrap();
+        let mut consent = state
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                |_| Ok(()),
+            )
+            .unwrap();
+        consent.registered = true;
+        let mut value = serde_json::to_value(&consent).unwrap();
+        value["mode"] = json!("copy");
+        let explicit: Consent = serde_json::from_value(value.clone()).unwrap();
+        explicit.copy_approval(&saved(), &identity).unwrap();
+        assert_eq!(
+            serde_json::to_value(explicit.view()).unwrap()["mode"],
+            "copy"
+        );
+        value.as_object_mut().unwrap().remove("mode");
+        let legacy: Consent = serde_json::from_value(value).unwrap();
+        legacy.copy_approval(&saved(), &identity).unwrap();
+        assert_eq!(serde_json::to_value(legacy.view()).unwrap()["mode"], "copy");
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn reference_permission_is_explicit_signed_and_never_grants_copy_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "frameleaf-consent-reference-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let identity = DeviceIdentity::generate();
+        let picker = SourceConsent::default();
+        let selected = picker
+            .select(picker.generation().unwrap(), root.clone())
+            .unwrap();
+        let mut consent = picker
+            .approve_with_hydration(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                SourceMode::Reference,
+                true,
+                false,
+                |_| Ok(()),
+            )
+            .unwrap();
+        consent.require(&saved(), &identity).unwrap();
+        assert_eq!(consent.mode, SourceMode::Reference);
+        let mut ack = consent.request(&saved());
+        assert_eq!(ack["mode"], "reference");
+        assert!(!ack.to_string().contains(root.to_str().unwrap()));
+        ack["revokedAt"] = Value::Null;
+        consent.accept(&saved(), &ack).unwrap();
+        ack["mode"] = json!("copy");
+        assert!(consent.accept(&saved(), &ack).is_err());
+        consent.registered = true;
+        consent.reference_approval(&saved(), &identity).unwrap();
+        assert_eq!(
+            consent.copy_approval(&saved(), &identity).err().as_deref(),
+            Some("source_copy_mode_required")
+        );
+        let encoded = serde_json::to_value(&consent).unwrap();
+        for mode in [json!("copy"), Value::Null, json!("unknown")] {
+            let mut altered = encoded.clone();
+            altered["mode"] = mode;
+            if let Ok(changed) = serde_json::from_value::<Consent>(altered) {
+                assert!(changed.require(&saved(), &identity).is_err());
+            }
+        }
+        let selected = picker
+            .select(picker.generation().unwrap(), root.clone())
+            .unwrap();
+        let mut copy = picker
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                |_| Ok(()),
+            )
+            .unwrap();
+        copy.registered = true;
+        copy.copy_approval(&saved(), &identity).unwrap();
+        assert_eq!(
+            copy.reference_approval(&saved(), &identity)
+                .err()
+                .as_deref(),
+            Some("source_reference_mode_required")
+        );
+        let mut changed = serde_json::to_value(&copy).unwrap();
+        changed["mode"] = json!("reference");
+        assert!(serde_json::from_value::<Consent>(changed)
+            .unwrap()
+            .require(&saved(), &identity)
+            .is_err());
         std::fs::remove_dir(root).unwrap();
     }
     #[test]

@@ -123,7 +123,9 @@ impl Job {
         upload_limit: u64,
     ) -> Result<Self, String> {
         let consent = crate::source_import::current(saved, identity, resource.source_id())?;
-        if consent.approval(saved, identity)?.fingerprint() != resource.scope_fingerprint() {
+        if consent.reference_approval(saved, identity)?.fingerprint()
+            != resource.scope_fingerprint()
+        {
             return Err("source_approval_changed".into());
         }
         let source = resource.source_id().to_owned();
@@ -148,7 +150,7 @@ impl Job {
         version: &str,
     ) -> Result<Self, String> {
         let consent = crate::source_import::current(saved, identity, source)?;
-        let approval = consent.approval(saved, identity)?;
+        let approval = consent.reference_approval(saved, identity)?;
         if !approval.is_photos()
             && (base.starts_with(approval.root()) || approval.root().starts_with(base))
         {
@@ -438,7 +440,9 @@ impl Operation {
         job.require_owner()?;
         let consent =
             crate::source_import::current(&self.saved, &self.identity, job.resource.source_id())?;
-        if consent.approval(&self.saved, &self.identity)?.fingerprint()
+        if consent
+            .reference_approval(&self.saved, &self.identity)?
+            .fingerprint()
             != job.resource.scope_fingerprint()
         {
             return Err("source_approval_changed".into());
@@ -522,7 +526,9 @@ impl Job {
     ) -> Result<(), String> {
         let _owner = self.begin()?;
         let consent = crate::source_import::current(saved, identity, self.resource.source_id())?;
-        if consent.approval(saved, identity)?.fingerprint() != self.resource.scope_fingerprint() {
+        if consent.reference_approval(saved, identity)?.fingerprint()
+            != self.resource.scope_fingerprint()
+        {
             return Err("source_approval_changed".into());
         }
         self.extend(saved, identity, read, upload)
@@ -728,10 +734,21 @@ mod tests {
                 .select(picker.generation().unwrap(), root.join("source"))
                 .unwrap();
             let mut consent = picker
-                .approve(&saved, &identity, &selected.selection_id, true, |_| Ok(()))
+                .approve_with_hydration(
+                    &saved,
+                    &identity,
+                    &selected.selection_id,
+                    crate::source_consent::SourceMode::Reference,
+                    true,
+                    false,
+                    |_| Ok(()),
+                )
                 .unwrap();
             consent.registered = true;
-            let approval = consent.approval(&saved, &identity).unwrap().clone();
+            let approval = consent
+                .reference_approval(&saved, &identity)
+                .unwrap()
+                .clone();
             let resource = approval
                 .stage(
                     &saved,

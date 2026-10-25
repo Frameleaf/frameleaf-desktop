@@ -96,7 +96,7 @@ impl Preparation {
             return Err("source_selection_invalid".into());
         }
         let consent = crate::source_import::current(saved, identity, source)?;
-        let approval = consent.approval(saved, identity)?;
+        let approval = consent.reference_approval(saved, identity)?;
         let scan = approval.files()?;
         if scan.inventory.truncated || scan.unreadable != 0 {
             return Err("source_inventory_partial".into());
@@ -124,7 +124,7 @@ impl Preparation {
         source: &str,
     ) -> Result<Self, String> {
         let consent = crate::source_import::current(saved, identity, source)?;
-        let approval = consent.approval(saved, identity)?.clone();
+        let approval = consent.reference_approval(saved, identity)?.clone();
         if !canonical_uuid(source) {
             return Err("source_stage_invalid".into());
         }
@@ -294,7 +294,7 @@ impl Preparation {
     fn current(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
         self.require_owner()?;
         let consent = crate::source_import::current(saved, identity, &self.plan.source)?;
-        if consent.approval(saved, identity)?.fingerprint() != self.plan.scope {
+        if consent.reference_approval(saved, identity)?.fingerprint() != self.plan.scope {
             return Err("source_approval_changed".into());
         }
         Ok(())

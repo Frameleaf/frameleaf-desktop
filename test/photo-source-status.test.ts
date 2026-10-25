@@ -152,3 +152,20 @@ for (const action of copyActions) {
     }
   });
 }
+
+test('reference consent cannot display or start a copy job', async () => {
+  const view = component();
+  const unmount = view.mount();
+  await setImmediate();
+  view.pending.get('photo_source_status')!.resolve({ ...source, mode: 'reference' });
+  await setImmediate();
+  assert.equal(view.pending.has('photo_import_status'), false);
+  view.emit(job);
+  assert.equal(view.current().job, null);
+  await view.prepareCopy();
+  await view.controlCopy('resume');
+  assert.equal(view.pending.has('prepare_photo_import'), false);
+  assert.equal(view.pending.has('control_photo_import'), false);
+  assert.match(view.current().message, /does not allow copying/);
+  unmount();
+});
