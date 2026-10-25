@@ -25,6 +25,9 @@
     }
   },
   "bundle": {
+    "macOS": {
+      "minimumSystemVersion": "15.0"
+    },
     "active": true,
     "targets": "all",
     "category": "Photography",
