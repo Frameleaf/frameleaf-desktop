@@ -389,7 +389,7 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     profiles["cpu-ort"].sourceRevision,
     "25b22c16e47a27a2eb50017d838497abce850d11",
   );
-  assert.deepEqual(profiles["cpu-ort"].additionalSources["macos-aarch64"], [source, "f93c34d196955da3e2760c095c08b27ccbf53315", "088560702a69022b6eee705d8a67306f1075cea0"]);
+  assert.deepEqual(profiles["cpu-ort"].additionalSources["macos-aarch64"], [source, "f93c34d196955da3e2760c095c08b27ccbf53315", "088560702a69022b6eee705d8a67306f1075cea0", "1bf2ad55521c49f574cba2f450eb13d49652ea80"]);
   assert.deepEqual(profiles["cpu-ort"].additionalSources["linux-aarch64"], ["f93c34d196955da3e2760c095c08b27ccbf53315"]);
   assert.equal(
     profiles["coreml-ort"].sourceRevision,
@@ -553,7 +553,7 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
   const { packageConfiguration } = await import("./package_desktop.mjs");
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   const source = "b7b5756a3f9eaeec9e977460ab654cbbadee87e7";
-  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0"] });
+  assert.deepEqual(profiles["coreml-ort"].additionalSources, { "macos-aarch64": [source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0", "1bf2ad55521c49f574cba2f450eb13d49652ea80"] });
   for (const [revision, provider, allowed] of [
     [source, "CoreMLExecutionProvider", true],
     ["db72dcde18d3a4ff4ab5cfed3fb650a6b3629353", "CoreMLExecutionProvider", false],
@@ -582,8 +582,8 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
 
 
 test("runtime sources are approved only for their qualified provider and platform targets", async (t) => {
-  for (const source of ["f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0"]) {
-  const memoryReportSource = source === "088560702a69022b6eee705d8a67306f1075cea0";
+  for (const source of ["f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0", "1bf2ad55521c49f574cba2f450eb13d49652ea80"]) {
+  const memoryReportSource = source !== "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   for (const [name, profile] of Object.entries(profiles)) {
     const targets = Object.entries(profile.additionalSources ?? {}).filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
