@@ -801,7 +801,7 @@ async fn execute(
                     }
                 }
             }
-            // A stored receipt is evidence of an earlier acknowledgement, not current NAS file health.
+            // A stored receipt is evidence of an earlier acknowledgement, not current server file health.
             let active = cursor.active.as_ref().unwrap();
             let upload = active.upload.as_ref().ok_or("source_receipt_invalid")?;
             let receipt = api

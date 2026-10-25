@@ -739,7 +739,7 @@ struct DeliveryResponse {
     accepted: bool,
 }
 
-/// Owns an independently verified descriptor and source-bound proof; never deserialize a NAS path into this type.
+/// Owns an independently verified descriptor and source-bound proof; never deserialize a server path into this type.
 pub struct PreparedDelivery {
     signed: SignedSourceRequest,
     payload: zeroize::Zeroizing<String>,

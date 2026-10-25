@@ -130,7 +130,7 @@ pub(crate) async fn open_local_photos(
         return Ok(());
     }
     let origin = base.origin();
-    // No NAS session injection or native capabilities; the existing photo UI owns signup/login.
+    // No server session injection or native capabilities; the existing photo UI owns signup/login.
     tauri::WebviewWindowBuilder::new(&app, "local-photos", tauri::WebviewUrl::External(base))
         .title("Frameleaf Photos — This computer")
         .inner_size(1280.0, 850.0)

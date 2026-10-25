@@ -1,7 +1,7 @@
 use super::*;
 use crate::source_reads::{Preparation, PreparationView};
 
-/// Local user actions; a NAS claim never selects a path or grants an allowance.
+/// Local user actions; a server claim never selects a path or grants an allowance.
 pub enum PreparationAction {
     Plan { relative: String },
     Selection { relatives: Vec<String> },

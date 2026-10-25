@@ -779,7 +779,7 @@ async fn revoke_photo_source(
     stop_sources(&app).await?;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
-    // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
+    // Local authority ends before waiting on the server; offline revocation cannot leave it enabled here.
     credentials::delete(source_consent::CREDENTIAL)?;
     app.state::<source_consent::SourceConsent>().clear()?;
     match consent {

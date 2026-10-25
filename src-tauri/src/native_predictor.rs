@@ -1,4 +1,4 @@
-//! One scoped NAS job at a time; the owned qualified process is stopped on any execution failure.
+//! One scoped server job at a time; the owned qualified process is stopped on any execution failure.
 use crate::{
     ml_transport::{AcceptedQualification, ClaimedTask, InputKind, WorkerFailure, WorkerTransport},
     native_runtime::{NativeSidecar, QualifiedRuntime},
@@ -363,7 +363,7 @@ impl NativePredictor {
         self.prepared = true;
         Ok(())
     }
-    /// Execute one admitted job; empty NAS model grants cannot claim work.
+    /// Execute one admitted job; empty server model grants cannot claim work.
     pub async fn execute_next(
         &mut self,
         transport: &WorkerTransport,

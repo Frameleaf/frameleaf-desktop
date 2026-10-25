@@ -63,7 +63,7 @@ pub struct UploadSession {
     binding: FolderUploadBinding,
     signature: String,
 }
-/// Even a matching duplicate still needs the NAS source service's healthy-owned-bytes receipt.
+/// Even a matching duplicate still needs the server source service's healthy-owned-bytes receipt.
 #[derive(Debug, PartialEq)]
 pub enum UploadOutcome {
     Pending,

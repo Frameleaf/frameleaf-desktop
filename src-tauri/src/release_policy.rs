@@ -1,4 +1,4 @@
-//! Public release authority compiled into the app; a NAS response can never supply trust keys.
+//! Public release authority compiled into the app; a server response can never supply trust keys.
 use crate::runtime_store::RuntimeStore;
 use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;

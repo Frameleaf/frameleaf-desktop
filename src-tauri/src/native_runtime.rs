@@ -154,7 +154,7 @@ pub struct VerifiedRuntime {
     lease: Option<std::sync::Arc<File>>,
 }
 impl VerifiedRuntime {
-    /// Trusted keys and rollback floor come from the app/release authority, never the NAS or pack itself.
+    /// Trusted keys and rollback floor come from the app/release authority, never the connected server or pack itself.
     pub fn verify(
         root: &Path,
         raw: &[u8],

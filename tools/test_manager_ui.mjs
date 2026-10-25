@@ -88,7 +88,7 @@ async function fixture(scenario,run,viewport={width:1100,height:1000},colorSchem
   if(command==='manager_request'){
    const request=args.command;
    if(scenario==='devicechanged'&&paired)throw 'manager_device_changed';
-   if(request.kind==='status')return {manager:{id:manager.managerId,origin:manager.origin},installation:{id:manager.installationId,name:localScenario?'My local library':'Example NAS',release:'frameleaf-v3.0.0-1',port:2283},operations:current?[current]:scenario==='local-update-active'?[makeOperation('backup')]:scenario==='local-update-no-backup'?[{...makeOperation('backup','complete'),error:'synthetic failed backup'}]:updateScenario?[makeOperation('backup','complete')]:[]};
+   if(request.kind==='status')return {manager:{id:manager.managerId,origin:manager.origin},installation:{id:manager.installationId,name:localScenario?'My local library':'Example server',release:'frameleaf-v3.0.0-1',port:2283},operations:current?[current]:scenario==='local-update-active'?[makeOperation('backup')]:scenario==='local-update-no-backup'?[{...makeOperation('backup','complete'),error:'synthetic failed backup'}]:updateScenario?[makeOperation('backup','complete')]:[]};
    if(request.kind==='backups'){if(!authorized)throw 'manager_recent_auth_required';assert.ok(manager.scopes.includes('restore'));return [{id:'a'.repeat(64),time:new Date().toISOString()}];}
    if(request.kind==='review-restore'){
     assert.ok(manager.scopes.includes('restore'));assert.equal(request.snapshot,'a'.repeat(64));
@@ -129,7 +129,7 @@ async function fixture(scenario,run,viewport={width:1100,height:1000},colorSchem
   await page.goto(origin,{waitUntil:'networkidle'});
   const ui=page.getByRole('region',{name:'Server management'});
   await ui.getByRole('heading',{name:'Server management'}).waitFor();
-  if(!localScenario&&!['pair','devicechanged'].includes(scenario))await ui.getByText('Example NAS',{exact:true}).waitFor();
+  if(!localScenario&&!['pair','devicechanged'].includes(scenario))await ui.getByText('Example server',{exact:true}).waitFor();
   await run({page,ui,calls,keys,reviews,restores,finishRestore:()=>{restored={...restored,state:'complete',step:'native-restore-started',completed:['native-restore-started'],updatedAt:Date.now()};},interruptRestore:()=>{restored={...restored,state:'interrupted'};authorized=false;},finishReview:()=>{reviewReady=true;},loseNext:()=>{lost=true;},finish:()=>{current={...current,state:'complete',completed:[current.kind],updatedAt:Date.now()};}});
   assert.deepEqual(errors,[]);
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'horizontal overflow');
@@ -353,7 +353,7 @@ try{
   await ui.getByRole('button',{name:'Review certificate fingerprint'}).click();
   await ui.getByLabel('I verified this certificate fingerprint.').check();
   await ui.screenshot({path:join(output,'manager-pair-certificate.png')});
-  await pair.click();await ui.getByText('Example NAS',{exact:true}).waitFor();
+  await pair.click();await ui.getByText('Example server',{exact:true}).waitFor();
   const request=calls.find(value=>value.command==='pair_manager');assert.equal(request.args.certificate.sha256,wire.certificateSha256);assert.equal(request.args.allowRecovery,true);assert.equal(request.args.allowUpdates,true);await ui.getByText('Server update requests: allowed.',{exact:true}).waitFor();
   assert.ok(!(await page.textContent('body')).includes(password));
   assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(password));

@@ -1,4 +1,4 @@
-//! Approved model identities are compiled into the app; a NAS can request a profile but cannot replace it.
+//! Approved model identities are compiled into the app; a server can request a profile but cannot replace it.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -134,7 +134,7 @@ impl ProfileData {
         }
         Ok(bytes)
     }
-    /// A fresh NAS UUID changes the raw-spec digest without changing model/configuration or fixture bytes.
+    /// A fresh server UUID changes the raw-spec digest without changing model/configuration or fixture bytes.
     pub fn challenge(&self, id: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         let uuid = Uuid::parse_str(id).map_err(|_| "model_challenge_invalid")?;
         if uuid.get_version_num() != 4 || uuid.to_string() != id {

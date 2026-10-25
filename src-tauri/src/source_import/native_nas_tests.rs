@@ -1,4 +1,4 @@
-//! Opt-in consuming-client proof against the owned HTTPS/PostgreSQL NAS fixture.
+//! Opt-in consuming-client proof against the owned HTTPS/PostgreSQL server fixture.
 use super::*;
 use crate::ml_transport::native_nas_tests::{install_test_keyring, read_fixture_message};
 use std::io::{BufReader, Write};
@@ -17,7 +17,7 @@ fn report(value: Value) {
     std::io::stdout().flush().unwrap();
 }
 #[test]
-#[ignore = "requires the owned NAS HTTPS/PostgreSQL fixture; run alone with process-only credentials"]
+#[ignore = "requires the owned server HTTPS/PostgreSQL fixture; run alone with process-only credentials"]
 fn actual_native_folder_copy() {
     install_test_keyring();
     let mut input = BufReader::new(std::io::stdin());

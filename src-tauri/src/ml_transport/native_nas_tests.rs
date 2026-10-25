@@ -267,7 +267,7 @@ fn actual_native_nas_library_jobs() {
                 .request_qualification(&face[0], &attestation, &Uuid::new_v4().to_string())
                 .await
                 .err()
-                .expect("unavailable NAS Face producer");
+                .expect("unavailable server Face producer");
             assert!(refusal.starts_with("workload_desktop_"), "{refusal}");
         }
         let profiles = groups
