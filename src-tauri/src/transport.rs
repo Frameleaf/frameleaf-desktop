@@ -69,6 +69,17 @@ pub async fn capabilities(
     }
     Ok(Some(caps))
 }
+/// Publication version 1 includes exact previous-resource CAS, not just source registration.
+pub async fn reference_capabilities(
+    client: &Client,
+    saved: &SavedConnection,
+) -> Result<(), String> {
+    capabilities(client, saved)
+        .await?
+        .ok_or("source_server_update_required")?
+        .features
+        .require_reference_publication()
+}
 pub async fn enroll(client: &Client, saved: &SavedConnection) -> Result<Enrollment, String> {
     let identity = credentials::identity()?;
     let dto = identity.enrollment(

@@ -166,9 +166,18 @@ pub struct Features {
     #[serde(default)]
     pub qualification_memory: bool,
     pub sources: bool,
+    #[serde(default)]
+    pub reference_publication: u8,
     pub native_host: bool,
 }
 impl Features {
+    pub(crate) fn require_reference_publication(&self) -> Result<(), String> {
+        if self.reference_publication != 1 {
+            return Err("source_server_update_required".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_worker_qualification(&self) -> Result<(), String> {
         if !self.worker_session {
             return Err("desktop_worker_session_unavailable".into());
@@ -247,6 +256,32 @@ pub fn native_origin_allowed(label: &str, url: &Url, development_build: bool) ->
 #[cfg(test)]
 mod memory_capability_tests {
     use super::*;
+    #[test]
+    fn reference_publication_capability_preserves_the_explicit_protocol_version() {
+        let value = serde_json::json!({"enrollment":true,"worker":false,"workerSession":true,"qualificationMemory":true,"sources":false,"nativeHost":false,"referencePublication":1});
+        let features: Features = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(features).unwrap()["referencePublication"],
+            1
+        );
+    }
+    #[test]
+    fn reference_capability_defaults_closed_and_rejects_other_versions() {
+        let mut value = serde_json::json!({"enrollment":true,"worker":false,"sources":false,"nativeHost":false});
+        let legacy: Features = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            legacy.require_reference_publication().err().as_deref(),
+            Some("source_server_update_required")
+        );
+        for version in [0, 1, 2] {
+            value["referencePublication"] = serde_json::json!(version);
+            let features: Features = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                features.require_reference_publication().is_ok(),
+                version == 1
+            );
+        }
+    }
     #[test]
     fn older_server_keeps_photo_enrollment_but_cannot_start_memory_qualification() {
         let mut value = serde_json::json!({"enrollment":true,"worker":false,"workerSession":true,

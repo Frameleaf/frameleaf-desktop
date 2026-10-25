@@ -85,6 +85,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
         worker_session: false,
         qualification_memory: false,
         sources: false,
+        reference_publication: 0,
         native_host: false,
     };
     let client = match transport::client() {
@@ -104,6 +105,7 @@ async fn prepare_with_client(
         worker_session: false,
         qualification_memory: false,
         sources: false,
+        reference_publication: 0,
         native_host: false,
     };
     match transport::capabilities(client, saved).await {

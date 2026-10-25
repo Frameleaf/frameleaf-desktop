@@ -336,9 +336,13 @@ impl Consent {
     ) -> Result<(), String> {
         self.require(saved, identity)?;
         let client = transport::client()?;
-        transport::capabilities(&client, saved)
-            .await?
-            .ok_or("source_server_update_required")?;
+        if self.mode == SourceMode::Reference {
+            transport::reference_capabilities(&client, saved).await?;
+        } else {
+            transport::capabilities(&client, saved)
+                .await?
+                .ok_or("source_server_update_required")?;
+        }
         let base = normalize_server(&saved.server)?;
         let response = client
             .post(
