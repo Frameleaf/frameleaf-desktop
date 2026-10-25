@@ -1079,7 +1079,7 @@ mod tests {
                 .unwrap()
                 .is_none());
             assert!(
-                approved_profile(name, entries, source, "CUDAExecutionProvider")
+                approved_profile(name, entries, source, "MIGraphXExecutionProvider")
                     .unwrap()
                     .is_none()
             );
@@ -1159,7 +1159,7 @@ mod tests {
         );
     }
     #[test]
-    fn matches_nas_challenge_digest_for_every_approved_profile() {
+    fn matches_server_challenge_digest_for_every_approved_profile() {
         let expected = [
             "667244e2f6254b58c290a62f4b82cc5f82f5957f394813e015e1f8cf4454527a",
             "209293bc2f54fbcdc0524b1cec7eb81e5bfb4f045432885b037947288b42b03d",
@@ -1203,6 +1203,16 @@ mod tests {
             "d9eecddc9dbbc61ff126beb62ce35b1e45af0b289f568c3a9b6ca219eb75f93c",
             "40115f6689e12d4b40e2e456dd4f20b527a29795a17d76c1b79b881b6b3b0f34",
             "420f5d93f9189e42fad015eec0ff2cb19571e1e5f127e68b6e2770b697f15557",
+            "7480057b35520ea85d2bff0fa0fa026df115eabdd51ab87a9ba3ba2211d97b6d",
+            "37a25a170947f424cc0231e279ff5ea5de7dfc0c1a40b056bb60f3c807ef176b",
+            "f4a861ae2fb52c45577f1ab08aa0bdf794628dc11c4e4a2de75909bac6bf68b6",
+            "2a43cd5fb87f155cb03c1d528dad7d560f390654ce7849b4ffa4da45eab5daf2",
+            "bb60ac6ef80bdf0bcc77295364cece4173adad781cd945a7250b47fa2e19ad88",
+            "82bc3cb4ec3204c5f06e0b43e1c3e65666d82bda63381d655c7eb92ab1d56551",
+            "f3dabc2a4bdda94ec954ed297ef9da4ea2ea2b7875d328c508d5ca3d31227e0e",
+            "c07473e7f48fc116ede101ba012f266a7c84c1a79485f8be4f6f80df49153d82",
+            "eb5990f3895a30726bf70f19dca270e14c09325364d0c71085c4334a54912cff",
+            "84a5a8662aab5eac9415ca46b9c25318ba0bd989f4711853c75776614e919f8c",
             "6f146c1d05e93818586ed9fcf70e3ae6de1ff195dbfcf15e96cec4f8a93975c4",
             "a6d03f7df8104794200ac2c6f7734c77634dd0dd4a119fc24a85015730be0fa7",
             "2d8945f2b72d68508c39e87b2cbc123cf51723d8b302d67a678d4bd00720b582",
@@ -1213,6 +1223,16 @@ mod tests {
             "d9eecddc9dbbc61ff126beb62ce35b1e45af0b289f568c3a9b6ca219eb75f93c",
             "40115f6689e12d4b40e2e456dd4f20b527a29795a17d76c1b79b881b6b3b0f34",
             "420f5d93f9189e42fad015eec0ff2cb19571e1e5f127e68b6e2770b697f15557",
+            "710e4b75e702dc7fb357c7d9adfd46f112e72f2b293b7be7e2fae37027a2a350",
+            "2cd27bb7a97708f19bad89e56859e01a1c2a6d8e914715e40c4c6fe62a9756cf",
+            "a11e0dab1527fdf467089fee98931d8a611bd08ab73ff0fca3ce43b8251e580b",
+            "25ff5dadce6d2aca3a2592925fb8e9c2ea61d4d55a5faaa0cdaf512508e73c8a",
+            "63314b45995dff4db24beb827e5578329926e424ba123ecdd258a34684405cc3",
+            "90969ff68d6fad175517ef7c2416dd32c79c8c861e078ea372c8bd9947dbc788",
+            "bf7399911a1763dbe4a58c3246afcae28e8a659a1f3b4bb955b6e23fd35dd2cd",
+            "67726e0fc55b3f8c88325df8f4df0d545968664de3fd511a309e70904335411b",
+            "0767a6997a02500e5ba303d234356514d6954bc94fcdc3b4fb254a6901a57ece",
+            "de920faa258c7190b0071832332170ab78319c956a9dcf1792c3d0660e43276b",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
@@ -1373,8 +1393,8 @@ mod tests {
     fn precision_corrected_cpu_profiles_preserve_prior_bindings_and_require_complete_groups() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(catalogue["epoch"], 12);
-        assert_eq!(profiles.len(), 52);
+        assert_eq!(catalogue["epoch"], 13);
+        assert_eq!(profiles.len(), 72);
         assert_eq!(
             digest(
                 &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..27].to_vec())).unwrap()
@@ -1423,8 +1443,8 @@ mod tests {
     fn current_cpu_and_coreml_profiles_preserve_history_and_require_complete_clip_groups() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(catalogue["epoch"], 12);
-        assert_eq!(profiles.len(), 52);
+        assert_eq!(catalogue["epoch"], 13);
+        assert_eq!(profiles.len(), 72);
         assert_eq!(
             digest(
                 &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..32].to_vec())).unwrap()
@@ -1453,13 +1473,14 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
-        assert!(setup_profiles(
-            "ViT-B-16-SigLIP-384__webli",
-            source,
-            "CUDAExecutionProvider"
-        )
-        .unwrap()
-        .is_empty());
+        for provider in ["CUDAExecutionProvider", "OpenVINOExecutionProvider"] {
+            assert_eq!(
+                setup_profiles("ViT-B-16-SigLIP-384__webli", source, provider)
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
         for index in 0..5 {
             let mut gpu = profiles[37 + index].clone();
             gpu["spec"]["provider"] = json!("CPUExecutionProvider");
@@ -1502,5 +1523,59 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+    #[test]
+    fn current_main_profiles_preserve_every_prior_binding_and_require_complete_groups() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        assert_eq!(catalogue["epoch"], 13);
+        assert_eq!(profiles.len(), 72);
+        assert_eq!(
+            digest(
+                &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..52].to_vec())).unwrap()
+            ),
+            "3ea91381097841bd89b627106466dc202e86d733e816edb81357fbee5bc4ddbd"
+        );
+        let source = "1bf2ad55521c49f574cba2f450eb13d49652ea80";
+        let current: Vec<_> = profiles
+            .iter()
+            .filter(|p| p["runtimeSourceRevision"] == source)
+            .collect();
+        assert_eq!(current.len(), 10);
+        for (index, profile) in current.iter().enumerate() {
+            let old = &profiles[32 + index];
+            assert_eq!(
+                profile["spec"]["preprocessingSha256"],
+                "83bb75f1a5966ece214ae39221fb2b9eaa90aa53d724a2b8d0c56a6fc7681d5c"
+            );
+            assert_ne!(profile["modelKey"], old["modelKey"]);
+            let mut normalized = (*profile).clone();
+            normalized["modelKey"] = old["modelKey"].clone();
+            normalized["runtimeSourceRevision"] = old["runtimeSourceRevision"].clone();
+            normalized["spec"]["modelKey"] = old["spec"]["modelKey"].clone();
+            normalized["spec"]["preprocessingSha256"] = old["spec"]["preprocessingSha256"].clone();
+            assert_eq!(&normalized, old);
+        }
+        for provider in ["CPUExecutionProvider", "CoreMLExecutionProvider"] {
+            let selected = setup_profiles("ViT-B-16-SigLIP-384__webli", source, provider).unwrap();
+            assert_eq!(selected.len(), 3);
+            let keys: Vec<_> = selected.iter().map(|p| p.model_key().to_owned()).collect();
+            assert_eq!(
+                inventory_group("clip", &keys, source, provider)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert!(inventory_group("clip", &keys[..2], source, provider)
+                .unwrap()
+                .is_empty());
+        }
+        for provider in ["CUDAExecutionProvider", "OpenVINOExecutionProvider"] {
+            assert!(
+                setup_profiles("ViT-B-16-SigLIP-384__webli", source, provider)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
