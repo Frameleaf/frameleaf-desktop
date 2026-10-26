@@ -11,7 +11,7 @@
   function nativePlatform() { return typeof navigator !== 'undefined' && /Mac/.test(navigator.platform); }
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { mode?: 'copy' | 'reference'; allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
+  type Consent = { mode?: 'copy' | 'reference'; reconnectRequired?: boolean; allowPhotosHydration: boolean; kind: string; id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
   type CopyJob = { sourceReadRemaining: number | null; additionalSourceReadAllowance: number; provider: string | null; stagedBytes: number | null; exportRemaining: number | null; additionalExportAllowance: number; sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
   let approvals = $derived(job ? sourceCopyApprovals(job) : { read: false, export: false, upload: false, canResumeWithoutUpload: false, canResume: false });
@@ -91,7 +91,8 @@
     server_http_404: 'Your server needs the desktop photo-source update before this folder can be registered.',
     source_server_update_required: 'Your server needs the desktop photo-source update.',
     source_registration_unavailable: 'The server could not be reached. The local permission is saved; retry registration when connected.',
-    source_registration_response_invalid: 'The server did not confirm this exact folder permission. Copying remains stopped.',
+    source_registration_response_invalid: 'The server did not confirm this exact source permission. Source work remains stopped.',
+    source_reference_reapproval_required: 'This reference permission needs a new local approval before reconnecting.',
     server_identity_changed: 'The server identity changed. Sign out before reconnecting.',
 
     source_choose_photo_subfolder: 'Choose a photo folder inside your home folder, rather than your entire home folder.',
@@ -176,12 +177,31 @@
     } catch (error) { await loadConsent(); message = explain(error); }
     finally { busy = false; }
   }
+  async function reconnect() {
+    if (consent?.mode !== 'reference' || !consent.reconnectRequired) return;
+    const source = consent;
+    busy = true; message = '';
+    try {
+      const current = await invoke<Consent>('reconnect_photo_source', { sourceId: source.id });
+      if (alive && consent === source) {
+        if (current.id !== source.id || current.mode !== 'reference' || !current.registered || current.reconnectRequired) {
+          message = errors.source_registration_response_invalid;
+        } else {
+          consent = current; job = null; blockedConsent = false; message = 'Reference source reconnected.';
+        }
+      }
+    } catch (error) { if (alive && consent === source) message = explain(error); }
+    finally { busy = false; }
+  }
   async function revoke() {
+    const reference = consent?.mode === 'reference';
     busy = true; message = '';
     try {
       const confirmed = await invoke<boolean>('revoke_photo_source');
       consent = null; job = null; blockedConsent = false; folder = null; allowReads = false; allowHydration = false;
-      message = confirmed ? 'Folder permission removed. Existing server copies are kept.' : 'Local folder permission removed. The server could not confirm revocation; check it when connected.';
+      message = reference
+        ? (confirmed ? 'Reference permission removed. Library entries are kept; this computer no longer serves their originals.' : 'Local reference permission removed. The server could not confirm revocation; check it when connected.')
+        : (confirmed ? 'Folder permission removed. Existing server copies are kept.' : 'Local folder permission removed. The server could not confirm revocation; check it when connected.');
     } catch (error) { message = explain(error); }
     finally { busy = false; }
   }
@@ -238,8 +258,13 @@
     <div class="folder-preview" aria-label="Approved photo folder">
       <strong>{consent.name}</strong><p>{consent.path}</p>
       {#if consent.kind === 'apple-photos'}<p class="footnote">{consent.allowPhotosHydration ? 'Photos-managed iCloud downloads are allowed. They can exceed the export/staging ceiling.' : 'Photos network downloads are disabled. Cloud-only originals will stop safely until you remove this permission and approve hydration in a new selection.'}</p>{/if}
-      <p>{consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</p>
-      {#if !consent.registered}<button class="secondary" disabled={busy} onclick={() => approve(true)}>Retry server registration</button>{/if}
+      {#if consent.reconnectRequired}
+        <p>Reconnect this reference source to your current sign-in using its saved scope and permissions.</p>
+        <button class="secondary" disabled={busy} onclick={reconnect}>Reconnect source</button>
+      {:else}
+        <p>{consent.registered ? 'Source permission saved and registered with your server.' : 'Source permission saved locally. Server registration still needs to finish.'}</p>
+        {#if !consent.registered}<button class="secondary" disabled={busy} onclick={() => approve(true)}>Retry server registration</button>{/if}
+      {/if}
       {#if consent.registered && copyAllowed() && !job}
         <p>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</p>
         <button class="secondary" disabled={busy} onclick={prepareCopy}>Prepare copy</button>

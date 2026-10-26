@@ -9,20 +9,20 @@ import ts from 'typescript';
 function component() {
   const componentSource = readFileSync(new URL('../src/PhotoSources.svelte', import.meta.url), 'utf8');
   const script = componentSource.slice(componentSource.indexOf('>') + 1, componentSource.indexOf('</script>'));
-  const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: unknown) => void }>();
+  const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: unknown) => void; args?: Record<string, unknown> }>();
   let mount!: () => () => void;
   let event!: (value: { payload: unknown }) => void;
   const exports: Record<string, unknown> = {};
   const modules: Record<string, unknown> = {
     '@tauri-apps/api/core': {
       isTauri: () => true,
-      invoke: (name: string) => new Promise((resolve, reject) => { pending.set(name, { resolve, reject }); }),
+      invoke: (name: string, args?: Record<string, unknown>) => new Promise((resolve, reject) => { pending.set(name, { resolve, reject, args }); }),
     },
     '@tauri-apps/api/event': { listen: async (_name: string, callback: typeof event) => { event = callback; return () => {}; } },
     svelte: { onMount: (callback: typeof mount) => { mount = callback; } },
     './source-copy-state': {},
   };
-  const code = ts.transpileModule(`${script}\nexport { revoke, loadConsent, prepareCopy, controlCopy }; export const current = () => ({ consent, job, message, blockedConsent });`, {
+  const code = ts.transpileModule(`${script}\nexport { revoke, loadConsent, prepareCopy, controlCopy }; export { reconnect as reconnectCall }; export const current = () => ({ consent, job, message, blockedConsent });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, require: (name: string) => {
@@ -31,7 +31,7 @@ function component() {
   }, $state: (value: unknown) => value, $derived: (value: unknown) => value });
   return { ...exports, pending, mount: () => mount(), emit: (payload: unknown) => event({ payload }) } as unknown as {
     current: () => { consent: typeof source | null; job: typeof job | null; message: string; blockedConsent: boolean };
-    revoke: () => Promise<void>; loadConsent: () => Promise<void>;
+    reconnectCall: () => Promise<void>; revoke: () => Promise<void>; loadConsent: () => Promise<void>;
     prepareCopy: () => Promise<void>; controlCopy: (action: string) => Promise<void>;
     pending: typeof pending; mount: () => () => void; emit: (payload: unknown) => void;
   };
@@ -168,4 +168,45 @@ test('reference consent cannot display or start a copy job', async () => {
   assert.equal(view.pending.has('control_photo_import'), false);
   assert.match(view.current().message, /does not allow copying/);
   unmount();
+});
+
+const inactiveReference = { ...source, mode: 'reference', registered: false, reconnectRequired: true };
+async function loadingReference() {
+  const view = component();const unmount=view.mount();await setImmediate();
+  view.pending.get('photo_source_status')!.resolve(inactiveReference);await setImmediate();
+  return { view, unmount };
+}
+test('reconnect restores only the same explicitly approved reference source', async () => {
+  const {view,unmount}=await loadingReference();
+  const reconnect=view.reconnectCall();
+  assert.equal(view.pending.has('reconnect_photo_source'),true);
+  assert.equal(view.pending.get('reconnect_photo_source')!.args?.sourceId, source.id);
+  const active={...inactiveReference,registered:true,reconnectRequired:false};
+  view.pending.get('reconnect_photo_source')!.resolve(active);await reconnect;
+  assert.equal(view.current().consent,active);assert.equal(view.current().job,null);
+  assert.equal(view.pending.has('prepare_photo_import'),false);
+  unmount();
+});
+test('reconnect replies and failures cannot restore a revoked reference',async()=>{
+  for(const fails of [false,true]){
+    const {view,unmount}=await loadingReference();const reconnect=view.reconnectCall();
+    const revoke=view.revoke();view.pending.get('revoke_photo_source')!.resolve(true);await revoke;
+    const message=view.current().message;
+    if(fails)view.pending.get('reconnect_photo_source')!.reject('source_registration_unavailable');
+    else view.pending.get('reconnect_photo_source')!.resolve({...inactiveReference,registered:true,reconnectRequired:false});
+    await reconnect;assert.equal(view.current().consent,null);assert.equal(view.current().message,message);unmount();
+  }
+});
+test('reconnect refuses another source or mode in the native response',async()=>{
+  for(const change of [{id:'other'},{mode:'copy'},{registered:false},{reconnectRequired:true}]){
+    const {view,unmount}=await loadingReference();const reconnect=view.reconnectCall();
+    view.pending.get('reconnect_photo_source')!.resolve({...inactiveReference,registered:true,reconnectRequired:false,...change});await reconnect;
+    assert.equal(view.current().consent,inactiveReference);assert.match(view.current().message,/did not confirm/);unmount();
+  }
+});
+test('copy and active-reference consent cannot invoke reconnect',async()=>{
+  for(const value of [source,{...inactiveReference,registered:true,reconnectRequired:false}]){
+    const view=component();const unmount=view.mount();await setImmediate();view.pending.get('photo_source_status')!.resolve(value);await setImmediate();
+    await view.reconnectCall();assert.equal(view.pending.has('reconnect_photo_source'),false);unmount();
+  }
 });

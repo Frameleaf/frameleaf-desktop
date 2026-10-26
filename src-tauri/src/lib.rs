@@ -462,6 +462,7 @@ pub fn run() {
             choose_apple_photos,
             approve_photo_folder,
             photo_source_status,
+            reconnect_photo_source,
             revoke_photo_source,
             photo_import_status,
             prepare_photo_import,
@@ -726,12 +727,10 @@ async fn photo_source_status(
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
-    let Some(consent) = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
-    else {
-        return Ok(None);
-    };
-    consent.require(saved, &credentials::identity()?)?;
-    Ok(Some(consent.view()))
+    let identity = credentials::identity()?;
+    source_consent::stored(saved, &identity)?
+        .map(|consent| consent.session_view(saved, &identity))
+        .transpose()
 }
 #[tauri::command]
 async fn approve_photo_folder(
@@ -762,7 +761,7 @@ async fn approve_photo_folder(
                 mode.unwrap_or_default(),
                 allow_download,
                 allow_photos_hydration.unwrap_or(false),
-                |value| credentials::save(source_consent::CREDENTIAL, value),
+                |value| source_consent::persist(value, saved, &identity),
             )?
     } else {
         credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
@@ -772,7 +771,28 @@ async fn approve_photo_folder(
         return Err("source_approval_changed".into());
     }
     consent.register(saved, &identity).await?;
-    credentials::save(source_consent::CREDENTIAL, &consent)?;
+    source_consent::persist(&consent, saved, &identity)?;
+    Ok(consent.view())
+}
+#[tauri::command]
+async fn reconnect_photo_source(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+) -> Result<source_consent::ConsentView, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let identity = credentials::identity()?;
+    let stored = source_consent::stored(saved, &identity)?.ok_or("source_approval_required")?;
+    if stored.source_id() != source_id {
+        return Err("source_approval_changed".into());
+    }
+    let mut consent = stored.reconnect_candidate(saved, &identity)?;
+    stop_sources(&app).await?;
+    consent.register(saved, &identity).await?;
+    source_consent::persist(&consent, saved, &identity)?;
     Ok(consent.view())
 }
 #[tauri::command]
@@ -785,14 +805,27 @@ async fn revoke_photo_source(
     let current = state.0.lock().await;
     stop_sources(&app).await?;
     let saved = current.as_ref().ok_or("sign_in_required")?;
-    let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
+    let identity = credentials::identity();
+    let consent = match &identity {
+        Ok(identity) => source_consent::stored(saved, identity),
+        Err(_) => credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL),
+    };
     // Local authority ends before waiting on the server; offline revocation cannot leave it enabled here.
     credentials::delete(source_consent::CREDENTIAL)?;
     app.state::<source_consent::SourceConsent>().clear()?;
     match consent {
         Ok(Some(consent)) => {
-            let Ok(identity) = credentials::identity() else {
+            let Ok(identity) = identity else {
                 return Ok(false);
+            };
+            let consent = if consent.mode == source_consent::SourceMode::Reference {
+                let Ok(candidate) = consent.revocation_candidate(saved, &identity) else {
+                    return Ok(false);
+                };
+                source_consent::forget_reference(candidate.source_id(), saved, &identity)?;
+                candidate
+            } else {
+                consent
             };
             Ok(consent.revoke(saved, &identity).await.is_ok())
         }

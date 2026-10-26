@@ -2,6 +2,7 @@
 use crate::{
     connection::{normalize_server, DeviceIdentity, SavedConnection},
     copy_source::CopyApproval,
+    credentials,
     photo_sources::{self, FolderInventory},
     transport,
 };
@@ -10,6 +11,7 @@ use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Mutex};
 
 pub const CREDENTIAL: &str = "photo-source-copy";
+const REFERENCE_CREDENTIAL: &str = "photo-source-reference-record";
 fn registration_path(photos: bool) -> &'static str {
     if photos {
         "api/photo-sources/apple-photos"
@@ -42,13 +44,15 @@ pub struct SelectedFolder {
     #[serde(flatten)]
     pub inventory: FolderInventory,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Consent {
     #[serde(default)]
     pub(crate) mode: SourceMode,
     approval: CopyApproval,
     session_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent_signature: Option<String>,
     name: String,
     allow_download: bool,
     pub registered: bool,
@@ -64,6 +68,7 @@ pub struct ConsentView {
     allow_photos_hydration: bool,
     allow_download: bool,
     registered: bool,
+    reconnect_required: bool,
 }
 impl SourceConsent {
     pub fn generation(&self) -> Result<u64, String> {
@@ -204,14 +209,16 @@ impl SourceConsent {
                 ),
             )
         };
-        let consent = Consent {
+        let mut consent = Consent {
             mode,
             approval,
             session_signature: session_signature(saved, identity, mode),
+            intent_signature: None,
             name,
             allow_download,
             registered: false,
         };
+        consent.intent_signature = Some(consent.signed_intent(identity)?);
         persist(&consent)?;
         pending.selected = None;
         pending.photos = None;
@@ -250,6 +257,94 @@ fn session_signature(
 }
 
 impl Consent {
+    fn signed_intent(&self, identity: &DeviceIdentity) -> Result<String, String> {
+        let value = serde_json_canonicalizer::to_vec(&(
+            self.mode,
+            self.approval.fingerprint(),
+            source_label(&self.name),
+            self.allow_download,
+        ))
+        .map_err(|_| "source_approval_invalid")?;
+        Ok(identity.sign(&format!(
+            "frameleaf-desktop/photo-source-consent/v1\n{}",
+            String::from_utf8(value).map_err(|_| "source_approval_invalid")?
+        )))
+    }
+    fn require_bound_session(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<(), String> {
+        self.approval.validate(saved, identity)?;
+        if self
+            .intent_signature
+            .as_ref()
+            .is_some_and(|signature| self.signed_intent(identity).as_ref() != Ok(signature))
+        {
+            return Err("source_approval_invalid".into());
+        }
+        if self.session_signature != session_signature(saved, identity, self.mode) {
+            return Err("source_photo_session_changed".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn reconnect_candidate(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<Self, String> {
+        if self.mode != SourceMode::Reference {
+            return Err("source_reference_mode_required".into());
+        }
+        self.approval.validate(saved, identity)?;
+        if self.intent_signature.as_ref() != Some(&self.signed_intent(identity)?) {
+            return Err("source_reference_reapproval_required".into());
+        }
+        let mut next = self.clone();
+        next.session_signature = session_signature(saved, identity, self.mode);
+        next.registered = false;
+        Ok(next)
+    }
+    pub(crate) fn revocation_candidate(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<Self, String> {
+        if self.require_bound_session(saved, identity).is_ok() {
+            return Ok(self.clone());
+        }
+        self.reconnect_candidate(saved, identity)
+    }
+    fn reference_record(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<Option<Self>, String> {
+        if self.mode != SourceMode::Reference {
+            return Ok(None);
+        }
+        let mut record = self.reconnect_candidate(saved, identity)?;
+        // An inactive record retains identity and consent, never a live photo-session grant.
+        record.session_signature.clear();
+        Ok(Some(record))
+    }
+    pub(crate) fn session_view(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<ConsentView, String> {
+        match self.require(saved, identity) {
+            Ok(()) => Ok(self.view()),
+            Err(code)
+                if code == "source_photo_session_changed" && self.mode == SourceMode::Reference =>
+            {
+                let mut view = self.reconnect_candidate(saved, identity)?.view();
+                view.reconnect_required = true;
+                Ok(view)
+            }
+            Err(code) => Err(code),
+        }
+    }
     pub(crate) fn approval(
         &self,
         saved: &SavedConnection,
@@ -291,11 +386,8 @@ impl Consent {
         saved: &SavedConnection,
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
-        self.approval.validate_current(saved, identity)?;
-        if self.session_signature != session_signature(saved, identity, self.mode) {
-            return Err("source_photo_session_changed".into());
-        }
-        Ok(())
+        self.require_bound_session(saved, identity)?;
+        self.approval.validate_current(saved, identity)
     }
     pub fn view(&self) -> ConsentView {
         ConsentView {
@@ -311,6 +403,7 @@ impl Consent {
             allow_photos_hydration: self.approval.allows_photos_hydration(),
             allow_download: self.allow_download,
             registered: self.registered,
+            reconnect_required: false,
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
@@ -365,7 +458,7 @@ impl Consent {
         saved: &SavedConnection,
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
-        self.require(saved, identity)?;
+        self.require_bound_session(saved, identity)?;
         let client = transport::client()?;
         transport::capabilities(&client, saved)
             .await?
@@ -385,6 +478,41 @@ impl Consent {
         }
         Ok(())
     }
+}
+
+/// The inactive record is ignored by original readers and scoped before any path reaches the UI.
+pub(crate) fn stored(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+) -> Result<Option<Consent>, String> {
+    if let Some(active) = credentials::load::<Consent>(CREDENTIAL)? {
+        return Ok(Some(active));
+    }
+    Ok(credentials::load::<Consent>(REFERENCE_CREDENTIAL)?
+        .filter(|record| record.reconnect_candidate(saved, identity).is_ok()))
+}
+pub(crate) fn persist(
+    consent: &Consent,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+) -> Result<(), String> {
+    consent.require(saved, identity)?;
+    if let Some(record) = consent.reference_record(saved, identity)? {
+        credentials::save(REFERENCE_CREDENTIAL, &record)?;
+    }
+    credentials::save(CREDENTIAL, consent)
+}
+pub(crate) fn forget_reference(
+    source: &str,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+) -> Result<(), String> {
+    if let Some(record) = credentials::load::<Consent>(REFERENCE_CREDENTIAL)? {
+        if record.source_id() == source && record.reconnect_candidate(saved, identity).is_ok() {
+            credentials::delete(REFERENCE_CREDENTIAL)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -494,6 +622,7 @@ mod tests {
             "copy"
         );
         value.as_object_mut().unwrap().remove("mode");
+        value.as_object_mut().unwrap().remove("intentSignature");
         let legacy: Consent = serde_json::from_value(value).unwrap();
         legacy.copy_approval(&saved(), &identity).unwrap();
         assert_eq!(serde_json::to_value(legacy.view()).unwrap()["mode"], "copy");
@@ -573,6 +702,124 @@ mod tests {
             .require(&saved(), &identity)
             .is_err());
         std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn fresh_session_signature_cannot_turn_reference_consent_into_copy_permission() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-reconnect-mode-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let identity = DeviceIdentity::generate();
+        let picker = SourceConsent::default();
+        let selected = picker
+            .select(picker.generation().unwrap(), root.clone())
+            .unwrap();
+        let mut consent = picker
+            .approve_with_hydration(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                SourceMode::Reference,
+                true,
+                false,
+                |_| Ok(()),
+            )
+            .unwrap();
+        consent.registered = true;
+        let mut next = saved();
+        next.token = "synthetic-fresh-session".into();
+        let mut record = serde_json::to_value(consent).unwrap();
+        record["mode"] = json!("copy");
+        record["sessionSignature"] = json!(session_signature(&next, &identity, SourceMode::Copy));
+        let changed: Consent = serde_json::from_value(record).unwrap();
+        assert!(changed.copy_approval(&next, &identity).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn inactive_reference_record_preserves_identity_but_cannot_authorize_reads() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-reconnect-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let identity = DeviceIdentity::generate();
+        let picker = SourceConsent::default();
+        let selected = picker
+            .select(picker.generation().unwrap(), root.clone())
+            .unwrap();
+        let mut consent = picker
+            .approve_with_hydration(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                SourceMode::Reference,
+                true,
+                false,
+                |_| Ok(()),
+            )
+            .unwrap();
+        consent.registered = true;
+        let record = consent
+            .reference_record(&saved(), &identity)
+            .unwrap()
+            .unwrap();
+        assert!(record.reference_approval(&saved(), &identity).is_err());
+        let mut next = saved();
+        next.token = "synthetic-new-session".into();
+        assert!(record.reference_approval(&next, &identity).is_err());
+        let candidate = record.reconnect_candidate(&next, &identity).unwrap();
+        assert_eq!(candidate.request(&next), consent.request(&saved()));
+        assert_eq!(
+            candidate.approval.fingerprint(),
+            consent.approval.fingerprint()
+        );
+        candidate.require(&next, &identity).unwrap();
+        assert!(!candidate.registered);
+        assert!(candidate.reference_approval(&next, &identity).is_err());
+        assert!(candidate.require(&saved(), &identity).is_err());
+        assert!(
+            record
+                .session_view(&next, &identity)
+                .unwrap()
+                .reconnect_required
+        );
+        for field in ["server", "serverId", "accountId", "deviceId"] {
+            let mut value = serde_json::to_value(&next).unwrap();
+            value[field] = json!(if field == "server" {
+                "https://other.test/"
+            } else {
+                "other"
+            });
+            let foreign: SavedConnection = serde_json::from_value(value).unwrap();
+            assert!(
+                record.reconnect_candidate(&foreign, &identity).is_err(),
+                "{field}"
+            );
+        }
+        assert!(record
+            .reconnect_candidate(&next, &DeviceIdentity::generate())
+            .is_err());
+        for field in ["mode", "allowDownload", "name", "intentSignature"] {
+            let mut value = serde_json::to_value(&record).unwrap();
+            value[field] = match field {
+                "mode" => json!("copy"),
+                "allowDownload" => json!(false),
+                "intentSignature" => Value::Null,
+                _ => json!("Other"),
+            };
+            let changed: Consent = serde_json::from_value(value).unwrap();
+            assert!(
+                changed.reconnect_candidate(&next, &identity).is_err(),
+                "{field}"
+            );
+        }
+        let mut legacy = serde_json::to_value(&consent).unwrap();
+        legacy.as_object_mut().unwrap().remove("intentSignature");
+        let legacy: Consent = serde_json::from_value(legacy).unwrap();
+        legacy.require(&saved(), &identity).unwrap();
+        legacy.revocation_candidate(&saved(), &identity).unwrap();
+        assert!(legacy.revocation_candidate(&next, &identity).is_err());
+        assert!(legacy.reconnect_candidate(&next, &identity).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn registration_requires_an_exact_source_echo_and_never_discloses_the_local_root() {

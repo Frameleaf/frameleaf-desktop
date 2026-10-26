@@ -56,6 +56,7 @@ fn main() {
             "choose_apple_photos",
             "approve_photo_folder",
             "photo_source_status",
+            "reconnect_photo_source",
             "revoke_photo_source",
             "photo_import_status",
             "prepare_photo_import",

@@ -585,7 +585,11 @@ impl CopyApproval {
             .map_err(|_| "source_stage_write_failed")?;
         Ok(result)
     }
-    fn validate(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
+    pub(crate) fn validate(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<(), String> {
         let scope = &self.scope;
         if scope.version != 1
             || scope.server != saved.server

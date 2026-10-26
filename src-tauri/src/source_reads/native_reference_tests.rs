@@ -107,11 +107,11 @@ fn actual_native_reference_publication() {
                 SourceMode::Reference,
                 true,
                 false,
-                |value| credentials::save(CREDENTIAL, value),
+                |value| crate::source_consent::persist(value, &saved, &identity),
             )
             .unwrap();
         consent.register(&saved, &identity).await.unwrap();
-        credentials::save(CREDENTIAL, &consent).unwrap();
+        crate::source_consent::persist(&consent, &saved, &identity).unwrap();
         let source = consent.source_id().to_owned();
         let mut preparation =
             Preparation::plan(&base, &saved, &identity, &source, "original.jpg").unwrap();
@@ -193,5 +193,74 @@ fn actual_native_reference_publication() {
         report(
             json!({"phase":"complete","receipt":receipt,"independentOriginalUnchanged":true,"cacheRetained":true,"readAndUploadAllowancesUnchanged":true}),
         );
+        drop(job);
+        // Simulate local sign-out; its inactive record must never be usable by an original reader.
+        credentials::delete(CREDENTIAL).unwrap();
+        credentials::delete("connection").unwrap();
+        assert!(crate::source_import::current(&saved, &identity, &source).is_err());
+        let command = read_fixture_message(&mut input);
+        assert_eq!(command["command"], "reconnect");
+        let mut next = saved.clone();
+        next.token = command["token"].as_str().unwrap().into();
+        credentials::save("connection", &next).unwrap();
+        let mut foreign = next.clone();
+        foreign.account_id = "66666666-6666-4666-8666-666666666666".into();
+        assert!(crate::source_consent::stored(&foreign, &identity)
+            .unwrap()
+            .is_none());
+        let record = crate::source_consent::stored(&next, &identity)
+            .unwrap()
+            .unwrap();
+        assert!(record.require(&saved, &identity).is_err());
+        assert!(record.require(&next, &identity).is_err());
+        assert_eq!(
+            serde_json::to_value(record.session_view(&next, &identity).unwrap()).unwrap()
+                ["reconnectRequired"],
+            true
+        );
+        let mut reconnected = record.reconnect_candidate(&next, &identity).unwrap();
+        assert!(reconnected.reference_approval(&next, &identity).is_err());
+        reconnected.register(&next, &identity).await.unwrap();
+        crate::source_consent::persist(&reconnected, &next, &identity).unwrap();
+        assert!(reconnected.copy_approval(&next, &identity).is_err());
+        assert_eq!(publish(&base, &next, &source).await.state, "stopped");
+        let current: Value = journal
+            .read(&format!("{}.json", selected.resource_key), &identity)
+            .unwrap();
+        assert_eq!(&current["current"]["receipt"], receipt);
+        let job = Job::resume(
+            &base,
+            &next,
+            &identity,
+            &source,
+            &selected.resource_key,
+            &selected.version,
+        )
+        .unwrap();
+        let after = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
+        assert_eq!(before["read"], after["read"]);
+        assert_eq!(before["upload"], after["upload"]);
+        drop(job);
+        report(
+            json!({"phase":"reconnected","receipt":receipt,"readAndUploadAllowancesUnchanged":true}),
+        );
+        assert_eq!(read_fixture_message(&mut input)["command"], "forget");
+        crate::source_consent::forget_reference(&source, &next, &identity).unwrap();
+        credentials::delete(CREDENTIAL).unwrap();
+        assert!(crate::source_consent::stored(&next, &identity)
+            .unwrap()
+            .is_none());
+        reconnected
+            .revocation_candidate(&next, &identity)
+            .unwrap()
+            .revoke(&next, &identity)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&stage).unwrap(), original);
+        assert_eq!(
+            fs::read(source_root.join("original.jpg")).unwrap(),
+            original
+        );
+        report(json!({"phase":"forgotten","originalAndCacheRetained":true}));
     });
 }
