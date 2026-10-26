@@ -139,7 +139,46 @@ impl Requests {
         }
         self.prepare_owned_checked(source.clone(), Arc::new(|_| {}), false, move |_, stop| {
             let identity = crate::credentials::identity()?;
-            Preparation::reference_status(&base, &saved, &identity, &source, stop)
+            let scope = || {
+                let consent = crate::credentials::load::<crate::source_consent::Consent>(
+                    crate::source_consent::CREDENTIAL,
+                )?
+                .ok_or("source_approval_required")?;
+                if consent.source_id() != source {
+                    return Err("source_approval_changed".into());
+                }
+                consent.reference_metadata_scope(&saved, &identity)
+            };
+            let expected_scope = scope()?;
+            let check = || {
+                stop()?;
+                if scope()? != expected_scope {
+                    return Err("source_approval_changed".into());
+                }
+                Ok(())
+            };
+            let mut status =
+                Preparation::reference_status(&base, &saved, &identity, &source, &check)?;
+            let publications = super::super::publication::catalog(
+                &base.join("photo-reads").join(&source).join("publications"),
+                &saved,
+                &identity,
+                &source,
+                &expected_scope,
+                &check,
+            )?;
+            if status.is_none() && !publications.is_empty() {
+                status = Some(crate::source_reads::ReferenceStatus {
+                    source_id: source.clone(),
+                    scans: Vec::new(),
+                    publications: Vec::new(),
+                });
+            }
+            if let Some(value) = &mut status {
+                value.publications = publications;
+            }
+            check()?;
+            Ok(status)
         })
         .await
     }

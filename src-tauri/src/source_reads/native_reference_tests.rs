@@ -261,6 +261,17 @@ fn actual_native_reference_publication() {
         };
         let name = format!("{}.json", selected.resource_key);
         let pending_before = fs::read(journal.root.join(&name)).unwrap();
+        let inspector = Requests::default();
+        let local = inspector
+            .reference_status(base.clone(), saved.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        inspector.stop().await.unwrap();
+        assert_eq!(local.publications.len(), 1);
+        assert_eq!(local.publications[0].state, "publish");
+        assert!(local.publications[0].receipt.is_none());
+        assert_eq!(fs::read(journal.root.join(&name)).unwrap(), pending_before);
         let second = action(&base, &saved, &source, Some(&selected.resource_key)).await;
         assert_eq!(
             second.code.as_deref(),
@@ -293,6 +304,30 @@ fn actual_native_reference_publication() {
                 .state,
             "stopped"
         );
+        // Saved receipt inspection does not open originals, stages, or even require a preparation plan.
+        let preparation_root = base.join("photo-preparations").join(&source);
+        let detached = base.join("detached-synthetic-preparation");
+        let publication_bytes = fs::read(journal.root.join(&name)).unwrap();
+        fs::rename(&preparation_root, &detached).unwrap();
+        let inspector = Requests::default();
+        let local = inspector
+            .reference_status(base.clone(), saved.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        inspector.stop().await.unwrap();
+        assert!(local.scans.is_empty());
+        assert_eq!(local.publications.len(), 1);
+        assert_eq!(local.publications[0].state, "recorded");
+        assert!(local.publications[0].receipt.is_some());
+        assert!(!preparation_root.exists());
+        assert!(!source_root.join("original.jpg").exists());
+        assert_eq!(
+            fs::read(journal.root.join(&name)).unwrap(),
+            publication_bytes
+        );
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
+        fs::rename(&detached, &preparation_root).unwrap();
         fs::write(source_root.join("original.jpg"), edited).unwrap();
         let state: Value = journal
             .read(&format!("{}.json", selected.resource_key), &identity)

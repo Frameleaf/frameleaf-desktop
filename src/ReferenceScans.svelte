@@ -3,7 +3,8 @@
   import { onMount } from 'svelte';
   import ReferenceRead from './ReferenceRead.svelte';
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
-  type ReferenceStatus = { sourceId: string; scans: Scan[] };
+  type Publication = { resourceKey: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null };
+  type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[] };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
   let busy = $state(false);
@@ -11,6 +12,7 @@
   let message = $state('');
   let confirmation = $state<string | null>(null);
   let visible = $state(20);
+  let visiblePublications = $state(20);
   let alive = true;
   let serial = 0;
   const errors: Record<string, string> = {
@@ -34,6 +36,16 @@
     source_approval_required: 'Reconnect or approve this source before managing its scans.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'Saved reference work could not be checked. Refresh and try again; retained files are kept.'; }
+  function publicationMessage(value: { state: string }) {
+    switch (value.state) {
+      case 'run': return 'Publication run is not confirmed. A previous receipt, if present, belongs to the earlier version.';
+      case 'item': return 'Resource registration is not confirmed. A previous receipt, if present, belongs to the earlier version.';
+      case 'publish': return 'Publication may have completed on your server. Its receipt needs recovery before the result can be confirmed.';
+      case 'complete': return 'A publication receipt is saved; run completion is pending.';
+      case 'recorded': return 'A publication receipt is saved locally.';
+      default: return 'This publication record needs attention.';
+    }
+  }
   function size(bytes: number) {
     if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
     if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
@@ -106,7 +118,7 @@
         {#if scan.current}
           <p class="footnote">Remaining {photos ? 'maximum export' : 'original-read'} allowance: {size(scan.remaining)}.</p>
           {#if !scan.abandoned && !scan.prepared && scan.nextReadBytes === null}
-            <p class="footnote">An unfinished attempt is retained. Abandon this scan to review cache cleanup before starting a new scan.</p>
+            <p class="footnote">An unfinished attempt is retained. Recover the staged original, or abandon this scan to review cache cleanup.</p>
           {/if}
           {#if scan.additionalReadAllowance > 0 && !scan.abandoned}
             <p class="footnote">The next selected original needs {photos ? 'up to ' : ''}{size(scan.nextReadBytes ?? 0)} of {photos ? 'maximum export' : 'read'} allowance, including retries. Approval does not open or upload originals. {photos ? 'Photos-managed downloads are separate and can exceed the export ceiling when hydration is enabled for this source.' : 'Cloud-provider network traffic can exceed logical file data.'}</p>
@@ -129,6 +141,18 @@
         {/if}
       </div>
     {/each}
+    {#if status.publications?.length}
+      <h4>Saved publication records</h4>
+      <p class="footnote">These signed local records do not check current server availability or whether originals are still reachable. Refreshing reads only saved metadata.</p>
+      {#each status.publications.slice(0, visiblePublications) as publication (publication.resourceKey)}
+        <div class="scan">
+          <strong>{publication.originalFileName}</strong>
+          <p>{publicationMessage(publication)}</p>
+          {#if publication.receipt}<p class="footnote">Saved server receipt dated {publication.receipt.publishedAt}.</p>{/if}
+        </div>
+      {/each}
+      {#if status.publications.length > visiblePublications}<button class="text-button" disabled={busy || reading} onclick={() => visiblePublications += 20}>Show more publication records</button>{/if}
+    {/if}
     {#if status.scans.length > visible}<button class="text-button" disabled={busy || reading} onclick={() => visible += 20}>Show more scans</button>{/if}
   {:else if !busy && !message}<p>No saved reference scans on this computer.</p>{/if}
 </section>

@@ -5,6 +5,7 @@ use super::*;
 pub struct ReferenceStatus {
     pub source_id: String,
     pub scans: Vec<ScanStatus>,
+    pub publications: Vec<super::super::publication::PublicationStatus>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +100,7 @@ impl Preparation {
         Ok(ReferenceStatus {
             source_id: self.plan.source.clone(),
             scans,
+            publications: Vec::new(),
         })
     }
     fn scan_status(

@@ -14,7 +14,7 @@ function component() {
   const pending: { name: string; args: Record<string, unknown>; resolve(value: unknown): void; reject(error: unknown): void }[] = [];
   let mount!: () => () => void;
   const exports: Record<string, unknown> = {};
-  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard }; export const current = () => ({ status, message, busy, confirmation });`, {
+  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage }; export const current = () => ({ status, message, busy, confirmation });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, $state: (value: unknown) => value, $props: () => ({ sourceId: status.sourceId, photos: false }), require: (name: string) => {
@@ -23,6 +23,7 @@ function component() {
     return { invoke: (name: string, args: Record<string, unknown>) => new Promise((resolve, reject) => { pending.push({ name, args, resolve, reject }); }) };
   } });
   return { ...exports, pending, mount: () => mount() } as unknown as {
+    publicationMessage(value: { state: string }): string;
     refresh(): Promise<void>; control(action: string, value: typeof scan): Promise<void>; confirmDiscard(value: typeof scan): void;
     current(): { status: typeof status | null; message: string; busy: boolean; confirmation: string | null };
     pending: typeof pending; mount(): () => void;
@@ -153,4 +154,13 @@ test('a retained pending cache cannot request another original-read grant',async
   const {view,unmount}=await loaded({...status,scans:[row,archived]});
   await view.control('approve-read',row);
   assert.equal(view.pending.length,1);unmount();
+});
+
+// A saved receipt must never hide an interrupted replacement or imply fresh server availability.
+test('publication labels keep interrupted steps separate from retained receipts', () => {
+  const view = component();
+  for (const [state, expected] of [
+    ['run', /not confirmed/], ['item', /not confirmed/], ['publish', /may have completed/],
+    ['complete', /completion is pending/], ['recorded', /saved locally/], ['unknown', /needs attention/],
+  ] as const) assert.match(view.publicationMessage({state}), expected);
 });

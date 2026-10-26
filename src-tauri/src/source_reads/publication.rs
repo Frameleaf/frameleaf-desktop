@@ -446,11 +446,93 @@ impl Publication {
         Ok(())
     }
 }
+/// Local signed history, not a fresh confirmation of server or original availability.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationStatus {
+    pub resource_key: String,
+    pub original_file_name: String,
+    pub state: String,
+    pub receipt: Option<Receipt>,
+}
+pub(super) fn catalog(
+    root: &Path,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    source: &str,
+    scope: &str,
+    gate: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<PublicationStatus>, String> {
+    gate()?;
+    if !canonical_uuid(source) || !crate::native_runtime::digest_valid(scope, 64) {
+        return Err("source_publication_invalid".into());
+    }
+    if matches!(std::fs::symlink_metadata(root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    let server = normalize_server(&saved.server)?.to_string();
+    let mut entries = Vec::new();
+    visit_directory(root, source, identity, &mut 0, &mut |state| {
+        gate()?;
+        let b = &state.binding;
+        if b.server != server
+            || b.server_id != saved.server_id
+            || b.owner_id != saved.account_id
+            || Some(&b.device_id) != saved.device_id.as_ref()
+            || b.scope != scope
+        {
+            return Err("source_approval_changed".into());
+        }
+        let (phase, target) = if let Some(attempt) = &state.pending {
+            (
+                match attempt.phase {
+                    Phase::Run => "run",
+                    Phase::Item => "item",
+                    Phase::Publish => "publish",
+                    Phase::Complete => "complete",
+                },
+                &attempt.target,
+            )
+        } else {
+            (
+                "recorded",
+                &state
+                    .current
+                    .as_ref()
+                    .ok_or("source_publication_invalid")?
+                    .target,
+            )
+        };
+        entries.push(PublicationStatus {
+            resource_key: b.resource_key.clone(),
+            original_file_name: target.original_file_name.clone(),
+            state: phase.into(),
+            receipt: state
+                .current
+                .as_ref()
+                .map(|current| current.receipt.clone()),
+        });
+        Ok(())
+    })?;
+    gate()?;
+    entries.sort_by(|a, b| a.resource_key.cmp(&b.resource_key));
+    Ok(entries)
+}
 pub(crate) fn validate_directory(
     root: &Path,
     source: &str,
     identity: &DeviceIdentity,
     count: &mut usize,
+) -> Result<(), String> {
+    visit_directory(root, source, identity, count, &mut |_| Ok(()))
+}
+fn visit_directory(
+    root: &Path,
+    source: &str,
+    identity: &DeviceIdentity,
+    count: &mut usize,
+    visit: &mut dyn FnMut(State) -> Result<(), String>,
 ) -> Result<(), String> {
     crate::native_runtime::absolute_directory(root)?;
     let journal = Journal {
@@ -490,6 +572,7 @@ pub(crate) fn validate_directory(
         {
             return Err("source_journal_invalid".into());
         }
+        visit(state)?;
     }
     Ok(())
 }
@@ -609,6 +692,119 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.root.parent().unwrap());
+        }
+    }
+    fn saved(f: &Fixture) -> SavedConnection {
+        SavedConnection {
+            server: f.binding.server.clone(),
+            server_id: f.binding.server_id.clone(),
+            account_id: f.binding.owner_id.clone(),
+            device_id: Some(f.binding.device_id.clone()),
+            token: "synthetic".into(),
+            name: "Synthetic".into(),
+            device_name: "Synthetic".into(),
+            mode: "client-worker".into(),
+        }
+    }
+    #[test]
+    fn catalog_distinguishes_pending_metadata_from_retained_receipts_without_mutation() {
+        let mut f = Fixture::new();
+        f.binding.installation_id = f.identity.installation_id.clone();
+        let read = || {
+            catalog(
+                &f.root,
+                &saved(&f),
+                &f.identity,
+                &f.binding.source_id,
+                &f.binding.scope,
+                &|| Ok(()),
+            )
+        };
+        assert!(read().unwrap().is_empty());
+        assert!(!f.root.exists());
+        let mut p = f.open();
+        assert_eq!(read().unwrap()[0].state, "run");
+        assert!(read().unwrap()[0].receipt.is_none());
+        f.advance_to_publish(&mut p);
+        let before = std::fs::read(f.root.join(&p.name)).unwrap();
+        let entries = read().unwrap();
+        assert_eq!(entries[0].state, "publish");
+        assert_eq!(entries[0].original_file_name, "original.jpg");
+        assert_eq!(entries[0].resource_key, f.binding.resource_key);
+        assert!(entries[0].receipt.is_none());
+        assert_eq!(std::fs::read(f.root.join(&p.name)).unwrap(), before);
+        p.recover_receipt(f.response(&p), &f.identity).unwrap();
+        assert_eq!(read().unwrap()[0].state, "complete");
+        let receipt = read().unwrap()[0].receipt.clone().unwrap();
+        f.complete(&mut p);
+        assert_eq!(read().unwrap()[0].state, "recorded");
+        assert!(read().unwrap()[0].receipt.as_ref() == Some(&receipt));
+        let mut target = f.target.clone();
+        target.version = "e".repeat(64);
+        Publication::begin(&f.root, f.binding.clone(), target, &f.identity).unwrap();
+        assert_eq!(read().unwrap()[0].state, "run");
+        assert!(read().unwrap()[0].receipt.as_ref() == Some(&receipt));
+    }
+    #[test]
+    fn catalog_refuses_foreign_scope_and_unsafe_entries_without_creating_or_editing_records() {
+        let mut f = Fixture::new();
+        f.binding.installation_id = f.identity.installation_id.clone();
+        let p = f.open();
+        let before = std::fs::read(f.root.join(&p.name)).unwrap();
+        for field in ["server", "serverId", "owner", "device", "scope"] {
+            let mut connection = saved(&f);
+            let mut scope = f.binding.scope.clone();
+            match field {
+                "server" => connection.server = "https://other.test/".into(),
+                "serverId" => connection.server_id = "other".into(),
+                "owner" => connection.account_id = uuid::Uuid::new_v4().to_string(),
+                "device" => connection.device_id = Some(uuid::Uuid::new_v4().to_string()),
+                _ => scope = "f".repeat(64),
+            }
+            assert!(
+                catalog(
+                    &f.root,
+                    &connection,
+                    &f.identity,
+                    &f.binding.source_id,
+                    &scope,
+                    &|| Ok(())
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let read = || {
+            catalog(
+                &f.root,
+                &saved(&f),
+                &f.identity,
+                &f.binding.source_id,
+                &f.binding.scope,
+                &|| Ok(()),
+            )
+        };
+        std::fs::write(f.root.join("original"), b"unknown").unwrap();
+        assert!(read().is_err());
+        std::fs::remove_file(f.root.join("original")).unwrap();
+        assert!(catalog(
+            &f.root,
+            &saved(&f),
+            &f.identity,
+            &f.binding.source_id,
+            &f.binding.scope,
+            &|| Err("cancelled".into())
+        )
+        .is_err());
+        assert_eq!(std::fs::read(f.root.join(&p.name)).unwrap(), before);
+        #[cfg(unix)]
+        {
+            let outside = f.root.parent().unwrap().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let link = f.root.join("nested");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(read().is_err());
+            std::fs::remove_file(link).unwrap();
         }
     }
     #[test]
