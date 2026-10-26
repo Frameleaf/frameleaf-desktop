@@ -5,6 +5,7 @@ mod owner;
 mod planner;
 mod preparation;
 mod publication;
+mod transfer;
 use crate::{
     connection::{DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,
@@ -27,6 +28,7 @@ use std::{
         Arc,
     },
 };
+pub use transfer::{TransferApproval, TransferStatus};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -321,10 +323,19 @@ impl Job {
         Ok(())
     }
     fn state(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<State, String> {
+        let state = self.recorded_state(saved, identity)?;
+        state.resource.validate_current(saved, identity)?;
+        Ok(state)
+    }
+    fn recorded_state(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<State, String> {
         self.require_owner()?;
         let state: State = self.journal.read("state.json", identity)?;
         state.validate()?;
-        state.resource.validate_current(saved, identity)?;
+        state.resource.validate_receipt(saved, identity)?;
         if state.resource.source_id() != self.resource.source_id()
             || state.resource.scope_fingerprint() != self.resource.scope_fingerprint()
             || state.resource.resource_key() != self.resource.resource_key()
@@ -2577,6 +2588,163 @@ mod tests {
             copy.sha256
         );
         assert_eq!(job.state(&f.saved, &f.identity).unwrap().read.used, 0);
+    }
+    fn transfer_receipt(f: &Fixture) -> publication::Receipt {
+        publication::Receipt {
+            source_id: f.resource.source_id().into(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            item_id: uuid::Uuid::new_v4().to_string(),
+            asset_id: uuid::Uuid::new_v4().to_string(),
+            owner_id: f.saved.account_id.clone(),
+            server_id: f.saved.server_id.clone(),
+            resource_id: uuid::Uuid::new_v4().to_string(),
+            version: f.resource.version(),
+            sha256: f.resource.sha256.clone(),
+            bytes: f.resource.bytes,
+            published_at: "2026-10-26T12:00:00Z".into(),
+            storage: "reference".into(),
+        }
+    }
+    fn transfer_request(f: &Fixture, state: &str, additional: u64) -> TransferApproval {
+        TransferApproval {
+            source_id: f.resource.source_id().into(),
+            resource_key: f.resource.resource_key(),
+            record_id: "a".repeat(64),
+            state_id: state.into(),
+            additional,
+        }
+    }
+    #[test]
+    fn transfer_approval_is_exact_snapshot_bound_and_preserves_original_read_allowances() {
+        let f = Fixture::new();
+        let job = f.job(0, 6);
+        let receipt = transfer_receipt(&f);
+        let scope = f.resource.scope_fingerprint();
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.stage = Some(f.resource.id.clone());
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        let first = job
+            .transfer_view(&f.saved, &f.identity, &receipt, &scope)
+            .unwrap();
+        assert_eq!(
+            (
+                first.upload_used,
+                first.upload_remaining,
+                first.additional_upload
+            ),
+            (0, 6, 4)
+        );
+        let before = fs::read(job.journal.root.join("state.json")).unwrap();
+        for (expected, additional) in [
+            ("f".repeat(64), 4),
+            (first.state_id.clone(), 0),
+            (first.state_id.clone(), 10),
+        ] {
+            assert!(job
+                .approve_transfer_with(
+                    &f.saved,
+                    &f.identity,
+                    &receipt,
+                    &scope,
+                    &transfer_request(&f, &expected, additional),
+                    &|| Ok(())
+                )
+                .is_err());
+            assert_eq!(
+                fs::read(job.journal.root.join("state.json")).unwrap(),
+                before
+            );
+        }
+        fs::remove_file(f.root.join("source/original.jpg")).unwrap();
+        let approved = job
+            .approve_transfer_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &first.state_id, 4),
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_ne!(approved.state_id, first.state_id);
+        assert_eq!(
+            (
+                approved.read_used,
+                approved.read_remaining,
+                approved.upload_used,
+                approved.upload_remaining,
+                approved.additional_upload
+            ),
+            (0, 0, 0, 10, 0)
+        );
+        assert!(job
+            .approve_transfer_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &first.state_id, 4),
+                &|| Ok(())
+            )
+            .is_err());
+        assert!(job
+            .transfer_view(&f.saved, &f.identity, &receipt, &"f".repeat(64))
+            .is_err());
+        let mut foreign = receipt.clone();
+        foreign.sha256 = "e".repeat(64);
+        assert!(job
+            .transfer_view(&f.saved, &f.identity, &foreign, &scope)
+            .is_err());
+        assert!(!f.root.join("source/original.jpg").exists());
+    }
+    #[test]
+    fn interrupted_transfer_approval_keeps_the_saved_grant_and_rejects_old_snapshot_replay() {
+        let f = Fixture::new();
+        let job = f.job(0, 0);
+        let receipt = transfer_receipt(&f);
+        let scope = f.resource.scope_fingerprint();
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.stage = Some(f.resource.id.clone());
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        let before = fs::read(job.journal.root.join("state.json")).unwrap();
+        let first = job
+            .transfer_view(&f.saved, &f.identity, &receipt, &scope)
+            .unwrap();
+        let gate = || {
+            if fs::read(job.journal.root.join("state.json")).unwrap() != before {
+                Err("source_delivery_interrupted".into())
+            } else {
+                Ok(())
+            }
+        };
+        assert!(job
+            .approve_transfer_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &first.state_id, 10),
+                &gate
+            )
+            .is_err());
+        let saved = job
+            .transfer_view(&f.saved, &f.identity, &receipt, &scope)
+            .unwrap();
+        assert_eq!((saved.upload_remaining, saved.read_remaining), (10, 0));
+        assert!(job
+            .approve_transfer_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &first.state_id, 10),
+                &|| Ok(())
+            )
+            .is_err());
     }
     #[test]
     fn reference_preparation_rejects_rebound_selection_and_parallel_owner() {

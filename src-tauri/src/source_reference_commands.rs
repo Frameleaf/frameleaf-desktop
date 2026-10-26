@@ -272,6 +272,21 @@ pub(crate) async fn pause_photo_reference_publication(
         .await
         .map(source_reads::ReferenceWork::Publish)
 }
+#[tauri::command]
+pub(crate) async fn approve_photo_reference_transfer(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    input: source_reads::TransferApproval,
+) -> Result<source_reads::TransferStatus, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &input.source_id)?;
+    app.state::<source_reads::Requests>()
+        .approve_reference_transfer(import_base(&app)?, saved.clone(), input)
+        .await
+}
 #[cfg(test)]
 mod tests {
     use super::*;

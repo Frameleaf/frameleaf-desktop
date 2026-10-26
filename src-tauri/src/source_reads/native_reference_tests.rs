@@ -404,6 +404,9 @@ fn actual_native_reference_publication() {
         assert!(local.scans.is_empty());
         assert_eq!(local.publications.len(), 1);
         assert_eq!(local.publications[0].state, "recorded");
+        let transfer = local.publications[0].transfer.as_ref().unwrap();
+        assert_eq!((transfer.read_remaining, transfer.upload_remaining), (0, 0));
+        assert!(transfer.cache_recorded);
         assert!(local.publications[0].receipt.is_some());
         assert!(!preparation_root.exists());
         assert!(!source_root.join("original.jpg").exists());
@@ -963,26 +966,63 @@ fn actual_native_reference_publication() {
             read_fixture_message(&mut input)["command"],
             "approve-transfer"
         );
-        let job = Arc::new(
-            Job::resume(
-                &base,
-                &next,
-                &identity,
-                &source,
-                &fresh[0].resource_key,
-                &fresh[0].version,
-            )
-            .unwrap(),
-        );
-        job.approve_additional(&next, &identity, 0, fresh[0].bytes)
+        let approvals = Requests::default();
+        let status = approvals
+            .reference_status(base.clone(), next.clone(), source.clone())
+            .await
+            .unwrap()
             .unwrap();
-        let approved_transfer = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
-        assert_eq!(approved_transfer["read"], json!({"used":0,"limit":0}));
+        approvals.stop().await.unwrap();
+        let published = status
+            .publications
+            .iter()
+            .find(|entry| entry.resource_key == fresh[0].resource_key)
+            .unwrap();
+        let transfer = published.transfer.as_ref().unwrap();
+        let approval = TransferApproval {
+            source_id: source.clone(),
+            resource_key: published.resource_key.clone(),
+            record_id: published.record_id.clone(),
+            state_id: transfer.state_id.clone(),
+            additional: transfer.additional_upload,
+        };
+        assert_eq!(approval.additional, fresh[0].bytes);
+        for wrong in [
+            TransferApproval {
+                record_id: "f".repeat(64),
+                ..approval.clone()
+            },
+            TransferApproval {
+                additional: approval.additional + 1,
+                ..approval.clone()
+            },
+        ] {
+            assert!(approvals
+                .approve_reference_transfer(base.clone(), next.clone(), wrong)
+                .await
+                .is_err());
+            approvals.stop().await.unwrap();
+        }
+        let approved_transfer = approvals
+            .approve_reference_transfer(base.clone(), next.clone(), approval.clone())
+            .await
+            .unwrap();
+        approvals.stop().await.unwrap();
         assert_eq!(
-            approved_transfer["upload"],
-            json!({"used":0,"limit":fresh[0].bytes})
+            (
+                approved_transfer.read_used,
+                approved_transfer.read_remaining,
+                approved_transfer.upload_used,
+                approved_transfer.upload_remaining,
+                approved_transfer.additional_upload
+            ),
+            (0, 0, 0, fresh[0].bytes, 0)
         );
-        drop(job);
+        assert!(approvals
+            .approve_reference_transfer(base.clone(), next.clone(), approval)
+            .await
+            .is_err());
+        approvals.stop().await.unwrap();
         report(
             json!({"phase":"serving-ready","bytes":fresh[0].bytes,"originalReadAllowance":0,"transferAllowance":fresh[0].bytes}),
         );

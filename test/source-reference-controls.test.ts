@@ -8,13 +8,15 @@ import ts from 'typescript';
 const scan = { scanId: 'a'.repeat(64), current: true, abandoned: false, spent: 10, resources: 2, completed: 0, reservedBytes: 10, discardable: false, remaining: 0, nextReadBytes: 10, additionalReadAllowance: 10, canRescan: false, prepared: false };
 const archived = { ...scan, scanId: 'b'.repeat(64), current: false, abandoned: true, discardable: true };
 const status = { sourceId: 'source-a', scans: [scan, archived] };
+const transfer = { resourceKey: 'c'.repeat(64), resourceId: '00000000-0000-4000-8000-000000000001', version: 'd'.repeat(64), stateId: 'e'.repeat(64), bytes: 10, readUsed: 5, readRemaining: 0, uploadUsed: 0, uploadRemaining: 3, additionalUpload: 7, cacheRecorded: true };
+const publication = { resourceKey: transfer.resourceKey, recordId: 'f'.repeat(64), originalFileName: 'original.jpg', state: 'recorded', receipt: { publishedAt: '2026-10-26T12:00:00Z' }, transfer };
 function component() {
   const source = readFileSync(new URL('../src/ReferenceScans.svelte', import.meta.url), 'utf8');
   const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script>'));
   const pending: { name: string; args: Record<string, unknown>; resolve(value: unknown): void; reject(error: unknown): void }[] = [];
   let mount!: () => () => void;
   const exports: Record<string, unknown> = {};
-  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage }; export const current = () => ({ status, message, busy, confirmation });`, {
+  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage, approveTransfer }; export const current = () => ({ status, message, busy, confirmation });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, $state: (value: unknown) => value, $props: () => ({ sourceId: status.sourceId, photos: false }), require: (name: string) => {
@@ -23,13 +25,14 @@ function component() {
     return { invoke: (name: string, args: Record<string, unknown>) => new Promise((resolve, reject) => { pending.push({ name, args, resolve, reject }); }) };
   } });
   return { ...exports, pending, mount: () => mount() } as unknown as {
+    approveTransfer(value: typeof publication): Promise<void>;
     publicationMessage(value: { state: string }): string;
     refresh(): Promise<void>; control(action: string, value: typeof scan): Promise<void>; confirmDiscard(value: typeof scan): void;
     current(): { status: typeof status | null; message: string; busy: boolean; confirmation: string | null };
     pending: typeof pending; mount(): () => void;
   };
 }
-async function loaded(value = status) {
+async function loaded(value: typeof status & { publications?: typeof publication[] } = status) {
   const view = component(); const unmount = view.mount();
   view.pending[0].resolve(value); await setImmediate();
   return { view, unmount };
@@ -99,7 +102,7 @@ test('reference UI commands are permitted only in the packaged local main window
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
   const commands = [...ui.matchAll(/invoke(?:<[^\n]*?>)?\('([^']+)'/g)].map(match => match[1]);
-  assert.equal(commands.length, 9);
+  assert.equal(commands.length, 10);
   for (const command of commands) {
     assert.ok(manifest.includes(`"${command}"`), `${command} must exist in the application ACL manifest`);
     assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`));
@@ -163,4 +166,30 @@ test('publication labels keep interrupted steps separate from retained receipts'
     ['run', /not confirmed/], ['item', /not confirmed/], ['publish', /may have completed/],
     ['complete', /completion is pending/], ['recorded', /saved locally/], ['unknown', /needs attention/],
   ] as const) assert.match(view.publicationMessage({state}), expected);
+});
+
+test('transfer approval binds the publication and exact budget state without granting original reads', async () => {
+ const displayed={...status,publications:[publication]};const {view,unmount}=await loaded(displayed);
+ const call=view.approveTransfer(publication);const request=view.pending[1];assert.equal(request.name,'approve_photo_reference_transfer');
+ assert.deepEqual(JSON.parse(JSON.stringify(request.args)),{input:{sourceId:status.sourceId,resourceKey:publication.resourceKey,recordId:publication.recordId,stateId:transfer.stateId,additional:7}});
+ const approved={...transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0};request.resolve(approved);await call;
+ assert.match(view.current().message,/Transfer allowance saved/);assert.equal(view.pending.length,2);
+ await view.approveTransfer(publication);assert.equal(view.pending.length,2);unmount();
+});
+test('a changed or malformed transfer reply cannot claim a grant or replace displayed history', async () => {
+ for(const change of [{readRemaining:10},{uploadUsed:10},{resourceId:'other'},{stateId:transfer.stateId},{additionalUpload:7}]){
+  const displayed={...status,publications:[publication]};const {view,unmount}=await loaded(displayed);const call=view.approveTransfer(publication);
+  view.pending[1].resolve({...transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0,...change});await call;
+  assert.equal(view.current().status,displayed);assert.doesNotMatch(view.current().message,/Transfer allowance saved/);unmount();
+ }
+});
+test('pending publication or missing cached work cannot receive transfer approval', async () => {
+ for(const value of [{...publication,state:'publish'},{...publication,transfer:{...transfer,cacheRecorded:false}},{...publication,transfer:{...transfer,additionalUpload:0}}]){
+  const {view,unmount}=await loaded({...status,publications:[value]});await view.approveTransfer(value);assert.equal(view.pending.length,1);unmount();
+ }
+});
+test('unmount ignores delayed transfer acknowledgements and errors', async () => {
+ for(const fails of [false,true]){const {view,unmount}=await loaded({...status,publications:[publication]});const call=view.approveTransfer(publication);unmount();const before=view.current();
+ if(fails)view.pending[1].reject('source_transfer_state_changed');else view.pending[1].resolve({...transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0});await call;
+ assert.equal(view.current().status,before.status);assert.equal(view.current().message,before.message);}
 });

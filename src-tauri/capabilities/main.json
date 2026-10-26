@@ -23,6 +23,7 @@
     "allow-reconnect-photo-source",
     "allow-revoke-photo-source",
     "allow-photo-reference-status",
+    "allow-approve-photo-reference-transfer",
     "allow-control-photo-reference",
     "allow-start-photo-reference-read",
     "allow-pause-photo-reference-read",

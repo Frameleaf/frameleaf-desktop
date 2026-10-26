@@ -162,7 +162,7 @@ impl Requests {
             };
             let mut status =
                 Preparation::reference_status(&base, &saved, &identity, &source, &check)?;
-            let publications = super::super::publication::catalog(
+            let mut publications = super::super::publication::catalog(
                 &base.join("photo-reads").join(&source).join("publications"),
                 &saved,
                 &identity,
@@ -170,6 +170,24 @@ impl Requests {
                 &expected_scope,
                 &check,
             )?;
+            for publication in &mut publications {
+                check()?;
+                if publication.state == "recorded" {
+                    if let Some(receipt) = &publication.receipt {
+                        match Job::transfer_status(
+                            &base,
+                            &saved,
+                            &identity,
+                            &publication.resource_key,
+                            receipt,
+                            &expected_scope,
+                        ) {
+                            Ok(transfer) => publication.transfer = Some(transfer),
+                            Err(code) => publication.transfer_error = Some(code),
+                        }
+                    }
+                }
+            }
             if status.is_none() && !publications.is_empty() {
                 status = Some(crate::source_reads::ReferenceStatus {
                     source_id: source.clone(),
@@ -183,6 +201,70 @@ impl Requests {
             check()?;
             Ok(status)
         })
+        .await
+    }
+    pub async fn approve_reference_transfer(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        input: crate::source_reads::TransferApproval,
+    ) -> Result<crate::source_reads::TransferStatus, String> {
+        input.validate()?;
+        self.prepare_owned_checked(
+            input.source_id.clone(),
+            Arc::new(|_| {}),
+            false,
+            move |_, stop| {
+                let identity = crate::credentials::identity()?;
+                let scope = || {
+                    let consent = crate::credentials::load::<crate::source_consent::Consent>(
+                        crate::source_consent::CREDENTIAL,
+                    )?
+                    .ok_or("source_approval_required")?;
+                    if consent.source_id() != input.source_id {
+                        return Err("source_approval_changed".into());
+                    }
+                    consent.reference_metadata_scope(&saved, &identity)
+                };
+                let expected_scope = scope()?;
+                let check = || {
+                    stop()?;
+                    if scope()? != expected_scope {
+                        return Err("source_approval_changed".into());
+                    }
+                    Ok(())
+                };
+                check()?;
+                let _lease = PollLease::acquire(&base, &input.source_id)?;
+                let publication = super::super::publication::Publication::recover(
+                    &base,
+                    &saved,
+                    &identity,
+                    &input.source_id,
+                    expected_scope.clone(),
+                    input.resource_key.clone(),
+                )?;
+                publication.require_record(&input.record_id)?;
+                let receipt = publication.transfer_receipt()?;
+                let job = Job::open_owned(
+                    &base,
+                    &saved,
+                    &identity,
+                    &input.source_id,
+                    &input.resource_key,
+                    &receipt.version,
+                    super::super::OpenMode::Inspect,
+                )?;
+                job.approve_transfer_with(
+                    &saved,
+                    &identity,
+                    receipt,
+                    &expected_scope,
+                    &input,
+                    &check,
+                )
+            },
+        )
         .await
     }
     #[cfg(test)]

@@ -3,7 +3,8 @@
   import { onMount } from 'svelte';
   import ReferenceRead from './ReferenceRead.svelte';
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
-  type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null };
+  type Transfer = { resourceKey: string; resourceId: string; version: string; stateId: string; bytes: number; readUsed: number; readRemaining: number; uploadUsed: number; uploadRemaining: number; additionalUpload: number; cacheRecorded: boolean };
+  type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null; transfer?: Transfer | null; transferError?: string | null };
   type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[] };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
@@ -16,6 +17,9 @@
   let alive = true;
   let serial = 0;
   const errors: Record<string, string> = {
+    source_transfer_state_changed: 'The transfer allowance changed. Refresh before approving it again.',
+    source_transfer_budget_invalid: 'The displayed transfer amount is no longer valid. Refresh the saved record.',
+    source_publication_changed: 'The publication changed. Refresh before approving a transfer.',
     source_cache_cleanup_pending: 'The cache could not be discarded safely. It may belong to source work or need ownership recovery. Retained files and reservations are kept.',
     source_read_already_running: 'Photo-source work is active. Let it finish, then refresh.',
     source_scan_changed: 'The current scan changed. Refresh before choosing another action.',
@@ -61,6 +65,24 @@
       if (!current()) return;
       if (reply && reply.sourceId !== source) throw 'source_approval_changed';
       status = reply;
+    } catch (error) { if (current()) message = explain(error); }
+    finally { if (current()) busy = false; }
+  }
+  async function approveTransfer(publication: Publication) {
+    const previous = publication.transfer;
+    if (busy || reading || !status?.publications?.includes(publication) || publication.state !== 'recorded' || !previous?.cacheRecorded || previous.additionalUpload <= 0) return;
+    const request = ++serial; const source = sourceId;
+    busy = true; message = ''; confirmation = null;
+    const current = () => alive && serial === request && sourceId === source;
+    try {
+      const reply = await invoke<Transfer>('approve_photo_reference_transfer', { input: { sourceId: source, resourceKey: publication.resourceKey, recordId: publication.recordId, stateId: previous.stateId, additional: previous.additionalUpload } });
+      if (!current()) return;
+      if (!reply || reply.resourceKey !== publication.resourceKey || reply.resourceId !== previous.resourceId || reply.version !== previous.version || reply.bytes !== previous.bytes
+        || !/^[a-f0-9]{64}$/.test(reply.stateId) || reply.stateId === previous.stateId
+        || reply.readUsed !== previous.readUsed || reply.readRemaining !== previous.readRemaining || reply.uploadUsed !== previous.uploadUsed
+        || reply.uploadRemaining !== previous.uploadRemaining + previous.additionalUpload || reply.additionalUpload !== 0 || !reply.cacheRecorded) throw 'source_transfer_state_changed';
+      status = { ...status!, publications: status!.publications!.map(value => value === publication ? { ...value, transfer: reply } : value) };
+      message = 'Transfer allowance saved. No original read or transfer was started.';
     } catch (error) { if (current()) message = explain(error); }
     finally { if (current()) busy = false; }
   }
@@ -149,6 +171,16 @@
           <strong>{publication.originalFileName}</strong>
           <p>{publicationMessage(publication)}</p>
           {#if publication.receipt}<p class="footnote">Saved server receipt dated {publication.receipt.publishedAt}.</p>{/if}
+          {#if publication.transfer}
+            <p class="footnote">Original-read allowance used: {size(publication.transfer.readUsed)}. Remaining: {size(publication.transfer.readRemaining)}. Transfer allowance used: {size(publication.transfer.uploadUsed)}. Remaining: {size(publication.transfer.uploadRemaining)}.</p>
+            {#if publication.transfer.cacheRecorded}
+              <p class="footnote">A private cache is recorded; its availability is checked when serving.</p>
+              {#if publication.transfer.additionalUpload > 0}
+                <p class="footnote">Allow one cached-original transfer by adding the displayed deficit. This starts no transfer and adds no original-read allowance.</p>
+                <button class="secondary" disabled={busy || reading} onclick={() => approveTransfer(publication)}>Approve {size(publication.transfer.additionalUpload)} more transfer allowance</button>
+              {/if}
+            {:else}<p class="footnote">No private cache is recorded. Prepare the original again before approving another cached transfer.</p>{/if}
+          {:else if publication.transferError}<p class="footnote">Transfer allowances could not be verified. Saved publication records are kept.</p>{/if}
         </div>
       {/each}
       {#if status.publications.length > visiblePublications}<button class="text-button" disabled={busy || reading} onclick={() => visiblePublications += 20}>Show more publication records</button>{/if}

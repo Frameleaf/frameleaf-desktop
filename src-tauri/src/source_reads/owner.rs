@@ -1015,6 +1015,24 @@ mod tests {
                 .cancelled
                 .load(Ordering::Acquire));
         }
+        assert_eq!(
+            owner
+                .approve_reference_transfer(
+                    PathBuf::new(),
+                    saved.clone(),
+                    crate::source_reads::TransferApproval {
+                        source_id: source.clone(),
+                        resource_key: "c".repeat(64),
+                        record_id: "d".repeat(64),
+                        state_id: "e".repeat(64),
+                        additional: 1
+                    }
+                )
+                .await
+                .err()
+                .as_deref(),
+            Some("source_read_already_running")
+        );
         assert!(owner
             .pause_reference_preparation(&saved, publication.clone())
             .await

@@ -364,6 +364,13 @@ impl Publication {
             json!({"state":"complete","inventoryComplete":true}),
         ))
     }
+    pub(super) fn transfer_receipt(&self) -> Result<&Receipt, String> {
+        if self.state.pending.is_some() {
+            return Err("source_publication_pending".into());
+        }
+        self.receipt()
+            .ok_or("source_publication_not_committed".into())
+    }
     pub(super) fn receipt(&self) -> Option<&Receipt> {
         self.state.current.as_ref().map(|p| &p.receipt)
     }
@@ -470,6 +477,8 @@ pub struct PublicationStatus {
     pub original_file_name: String,
     pub state: String,
     pub receipt: Option<Receipt>,
+    pub transfer: Option<super::TransferStatus>,
+    pub transfer_error: Option<String>,
 }
 pub(super) fn catalog(
     root: &Path,
@@ -525,6 +534,8 @@ pub(super) fn catalog(
             record_id: Publication::record_id(&state)?,
             original_file_name: target.original_file_name.clone(),
             state: phase.into(),
+            transfer: None,
+            transfer_error: None,
             receipt: state
                 .current
                 .as_ref()
