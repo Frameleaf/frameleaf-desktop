@@ -429,6 +429,7 @@ struct Operation {
     epoch: u32,
     started: u64,
     policy: std::sync::Mutex<(std::time::Instant, Option<&'static str>)>,
+    sample: fn() -> crate::resource_policy::Snapshot,
 }
 impl Operation {
     fn check_stop(&self) -> Result<(), String> {
@@ -465,7 +466,7 @@ impl Operation {
         if policy.0.elapsed() >= std::time::Duration::from_secs(1) {
             *policy = (
                 std::time::Instant::now(),
-                crate::resource_policy::sample().refusal(64 * 1024 * 1024),
+                (self.sample)().refusal(64 * 1024 * 1024),
             );
         }
         if let Some(code) = policy.1 {
@@ -579,12 +580,13 @@ impl Job {
         self.journal.write("state.json", &state, identity)
     }
     /// Serves one claimed immutable resource. Acceptance is cache publication, never a backup receipt.
-    pub async fn serve(
+    pub(crate) async fn serve(
         self: Arc<Self>,
         saved: SavedConnection,
         identity: DeviceIdentity,
         mut claim: crate::resource_bridge::ReadClaim,
         cancelled: Arc<AtomicBool>,
+        sample: fn() -> crate::resource_policy::Snapshot,
     ) -> Result<bool, String> {
         let owner = self.begin()?;
         if !claim.matches_resource(&self.resource) {
@@ -601,6 +603,7 @@ impl Job {
             lease: std::sync::atomic::AtomicU64::new(claim.lease_expiry()?),
             epoch: claim.authorization_epoch(),
             started: crate::resource_bridge::now()?,
+            sample,
             policy: std::sync::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(2),
                 Some("network_unknown"),
@@ -3001,7 +3004,8 @@ mod tests {
                     f.saved.clone(),
                     identity(),
                     claim,
-                    Arc::new(AtomicBool::new(true))
+                    Arc::new(AtomicBool::new(true)),
+                    crate::resource_policy::sample
                 )
                 .await
                 .unwrap_err(),
@@ -3016,7 +3020,8 @@ mod tests {
                     f.saved.clone(),
                     identity(),
                     claim,
-                    Arc::new(AtomicBool::new(false))
+                    Arc::new(AtomicBool::new(false)),
+                    crate::resource_policy::sample
                 )
                 .await
                 .unwrap_err(),
@@ -3049,6 +3054,7 @@ mod tests {
                 epoch: 1,
                 started: crate::resource_bridge::now().unwrap(),
                 policy: std::sync::Mutex::new((std::time::Instant::now(), None)),
+                sample: crate::resource_policy::sample,
             });
             let mut claim:crate::resource_bridge::ReadClaim=serde_json::from_value(serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"sourceId":f.resource.source_id(),"scopeFingerprint":f.resource.scope_fingerprint(),"authorizationEpoch":1,"resourceKey":f.resource.resource_key(),"version":f.resource.version(),"sha256":f.resource.sha256,"bytes":10,"claimFence":1,"claimToken":"a".repeat(64),"leaseUntil":"2026-10-22T00:01:00Z","deadline":"2026-10-22T00:05:00Z"})).unwrap();
             let result = keep_alive(&operation, &mut claim, async {

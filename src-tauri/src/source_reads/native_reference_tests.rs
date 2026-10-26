@@ -882,6 +882,148 @@ fn actual_native_reference_publication() {
         report(
             json!({"phase":"rescanned","receipt":replacement,"explicitReadSpent":prepared.spent,"remaining":prepared.remaining,"oldReadAndUploadAllowancesUnchanged":true,"newReadAndUploadAllowancesZero":true}),
         );
+        assert_eq!(
+            read_fixture_message(&mut input)["command"],
+            "serve-original"
+        );
+        let job = Job::resume(
+            &base,
+            &next,
+            &identity,
+            &source,
+            &fresh[0].resource_key,
+            &fresh[0].version,
+        )
+        .unwrap();
+        let job = Arc::new(job);
+        let unapproved = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
+        assert_eq!(unapproved["read"], json!({"used":0,"limit":0}));
+        assert_eq!(unapproved["upload"], json!({"used":0,"limit":0}));
+        drop(job);
+        crate::resource_bridge::issue_grant(
+            &next,
+            &identity,
+            &source,
+            &reconnected
+                .reference_metadata_scope(&next, &identity)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        report(json!({"phase":"serving-unapproved-ready","bytes":fresh[0].bytes}));
+        assert_eq!(
+            read_fixture_message(&mut input)["command"],
+            "start-unapproved-serving"
+        );
+        let denied = Requests::default();
+        let (send, mut receive) = tokio::sync::watch::channel(View::default());
+        denied
+            .start_for_test(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                Arc::new(move |view| {
+                    send.send_replace(view);
+                }),
+                allowed_preparation_policy,
+            )
+            .await
+            .unwrap();
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            receive.wait_for(|view| view.state == "needs-attention"),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            refusal.code.as_deref(),
+            Some("source_upload_budget_exhausted")
+        );
+        denied.stop().await.unwrap();
+        let job = Job::resume(
+            &base,
+            &next,
+            &identity,
+            &source,
+            &fresh[0].resource_key,
+            &fresh[0].version,
+        )
+        .unwrap();
+        let unchanged = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
+        assert_eq!(unchanged["read"], json!({"used":0,"limit":0}));
+        assert_eq!(unchanged["upload"], json!({"used":0,"limit":0}));
+        assert_eq!(unchanged["stage"], unapproved["stage"]);
+        drop(job);
+        report(
+            json!({"phase":"serving-blocked","additionalOriginalReads":0,"transferUsed":0,"cacheRetained":true}),
+        );
+        assert_eq!(
+            read_fixture_message(&mut input)["command"],
+            "approve-transfer"
+        );
+        let job = Arc::new(
+            Job::resume(
+                &base,
+                &next,
+                &identity,
+                &source,
+                &fresh[0].resource_key,
+                &fresh[0].version,
+            )
+            .unwrap(),
+        );
+        job.approve_additional(&next, &identity, 0, fresh[0].bytes)
+            .unwrap();
+        let approved_transfer = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
+        assert_eq!(approved_transfer["read"], json!({"used":0,"limit":0}));
+        assert_eq!(
+            approved_transfer["upload"],
+            json!({"used":0,"limit":fresh[0].bytes})
+        );
+        drop(job);
+        report(
+            json!({"phase":"serving-ready","bytes":fresh[0].bytes,"originalReadAllowance":0,"transferAllowance":fresh[0].bytes}),
+        );
+        assert_eq!(read_fixture_message(&mut input)["command"], "start-serving");
+        let serving = Requests::default();
+        serving
+            .start_for_test(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                Arc::new(|_| {}),
+                allowed_preparation_policy,
+            )
+            .await
+            .unwrap();
+        report(json!({"phase":"serving-started"}));
+        assert_eq!(read_fixture_message(&mut input)["command"], "stop-serving");
+        serving.stop().await.unwrap();
+        assert!(!serving.is_active());
+        let job = Job::resume(
+            &base,
+            &next,
+            &identity,
+            &source,
+            &fresh[0].resource_key,
+            &fresh[0].version,
+        )
+        .unwrap();
+        let transferred = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
+        assert_eq!(transferred["read"], json!({"used":0,"limit":0}));
+        assert_eq!(
+            transferred["upload"],
+            json!({"used":fresh[0].bytes,"limit":fresh[0].bytes})
+        );
+        assert!(transferred["stage"].is_null());
+        assert_eq!(fs::read(source_root.join("original.jpg")).unwrap(), edited);
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
+        drop(job);
+        report(
+            json!({"phase":"served-original","bytes":fresh[0].bytes,"additionalOriginalReads":0,"transferUsed":fresh[0].bytes,"workerStopped":true,"sourceAndPriorCacheRetained":true}),
+        );
         assert_eq!(read_fixture_message(&mut input)["command"], "forget");
         crate::source_consent::forget_reference(&source, &next, &identity).unwrap();
         credentials::delete(CREDENTIAL).unwrap();

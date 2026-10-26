@@ -352,7 +352,31 @@ impl Requests {
             return Err("source_read_request_invalid".into());
         }
         self.install(source.clone(), notify, move |progress, signal| {
-            run(base, saved, source, progress, signal)
+            run(
+                base,
+                saved,
+                source,
+                progress,
+                signal,
+                crate::resource_policy::sample,
+            )
+        })
+        .await
+    }
+    #[cfg(test)]
+    pub(in crate::source_reads) async fn start_for_test(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        source: String,
+        notify: Arc<dyn Fn(View) + Send + Sync>,
+        sample: fn() -> crate::resource_policy::Snapshot,
+    ) -> Result<View, String> {
+        if !super::canonical_uuid(&source) {
+            return Err("source_read_request_invalid".into());
+        }
+        self.install(source.clone(), notify, move |progress, signal| {
+            run(base, saved, source, progress, signal, sample)
         })
         .await
     }
@@ -463,6 +487,7 @@ async fn run(
     source: String,
     progress: Progress,
     mut signal: Signal,
+    sample: fn() -> crate::resource_policy::Snapshot,
 ) -> Result<(), String> {
     let initial_base = base.clone();
     let initial_saved = saved.clone();
@@ -486,10 +511,7 @@ async fn run(
         let (identity, refusal) = tauri::async_runtime::spawn_blocking(move || {
             current_lease.check()?;
             let identity = authority(&current_base, &current_saved, &current_source)?;
-            Ok::<_, String>((
-                identity,
-                crate::resource_policy::sample().refusal(64 * 1024 * 1024),
-            ))
+            Ok::<_, String>((identity, sample().refusal(64 * 1024 * 1024)))
         })
         .await
         .map_err(|_| "source_read_shutdown_unconfirmed")??;
@@ -544,8 +566,14 @@ async fn run(
                     break;
                 }
                 progress.set("serving", None);
-                job.serve(saved.clone(), identity, claim, signal.cancelled.clone())
-                    .await?;
+                job.serve(
+                    saved.clone(),
+                    identity,
+                    claim,
+                    signal.cancelled.clone(),
+                    sample,
+                )
+                .await?;
             }
         }
         if signal
