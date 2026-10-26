@@ -17,6 +17,11 @@ pub struct ScanStatus {
     pub completed: usize,
     pub reserved_bytes: u64,
     pub discardable: bool,
+    pub remaining: u64,
+    pub next_read_bytes: Option<u64>,
+    pub additional_read_allowance: u64,
+    pub can_rescan: bool,
+    pub prepared: bool,
 }
 impl Preparation {
     pub fn reference_status(
@@ -119,6 +124,16 @@ impl Preparation {
             resources: plan.count(),
             completed: state.position(),
             reserved_bytes,
+            remaining: if state.abandoned {
+                0
+            } else {
+                state.read.limit - state.read.used
+            },
+            next_read_bytes: state.next_read_bytes(plan)?,
+            additional_read_allowance: state.additional_read_allowance(plan)?,
+            can_rescan: expected == self.plan_hash
+                && (state.abandoned || state.position() == plan.count()),
+            prepared: !state.abandoned && state.position() == plan.count(),
             discardable: state.abandoned
                 && reserved_bytes > 0
                 && state.handoff_started != Some(true)

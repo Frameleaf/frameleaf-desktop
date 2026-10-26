@@ -1142,6 +1142,132 @@ mod tests {
         }
     }
     #[test]
+    fn scan_allowance_approval_is_exact_stale_safe_and_cannot_double_grant() {
+        let f = Fixture::new();
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        let scan = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+        fs::remove_file(f.approval.root().join("original.jpg")).unwrap();
+        for (expected, additional) in [(&"f".repeat(64), 10), (&scan, 9), (&scan, 11), (&scan, 0)] {
+            assert!(prep
+                .approve_scan_with(&f.saved, &f.identity, expected, additional)
+                .is_err());
+            assert_eq!(prep.view(&f.saved, &f.identity).unwrap().remaining, 0);
+        }
+        prep.approve_scan_with(&f.saved, &f.identity, &scan, 10)
+            .unwrap();
+        assert!(prep
+            .approve_scan_with(&f.saved, &f.identity, &scan, 10)
+            .is_err());
+        assert_eq!(
+            (
+                prep.view(&f.saved, &f.identity).unwrap().spent,
+                prep.view(&f.saved, &f.identity).unwrap().remaining
+            ),
+            (0, 10)
+        );
+        let status = prep
+            .reference_status_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        assert_eq!(status.scans[0].next_read_bytes, Some(10));
+        assert_eq!(status.scans[0].additional_read_allowance, 0);
+        assert!(!status.scans[0].can_rescan);
+        prep.abandon_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+            .unwrap();
+        assert!(prep
+            .approve_scan_with(&f.saved, &f.identity, &scan, 10)
+            .is_err());
+        let status = prep
+            .reference_status_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        assert!(status.scans[0].can_rescan);
+        assert_eq!(
+            (
+                status.scans[0].remaining,
+                status.scans[0].additional_read_allowance
+            ),
+            (0, 0)
+        );
+        let fresh = prep
+            .rescan_with(&f.saved, &f.identity, vec![entry], &scan, &|| Ok(()))
+            .unwrap();
+        assert!(prep
+            .approve_scan_with(&f.saved, &f.identity, &scan, 10)
+            .is_err());
+        prep.approve_with(&f.saved, &f.identity, 4).unwrap();
+        assert!(prep
+            .approve_scan_with(&f.saved, &f.identity, &fresh.scan_id, 10)
+            .is_err());
+        prep.approve_scan_with(&f.saved, &f.identity, &fresh.scan_id, 6)
+            .unwrap();
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().remaining, 10);
+        assert_eq!(prep.view(&f.saved, &f.identity).unwrap().spent, 0);
+        assert!(fs::read_dir(prep.journal.root.join("stage"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+    #[test]
+    fn pending_cache_recovery_does_not_recommend_or_grant_another_original_read() {
+        let f = Fixture::new();
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            },
+            true,
+        )
+        .unwrap();
+        let scan = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+        prep.approve_scan_with(&f.saved, &f.identity, &scan, 10)
+            .unwrap();
+        let copy = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let mut state: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        state["resource"] = serde_json::Value::Null;
+        prep.journal
+            .write("preparation-state.json", &state, &f.identity)
+            .unwrap();
+        let status = prep
+            .reference_status_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        assert_eq!(status.scans[0].next_read_bytes, None);
+        assert_eq!(status.scans[0].additional_read_allowance, 0);
+        assert!(prep
+            .approve_scan_with(&f.saved, &f.identity, &scan, 10)
+            .is_err());
+        let restored = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(restored.id, copy.id);
+        assert_eq!(
+            (
+                prep.view(&f.saved, &f.identity).unwrap().spent,
+                prep.view(&f.saved, &f.identity).unwrap().remaining
+            ),
+            (10, 0)
+        );
+    }
+    #[test]
     fn reference_status_lists_reserved_abandoned_scans_without_opening_originals() {
         let f = Fixture::new();
         let entry = crate::photo_sources::SourceFile {

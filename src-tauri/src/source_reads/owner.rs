@@ -610,6 +610,50 @@ mod tests {
             .stop
             .cancelled
             .load(Ordering::Acquire));
+        let source = uuid::Uuid::new_v4().to_string();
+        let saved = SavedConnection {
+            server: "https://server.test/".into(),
+            server_id: "server".into(),
+            account_id: "owner".into(),
+            name: "Synthetic".into(),
+            token: "synthetic".into(),
+            device_name: "Synthetic".into(),
+            mode: "client-worker".into(),
+            device_id: Some("device".into()),
+        };
+        for action in [
+            PreparationAction::RescanSelected {
+                expected_scan: "a".repeat(64),
+            },
+            PreparationAction::ApproveRead {
+                expected_scan: "a".repeat(64),
+                additional: 10,
+            },
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                owner.prepare_reference(
+                    PathBuf::new(),
+                    saved.clone(),
+                    source.clone(),
+                    action,
+                    notify(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.err().as_deref(), Some("source_read_already_running"));
+            assert!(!owner
+                .owner
+                .lock()
+                .await
+                .running
+                .as_ref()
+                .unwrap()
+                .stop
+                .cancelled
+                .load(Ordering::Acquire));
+        }
         finish.send(()).unwrap();
         owner.stop().await.unwrap();
     }

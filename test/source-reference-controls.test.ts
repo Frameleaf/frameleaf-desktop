@@ -5,7 +5,7 @@ import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
 
-const scan = { scanId: 'a'.repeat(64), current: true, abandoned: false, spent: 10, resources: 2, completed: 0, reservedBytes: 10, discardable: false };
+const scan = { scanId: 'a'.repeat(64), current: true, abandoned: false, spent: 10, resources: 2, completed: 0, reservedBytes: 10, discardable: false, remaining: 0, nextReadBytes: 10, additionalReadAllowance: 10, canRescan: false, prepared: false };
 const archived = { ...scan, scanId: 'b'.repeat(64), current: false, abandoned: true, discardable: true };
 const status = { sourceId: 'source-a', scans: [scan, archived] };
 function component() {
@@ -28,9 +28,9 @@ function component() {
     pending: typeof pending; mount(): () => void;
   };
 }
-async function loaded() {
+async function loaded(value = status) {
   const view = component(); const unmount = view.mount();
-  view.pending[0].resolve(status); await setImmediate();
+  view.pending[0].resolve(value); await setImmediate();
   return { view, unmount };
 }
 test('reference status is source-bound and refresh grants no original access', async () => {
@@ -88,7 +88,7 @@ test('a newer refresh supersedes an older snapshot', async () => {
 });
 test('unknown controls, stale scan objects and job-owned caches cannot invoke native mutations', async () => {
   const { view, unmount } = await loaded();
-  for (const action of ['read', 'rescan', 'publish', 'start']) await view.control(action, scan);
+  for (const action of ['read', 'select', 'publish', 'start']) await view.control(action, scan);
   await view.control('abandon', { ...scan }); view.confirmDiscard(scan); await view.control('discard', scan);
   assert.equal(view.pending.length, 1); unmount();
 });
@@ -105,4 +105,52 @@ test('reference UI commands are permitted only in the packaged local main window
   }
   assert.deepEqual(capability.windows, ['main']); assert.equal(capability.local, true);
   assert.equal('remote' in capability, false);
+});
+
+test('rescan preserves selected scope and accepts only a fresh zero-allowance scan', async () => {
+  for (const valid of [false,true]) {
+    const row = {...scan,completed:2,prepared:true,canRescan:true};
+    const displayed = {...status,scans:[row,archived]};
+    const {view,unmount}=await loaded(displayed);
+    const work=view.control('rescan',row);
+    assert.equal(view.pending[1].args.action,'rescan');
+    assert.equal('relatives' in view.pending[1].args,false);
+    assert.equal('additional' in view.pending[1].args,false);
+    const reply={...status,scans:[{...scan,scanId:valid?'c'.repeat(64):scan.scanId,spent:0}]};
+    view.pending[1].resolve(reply);await work;
+    assert.equal(view.current().status,valid?reply:displayed);unmount();
+  }
+});
+test('read approval sends the exact displayed amount without executing reads or uploads',async()=>{
+  const {view,unmount}=await loaded();
+  const work=view.control('approve-read',scan);
+  assert.equal(view.pending[1].args.action,'approve-read');
+  assert.equal(view.pending[1].args.additional,10);
+  assert.equal(view.pending[1].args.expectedScan,scan.scanId);
+  const reply={...status,scans:[{...scan,remaining:10,additionalReadAllowance:0},archived]};
+  view.pending[1].resolve(reply);await work;
+  assert.equal(view.current().status,reply);assert.equal(view.pending.length,2);
+  await view.control('approve-read',reply.scans[0]);assert.equal(view.pending.length,2);unmount();
+});
+test('incomplete scans cannot rescan and archived scans cannot receive new read authority',async()=>{
+  const {view,unmount}=await loaded();
+  await view.control('rescan',scan);await view.control('approve-read',archived);
+  assert.equal(view.pending.length,1);unmount();
+});
+test('new preparation replies cannot revive an unmounted source',async()=>{
+  for(const action of ['rescan','approve-read']) for(const fails of [false,true]){
+    const row=action==='rescan'?{...scan,completed:2,prepared:true,canRescan:true}:scan;
+    const {view,unmount}=await loaded({...status,scans:[row,archived]});
+    const work=view.control(action,row);unmount();const before=view.current();
+    if(fails)view.pending[1].reject('source_photo_session_changed');
+    else view.pending[1].resolve({...status,scans:[{...scan,remaining:10,additionalReadAllowance:0}]});
+    await work;assert.equal(view.current().status,before.status);assert.equal(view.current().message,before.message);
+  }
+});
+
+test('a retained pending cache cannot request another original-read grant',async()=>{
+  const row={...scan,nextReadBytes:null,additionalReadAllowance:0,reservedBytes:10};
+  const {view,unmount}=await loaded({...status,scans:[row,archived]});
+  await view.control('approve-read',row);
+  assert.equal(view.pending.length,1);unmount();
 });

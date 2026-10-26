@@ -293,14 +293,18 @@ fn actual_native_reference_publication() {
             json!({"phase":"reconnected","receipt":receipt,"readAndUploadAllowancesUnchanged":true}),
         );
         assert_eq!(read_fixture_message(&mut input)["command"], "rescan");
+        fs::write(
+            source_root.join("not-selected.jpg"),
+            b"not part of the selected scope",
+        )
+        .unwrap();
         let scan_owner = Requests::default();
         let scan = scan_owner
             .prepare_reference(
                 base.clone(),
                 next.clone(),
                 source.clone(),
-                PreparationAction::Rescan {
-                    relatives: vec!["original.jpg".into()],
+                PreparationAction::RescanSelected {
                     expected_scan: first_scan.clone(),
                 },
                 Arc::new(|_| {}),
@@ -316,10 +320,26 @@ fn actual_native_reference_publication() {
             .unwrap()
             .remaining()
             .unwrap();
-        let mut pending = Preparation::resume(&base, &next, &identity, &source).unwrap();
-        pending
-            .approve(&next, &identity, edited.len() as u64)
+        assert_eq!(scan.resources, 1);
+        let approved = scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::ApproveRead {
+                    expected_scan: scan.scan_id.clone(),
+                    additional: edited.len() as u64,
+                },
+                Arc::new(|_| {}),
+            )
+            .await
             .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert_eq!(
+            (approved.spent, approved.remaining),
+            (0, edited.len() as u64)
+        );
+        let pending = Preparation::resume(&base, &next, &identity, &source).unwrap();
         let staged = pending
             .stage_with(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
             .unwrap();
@@ -439,8 +459,7 @@ fn actual_native_reference_publication() {
                 base.clone(),
                 next.clone(),
                 source.clone(),
-                PreparationAction::Rescan {
-                    relatives: vec!["original.jpg".into()],
+                PreparationAction::RescanSelected {
                     expected_scan: ended.scan_id.clone(),
                 },
                 Arc::new(|_| {}),
@@ -469,9 +488,62 @@ fn actual_native_reference_publication() {
         assert!(preparation
             .stage_and_handoff(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
             .is_err());
-        preparation
-            .approve(&next, &identity, edited.len() as u64)
+        drop(preparation);
+        assert_eq!(
+            scan_owner
+                .prepare_reference(
+                    base.clone(),
+                    next.clone(),
+                    source.clone(),
+                    PreparationAction::ApproveRead {
+                        expected_scan: scan.scan_id.clone(),
+                        additional: edited.len() as u64
+                    },
+                    Arc::new(|_| {})
+                )
+                .await
+                .err()
+                .as_deref(),
+            Some("source_scan_changed")
+        );
+        scan_owner.stop().await.unwrap();
+        let approved = scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::ApproveRead {
+                    expected_scan: restarted.scan_id.clone(),
+                    additional: edited.len() as u64,
+                },
+                Arc::new(|_| {}),
+            )
+            .await
             .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert_eq!(
+            (approved.spent, approved.remaining),
+            (0, edited.len() as u64)
+        );
+        assert_eq!(
+            scan_owner
+                .prepare_reference(
+                    base.clone(),
+                    next.clone(),
+                    source.clone(),
+                    PreparationAction::ApproveRead {
+                        expected_scan: restarted.scan_id.clone(),
+                        additional: edited.len() as u64
+                    },
+                    Arc::new(|_| {})
+                )
+                .await
+                .err()
+                .as_deref(),
+            Some("source_read_budget_invalid")
+        );
+        scan_owner.stop().await.unwrap();
+        let mut preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
         let prepared = preparation
             .stage_and_handoff(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
             .unwrap();

@@ -13,6 +13,13 @@ pub enum PreparationAction {
         additional: u64,
     },
     Reconcile,
+    RescanSelected {
+        expected_scan: String,
+    },
+    ApproveRead {
+        expected_scan: String,
+        additional: u64,
+    },
     Discard {
         expected_scan: String,
     },
@@ -26,7 +33,6 @@ pub enum PreparationAction {
 }
 impl Requests {
     /// Uses the same application owner drained by source revocation, sign-out and quit.
-    /// The reference controls remain hidden until publication and recovery are connected.
     pub async fn prepare_reference(
         &self,
         base: PathBuf,
@@ -39,7 +45,11 @@ impl Requests {
             return Err("source_read_request_invalid".into());
         }
         let selected_source = source.clone();
-        self.prepare_owned(source, notify, move |cancelled, stop| {
+        let replace = !matches!(
+            &action,
+            PreparationAction::RescanSelected { .. } | PreparationAction::ApproveRead { .. }
+        );
+        self.prepare_owned_checked(source, notify, replace, move |cancelled, stop| {
             stop()?;
             let identity = if matches!(
                 &action,
@@ -72,6 +82,20 @@ impl Requests {
                     &expected_scan,
                     stop,
                 ),
+                PreparationAction::RescanSelected { expected_scan } => {
+                    Preparation::resume(&base, &saved, &identity, &selected_source)?
+                        .rescan_selected(&saved, &identity, &expected_scan, stop)
+                }
+                PreparationAction::ApproveRead {
+                    expected_scan,
+                    additional,
+                } => {
+                    let mut preparation =
+                        Preparation::resume(&base, &saved, &identity, &selected_source)?;
+                    stop()?;
+                    preparation.approve_scan(&saved, &identity, &expected_scan, additional)?;
+                    preparation.view(&saved, &identity)
+                }
                 PreparationAction::Discard { expected_scan } => {
                     Preparation::resume_control(&base, &saved, &identity, &selected_source)?
                         .discard(&saved, &identity, &expected_scan, stop)
@@ -130,6 +154,7 @@ impl Requests {
         })
         .await
     }
+    #[cfg(test)]
     pub(super) async fn prepare_owned<F>(
         &self,
         source: String,

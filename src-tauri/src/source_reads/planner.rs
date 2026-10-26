@@ -494,6 +494,19 @@ impl Preparation {
         self.total_bytes = next.total;
         self.view(saved, identity)
     }
+    pub fn rescan_selected(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<PreparationView, String> {
+        let relatives = std::iter::once(&self.plan.entry)
+            .chain(&self.plan.additional)
+            .map(|entry| entry.relative.clone())
+            .collect::<Vec<_>>();
+        self.rescan(saved, identity, &relatives, expected, gate)
+    }
     #[cfg(test)]
     pub(super) fn rescan_with(
         &mut self,
@@ -546,6 +559,33 @@ impl Preparation {
         additional: u64,
     ) -> Result<(), String> {
         self.current(saved, identity)?;
+        self.approve_with(saved, identity, additional)
+    }
+    pub fn approve_scan(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+        additional: u64,
+    ) -> Result<(), String> {
+        self.current(saved, identity)?;
+        self.approve_scan_with(saved, identity, expected, additional)
+    }
+    pub(super) fn approve_scan_with(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+        additional: u64,
+    ) -> Result<(), String> {
+        let state = self.progress(saved, identity)?;
+        if expected != self.plan_hash {
+            return Err("source_scan_changed".into());
+        }
+        let needed = state.additional_read_allowance(&self.plan)?;
+        if needed == 0 || additional != needed {
+            return Err("source_read_budget_invalid".into());
+        }
         self.approve_with(saved, identity, additional)
     }
     pub(super) fn approve_with(

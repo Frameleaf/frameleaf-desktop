@@ -60,6 +60,18 @@ impl Plan {
     }
 }
 impl Progress {
+    pub(super) fn next_read_bytes(&self, plan: &Plan) -> Result<Option<u64>, String> {
+        if self.abandoned || self.attempt.is_some() || self.position() == plan.count() {
+            return Ok(None);
+        }
+        Ok(Some(plan.entry_at(self.position())?.bytes))
+    }
+    pub(super) fn additional_read_allowance(&self, plan: &Plan) -> Result<u64, String> {
+        Ok(self
+            .next_read_bytes(plan)?
+            .map(|bytes| bytes.saturating_sub(self.read.limit - self.read.used))
+            .unwrap_or(0))
+    }
     pub(super) fn reservation(&self, plan: &Plan) -> Result<u64, String> {
         if let Some(bytes) = self.attempt_bytes {
             if !plan.export

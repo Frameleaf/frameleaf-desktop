@@ -4,6 +4,8 @@ use crate::*;
 pub(crate) enum ReferenceControl {
     Abandon,
     Discard,
+    Rescan,
+    ApproveRead,
 }
 
 pub(crate) fn require_reference_source(
@@ -42,15 +44,26 @@ pub(crate) async fn control_photo_reference(
     source_id: String,
     expected_scan: String,
     action: ReferenceControl,
+    additional: Option<u64>,
 ) -> Result<Option<source_reads::ReferenceStatus>, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     require_reference_source(saved, &source_id)?;
     let reads = app.state::<source_reads::Requests>();
+    if additional.is_some() && !matches!(&action, ReferenceControl::ApproveRead) {
+        return Err("source_read_request_invalid".into());
+    }
     let action = match action {
         ReferenceControl::Abandon => source_reads::PreparationAction::Abandon { expected_scan },
         ReferenceControl::Discard => source_reads::PreparationAction::Discard { expected_scan },
+        ReferenceControl::Rescan => {
+            source_reads::PreparationAction::RescanSelected { expected_scan }
+        }
+        ReferenceControl::ApproveRead => source_reads::PreparationAction::ApproveRead {
+            expected_scan,
+            additional: additional.ok_or("source_read_budget_required")?,
+        },
     };
     reads
         .prepare_reference(
@@ -71,11 +84,11 @@ pub(crate) async fn control_photo_reference(
 mod tests {
     use super::*;
     #[test]
-    fn metadata_controls_cannot_grant_reads_uploads_or_change_scope() {
-        for action in ["abandon", "discard"] {
+    fn reference_controls_cannot_execute_reads_uploads_or_select_paths() {
+        for action in ["abandon", "discard", "rescan", "approve-read"] {
             assert!(serde_json::from_value::<ReferenceControl>(serde_json::json!(action)).is_ok());
         }
-        for action in ["read", "rescan", "publish", "approve", "start", "resume"] {
+        for action in ["read", "publish", "approve", "start", "resume", "selection"] {
             assert!(serde_json::from_value::<ReferenceControl>(serde_json::json!(action)).is_err());
         }
     }

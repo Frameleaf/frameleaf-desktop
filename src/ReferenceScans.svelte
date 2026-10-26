@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
-  type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean };
+  type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
   type ReferenceStatus = { sourceId: string; scans: Scan[] };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
@@ -16,6 +16,12 @@
     source_read_already_running: 'Photo-source work is active. Let it finish, then refresh.',
     source_scan_changed: 'The current scan changed. Refresh before choosing another action.',
     source_scan_not_abandoned: 'Abandon this scan before discarding its unfinished cache.',
+    source_preparation_incomplete: 'Finish or abandon the current scan before scanning the same selection again.',
+    source_read_budget_invalid: 'The displayed read allowance changed. Refresh before approving it again.',
+    source_item_unavailable: 'A selected original is unavailable. Reconnect its source before rescanning; saved progress is kept.',
+    photos_permission_required: 'Photos access is unavailable. Restore access before rescanning; saved progress is kept.',
+    photos_scope_changed: 'An exact approved Photos resource is no longer available. Saved progress is kept; select it again before granting a new scope.',
+
     source_journal_invalid: 'Saved scan records could not be verified. Retained files and reservations are kept.',
     source_input_budget_invalid: 'Saved staging reservations could not be verified. Retained files are kept.',
     source_input_budget_untracked: 'Staged data needs ownership recovery. Retained files are kept.',
@@ -49,17 +55,33 @@
   }
   async function control(action: string, scan: Scan) {
     if (busy || !status?.scans.includes(scan)) return;
-    if (action === 'abandon' ? !scan.current || scan.abandoned : action !== 'discard' || !scan.abandoned || !scan.discardable || confirmation !== scan.scanId) return;
+    if (action === 'abandon') { if (!scan.current || scan.abandoned) return; }
+    else if (action === 'discard') { if (!scan.abandoned || !scan.discardable || confirmation !== scan.scanId) return; }
+    else if (action === 'rescan') { if (!scan.current || !scan.canRescan) return; }
+    else if (action === 'approve-read') { if (!scan.current || scan.abandoned || scan.additionalReadAllowance <= 0) return; }
+    else return;
     const request = ++serial; const source = sourceId;
     busy = true; message = ''; confirmation = null;
     const current = () => alive && serial === request && sourceId === source;
     try {
-      const reply = await invoke<ReferenceStatus | null>('control_photo_reference', { sourceId: source, expectedScan: scan.scanId, action });
+      const reply = await invoke<ReferenceStatus | null>('control_photo_reference', { sourceId: source, expectedScan: scan.scanId, action, ...(action === 'approve-read' ? { additional: scan.additionalReadAllowance } : {}) });
       if (!current()) return;
-      const updated = reply?.sourceId === source ? reply.scans.find(value => value.scanId === scan.scanId) : null;
-      if (!updated?.abandoned || (action === 'discard' && (updated.reservedBytes !== 0 || updated.discardable))) throw 'source_cache_cleanup_pending';
+      if (!reply || reply.sourceId !== source) throw 'source_approval_changed';
+      if (action === 'rescan') {
+        const fresh = reply.scans.find(value => value.current);
+        if (!fresh || fresh.scanId === scan.scanId || fresh.abandoned || fresh.spent !== 0 || fresh.remaining !== 0) throw 'source_scan_changed';
+        message = 'Selection rescanned. No new reads were approved or started.';
+      } else {
+        const updated = reply.scans.find(value => value.scanId === scan.scanId);
+        if (action === 'approve-read') {
+          if (!updated?.current || updated.abandoned || updated.spent !== scan.spent || updated.additionalReadAllowance !== 0 || updated.remaining < (scan.nextReadBytes ?? 0)) throw 'source_read_budget_invalid';
+          message = 'Allowance saved. No original read or upload was started.';
+        } else {
+          if (!updated?.abandoned || (action === 'discard' && (updated.reservedBytes !== 0 || updated.discardable))) throw 'source_cache_cleanup_pending';
+          message = action === 'discard' ? 'Cache discarded. Spent allowances, source originals and server photos are kept.' : 'Scan abandoned. Its remaining allowance cannot be used; retained cache is kept.';
+        }
+      }
       status = reply;
-      message = action === 'discard' ? 'Cache discarded. Spent allowances, source originals and server photos are kept.' : 'Scan abandoned. Its remaining allowance cannot be used; retained cache is kept.';
     } catch (error) { if (current()) message = explain(error); }
     finally { if (current()) busy = false; }
   }
@@ -78,6 +100,20 @@
         <strong>{scan.current ? 'Current scan' : 'Earlier abandoned scan'}{scan.current && scan.abandoned ? ' · abandoned' : ''}</strong>
         <p>{scan.completed.toLocaleString()} of {scan.resources.toLocaleString()} originals prepared. {photos ? 'Export' : 'Original-read'} allowance used: {size(scan.spent)}.</p>
         <p class="footnote">Unfinished cache reservation: {size(scan.reservedBytes)}. Preparation does not confirm that photos were published on your server.</p>
+        {#if scan.current}
+          <p class="footnote">Remaining {photos ? 'maximum export' : 'original-read'} allowance: {size(scan.remaining)}.</p>
+          {#if !scan.abandoned && !scan.prepared && scan.nextReadBytes === null}
+            <p class="footnote">An unfinished attempt is retained. Abandon this scan to review cache cleanup before starting a new scan.</p>
+          {/if}
+          {#if scan.additionalReadAllowance > 0 && !scan.abandoned}
+            <p class="footnote">The next selected original needs {photos ? 'up to ' : ''}{size(scan.nextReadBytes ?? 0)} of {photos ? 'maximum export' : 'read'} allowance, including retries. Approval does not open or upload originals. {photos ? 'Photos-managed downloads are separate and can exceed the export ceiling when hydration is enabled for this source.' : 'Cloud-provider network traffic can exceed logical file data.'}</p>
+            <button class="secondary" disabled={busy} onclick={() => control('approve-read', scan)}>Approve {size(scan.additionalReadAllowance)} more {photos ? 'maximum export' : 'original-read'} allowance</button>
+          {/if}
+          {#if scan.canRescan}
+            <p class="footnote">Scan the same selected originals again to refresh their metadata. Earlier receipts and caches are kept. A new scan starts with no read allowance.</p>
+            <button class="secondary" disabled={busy} onclick={() => control('rescan', scan)}>Scan the same selection again</button>
+          {/if}
+        {/if}
         {#if scan.current && !scan.abandoned}<button class="secondary" disabled={busy} onclick={() => control('abandon', scan)}>Abandon scan</button>{/if}
         {#if scan.discardable}
           {#if confirmation === scan.scanId}
