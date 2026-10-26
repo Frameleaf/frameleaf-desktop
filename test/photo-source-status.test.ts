@@ -235,3 +235,31 @@ test('a failed fresh approval status lookup cannot restore permission after revo
  view.pending.get('photo_source_status')!.resolve({...source,mode:'reference',kind:'folder',allowDownload:true,allowPhotosHydration:false});await approval;
  assert.equal(view.current().consent,null);assert.match(view.current().message,/permission removed/);
 });
+
+
+test('registration retry cannot replace the saved source identity',async()=>{
+ for(const change of [{},{id:'another-source'},{kind:'apple-photos'},{path:'/Another folder'}]){
+  const changed=Object.keys(change).length>0;
+  const saved={...source,registered:false,mode:'reference',kind:'folder',path:'/Synthetic originals',allowDownload:true,allowPhotosHydration:false};
+  const view=component();const unmount=view.mount();await setImmediate();
+  view.pending.get('photo_source_status')!.resolve(saved);await setImmediate();
+  const call=view.approve(true);
+  assert.equal(view.pending.get('approve_photo_folder')!.args?.selectionId,null);
+  const reply={...saved,registered:true,...change};
+  view.pending.get('approve_photo_folder')!.resolve(reply);await call;
+  assert.equal(view.current().consent,changed?saved:reply);
+  if(changed)assert.match(view.current().message,/did not confirm/);
+  unmount();
+ }
+});
+test('reconnect cannot alter the approved provider folder or hydration scope',async()=>{
+ const saved={...inactiveReference,kind:'folder',path:'/Synthetic originals',allowDownload:true,allowPhotosHydration:false};
+ for(const change of [{kind:'apple-photos'},{path:'/Another folder'},{allowDownload:false},{allowPhotosHydration:true}]){
+  const view=component();const unmount=view.mount();await setImmediate();
+  view.pending.get('photo_source_status')!.resolve(saved);await setImmediate();
+  const call=view.reconnectCall();
+  view.pending.get('reconnect_photo_source')!.resolve({...saved,registered:true,reconnectRequired:false,...change});await call;
+  assert.equal(view.current().consent,saved);assert.match(view.current().message,/did not confirm/);
+  unmount();
+ }
+});

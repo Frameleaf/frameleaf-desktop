@@ -185,7 +185,7 @@
     try {
       const reply = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : selected!.selectionId, allowDownload: retry ? previous?.allowDownload ?? false : allowReads, allowPhotosHydration: hydration, mode });
       if (!current()) return;
-      if (!reply || !reply.registered || !reply.id || (reply.mode ?? 'copy') !== mode || reply.allowDownload !== true || reply.allowPhotosHydration !== hydration || (!retry && reply.kind !== selected?.kind)) {
+      if (!reply || !reply.registered || !reply.id || (reply.mode ?? 'copy') !== mode || (retry && (reply.id !== previous?.id || reply.kind !== previous?.kind || reply.path !== previous?.path)) || reply.allowDownload !== true || reply.allowPhotosHydration !== hydration || (!retry && reply.kind !== selected?.kind)) {
         blockedConsent = true; message = errors.source_registration_response_invalid; return;
       }
       consent = reply; job = null; blockedConsent = false;
@@ -200,7 +200,7 @@
     try {
       const current = await invoke<Consent>('reconnect_photo_source', { sourceId: source.id });
       if (alive && consent === source) {
-        if (current.id !== source.id || current.mode !== 'reference' || !current.registered || current.reconnectRequired) {
+        if (current.id !== source.id || current.mode !== 'reference' || !current.registered || current.reconnectRequired || current.kind !== source.kind || current.path !== source.path || current.allowDownload !== source.allowDownload || current.allowPhotosHydration !== source.allowPhotosHydration) {
           message = errors.source_registration_response_invalid;
         } else {
           consent = current; job = null; blockedConsent = false; message = 'Reference source reconnected.';
