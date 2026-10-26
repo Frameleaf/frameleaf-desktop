@@ -1,4 +1,6 @@
 //! One source-owned original read, with durable allowances and locally signed resource selection.
+#[cfg(test)]
+mod native_reference_tests;
 mod owner;
 mod planner;
 mod preparation;

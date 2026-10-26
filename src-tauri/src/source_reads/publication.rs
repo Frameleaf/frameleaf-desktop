@@ -363,7 +363,7 @@ impl Job {
             .next()
             .is_some_and(|ext| matches!(ext, "mp4" | "mov" | "m4v"));
         Publication::begin(
-            &parent.join(self.resource.resource_key()),
+            &parent,
             Binding {
                 server: normalize_server(&saved.server)?.to_string(),
                 server_id: saved.server_id.clone(),
