@@ -23,13 +23,13 @@ fn worker_lock(account: &str) -> Result<Option<MutexGuard<'static, ()>>, String>
     Ok(None)
 }
 
-const SERVICE: &str = "app.frameleaf.desktop";
 pub fn load<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
     let _lock = worker_lock(account)?;
     load_record(account)
 }
 fn load_record<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
-    let entry = Entry::new(SERVICE, account).map_err(|_| "credential_store_unavailable")?;
+    let entry = Entry::new(&crate::app_profile().service(), account)
+        .map_err(|_| "credential_store_unavailable")?;
     match entry.get_password() {
         Ok(value) => serde_json::from_str(&Zeroizing::new(value))
             .map(Some)
@@ -45,14 +45,14 @@ pub fn save<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
 fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     let data =
         Zeroizing::new(serde_json::to_string(value).map_err(|_| "credential_record_invalid")?);
-    Entry::new(SERVICE, account)
+    Entry::new(&crate::app_profile().service(), account)
         .map_err(|_| "credential_store_unavailable")?
         .set_password(&data)
         .map_err(|_| "credential_store_locked_or_unavailable".into())
 }
 pub fn delete(account: &str) -> Result<(), String> {
     let _lock = worker_lock(account)?;
-    match Entry::new(SERVICE, account)
+    match Entry::new(&crate::app_profile().service(), account)
         .map_err(|_| "credential_store_unavailable")?
         .delete_credential()
     {
@@ -409,6 +409,30 @@ mod qualification_keychain {
 #[cfg(test)]
 mod epoch_enrollment_tests {
     use super::*;
+    #[test]
+    fn compiled_profile_binds_credential_load_save_and_delete() {
+        crate::ml_transport::native_nas_tests::install_test_keyring();
+        let identifier = crate::app_context().config().identifier.clone();
+        println!("compiled_app_identifier={identifier}");
+        let other = crate::app_profile::Profile::new(if identifier == "app.frameleaf.desktop" {
+            "app.frameleaf.desktop.development"
+        } else {
+            "app.frameleaf.desktop"
+        });
+        let account = "profile-isolation-synthetic-record";
+        let foreign = Entry::new(&other.service(), account).unwrap();
+        foreign.set_password("\"foreign-profile-value\"").unwrap();
+        assert!(load::<String>(account).unwrap().is_none());
+        save(account, &"current-profile-value").unwrap();
+        assert_eq!(
+            load::<String>(account).unwrap().as_deref(),
+            Some("current-profile-value")
+        );
+        assert_eq!(foreign.get_password().unwrap(), "\"foreign-profile-value\"");
+        delete(account).unwrap();
+        assert!(load::<String>(account).unwrap().is_none());
+        assert_eq!(foreign.get_password().unwrap(), "\"foreign-profile-value\"");
+    }
     #[test]
     fn deleted_credential_cannot_turn_normal_sign_in_into_fresh_enrollment() {
         let identity = DeviceIdentity::generate();

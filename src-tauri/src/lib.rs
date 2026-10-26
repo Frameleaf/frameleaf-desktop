@@ -1,3 +1,4 @@
+mod app_profile;
 mod apple_photos;
 pub mod connection;
 #[cfg(any(target_os = "linux", all(test, unix)))]
@@ -425,6 +426,16 @@ async fn open_photos(
     Ok(())
 }
 
+fn app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+fn app_profile() -> &'static app_profile::Profile {
+    static PROFILE: std::sync::LazyLock<app_profile::Profile> =
+        std::sync::LazyLock::new(|| app_profile::Profile::new(&app_context().config().identifier));
+    &PROFILE
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -507,7 +518,7 @@ pub fn run() {
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build(app_context())
         .expect("Frameleaf desktop failed to start")
         .run(|app, event| {
             #[cfg(target_os = "macos")]

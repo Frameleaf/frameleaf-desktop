@@ -299,9 +299,7 @@ fn remove_owned_marker() {
 #[cfg(windows)]
 fn remove_owned_marker() {
     use windows_sys::Win32::System::Registry::*;
-    let name: Vec<u16> = "Software\\Frameleaf\\DesktopSecurity\0"
-        .encode_utf16()
-        .collect();
+    let name: Vec<u16> = crate::app_profile().registry_key().encode_utf16().collect();
     let value: Vec<u16> = "InstallationId\0".encode_utf16().collect();
     let mut key = std::ptr::null_mut();
     assert_eq!(

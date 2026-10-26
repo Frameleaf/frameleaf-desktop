@@ -83,7 +83,7 @@ pub(crate) fn directory() -> Result<std::path::PathBuf, String> {
     let home = std::path::Path::new(std::ffi::OsStr::from_bytes(
         unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }.to_bytes(),
     ));
-    Ok(home.join(".frameleaf-desktop-security"))
+    Ok(home.join(crate::app_profile().security_directory()))
 }
 
 #[cfg(unix)]
@@ -104,7 +104,8 @@ pub(crate) fn acquire() -> Result<Guard, String> {
     };
     let sid = crate::windows_protection::process_user_sid()
         .map_err(|_| "credential_store_lock_unavailable")?;
-    let name: Vec<u16> = format!("Global\\FrameleafRuntimeEpochsV1-{sid}\0")
+    let name: Vec<u16> = crate::app_profile()
+        .mutex_name(&sid)
         .encode_utf16()
         .collect();
     let raw = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };

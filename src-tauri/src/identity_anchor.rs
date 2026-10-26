@@ -50,9 +50,7 @@ mod native {
         }
     }
     fn name() -> Vec<u16> {
-        "Software\\Frameleaf\\DesktopSecurity\0"
-            .encode_utf16()
-            .collect()
+        crate::app_profile().registry_key().encode_utf16().collect()
     }
     fn value() -> Vec<u16> {
         "InstallationId\0".encode_utf16().collect()
