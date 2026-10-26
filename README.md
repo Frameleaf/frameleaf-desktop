@@ -810,6 +810,27 @@ Native database admission now rejects standard macOS File Provider/iCloud paths 
 The development `frameleaf-native-host --owner-pipe` helper now provides bounded, manifest-pinned native host control using the compiled release authority. Actual signed Mac host startup, same-profile restart, explicit stop, owner-pipe closure and invalid-command drain pass; the final Rust suite has 176 passing tests with 15 opt-in cases skipped. This helper is not yet packaged/signed or wired into Manager’s operation journal/APIs or setup UI. It accepts credentials only on its private stdin pipe and exposes no listener. Existing desktop launches keep `frameleaf-desktop` as Cargo’s default target.
 
 
+### macOS controller packaging
+
+Stage a release controller with `tools/build_host_macos_bundle.py`, then sign the
+whole `Frameleaf Native Host.app` with the intended signing authority. Pass its
+`Contents/MacOS/frameleaf-native-host` path to `tools/build_host_macos_pkg.py`.
+The package author verifies and copies the sealed bundle into both installer
+phases; it never executes the supplied controller or candidate Node. Signature
+verification uses the installed authoring Node.
+
+New macOS receipts use schema 3 and require the signature seal. Legacy flat
+schema-1 and unsigned schema-2 installations retain their original admission
+rules. Both forms require canonical metadata, immutable protected paths and the
+exact controller digest. Sealed bundles permit only `CodeResources` in addition
+to the canonical executable and metadata; missing seals cannot downgrade a
+schema-3 installation to unsigned admission. Advance the signed host epoch when
+changing the controller so existing version identities remain intact.
+
+Ad-hoc seal verification establishes integrity only. Developer ID identity,
+notarization, shared credential access and installed lifecycle acceptance remain
+separate release gates.
+
 ### Native Manager packaging
 
 `tools/build_host_manager.py --source /absolute/repo --revision <commit> --node /absolute/private-node --output /absolute/new-output` builds Manager and its UI from an exact Git archive with the frozen npm lockfile. It ignores package lifecycle scripts, prunes development dependencies and checks deployed production imports, including the shared release verifier. Only runtime code, production dependencies, worker scripts, public release-verification resources, UI assets and licenses enter `output/manager`. `component.json` records the Manager revision independently of the photo server revision.

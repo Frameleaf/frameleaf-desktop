@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from build_host_server import stage_server
-from build_host_macos_bundle import EXECUTABLE, NAME, inspect_controller, stage_bundle
+from build_host_macos_bundle import EXECUTABLE, NAME, inspect_controller, stage_bundle, validate_bundle
 from build_runtime import BuildError, regular, run, sha256
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,12 +83,21 @@ def build(candidate: Path, controller: Path, output: Path) -> None:
         raise BuildError('host_install_platform_unsupported')
     if not all(p.is_absolute() and p.resolve() == p for p in [candidate, controller, output]) or output.exists() or output.is_symlink():
         raise BuildError('host_install_paths_invalid')
+    if controller.parts[-4:] != (NAME, 'Contents', 'MacOS', 'frameleaf-native-host'):
+        raise BuildError('host_controller_bundle_signature_required')
+    version = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_text())['version']
+    validate_bundle(controller.parents[2], sha256(controller), version, signature_required=True)
     # Inspect the local build artifact; never execute a supplied controller during authoring.
     work = candidate.parent
     env = os.environ.copy()
     env.update({'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1', 'RAYON_NUM_THREADS': '1'})
     arch = inspect_controller(controller, work, env)
-    node = candidate / 'payload/node'
+    authoring_node = shutil.which('node')
+    if not authoring_node:
+        raise BuildError('host_install_authoring_node_missing')
+    node = Path(authoring_node).resolve()
+    if node.is_relative_to(candidate):
+        raise BuildError('host_install_authoring_node_untrusted')
     verifier = (ROOT / 'tools/sign_host_runtime.mjs').as_uri()
     command = [node, '--input-type=module', '--eval', f'import({json.dumps(verifier)}).then(async m=>console.log(JSON.stringify(await m.verifySignedHostCandidate(process.argv[1]))))']
     checked = json.loads(run([*command, candidate], cwd=work, env=env))

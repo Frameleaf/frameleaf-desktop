@@ -63,7 +63,7 @@ impl Installation {
             record.controller_bundle_version.as_deref(),
         ) {
             (1, None) => true,
-            (2, Some(version)) => macos_bundle::info(version).is_ok(),
+            (2 | 3, Some(version)) => macos_bundle::info(version).is_ok(),
             _ => false,
         };
         #[cfg(not(target_os = "macos"))]
@@ -108,6 +108,7 @@ impl Installation {
                 &layout.controller,
                 &record.controller_sha256,
                 version,
+                record.schema_version == 3,
                 |path| crate::manager_host::protect(path, &mut std::collections::BTreeSet::new()),
             )?;
         }
@@ -248,22 +249,31 @@ fn verify_resources(layout: &Layout, manifest: &str, controller: &str) -> Result
         .controller
         .ends_with("Frameleaf Native Host.app/Contents/MacOS/frameleaf-native-host")
     {
-        let version = if receipt_present(&layout.runtime.join("installation.json"))? {
-            let record = Installation::read(manifest)?;
-            if record.layout()?.controller != layout.controller
-                || record.controller_sha256 != controller
-            {
-                return Err("host_install_record_invalid".into());
-            }
-            record
-                .controller_bundle_version
-                .ok_or("host_install_record_invalid")?
-        } else {
-            env!("CARGO_PKG_VERSION").to_owned()
-        };
-        macos_bundle::verify(&layout.controller, controller, &version, |path| {
-            protect(path, &mut BTreeSet::new())
-        })?;
+        let (version, signature_required) =
+            if receipt_present(&layout.runtime.join("installation.json"))? {
+                let record = Installation::read(manifest)?;
+                if record.layout()?.controller != layout.controller
+                    || record.controller_sha256 != controller
+                {
+                    return Err("host_install_record_invalid".into());
+                }
+                let signature_required = record.schema_version == 3;
+                (
+                    record
+                        .controller_bundle_version
+                        .ok_or("host_install_record_invalid")?,
+                    signature_required,
+                )
+            } else {
+                (env!("CARGO_PKG_VERSION").to_owned(), true)
+            };
+        macos_bundle::verify(
+            &layout.controller,
+            controller,
+            &version,
+            signature_required,
+            |path| protect(path, &mut BTreeSet::new()),
+        )?;
     }
     let raw = crate::runtime_store::read_bounded(
         &layout.runtime.join("manifest.json"),
@@ -781,7 +791,7 @@ mod posix {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let record = Installation {
-            schema_version: if cfg!(target_os = "macos") { 2 } else { 1 },
+            schema_version: if cfg!(target_os = "macos") { 3 } else { 1 },
             manifest_sha256: manifest.into(),
             controller_sha256: controller.into(),
             #[cfg(target_os = "macos")]
@@ -997,6 +1007,23 @@ mod posix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn signed_receipts_keep_legacy_versions_and_require_a_bundle_version() {
+        let record = |schema: u32, version: Option<&str>| {
+            let mut value = serde_json::json!({"schemaVersion":schema,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)});
+            if let Some(version) = version {
+                value["controllerBundleVersion"] = version.into();
+            }
+            Installation::decode(&serde_json::to_vec(&value).unwrap())
+        };
+        assert!(record(1, None).is_ok());
+        assert!(record(2, Some("0.1.0")).is_ok());
+        assert!(record(3, Some("0.1.0")).is_ok());
+        assert!(record(3, None).is_err());
+        assert!(record(3, Some("../outside")).is_err());
+        assert!(record(4, Some("0.1.0")).is_err());
+    }
     struct InventoryFixture(PathBuf);
     impl InventoryFixture {
         fn new() -> Self {

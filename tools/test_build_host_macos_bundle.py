@@ -1,7 +1,9 @@
 import hashlib
 import os
 import plistlib
+import platform
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -98,3 +100,50 @@ class MacControllerBundleTests(unittest.TestCase):
                         self.assertEqual(run.call_args_list[1].args[0], ['/usr/bin/otool', '-L', source])
                     else:
                         with self.assertRaises(BuildError): inspect_controller(source, root, {})
+
+    @unittest.skipUnless(platform.system() == 'Darwin', 'real macOS code signing')
+    def test_presigned_controller_keeps_its_seal_and_refuses_tampering(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            code = root / 'fixture.c'
+            code.write_text('int main(void) { return 0; }\n')
+            executable = root / 'frameleaf-native-host'
+            subprocess.run(['xcrun', 'clang', '-arch', platform.machine(), str(code), '-o', str(executable)], check=True,
+                           capture_output=True)
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            source = stage_bundle(executable, root / 'unsigned', digest, '0.1.0')
+            subprocess.run(['codesign', '--force', '--sign', '-', str(source)], check=True,
+                           capture_output=True)
+            controller = source / 'Contents/MacOS/frameleaf-native-host'
+            digest = hashlib.sha256(controller.read_bytes()).hexdigest()
+            copied = stage_bundle(controller, root / 'copied', digest, '0.1.0')
+            seal = 'Contents/_CodeSignature/CodeResources'
+            self.assertTrue((copied / seal).is_file(), 'signed input must retain its resource seal')
+            self.assertEqual((copied / seal).read_bytes(), (source / seal).read_bytes())
+            subprocess.run(['codesign', '--verify', '--strict', str(copied)], check=True,
+                           capture_output=True)
+            original = (source / seal).read_bytes()
+            (source / seal).write_bytes(plistlib.dumps({'files2': {'../outside': {}}}))
+            with self.assertRaises(BuildError):
+                stage_bundle(controller, root / 'tampered', digest, '0.1.0')
+            self.assertFalse((root / 'tampered').exists())
+            for raw in [b'<plist><dict>', plistlib.dumps({'files': {}, 'files2': {}}), b'x' * (256 * 1024 + 1)]:
+                with self.subTest(seal=raw[:20]):
+                    (source / seal).write_bytes(raw)
+                    with self.assertRaises(BuildError):
+                        stage_bundle(controller, root / 'invalid-seal', digest, '0.1.0')
+                    self.assertFalse((root / 'invalid-seal').exists())
+            (source / seal).write_bytes(original)
+            resources = source / seal
+            resources.chmod(0o666)
+            with self.assertRaises(BuildError):
+                validate_bundle(source, digest, '0.1.0', signature_required=True)
+            resources.chmod(0o644)
+            resources.unlink()
+            with self.assertRaises(BuildError):
+                validate_bundle(source, digest, '0.1.0', signature_required=True)
+            resources.write_bytes(original)
+            resources.chmod(0o644)
+            with self.assertRaises(BuildError):
+                stage_bundle(controller, source / 'recursive-copy', digest, '0.1.0')
+            self.assertFalse((source / 'recursive-copy').exists())

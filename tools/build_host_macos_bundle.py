@@ -1,14 +1,17 @@
-"""Author an unsigned app-like controller bundle; never sign, install or execute it."""
+"""Stage a closed controller bundle; never sign, install or execute it."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import stat
+import subprocess
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 from build_runtime import BuildError, inventory, regular, run, sha256
 
@@ -39,13 +42,15 @@ def inspect_controller(controller: Path, work: Path, env: dict[str, str]) -> str
     return arch
 
 
-def validate_bundle(bundle: Path, controller_hash: str, version: str) -> dict:
-    """Check the unsigned authoring form, never installed ownership or signing admission."""
+def validate_bundle(bundle: Path, controller_hash: str, version: str, *, signature_required: bool = False) -> dict:
+    """Check a closed bundle; a seal validates integrity, not publisher/notarization acceptance."""
     expected_info = info_bytes(version)
     if (not re.fullmatch(r'[a-f0-9]{64}', controller_hash) or not bundle.is_absolute()
         or bundle.resolve() != bundle or bundle.name != NAME):
         raise BuildError('host_controller_bundle_invalid')
     expected = {'Contents': True, 'Contents/MacOS': True, 'Contents/Info.plist': False, EXECUTABLE: False}
+    if signature_required:
+        expected.update({'Contents/_CodeSignature': True, 'Contents/_CodeSignature/CodeResources': False})
     if not stat.S_ISDIR(regular(bundle).st_mode) or bundle.stat().st_mode & 0o7777 != 0o755:
         raise BuildError('host_controller_bundle_invalid')
     found = set()
@@ -66,6 +71,33 @@ def validate_bundle(bundle: Path, controller_hash: str, version: str) -> dict:
             raise BuildError('host_controller_bundle_invalid')
     if sha256(bundle / EXECUTABLE) != controller_hash:
         raise BuildError('host_install_controller_changed')
+    if signature_required:
+        resources = bundle / 'Contents/_CodeSignature/CodeResources'
+        with resources.open('rb') as stream:
+            raw = stream.read(256 * 1024 + 1)
+        if not raw or len(raw) > 256 * 1024:
+            raise BuildError('host_controller_bundle_signature_invalid')
+        try:
+            seal = plistlib.loads(raw)
+        except (ValueError, plistlib.InvalidFileException, OverflowError, ExpatError, RecursionError) as error:
+            raise BuildError('host_controller_bundle_signature_invalid') from error
+        if (not isinstance(seal, dict) or not set(seal) <= {'files', 'files2', 'rules', 'rules2'}
+            or any(not isinstance(value, dict) for value in seal.values())):
+            raise BuildError('host_controller_bundle_signature_invalid')
+        for kind, entries in seal.items():
+            if len(entries) > 64:
+                raise BuildError('host_controller_bundle_signature_invalid')
+            for path in entries:
+                if (not isinstance(path, str) or len(path.encode('utf-8')) > 4096
+                    or (kind in ['files', 'files2'] and path not in ['Info.plist', 'MacOS/frameleaf-native-host'])):
+                    raise BuildError('host_controller_bundle_signature_invalid')
+        try:
+            checked = subprocess.run(['/usr/bin/codesign', '--verify', '--strict', '--all-architectures', str(bundle)],
+                env={'PATH': os.defpath, 'LC_ALL': 'C'}, capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise BuildError('host_controller_bundle_signature_invalid') from error
+        if checked.returncode:
+            raise BuildError('host_controller_bundle_signature_invalid')
     return inventory(bundle)
 
 
@@ -80,6 +112,17 @@ def stage_bundle(controller: Path, output: Path, controller_hash: str, version: 
         raise BuildError('host_install_controller_invalid')
     if sha256(controller) != controller_hash:
         raise BuildError('host_install_controller_changed')
+    signed_source = controller.parents[2] if controller.parts[-4:] == (NAME, 'Contents', 'MacOS', 'frameleaf-native-host') else None
+    if signed_source is not None and (signed_source / 'Contents/_CodeSignature').exists():
+        if output.is_relative_to(signed_source):
+            raise BuildError('host_install_paths_invalid')
+        expected = validate_bundle(signed_source, controller_hash, version, signature_required=True)
+        output.mkdir(mode=0o700)
+        bundle = output / NAME
+        shutil.copytree(signed_source, bundle, symlinks=True)
+        if validate_bundle(bundle, controller_hash, version, signature_required=True) != expected:
+            raise BuildError('host_controller_bundle_changed')
+        return bundle
     output.mkdir(mode=0o700)
     bundle = output / NAME
     for directory in [bundle, bundle / 'Contents', bundle / 'Contents/MacOS']:
@@ -104,9 +147,11 @@ def build(controller: Path, output: Path) -> None:
     controller_hash = sha256(controller)
     version = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_text())['version']
     bundle = stage_bundle(controller, output, controller_hash, version)
-    files = validate_bundle(bundle, controller_hash, version)
+    signature_required = (bundle / 'Contents/_CodeSignature').exists()
+    files = validate_bundle(bundle, controller_hash, version, signature_required=signature_required)
     (output / 'qualification.json').write_text(json.dumps({
-        'schemaVersion': 1, 'qualification': 'unsigned-helper-bundle',
+        'schemaVersion': 1, 'qualification': 'sealed-helper-bundle' if signature_required else 'unsigned-helper-bundle',
+        'controllerSignatureVerified': signature_required,
         'bundle': NAME, 'bundleIdentifier': 'app.frameleaf.desktop.host',
         'controllerSha256': controller_hash, 'architecture': arch, 'files': files,
         'osCodeSigningQualified': False, 'provisioningProfileQualified': False,
