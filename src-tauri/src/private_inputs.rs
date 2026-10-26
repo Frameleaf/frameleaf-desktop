@@ -147,6 +147,19 @@ impl<'a> InputBudget<'a> {
                 .map(|entry| entry.bytes)
                 .sum::<u64>())
     }
+    pub(crate) fn reservations(
+        &self,
+        source: &str,
+    ) -> Result<std::collections::HashMap<String, u64>, String> {
+        let ledger = self.read()?;
+        self.staged(&ledger)?;
+        Ok(ledger
+            .allocations
+            .into_iter()
+            .filter(|entry| entry.source == source && !entry.worker)
+            .map(|entry| (entry.id, entry.bytes))
+            .collect())
+    }
     pub(crate) fn reserve(&mut self, source: &str, id: &str, bytes: u64) -> Result<(), String> {
         self.reserve_kind(source, id, bytes, false)
     }

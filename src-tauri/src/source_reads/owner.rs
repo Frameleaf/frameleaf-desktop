@@ -185,7 +185,26 @@ impl Requests {
         F: FnOnce(Progress, Signal) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
+        self.install_checked(source, notify, true, work).await
+    }
+    async fn install_checked<F, Fut>(
+        &self,
+        source: String,
+        notify: Arc<dyn Fn(View) + Send + Sync>,
+        replace: bool,
+        work: F,
+    ) -> Result<View, String>
+    where
+        F: FnOnce(Progress, Signal) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
         let mut owner = self.owner.lock().await;
+        if !replace
+            && self.active.load(Ordering::Acquire)
+            && !matches!(self.status().state.as_str(), "stopped" | "needs-attention")
+        {
+            return Err("source_read_already_running".into());
+        }
         self.drain(&mut owner).await?;
         if self.closing.load(Ordering::Acquire) {
             return Err("source_read_shutting_down".into());
@@ -562,6 +581,37 @@ mod tests {
             );
             assert_eq!(owner.is_active(), unknown);
         }
+    }
+    #[tokio::test]
+    async fn metadata_inspection_cannot_replace_or_cancel_active_source_work() {
+        let owner = Requests::default();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        owner
+            .install("source".into(), notify(), move |_, _| async move {
+                let _ = wait.await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let result = owner
+            .install_checked("inspect".into(), notify(), false, |_, _| async move {
+                panic!("inspection must not replace the active task")
+            })
+            .await;
+        assert_eq!(result.err().as_deref(), Some("source_read_already_running"));
+        assert!(owner.is_active());
+        assert!(!owner
+            .owner
+            .lock()
+            .await
+            .running
+            .as_ref()
+            .unwrap()
+            .stop
+            .cancelled
+            .load(Ordering::Acquire));
+        finish.send(()).unwrap();
+        owner.stop().await.unwrap();
     }
     #[tokio::test]
     async fn preparation_panic_reports_unknown_and_fences_replacement() {

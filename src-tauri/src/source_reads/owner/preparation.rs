@@ -115,6 +115,21 @@ impl Requests {
         })
         .await
     }
+    pub async fn reference_status(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        source: String,
+    ) -> Result<Option<crate::source_reads::ReferenceStatus>, String> {
+        if !super::super::canonical_uuid(&source) {
+            return Err("source_read_request_invalid".into());
+        }
+        self.prepare_owned_checked(source.clone(), Arc::new(|_| {}), false, move |_, stop| {
+            let identity = crate::credentials::identity()?;
+            Preparation::reference_status(&base, &saved, &identity, &source, stop)
+        })
+        .await
+    }
     pub(super) async fn prepare_owned<F>(
         &self,
         source: String,
@@ -129,32 +144,53 @@ impl Requests {
             + Send
             + 'static,
     {
+        self.prepare_owned_checked(source, notify, true, work).await
+    }
+    async fn prepare_owned_checked<F, T>(
+        &self,
+        source: String,
+        notify: Arc<dyn Fn(View) + Send + Sync>,
+        replace: bool,
+        work: F,
+    ) -> Result<T, String>
+    where
+        T: Clone + Send + 'static,
+        F: FnOnce(&AtomicBool, &(dyn Fn() -> Result<(), String> + Sync)) -> Result<T, String>
+            + Send
+            + 'static,
+    {
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = super::super::Stop(cancelled.clone());
         let (send, receive) = tokio::sync::oneshot::channel();
-        self.install(source, notify, move |progress, signal| async move {
-            progress.set("preparing", None);
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                let check = || {
-                    if cancelled.load(Ordering::Acquire) || signal.cancelled.load(Ordering::Acquire)
-                    {
-                        return Err("source_delivery_interrupted".into());
-                    }
-                    Ok(())
-                };
-                check()?;
-                let result = work(&cancelled, &check);
-                if !result.as_ref().err().is_some_and(|code| unconfirmed(code)) {
+        self.install_checked(
+            source,
+            notify,
+            replace,
+            move |progress, signal| async move {
+                progress.set("preparing", None);
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    let check = || {
+                        if cancelled.load(Ordering::Acquire)
+                            || signal.cancelled.load(Ordering::Acquire)
+                        {
+                            return Err("source_delivery_interrupted".into());
+                        }
+                        Ok(())
+                    };
                     check()?;
-                }
-                result
-            })
-            .await
-            .map_err(|_| "source_read_shutdown_unconfirmed".to_string())
-            .and_then(|result| result);
-            let _ = send.send(result.clone());
-            result.map(|_| ())
-        })
+                    let result = work(&cancelled, &check);
+                    if !result.as_ref().err().is_some_and(|code| unconfirmed(code)) {
+                        check()?;
+                    }
+                    result
+                })
+                .await
+                .map_err(|_| "source_read_shutdown_unconfirmed".to_string())
+                .and_then(|result| result);
+                let _ = send.send(result.clone());
+                result.map(|_| ())
+            },
+        )
         .await?;
         receive
             .await

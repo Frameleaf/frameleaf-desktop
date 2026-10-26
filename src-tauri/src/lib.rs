@@ -43,6 +43,7 @@ mod source_consent;
 mod source_import;
 mod source_metadata;
 pub mod source_reads;
+mod source_reference_commands;
 mod transport;
 mod upload_budget;
 #[cfg(windows)]
@@ -464,6 +465,8 @@ pub fn run() {
             photo_source_status,
             reconnect_photo_source,
             revoke_photo_source,
+            source_reference_commands::photo_reference_status,
+            source_reference_commands::control_photo_reference,
             photo_import_status,
             prepare_photo_import,
             control_photo_import,

@@ -22,6 +22,8 @@
     "allow-photo-source-status",
     "allow-reconnect-photo-source",
     "allow-revoke-photo-source",
+    "allow-photo-reference-status",
+    "allow-control-photo-reference",
     "allow-photo-import-status",
     "allow-prepare-photo-import",
     "allow-control-photo-import",

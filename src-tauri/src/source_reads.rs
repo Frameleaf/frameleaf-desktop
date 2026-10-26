@@ -12,7 +12,7 @@ use crate::{
 };
 use cap_std::{ambient_authority, fs::Dir};
 pub use owner::{PreparationAction, Requests, View};
-pub use planner::{Preparation, PreparationView, PreparedResource};
+pub use planner::{Preparation, PreparationView, PreparedResource, ReferenceStatus};
 pub(crate) use publication::validate_directory as validate_publication_store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1140,6 +1140,58 @@ mod tests {
                 .is_err());
             assert_eq!(fs::read(moved.join("original")).unwrap(), b"abcdefghij");
         }
+    }
+    #[test]
+    fn reference_status_lists_reserved_abandoned_scans_without_opening_originals() {
+        let f = Fixture::new();
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let old = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+        prep.abandon_with(&f.saved, &f.identity, &old, &|| Ok(()))
+            .unwrap();
+        let next = prep
+            .rescan_with(&f.saved, &f.identity, vec![entry], &old, &|| Ok(()))
+            .unwrap();
+        fs::remove_file(f.approval.root().join("original.jpg")).unwrap();
+        let status = prep
+            .reference_status_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        assert_eq!(status.source_id, f.approval.source_id());
+        assert_eq!(status.scans.len(), 2);
+        assert_eq!(status.scans[0].scan_id, next.scan_id);
+        assert!(status.scans[0].current);
+        assert!(!status.scans[0].abandoned);
+        let archived = &status.scans[1];
+        assert_eq!(archived.scan_id, old);
+        assert!(archived.abandoned && archived.discardable);
+        assert_eq!((archived.spent, archived.reserved_bytes), (10, 10));
+        prep.discard_with(&f.saved, &f.identity, &old, &|| Ok(()))
+            .unwrap();
+        let status = prep
+            .reference_status_with(&f.saved, &f.identity, &|| Ok(()))
+            .unwrap();
+        assert_eq!(status.scans[1].spent, 10);
+        assert_eq!(status.scans[1].reserved_bytes, 0);
+        assert!(!status.scans[1].discardable);
+        assert!(prep
+            .reference_status_with(&f.saved, &f.identity, &|| Err(
+                "source_copy_cancelled".into()
+            ))
+            .is_err());
     }
     #[test]
     fn discard_preserves_first_handoff_intent_when_job_store_disappears() {

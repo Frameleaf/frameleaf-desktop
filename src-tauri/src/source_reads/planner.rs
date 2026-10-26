@@ -2,8 +2,10 @@ mod capacity;
 mod discard;
 mod inventory;
 mod scans;
+mod status;
 use super::*;
 use crate::{copy_source::CopyApproval, photo_sources::SourceFile};
+pub use status::ReferenceStatus;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -129,6 +131,19 @@ impl Preparation {
         identity: &DeviceIdentity,
         source: &str,
     ) -> Result<Self, String> {
+        Self::open_recorded(
+            base,
+            saved,
+            identity,
+            Self::control_approval(saved, identity, source)?,
+            false,
+        )
+    }
+    fn control_approval(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        source: &str,
+    ) -> Result<CopyApproval, String> {
         let consent = crate::credentials::load::<crate::source_consent::Consent>(
             crate::source_consent::CREDENTIAL,
         )?
@@ -137,7 +152,7 @@ impl Preparation {
             return Err("source_approval_changed".into());
         }
         let approval = consent.reference_control_approval(saved, identity)?.clone();
-        Self::open_recorded(base, saved, identity, approval, false)
+        Ok(approval)
     }
     fn open_recorded(
         base: &Path,

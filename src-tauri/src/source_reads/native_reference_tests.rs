@@ -363,6 +363,32 @@ fn actual_native_reference_publication() {
             fs::read(journal.root.join(&name)).unwrap(),
             publication_before
         );
+        crate::source_reference_commands::require_reference_source(&next, &source).unwrap();
+        assert!(crate::source_reference_commands::require_reference_source(
+            &next,
+            &uuid::Uuid::new_v4().to_string()
+        )
+        .is_err());
+        let mut foreign_session = next.clone();
+        foreign_session.token = "unbound-session".into();
+        assert!(crate::source_reference_commands::require_reference_source(
+            &foreign_session,
+            &source
+        )
+        .is_err());
+        let listed = scan_owner
+            .reference_status(base.clone(), next.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert_eq!(listed.source_id, source);
+        assert_eq!(listed.scans[0].scan_id, ended.scan_id);
+        assert_eq!(
+            (listed.scans[0].spent, listed.scans[0].reserved_bytes),
+            (edited.len() as u64, edited.len() as u64)
+        );
+        assert!(listed.scans[0].abandoned && listed.scans[0].discardable);
         let abandoned_before = fs::read(&pending_state).unwrap();
         let discarded = scan_owner
             .prepare_reference(
@@ -383,6 +409,17 @@ fn actual_native_reference_publication() {
             (edited.len() as u64, 0)
         );
         assert!(!pending_cache.exists());
+        let listed = scan_owner
+            .reference_status(base.clone(), next.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert_eq!(
+            (listed.scans[0].spent, listed.scans[0].reserved_bytes),
+            (edited.len() as u64, 0)
+        );
+        assert!(!listed.scans[0].discardable);
         assert_eq!(fs::read(&pending_state).unwrap(), abandoned_before);
         assert_eq!(fs::read(&job_record).unwrap(), job_before);
         assert_eq!(

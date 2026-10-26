@@ -58,6 +58,8 @@ fn main() {
             "photo_source_status",
             "reconnect_photo_source",
             "revoke_photo_source",
+            "photo_reference_status",
+            "control_photo_reference",
             "photo_import_status",
             "prepare_photo_import",
             "control_photo_import",

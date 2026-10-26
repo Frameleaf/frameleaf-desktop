@@ -2,6 +2,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { sourceCopyApprovals } from './source-copy-state';
+  import ReferenceScans from './ReferenceScans.svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   type Hint = { label: string; path: string };
   type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
@@ -299,6 +300,9 @@
           {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}
           {#if job.state === 'cancelled'}<p class="footnote">Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</p>{/if}
         </div>
+      {/if}
+      {#if native && consent.mode === 'reference' && consent.registered && !consent.reconnectRequired}
+        {#key consent}<ReferenceScans sourceId={consent.id} photos={consent.kind === 'apple-photos'} />{/key}
       {/if}
       <button class="text-button" disabled={busy} onclick={revoke}>Remove source permission</button>
     </div>
