@@ -6,12 +6,39 @@ pub(super) struct Generation {
     pub id: String,
     pub previous: String,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct PhotoSnapshot {
+    pub relative: String,
+    pub key: String,
+    pub resource: crate::apple_photos::Resource,
+}
+struct Known {
+    current: std::collections::HashMap<String, StagedCopy>,
+    keys: std::collections::HashMap<String, String>,
+    _owner: Option<Job>,
+}
 pub(super) struct Next {
     pub plan: Plan,
     pub hash: String,
     pub total: u64,
 }
 impl Plan {
+    pub(super) fn photo_snapshot(
+        &self,
+        relative: &str,
+    ) -> Option<(&crate::apple_photos::Resource, &str)> {
+        self.photos_snapshots
+            .iter()
+            .find(|p| p.relative == relative)
+            .map(|p| (&p.resource, p.key.as_str()))
+    }
+    pub(super) fn validate_photos(&self, approval: &CopyApproval) -> Result<(), String> {
+        for photo in &self.photos_snapshots {
+            approval.validate_photos_snapshot(&photo.relative, &photo.resource, &photo.key)?;
+        }
+        Ok(())
+    }
     fn suffix(&self) -> String {
         self.generation
             .as_ref()
@@ -79,7 +106,7 @@ fn known(
     identity: &DeviceIdentity,
     entries: &[SourceFile],
     gate: &dyn Fn() -> Result<(), String>,
-) -> Result<(std::collections::HashMap<String, StagedCopy>, Option<Job>), String> {
+) -> Result<Known, String> {
     let base = prep
         .journal
         .root
@@ -90,6 +117,7 @@ fn known(
     crate::native_runtime::absolute_directory(&root)?;
     let mut owner: Option<Job> = None;
     let mut copies = std::collections::HashMap::new();
+    let mut keys = std::collections::HashMap::new();
     for (index, entry) in fs::read_dir(&root)
         .map_err(|_| "source_journal_invalid")?
         .enumerate()
@@ -138,24 +166,33 @@ fn known(
             .as_ref()
             .ok_or("source_journal_invalid")?
             .require_owner()?;
-        if copy.scope_fingerprint() == prep.plan.scope
-            && entries
-                .iter()
-                .any(|e| copy.matches_entry(&e.relative, e.bytes))
-            && copy.validate_current(saved, identity).is_ok()
-        {
-            let relative = entries
+        if copy.scope_fingerprint() == prep.plan.scope {
+            if let Some(entry) = entries
                 .iter()
                 .find(|e| copy.matches_entry(&e.relative, e.bytes))
-                .ok_or("source_journal_invalid")?
-                .relative
-                .clone();
-            if copies.insert(relative, copy).is_some() {
-                return Err("source_reference_identity_ambiguous".into());
+            {
+                if copy.photos_snapshot()?.is_some() {
+                    let key = copy.resource_key();
+                    if keys
+                        .insert(entry.relative.clone(), key.clone())
+                        .is_some_and(|old| old != key)
+                    {
+                        return Err("source_reference_identity_ambiguous".into());
+                    }
+                }
+                if copy.validate_current(saved, identity).is_ok()
+                    && copies.insert(entry.relative.clone(), copy).is_some()
+                {
+                    return Err("source_reference_identity_ambiguous".into());
+                }
             }
         }
     }
-    Ok((copies, owner))
+    Ok(Known {
+        current: copies,
+        keys,
+        _owner: owner,
+    })
 }
 pub(super) fn transition(
     prep: &Preparation,
@@ -197,17 +234,34 @@ pub(super) fn transition(
         export: prep.plan.export,
         entry: entries.first().cloned().ok_or("source_selection_invalid")?,
         additional: entries.iter().skip(1).cloned().collect(),
+        photos_snapshots: Vec::new(),
         generation: Some(Generation {
             id: uuid::Uuid::new_v4().to_string(),
             previous: expected.into(),
         }),
     };
     let total = plan.total()?;
-    let (mut copies, _owner) = known(prep, saved, identity, &entries, gate)?;
+    let mut known = known(prep, saved, identity, &entries, gate)?;
+    for entry in &entries {
+        gate()?;
+        if let Some(resource) = prep.approval.refresh_photos_snapshot(&entry.relative)? {
+            let key = match known.keys.get(&entry.relative) {
+                Some(key) => key.clone(),
+                None => prep.approval.photos_key(&entry.relative)?,
+            };
+            prep.approval
+                .validate_photos_snapshot(&entry.relative, &resource, &key)?;
+            plan.photos_snapshots.push(PhotoSnapshot {
+                relative: entry.relative.clone(),
+                key,
+                resource,
+            });
+        }
+    }
     let mut reusable = Vec::new();
     let mut changed = Vec::new();
     for entry in entries {
-        if let Some(copy) = copies.remove(&entry.relative) {
+        if let Some(copy) = known.current.remove(&entry.relative) {
             reusable.push((entry, copy));
         } else {
             changed.push(entry);
@@ -220,6 +274,8 @@ pub(super) fn transition(
         .collect();
     plan.entry = ordered[0].clone();
     plan.additional = ordered.into_iter().skip(1).collect();
+    plan.total()?;
+    plan.validate_photos(&prep.approval)?;
     let plan_hash = hash(&plan)?;
     let mut bytes = 0u64;
     for (_, copy) in &reusable {

@@ -18,6 +18,26 @@ impl Plan {
         }) {
             return Err("source_journal_invalid".into());
         }
+        if !self.photos_snapshots.is_empty() {
+            if !self.export
+                || self.photos_snapshots.len() != self.count()
+                || self.photos_snapshots.len() > 100
+            {
+                return Err("source_journal_invalid".into());
+            }
+            let mut seen = std::collections::HashSet::new();
+            for photo in &self.photos_snapshots {
+                photo.resource.validate_approved(&photo.resource)?;
+                if !seen.insert(&photo.relative)
+                    || !crate::native_runtime::digest_valid(&photo.key, 64)
+                    || !std::iter::once(&self.entry)
+                        .chain(&self.additional)
+                        .any(|e| e.relative == photo.relative)
+                {
+                    return Err("source_journal_invalid".into());
+                }
+            }
+        }
         if self.count() > 10_000 {
             return Err("source_inventory_partial".into());
         }
@@ -217,9 +237,43 @@ mod tests {
             export: true,
             additional: Vec::new(),
             generation: None,
+            photos_snapshots: Vec::new(),
         }
     }
 
+    #[test]
+    fn photos_snapshots_are_optional_for_legacy_plans_but_complete_and_bounded_when_present() {
+        let mut plan = export_plan();
+        assert!(serde_json::to_value(&plan)
+            .unwrap()
+            .get("photosSnapshots")
+            .is_none());
+        let resource = serde_json::from_value(serde_json::json!({"asset":"synthetic-private-id","created":1000,"modified":3000,"index":7,"kind":1,"filename":"original.HEIC"})).unwrap();
+        plan.photos_snapshots
+            .push(super::super::scans::PhotoSnapshot {
+                relative: "0/original.HEIC".into(),
+                key: "a".repeat(64),
+                resource,
+            });
+        plan.total().unwrap();
+        let mut duplicate = plan.clone();
+        duplicate
+            .photos_snapshots
+            .push(duplicate.photos_snapshots[0].clone());
+        assert!(duplicate.total().is_err());
+        let mut missing = plan.clone();
+        missing.additional.push(SourceFile {
+            relative: "1/other.jpg".into(),
+            bytes: 10,
+        });
+        assert!(missing.total().is_err());
+        let mut foreign = plan.clone();
+        foreign.photos_snapshots[0].relative = "1/other.jpg".into();
+        assert!(foreign.total().is_err());
+        let mut invalid_key = plan.clone();
+        invalid_key.photos_snapshots[0].key = "invalid".into();
+        assert!(invalid_key.total().is_err());
+    }
     #[test]
     fn export_admission_uses_remaining_space_but_spends_the_full_read_ceiling() {
         let plan = export_plan();

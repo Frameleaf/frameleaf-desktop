@@ -84,6 +84,7 @@ impl Selection {
 unsafe extern "C" {
     fn fl_photos_preview(count: u32) -> *mut std::ffi::c_char;
     fn fl_photos_authorized() -> bool;
+    fn fl_photos_refresh(description: *const std::ffi::c_char) -> *mut std::ffi::c_char;
     fn fl_photos_current(description: *const std::ffi::c_char) -> i32;
     fn fl_photos_export(
         description: *const std::ffi::c_char,
@@ -120,6 +121,35 @@ pub(crate) fn validate_current(resource: &Resource) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = resource;
+        Err("photos_macos_required".into())
+    }
+}
+pub(crate) fn refresh(approved: &Resource) -> Result<Resource, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let description = std::ffi::CString::new(
+            serde_json::to_string(approved).map_err(|_| "photos_metadata_invalid")?,
+        )
+        .map_err(|_| "photos_metadata_invalid")?;
+        let raw = unsafe { fl_photos_refresh(description.as_ptr()) };
+        if raw.is_null() {
+            return Err("photos_metadata_invalid".into());
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes().to_vec();
+        unsafe { libc::free(raw.cast()) };
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "photos_metadata_invalid")?;
+        if let Some(code) = value["error"].as_str() {
+            return Err(code.into());
+        }
+        let resource: Resource =
+            serde_json::from_value(value).map_err(|_| "photos_metadata_invalid")?;
+        resource.validate_approved(approved)?;
+        Ok(resource)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = approved;
         Err("photos_macos_required".into())
     }
 }
@@ -211,6 +241,21 @@ pub(crate) fn export(
     Err("photos_macos_required".into())
 }
 impl Resource {
+    pub(crate) fn validate_approved(&self, approved: &Self) -> Result<(), String> {
+        Selection {
+            assets: 1,
+            allow_hydration: false,
+            resources: vec![self.clone()],
+        }
+        .validate()?;
+        if self.asset != approved.asset
+            || self.kind != approved.kind
+            || self.filename != approved.filename
+        {
+            return Err("photos_scope_changed".into());
+        }
+        Ok(())
+    }
     pub(crate) fn reference_key(&self, source: &str) -> String {
         use sha2::{Digest, Sha256};
         let identity = serde_json::json!([source, self.asset, self.kind, self.filename]);

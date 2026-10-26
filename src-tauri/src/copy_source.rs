@@ -64,6 +64,12 @@ fn signed(
         String::from_utf8(bytes).map_err(|_| "source_approval_invalid")?
     )))
 }
+fn legacy_key(signature: &str, relative: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{signature}\n{relative}").as_bytes())
+    )
+}
 fn cancel(cancelled: &AtomicBool) -> Result<(), String> {
     if cancelled.load(Ordering::Acquire) {
         Err("source_copy_cancelled".into())
@@ -428,6 +434,45 @@ impl CopyApproval {
     pub(crate) fn fingerprint(&self) -> String {
         format!("{:x}", Sha256::digest(self.signature.as_bytes()))
     }
+    pub(crate) fn refresh_photos_snapshot(
+        &self,
+        relative: &str,
+    ) -> Result<Option<crate::apple_photos::Resource>, String> {
+        self.scope
+            .photos
+            .as_ref()
+            .map(|photos| crate::apple_photos::refresh(photos.resource(relative)?))
+            .transpose()
+    }
+    pub(crate) fn photos_key(&self, relative: &str) -> Result<String, String> {
+        Ok(self
+            .scope
+            .photos
+            .as_ref()
+            .ok_or("photos_scope_changed")?
+            .resource(relative)?
+            .reference_key(self.source_id()))
+    }
+    pub(crate) fn validate_photos_snapshot(
+        &self,
+        relative: &str,
+        snapshot: &crate::apple_photos::Resource,
+        key: &str,
+    ) -> Result<(), String> {
+        let approved = self
+            .scope
+            .photos
+            .as_ref()
+            .ok_or("photos_scope_changed")?
+            .resource(relative)?;
+        snapshot.validate_approved(approved)?;
+        if key != approved.reference_key(self.source_id())
+            && key != legacy_key(&self.signature, relative)
+        {
+            return Err("source_stage_invalid".into());
+        }
+        Ok(())
+    }
     pub(crate) fn root(&self) -> &Path {
         Path::new(&self.scope.root)
     }
@@ -511,12 +556,16 @@ impl CopyApproval {
         destination: &Path,
         stage_id: &str,
         maximum: u64,
+        photos_snapshot: Option<(&crate::apple_photos::Resource, &str)>,
         cancelled: &AtomicBool,
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<StagedCopy, String> {
         self.validate(saved, identity)?;
         crate::apple_photos::authorized()?;
-        let resource = photos.resource(relative)?;
+        let approved = photos.resource(relative)?;
+        let default_key = approved.reference_key(self.source_id());
+        let (resource, resource_key) = photos_snapshot.unwrap_or((approved, &default_key));
+        self.validate_photos_snapshot(relative, resource, resource_key)?;
         relative_path(relative)?;
         crate::native_runtime::absolute_directory(destination)?;
         let dir = Dir::open_ambient_dir(destination, ambient_authority())
@@ -565,7 +614,7 @@ impl CopyApproval {
         output.sync_all().map_err(|_| "source_stage_write_failed")?;
         drop(output);
         let mut result = StagedCopy {
-            photos_resource_key: Some(resource.reference_key(self.source_id())),
+            photos_resource_key: Some(resource_key.into()),
             id: stage_id.into(),
             bytes,
             sha256: format!("{:x}", hash.finalize()),
@@ -637,6 +686,31 @@ impl CopyApproval {
         cancelled: &AtomicBool,
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<StagedCopy, String> {
+        self.stage_with_snapshot(
+            saved,
+            identity,
+            relative,
+            destination,
+            stage_id,
+            expected_bytes,
+            None,
+            cancelled,
+            gate,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_with_snapshot(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        relative: &str,
+        destination: &Path,
+        stage_id: &str,
+        expected_bytes: Option<u64>,
+        photos_snapshot: Option<(&crate::apple_photos::Resource, &str)>,
+        cancelled: &AtomicBool,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<StagedCopy, String> {
         if !Uuid::parse_str(stage_id).is_ok_and(|id| !id.is_nil() && id.to_string() == stage_id) {
             return Err("source_stage_invalid".into());
         }
@@ -653,9 +727,13 @@ impl CopyApproval {
                 destination,
                 stage_id,
                 maximum,
+                photos_snapshot,
                 cancelled,
                 gate,
             );
+        }
+        if photos_snapshot.is_some() {
+            return Err("photos_scope_changed".into());
         }
         if !self.scope.allow_download {
             return Err("source_download_permission_required".into());
@@ -851,13 +929,18 @@ impl StagedCopy {
     ) -> Result<(), String> {
         self.validate_receipt(saved, identity)?;
         if let Some(photos) = &self.approval.scope.photos {
-            let resource = photos.resource(&self.relative)?;
-            if serde_json::to_string(resource).map_err(|_| "photos_metadata_invalid")?
-                != self.source_stamp
-            {
-                return Err("source_item_changed".into());
-            }
-            return crate::apple_photos::validate_current(resource);
+            let resource = if self.photos_resource_key.is_some() {
+                self.photos_snapshot()?.ok_or("source_stage_invalid")?
+            } else {
+                let resource = photos.resource(&self.relative)?;
+                if serde_json::to_string(resource).map_err(|_| "photos_metadata_invalid")?
+                    != self.source_stamp
+                {
+                    return Err("source_item_changed".into());
+                }
+                resource.clone()
+            };
+            return crate::apple_photos::validate_current(&resource);
         }
         #[cfg(windows)]
         if self.source_stamp.starts_with("cloud-file-v1:") {
@@ -933,13 +1016,16 @@ impl StagedCopy {
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<Self, String> {
         self.validate_current(saved, identity)?;
-        let copy = self.approval.stage_to(
+        let snapshot = self.photos_snapshot()?;
+        let key = self.resource_key();
+        let copy = self.approval.stage_with_snapshot(
             saved,
             identity,
             &self.relative,
             destination,
             id,
             Some(self.bytes),
+            snapshot.as_ref().map(|s| (s, key.as_str())),
             cancelled,
             gate,
         )?;
@@ -965,14 +1051,23 @@ impl StagedCopy {
                 self.bytes == bytes
             }
     }
+    pub(crate) fn photos_snapshot(&self) -> Result<Option<crate::apple_photos::Resource>, String> {
+        self.approval
+            .scope
+            .photos
+            .as_ref()
+            .map(|photos| {
+                let snapshot: crate::apple_photos::Resource =
+                    serde_json::from_str(&self.source_stamp).map_err(|_| "source_stage_invalid")?;
+                snapshot.validate_approved(photos.resource(&self.relative)?)?;
+                Ok(snapshot)
+            })
+            .transpose()
+    }
     pub(crate) fn resource_key(&self) -> String {
-        if let Some(key) = &self.photos_resource_key {
-            return key.clone();
-        }
-        format!(
-            "{:x}",
-            Sha256::digest(format!("{}\n{}", self.source_signature, self.relative).as_bytes())
-        )
+        self.photos_resource_key
+            .clone()
+            .unwrap_or_else(|| legacy_key(&self.source_signature, &self.relative))
     }
     pub(crate) fn version(&self) -> String {
         format!("{:x}", Sha256::digest(self.source_stamp.as_bytes()))
@@ -1096,19 +1191,9 @@ impl StagedCopy {
             return Err("source_stage_invalid".into());
         }
         if let Some(key) = &self.photos_resource_key {
-            let photos = self
-                .approval
-                .scope
-                .photos
-                .as_ref()
-                .ok_or("source_stage_invalid")?;
-            let resource = photos.resource(&self.relative)?;
-            if key != &resource.reference_key(self.source_id())
-                || self.source_stamp
-                    != serde_json::to_string(resource).map_err(|_| "source_stage_invalid")?
-            {
-                return Err("source_stage_invalid".into());
-            }
+            let snapshot = self.photos_snapshot()?.ok_or("source_stage_invalid")?;
+            self.approval
+                .validate_photos_snapshot(&self.relative, &snapshot, key)?;
         }
         Ok(())
     }
@@ -1523,6 +1608,36 @@ mod tests {
         };
         staged.signature = staged.sign(&identity).unwrap();
         staged.validate_receipt(&saved, &identity).unwrap();
+        let mut fresh = staged.clone();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&fresh.source_stamp).unwrap();
+        snapshot["modified"] = serde_json::json!(3000);
+        snapshot["index"] = serde_json::json!(7);
+        fresh.source_stamp = snapshot.to_string();
+        fresh.file_modified_at_ms = 3000;
+        fresh.signature = fresh.sign(&identity).unwrap();
+        fresh.validate_receipt(&saved, &identity).unwrap();
+        assert_eq!(fresh.resource_key(), staged.resource_key());
+        assert_eq!(fresh.scope_fingerprint(), staged.scope_fingerprint());
+        assert_ne!(fresh.version(), staged.version());
+        for field in ["asset", "filename"] {
+            let mut foreign = fresh.clone();
+            let mut value = snapshot.clone();
+            value[field] = serde_json::json!("foreign.jpg");
+            foreign.source_stamp = value.to_string();
+            foreign.signature = foreign.sign(&identity).unwrap();
+            assert!(foreign.validate_receipt(&saved, &identity).is_err());
+        }
+        let mut alias = fresh.clone();
+        alias.photos_resource_key = Some(format!(
+            "{:x}",
+            Sha256::digest(format!("{}\n{}", alias.source_signature, alias.relative).as_bytes())
+        ));
+        alias.signature = alias.sign(&identity).unwrap();
+        alias.validate_receipt(&saved, &identity).unwrap();
+        let mut old = staged.clone();
+        old.photos_resource_key = None;
+        old.signature = old.sign(&identity).unwrap();
+        assert_eq!(alias.resource_key(), old.resource_key());
         let key = staged.resource_key();
         let encoded = serde_json::to_value(&staged).unwrap();
         let mut removed = encoded.clone();

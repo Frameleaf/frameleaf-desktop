@@ -15,6 +15,8 @@ struct Plan {
     additional: Vec<SourceFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generation: Option<scans::Generation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    photos_snapshots: Vec<scans::PhotoSnapshot>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -152,6 +154,7 @@ impl Preparation {
             export: approval.is_photos(),
             additional: entries.collect(),
             generation: None,
+            photos_snapshots: Vec::new(),
         };
         let total_bytes = plan.total()?;
         crate::native_runtime::absolute_directory(base)?;
@@ -209,6 +212,8 @@ impl Preparation {
         }
         let recorded: Plan = journal.read("preparation-plan.json", identity)?;
         plan.generation = recorded.generation.clone();
+        plan.photos_snapshots = recorded.photos_snapshots.clone();
+        plan.validate_photos(&approval)?;
         plan.total()?;
         let plan_hash = hash(&plan)?;
         if hash(&recorded)? != plan_hash {
@@ -254,6 +259,7 @@ impl Preparation {
     ) -> Result<Progress, String> {
         self.require_owner()?;
         self.approval.validate_current(saved, identity)?;
+        self.plan.validate_photos(&self.approval)?;
         let active: Plan = self.journal.read("preparation-plan.json", identity)?;
         if hash(&active)? != self.plan_hash {
             return Err("source_scan_changed".into());
@@ -582,13 +588,14 @@ impl Preparation {
                 .write(&self.plan.state_name(), &state, identity)?;
             check()?;
             budget.reserve(&self.plan.source, id, maximum)?;
-            self.approval.stage_to(
+            self.approval.stage_with_snapshot(
                 saved,
                 identity,
                 &entry.relative,
                 &stage,
                 id,
                 Some(maximum),
+                self.plan.photo_snapshot(&entry.relative),
                 cancelled,
                 &|| {
                     check()?;
@@ -608,6 +615,11 @@ impl Preparation {
             })
         {
             return Err("source_stage_changed".into());
+        }
+        if let Some((snapshot, key)) = self.plan.photo_snapshot(&entry.relative) {
+            if copy.resource_key() != key || copy.photos_snapshot()?.as_ref() != Some(snapshot) {
+                return Err("source_stage_changed".into());
+            }
         }
         copy.validate_current(saved, identity)?;
         check()?;
