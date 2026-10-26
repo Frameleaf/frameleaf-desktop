@@ -419,6 +419,7 @@ pub(super) fn stage(
     super::cancel(cancelled)?;
     gate()?;
     let mut staged = super::StagedCopy {
+        photos_resource_key: None,
         id: stage_id.into(),
         bytes,
         sha256: copied.sha256,

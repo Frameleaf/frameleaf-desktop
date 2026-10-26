@@ -36,6 +36,7 @@ impl Selection {
         }
         let mut seen = std::collections::HashSet::new();
         let mut assets = std::collections::HashSet::new();
+        let mut originals = std::collections::HashSet::new();
         for r in &self.resources {
             if r.asset.is_empty()
                 || r.asset.len() > 1024
@@ -47,6 +48,7 @@ impl Selection {
                 || r.filename.chars().any(char::is_control)
                 || !crate::photo_sources::is_media_filename(&r.filename)
                 || !seen.insert((&r.asset, r.index))
+                || !originals.insert((&r.asset, r.kind, &r.filename))
             {
                 return Err("photos_original_resources_unavailable".into());
             }
@@ -209,6 +211,16 @@ pub(crate) fn export(
     Err("photos_macos_required".into())
 }
 impl Resource {
+    pub(crate) fn reference_key(&self, source: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let identity = serde_json::json!([source, self.asset, self.kind, self.filename]);
+        format!(
+            "{:x}",
+            Sha256::digest(
+                format!("frameleaf-desktop/photokit-resource/v1\n{identity}").as_bytes()
+            )
+        )
+    }
     pub fn created(&self) -> i64 {
         self.created
     }
@@ -242,6 +254,40 @@ mod tests {
                 },
             ],
         }
+    }
+    #[test]
+    fn reference_identity_survives_selection_order_metadata_and_ordinal_changes() {
+        let source = "44444444-4444-4444-8444-444444444444";
+        let s = selection();
+        let key = s.resources[0].reference_key(source);
+        assert!(crate::native_runtime::digest_valid(&key, 64));
+        let mut next = s.clone();
+        next.resources.reverse();
+        next.resources[1].index = 7;
+        next.resources[1].modified += 1;
+        next.resources[1].created += 1;
+        next.allow_hydration = true;
+        assert_ne!(
+            s.files().unwrap()[0].relative,
+            next.files().unwrap()[1].relative
+        );
+        assert_eq!(key, next.resources[1].reference_key(source));
+        assert_ne!(key, s.resources[1].reference_key(source));
+        assert_ne!(
+            key,
+            s.resources[0].reference_key("55555555-5555-4555-8555-555555555555")
+        );
+        let mut other = s.resources[0].clone();
+        other.asset = "different-private-id".into();
+        assert_ne!(key, other.reference_key(source));
+        other = s.resources[0].clone();
+        other.filename = "alternate.HEIC".into();
+        assert_ne!(key, other.reference_key(source));
+        let mut ambiguous = s.clone();
+        let mut duplicate = s.resources[0].clone();
+        duplicate.index = 8;
+        ambiguous.resources.push(duplicate);
+        assert!(ambiguous.validate().is_err());
     }
     #[test]
     fn preserves_paired_resources_and_rejects_unsafe_or_unknown_originals() {

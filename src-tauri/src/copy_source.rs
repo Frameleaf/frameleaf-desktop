@@ -47,6 +47,8 @@ pub struct StagedCopy {
     pub file_modified_at_ms: i64,
     source_signature: String,
     source_stamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photos_resource_key: Option<String>,
     relative: String,
     approval: CopyApproval,
     signature: String,
@@ -563,6 +565,7 @@ impl CopyApproval {
         output.sync_all().map_err(|_| "source_stage_write_failed")?;
         drop(output);
         let mut result = StagedCopy {
+            photos_resource_key: Some(resource.reference_key(self.source_id())),
             id: stage_id.into(),
             bytes,
             sha256: format!("{:x}", hash.finalize()),
@@ -804,6 +807,7 @@ impl CopyApproval {
         drop(output);
         let approval = self.clone();
         let mut result = StagedCopy {
+            photos_resource_key: None,
             id,
             bytes,
             sha256: format!("{:x}", hash.finalize()),
@@ -962,6 +966,9 @@ impl StagedCopy {
             }
     }
     pub(crate) fn resource_key(&self) -> String {
+        if let Some(key) = &self.photos_resource_key {
+            return key.clone();
+        }
         format!(
             "{:x}",
             Sha256::digest(format!("{}\n{}", self.source_signature, self.relative).as_bytes())
@@ -1058,20 +1065,20 @@ impl StagedCopy {
         Ok(())
     }
     fn sign(&self, identity: &DeviceIdentity) -> Result<String, String> {
-        signed(
-            identity,
-            "copy-stage",
-            &(
-                &self.id,
-                self.bytes,
-                &self.sha256,
-                self.file_created_at_ms,
-                self.file_modified_at_ms,
-                &self.source_signature,
-                &self.source_stamp,
-                &self.relative,
-            ),
-        )
+        let receipt = (
+            &self.id,
+            self.bytes,
+            &self.sha256,
+            self.file_created_at_ms,
+            self.file_modified_at_ms,
+            &self.source_signature,
+            &self.source_stamp,
+            &self.relative,
+        );
+        match &self.photos_resource_key {
+            Some(key) => signed(identity, "copy-stage-photos-key", &(receipt, key)),
+            None => signed(identity, "copy-stage", &receipt),
+        }
     }
     pub(crate) fn validate_receipt(
         &self,
@@ -1087,6 +1094,21 @@ impl StagedCopy {
             || self.signature != self.sign(identity)?
         {
             return Err("source_stage_invalid".into());
+        }
+        if let Some(key) = &self.photos_resource_key {
+            let photos = self
+                .approval
+                .scope
+                .photos
+                .as_ref()
+                .ok_or("source_stage_invalid")?;
+            let resource = photos.resource(&self.relative)?;
+            if key != &resource.reference_key(self.source_id())
+                || self.source_stamp
+                    != serde_json::to_string(resource).map_err(|_| "source_stage_invalid")?
+            {
+                return Err("source_stage_invalid".into());
+            }
         }
         Ok(())
     }
@@ -1332,6 +1354,7 @@ mod tests {
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
         let meta = dir.symlink_metadata("photo.jpg").unwrap();
         let mut copy = StagedCopy {
+            photos_resource_key: None,
             id: Uuid::new_v4().to_string(),
             bytes: 8,
             sha256: format!("{:x}", Sha256::digest(b"original")),
@@ -1483,6 +1506,107 @@ mod tests {
         ] {
             assert!(approval.export_maximum(maximum).is_err());
         }
+        let photos = approval.scope.photos.as_ref().unwrap();
+        let resource = photos.resource("0/original.HEIC").unwrap();
+        let mut staged = StagedCopy {
+            id: Uuid::new_v4().to_string(),
+            bytes: 5,
+            sha256: "a".repeat(64),
+            file_created_at_ms: resource.created(),
+            file_modified_at_ms: resource.modified(),
+            source_signature: approval.signature.clone(),
+            source_stamp: serde_json::to_string(resource).unwrap(),
+            relative: "0/original.HEIC".into(),
+            approval: approval.clone(),
+            signature: String::new(),
+            photos_resource_key: Some(resource.reference_key(approval.source_id())),
+        };
+        staged.signature = staged.sign(&identity).unwrap();
+        staged.validate_receipt(&saved, &identity).unwrap();
+        let key = staged.resource_key();
+        let encoded = serde_json::to_value(&staged).unwrap();
+        let mut removed = encoded.clone();
+        removed.as_object_mut().unwrap().remove("photosResourceKey");
+        assert!(serde_json::from_value::<StagedCopy>(removed)
+            .unwrap()
+            .validate_receipt(&saved, &identity)
+            .is_err());
+        let mut altered_key = staged.clone();
+        altered_key.photos_resource_key = Some("f".repeat(64));
+        altered_key.signature = altered_key.sign(&identity).unwrap();
+        assert!(altered_key.validate_receipt(&saved, &identity).is_err());
+        // Legacy signed receipts keep their original key; rescans must reconcile their provider aliases.
+        let mut legacy = staged.clone();
+        legacy.photos_resource_key = None;
+        legacy.signature = legacy.sign(&identity).unwrap();
+        legacy.validate_receipt(&saved, &identity).unwrap();
+        assert_eq!(
+            legacy.signature,
+            signed(
+                &identity,
+                "copy-stage",
+                &(
+                    &legacy.id,
+                    legacy.bytes,
+                    &legacy.sha256,
+                    legacy.file_created_at_ms,
+                    legacy.file_modified_at_ms,
+                    &legacy.source_signature,
+                    &legacy.source_stamp,
+                    &legacy.relative,
+                )
+            )
+            .unwrap()
+        );
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("photosResourceKey").is_none());
+        let restored: StagedCopy = serde_json::from_value(encoded).unwrap();
+        restored.validate_receipt(&saved, &identity).unwrap();
+        assert_eq!(
+            restored.resource_key(),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    format!("{}\n{}", legacy.source_signature, legacy.relative).as_bytes()
+                )
+            )
+        );
+        assert_ne!(legacy.resource_key(), key);
+        let mut injected = restored.clone();
+        injected.photos_resource_key = staged.photos_resource_key.clone();
+        assert!(injected.validate_receipt(&saved, &identity).is_err());
+        // A new, explicitly signed selection changes authority and ordinal, but preserves resource identity.
+        let mut changed = serde_json::to_value(&approval.scope).unwrap();
+        changed["photos"]["resources"][0]["index"] = serde_json::json!(7);
+        changed["photos"]["resources"][0]["modified"] = serde_json::json!(3000);
+        changed["photos"]["resources"].as_array_mut().unwrap().insert(0, serde_json::json!({
+            "asset":"another-private-id","created":1000,"modified":2000,"index":0,"kind":1,"filename":"other.jpg"
+        }));
+        changed["photos"]["assets"] = serde_json::json!(2);
+        let scope: CopyScope = serde_json::from_value(changed).unwrap();
+        let next = CopyApproval {
+            signature: signed(&identity, "copy-approval", &scope).unwrap(),
+            scope,
+        };
+        let next_resource = next
+            .scope
+            .photos
+            .as_ref()
+            .unwrap()
+            .resource("1/original.HEIC")
+            .unwrap();
+        let mut next_copy = staged.clone();
+        next_copy.photos_resource_key = Some(next_resource.reference_key(next.source_id()));
+        next_copy.relative = "1/original.HEIC".into();
+        next_copy.source_stamp = serde_json::to_string(next_resource).unwrap();
+        next_copy.file_modified_at_ms = next_resource.modified();
+        next_copy.source_signature = next.signature.clone();
+        next_copy.approval = next;
+        next_copy.signature = next_copy.sign(&identity).unwrap();
+        next_copy.validate_receipt(&saved, &identity).unwrap();
+        assert_eq!(next_copy.resource_key(), key);
+        assert_ne!(next_copy.scope_fingerprint(), staged.scope_fingerprint());
+        assert_ne!(next_copy.version(), staged.version());
         let mut denied = approval.clone();
         denied.scope.allow_download = false;
         assert!(denied.export_maximum(Some(6)).is_err());
