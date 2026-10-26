@@ -28,13 +28,36 @@ async fn action(base: &Path, saved: &SavedConnection, source: &str, recover: Opt
         send.send_replace(value);
     });
     if let Some(key) = recover {
+        let status = owner
+            .reference_status(base.to_owned(), saved.clone(), source.into())
+            .await
+            .unwrap()
+            .unwrap();
+        owner.stop().await.unwrap();
+        let entry = status
+            .publications
+            .iter()
+            .find(|entry| entry.resource_key == key)
+            .unwrap();
+        let request = RecoveryRequest {
+            source_id: source.into(),
+            resource_key: key.into(),
+            record_id: entry.record_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let source = source.to_owned();
         owner
-            .recover_reference(
+            .start_reference_recovery(
                 base.to_owned(),
                 saved.clone(),
-                source.into(),
-                key.into(),
-                notify,
+                request,
+                Arc::new(move |value| {
+                    notify(View {
+                        source_id: source.clone(),
+                        state: value.state,
+                        code: value.code,
+                    })
+                }),
             )
             .await
             .unwrap();
@@ -271,6 +294,39 @@ fn actual_native_reference_publication() {
         assert_eq!(local.publications.len(), 1);
         assert_eq!(local.publications[0].state, "publish");
         assert!(local.publications[0].receipt.is_none());
+        assert_eq!(fs::read(journal.root.join(&name)).unwrap(), pending_before);
+        let stale_owner = Requests::default();
+        let (stale_send, mut stale_receive) = tokio::sync::watch::channel(None::<RecoveryWork>);
+        stale_owner
+            .start_reference_recovery(
+                base.clone(),
+                saved.clone(),
+                RecoveryRequest {
+                    source_id: source.clone(),
+                    resource_key: selected.resource_key.clone(),
+                    record_id: "f".repeat(64),
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                },
+                Arc::new(move |work| {
+                    stale_send.send_replace(Some(work));
+                }),
+            )
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stale_receive.wait_for(|work| {
+                work.as_ref()
+                    .is_some_and(|work| work.state == "needs-attention")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone()
+        .unwrap();
+        assert_eq!(refused.code.as_deref(), Some("source_publication_changed"));
+        stale_owner.stop().await.unwrap();
         assert_eq!(fs::read(journal.root.join(&name)).unwrap(), pending_before);
         let second = action(&base, &saved, &source, Some(&selected.resource_key)).await;
         assert_eq!(

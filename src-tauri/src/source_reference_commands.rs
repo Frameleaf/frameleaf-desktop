@@ -88,7 +88,7 @@ pub(crate) async fn start_photo_reference_read(
     source_id: String,
     expected_scan: String,
     request_id: String,
-) -> Result<source_reads::PreparationWork, String> {
+) -> Result<source_reads::ReferenceWork, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
@@ -106,10 +106,14 @@ pub(crate) async fn start_photo_reference_read(
             saved.clone(),
             request,
             std::sync::Arc::new(move |work| {
-                let _ = events.emit("photo-reference-preparation", work);
+                let _ = events.emit(
+                    "photo-reference-work",
+                    source_reads::ReferenceWork::Prepare(work),
+                );
             }),
         )
         .await
+        .map(source_reads::ReferenceWork::Prepare)
 }
 #[tauri::command]
 pub(crate) async fn pause_photo_reference_read(
@@ -119,7 +123,7 @@ pub(crate) async fn pause_photo_reference_read(
     source_id: String,
     expected_scan: String,
     request_id: String,
-) -> Result<source_reads::PreparationWork, String> {
+) -> Result<source_reads::ReferenceWork, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
@@ -134,20 +138,82 @@ pub(crate) async fn pause_photo_reference_read(
             },
         )
         .await
+        .map(source_reads::ReferenceWork::Prepare)
 }
 #[tauri::command]
-pub(crate) async fn photo_reference_read_status(
+pub(crate) async fn photo_reference_work_status(
     window: WebviewWindow,
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     source_id: String,
-) -> Result<Option<source_reads::PreparationWork>, String> {
+) -> Result<Option<source_reads::ReferenceWork>, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     app.state::<source_reads::Requests>()
-        .reference_preparation_status(saved, &source_id)
+        .reference_work_status(saved, &source_id)
         .await
+}
+#[tauri::command]
+pub(crate) async fn start_photo_reference_recovery(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    resource_key: String,
+    expected_record: String,
+    request_id: String,
+) -> Result<source_reads::ReferenceWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &source_id)?;
+    let events = app.clone();
+    app.state::<source_reads::Requests>()
+        .start_reference_recovery(
+            import_base(&app)?,
+            saved.clone(),
+            source_reads::RecoveryRequest {
+                source_id,
+                resource_key,
+                record_id: expected_record,
+                request_id,
+            },
+            std::sync::Arc::new(move |work| {
+                let _ = events.emit(
+                    "photo-reference-work",
+                    source_reads::ReferenceWork::Recover(work),
+                );
+            }),
+        )
+        .await
+        .map(source_reads::ReferenceWork::Recover)
+}
+#[tauri::command]
+pub(crate) async fn pause_photo_reference_recovery(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    resource_key: String,
+    expected_record: String,
+    request_id: String,
+) -> Result<source_reads::ReferenceWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    app.state::<source_reads::Requests>()
+        .pause_reference_recovery(
+            saved,
+            source_reads::RecoveryRequest {
+                source_id,
+                resource_key,
+                record_id: expected_record,
+                request_id,
+            },
+        )
+        .await
+        .map(source_reads::ReferenceWork::Recover)
 }
 #[cfg(test)]
 mod tests {

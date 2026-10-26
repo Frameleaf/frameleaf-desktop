@@ -184,6 +184,21 @@ impl State {
     }
 }
 impl Publication {
+    fn record_id(state: &State) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"frameleaf/reference-publication-record/v1");
+        hash.update(serde_json::to_vec(state).map_err(|_| "source_publication_invalid")?);
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    pub(super) fn require_record(&self, expected: &str) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(expected, 64)
+            || Self::record_id(&self.state)? != expected
+        {
+            return Err("source_publication_changed".into());
+        }
+        Ok(())
+    }
     fn begin(
         root: &Path,
         binding: Binding,
@@ -451,6 +466,7 @@ impl Publication {
 #[serde(rename_all = "camelCase")]
 pub struct PublicationStatus {
     pub resource_key: String,
+    pub record_id: String,
     pub original_file_name: String,
     pub state: String,
     pub receipt: Option<Receipt>,
@@ -506,6 +522,7 @@ pub(super) fn catalog(
         };
         entries.push(PublicationStatus {
             resource_key: b.resource_key.clone(),
+            record_id: Publication::record_id(&state)?,
             original_file_name: target.original_file_name.clone(),
             state: phase.into(),
             receipt: state
@@ -729,12 +746,21 @@ mod tests {
         let before = std::fs::read(f.root.join(&p.name)).unwrap();
         let entries = read().unwrap();
         assert_eq!(entries[0].state, "publish");
+        assert!(crate::native_runtime::digest_valid(
+            &entries[0].record_id,
+            64
+        ));
+        assert_eq!(entries[0].record_id, read().unwrap()[0].record_id);
+        assert!(p.require_record(&entries[0].record_id).is_ok());
+        assert!(p.require_record(&"f".repeat(64)).is_err());
         assert_eq!(entries[0].original_file_name, "original.jpg");
         assert_eq!(entries[0].resource_key, f.binding.resource_key);
         assert!(entries[0].receipt.is_none());
         assert_eq!(std::fs::read(f.root.join(&p.name)).unwrap(), before);
         p.recover_receipt(f.response(&p), &f.identity).unwrap();
         assert_eq!(read().unwrap()[0].state, "complete");
+        assert_ne!(entries[0].record_id, read().unwrap()[0].record_id);
+        assert!(p.require_record(&entries[0].record_id).is_err());
         let receipt = read().unwrap()[0].receipt.clone().unwrap();
         f.complete(&mut p);
         assert_eq!(read().unwrap()[0].state, "recorded");

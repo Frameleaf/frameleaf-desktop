@@ -8,6 +8,7 @@ use crate::connection::{DeviceIdentity, SavedConnection};
 use cap_std::{ambient_authority, fs::Dir};
 pub use preparation::PreparationAction;
 pub use reading::{PreparationRequest, PreparationWork};
+pub use recovery::{RecoveryRequest, RecoveryWork};
 use serde::Serialize;
 use std::{
     future::Future,
@@ -95,8 +96,53 @@ impl Drop for Stop {
         self.request();
     }
 }
+#[derive(Clone, PartialEq, Eq)]
+enum OperationKey {
+    Prepare(reading::Key),
+    Recovery(recovery::Key),
+}
+impl OperationKey {
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Prepare(key) => &key.request.request_id,
+            Self::Recovery(key) => &key.request.request_id,
+        }
+    }
+    fn preparation(&self) -> Option<&reading::Key> {
+        if let Self::Prepare(key) = self {
+            Some(key)
+        } else {
+            None
+        }
+    }
+    fn recovery(&self) -> Option<&recovery::Key> {
+        if let Self::Recovery(key) = self {
+            Some(key)
+        } else {
+            None
+        }
+    }
+    fn matches(&self, saved: &SavedConnection, source: &str) -> bool {
+        match self {
+            Self::Prepare(key) => key.matches(saved, source),
+            Self::Recovery(key) => key.matches(saved, source),
+        }
+    }
+    fn view(&self, view: View) -> ReferenceWork {
+        match self {
+            Self::Prepare(key) => ReferenceWork::Prepare(key.view(view)),
+            Self::Recovery(key) => ReferenceWork::Recover(key.view(view)),
+        }
+    }
+}
+#[derive(Clone, Serialize)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum ReferenceWork {
+    Prepare(PreparationWork),
+    Recover(RecoveryWork),
+}
 struct Running {
-    preparation: Option<reading::Key>,
+    operation: Option<OperationKey>,
     stop: Stop,
     task: tauri::async_runtime::JoinHandle<Result<(), String>>,
 }
@@ -195,7 +241,7 @@ impl Requests {
         source: String,
         notify: Arc<dyn Fn(View) + Send + Sync>,
         replace: bool,
-        preparation: Option<reading::Key>,
+        operation: Option<OperationKey>,
         work: F,
     ) -> Result<View, String>
     where
@@ -203,16 +249,16 @@ impl Requests {
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let mut owner = self.owner.lock().await;
-        if let Some(key) = &preparation {
+        if let Some(key) = &operation {
             if let Some(previous) = owner
                 .running
                 .as_ref()
-                .and_then(|running| running.preparation.as_ref())
+                .and_then(|running| running.operation.as_ref())
             {
                 if previous == key {
                     return Ok(self.status());
                 }
-                if previous.request.request_id == key.request.request_id {
+                if previous.request_id() == key.request_id() {
                     return Err("source_read_request_invalid".into());
                 }
             }
@@ -256,7 +302,7 @@ impl Requests {
             result
         });
         owner.running = Some(Running {
-            preparation,
+            operation,
             stop: Stop {
                 cancelled,
                 changed: send,
@@ -264,6 +310,25 @@ impl Requests {
             task,
         });
         Ok(self.status())
+    }
+    pub async fn reference_work_status(
+        &self,
+        saved: &SavedConnection,
+        source: &str,
+    ) -> Result<Option<ReferenceWork>, String> {
+        if !super::canonical_uuid(source) {
+            return Err("source_read_request_invalid".into());
+        }
+        let owner = self.owner.lock().await;
+        if owner.failed || self.status().code.as_deref().is_some_and(unconfirmed) {
+            return Err("source_read_shutdown_unconfirmed".into());
+        }
+        Ok(owner
+            .running
+            .as_ref()
+            .and_then(|running| running.operation.as_ref())
+            .filter(|key| key.matches(saved, source))
+            .map(|key| key.view(self.status())))
     }
     /// Called only after local reference approval and resource allowances exist; no UI activates it yet.
     pub async fn start(
@@ -705,7 +770,7 @@ mod tests {
                 source.clone(),
                 notify(),
                 false,
-                Some(key),
+                Some(OperationKey::Prepare(key)),
                 move |_, signal| async move {
                     while !signal.cancelled.load(Ordering::Acquire) {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -723,7 +788,7 @@ mod tests {
                 source.clone(),
                 notify(),
                 false,
-                Some(duplicate),
+                Some(OperationKey::Prepare(duplicate)),
                 |_, _| async move { panic!("duplicate request must not install another producer") },
             )
             .await
@@ -771,6 +836,72 @@ mod tests {
         let mut pause = Box::pin(owner.pause_reference_preparation(&saved, requested.clone()));
         tokio::select! {result=&mut pause=>panic!("pause returned before producer drained: {}",result.err().unwrap_or_default()),result=stopping=>result.unwrap(),}
         assert!(owner.is_active());
+        finish.send(()).unwrap();
+        assert_eq!(pause.await.unwrap().state, "paused");
+        assert!(!owner.is_active());
+        let recovery = RecoveryRequest {
+            source_id: source.clone(),
+            resource_key: "c".repeat(64),
+            record_id: "d".repeat(64),
+            request_id: request.clone(),
+        };
+        let key = recovery::Key::new(&saved, recovery.clone()).unwrap();
+        let (observed, stopping) = tokio::sync::oneshot::channel();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        owner
+            .install_checked(
+                source.clone(),
+                notify(),
+                false,
+                Some(OperationKey::Recovery(key)),
+                move |_, signal| async move {
+                    while !signal.cancelled.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    observed.send(()).unwrap();
+                    let _ = wait.await;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let duplicate = owner
+            .start_reference_recovery(
+                PathBuf::new(),
+                saved.clone(),
+                recovery.clone(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.request.record_id, recovery.record_id);
+        let mut another = recovery.clone();
+        another.request_id = uuid::Uuid::new_v4().to_string();
+        assert!(owner
+            .start_reference_recovery(PathBuf::new(), saved.clone(), another, Arc::new(|_| {}))
+            .await
+            .is_err());
+        assert!(owner
+            .pause_reference_preparation(&saved, requested)
+            .await
+            .is_err());
+        let mut stale = recovery.clone();
+        stale.record_id = "e".repeat(64);
+        assert!(owner.pause_reference_recovery(&saved, stale).await.is_err());
+        assert!(owner
+            .pause_reference_recovery(&foreign, recovery.clone())
+            .await
+            .is_err());
+        let current = owner
+            .reference_work_status(&saved, &source)
+            .await
+            .unwrap()
+            .unwrap();
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["operation"], "recover");
+        assert_eq!(value["recordId"], recovery.record_id);
+        let mut pause = Box::pin(owner.pause_reference_recovery(&saved, recovery));
+        tokio::select! {result=&mut pause=>panic!("recovery pause returned before drain: {}",result.err().unwrap_or_default()),result=stopping=>result.unwrap(),}
         finish.send(()).unwrap();
         assert_eq!(pause.await.unwrap().state, "paused");
         assert!(!owner.is_active());

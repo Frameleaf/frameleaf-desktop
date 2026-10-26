@@ -3,7 +3,7 @@
   import { onMount } from 'svelte';
   import ReferenceRead from './ReferenceRead.svelte';
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
-  type Publication = { resourceKey: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null };
+  type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null };
   type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[] };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
@@ -105,7 +105,7 @@
 <section aria-label="Saved reference scans" aria-busy={busy}>
   <h3>Saved reference scans</h3>
   <p class="footnote">Inspect saved preparation and staging reservations without opening or downloading originals.</p>
-  <ReferenceRead {sourceId} scan={status?.scans.find(value => value.current) ?? null} disabled={busy} onActiveChange={value => reading = value} onSettled={() => void refresh()} />
+  <ReferenceRead {sourceId} scan={status?.scans.find(value => value.current) ?? null} publications={status?.publications ?? []} disabled={busy} onActiveChange={value => reading = value} onSettled={() => void refresh()} />
   <button class="text-button" disabled={busy || reading} onclick={refresh}>Refresh saved scans</button>
   {#if busy}<p role="status">Checking saved reference work…</p>{/if}
   {#if message}<p role="status">{message}</p>{/if}

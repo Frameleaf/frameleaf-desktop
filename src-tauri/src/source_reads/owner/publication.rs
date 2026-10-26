@@ -195,7 +195,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn stop_cancels_capability_wait_before_inventory_or_publication() {
-        for recovery in [false, true] {
+        {
             use tokio::io::AsyncReadExt;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -215,23 +215,10 @@ mod tests {
                 device_id: Some("22222222-2222-4222-8222-222222222222".into()),
             };
             let owner = Requests::default();
-            if recovery {
-                owner
-                    .recover_reference(
-                        base.clone(),
-                        saved,
-                        source.into(),
-                        "a".repeat(64),
-                        Arc::new(|_| {}),
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                owner
-                    .publish_reference(base.clone(), saved, source.into(), Arc::new(|_| {}))
-                    .await
-                    .unwrap();
-            }
+            owner
+                .publish_reference(base.clone(), saved, source.into(), Arc::new(|_| {}))
+                .await
+                .unwrap();
             let (mut stream, _) =
                 tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
                     .await

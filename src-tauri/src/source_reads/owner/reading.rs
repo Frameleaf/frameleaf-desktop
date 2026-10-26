@@ -23,7 +23,7 @@ pub(super) struct Key {
     pub(super) request: PreparationRequest,
     session: String,
 }
-fn session(saved: &SavedConnection) -> String {
+pub(super) fn session(saved: &SavedConnection) -> String {
     let mut hash = Sha256::new();
     hash.update(b"frameleaf/reference-preparation-session/v1");
     for value in [
@@ -54,7 +54,10 @@ impl Key {
             session: session(saved),
         })
     }
-    fn view(&self, view: View) -> PreparationWork {
+    pub(super) fn matches(&self, saved: &SavedConnection, source: &str) -> bool {
+        self.request.source_id == source && self.session == session(saved)
+    }
+    pub(super) fn view(&self, view: View) -> PreparationWork {
         PreparationWork {
             request: self.request.clone(),
             state: view.state,
@@ -102,7 +105,7 @@ impl Requests {
                 key.request.source_id.clone(),
                 Arc::new(move |view| notify(event_key.view(view))),
                 false,
-                Some(key.clone()),
+                Some(OperationKey::Prepare(key.clone())),
                 move |progress, signal| async move {
                     progress.set("preparing", None);
                     tauri::async_runtime::spawn_blocking(move || {
@@ -138,6 +141,7 @@ impl Requests {
             .await?;
         Ok(key.view(view))
     }
+    #[cfg(test)]
     pub async fn reference_preparation_status(
         &self,
         saved: &SavedConnection,
@@ -153,7 +157,12 @@ impl Requests {
         Ok(owner
             .running
             .as_ref()
-            .and_then(|running| running.preparation.as_ref())
+            .and_then(|running| {
+                running
+                    .operation
+                    .as_ref()
+                    .and_then(OperationKey::preparation)
+            })
             .filter(|key| key.request.source_id == source && key.session == session(saved))
             .map(|key| key.view(self.status())))
     }
@@ -165,11 +174,12 @@ impl Requests {
     ) -> Result<PreparationWork, String> {
         let key = Key::new(saved, request)?;
         let mut owner = self.owner.lock().await;
-        if owner
-            .running
-            .as_ref()
-            .and_then(|running| running.preparation.as_ref())
-            != Some(&key)
+        if owner.running.as_ref().and_then(|running| {
+            running
+                .operation
+                .as_ref()
+                .and_then(OperationKey::preparation)
+        }) != Some(&key)
         {
             return Err("source_read_operation_changed".into());
         }
