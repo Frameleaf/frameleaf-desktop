@@ -390,6 +390,14 @@ impl Consent {
         }
         Ok(self.approval.fingerprint())
     }
+    pub(crate) fn reference_control_approval(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<&CopyApproval, String> {
+        self.reference_metadata_scope(saved, identity)?;
+        Ok(&self.approval)
+    }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()
     }

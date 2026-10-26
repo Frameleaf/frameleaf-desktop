@@ -124,6 +124,9 @@ impl Preparation {
         identity: &DeviceIdentity,
     ) -> Result<Vec<PreparedResource>, String> {
         self.current(saved, identity)?;
+        if self.progress(saved, identity)?.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
         self.resources_with(saved, identity)
     }
     pub(super) fn resources_with(
@@ -171,6 +174,9 @@ impl Preparation {
         copy: &StagedCopy,
     ) -> Result<(), String> {
         let mut state = self.progress(saved, identity)?;
+        if state.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
         if state
             .resource
             .as_ref()

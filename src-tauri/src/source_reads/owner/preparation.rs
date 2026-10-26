@@ -13,6 +13,9 @@ pub enum PreparationAction {
         additional: u64,
     },
     Reconcile,
+    Abandon {
+        expected_scan: String,
+    },
     Rescan {
         relatives: Vec<String>,
         expected_scan: String,
@@ -35,7 +38,11 @@ impl Requests {
         let selected_source = source.clone();
         self.prepare_owned(source, notify, move |cancelled, stop| {
             stop()?;
-            let identity = authority(&base, &saved, &selected_source)?;
+            let identity = if matches!(&action, PreparationAction::Abandon { .. }) {
+                crate::credentials::identity()?
+            } else {
+                authority(&base, &saved, &selected_source)?
+            };
             match action {
                 PreparationAction::Plan { relative } => {
                     Preparation::plan(&base, &saved, &identity, &selected_source, &relative)?
@@ -59,6 +66,10 @@ impl Requests {
                     &expected_scan,
                     stop,
                 ),
+                PreparationAction::Abandon { expected_scan } => {
+                    Preparation::resume_control(&base, &saved, &identity, &selected_source)?
+                        .abandon(&saved, &identity, &expected_scan, stop)
+                }
                 PreparationAction::Reconcile => {
                     Preparation::resume(&base, &saved, &identity, &selected_source)?
                         .reconcile_capacity(&saved, &identity, stop)

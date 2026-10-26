@@ -22,6 +22,8 @@ struct Plan {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Progress {
     plan_hash: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    abandoned: bool,
     read: Budget,
     attempt: Option<String>,
     resource: Option<StagedCopy>,
@@ -31,6 +33,9 @@ struct Progress {
     released_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attempt_bytes: Option<u64>,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 const STAGING_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -60,6 +65,7 @@ struct InventoryRecord {
 pub struct PreparationView {
     pub source_id: String,
     pub scan_id: String,
+    pub abandoned: bool,
     pub maximum_bytes: u64,
     pub export: bool,
     pub spent: u64,
@@ -111,6 +117,32 @@ impl Preparation {
     ) -> Result<Self, String> {
         let consent = crate::source_import::current(saved, identity, source)?;
         let approval = consent.reference_approval(saved, identity)?.clone();
+        Self::open_recorded(base, saved, identity, approval, true)
+    }
+    pub fn resume_control(
+        base: &Path,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        source: &str,
+    ) -> Result<Self, String> {
+        let consent = crate::credentials::load::<crate::source_consent::Consent>(
+            crate::source_consent::CREDENTIAL,
+        )?
+        .ok_or("source_approval_required")?;
+        if consent.source_id() != source {
+            return Err("source_approval_changed".into());
+        }
+        let approval = consent.reference_control_approval(saved, identity)?.clone();
+        Self::open_recorded(base, saved, identity, approval, false)
+    }
+    fn open_recorded(
+        base: &Path,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        approval: CopyApproval,
+        provider: bool,
+    ) -> Result<Self, String> {
+        let source = approval.source_id();
         if !canonical_uuid(source) {
             return Err("source_stage_invalid".into());
         }
@@ -120,7 +152,7 @@ impl Preparation {
         let plan: Plan = journal.read("preparation-plan.json", identity)?;
         let mut entries = vec![plan.entry];
         entries.extend(plan.additional);
-        Self::open_selection(base, saved, identity, approval, entries, false)
+        Self::open_selection_checked(base, saved, identity, approval, entries, false, provider)
     }
     #[cfg(test)]
     pub(super) fn open_with(
@@ -141,7 +173,23 @@ impl Preparation {
         entries: Vec<SourceFile>,
         create: bool,
     ) -> Result<Self, String> {
-        approval.validate_current(saved, identity)?;
+        Self::open_selection_checked(base, saved, identity, approval, entries, create, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn open_selection_checked(
+        base: &Path,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        approval: CopyApproval,
+        entries: Vec<SourceFile>,
+        create: bool,
+        provider: bool,
+    ) -> Result<Self, String> {
+        if provider {
+            approval.validate_current(saved, identity)?;
+        } else {
+            approval.validate(saved, identity)?;
+        }
         if !canonical_uuid(approval.source_id()) {
             return Err("source_read_budget_invalid".into());
         }
@@ -200,6 +248,7 @@ impl Preparation {
                 "preparation-state.json",
                 &Progress {
                     plan_hash: hash(&plan)?,
+                    abandoned: false,
                     read: Budget { used: 0, limit: 0 },
                     attempt: None,
                     resource: None,
@@ -258,7 +307,7 @@ impl Preparation {
         identity: &DeviceIdentity,
     ) -> Result<Progress, String> {
         self.require_owner()?;
-        self.approval.validate_current(saved, identity)?;
+        self.approval.validate(saved, identity)?;
         self.plan.validate_photos(&self.approval)?;
         let active: Plan = self.journal.read("preparation-plan.json", identity)?;
         if hash(&active)? != self.plan_hash {
@@ -312,15 +361,79 @@ impl Preparation {
         Ok(PreparationView {
             source_id: self.plan.source.clone(),
             scan_id: self.plan_hash.clone(),
+            abandoned: state.abandoned,
             maximum_bytes: self.total_bytes,
             export: self.plan.export,
             spent: state.read.used,
-            remaining: state.read.limit - state.read.used,
-            prepared: state.position() == self.plan.count(),
+            remaining: if state.abandoned {
+                0
+            } else {
+                state.read.limit - state.read.used
+            },
+            prepared: !state.abandoned && state.position() == self.plan.count(),
             resources: self.plan.count(),
             completed: state.position(),
             staging_remaining,
         })
+    }
+    fn current_control(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<(), String> {
+        self.require_owner()?;
+        let consent = crate::credentials::load::<crate::source_consent::Consent>(
+            crate::source_consent::CREDENTIAL,
+        )?
+        .ok_or("source_approval_required")?;
+        if consent.source_id() != self.plan.source
+            || consent.reference_metadata_scope(saved, identity)? != self.plan.scope
+        {
+            return Err("source_approval_changed".into());
+        }
+        Ok(())
+    }
+    pub fn abandon(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<PreparationView, String> {
+        self.abandon_state(saved, identity, expected, &|| {
+            self.current_control(saved, identity)?;
+            gate()
+        })
+    }
+    fn abandon_state(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+        gate: &dyn Fn() -> Result<(), String>,
+    ) -> Result<PreparationView, String> {
+        gate()?;
+        if expected != self.plan_hash {
+            return Err("source_scan_changed".into());
+        }
+        let mut state = self.progress(saved, identity)?;
+        if !state.abandoned {
+            state.abandoned = true;
+            gate()?;
+            self.journal
+                .write(&self.plan.state_name(), &state, identity)?;
+        }
+        self.view(saved, identity)
+    }
+    #[cfg(test)]
+    pub(super) fn abandon_with(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+        gate: &dyn Fn() -> Result<(), String>,
+    ) -> Result<PreparationView, String> {
+        self.abandon_state(saved, identity, expected, gate)
     }
     pub fn rescan(
         &mut self,
@@ -402,6 +515,9 @@ impl Preparation {
         additional: u64,
     ) -> Result<(), String> {
         let mut state = self.progress(saved, identity)?;
+        if state.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
         if additional == 0
             || additional > self.total_bytes.saturating_mul(2)
             || state.resource.is_some()
@@ -457,6 +573,9 @@ impl Preparation {
         };
         check()?;
         let state = self.progress(saved, identity)?;
+        if state.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
         if state.position() == self.plan.count() {
             return self.view(saved, identity);
         }
@@ -490,6 +609,9 @@ impl Preparation {
     ) -> Result<Arc<Job>, String> {
         gate()?;
         let state = self.progress(saved, identity)?;
+        if state.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
         let copy = state.resource.ok_or("source_stage_unavailable")?;
         let base = self
             .journal
@@ -545,6 +667,9 @@ impl Preparation {
             gate()
         };
         check()?;
+        if self.progress(saved, identity)?.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
         let _capacity_owner = self.reconcile_with(saved, identity, &check)?;
         let mut state = self.progress(saved, identity)?;
         let entry = self.plan.entry_at(state.position())?;

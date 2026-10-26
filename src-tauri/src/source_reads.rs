@@ -825,6 +825,106 @@ mod tests {
         }
     }
     #[test]
+    fn abandonment_preserves_spent_allowance_partial_cache_and_explicit_restart() {
+        let f = Fixture::new();
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 20).unwrap();
+        let copy = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let before = prep.view(&f.saved, &f.identity).unwrap();
+        let bytes = fs::read(prep.journal.root.join("preparation-state.json")).unwrap();
+        assert!(prep
+            .abandon_with(&f.saved, &f.identity, &"f".repeat(64), &|| Ok(()))
+            .is_err());
+        assert!(prep
+            .abandon_with(&f.saved, &f.identity, &before.scan_id, &|| Err(
+                "source_copy_cancelled".into()
+            ))
+            .is_err());
+        assert_eq!(
+            fs::read(prep.journal.root.join("preparation-state.json")).unwrap(),
+            bytes
+        );
+        let ended = prep
+            .abandon_with(&f.saved, &f.identity, &before.scan_id, &|| Ok(()))
+            .unwrap();
+        assert!(ended.abandoned);
+        assert!(!ended.prepared);
+        assert_eq!((ended.spent, ended.remaining), (10, 0));
+        let state: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        assert_eq!(state["read"], serde_json::json!({"used":10,"limit":20}));
+        assert_eq!(state["resource"]["id"], copy.id);
+        assert_eq!(
+            fs::read(
+                prep.journal
+                    .root
+                    .join("stage")
+                    .join(&copy.id)
+                    .join("original")
+            )
+            .unwrap(),
+            b"abcdefghij"
+        );
+        assert!(prep.approve_with(&f.saved, &f.identity, 1).is_err());
+        assert!(prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .is_err());
+        assert!(prep
+            .handoff_with(&f.saved, &f.identity, &|| Ok(()))
+            .is_err());
+        assert!(prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .is_err());
+        assert!(
+            prep.abandon_with(&f.saved, &f.identity, &before.scan_id, &|| Ok(()))
+                .unwrap()
+                .abandoned
+        );
+        let restarted = prep
+            .rescan_with(&f.saved, &f.identity, vec![entry], &ended.scan_id, &|| {
+                Ok(())
+            })
+            .unwrap();
+        assert!(!restarted.abandoned);
+        assert_eq!((restarted.spent, restarted.remaining), (0, 0));
+        assert_ne!(restarted.scan_id, ended.scan_id);
+        assert!(prep
+            .abandon_with(&f.saved, &f.identity, &ended.scan_id, &|| Ok(()))
+            .is_err());
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                .unwrap()
+                .remaining()
+                .unwrap(),
+            crate::private_inputs::LIMIT - 20
+        );
+        let archived: serde_json::Value = prep
+            .journal
+            .read("preparation-state.json", &f.identity)
+            .unwrap();
+        assert_eq!(archived["read"], state["read"]);
+        assert_eq!(archived["abandoned"], true);
+    }
+    #[test]
     fn rescan_preserves_history_reuses_unchanged_resources_and_never_refills_allowances() {
         let f = Fixture::new();
         let entries = || {

@@ -459,6 +459,7 @@ mod tests {
         super::super::PreparationView {
             source_id: "source".into(),
             scan_id: "a".repeat(64),
+            abandoned: false,
             maximum_bytes: 10,
             export: false,
             spent: 10,
