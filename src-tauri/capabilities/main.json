@@ -24,6 +24,7 @@
     "allow-revoke-photo-source",
     "allow-photo-reference-status",
     "allow-approve-photo-reference-transfer",
+    "allow-approve-photo-reference-original-read",
     "allow-control-photo-reference",
     "allow-start-photo-reference-read",
     "allow-start-photo-reference-serving",

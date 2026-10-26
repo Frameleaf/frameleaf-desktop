@@ -149,7 +149,26 @@ impl Requests {
         &self,
         base: PathBuf,
         saved: SavedConnection,
-        input: crate::source_reads::TransferApproval,
+        input: crate::source_reads::AllowanceApproval,
+    ) -> Result<crate::source_reads::TransferStatus, String> {
+        self.approve_reference_allowance(base, saved, input, false)
+            .await
+    }
+    pub async fn approve_reference_read(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        input: crate::source_reads::AllowanceApproval,
+    ) -> Result<crate::source_reads::TransferStatus, String> {
+        self.approve_reference_allowance(base, saved, input, true)
+            .await
+    }
+    async fn approve_reference_allowance(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        input: crate::source_reads::AllowanceApproval,
+        read: bool,
     ) -> Result<crate::source_reads::TransferStatus, String> {
         input.validate()?;
         self.prepare_owned_checked(
@@ -197,14 +216,25 @@ impl Requests {
                     &receipt.version,
                     super::super::OpenMode::Inspect,
                 )?;
-                job.approve_transfer_with(
-                    &saved,
-                    &identity,
-                    receipt,
-                    &expected_scope,
-                    &input,
-                    &check,
-                )
+                if read {
+                    job.approve_read_with(
+                        &saved,
+                        &identity,
+                        receipt,
+                        &expected_scope,
+                        &input,
+                        &check,
+                    )
+                } else {
+                    job.approve_transfer_with(
+                        &saved,
+                        &identity,
+                        receipt,
+                        &expected_scope,
+                        &input,
+                        &check,
+                    )
+                }
             },
         )
         .await

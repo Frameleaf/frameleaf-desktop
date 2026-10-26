@@ -979,7 +979,7 @@ fn actual_native_reference_publication() {
             .find(|entry| entry.resource_key == fresh[0].resource_key)
             .unwrap();
         let transfer = published.transfer.as_ref().unwrap();
-        let approval = TransferApproval {
+        let approval = AllowanceApproval {
             source_id: source.clone(),
             resource_key: published.resource_key.clone(),
             record_id: published.record_id.clone(),
@@ -988,11 +988,11 @@ fn actual_native_reference_publication() {
         };
         assert_eq!(approval.additional, fresh[0].bytes);
         for wrong in [
-            TransferApproval {
+            AllowanceApproval {
                 record_id: "f".repeat(64),
                 ..approval.clone()
             },
-            TransferApproval {
+            AllowanceApproval {
                 additional: approval.additional + 1,
                 ..approval.clone()
             },
@@ -1129,6 +1129,137 @@ fn actual_native_reference_publication() {
         drop(job);
         report(
             json!({"phase":"served-original","bytes":fresh[0].bytes,"additionalOriginalReads":0,"transferUsed":fresh[0].bytes,"workerStopped":true,"sourceAndPriorCacheRetained":true}),
+        );
+        assert_eq!(
+            read_fixture_message(&mut input)["command"],
+            "approve-repeat"
+        );
+        let repeat = Requests::default();
+        let metadata = repeat
+            .reference_status(base.clone(), next.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        repeat.stop().await.unwrap();
+        assert!(metadata.serving.is_none());
+        let published = metadata
+            .publications
+            .iter()
+            .find(|p| p.resource_key == fresh[0].resource_key)
+            .unwrap();
+        let exhausted = published.transfer.as_ref().unwrap();
+        assert!(!exhausted.cache_recorded);
+        assert_eq!(
+            (exhausted.read_used, exhausted.upload_used),
+            (0, fresh[0].bytes)
+        );
+        let read = AllowanceApproval {
+            source_id: source.clone(),
+            resource_key: published.resource_key.clone(),
+            record_id: published.record_id.clone(),
+            state_id: exhausted.state_id.clone(),
+            additional: exhausted.additional_read,
+        };
+        let readable = repeat
+            .approve_reference_read(base.clone(), next.clone(), read.clone())
+            .await
+            .unwrap();
+        repeat.stop().await.unwrap();
+        assert_eq!(
+            (readable.read_remaining, readable.upload_remaining),
+            (fresh[0].bytes, 0)
+        );
+        assert!(repeat
+            .approve_reference_read(base.clone(), next.clone(), read)
+            .await
+            .is_err());
+        repeat.stop().await.unwrap();
+        let transfer = AllowanceApproval {
+            source_id: source.clone(),
+            resource_key: published.resource_key.clone(),
+            record_id: published.record_id.clone(),
+            state_id: readable.state_id.clone(),
+            additional: readable.additional_upload,
+        };
+        let ready = repeat
+            .approve_reference_transfer(base.clone(), next.clone(), transfer)
+            .await
+            .unwrap();
+        repeat.stop().await.unwrap();
+        assert_eq!(
+            (
+                ready.read_remaining,
+                ready.upload_remaining,
+                ready.upload_used
+            ),
+            (fresh[0].bytes, fresh[0].bytes, fresh[0].bytes)
+        );
+        let metadata = repeat
+            .reference_status(base.clone(), next.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        repeat.stop().await.unwrap();
+        let request = ServingRequest {
+            source_id: source.clone(),
+            selection_id: metadata.serving.unwrap().selection_id,
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        report(
+            json!({"phase":"repeat-ready","readRemaining":fresh[0].bytes,"transferRemaining":fresh[0].bytes,"priorTransferSpent":fresh[0].bytes}),
+        );
+        assert_eq!(
+            read_fixture_message(&mut input)["command"],
+            "start-repeat-serving"
+        );
+        repeat
+            .start_serving_for_test(
+                base.clone(),
+                next.clone(),
+                request.clone(),
+                Arc::new(|_| {}),
+                allowed_preparation_policy,
+            )
+            .await
+            .unwrap();
+        report(json!({"phase":"repeat-serving-started"}));
+        assert_eq!(
+            read_fixture_message(&mut input)["command"],
+            "stop-repeat-serving"
+        );
+        repeat
+            .pause_reference_serving(&next, request)
+            .await
+            .unwrap();
+        let job = Job::resume(
+            &base,
+            &next,
+            &identity,
+            &source,
+            &fresh[0].resource_key,
+            &fresh[0].version,
+        )
+        .unwrap();
+        let repeated = job.state(&next, &identity).unwrap();
+        assert!(repeated.stage.is_none());
+        assert_eq!(
+            (
+                repeated.read.used,
+                repeated.read.limit,
+                repeated.upload.used,
+                repeated.upload.limit
+            ),
+            (
+                fresh[0].bytes,
+                fresh[0].bytes,
+                fresh[0].bytes * 2,
+                fresh[0].bytes * 2
+            )
+        );
+        assert_eq!(fs::read(source_root.join("original.jpg")).unwrap(), edited);
+        drop(job);
+        report(
+            json!({"phase":"served-again","bytes":fresh[0].bytes,"additionalOriginalReads":fresh[0].bytes,"transferUsed":fresh[0].bytes*2,"workerStopped":true,"sourceAndPriorCacheRetained":true}),
         );
         assert_eq!(read_fixture_message(&mut input)["command"], "forget");
         crate::source_consent::forget_reference(&source, &next, &identity).unwrap();

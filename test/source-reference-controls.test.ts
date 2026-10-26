@@ -8,7 +8,7 @@ import ts from 'typescript';
 const scan = { scanId: 'a'.repeat(64), current: true, abandoned: false, spent: 10, resources: 2, completed: 0, reservedBytes: 10, discardable: false, remaining: 0, nextReadBytes: 10, additionalReadAllowance: 10, canRescan: false, prepared: false };
 const archived = { ...scan, scanId: 'b'.repeat(64), current: false, abandoned: true, discardable: true };
 const status = { sourceId: 'source-a', scans: [scan, archived] };
-const transfer = { resourceKey: 'c'.repeat(64), resourceId: '00000000-0000-4000-8000-000000000001', version: 'd'.repeat(64), stateId: 'e'.repeat(64), bytes: 10, readUsed: 5, readRemaining: 0, uploadUsed: 0, uploadRemaining: 3, additionalUpload: 7, cacheRecorded: true };
+const transfer = { resourceKey: 'c'.repeat(64), resourceId: '00000000-0000-4000-8000-000000000001', version: 'd'.repeat(64), stateId: 'e'.repeat(64), bytes: 10, readUsed: 5, readRemaining: 0, uploadUsed: 0, uploadRemaining: 3, additionalUpload: 7, readCost: 10, additionalRead: 10, cacheRecorded: true };
 const publication = { resourceKey: transfer.resourceKey, recordId: 'f'.repeat(64), originalFileName: 'original.jpg', state: 'recorded', receipt: { publishedAt: '2026-10-26T12:00:00Z' }, transfer };
 function component() {
   const source = readFileSync(new URL('../src/ReferenceScans.svelte', import.meta.url), 'utf8');
@@ -16,7 +16,7 @@ function component() {
   const pending: { name: string; args: Record<string, unknown>; resolve(value: unknown): void; reject(error: unknown): void }[] = [];
   let mount!: () => () => void;
   const exports: Record<string, unknown> = {};
-  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage, approveTransfer }; export const current = () => ({ status, message, busy, confirmation });`, {
+  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage, approveTransfer, approveRead }; export const current = () => ({ status, message, busy, confirmation });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, $state: (value: unknown) => value, $props: () => ({ sourceId: status.sourceId, photos: false }), require: (name: string) => {
@@ -25,6 +25,7 @@ function component() {
     return { invoke: (name: string, args: Record<string, unknown>) => new Promise((resolve, reject) => { pending.push({ name, args, resolve, reject }); }) };
   } });
   return { ...exports, pending, mount: () => mount() } as unknown as {
+    approveRead(value: typeof publication): Promise<void>;
     approveTransfer(value: typeof publication): Promise<void>;
     publicationMessage(value: { state: string }): string;
     refresh(): Promise<void>; control(action: string, value: typeof scan): Promise<void>; confirmDiscard(value: typeof scan): void;
@@ -102,7 +103,7 @@ test('reference UI commands are permitted only in the packaged local main window
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
   const commands = [...ui.matchAll(/invoke(?:<[^\n]*?>)?\('([^']+)'/g)].map(match => match[1]);
-  assert.equal(commands.length, 12);
+  assert.equal(commands.length, 13);
   for (const command of commands) {
     assert.ok(manifest.includes(`"${command}"`), `${command} must exist in the application ACL manifest`);
     assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`));
@@ -186,8 +187,8 @@ test('a changed or malformed transfer reply cannot claim a grant or replace disp
   assert.equal(view.current().status,displayed);assert.doesNotMatch(view.current().message,/Transfer allowance saved/);unmount();
  }
 });
-test('pending publication or missing cached work cannot receive transfer approval', async () => {
- for(const value of [{...publication,state:'publish'},{...publication,transfer:{...transfer,cacheRecorded:false}},{...publication,transfer:{...transfer,additionalUpload:0}}]){
+test('pending publication or a sufficient allowance cannot receive transfer approval', async () => {
+ for(const value of [{...publication,state:'publish'},{...publication,transfer:{...transfer,additionalUpload:0}}]){
   const {view,unmount}=await loaded({...status,publications:[value]});await view.approveTransfer(value);assert.equal(view.pending.length,1);unmount();
  }
 });
@@ -195,4 +196,22 @@ test('unmount ignores delayed transfer acknowledgements and errors', async () =>
  for(const fails of [false,true]){const {view,unmount}=await loaded({...status,publications:[publication]});const call=view.approveTransfer(publication);unmount();const before=view.current();
  if(fails)view.pending[1].reject('source_transfer_state_changed');else view.pending[1].resolve({...transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0});await call;
  assert.equal(view.current().status,before.status);assert.equal(view.current().message,before.message);}
+});
+
+test('an exact original-read grant preserves transfer budgets and waits for metadata refresh',async()=>{
+ const displayed={...status,publications:[publication]};const {view,unmount}=await loaded(displayed);
+ const call=view.approveRead(publication);const request=view.pending[1];
+ assert.equal(request.name,'approve_photo_reference_original_read');
+ assert.deepEqual(JSON.parse(JSON.stringify(request.args)),{input:{sourceId:status.sourceId,resourceKey:publication.resourceKey,recordId:publication.recordId,stateId:transfer.stateId,additional:10}});
+ const approved={...transfer,stateId:'b'.repeat(64),readRemaining:10,additionalRead:0};request.resolve(approved);await call;
+ assert.equal(view.pending[2].name,'photo_reference_status');assert.equal(view.current().busy,true);
+ view.pending[2].resolve({...displayed,publications:[{...publication,transfer:approved}]});await setImmediate();
+ assert.equal(view.current().busy,false);unmount();
+});
+
+test('a recorded but consumed original can receive a separate transfer grant without another read grant',async()=>{
+ const value={...publication,transfer:{...transfer,cacheRecorded:false}};
+ const {view,unmount}=await loaded({...status,publications:[value]});const call=view.approveTransfer(value);
+ view.pending[1].resolve({...value.transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0});await call;
+ assert.equal(view.pending[2].name,'photo_reference_status');view.pending[2].resolve(null);await setImmediate();unmount();
 });

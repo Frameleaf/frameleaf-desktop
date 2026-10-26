@@ -3,7 +3,7 @@
   import { onMount } from 'svelte';
   import ReferenceRead from './ReferenceRead.svelte';
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
-  type Transfer = { resourceKey: string; resourceId: string; version: string; stateId: string; bytes: number; readUsed: number; readRemaining: number; uploadUsed: number; uploadRemaining: number; additionalUpload: number; cacheRecorded: boolean };
+  type Transfer = { resourceKey: string; resourceId: string; version: string; stateId: string; bytes: number; readUsed: number; readRemaining: number; readCost: number; additionalRead: number; uploadUsed: number; uploadRemaining: number; additionalUpload: number; cacheRecorded: boolean };
   type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null; transfer?: Transfer | null; transferError?: string | null };
   type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[]; serving?: { selectionId: string; resources: number; maxTransferBytes: number } | null };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
@@ -68,22 +68,31 @@
     } catch (error) { if (current()) message = explain(error); }
     finally { if (current()) busy = false; }
   }
-  async function approveTransfer(publication: Publication) {
+  async function approveTransfer(publication: Publication) { return approveAllowance(publication, 'transfer'); }
+  async function approveRead(publication: Publication) { return approveAllowance(publication, 'read'); }
+  async function approveAllowance(publication: Publication, kind: 'read' | 'transfer') {
     const previous = publication.transfer;
-    if (busy || reading || !status?.publications?.includes(publication) || publication.state !== 'recorded' || !previous?.cacheRecorded || previous.additionalUpload <= 0) return;
+    const additional = kind === 'read' ? previous?.additionalRead : previous?.additionalUpload;
+    if (busy || reading || !status?.publications?.includes(publication) || publication.state !== 'recorded' || !previous || !additional || additional <= 0) return;
     const request = ++serial; const source = sourceId;
     busy = true; message = ''; confirmation = null;
     let approved = false;
     const current = () => alive && serial === request && sourceId === source;
     try {
-      const reply = await invoke<Transfer>('approve_photo_reference_transfer', { input: { sourceId: source, resourceKey: publication.resourceKey, recordId: publication.recordId, stateId: previous.stateId, additional: previous.additionalUpload } });
+      const input = { sourceId: source, resourceKey: publication.resourceKey, recordId: publication.recordId, stateId: previous.stateId, additional };
+      const reply = kind === 'read' ? await invoke<Transfer>('approve_photo_reference_original_read', { input })
+        : await invoke<Transfer>('approve_photo_reference_transfer', { input });
       if (!current()) return;
-      if (!reply || reply.resourceKey !== publication.resourceKey || reply.resourceId !== previous.resourceId || reply.version !== previous.version || reply.bytes !== previous.bytes
+      if (!reply || reply.resourceKey !== publication.resourceKey || reply.resourceId !== previous.resourceId || reply.version !== previous.version || reply.bytes !== previous.bytes || reply.readCost !== previous.readCost
         || !/^[a-f0-9]{64}$/.test(reply.stateId) || reply.stateId === previous.stateId
-        || reply.readUsed !== previous.readUsed || reply.readRemaining !== previous.readRemaining || reply.uploadUsed !== previous.uploadUsed
-        || reply.uploadRemaining !== previous.uploadRemaining + previous.additionalUpload || reply.additionalUpload !== 0 || !reply.cacheRecorded) throw 'source_transfer_state_changed';
+        || reply.readUsed !== previous.readUsed || reply.uploadUsed !== previous.uploadUsed
+        || reply.readRemaining !== previous.readRemaining + (kind === 'read' ? additional : 0)
+        || reply.uploadRemaining !== previous.uploadRemaining + (kind === 'transfer' ? additional : 0)
+        || reply.additionalRead !== (kind === 'read' ? 0 : previous.additionalRead)
+        || reply.additionalUpload !== (kind === 'transfer' ? 0 : previous.additionalUpload)
+        || reply.cacheRecorded !== previous.cacheRecorded) throw 'source_transfer_state_changed';
       status = { ...status!, serving: null, publications: status!.publications!.map(value => value === publication ? { ...value, transfer: reply } : value) };
-      message = 'Transfer allowance saved. No original read or transfer was started.';
+      message = kind === 'read' ? 'Original-read allowance saved. No original was read or transferred.' : 'Transfer allowance saved. No original read or transfer was started.';
       approved = true;
     } catch (error) { if (current()) message = explain(error); }
     finally { if (current()) { busy = false; if (approved) { const note = message; void refresh(); message = note; } } }
@@ -177,11 +186,15 @@
             <p class="footnote">Original-read allowance used: {size(publication.transfer.readUsed)}. Remaining: {size(publication.transfer.readRemaining)}. Transfer allowance used: {size(publication.transfer.uploadUsed)}. Remaining: {size(publication.transfer.uploadRemaining)}.</p>
             {#if publication.transfer.cacheRecorded}
               <p class="footnote">A private cache is recorded; its availability is checked when serving.</p>
-              {#if publication.transfer.additionalUpload > 0}
-                <p class="footnote">Allow one cached-original transfer by adding the displayed deficit. This starts no transfer and adds no original-read allowance.</p>
-                <button class="secondary" disabled={busy || reading} onclick={() => approveTransfer(publication)}>Approve {size(publication.transfer.additionalUpload)} more transfer allowance</button>
-              {/if}
-            {:else}<p class="footnote">No private cache is recorded. Prepare the original again before approving another cached transfer.</p>{/if}
+            {:else}<p class="footnote">No private cache is recorded. Serving again needs sufficient original-read and transfer allowances.</p>{/if}
+            {#if publication.transfer.additionalRead > 0}
+              <p class="footnote">Allow one original read or export if staging is unavailable. This adds only the displayed deficit, starts no read, and adds no transfer allowance.</p>
+              <button class="secondary" disabled={busy || reading} onclick={() => approveRead(publication)}>Approve {size(publication.transfer.additionalRead)} more {photos ? 'maximum export' : 'original-read'} allowance</button>
+            {/if}
+            {#if publication.transfer.additionalUpload > 0}
+              <p class="footnote">Allow one original transfer by adding the displayed deficit. This starts no transfer and adds no original-read allowance.</p>
+              <button class="secondary" disabled={busy || reading} onclick={() => approveTransfer(publication)}>Approve {size(publication.transfer.additionalUpload)} more transfer allowance</button>
+            {/if}
           {:else if publication.transferError}<p class="footnote">Transfer allowances could not be verified. Saved publication records are kept.</p>{/if}
         </div>
       {/each}

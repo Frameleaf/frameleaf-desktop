@@ -1,17 +1,17 @@
-//! Explicit outbound-transfer approval. It never grants original reads or starts a worker.
+//! Separate explicit original-read and outbound-transfer approvals; neither starts work.
 use super::*;
 use publication::Receipt;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TransferApproval {
+pub struct AllowanceApproval {
     pub source_id: String,
     pub resource_key: String,
     pub record_id: String,
     pub state_id: String,
     pub additional: u64,
 }
-impl TransferApproval {
+impl AllowanceApproval {
     pub(super) fn validate(&self) -> Result<(), String> {
         if !canonical_uuid(&self.source_id)
             || [&self.resource_key, &self.record_id, &self.state_id]
@@ -39,6 +39,7 @@ pub struct TransferStatus {
     pub upload_used: u64,
     pub upload_remaining: u64,
     pub additional_upload: u64,
+    pub additional_read: u64,
     pub cache_recorded: bool,
 }
 fn state_id(state: &State) -> Result<String, String> {
@@ -98,11 +99,11 @@ impl Job {
             read_remaining: state.read.limit - state.read.used,
             upload_used: state.upload.used,
             upload_remaining: remaining,
-            additional_upload: if state.stage.is_some() {
-                self.resource.bytes.saturating_sub(remaining)
-            } else {
-                0
-            },
+            additional_upload: self.resource.bytes.saturating_sub(remaining),
+            additional_read: self
+                .resource
+                .read_cost()
+                .saturating_sub(state.read.limit - state.read.used),
             cache_recorded: state.stage.is_some(),
         })
     }
@@ -112,7 +113,7 @@ impl Job {
         identity: &DeviceIdentity,
         receipt: &Receipt,
         scope: &str,
-        input: &TransferApproval,
+        input: &AllowanceApproval,
         gate: &dyn Fn() -> Result<(), String>,
     ) -> Result<TransferStatus, String> {
         input.validate()?;
@@ -124,10 +125,7 @@ impl Job {
         {
             return Err("source_transfer_state_changed".into());
         }
-        if !before.cache_recorded
-            || before.additional_upload == 0
-            || input.additional != before.additional_upload
-        {
+        if before.additional_upload == 0 || input.additional != before.additional_upload {
             return Err("source_transfer_budget_invalid".into());
         }
         let mut state = self.recorded_state(saved, identity)?;
@@ -143,6 +141,40 @@ impl Job {
         gate()?;
         self.transfer_view(saved, identity, receipt, scope)
     }
+    pub(super) fn approve_read_with(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        receipt: &Receipt,
+        scope: &str,
+        input: &AllowanceApproval,
+        gate: &dyn Fn() -> Result<(), String>,
+    ) -> Result<TransferStatus, String> {
+        input.validate()?;
+        gate()?;
+        let before = self.transfer_view(saved, identity, receipt, scope)?;
+        if input.source_id != self.resource.source_id()
+            || input.resource_key != before.resource_key
+            || input.state_id != before.state_id
+        {
+            return Err("source_transfer_state_changed".into());
+        }
+        if before.additional_read == 0 || input.additional != before.additional_read {
+            return Err("source_read_budget_invalid".into());
+        }
+        let mut state = self.recorded_state(saved, identity)?;
+        state.read.limit = state
+            .read
+            .limit
+            .checked_add(input.additional)
+            .ok_or("source_read_budget_invalid")?;
+        state.validate()?;
+        self.require_owner()?;
+        gate()?;
+        self.journal.write("state.json", &state, identity)?;
+        gate()?;
+        self.transfer_view(saved, identity, receipt, scope)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -150,12 +182,12 @@ mod tests {
     #[test]
     fn transfer_payload_cannot_request_original_reads_or_hide_extra_fields() {
         let input = serde_json::json!({"sourceId":uuid::Uuid::new_v4().to_string(),"resourceKey":"a".repeat(64),"recordId":"b".repeat(64),"stateId":"c".repeat(64),"additional":10});
-        serde_json::from_value::<TransferApproval>(input.clone())
+        serde_json::from_value::<AllowanceApproval>(input.clone())
             .unwrap()
             .validate()
             .unwrap();
         let mut original = input;
         original["read"] = serde_json::json!(10);
-        assert!(serde_json::from_value::<TransferApproval>(original).is_err());
+        assert!(serde_json::from_value::<AllowanceApproval>(original).is_err());
     }
 }

@@ -28,7 +28,7 @@ use std::{
         Arc,
     },
 };
-pub use transfer::{TransferApproval, TransferStatus};
+pub use transfer::{AllowanceApproval, TransferStatus};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2605,14 +2605,158 @@ mod tests {
             storage: "reference".into(),
         }
     }
-    fn transfer_request(f: &Fixture, state: &str, additional: u64) -> TransferApproval {
-        TransferApproval {
+    fn transfer_request(f: &Fixture, state: &str, additional: u64) -> AllowanceApproval {
+        AllowanceApproval {
             source_id: f.resource.source_id().into(),
             resource_key: f.resource.resource_key(),
             record_id: "a".repeat(64),
             state_id: state.into(),
             additional,
         }
+    }
+    #[test]
+    fn consumed_reference_metadata_offers_one_read_and_transfer_without_resetting_spend() {
+        let f = Fixture::new();
+        let job = f.job(10, 10);
+        let receipt = transfer_receipt(&f);
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.read.used = 10;
+        state.upload.used = 10;
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        let status = serde_json::to_value(
+            job.transfer_view(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &f.resource.scope_fingerprint(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["additionalRead"], 10);
+        assert_eq!(status["additionalUpload"], 10);
+        assert_eq!(status["readUsed"], 10);
+        assert_eq!(status["uploadUsed"], 10);
+    }
+    #[test]
+    fn original_read_approval_is_snapshot_bound_preserves_spend_and_never_grants_transfer() {
+        let f = Fixture::new();
+        let job = f.job(10, 10);
+        let receipt = transfer_receipt(&f);
+        let scope = f.resource.scope_fingerprint();
+        let mut state = job.state(&f.saved, &f.identity).unwrap();
+        state.read.used = 7;
+        state.upload.used = 10;
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        let view = job
+            .transfer_view(&f.saved, &f.identity, &receipt, &scope)
+            .unwrap();
+        assert_eq!(view.additional_read, 7);
+        let before = fs::read(job.journal.root.join("state.json")).unwrap();
+        for (id, amount) in [
+            ("f".repeat(64), 7),
+            (view.state_id.clone(), 10),
+            (view.state_id.clone(), 0),
+        ] {
+            assert!(job
+                .approve_read_with(
+                    &f.saved,
+                    &f.identity,
+                    &receipt,
+                    &scope,
+                    &transfer_request(&f, &id, amount),
+                    &|| Ok(())
+                )
+                .is_err());
+            assert_eq!(
+                fs::read(job.journal.root.join("state.json")).unwrap(),
+                before
+            );
+        }
+        fs::remove_file(f.root.join("source/original.jpg")).unwrap();
+        let granted = job
+            .approve_read_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &view.state_id, 7),
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                granted.read_used,
+                granted.read_remaining,
+                granted.upload_used,
+                granted.upload_remaining
+            ),
+            (7, 10, 10, 0)
+        );
+        assert!(job
+            .approve_read_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &view.state_id, 7),
+                &|| Ok(())
+            )
+            .is_err());
+        let transfer = job
+            .approve_transfer_with(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &scope,
+                &transfer_request(&f, &granted.state_id, 10),
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                transfer.read_used,
+                transfer.read_remaining,
+                transfer.upload_used,
+                transfer.upload_remaining
+            ),
+            (7, 10, 10, 10)
+        );
+        assert!(!transfer.cache_recorded);
+        assert!(!f.root.join("source/original.jpg").exists());
+    }
+    #[test]
+    fn interrupted_original_read_approval_preserves_the_grant_without_replaying_it() {
+        let f = Fixture::new();
+        let job = f.job(0, 0);
+        let receipt = transfer_receipt(&f);
+        let scope = f.resource.scope_fingerprint();
+        let before = fs::read(job.journal.root.join("state.json")).unwrap();
+        let view = job
+            .transfer_view(&f.saved, &f.identity, &receipt, &scope)
+            .unwrap();
+        let gate = || {
+            if fs::read(job.journal.root.join("state.json")).unwrap() != before {
+                Err("source_delivery_interrupted".into())
+            } else {
+                Ok(())
+            }
+        };
+        let input = transfer_request(&f, &view.state_id, 10);
+        assert!(job
+            .approve_read_with(&f.saved, &f.identity, &receipt, &scope, &input, &gate)
+            .is_err());
+        let granted = job
+            .transfer_view(&f.saved, &f.identity, &receipt, &scope)
+            .unwrap();
+        assert_eq!((granted.read_remaining, granted.upload_remaining), (10, 0));
+        assert!(job
+            .approve_read_with(&f.saved, &f.identity, &receipt, &scope, &input, &|| Ok(()))
+            .is_err());
     }
     #[test]
     fn transfer_metadata_exposes_the_actual_cost_of_reading_the_original() {

@@ -277,7 +277,7 @@ pub(crate) async fn approve_photo_reference_transfer(
     window: WebviewWindow,
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
-    input: source_reads::TransferApproval,
+    input: source_reads::AllowanceApproval,
 ) -> Result<source_reads::TransferStatus, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
@@ -285,6 +285,21 @@ pub(crate) async fn approve_photo_reference_transfer(
     require_reference_source(saved, &input.source_id)?;
     app.state::<source_reads::Requests>()
         .approve_reference_transfer(import_base(&app)?, saved.clone(), input)
+        .await
+}
+#[tauri::command]
+pub(crate) async fn approve_photo_reference_original_read(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    input: source_reads::AllowanceApproval,
+) -> Result<source_reads::TransferStatus, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &input.source_id)?;
+    app.state::<source_reads::Requests>()
+        .approve_reference_read(import_base(&app)?, saved.clone(), input)
         .await
 }
 #[tauri::command]

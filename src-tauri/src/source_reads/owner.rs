@@ -1059,7 +1059,7 @@ mod tests {
                 .approve_reference_transfer(
                     PathBuf::new(),
                     saved.clone(),
-                    crate::source_reads::TransferApproval {
+                    crate::source_reads::AllowanceApproval {
                         source_id: source.clone(),
                         resource_key: "c".repeat(64),
                         record_id: "d".repeat(64),

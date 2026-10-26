@@ -60,6 +60,7 @@ fn main() {
             "revoke_photo_source",
             "photo_reference_status",
             "approve_photo_reference_transfer",
+            "approve_photo_reference_original_read",
             "control_photo_reference",
             "start_photo_reference_read",
             "start_photo_reference_serving",
