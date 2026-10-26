@@ -1384,6 +1384,23 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
         _ => return Err("source_stage_invalid".into()),
     }
     let dir = root.open_dir(id).map_err(|_| "source_stage_unavailable")?;
+    // Refuse the whole cache before deleting anything if its contents are unexpected.
+    for (index, entry) in dir
+        .entries()
+        .map_err(|_| "source_stage_unavailable")?
+        .enumerate()
+    {
+        let name = entry.map_err(|_| "source_stage_unavailable")?.file_name();
+        if index >= 2 || !matches!(name.to_str(), Some("original" | "receipt.json")) {
+            return Err("source_cache_cleanup_pending".into());
+        }
+        let meta = dir
+            .symlink_metadata(&name)
+            .map_err(|_| "source_stage_unavailable")?;
+        if !meta.is_file() || link(&meta) {
+            return Err("source_stage_invalid".into());
+        }
+    }
     for name in ["original", "receipt.json"] {
         match dir.symlink_metadata(name) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1880,11 +1897,42 @@ mod tests {
             Some("source_cache_cleanup_pending")
         );
         assert_eq!(fs::read(stage.join("unexpected")).unwrap(), b"retain");
+        assert_eq!(
+            fs::read(stage.join("original")).unwrap(),
+            b"staged original"
+        );
+        assert_eq!(fs::read(stage.join("receipt.json")).unwrap(), b"receipt");
         fs::remove_file(stage.join("unexpected")).unwrap();
         release_stage(&path, &id).unwrap();
         assert!(!stage.exists());
         release_stage(&path, &id).unwrap();
         drop(cleanup);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn stage_release_refuses_linked_receipt_before_removing_original() {
+        let path = std::env::temp_dir().join(format!("frameleaf-release-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let _cleanup = Partial(Some(path.clone()));
+        let path = fs::canonicalize(path).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let stage = path.join(&id);
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("original"), b"staged original").unwrap();
+        fs::write(path.join("outside"), b"retain").unwrap();
+        std::os::unix::fs::symlink(path.join("outside"), stage.join("receipt.json")).unwrap();
+        assert_eq!(
+            release_stage(&path, &id).err().as_deref(),
+            Some("source_stage_invalid")
+        );
+        assert_eq!(
+            fs::read(stage.join("original")).unwrap(),
+            b"staged original"
+        );
+        assert_eq!(fs::read(path.join("outside")).unwrap(), b"retain");
+        assert!(fs::symlink_metadata(stage.join("receipt.json"))
+            .unwrap()
+            .is_symlink());
     }
     #[test]
     fn capacity_accounts_for_original_and_stage_on_shared_volume() {

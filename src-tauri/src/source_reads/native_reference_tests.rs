@@ -311,7 +311,63 @@ fn actual_native_reference_publication() {
         assert!(!scan.prepared);
         assert_eq!((scan.spent, scan.remaining), (0, 0));
         assert_ne!(scan.scan_id, first_scan);
+        let publication_before = fs::read(journal.root.join(&name)).unwrap();
+        fs::remove_file(source_root.join("original.jpg")).unwrap();
+        let ended = scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::Abandon {
+                    expected_scan: scan.scan_id.clone(),
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert!(ended.abandoned);
+        assert!(!ended.prepared);
+        assert_eq!((ended.spent, ended.remaining), (0, 0));
+        assert_eq!(ended.scan_id, scan.scan_id);
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
+        assert_eq!(
+            fs::read(journal.root.join(&name)).unwrap(),
+            publication_before
+        );
+        fs::write(source_root.join("original.jpg"), edited).unwrap();
+        let restarted = scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::Rescan {
+                    relatives: vec!["original.jpg".into()],
+                    expected_scan: ended.scan_id.clone(),
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert!(!restarted.abandoned);
+        assert_eq!((restarted.spent, restarted.remaining), (0, 0));
+        assert_ne!(restarted.scan_id, ended.scan_id);
+        assert!(scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::Abandon {
+                    expected_scan: ended.scan_id,
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .is_err());
+        scan_owner.stop().await.unwrap();
         let mut preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
+        assert!(!preparation.view(&next, &identity).unwrap().abandoned);
         assert!(preparation
             .stage_and_handoff(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
             .is_err());
