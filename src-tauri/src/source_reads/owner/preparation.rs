@@ -115,25 +115,14 @@ impl Requests {
                         stop()?;
                         preparation.approve(&saved, &identity, additional)?;
                     }
-                    let policy = Mutex::new((
-                        std::time::Instant::now(),
-                        crate::resource_policy::sample().refusal(64 * 1024 * 1024),
-                    ));
-                    let gate = || {
-                        stop()?;
-                        let mut policy = policy.lock().map_err(|_| "network_unknown")?;
-                        if policy.0.elapsed() >= std::time::Duration::from_secs(1) {
-                            *policy = (
-                                std::time::Instant::now(),
-                                crate::resource_policy::sample().refusal(64 * 1024 * 1024),
-                            );
-                        }
-                        if let Some(code) = policy.1 {
-                            return Err(code.into());
-                        }
-                        stop()
-                    };
-                    preparation.stage_and_handoff(&saved, &identity, cancelled, &gate)
+                    prepare_one(
+                        &mut preparation,
+                        &saved,
+                        &identity,
+                        cancelled,
+                        stop,
+                        crate::resource_policy::sample,
+                    )
                 }
             }
         })
@@ -191,6 +180,7 @@ impl Requests {
             source,
             notify,
             replace,
+            None,
             move |progress, signal| async move {
                 progress.set("preparing", None);
                 let result = tauri::async_runtime::spawn_blocking(move || {
@@ -221,4 +211,33 @@ impl Requests {
             .await
             .map_err(|_| "source_read_shutdown_unconfirmed".to_string())?
     }
+}
+
+pub(super) fn prepare_one(
+    preparation: &mut Preparation,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    cancelled: &AtomicBool,
+    stop: &(dyn Fn() -> Result<(), String> + Sync),
+    sample: fn() -> crate::resource_policy::Snapshot,
+) -> Result<PreparationView, String> {
+    let policy = Mutex::new((
+        std::time::Instant::now(),
+        sample().refusal(64 * 1024 * 1024),
+    ));
+    let gate = || {
+        stop()?;
+        let mut policy = policy.lock().map_err(|_| "network_unknown")?;
+        if policy.0.elapsed() >= std::time::Duration::from_secs(1) {
+            *policy = (
+                std::time::Instant::now(),
+                sample().refusal(64 * 1024 * 1024),
+            );
+        }
+        if let Some(code) = policy.1 {
+            return Err(code.into());
+        }
+        stop()
+    };
+    preparation.stage_and_handoff(saved, identity, cancelled, &gate)
 }

@@ -57,6 +57,82 @@ async fn action(base: &Path, saved: &SavedConnection, source: &str, recover: Opt
     owner.stop().await.unwrap();
     view
 }
+static PREPARATION_POLICY_GATE: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+fn allowed_preparation_policy() -> crate::resource_policy::Snapshot {
+    if let Some((entered, finish)) = PREPARATION_POLICY_GATE.lock().unwrap().take() {
+        entered.send(()).unwrap();
+        finish
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    }
+    crate::resource_policy::Snapshot {
+        external_power: Some(true),
+        unmetered: Some(true),
+        available_memory: Some(128 * 1024 * 1024),
+    }
+}
+fn denied_preparation_policy() -> crate::resource_policy::Snapshot {
+    crate::resource_policy::Snapshot {
+        external_power: Some(false),
+        ..allowed_preparation_policy()
+    }
+}
+async fn owned_preparation(
+    base: &Path,
+    saved: &SavedConnection,
+    source: &str,
+    scan: &str,
+    sample: fn() -> crate::resource_policy::Snapshot,
+) -> PreparationWork {
+    let owner = Requests::default();
+    let request = PreparationRequest {
+        source_id: source.into(),
+        scan_id: scan.into(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let (send, mut receive) = tokio::sync::watch::channel(None::<PreparationWork>);
+    let notify: Arc<dyn Fn(PreparationWork) + Send + Sync> = Arc::new(move |work| {
+        send.send_replace(Some(work));
+    });
+    owner
+        .start_reference_preparation_for_test(
+            base.to_owned(),
+            saved.clone(),
+            request.clone(),
+            notify.clone(),
+            sample,
+        )
+        .await
+        .unwrap();
+    owner
+        .start_reference_preparation_for_test(
+            base.to_owned(),
+            saved.clone(),
+            request.clone(),
+            notify,
+            sample,
+        )
+        .await
+        .unwrap();
+    let work = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        receive.wait_for(|view| {
+            view.as_ref().is_some_and(|view| {
+                view.request == request
+                    && matches!(view.state.as_str(), "stopped" | "needs-attention")
+            })
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .clone()
+    .unwrap();
+    owner.stop().await.unwrap();
+    work
+}
 #[test]
 #[ignore = "requires the owned HTTPS/PostgreSQL fixture; run alone with process-only credentials"]
 fn actual_native_reference_publication() {
@@ -543,10 +619,71 @@ fn actual_native_reference_publication() {
             Some("source_read_budget_invalid")
         );
         scan_owner.stop().await.unwrap();
-        let mut preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
-        let prepared = preparation
-            .stage_and_handoff(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
+        let owner = Requests::default();
+        let request = PreparationRequest {
+            source_id: source.clone(),
+            scan_id: restarted.scan_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        *PREPARATION_POLICY_GATE.lock().unwrap() = Some((entered, finish));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            owner.start_reference_preparation_for_test(
+                base.clone(),
+                next.clone(),
+                request.clone(),
+                Arc::new(|_| {}),
+                allowed_preparation_policy,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
+        let mut pause = Box::pin(owner.pause_reference_preparation(&next, request));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(15), &mut pause)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        assert_eq!(pause.await.unwrap().state, "paused");
+        let policy_denied = owned_preparation(
+            &base,
+            &next,
+            &source,
+            &restarted.scan_id,
+            denied_preparation_policy,
+        )
+        .await;
+        assert_eq!(policy_denied.code.as_deref(), Some("on_battery"));
+        let preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
+        assert_eq!(
+            (
+                preparation.view(&next, &identity).unwrap().spent,
+                preparation.view(&next, &identity).unwrap().remaining
+            ),
+            (0, edited.len() as u64)
+        );
+        drop(preparation);
+        assert_eq!(
+            owned_preparation(
+                &base,
+                &next,
+                &source,
+                &restarted.scan_id,
+                allowed_preparation_policy
+            )
+            .await
+            .state,
+            "stopped"
+        );
+        let preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
+        let prepared = preparation.view(&next, &identity).unwrap();
         assert!(prepared.prepared);
         assert_eq!(
             (prepared.spent, prepared.remaining),

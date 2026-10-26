@@ -11,7 +11,7 @@ use crate::{
     source_import::Journal,
 };
 use cap_std::{ambient_authority, fs::Dir};
-pub use owner::{PreparationAction, Requests, View};
+pub use owner::{PreparationAction, PreparationRequest, PreparationWork, Requests, View};
 pub use planner::{Preparation, PreparationView, PreparedResource, ReferenceStatus};
 pub(crate) use publication::validate_directory as validate_publication_store;
 use serde::{Deserialize, Serialize};

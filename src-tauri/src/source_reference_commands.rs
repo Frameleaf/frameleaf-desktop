@@ -80,6 +80,75 @@ pub(crate) async fn control_photo_reference(
         .reference_status(import_base(&app)?, saved.clone(), source_id)
         .await
 }
+#[tauri::command]
+pub(crate) async fn start_photo_reference_read(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    expected_scan: String,
+    request_id: String,
+) -> Result<source_reads::PreparationWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &source_id)?;
+    let request = source_reads::PreparationRequest {
+        source_id,
+        scan_id: expected_scan,
+        request_id,
+    };
+    let events = app.clone();
+    // Installation returns promptly; the application owner keeps and drains the blocking export.
+    app.state::<source_reads::Requests>()
+        .start_reference_preparation(
+            import_base(&app)?,
+            saved.clone(),
+            request,
+            std::sync::Arc::new(move |work| {
+                let _ = events.emit("photo-reference-preparation", work);
+            }),
+        )
+        .await
+}
+#[tauri::command]
+pub(crate) async fn pause_photo_reference_read(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    expected_scan: String,
+    request_id: String,
+) -> Result<source_reads::PreparationWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    // Stopping a matching owned request needs no new keystore access or provider permission.
+    app.state::<source_reads::Requests>()
+        .pause_reference_preparation(
+            saved,
+            source_reads::PreparationRequest {
+                source_id,
+                scan_id: expected_scan,
+                request_id,
+            },
+        )
+        .await
+}
+#[tauri::command]
+pub(crate) async fn photo_reference_read_status(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+) -> Result<Option<source_reads::PreparationWork>, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    app.state::<source_reads::Requests>()
+        .reference_preparation_status(saved, &source_id)
+        .await
+}
 #[cfg(test)]
 mod tests {
     use super::*;

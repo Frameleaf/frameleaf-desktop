@@ -1,11 +1,13 @@
 //! The application owns one poller and drains its current read before changing authority.
 mod preparation;
 mod publication;
+mod reading;
 mod recovery;
 use super::Job;
 use crate::connection::{DeviceIdentity, SavedConnection};
 use cap_std::{ambient_authority, fs::Dir};
 pub use preparation::PreparationAction;
+pub use reading::{PreparationRequest, PreparationWork};
 use serde::Serialize;
 use std::{
     future::Future,
@@ -94,6 +96,7 @@ impl Drop for Stop {
     }
 }
 struct Running {
+    preparation: Option<reading::Key>,
     stop: Stop,
     task: tauri::async_runtime::JoinHandle<Result<(), String>>,
 }
@@ -185,13 +188,14 @@ impl Requests {
         F: FnOnce(Progress, Signal) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        self.install_checked(source, notify, true, work).await
+        self.install_checked(source, notify, true, None, work).await
     }
     async fn install_checked<F, Fut>(
         &self,
         source: String,
         notify: Arc<dyn Fn(View) + Send + Sync>,
         replace: bool,
+        preparation: Option<reading::Key>,
         work: F,
     ) -> Result<View, String>
     where
@@ -199,6 +203,20 @@ impl Requests {
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let mut owner = self.owner.lock().await;
+        if let Some(key) = &preparation {
+            if let Some(previous) = owner
+                .running
+                .as_ref()
+                .and_then(|running| running.preparation.as_ref())
+            {
+                if previous == key {
+                    return Ok(self.status());
+                }
+                if previous.request.request_id == key.request.request_id {
+                    return Err("source_read_request_invalid".into());
+                }
+            }
+        }
         if !replace
             && self.active.load(Ordering::Acquire)
             && !matches!(self.status().state.as_str(), "stopped" | "needs-attention")
@@ -238,6 +256,7 @@ impl Requests {
             result
         });
         owner.running = Some(Running {
+            preparation,
             stop: Stop {
                 cancelled,
                 changed: send,
@@ -594,7 +613,7 @@ mod tests {
             .await
             .unwrap();
         let result = owner
-            .install_checked("inspect".into(), notify(), false, |_, _| async move {
+            .install_checked("inspect".into(), notify(), false, None, |_, _| async move {
                 panic!("inspection must not replace the active task")
             })
             .await;
@@ -656,6 +675,105 @@ mod tests {
         }
         finish.send(()).unwrap();
         owner.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn preparation_pause_is_session_scan_and_request_bound() {
+        let owner = Requests::default();
+        let saved = SavedConnection {
+            server: "https://server.test/".into(),
+            server_id: "server".into(),
+            account_id: "owner".into(),
+            name: "Synthetic".into(),
+            token: "synthetic".into(),
+            device_name: "Synthetic".into(),
+            mode: "client-worker".into(),
+            device_id: Some("device".into()),
+        };
+        let source = uuid::Uuid::new_v4().to_string();
+        let scan = "a".repeat(64);
+        let request = uuid::Uuid::new_v4().to_string();
+        let requested = PreparationRequest {
+            source_id: source.clone(),
+            scan_id: scan.clone(),
+            request_id: request.clone(),
+        };
+        let key = reading::Key::new(&saved, requested.clone()).unwrap();
+        let (observed, stopping) = tokio::sync::oneshot::channel();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        owner
+            .install_checked(
+                source.clone(),
+                notify(),
+                false,
+                Some(key),
+                move |_, signal| async move {
+                    while !signal.cancelled.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    observed.send(()).unwrap();
+                    let _ = wait.await;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let duplicate = reading::Key::new(&saved, requested.clone()).unwrap();
+        owner
+            .install_checked(
+                source.clone(),
+                notify(),
+                false,
+                Some(duplicate),
+                |_, _| async move { panic!("duplicate request must not install another producer") },
+            )
+            .await
+            .unwrap();
+        let mut foreign = saved.clone();
+        foreign.token = "another-session".into();
+        for (connection, expected, nonce) in [
+            (&foreign, scan.clone(), request.clone()),
+            (&saved, "b".repeat(64), request.clone()),
+            (&saved, scan.clone(), uuid::Uuid::new_v4().to_string()),
+        ] {
+            assert!(owner
+                .pause_reference_preparation(
+                    connection,
+                    PreparationRequest {
+                        source_id: source.clone(),
+                        scan_id: expected,
+                        request_id: nonce
+                    }
+                )
+                .await
+                .is_err());
+            assert!(!owner
+                .owner
+                .lock()
+                .await
+                .running
+                .as_ref()
+                .unwrap()
+                .stop
+                .cancelled
+                .load(Ordering::Acquire));
+        }
+        let work = owner
+            .reference_preparation_status(&saved, &source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(work.request.request_id, request);
+        assert!(owner
+            .reference_preparation_status(&foreign, &source)
+            .await
+            .unwrap()
+            .is_none());
+        let mut pause = Box::pin(owner.pause_reference_preparation(&saved, requested.clone()));
+        tokio::select! {result=&mut pause=>panic!("pause returned before producer drained: {}",result.err().unwrap_or_default()),result=stopping=>result.unwrap(),}
+        assert!(owner.is_active());
+        finish.send(()).unwrap();
+        assert_eq!(pause.await.unwrap().state, "paused");
+        assert!(!owner.is_active());
     }
     #[tokio::test]
     async fn preparation_panic_reports_unknown_and_fences_replacement() {

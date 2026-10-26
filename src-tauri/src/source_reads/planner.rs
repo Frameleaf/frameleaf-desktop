@@ -551,6 +551,18 @@ impl Preparation {
     ) -> Result<Option<Job>, String> {
         capacity::reconcile(self, saved, identity, gate)
     }
+    pub fn check_scan(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+    ) -> Result<(), String> {
+        self.progress(saved, identity)?;
+        if expected != self.plan_hash {
+            return Err("source_scan_changed".into());
+        }
+        Ok(())
+    }
     /// An additional local approval never replaces the already spent amount.
     pub fn approve(
         &mut self,

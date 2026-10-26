@@ -1,11 +1,13 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import ReferenceRead from './ReferenceRead.svelte';
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
   type ReferenceStatus = { sourceId: string; scans: Scan[] };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
   let busy = $state(false);
+  let reading = $state(false);
   let message = $state('');
   let confirmation = $state<string | null>(null);
   let visible = $state(20);
@@ -51,10 +53,10 @@
     finally { if (current()) busy = false; }
   }
   function confirmDiscard(scan: Scan) {
-    if (!busy && status?.scans.includes(scan) && scan.abandoned && scan.discardable) confirmation = scan.scanId;
+    if (!busy && !reading && status?.scans.includes(scan) && scan.abandoned && scan.discardable) confirmation = scan.scanId;
   }
   async function control(action: string, scan: Scan) {
-    if (busy || !status?.scans.includes(scan)) return;
+    if (busy || reading || !status?.scans.includes(scan)) return;
     if (action === 'abandon') { if (!scan.current || scan.abandoned) return; }
     else if (action === 'discard') { if (!scan.abandoned || !scan.discardable || confirmation !== scan.scanId) return; }
     else if (action === 'rescan') { if (!scan.current || !scan.canRescan) return; }
@@ -91,7 +93,8 @@
 <section aria-label="Saved reference scans" aria-busy={busy}>
   <h3>Saved reference scans</h3>
   <p class="footnote">Inspect saved preparation and staging reservations without opening or downloading originals.</p>
-  <button class="text-button" disabled={busy} onclick={refresh}>Refresh saved scans</button>
+  <ReferenceRead {sourceId} scan={status?.scans.find(value => value.current) ?? null} disabled={busy} onActiveChange={value => reading = value} onSettled={() => void refresh()} />
+  <button class="text-button" disabled={busy || reading} onclick={refresh}>Refresh saved scans</button>
   {#if busy}<p role="status">Checking saved reference work…</p>{/if}
   {#if message}<p role="status">{message}</p>{/if}
   {#if status}
@@ -107,26 +110,26 @@
           {/if}
           {#if scan.additionalReadAllowance > 0 && !scan.abandoned}
             <p class="footnote">The next selected original needs {photos ? 'up to ' : ''}{size(scan.nextReadBytes ?? 0)} of {photos ? 'maximum export' : 'read'} allowance, including retries. Approval does not open or upload originals. {photos ? 'Photos-managed downloads are separate and can exceed the export ceiling when hydration is enabled for this source.' : 'Cloud-provider network traffic can exceed logical file data.'}</p>
-            <button class="secondary" disabled={busy} onclick={() => control('approve-read', scan)}>Approve {size(scan.additionalReadAllowance)} more {photos ? 'maximum export' : 'original-read'} allowance</button>
+            <button class="secondary" disabled={busy || reading} onclick={() => control('approve-read', scan)}>Approve {size(scan.additionalReadAllowance)} more {photos ? 'maximum export' : 'original-read'} allowance</button>
           {/if}
           {#if scan.canRescan}
             <p class="footnote">Scan the same selected originals again to refresh their metadata. Earlier receipts and caches are kept. A new scan starts with no read allowance.</p>
-            <button class="secondary" disabled={busy} onclick={() => control('rescan', scan)}>Scan the same selection again</button>
+            <button class="secondary" disabled={busy || reading} onclick={() => control('rescan', scan)}>Scan the same selection again</button>
           {/if}
         {/if}
-        {#if scan.current && !scan.abandoned}<button class="secondary" disabled={busy} onclick={() => control('abandon', scan)}>Abandon scan</button>{/if}
+        {#if scan.current && !scan.abandoned}<button class="secondary" disabled={busy || reading} onclick={() => control('abandon', scan)}>Abandon scan</button>{/if}
         {#if scan.discardable}
           {#if confirmation === scan.scanId}
             <p>Discard this scan’s unfinished cached data and release its staging reservation? Spent allowances and photos on your server are kept.</p>
-            <button class="secondary" disabled={busy} onclick={() => control('discard', scan)}>Confirm cache discard</button>
-            <button class="text-button" disabled={busy} onclick={() => confirmation = null}>Keep cache</button>
-          {:else}<button class="text-button" disabled={busy} onclick={() => confirmDiscard(scan)}>Discard unfinished cache</button>{/if}
+            <button class="secondary" disabled={busy || reading} onclick={() => control('discard', scan)}>Confirm cache discard</button>
+            <button class="text-button" disabled={busy || reading} onclick={() => confirmation = null}>Keep cache</button>
+          {:else}<button class="text-button" disabled={busy || reading} onclick={() => confirmDiscard(scan)}>Discard unfinished cache</button>{/if}
         {:else if scan.abandoned && scan.reservedBytes > 0}
           <p class="footnote">This cache belongs to source work or needs ownership recovery. It is retained.</p>
         {/if}
       </div>
     {/each}
-    {#if status.scans.length > visible}<button class="text-button" disabled={busy} onclick={() => visible += 20}>Show more scans</button>{/if}
+    {#if status.scans.length > visible}<button class="text-button" disabled={busy || reading} onclick={() => visible += 20}>Show more scans</button>{/if}
   {:else if !busy && !message}<p>No saved reference scans on this computer.</p>{/if}
 </section>
 

@@ -94,11 +94,11 @@ test('unknown controls, stale scan objects and job-owned caches cannot invoke na
 });
 
 test('reference UI commands are permitted only in the packaged local main window', () => {
-  const ui = readFileSync(new URL('../src/ReferenceScans.svelte', import.meta.url), 'utf8');
+  const ui = readFileSync(new URL('../src/ReferenceScans.svelte', import.meta.url), 'utf8') + readFileSync(new URL('../src/ReferenceRead.svelte', import.meta.url), 'utf8');
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
   const commands = [...ui.matchAll(/invoke(?:<[^\n]*?>)?\('([^']+)'/g)].map(match => match[1]);
-  assert.equal(commands.length, 2);
+  assert.equal(commands.length, 5);
   for (const command of commands) {
     assert.ok(manifest.includes(`"${command}"`), `${command} must exist in the application ACL manifest`);
     assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`));
