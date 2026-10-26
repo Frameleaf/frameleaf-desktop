@@ -7,6 +7,7 @@ use crate::{
 struct Resource {
     job: Job,
     publication: Publication,
+    scan: String,
 }
 impl Resource {
     fn check(
@@ -23,32 +24,65 @@ impl Resource {
         lease.check()?;
         self.job.require_owner()?;
         let identity = authority(base, saved, source)?;
+        Preparation::resume_control(base, saved, &identity, source)?
+            .check_publication_scan(saved, &identity, &self.scan)?;
         self.job.resource.validate_current(saved, &identity)?;
         Ok(identity)
     }
 }
 impl Requests {
-    /// Publishes only already-prepared resource metadata; original reads remain separately approved.
-    pub async fn publish_reference(
+    /// Publishes metadata for the exact completed scan; original reads require a separate action.
+    pub async fn start_reference_publication(
         &self,
         base: PathBuf,
         saved: SavedConnection,
-        source: String,
-        notify: Arc<dyn Fn(View) + Send + Sync>,
-    ) -> Result<View, String> {
-        if !super::super::canonical_uuid(&source) {
-            return Err("source_read_request_invalid".into());
+        request: PreparationRequest,
+        notify: Arc<dyn Fn(PreparationWork) + Send + Sync>,
+    ) -> Result<PreparationWork, String> {
+        let key = super::reading::Key::new(&saved, request)?;
+        let event_key = key.clone();
+        let requested = key.request.clone();
+        let view = self
+            .install_checked(
+                requested.source_id.clone(),
+                Arc::new(move |view| notify(event_key.view(view))),
+                false,
+                Some(OperationKey::Publication(key.clone())),
+                move |progress, signal| publish(base, saved, requested, progress, signal),
+            )
+            .await?;
+        Ok(key.view(view))
+    }
+    pub async fn pause_reference_publication(
+        &self,
+        saved: &SavedConnection,
+        request: PreparationRequest,
+    ) -> Result<PreparationWork, String> {
+        let key = super::reading::Key::new(saved, request)?;
+        let mut owner = self.owner.lock().await;
+        if owner
+            .running
+            .as_ref()
+            .and_then(|running| running.operation.as_ref())
+            .and_then(OperationKey::publication)
+            != Some(&key)
+        {
+            return Err("source_read_operation_changed".into());
         }
-        self.install(source.clone(), notify, move |progress, signal| {
-            publish(base, saved, source, progress, signal)
+        self.drain(&mut owner).await?;
+        Ok(PreparationWork {
+            request: key.request,
+            state: "paused".into(),
+            code: None,
         })
-        .await
     }
 }
+
 async fn inventory(
     base: PathBuf,
     saved: SavedConnection,
     source: String,
+    scan: String,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(PollLease, Vec<PreparedResource>), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -57,7 +91,8 @@ async fn inventory(
         }
         let identity = authority(&base, &saved, &source)?;
         let lease = PollLease::acquire(&base, &source)?;
-        let preparation = Preparation::resume(&base, &saved, &identity, &source)?;
+        let preparation = Preparation::resume_control(&base, &saved, &identity, &source)?;
+        preparation.check_publication_scan(&saved, &identity, &scan)?;
         let resources = preparation.prepared_resources(&saved, &identity)?;
         if resources.is_empty() {
             return Err("source_preparation_required".into());
@@ -71,23 +106,26 @@ async fn inventory(
 async fn publish(
     base: PathBuf,
     saved: SavedConnection,
-    source: String,
+    request: PreparationRequest,
     progress: Progress,
     mut signal: Signal,
 ) -> Result<(), String> {
+    let source = request.source_id;
+    let scan = request.scan_id;
+    let (lease, resources) = inventory(
+        base.clone(),
+        saved.clone(),
+        source.clone(),
+        scan.clone(),
+        signal.cancelled.clone(),
+    )
+    .await?;
     let client = transport::client()?;
     // The wait belongs to the installed owner, so stop cannot be followed by a late worker start.
     signal
         .wait(transport::reference_capabilities(&client, &saved))
         .await
         .ok_or("source_delivery_interrupted")??;
-    let (lease, resources) = inventory(
-        base.clone(),
-        saved.clone(),
-        source.clone(),
-        signal.cancelled.clone(),
-    )
-    .await?;
     let lease = Arc::new(lease);
     for selected in resources {
         if signal.cancelled.load(Ordering::Acquire) {
@@ -99,12 +137,20 @@ async fn publish(
         let current_source = source.clone();
         let current_lease = lease.clone();
         let cancelled = signal.cancelled.clone();
+        let current_scan = scan.clone();
         let mut resource = tauri::async_runtime::spawn_blocking(move || {
             if cancelled.load(Ordering::Acquire) {
                 return Err("source_delivery_interrupted".into());
             }
             current_lease.check()?;
             let identity = authority(&current_base, &current_saved, &current_source)?;
+            let preparation = Preparation::resume_control(
+                &current_base,
+                &current_saved,
+                &identity,
+                &current_source,
+            )?;
+            preparation.check_publication_scan(&current_saved, &identity, &current_scan)?;
             let job = Job::resume(
                 &current_base,
                 &current_saved,
@@ -120,7 +166,11 @@ async fn publish(
                 return Err("source_item_changed".into());
             }
             let publication = job.publication(&current_saved, &identity)?;
-            Ok::<_, String>(Resource { job, publication })
+            Ok::<_, String>(Resource {
+                job,
+                publication,
+                scan: current_scan,
+            })
         })
         .await
         .map_err(|_| "source_read_shutdown_unconfirmed")??;
@@ -194,7 +244,7 @@ async fn publish(
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn stop_cancels_capability_wait_before_inventory_or_publication() {
+    async fn stop_drains_owned_publication_capability_wait_without_late_requests() {
         {
             use tokio::io::AsyncReadExt;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -215,8 +265,29 @@ mod tests {
                 device_id: Some("22222222-2222-4222-8222-222222222222".into()),
             };
             let owner = Requests::default();
+            let request = PreparationRequest {
+                source_id: source.into(),
+                scan_id: "a".repeat(64),
+                request_id: uuid::Uuid::new_v4().to_string(),
+            };
+            let key = super::super::reading::Key::new(&saved, request).unwrap();
             owner
-                .publish_reference(base.clone(), saved, source.into(), Arc::new(|_| {}))
+                .install_checked(
+                    source.into(),
+                    Arc::new(|_| {}),
+                    false,
+                    Some(OperationKey::Publication(key)),
+                    move |_, mut signal| async move {
+                        signal
+                            .wait(transport::reference_capabilities(
+                                &transport::client()?,
+                                &saved,
+                            ))
+                            .await
+                            .ok_or("source_delivery_interrupted")??;
+                        Err("unexpected_late_publication".into())
+                    },
+                )
                 .await
                 .unwrap();
             let (mut stream, _) =

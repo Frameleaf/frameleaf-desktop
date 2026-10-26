@@ -2,9 +2,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
-  type Scan = { scanId: string; current: boolean; abandoned: boolean; prepared: boolean; additionalReadAllowance: number; nextReadBytes: number | null };
+  type Scan = { resources: number; scanId: string; current: boolean; abandoned: boolean; prepared: boolean; additionalReadAllowance: number; nextReadBytes: number | null };
   type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string };
-  type Work = { sourceId: string; requestId: string; state: string; code: string | null } & ({ operation: 'prepare'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string });
+  type Work = { sourceId: string; requestId: string; state: string; code: string | null } & ({ operation: 'prepare'; scanId: string } | { operation: 'publish'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string });
   let { sourceId, scan = null, publications = [], disabled = false, onActiveChange, onSettled }: {
     sourceId: string; scan?: Scan | null; publications?: Publication[]; disabled?: boolean; onActiveChange: (active: boolean) => void; onSettled: () => void;
   } = $props();
@@ -21,6 +21,7 @@
   let unlisten: UnlistenFn | undefined;
   const observed = new Map<string, Work>();
   const errors: Record<string, string> = {
+    source_preparation_incomplete: 'Finish preparing the selected originals before publishing this scan.',
     source_publication_changed: 'The saved publication record changed. Refresh its metadata before recovering its receipt.',
     source_publication_not_committed: 'This attempt has not reached publication. Its earlier receipt and pending metadata are kept.',
     source_reference_receipt_invalid: 'The server reply does not match this saved publication. The existing record is kept.',
@@ -60,12 +61,13 @@
     return v.sourceId === sourceId && typeof v.requestId === 'string' && v.requestId.length === 36 && /^[a-f0-9-]{36}$/.test(v.requestId)
       && (v.code === null || typeof v.code === 'string') && (
         v.operation === 'prepare' && digest(v.scanId) && ['starting', 'preparing', 'stopped', 'paused', 'needs-attention'].includes(v.state)
+        || v.operation === 'publish' && digest(v.scanId) && ['starting', 'publishing', 'stopped', 'paused', 'needs-attention'].includes(v.state)
         || v.operation === 'recover' && digest(v.resourceKey) && digest(v.recordId) && ['starting', 'recovering', 'stopped', 'paused', 'needs-attention'].includes(v.state)
       );
   }
   function same(a: Work | null, b: Work) {
-    return !!a && a.sourceId === b.sourceId && a.requestId === b.requestId && (a.operation === 'prepare' && b.operation === 'prepare'
-      ? a.scanId === b.scanId : a.operation === 'recover' && b.operation === 'recover' && a.resourceKey === b.resourceKey && a.recordId === b.recordId);
+    return !!a && a.sourceId === b.sourceId && a.requestId === b.requestId && (a.operation !== 'recover' && b.operation !== 'recover'
+      ? a.operation === b.operation && a.scanId === b.scanId : a.operation === 'recover' && b.operation === 'recover' && a.resourceKey === b.resourceKey && a.recordId === b.recordId);
   }
   function settle() {
     announce();
@@ -79,8 +81,8 @@
     if (same(work, value) && finished(work) && !finished(value)) return;
     work = value;
     if (value.code) message = explain(value.code);
-    else if (value.state === 'paused') message = value.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
-    else if (value.state === 'stopped') message = value.operation === 'recover' ? 'Receipt recovery stopped. Refreshing saved publication records…' : 'Preparation stopped. Refreshing saved scan progress…';
+    else if (value.state === 'paused') message = value.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : value.operation === 'publish' ? 'Publication paused. Saved receipts and pending attempts are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
+    else if (value.state === 'stopped') message = value.operation === 'recover' ? 'Receipt recovery stopped. Refreshing saved publication records…' : value.operation === 'publish' ? 'Publication stopped. Refreshing saved publication records…' : 'Preparation stopped. Refreshing saved scan progress…';
     else message = '';
     settle();
   }
@@ -123,6 +125,7 @@
   function idle() { return ready && !checking && !startPending && !pausePending && !activeWork() && !disabled; }
   function canRecover(value: Publication) { return idle() && publications.includes(value) && ['publish', 'complete', 'recorded'].includes(value.state) && /^[a-f0-9]{64}$/.test(value.resourceKey) && /^[a-f0-9]{64}$/.test(value.recordId); }
   function canStart() { return idle() && !!scan?.current && !scan.abandoned && !scan.prepared && scan.additionalReadAllowance === 0; }
+  function canPublish() { return idle() && !!scan?.current && !scan.abandoned && scan.prepared && scan.resources > 0; }
   function newRequestId() {
     if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
     const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -134,11 +137,15 @@
     if (!canStart() || !scan) return;
     await launch({ operation: 'prepare', sourceId, scanId: scan.scanId });
   }
+  async function startPublication() {
+    if (!canPublish() || !scan) return;
+    await launch({ operation: 'publish', sourceId, scanId: scan.scanId });
+  }
   async function startRecovery(value: Publication) {
     if (!canRecover(value)) return;
     await launch({ operation: 'recover', sourceId, resourceKey: value.resourceKey, recordId: value.recordId });
   }
-  async function launch(target: { sourceId: string } & ({ operation: 'prepare'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string })) {
+  async function launch(target: { sourceId: string } & ({ operation: 'prepare'; scanId: string } | { operation: 'publish'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string })) {
     let requestId: string;
     try { requestId = newRequestId(); }
     catch { message = 'Secure request IDs are unavailable. Restart Frameleaf before preparing an original.'; return; }
@@ -149,6 +156,7 @@
     try {
       const reply = requested.operation === 'prepare'
         ? await invoke<Work>('start_photo_reference_read', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
+        : requested.operation === 'publish' ? await invoke<Work>('start_photo_reference_publication', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
         : await invoke<Work>('start_photo_reference_recovery', { sourceId: requested.sourceId, resourceKey: requested.resourceKey, expectedRecord: requested.recordId, requestId: requested.requestId });
       if (!current()) return;
       if (!valid(reply) || !same(requested, reply)) throw 'source_read_shutdown_unconfirmed';
@@ -168,11 +176,12 @@
     try {
       const reply = requested.operation === 'prepare'
         ? await invoke<Work>('pause_photo_reference_read', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
+        : requested.operation === 'publish' ? await invoke<Work>('pause_photo_reference_publication', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
         : await invoke<Work>('pause_photo_reference_recovery', { sourceId: requested.sourceId, resourceKey: requested.resourceKey, expectedRecord: requested.recordId, requestId: requested.requestId });
       if (!current()) return;
       if (!valid(reply) || !same(requested, reply) || reply.state !== 'paused') throw 'source_read_shutdown_unconfirmed';
       work = reply;
-      message = requested.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
+      message = requested.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : requested.operation === 'publish' ? 'Publication paused. Saved receipts and pending attempts are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
     } catch (error) {
       if (current()) { message = explain(error); work = { ...requested, state: 'needs-attention', code: 'source_read_shutdown_unconfirmed' }; }
     } finally { if (current()) { pausePending = false; settle(); } }
@@ -185,13 +194,18 @@
   <p class="footnote">Prepare one selected original at a time using the saved read or export allowance. Originals stay in their source; this action starts no server upload.</p>
   {#if checking}<p role="status">Checking source work status…</p>{/if}
   {#if activeWork()}
-    <p role="status">{pausePending ? 'Pausing and waiting for source work to stop…' : uncertain(work) ? 'Source work stop remains unconfirmed.' : work?.operation === 'recover' ? 'Recovering the saved server receipt…' : 'Preparing one original within its saved allowance…'}</p>
-    <progress aria-label={work?.operation === 'recover' ? 'Recovering saved server receipt' : 'Preparing one approved original'}></progress>
-    <button class="secondary" disabled={pausePending} onclick={pause}>{work?.operation === 'recover' ? 'Pause receipt recovery' : 'Pause preparation'}</button>
+    <p role="status">{pausePending ? 'Pausing and waiting for source work to stop…' : uncertain(work) ? 'Source work stop remains unconfirmed.' : work?.operation === 'recover' ? 'Recovering the saved server receipt…' : work?.operation === 'publish' ? 'Publishing the completed scan’s reference metadata…' : 'Preparing one original within its saved allowance…'}</p>
+    <progress aria-label={work?.operation === 'recover' ? 'Recovering saved server receipt' : work?.operation === 'publish' ? 'Publishing completed scan' : 'Preparing one approved original'}></progress>
+    <button class="secondary" disabled={pausePending} onclick={pause}>{work?.operation === 'recover' ? 'Pause receipt recovery' : work?.operation === 'publish' ? 'Pause publication' : 'Pause preparation'}</button>
   {/if}
   {#if message}<p role="status">{message}</p>{/if}
   <button class="text-button" disabled={checking || pausePending || startPending} onclick={checkStatus}>Check source work status</button>
   {#if canStart()}<button class="secondary" onclick={() => start()}>{scan?.nextReadBytes === null ? 'Recover staged original' : 'Prepare next original within allowance'}</button>{/if}
+  {#if scan?.current && !scan.abandoned && scan.prepared}
+    <h4>Publish prepared references</h4>
+    <p class="footnote">Publish this completed scan’s metadata to your server. This starts no original read or upload. Original access from your server is not yet available for desktop references.</p>
+    <button class="secondary" disabled={!canPublish()} onclick={startPublication}>Publish {scan.resources.toLocaleString()} prepared references</button>
+  {/if}
   {#if publications.some(value => ['publish', 'complete', 'recorded'].includes(value.state))}
     <h4>Recover a server receipt</h4>
     <p class="footnote">Check the exact saved publication on your server and finish its run if needed. This reads no original and starts no upload or new publication.</p>

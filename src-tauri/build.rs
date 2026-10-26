@@ -63,6 +63,8 @@ fn main() {
             "start_photo_reference_read",
             "pause_photo_reference_read",
             "photo_reference_work_status",
+            "start_photo_reference_publication",
+            "pause_photo_reference_publication",
             "start_photo_reference_recovery",
             "pause_photo_reference_recovery",
             "photo_import_status",

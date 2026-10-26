@@ -62,8 +62,37 @@ async fn action(base: &Path, saved: &SavedConnection, source: &str, recover: Opt
             .await
             .unwrap();
     } else {
+        let status = owner
+            .reference_status(base.to_owned(), saved.clone(), source.into())
+            .await
+            .unwrap()
+            .unwrap();
+        owner.stop().await.unwrap();
+        let scan = status.scans.iter().find(|scan| scan.current).unwrap();
+        let request = PreparationRequest {
+            source_id: source.into(),
+            scan_id: scan.scan_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let source = source.to_owned();
+        let publish_notify: Arc<dyn Fn(PreparationWork) + Send + Sync> = Arc::new(move |value| {
+            notify(View {
+                source_id: source.clone(),
+                state: value.state,
+                code: value.code,
+            })
+        });
         owner
-            .publish_reference(base.to_owned(), saved.clone(), source.into(), notify)
+            .start_reference_publication(
+                base.to_owned(),
+                saved.clone(),
+                request.clone(),
+                publish_notify.clone(),
+            )
+            .await
+            .unwrap();
+        owner
+            .start_reference_publication(base.to_owned(), saved.clone(), request, publish_notify)
             .await
             .unwrap();
     }
@@ -650,6 +679,46 @@ fn actual_native_reference_publication() {
             .await
             .is_err());
         scan_owner.stop().await.unwrap();
+        for (expected, code) in [
+            (restarted.scan_id.clone(), "source_preparation_incomplete"),
+            ("f".repeat(64), "source_scan_changed"),
+        ] {
+            let blocked = Requests::default();
+            let (send, mut receive) = tokio::sync::watch::channel(None::<PreparationWork>);
+            blocked
+                .start_reference_publication(
+                    base.clone(),
+                    next.clone(),
+                    PreparationRequest {
+                        source_id: source.clone(),
+                        scan_id: expected,
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    Arc::new(move |work| {
+                        send.send_replace(Some(work));
+                    }),
+                )
+                .await
+                .unwrap();
+            let refused = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                receive.wait_for(|work| {
+                    work.as_ref()
+                        .is_some_and(|work| work.state == "needs-attention")
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .clone()
+            .unwrap();
+            assert_eq!(refused.code.as_deref(), Some(code));
+            blocked.stop().await.unwrap();
+            assert_eq!(
+                fs::read(journal.root.join(&name)).unwrap(),
+                publication_before
+            );
+        }
         let mut preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
         assert!(!preparation.view(&next, &identity).unwrap().abandoned);
         assert!(preparation

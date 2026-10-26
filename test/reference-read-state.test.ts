@@ -5,9 +5,10 @@ import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
 const sourceId='00000000-0000-4000-8000-000000000101';
-const scan={scanId:'a'.repeat(64),current:true,abandoned:false,prepared:false,additionalReadAllowance:0,nextReadBytes:10};
+const scan={resources:2,scanId:'a'.repeat(64),current:true,abandoned:false,prepared:false,additionalReadAllowance:0,nextReadBytes:10};
 const work={operation:'prepare' as const,sourceId,scanId:scan.scanId,requestId:'00000000-0000-4000-8000-000000000001',state:'preparing',code:null as string|null};
 const publication={resourceKey:'c'.repeat(64),recordId:'d'.repeat(64),originalFileName:'Synthetic pending.jpg',state:'publish'};
+const publicationWork={...work,operation:'publish' as const,state:'publishing'};
 const recoveryWork={operation:'recover' as const,sourceId,resourceKey:publication.resourceKey,recordId:publication.recordId,requestId:work.requestId,state:'recovering',code:null as string|null};
 function component(selected: typeof scan|null=scan, cryptoMode: 'uuid'|'bytes'|'none'='uuid'){
  const source=readFileSync(new URL('../src/ReferenceRead.svelte',import.meta.url),'utf8');
@@ -15,17 +16,17 @@ function component(selected: typeof scan|null=scan, cryptoMode: 'uuid'|'bytes'|'
  const pending:{name:string;args:Record<string,unknown>;resolve(v:unknown):void;reject(e:unknown):void}[]=[];
  let mount!:()=>()=>void;let event!:(e:{payload:unknown})=>void;let sequence=0;let settled=0;let active=false;let unlistened=false;
  const exports:Record<string,unknown>={};
- const code=ts.transpileModule(`${script}\nexport { start, startRecovery, pause, checkStatus }; export const current=()=>({work,message,ready,startPending,pausePending});`,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+ const code=ts.transpileModule(`${script}\nexport { start, startRecovery, startPublication, pause, checkStatus }; export const current=()=>({work,message,ready,startPending,pausePending});`,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
  runInNewContext(code,{exports,$state:(v:unknown)=>v,$props:()=>({sourceId,scan:selected,publications:[publication],disabled:false,onActiveChange:(v:boolean)=>active=v,onSettled:()=>settled++}),crypto:cryptoMode==='uuid'?{randomUUID:()=>`00000000-0000-4000-8000-${String(++sequence).padStart(12,'0')}`} : cryptoMode==='bytes'?{getRandomValues:(bytes:Uint8Array)=>{bytes.fill(7);return bytes;}}:{},require:(name:string)=>{
   if(name==='svelte')return{onMount:(callback:typeof mount)=>mount=callback};
   if(name==='@tauri-apps/api/event')return{listen:async(channel:string,callback:typeof event)=>{assert.equal(channel,'photo-reference-work');event=callback;return()=>unlistened=true;}};
   assert.equal(name,'@tauri-apps/api/core');return{invoke:(name:string,args:Record<string,unknown>)=>new Promise((resolve,reject)=>pending.push({name,args,resolve,reject}))};
  }});
  return {...exports,pending,mount:()=>mount(),emit:(payload:unknown)=>event({payload}),observed:()=>({active,settled,unlistened})}as unknown as{
-  start():Promise<void>;startRecovery(value:typeof publication):Promise<void>;pause():Promise<void>;checkStatus():Promise<void>;current():{work:typeof work|typeof recoveryWork|null;message:string;ready:boolean;startPending:boolean;pausePending:boolean};pending:typeof pending;mount():()=>void;emit(v:unknown):void;observed():{active:boolean;settled:number;unlistened:boolean};
+  start():Promise<void>;startPublication():Promise<void>;startRecovery(value:typeof publication):Promise<void>;pause():Promise<void>;checkStatus():Promise<void>;current():{work:typeof work|typeof recoveryWork|typeof publicationWork|null;message:string;ready:boolean;startPending:boolean;pausePending:boolean};pending:typeof pending;mount():()=>void;emit(v:unknown):void;observed():{active:boolean;settled:number;unlistened:boolean};
  };
 }
-async function loaded(selected:typeof scan|null=scan,snapshot:typeof work|typeof recoveryWork|null=null){const view=component(selected);const unmount=view.mount();await setImmediate();assert.equal(view.pending[0].name,'photo_reference_work_status');view.pending[0].resolve(snapshot);await setImmediate();return{view,unmount};}
+async function loaded(selected:typeof scan|null=scan,snapshot:typeof work|typeof recoveryWork|typeof publicationWork|null=null){const view=component(selected);const unmount=view.mount();await setImmediate();assert.equal(view.pending[0].name,'photo_reference_work_status');view.pending[0].resolve(snapshot);await setImmediate();return{view,unmount};}
 test('opening the panel checks status and never starts a read',{timeout:5000},async()=>{
  const {view,unmount}=await loaded();assert.equal(view.pending.length,1);assert.equal(view.observed().active,false);assert.equal(view.current().ready,true);unmount();assert.equal(view.observed().unlistened,true);
 });
@@ -120,6 +121,26 @@ test('recovery binds the displayed record and cannot grant read or upload allowa
 test('a restored recovery keeps other operations blocked until its own confirmed stop',{timeout:5000},async()=>{
  const {view,unmount}=await loaded(scan,recoveryWork);await view.start();await view.startRecovery(publication);assert.equal(view.pending.length,1);
  view.emit({...work,state:'stopped'});assert.equal(view.current().work?.state,'recovering');
+ const pause=view.pause();view.pending[1].reject('source_read_shutdown_unconfirmed');await pause;
+ assert.equal(view.observed().active,true);assert.equal(view.observed().settled,0);unmount();
+});
+
+test('publication requires a completed displayed scan and never grants more allowance',{timeout:5000},async()=>{
+ for(const selected of [null,scan,{...scan,prepared:true,abandoned:true},{...scan,prepared:true,current:false}]){
+  const {view,unmount}=await loaded(selected);await view.startPublication();assert.equal(view.pending.length,1);unmount();
+ }
+ const {view,unmount}=await loaded({...scan,prepared:true});const start=view.startPublication();
+ assert.equal(view.pending[1].name,'start_photo_reference_publication');assert.equal(view.pending[1].args.expectedScan,scan.scanId);
+ assert.equal('additional' in view.pending[1].args,false);assert.equal('resourceKey' in view.pending[1].args,false);
+ view.pending[1].resolve(publicationWork);await start;
+ view.emit({...work,state:'stopped'});assert.equal(view.current().work?.state,'publishing');
+ const pause=view.pause();assert.equal(view.pending[2].name,'pause_photo_reference_publication');
+ view.pending[2].resolve({...publicationWork,state:'paused'});await pause;assert.equal(view.observed().active,false);unmount();
+});
+test('restored publication excludes reads and recovery until confirmed stop',{timeout:5000},async()=>{
+ const {view,unmount}=await loaded({...scan,prepared:true},publicationWork);
+ await view.start();await view.startRecovery(publication);await view.startPublication();assert.equal(view.pending.length,1);
+ view.emit({...recoveryWork,state:'stopped'});assert.equal(view.observed().active,true);
  const pause=view.pause();view.pending[1].reject('source_read_shutdown_unconfirmed');await pause;
  assert.equal(view.observed().active,true);assert.equal(view.observed().settled,0);unmount();
 });

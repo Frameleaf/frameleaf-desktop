@@ -27,6 +27,8 @@
     "allow-start-photo-reference-read",
     "allow-pause-photo-reference-read",
     "allow-photo-reference-work-status",
+    "allow-start-photo-reference-publication",
+    "allow-pause-photo-reference-publication",
     "allow-start-photo-reference-recovery",
     "allow-pause-photo-reference-recovery",
     "allow-photo-import-status",

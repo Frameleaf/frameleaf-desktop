@@ -99,17 +99,25 @@ impl Drop for Stop {
 #[derive(Clone, PartialEq, Eq)]
 enum OperationKey {
     Prepare(reading::Key),
+    Publication(reading::Key),
     Recovery(recovery::Key),
 }
 impl OperationKey {
     fn request_id(&self) -> &str {
         match self {
-            Self::Prepare(key) => &key.request.request_id,
+            Self::Prepare(key) | Self::Publication(key) => &key.request.request_id,
             Self::Recovery(key) => &key.request.request_id,
         }
     }
     fn preparation(&self) -> Option<&reading::Key> {
         if let Self::Prepare(key) = self {
+            Some(key)
+        } else {
+            None
+        }
+    }
+    fn publication(&self) -> Option<&reading::Key> {
+        if let Self::Publication(key) = self {
             Some(key)
         } else {
             None
@@ -124,13 +132,14 @@ impl OperationKey {
     }
     fn matches(&self, saved: &SavedConnection, source: &str) -> bool {
         match self {
-            Self::Prepare(key) => key.matches(saved, source),
+            Self::Prepare(key) | Self::Publication(key) => key.matches(saved, source),
             Self::Recovery(key) => key.matches(saved, source),
         }
     }
     fn view(&self, view: View) -> ReferenceWork {
         match self {
             Self::Prepare(key) => ReferenceWork::Prepare(key.view(view)),
+            Self::Publication(key) => ReferenceWork::Publish(key.view(view)),
             Self::Recovery(key) => ReferenceWork::Recover(key.view(view)),
         }
     }
@@ -139,6 +148,7 @@ impl OperationKey {
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum ReferenceWork {
     Prepare(PreparationWork),
+    Publish(PreparationWork),
     Recover(RecoveryWork),
 }
 struct Running {
@@ -902,6 +912,106 @@ mod tests {
         assert_eq!(value["recordId"], recovery.record_id);
         let mut pause = Box::pin(owner.pause_reference_recovery(&saved, recovery));
         tokio::select! {result=&mut pause=>panic!("recovery pause returned before drain: {}",result.err().unwrap_or_default()),result=stopping=>result.unwrap(),}
+        finish.send(()).unwrap();
+        assert_eq!(pause.await.unwrap().state, "paused");
+        assert!(!owner.is_active());
+        let publication = PreparationRequest {
+            source_id: source.clone(),
+            scan_id: scan.clone(),
+            request_id: request.clone(),
+        };
+        let key = reading::Key::new(&saved, publication.clone()).unwrap();
+        let (observed, stopping) = tokio::sync::oneshot::channel();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        owner
+            .install_checked(
+                source.clone(),
+                notify(),
+                false,
+                Some(OperationKey::Publication(key)),
+                move |_, signal| async move {
+                    while !signal.cancelled.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    observed.send(()).unwrap();
+                    let _ = wait.await;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        owner
+            .start_reference_publication(
+                PathBuf::new(),
+                saved.clone(),
+                publication.clone(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        for action in [
+            PreparationAction::Abandon {
+                expected_scan: "e".repeat(64),
+            },
+            PreparationAction::Discard {
+                expected_scan: "e".repeat(64),
+            },
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                owner.prepare_reference(
+                    PathBuf::new(),
+                    saved.clone(),
+                    source.clone(),
+                    action,
+                    notify(),
+                ),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "stale metadata control must refuse without draining active publication"
+            );
+            assert_eq!(
+                result.unwrap().err().as_deref(),
+                Some("source_read_already_running")
+            );
+            assert!(!owner
+                .owner
+                .lock()
+                .await
+                .running
+                .as_ref()
+                .unwrap()
+                .stop
+                .cancelled
+                .load(Ordering::Acquire));
+        }
+        assert!(owner
+            .pause_reference_preparation(&saved, publication.clone())
+            .await
+            .is_err());
+        assert!(owner
+            .pause_reference_publication(&foreign, publication.clone())
+            .await
+            .is_err());
+        let mut stale = publication.clone();
+        stale.scan_id = "e".repeat(64);
+        assert!(owner
+            .pause_reference_publication(&saved, stale)
+            .await
+            .is_err());
+        let current = owner
+            .reference_work_status(&saved, &source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["operation"],
+            "publish"
+        );
+        let mut pause = Box::pin(owner.pause_reference_publication(&saved, publication));
+        tokio::select! {result=&mut pause=>panic!("publication pause returned before drain: {}",result.err().unwrap_or_default()),result=stopping=>result.unwrap(),}
         finish.send(()).unwrap();
         assert_eq!(pause.await.unwrap().state, "paused");
         assert!(!owner.is_active());

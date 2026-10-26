@@ -470,6 +470,8 @@ pub fn run() {
             source_reference_commands::start_photo_reference_read,
             source_reference_commands::pause_photo_reference_read,
             source_reference_commands::photo_reference_work_status,
+            source_reference_commands::start_photo_reference_publication,
+            source_reference_commands::pause_photo_reference_publication,
             source_reference_commands::start_photo_reference_recovery,
             source_reference_commands::pause_photo_reference_recovery,
             photo_import_status,

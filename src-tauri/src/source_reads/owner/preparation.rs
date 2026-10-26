@@ -47,7 +47,10 @@ impl Requests {
         let selected_source = source.clone();
         let replace = !matches!(
             &action,
-            PreparationAction::RescanSelected { .. } | PreparationAction::ApproveRead { .. }
+            PreparationAction::RescanSelected { .. }
+                | PreparationAction::ApproveRead { .. }
+                | PreparationAction::Abandon { .. }
+                | PreparationAction::Discard { .. }
         );
         self.prepare_owned_checked(source, notify, replace, move |cancelled, stop| {
             stop()?;

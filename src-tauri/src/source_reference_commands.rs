@@ -215,6 +215,63 @@ pub(crate) async fn pause_photo_reference_recovery(
         .await
         .map(source_reads::ReferenceWork::Recover)
 }
+#[tauri::command]
+pub(crate) async fn start_photo_reference_publication(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    expected_scan: String,
+    request_id: String,
+) -> Result<source_reads::ReferenceWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &source_id)?;
+    let events = app.clone();
+    app.state::<source_reads::Requests>()
+        .start_reference_publication(
+            import_base(&app)?,
+            saved.clone(),
+            source_reads::PreparationRequest {
+                source_id,
+                scan_id: expected_scan,
+                request_id,
+            },
+            std::sync::Arc::new(move |work| {
+                let _ = events.emit(
+                    "photo-reference-work",
+                    source_reads::ReferenceWork::Publish(work),
+                );
+            }),
+        )
+        .await
+        .map(source_reads::ReferenceWork::Publish)
+}
+#[tauri::command]
+pub(crate) async fn pause_photo_reference_publication(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    expected_scan: String,
+    request_id: String,
+) -> Result<source_reads::ReferenceWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    app.state::<source_reads::Requests>()
+        .pause_reference_publication(
+            saved,
+            source_reads::PreparationRequest {
+                source_id,
+                scan_id: expected_scan,
+                request_id,
+            },
+        )
+        .await
+        .map(source_reads::ReferenceWork::Publish)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

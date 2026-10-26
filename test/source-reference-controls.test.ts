@@ -99,7 +99,7 @@ test('reference UI commands are permitted only in the packaged local main window
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
   const commands = [...ui.matchAll(/invoke(?:<[^\n]*?>)?\('([^']+)'/g)].map(match => match[1]);
-  assert.equal(commands.length, 7);
+  assert.equal(commands.length, 9);
   for (const command of commands) {
     assert.ok(manifest.includes(`"${command}"`), `${command} must exist in the application ACL manifest`);
     assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`));

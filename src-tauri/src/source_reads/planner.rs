@@ -563,6 +563,23 @@ impl Preparation {
         }
         Ok(())
     }
+    pub fn check_publication_scan(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        expected: &str,
+    ) -> Result<(), String> {
+        self.current_control(saved, identity)?;
+        self.check_scan(saved, identity, expected)?;
+        let state = self.progress(saved, identity)?;
+        if state.abandoned {
+            return Err("source_scan_abandoned".into());
+        }
+        if state.position() != self.plan.count() || self.plan.count() == 0 {
+            return Err("source_preparation_incomplete".into());
+        }
+        Ok(())
+    }
     /// An additional local approval never replaces the already spent amount.
     pub fn approve(
         &mut self,
