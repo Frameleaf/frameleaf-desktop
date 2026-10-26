@@ -10,6 +10,20 @@ pub struct ProcessTree(i32);
 #[cfg(windows)]
 pub struct ProcessTree(std::os::windows::io::OwnedHandle);
 
+#[cfg(unix)]
+fn group_exit_confirmed(reaped: bool, query: i32, error: Option<i32>) -> Result<bool, String> {
+    let absent = query == -1 && error == Some(libc::ESRCH);
+    // A dying macOS group may deny this query even after its leader is reaped.
+    let exiting = error == Some(libc::EPERM);
+    if reaped && absent {
+        return Ok(true);
+    }
+    if query == -1 && !absent && !exiting {
+        return Err("runtime_process_shutdown_unconfirmed".into());
+    }
+    Ok(false)
+}
+
 pub fn configure(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -101,13 +115,10 @@ impl ProcessTree {
             let error = (present == -1)
                 .then(|| std::io::Error::last_os_error().raw_os_error())
                 .flatten();
-            let absent = present == -1 && error == Some(libc::ESRCH);
-            // macOS may deny a dying group query until its still-owned leader is reaped.
-            let exiting = !reaped && error == Some(libc::EPERM);
-            if reaped && absent {
+            if group_exit_confirmed(reaped, present, error)? {
                 return Ok(());
             }
-            if (present == -1 && !absent && !exiting) || std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return Err("runtime_process_shutdown_unconfirmed".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -235,5 +246,19 @@ impl ProcessTree {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::group_exit_confirmed;
+    #[test]
+    fn permission_error_after_reaping_keeps_shutdown_pending_until_group_absence() {
+        assert!(!group_exit_confirmed(true, -1, Some(libc::EPERM)).unwrap());
+        assert!(!group_exit_confirmed(false, -1, Some(libc::EPERM)).unwrap());
+        assert!(!group_exit_confirmed(false, -1, Some(libc::ESRCH)).unwrap());
+        assert!(!group_exit_confirmed(true, 0, None).unwrap());
+        assert!(group_exit_confirmed(true, -1, Some(libc::ESRCH)).unwrap());
+        assert!(group_exit_confirmed(true, -1, Some(libc::EINVAL)).is_err());
     }
 }
