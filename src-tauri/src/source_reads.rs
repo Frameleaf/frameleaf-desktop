@@ -2,6 +2,7 @@
 mod owner;
 mod planner;
 mod preparation;
+mod publication;
 use crate::{
     connection::{DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,

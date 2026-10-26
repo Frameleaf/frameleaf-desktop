@@ -1,5 +1,6 @@
 //! The application owns one poller and drains its current read before changing authority.
 mod preparation;
+mod publication;
 use super::Job;
 use crate::connection::{DeviceIdentity, SavedConnection};
 use cap_std::{ambient_authority, fs::Dir};

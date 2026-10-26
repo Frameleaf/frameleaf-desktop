@@ -224,7 +224,7 @@ fn limits(response: &Response, bytes: u64) -> Result<usize, String> {
         _ => Err("source_upload_response_invalid".into()),
     }
 }
-fn date(ms: i64) -> Result<String, String> {
+pub(crate) fn date(ms: i64) -> Result<String, String> {
     let value = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
         .map_err(|_| "source_date_invalid")?;
     if !(0..=9999).contains(&value.year()) {
