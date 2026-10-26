@@ -376,3 +376,48 @@ mod tests {
         }
     }
 }
+
+#[tauri::command]
+pub(crate) async fn photo_reference_files(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+) -> Result<source_reads::ReferenceFiles, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &source_id)?;
+    app.state::<source_reads::Requests>()
+        .reference_files(import_base(&app)?, saved.clone(), source_id)
+        .await
+}
+#[tauri::command]
+pub(crate) async fn plan_photo_reference(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    relatives: Vec<String>,
+    expected_scan: Option<String>,
+) -> Result<source_reads::ReferenceStatus, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &source_id)?;
+    let reads = app.state::<source_reads::Requests>();
+    reads
+        .plan_reference_selection(
+            import_base(&app)?,
+            saved.clone(),
+            source_id.clone(),
+            relatives,
+            expected_scan,
+        )
+        .await?;
+    reads.stop().await?;
+    reads
+        .reference_status(import_base(&app)?, saved.clone(), source_id)
+        .await?
+        .ok_or("source_scan_changed".into())
+}

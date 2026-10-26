@@ -20,7 +20,9 @@
   let blockedConsent = $state(false);
   let allowHydration = $state(false);
   let allowReads = $state(false);
+  let sourceMode = $state<'copy' | 'reference'>('copy');
   let alive = true;
+  let approvalSerial = 0;
   let busy = $state(false);
   let message = $state('');
   const native = isTauri();
@@ -104,12 +106,12 @@
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
   function copyAllowed() { return !!consent && (consent.mode ?? 'copy') === 'copy'; }
   async function loadConsent() {
-    const previous = consent;
+    const previous = consent; const operation = approvalSerial;
     try {
       const current = await invoke<Consent | null>('photo_source_status');
-      if (alive && consent === previous) { consent = current; blockedConsent = false; if (!copyAllowed()) job = null; }
+      if (alive && approvalSerial === operation && consent === previous) { consent = current; blockedConsent = false; if (!copyAllowed()) job = null; }
     } catch (error) {
-      if (alive && consent === previous) {
+      if (alive && approvalSerial === operation && consent === previous) {
         blockedConsent = ['source_photo_session_changed', 'source_approval_invalid', 'credential_record_invalid', 'photos_permission_required', 'photos_macos_required'].includes(String(error));
         message = explain(error);
       }
@@ -169,14 +171,27 @@
     catch (error) { if (alive && consent === source) message = explain(error); }
     finally { busy = false; }
   }
+  function setMode(value: string) {
+    if (busy || consent || (value !== 'copy' && value !== 'reference') || value === sourceMode) return;
+    sourceMode = value; allowReads = false; allowHydration = false;
+  }
   async function approve(retry = false) {
-    if (!retry && (!folder || !allowReads)) return;
+    if (busy || (!retry && (!folder || !allowReads))) return;
+    const previous = consent; const selected = folder; const operation = ++approvalSerial;
+    const mode = retry ? previous?.mode ?? 'copy' : sourceMode;
+    const hydration = retry ? previous?.allowPhotosHydration ?? false : allowHydration;
+    const current = () => alive && approvalSerial === operation && consent === previous && folder === selected;
     busy = true; message = '';
     try {
-      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads, allowPhotosHydration: allowHydration });
-      folder = null; allowReads = false; allowHydration = false;
-    } catch (error) { await loadConsent(); message = explain(error); }
-    finally { busy = false; }
+      const reply = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : selected!.selectionId, allowDownload: retry ? previous?.allowDownload ?? false : allowReads, allowPhotosHydration: hydration, mode });
+      if (!current()) return;
+      if (!reply || !reply.registered || !reply.id || (reply.mode ?? 'copy') !== mode || reply.allowDownload !== true || reply.allowPhotosHydration !== hydration || (!retry && reply.kind !== selected?.kind)) {
+        blockedConsent = true; message = errors.source_registration_response_invalid; return;
+      }
+      consent = reply; job = null; blockedConsent = false;
+      folder = null; allowReads = false; allowHydration = false; sourceMode = 'copy';
+    } catch (error) { if (current()) { await loadConsent(); if (alive && approvalSerial === operation) message = explain(error); } }
+    finally { if (alive && approvalSerial === operation) busy = false; }
   }
   async function reconnect() {
     if (consent?.mode !== 'reference' || !consent.reconnectRequired) return;
@@ -195,11 +210,12 @@
     finally { busy = false; }
   }
   async function revoke() {
+    approvalSerial++;
     const reference = consent?.mode === 'reference';
     busy = true; message = '';
     try {
       const confirmed = await invoke<boolean>('revoke_photo_source');
-      consent = null; job = null; blockedConsent = false; folder = null; allowReads = false; allowHydration = false;
+      consent = null; job = null; blockedConsent = false; folder = null; allowReads = false; allowHydration = false; sourceMode = 'copy';
       message = reference
         ? (confirmed ? 'Reference permission removed. Library entries are kept; this computer no longer serves their originals.' : 'Local reference permission removed. The server could not confirm revocation; check it when connected.')
         : (confirmed ? 'Folder permission removed. Existing server copies are kept.' : 'Local folder permission removed. The server could not confirm revocation; check it when connected.');
@@ -215,16 +231,18 @@
     finally { busy = false; }
   }
   async function choosePhotos() {
+    approvalSerial++;
     busy = true; message = '';
-    try { folder = await invoke<Inventory>('choose_apple_photos', { count: photosCount }); allowReads = false; allowHydration = false; }
+    try { folder = await invoke<Inventory>('choose_apple_photos', { count: photosCount }); allowReads = false; allowHydration = false; sourceMode = 'copy'; }
     catch (error) { message = explain(error); }
     finally { busy = false; }
   }
   async function choose(oneDrive: number | null = null) {
+    approvalSerial++;
     busy = true; message = '';
     try {
       const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive });
-      if (selected) { folder = selected; allowReads = false; allowHydration = false; }
+      if (selected) { folder = selected; allowReads = false; allowHydration = false; sourceMode = 'copy'; }
     } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
     finally { busy = false; }
   }
@@ -314,17 +332,24 @@
       <strong>{folder.path}</strong>
       <p>{folder.photos.toLocaleString()} {folder.kind === 'apple-photos' ? 'original resources selected' : 'photo or video filenames found'}{folder.truncated ? ' in a partial preview' : ''}.</p>
       <p class="footnote">{folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</p>
-      {#if folder.kind === 'apple-photos'}<p class="footnote">Sizes and cloud residency are unknown. Approval permits up to {size(folder.logicalBytes)} of original export attempts, capped at 2 GiB per resource, including paired originals. Export stops at this ceiling. This metadata snapshot and its exact original resources are bound to your current sign-in and device; library changes require a new selection.</p>{/if}
+      {#if folder.kind === 'apple-photos'}<p class="footnote">Sizes and cloud residency are unknown. {sourceMode === 'reference' ? 'Reference approval grants no original export allowance. Review the exact export allowance after creating a reference scan.' : `Approval permits up to ${size(folder.logicalBytes)} of original export attempts, capped at 2 GiB per resource, including paired originals.`} Export stops at this ceiling. This metadata snapshot and its exact original resources are bound to your current sign-in and device; library changes require a new selection.</p>{/if}
       {#if folder.kind !== 'apple-photos' && folder.availability}<p class="footnote" aria-label="Preview file availability">{availabilityText(folder.availability)}</p>{/if}
-      <label class="source-consent"><input type="checkbox" bind:checked={allowReads} disabled={busy}> {folder.kind === 'apple-photos' ? `Allow Photos to read these selected originals within the ${size(folder.logicalBytes)} export allowance. Upload approval follows verified staging.` : 'Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.'}</label>
+      <label>Use these originals <select aria-label="Photo source use" value={sourceMode} onchange={event => setMode(event.currentTarget.value)} disabled={busy}>
+        <option value="copy">Copy into Frameleaf</option>
+        <option value="reference">Keep a read-only reference on this computer</option>
+      </select></label>
+      {#if sourceMode === 'reference'}
+        <p class="footnote">Originals stay here and are never edited by Frameleaf. This computer and app must be available for server requests, including processing, downloads and sharing. Completed Buddy backups retain independent originals. Prepare and publish batches after approval; original-read/export and transfer allowances are approved separately.</p>
+      {/if}
+      <label class="source-consent"><input type="checkbox" bind:checked={allowReads} disabled={busy}> {sourceMode === 'reference' ? 'Allow read-only access to this source for references. Approval reads no originals and adds no read/export or transfer allowance.' : folder.kind === 'apple-photos' ? `Allow Photos to read these selected originals within the ${size(folder.logicalBytes)} export allowance. Upload approval follows verified staging.` : 'Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.'}</label>
       {#if folder.kind === 'apple-photos'}
         <label class="source-consent"><input type="checkbox" bind:checked={allowHydration} disabled={busy}> Allow Apple Photos to download iCloud originals. Photos can download and cache the full original before Frameleaf receives any bytes. The export/staging ceiling does not limit Photos-managed network traffic; downloads may exceed it. An unmetered connection is still required.</label>
       {/if}
-      <button class="secondary" disabled={busy || !allowReads} onclick={() => approve()}>Approve this {folder.kind === 'apple-photos' ? 'Photos scope and export allowance' : 'folder'}</button>
-      <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; allowHydration = false; }}>Clear preview</button>
+      <button class="secondary" disabled={busy || !allowReads} onclick={() => approve()}>Approve this {sourceMode === 'reference' ? 'read-only reference source' : folder.kind === 'apple-photos' ? 'Photos scope and export allowance' : 'folder'}</button>
+      <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; allowHydration = false; sourceMode = 'copy'; }}>Clear preview</button>
     </div>
   {/if}
-  <p class="footnote">Copy jobs require explicit source approval and an unmetered connection. Cloud-only files may download while staging an approved original. External-library connections are still being implemented. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
+  <p class="footnote">Copy jobs require explicit source approval and an unmetered connection. Cloud-only files may download while staging an approved original. Reference originals depend on this computer; preparation, publication and serving need explicit actions and allowances. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
 </section>
 
 <style>

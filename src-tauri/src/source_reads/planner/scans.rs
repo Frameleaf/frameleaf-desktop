@@ -61,7 +61,7 @@ impl Plan {
     }
 }
 impl Preparation {
-    pub(super) fn select(
+    pub(in crate::source_reads) fn select(
         approval: &CopyApproval,
         relatives: &[String],
     ) -> Result<Vec<SourceFile>, String> {

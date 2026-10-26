@@ -250,8 +250,61 @@ fn actual_native_reference_publication() {
         consent.register(&saved, &identity).await.unwrap();
         crate::source_consent::persist(&consent, &saved, &identity).unwrap();
         let source = consent.source_id().to_owned();
-        let mut preparation =
-            Preparation::plan(&base, &saved, &identity, &source, "original.jpg").unwrap();
+        let planner = Requests::default();
+        let files = planner
+            .reference_files(base.clone(), saved.clone(), source.clone())
+            .await
+            .unwrap();
+        planner.stop().await.unwrap();
+        assert_eq!(files.source_id, source);
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].relative, "original.jpg");
+        assert_eq!(files.files[0].bytes, original.len() as u64);
+        for relatives in [
+            vec![],
+            vec!["../outside.jpg".into()],
+            vec!["/outside.jpg".into()],
+            vec!["missing.jpg".into()],
+        ] {
+            assert!(planner
+                .plan_reference_selection(
+                    base.clone(),
+                    saved.clone(),
+                    source.clone(),
+                    relatives,
+                    None
+                )
+                .await
+                .is_err());
+            planner.stop().await.unwrap();
+        }
+        let planned = planner
+            .plan_reference_selection(
+                base.clone(),
+                saved.clone(),
+                source.clone(),
+                vec![files.files[0].relative.clone()],
+                None,
+            )
+            .await
+            .unwrap();
+        planner.stop().await.unwrap();
+        assert_eq!(
+            (planned.resources, planned.spent, planned.remaining),
+            (1, 0, 0)
+        );
+        assert!(planner
+            .plan_reference_selection(
+                base.clone(),
+                saved.clone(),
+                source.clone(),
+                vec!["original.jpg".into()],
+                None
+            )
+            .await
+            .is_err());
+        planner.stop().await.unwrap();
+        let mut preparation = Preparation::resume(&base, &saved, &identity, &source).unwrap();
         preparation
             .approve(&saved, &identity, original.len() as u64)
             .unwrap();

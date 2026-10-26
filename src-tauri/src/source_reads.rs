@@ -12,6 +12,7 @@ use crate::{
     source_import::Journal,
 };
 use cap_std::{ambient_authority, fs::Dir};
+pub(crate) use owner::ReferenceFiles;
 pub use owner::{
     PreparationAction, PreparationRequest, PreparationWork, RecoveryRequest, RecoveryWork,
     ReferenceWork, Requests, ServingRequest, ServingSelection, ServingWork, View,

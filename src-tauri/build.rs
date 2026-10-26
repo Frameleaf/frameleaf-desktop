@@ -59,6 +59,8 @@ fn main() {
             "reconnect_photo_source",
             "revoke_photo_source",
             "photo_reference_status",
+            "photo_reference_files",
+            "plan_photo_reference",
             "approve_photo_reference_transfer",
             "approve_photo_reference_original_read",
             "control_photo_reference",

@@ -3,11 +3,15 @@
   import { onMount } from 'svelte';
   import ReferenceRead from './ReferenceRead.svelte';
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
+  type ReferenceFiles = { sourceId: string; files: { relative: string; bytes: number }[]; stagingRemaining: number };
   type Transfer = { resourceKey: string; resourceId: string; version: string; stateId: string; bytes: number; readUsed: number; readRemaining: number; readCost: number; additionalRead: number; uploadUsed: number; uploadRemaining: number; additionalUpload: number; cacheRecorded: boolean };
   type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null; transfer?: Transfer | null; transferError?: string | null };
   type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[]; serving?: { selectionId: string; resources: number; maxTransferBytes: number } | null };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
+  let files = $state<ReferenceFiles | null>(null);
+  let selectedFiles = $state<string[]>([]);
+  let visibleFiles = $state(20);
   let busy = $state(false);
   let reading = $state(false);
   let message = $state('');
@@ -17,6 +21,10 @@
   let alive = true;
   let serial = 0;
   const errors: Record<string, string> = {
+    source_inventory_partial: 'This source’s metadata inventory is incomplete. Review folder size or access before selecting a batch; saved records are kept.',
+    source_inventory_unreadable: 'Some entries could not be inspected. Restore folder access before selecting a batch.',
+    source_staging_budget_exceeded: 'This batch no longer fits private staging. Choose fewer originals or finish existing transfers first.',
+    source_selection_invalid: 'Choose supported originals within the displayed staging capacity. Empty files and resources over 2 GiB cannot be prepared.',
     source_transfer_state_changed: 'The transfer allowance changed. Refresh before approving it again.',
     source_transfer_budget_invalid: 'The displayed transfer amount is no longer valid. Refresh the saved record.',
     source_publication_changed: 'The publication changed. Refresh before approving a transfer.',
@@ -65,6 +73,46 @@
       if (!current()) return;
       if (reply && reply.sourceId !== source) throw 'source_approval_changed';
       status = reply;
+    } catch (error) { if (current()) message = explain(error); }
+    finally { if (current()) busy = false; }
+  }
+  function selectionBytes() { const selected = new Set(selectedFiles); return (files?.files ?? []).reduce((total, file) => total + (selected.has(file.relative) ? file.bytes : 0), 0); }
+  function toggleFile(relative: string) {
+    if (busy || reading || !files?.files.some(file => file.relative === relative)) return;
+    if (selectedFiles.includes(relative)) selectedFiles = selectedFiles.filter(value => value !== relative);
+    else {
+      const file = files.files.find(file => file.relative === relative)!;
+      if (file.bytes < 1 || selectionBytes() + file.bytes > files.stagingRemaining) { message = 'Choose a smaller batch that fits the displayed private staging capacity.'; return; }
+      selectedFiles = [...selectedFiles, relative];
+    }
+  }
+  async function inspectFiles() {
+    if (busy || reading) return;
+    const request = ++serial; const source = sourceId; busy = true; message = '';
+    const current = () => alive && serial === request && sourceId === source;
+    try {
+      const reply = await invoke<ReferenceFiles>('photo_reference_files', { sourceId: source });
+      if (!current()) return;
+      if (!reply || reply.sourceId !== source || !Array.isArray(reply.files) || reply.files.length > 10000
+        || !Number.isSafeInteger(reply.stagingRemaining) || reply.stagingRemaining < 0 || reply.stagingRemaining > 2 * 1024 ** 3
+        || reply.files.some(file => typeof file.relative !== 'string' || !file.relative || !Number.isSafeInteger(file.bytes) || file.bytes < 0)
+        || new Set(reply.files.map(file => file.relative)).size !== reply.files.length) throw 'source_inventory_partial';
+      files = reply; selectedFiles = []; visibleFiles = 20;
+    } catch (error) { if (current()) message = explain(error); }
+    finally { if (current()) busy = false; }
+  }
+  async function planSelection() {
+    const scan = status?.scans.find(value => value.current);
+    if (busy || reading || !files || files.sourceId !== sourceId || !selectedFiles.length || (scan && !scan.canRescan) || selectionBytes() > files.stagingRemaining) return;
+    const relatives = [...selectedFiles]; const request = ++serial; const source = sourceId; busy = true; message = '';
+    const current = () => alive && serial === request && sourceId === source;
+    try {
+      const reply = await invoke<ReferenceStatus>('plan_photo_reference', { sourceId: source, relatives, expectedScan: scan?.scanId ?? null });
+      if (!current()) return;
+      const next = reply?.scans.find(value => value.current);
+      if (reply?.sourceId !== source || !next || next.abandoned || typeof next.scanId !== 'string' || !/^[a-f0-9]{64}$/.test(next.scanId) || next.resources !== relatives.length || next.spent !== 0 || next.remaining !== 0 || (scan && next.scanId === scan.scanId)) throw 'source_scan_changed';
+      status = reply; files = null; selectedFiles = [];
+      message = 'Reference scan saved. No original-read, export or transfer allowance was granted; no original was read.';
     } catch (error) { if (current()) message = explain(error); }
     finally { if (current()) busy = false; }
   }
@@ -138,6 +186,19 @@
 <section aria-label="Saved reference scans" aria-busy={busy}>
   <h3>Saved reference scans</h3>
   <p class="footnote">Inspect saved preparation and staging reservations without opening or downloading originals.</p>
+  <button class="secondary" disabled={busy || reading} onclick={inspectFiles}>Choose originals for a reference batch</button>
+  {#if files}
+    <div aria-label="Reference batch selection">
+      <p class="footnote">Choose originals from the approved source. This lists metadata only. Select batches within {size(files.stagingRemaining)} of currently available private staging; Photos resource sizes use their maximum export ceiling. Publish and serve a completed batch before staging more when space is full. Existing published references are kept.</p>
+      {#each files.files.slice(0, visibleFiles) as file (file.relative)}
+        <label><input type="checkbox" checked={selectedFiles.includes(file.relative)} disabled={busy || reading || file.bytes < 1 || (!selectedFiles.includes(file.relative) && selectionBytes() + file.bytes > files.stagingRemaining)} onchange={() => toggleFile(file.relative)}> {file.relative} · {size(file.bytes)}</label>
+      {/each}
+      {#if files.files.length > visibleFiles}<button class="text-button" disabled={busy || reading} onclick={() => visibleFiles += 20}>Show more originals</button>{/if}
+      <p>{selectedFiles.length.toLocaleString()} selected · {size(selectionBytes())}.</p>
+      <button class="secondary" disabled={busy || reading || !selectedFiles.length || !!status?.scans.some(scan => scan.current && !scan.canRescan)} onclick={planSelection}>Create metadata-only reference scan</button>
+      <button class="text-button" disabled={busy || reading} onclick={() => { files = null; selectedFiles = []; }}>Clear batch selection</button>
+    </div>
+  {/if}
   <ReferenceRead {sourceId} scan={status?.scans.find(value => value.current) ?? null} publications={status?.publications ?? []} serving={status?.serving ?? null} disabled={busy} onActiveChange={value => reading = value} onSettled={() => void refresh()} />
   <button class="text-button" disabled={busy || reading} onclick={refresh}>Refresh saved scans</button>
   {#if busy}<p role="status">Checking saved reference work…</p>{/if}

@@ -23,6 +23,8 @@
     "allow-reconnect-photo-source",
     "allow-revoke-photo-source",
     "allow-photo-reference-status",
+    "allow-photo-reference-files",
+    "allow-plan-photo-reference",
     "allow-approve-photo-reference-transfer",
     "allow-approve-photo-reference-original-read",
     "allow-control-photo-reference",

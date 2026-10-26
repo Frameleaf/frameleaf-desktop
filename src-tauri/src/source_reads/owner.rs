@@ -8,6 +8,7 @@ use super::Job;
 use crate::connection::{DeviceIdentity, SavedConnection};
 use cap_std::{ambient_authority, fs::Dir};
 pub use preparation::PreparationAction;
+pub(crate) use preparation::ReferenceFiles;
 pub use reading::{PreparationRequest, PreparationWork};
 pub use recovery::{RecoveryRequest, RecoveryWork};
 use serde::Serialize;
@@ -1016,7 +1017,41 @@ mod tests {
             )
             .await
             .unwrap();
+        let files = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            owner.reference_files(PathBuf::new(), saved.clone(), source.clone()),
+        )
+        .await;
+        assert_eq!(
+            files.ok().and_then(Result::err).as_deref(),
+            Some("source_read_already_running")
+        );
+        let plan = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            owner.plan_reference_selection(
+                PathBuf::new(),
+                saved.clone(),
+                source.clone(),
+                vec!["original.jpg".into()],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            plan.ok().and_then(Result::err).as_deref(),
+            Some("source_read_already_running")
+        );
         for action in [
+            PreparationAction::Plan {
+                relative: "original.jpg".into(),
+            },
+            PreparationAction::Selection {
+                relatives: vec!["original.jpg".into()],
+            },
+            PreparationAction::Rescan {
+                relatives: vec!["original.jpg".into()],
+                expected_scan: "e".repeat(64),
+            },
             PreparationAction::Abandon {
                 expected_scan: "e".repeat(64),
             },

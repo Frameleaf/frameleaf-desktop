@@ -16,7 +16,7 @@ function component() {
   const pending: { name: string; args: Record<string, unknown>; resolve(value: unknown): void; reject(error: unknown): void }[] = [];
   let mount!: () => () => void;
   const exports: Record<string, unknown> = {};
-  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage, approveTransfer, approveRead }; export const current = () => ({ status, message, busy, confirmation });`, {
+  const code = ts.transpileModule(`${script}\nexport { refresh, control, confirmDiscard, publicationMessage, approveTransfer, approveRead }; export const inspectFilesCall=()=>inspectFiles(); export const toggleFileCall=(key:string)=>toggleFile(key); export const planSelectionCall=()=>planSelection(); export const current = () => ({ status, message, busy, confirmation });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, $state: (value: unknown) => value, $props: () => ({ sourceId: status.sourceId, photos: false }), require: (name: string) => {
@@ -25,6 +25,7 @@ function component() {
     return { invoke: (name: string, args: Record<string, unknown>) => new Promise((resolve, reject) => { pending.push({ name, args, resolve, reject }); }) };
   } });
   return { ...exports, pending, mount: () => mount() } as unknown as {
+    inspectFilesCall(): Promise<void>; toggleFileCall(key:string): void; planSelectionCall(): Promise<void>;
     approveRead(value: typeof publication): Promise<void>;
     approveTransfer(value: typeof publication): Promise<void>;
     publicationMessage(value: { state: string }): string;
@@ -103,7 +104,7 @@ test('reference UI commands are permitted only in the packaged local main window
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
   const commands = [...ui.matchAll(/invoke(?:<[^\n]*?>)?\('([^']+)'/g)].map(match => match[1]);
-  assert.equal(commands.length, 13);
+  assert.equal(commands.length, 15);
   for (const command of commands) {
     assert.ok(manifest.includes(`"${command}"`), `${command} must exist in the application ACL manifest`);
     assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`));
@@ -214,4 +215,27 @@ test('a recorded but consumed original can receive a separate transfer grant wit
  const {view,unmount}=await loaded({...status,publications:[value]});const call=view.approveTransfer(value);
  view.pending[1].resolve({...value.transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0});await call;
  assert.equal(view.pending[2].name,'photo_reference_status');view.pending[2].resolve(null);await setImmediate();unmount();
+});
+
+test('a fresh reference scan chooses only displayed bounded files and creates no allowances',async()=>{
+ const {view,unmount}=await loaded({...status,scans:[]});const inspect=view.inspectFilesCall();
+ assert.equal(view.pending[1].name,'photo_reference_files');view.pending[1].resolve({sourceId:status.sourceId,files:[{relative:'one.jpg',bytes:10},{relative:'two.jpg',bytes:20}],stagingRemaining:15});await inspect;
+ view.toggleFileCall('two.jpg');await view.planSelectionCall();assert.equal(view.pending.length,2);
+ view.toggleFileCall('one.jpg');const plan=view.planSelectionCall();assert.equal(view.pending[2].name,'plan_photo_reference');
+ assert.deepEqual(JSON.parse(JSON.stringify(view.pending[2].args)),{sourceId:status.sourceId,relatives:['one.jpg'],expectedScan:null});
+ view.pending[2].resolve({...status,scans:[{...scan,spent:0,remaining:0,resources:1,prepared:false,abandoned:false}]});await plan;
+ assert.equal(view.current().status?.scans[0].spent,0);unmount();
+});
+test('an incomplete current scan cannot be replaced by choosing new files',async()=>{
+ const {view,unmount}=await loaded();const inspect=view.inspectFilesCall();view.pending[1].resolve({sourceId:status.sourceId,files:[{relative:'one.jpg',bytes:10}],stagingRemaining:10});await inspect;
+ view.toggleFileCall('one.jpg');await view.planSelectionCall();assert.equal(view.pending.length,2);unmount();
+});
+
+test('a completed unchanged batch may reuse verified metadata without another original read',async()=>{
+ const current={...scan,prepared:true,canRescan:true};const displayed={...status,scans:[current]};
+ const {view,unmount}=await loaded(displayed);const inspect=view.inspectFilesCall();
+ view.pending[1].resolve({sourceId:status.sourceId,files:[{relative:'one.jpg',bytes:10}],stagingRemaining:10});await inspect;
+ view.toggleFileCall('one.jpg');const call=view.planSelectionCall();assert.equal(view.pending[2].args.expectedScan,current.scanId);
+ const next={...displayed,scans:[{...current,scanId:'c'.repeat(64),resources:1,spent:0,remaining:0}]};
+ view.pending[2].resolve(next);await call;assert.equal(view.current().status,next);assert.match(view.current().message,/No original-read/);unmount();
 });

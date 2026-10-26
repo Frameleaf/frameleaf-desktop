@@ -22,7 +22,7 @@ function component() {
     svelte: { onMount: (callback: typeof mount) => { mount = callback; } },
     './source-copy-state': {},
   };
-  const code = ts.transpileModule(`${script}\nexport { revoke, loadConsent, prepareCopy, controlCopy }; export { reconnect as reconnectCall }; export const current = () => ({ consent, job, message, blockedConsent });`, {
+  const code = ts.transpileModule(`${script}\nexport { revoke, loadConsent, prepareCopy, controlCopy, approve, choose, setMode }; export function acknowledge(){allowReads=true;} export { reconnect as reconnectCall }; export const current = () => ({ consent, job, message, blockedConsent, sourceMode, allowReads });`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   runInNewContext(code, { exports, require: (name: string) => {
@@ -30,8 +30,9 @@ function component() {
     return modules[name];
   }, $state: (value: unknown) => value, $derived: (value: unknown) => value });
   return { ...exports, pending, mount: () => mount(), emit: (payload: unknown) => event({ payload }) } as unknown as {
-    current: () => { consent: typeof source | null; job: typeof job | null; message: string; blockedConsent: boolean };
+    current: () => { consent: typeof source | null; job: typeof job | null; message: string; blockedConsent: boolean; sourceMode:string; allowReads:boolean };
     reconnectCall: () => Promise<void>; revoke: () => Promise<void>; loadConsent: () => Promise<void>;
+    approve: (retry?:boolean) => Promise<void>; choose: () => Promise<void>; setMode: (mode:string) => void; acknowledge: () => void;
     prepareCopy: () => Promise<void>; controlCopy: (action: string) => Promise<void>;
     pending: typeof pending; mount: () => () => void; emit: (payload: unknown) => void;
   };
@@ -209,4 +210,28 @@ test('copy and active-reference consent cannot invoke reconnect',async()=>{
     const view=component();const unmount=view.mount();await setImmediate();view.pending.get('photo_source_status')!.resolve(value);await setImmediate();
     await view.reconnectCall();assert.equal(view.pending.has('reconnect_photo_source'),false);unmount();
   }
+});
+
+const selectedFolder={kind:'folder',selectionId:'chosen-folder',path:'/Synthetic originals',photos:2,logicalBytes:10,skipped:0,truncated:false,availability:{available:2,needsDownload:0,notReady:0,unknown:0,pinned:0,downloadBytes:0}};
+async function chosen(){const view=component();const call=view.choose();view.pending.get('choose_photo_folder')!.resolve(selectedFolder);await call;return view;}
+test('reference setup requires its own acknowledgement and sends explicit immutable mode',async()=>{
+ const view=await chosen();view.acknowledge();view.setMode('reference');assert.equal(view.current().allowReads,false);
+ await view.approve();assert.equal(view.pending.has('approve_photo_folder'),false);
+ view.acknowledge();const call=view.approve();assert.equal(view.pending.get('approve_photo_folder')!.args?.mode,'reference');
+ view.pending.get('approve_photo_folder')!.resolve({...source,mode:'reference',kind:'folder',allowDownload:true,allowPhotosHydration:false});await call;
+ assert.equal((view.current().consent as {mode?:string})?.mode,'reference');assert.equal(view.current().job,null);
+});
+test('a changed mode or late approval reply cannot install reference or copy permission',async()=>{
+ for(const late of [false,true]){const view=await chosen();view.setMode('reference');view.acknowledge();const call=view.approve();
+ if(late){const removed=view.revoke();view.pending.get('revoke_photo_source')!.resolve(true);await removed;}
+ view.pending.get('approve_photo_folder')!.resolve({...source,mode:late?'reference':'copy',kind:'folder',allowDownload:true,allowPhotosHydration:false});await call;
+ assert.equal(view.current().consent,null);}
+});
+
+test('a failed fresh approval status lookup cannot restore permission after revocation',async()=>{
+ const view=await chosen();view.setMode('reference');view.acknowledge();const approval=view.approve();
+ view.pending.get('approve_photo_folder')!.reject('source_registration_unavailable');await setImmediate();
+ assert.ok(view.pending.has('photo_source_status'));const revoke=view.revoke();view.pending.get('revoke_photo_source')!.resolve(true);await revoke;
+ view.pending.get('photo_source_status')!.resolve({...source,mode:'reference',kind:'folder',allowDownload:true,allowPhotosHydration:false});await approval;
+ assert.equal(view.current().consent,null);assert.match(view.current().message,/permission removed/);
 });

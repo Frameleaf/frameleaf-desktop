@@ -47,7 +47,10 @@ impl Requests {
         let selected_source = source.clone();
         let replace = !matches!(
             &action,
-            PreparationAction::RescanSelected { .. }
+            PreparationAction::Plan { .. }
+                | PreparationAction::Selection { .. }
+                | PreparationAction::Rescan { .. }
+                | PreparationAction::RescanSelected { .. }
                 | PreparationAction::ApproveRead { .. }
                 | PreparationAction::Abandon { .. }
                 | PreparationAction::Discard { .. }
@@ -406,4 +409,99 @@ pub(super) fn recorded_status(
     }
     check()?;
     Ok(status)
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReferenceFiles {
+    pub(crate) source_id: String,
+    pub(crate) files: Vec<crate::photo_sources::SourceFile>,
+    pub(crate) staging_remaining: u64,
+}
+impl Requests {
+    pub(crate) async fn reference_files(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        source: String,
+    ) -> Result<ReferenceFiles, String> {
+        if !super::super::canonical_uuid(&source) {
+            return Err("source_read_request_invalid".into());
+        }
+        self.prepare_owned_checked(source.clone(), Arc::new(|_| {}), false, move |_, stop| {
+            stop()?;
+            let identity = authority(&base, &saved, &source)?;
+            let consent = crate::source_import::current(&saved, &identity, &source)?;
+            let approval = consent.reference_approval(&saved, &identity)?;
+            let scan = approval.files()?;
+            if scan.inventory.truncated {
+                return Err("source_inventory_partial".into());
+            }
+            if scan.unreadable > 0 {
+                return Err("source_inventory_unreadable".into());
+            }
+            let staging_remaining =
+                crate::private_inputs::InputBudget::open(&base, &identity)?.remaining()?;
+            stop()?;
+            approval.validate_current(&saved, &identity)?;
+            Ok(ReferenceFiles {
+                source_id: source,
+                files: scan.files,
+                staging_remaining,
+            })
+        })
+        .await
+    }
+    pub(crate) async fn plan_reference_selection(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        source: String,
+        relatives: Vec<String>,
+        expected: Option<String>,
+    ) -> Result<PreparationView, String> {
+        if !super::super::canonical_uuid(&source)
+            || expected
+                .as_ref()
+                .is_some_and(|value| !crate::native_runtime::digest_valid(value, 64))
+        {
+            return Err("source_read_request_invalid".into());
+        }
+        self.prepare_owned_checked(source.clone(), Arc::new(|_| {}), false, move |_, stop| {
+            stop()?;
+            let identity = authority(&base, &saved, &source)?;
+            let consent = crate::source_import::current(&saved, &identity, &source)?;
+            let approval = consent.reference_approval(&saved, &identity)?;
+            let entries = Preparation::select(approval, &relatives)?;
+            let required = entries.iter().try_fold(0u64, |total, entry| {
+                total
+                    .checked_add(entry.bytes)
+                    .ok_or("source_selection_invalid")
+            })?;
+            if required > crate::private_inputs::InputBudget::open(&base, &identity)?.remaining()? {
+                return Err("source_staging_budget_exceeded".into());
+            }
+            stop()?;
+            if let Some(expected) = expected {
+                Preparation::resume(&base, &saved, &identity, &source)?
+                    .rescan(&saved, &identity, &relatives, &expected, stop)
+            } else {
+                if Preparation::reference_status(&base, &saved, &identity, &source, stop)?.is_some()
+                {
+                    return Err("source_scan_changed".into());
+                }
+                let prep = Preparation::open_selection(
+                    &base,
+                    &saved,
+                    &identity,
+                    approval.clone(),
+                    entries,
+                    true,
+                )?;
+                stop()?;
+                prep.view(&saved, &identity)
+            }
+        })
+        .await
+    }
 }
