@@ -13,6 +13,11 @@ impl Plan {
         }
     }
     pub(super) fn total(&self) -> Result<u64, String> {
+        if self.generation.as_ref().is_some_and(|g| {
+            !canonical_uuid(&g.id) || !crate::native_runtime::digest_valid(&g.previous, 64)
+        }) {
+            return Err("source_journal_invalid".into());
+        }
         if self.count() > 10_000 {
             return Err("source_inventory_partial".into());
         }
@@ -113,7 +118,7 @@ impl Preparation {
         for index in 0..state.position() {
             let record: InventoryRecord = self
                 .journal
-                .read(&format!("prepared-{index}.json"), identity)?;
+                .read(&self.plan.inventory_name(index), identity)?;
             let entry = self.plan.entry_at(index)?;
             let resource = &record.resource;
             if record.plan_hash != self.plan_hash
@@ -165,7 +170,7 @@ impl Preparation {
                 bytes: copy.bytes,
             },
         };
-        let name = format!("prepared-{index}.json");
+        let name = self.plan.inventory_name(index);
         if super::super::preparation::present(&self.journal.root.join(&name))? {
             let previous: InventoryRecord = self.journal.read(&name, identity)?;
             if previous != record {
@@ -193,7 +198,7 @@ impl Preparation {
         state.attempt = None;
         state.attempt_bytes = None;
         self.journal
-            .write("preparation-state.json", &state, identity)
+            .write(&self.plan.state_name(), &state, identity)
     }
 }
 
@@ -211,6 +216,7 @@ mod tests {
             },
             export: true,
             additional: Vec::new(),
+            generation: None,
         }
     }
 

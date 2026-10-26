@@ -130,6 +130,7 @@ fn actual_native_reference_publication() {
         let prepared = preparation
             .stage_and_handoff(&saved, &identity, &AtomicBool::new(false), &|| Ok(()))
             .unwrap();
+        let first_scan = prepared.scan_id.clone();
         assert!(prepared.prepared);
         assert_eq!(prepared.spent, original.len() as u64);
         assert_eq!(prepared.remaining, 0);
@@ -290,6 +291,73 @@ fn actual_native_reference_publication() {
         assert_eq!(fs::read(&job_record).unwrap(), job_before);
         report(
             json!({"phase":"reconnected","receipt":receipt,"readAndUploadAllowancesUnchanged":true}),
+        );
+        assert_eq!(read_fixture_message(&mut input)["command"], "rescan");
+        let scan_owner = Requests::default();
+        let scan = scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::Rescan {
+                    relatives: vec!["original.jpg".into()],
+                    expected_scan: first_scan.clone(),
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert!(!scan.prepared);
+        assert_eq!((scan.spent, scan.remaining), (0, 0));
+        assert_ne!(scan.scan_id, first_scan);
+        let mut preparation = Preparation::resume(&base, &next, &identity, &source).unwrap();
+        assert!(preparation
+            .stage_and_handoff(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
+            .is_err());
+        preparation
+            .approve(&next, &identity, edited.len() as u64)
+            .unwrap();
+        let prepared = preparation
+            .stage_and_handoff(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        assert!(prepared.prepared);
+        assert_eq!(
+            (prepared.spent, prepared.remaining),
+            (edited.len() as u64, 0)
+        );
+        let fresh = preparation.prepared_resources(&next, &identity).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].resource_key, selected.resource_key);
+        assert_ne!(fresh[0].version, selected.version);
+        assert!(preparation
+            .journal
+            .root
+            .join(format!("preparation-plan-{first_scan}.json"))
+            .exists());
+        drop(preparation);
+        assert_eq!(action(&base, &next, &source, None).await.state, "stopped");
+        let updated: Value = journal.read(&name, &identity).unwrap();
+        let replacement = &updated["current"]["receipt"];
+        assert!(updated["pending"].is_null());
+        assert_eq!(replacement["assetId"], receipt["assetId"]);
+        assert_ne!(replacement["resourceId"], receipt["resourceId"]);
+        let job = Job::resume(
+            &base,
+            &next,
+            &identity,
+            &source,
+            &fresh[0].resource_key,
+            &fresh[0].version,
+        )
+        .unwrap();
+        let view = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
+        assert_eq!(view["read"], json!({"used":0,"limit":0}));
+        assert_eq!(view["upload"], json!({"used":0,"limit":0}));
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
+        drop(job);
+        report(
+            json!({"phase":"rescanned","receipt":replacement,"explicitReadSpent":prepared.spent,"remaining":prepared.remaining,"oldReadAndUploadAllowancesUnchanged":true,"newReadAndUploadAllowancesZero":true}),
         );
         assert_eq!(read_fixture_message(&mut input)["command"], "forget");
         crate::source_consent::forget_reference(&source, &next, &identity).unwrap();

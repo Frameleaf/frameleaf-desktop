@@ -13,6 +13,7 @@ use crate::{
 use cap_std::{ambient_authority, fs::Dir};
 pub use owner::{PreparationAction, Requests, View};
 pub use planner::{Preparation, PreparationView, PreparedResource};
+pub(crate) use publication::validate_directory as validate_publication_store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -822,6 +823,260 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn rescan_preserves_history_reuses_unchanged_resources_and_never_refills_allowances() {
+        let f = Fixture::new();
+        let entries = || {
+            vec![crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            }]
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries().remove(0),
+            true,
+        )
+        .unwrap();
+        let first = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+        assert!(prep
+            .rescan_with(&f.saved, &f.identity, entries(), &first, &|| Ok(()))
+            .is_err());
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let initial = prep.recorded_resources(&f.saved, &f.identity).unwrap();
+        let spent = fs::read(prep.journal.root.join("preparation-state.json")).unwrap();
+        let same = prep
+            .rescan_with(&f.saved, &f.identity, entries(), &first, &|| Ok(()))
+            .unwrap();
+        assert_ne!(same.scan_id, first);
+        assert!(same.prepared);
+        assert_eq!((same.spent, same.remaining), (0, 0));
+        assert!(prep.recorded_resources(&f.saved, &f.identity).unwrap() == initial);
+        assert_eq!(
+            fs::read(prep.journal.root.join("preparation-state.json")).unwrap(),
+            spent
+        );
+        assert_eq!(
+            prep.rescan_with(&f.saved, &f.identity, entries(), &first, &|| Ok(()))
+                .unwrap()
+                .scan_id,
+            same.scan_id
+        );
+        fs::write(f.root.join("source/original.jpg"), b"new pixels").unwrap();
+        let changed = prep
+            .rescan_with(&f.saved, &f.identity, entries(), &same.scan_id, &|| Ok(()))
+            .unwrap();
+        assert!(!changed.prepared);
+        assert_eq!((changed.spent, changed.remaining), (0, 0));
+        assert!(prep
+            .finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .is_err());
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let current = prep.recorded_resources(&f.saved, &f.identity).unwrap();
+        assert_eq!(initial[0].resource_key, current[0].resource_key);
+        assert_ne!(initial[0].version, current[0].version);
+        assert_ne!(initial[0].id, current[0].id);
+        assert!(prep
+            .rescan_with(&f.saved, &f.identity, entries(), &first, &|| Ok(()))
+            .is_err());
+        drop(prep);
+        let resumed = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entries().remove(0),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.view(&f.saved, &f.identity).unwrap().scan_id,
+            changed.scan_id
+        );
+        assert_eq!(resumed.view(&f.saved, &f.identity).unwrap().spent, 10);
+        assert!(resumed.recorded_resources(&f.saved, &f.identity).unwrap() == current);
+        assert_eq!(
+            fs::read(resumed.journal.root.join("preparation-state.json")).unwrap(),
+            spent
+        );
+    }
+    #[test]
+    fn rescan_cutpoints_keep_the_previous_scan_active_and_its_spent_budget_intact() {
+        for failure in 1..=7 {
+            let f = Fixture::new();
+            let entry = crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            };
+            let mut prep = Preparation::open_with(
+                &f.root.join("data"),
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                entry.clone(),
+                true,
+            )
+            .unwrap();
+            prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+            prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+            let before = prep.view(&f.saved, &f.identity).unwrap();
+            let active = fs::read(prep.journal.root.join("preparation-plan.json")).unwrap();
+            let spent = fs::read(prep.journal.root.join("preparation-state.json")).unwrap();
+            let checks = std::cell::Cell::new(0);
+            assert!(prep
+                .rescan_with(
+                    &f.saved,
+                    &f.identity,
+                    vec![entry.clone()],
+                    &before.scan_id,
+                    &|| {
+                        checks.set(checks.get() + 1);
+                        if checks.get() == failure {
+                            Err("source_copy_cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                )
+                .is_err());
+            assert_eq!(
+                fs::read(prep.journal.root.join("preparation-plan.json")).unwrap(),
+                active
+            );
+            assert_eq!(
+                fs::read(prep.journal.root.join("preparation-state.json")).unwrap(),
+                spent
+            );
+            let resumed = prep.view(&f.saved, &f.identity).unwrap();
+            assert_eq!(resumed.scan_id, before.scan_id);
+            assert_eq!(resumed.spent, 10);
+            let next = prep
+                .rescan_with(&f.saved, &f.identity, vec![entry], &before.scan_id, &|| {
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!((next.spent, next.remaining), (0, 0));
+            assert!(next.prepared);
+            let plan: serde_json::Value = prep
+                .journal
+                .read("preparation-plan.json", &f.identity)
+                .unwrap();
+            let name = format!(
+                "preparation-state-{}.json",
+                plan["generation"]["id"].as_str().unwrap()
+            );
+            let old: serde_json::Value = prep
+                .journal
+                .read("preparation-state.json", &f.identity)
+                .unwrap();
+            prep.journal.write(&name, &old, &f.identity).unwrap();
+            assert!(prep.view(&f.saved, &f.identity).is_err());
+        }
+    }
+    #[test]
+    fn rescan_reuses_earlier_resources_in_mixed_selections_and_recovers_before_activation() {
+        let f = Fixture::new();
+        let old = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let new = crate::photo_sources::SourceFile {
+            relative: "fresh.jpg".into(),
+            bytes: 3,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            old.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let first = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+        let initial = prep.recorded_resources(&f.saved, &f.identity).unwrap();
+        let active = fs::read(prep.journal.root.join("preparation-plan.json")).unwrap();
+        let root = prep.journal.root.clone();
+        assert!(prep
+            .rescan_with(&f.saved, &f.identity, vec![old.clone()], &first, &|| {
+                let published_state = fs::read_dir(&root).unwrap().any(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("preparation-state-")
+                });
+                if published_state {
+                    Err("source_copy_cancelled".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        assert_eq!(
+            fs::read(prep.journal.root.join("preparation-plan.json")).unwrap(),
+            active
+        );
+        fs::write(f.root.join("source/fresh.jpg"), b"new").unwrap();
+        let mixed = prep
+            .rescan_with(
+                &f.saved,
+                &f.identity,
+                vec![new.clone(), old.clone()],
+                &first,
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                mixed.completed,
+                mixed.resources,
+                mixed.spent,
+                mixed.remaining
+            ),
+            (1, 2, 0, 0)
+        );
+        assert!(prep.recorded_resources(&f.saved, &f.identity).unwrap() == initial);
+        prep.approve_with(&f.saved, &f.identity, 3).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let complete = prep.recorded_resources(&f.saved, &f.identity).unwrap();
+        let subset = prep
+            .rescan_with(&f.saved, &f.identity, vec![new], &mixed.scan_id, &|| Ok(()))
+            .unwrap();
+        assert!(subset.prepared);
+        assert_eq!((subset.spent, subset.remaining), (0, 0));
+        let earlier = prep
+            .rescan_with(
+                &f.saved,
+                &f.identity,
+                vec![old],
+                &subset.scan_id,
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert!(earlier.prepared);
+        assert_eq!((earlier.spent, earlier.remaining), (0, 0));
+        assert!(prep.recorded_resources(&f.saved, &f.identity).unwrap() == initial);
+        assert_eq!(complete[0].id, initial[0].id);
+        assert_eq!(
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                .unwrap()
+                .remaining()
+                .unwrap(),
+            crate::private_inputs::LIMIT - 13
+        );
     }
     #[test]
     #[cfg(unix)]

@@ -446,6 +446,53 @@ impl Publication {
         Ok(())
     }
 }
+pub(crate) fn validate_directory(
+    root: &Path,
+    source: &str,
+    identity: &DeviceIdentity,
+    count: &mut usize,
+) -> Result<(), String> {
+    crate::native_runtime::absolute_directory(root)?;
+    let journal = Journal {
+        root: root.to_owned(),
+    };
+    for entry in std::fs::read_dir(root).map_err(|_| "source_journal_invalid")? {
+        *count += 1;
+        if *count > 50_000 {
+            return Err("source_inventory_partial".into());
+        }
+        let entry = entry.map_err(|_| "source_journal_invalid")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("source_journal_invalid")?;
+        let metadata =
+            std::fs::symlink_metadata(entry.path()).map_err(|_| "source_journal_invalid")?;
+        if !metadata.is_file() || metadata.is_symlink() || metadata.len() > 4 * 1024 * 1024 {
+            return Err("source_journal_invalid".into());
+        }
+        // A crash may leave a bounded atomic-write temporary; it never contains original media.
+        if name
+            .strip_prefix(".checkpoint-")
+            .is_some_and(canonical_uuid)
+        {
+            continue;
+        }
+        if !name
+            .strip_suffix(".json")
+            .is_some_and(|s| crate::native_runtime::digest_valid(s, 64))
+        {
+            return Err("source_journal_invalid".into());
+        }
+        let state: State = journal.read(name, identity)?;
+        state.validate()?;
+        if state.binding.source_id != source
+            || state.binding.installation_id != identity.installation_id
+            || name != format!("{}.json", state.binding.resource_key)
+        {
+            return Err("source_journal_invalid".into());
+        }
+    }
+    Ok(())
+}
 impl Job {
     pub(super) fn publication(
         &self,
@@ -614,6 +661,39 @@ mod tests {
             &DeviceIdentity::generate()
         )
         .is_err());
+    }
+    #[test]
+    fn quota_metadata_validation_accepts_only_bound_journals_and_bounded_temporaries() {
+        let mut f = Fixture::new();
+        f.binding.installation_id = f.identity.installation_id.clone();
+        let p = f.open();
+        let check = || validate_directory(&f.root, &f.binding.source_id, &f.identity, &mut 0);
+        check().unwrap();
+        std::fs::write(
+            f.root.join(format!(".checkpoint-{}", uuid::Uuid::new_v4())),
+            b"partial",
+        )
+        .unwrap();
+        check().unwrap();
+        assert!(validate_directory(
+            &f.root,
+            "66666666-6666-4666-8666-666666666666",
+            &f.identity,
+            &mut 0
+        )
+        .is_err());
+        std::fs::write(f.root.join("original"), b"media").unwrap();
+        assert!(check().is_err());
+        std::fs::remove_file(f.root.join("original")).unwrap();
+        std::fs::create_dir(f.root.join("nested")).unwrap();
+        assert!(check().is_err());
+        std::fs::remove_dir(f.root.join("nested")).unwrap();
+        let mut foreign = p.state.clone();
+        foreign.binding.installation_id = "66666666-6666-4666-8666-666666666666".into();
+        p.journal.write(&p.name, &foreign, &f.identity).unwrap();
+        assert!(check().is_err());
+        std::fs::write(f.root.join(&p.name), b"unsigned").unwrap();
+        assert!(check().is_err());
     }
     #[test]
     fn empty_directory_and_interrupted_first_write_can_restart_without_a_request() {

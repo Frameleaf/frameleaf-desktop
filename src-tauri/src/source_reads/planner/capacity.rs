@@ -48,7 +48,7 @@ pub(super) fn reconcile(
         gate()?;
         owner.require_owner()?;
         prep.journal
-            .write("preparation-state.json", &progress, identity)?;
+            .write(&prep.plan.state_name(), &progress, identity)?;
     }
     gate()?;
     owner.require_owner()?;

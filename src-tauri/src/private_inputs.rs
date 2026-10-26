@@ -253,6 +253,15 @@ impl<'a> InputBudget<'a> {
                 }
                 if reads {
                     for job in directories(&source, &mut count, true)? {
+                        if job.file_name().and_then(|n| n.to_str()) == Some("publications") {
+                            crate::source_reads::validate_publication_store(
+                                &job,
+                                id,
+                                self.identity,
+                                &mut count,
+                            )?;
+                            continue;
+                        }
                         if !job
                             .file_name()
                             .and_then(|s| s.to_str())
@@ -261,6 +270,17 @@ impl<'a> InputBudget<'a> {
                             return Err("source_input_budget_invalid".into());
                         }
                         inspect_stage(&job.join("stage"), id, ledger, &mut seen, &mut count)?;
+                    }
+                } else if prefix == "photo-preparations" {
+                    for stage in directories(&source, &mut count, true)? {
+                        let name = stage
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .ok_or("source_input_budget_invalid")?;
+                        if name != "stage" && !name.strip_prefix("stage-").is_some_and(uuid) {
+                            return Err("source_input_budget_invalid".into());
+                        }
+                        inspect_stage(&stage, id, ledger, &mut seen, &mut count)?;
                     }
                 } else {
                     inspect_stage(&source.join("stage"), id, ledger, &mut seen, &mut count)?;
@@ -400,6 +420,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generation_stages_cannot_hide_bytes_or_release_a_live_reservation() {
+        let f = Fixture::new();
+        let mut budget = InputBudget::open(&f.base, &f.identity).unwrap();
+        budget.reserve(&f.source, &f.id, 5).unwrap();
+        let path = f.stage(false);
+        fs::write(path.join("original"), b"bytes").unwrap();
+        let generation = f
+            .base
+            .join("photo-preparations")
+            .join(&f.source)
+            .join(format!("stage-{}", uuid::Uuid::new_v4()));
+        fs::rename(path.parent().unwrap(), &generation).unwrap();
+        assert!(budget.release(&f.source, &f.id).is_err());
+        assert_eq!(budget.remaining().unwrap(), LIMIT - 5);
+        fs::write(generation.join(&f.id).join("original"), b"too many bytes").unwrap();
+        assert!(budget.remaining().is_err());
+    }
     #[test]
     fn reservations_survive_restart_and_cannot_change_identity_or_size() {
         let f = Fixture::new();

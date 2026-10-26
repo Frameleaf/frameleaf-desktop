@@ -1,9 +1,10 @@
 mod capacity;
 mod inventory;
+mod scans;
 use super::*;
 use crate::{copy_source::CopyApproval, photo_sources::SourceFile};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
     source: String,
@@ -12,6 +13,8 @@ struct Plan {
     export: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     additional: Vec<SourceFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<scans::Generation>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,6 +57,7 @@ struct InventoryRecord {
 #[serde(rename_all = "camelCase")]
 pub struct PreparationView {
     pub source_id: String,
+    pub scan_id: String,
     pub maximum_bytes: u64,
     pub export: bool,
     pub spent: u64,
@@ -92,29 +96,9 @@ impl Preparation {
         source: &str,
         relatives: &[String],
     ) -> Result<Self, String> {
-        if relatives.is_empty() || relatives.len() > 10_000 {
-            return Err("source_selection_invalid".into());
-        }
         let consent = crate::source_import::current(saved, identity, source)?;
         let approval = consent.reference_approval(saved, identity)?;
-        let scan = approval.files()?;
-        if scan.inventory.truncated || scan.unreadable != 0 {
-            return Err("source_inventory_partial".into());
-        }
-        let files: std::collections::HashMap<_, _> = scan
-            .files
-            .into_iter()
-            .map(|entry| (entry.relative.clone(), entry))
-            .collect();
-        let selected = relatives
-            .iter()
-            .map(|relative| {
-                files
-                    .get(relative)
-                    .cloned()
-                    .ok_or("source_item_unavailable".into())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let selected = Self::select(approval, relatives)?;
         Self::open_selection(base, saved, identity, approval.clone(), selected, true)
     }
     pub fn resume(
@@ -161,15 +145,15 @@ impl Preparation {
         }
         let mut entries = entries.into_iter();
         let entry = entries.next().ok_or("source_selection_invalid")?;
-        let plan = Plan {
+        let mut plan = Plan {
             source: approval.source_id().into(),
             scope: approval.fingerprint(),
             entry,
             export: approval.is_photos(),
             additional: entries.collect(),
+            generation: None,
         };
         let total_bytes = plan.total()?;
-        let plan_hash = hash(&plan)?;
         crate::native_runtime::absolute_directory(base)?;
         if !approval.is_photos()
             && (base.starts_with(approval.root()) || approval.root().starts_with(base))
@@ -224,7 +208,10 @@ impl Preparation {
             )?;
         }
         let recorded: Plan = journal.read("preparation-plan.json", identity)?;
-        if hash(&recorded)? != hash(&plan)? {
+        plan.generation = recorded.generation.clone();
+        plan.total()?;
+        let plan_hash = hash(&plan)?;
+        if hash(&recorded)? != plan_hash {
             return Err("source_approval_changed".into());
         }
         let result = Self {
@@ -267,7 +254,11 @@ impl Preparation {
     ) -> Result<Progress, String> {
         self.require_owner()?;
         self.approval.validate_current(saved, identity)?;
-        let state: Progress = self.journal.read("preparation-state.json", identity)?;
+        let active: Plan = self.journal.read("preparation-plan.json", identity)?;
+        if hash(&active)? != self.plan_hash {
+            return Err("source_scan_changed".into());
+        }
+        let state: Progress = self.journal.read(&self.plan.state_name(), identity)?;
         if state.plan_hash != self.plan_hash
             || state.read.used > state.read.limit
             || state.read.limit > 9_007_199_254_740_991
@@ -314,6 +305,7 @@ impl Preparation {
         );
         Ok(PreparationView {
             source_id: self.plan.source.clone(),
+            scan_id: self.plan_hash.clone(),
             maximum_bytes: self.total_bytes,
             export: self.plan.export,
             spent: state.read.used,
@@ -323,6 +315,48 @@ impl Preparation {
             completed: state.position(),
             staging_remaining,
         })
+    }
+    pub fn rescan(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        relatives: &[String],
+        expected: &str,
+        gate: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<PreparationView, String> {
+        self.current(saved, identity)?;
+        let entries = Self::select(&self.approval, relatives)?;
+        let next = scans::transition(self, saved, identity, entries, expected, &|| {
+            self.current(saved, identity)?;
+            gate()
+        })?;
+        self.plan = next.plan;
+        self.plan_hash = next.hash;
+        self.total_bytes = next.total;
+        self.view(saved, identity)
+    }
+    #[cfg(test)]
+    pub(super) fn rescan_with(
+        &mut self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        entries: Vec<SourceFile>,
+        expected: &str,
+        gate: &dyn Fn() -> Result<(), String>,
+    ) -> Result<PreparationView, String> {
+        let next = scans::transition(self, saved, identity, entries, expected, gate)?;
+        self.plan = next.plan;
+        self.plan_hash = next.hash;
+        self.total_bytes = next.total;
+        self.view(saved, identity)
+    }
+    #[cfg(test)]
+    pub(super) fn recorded_resources(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<Vec<PreparedResource>, String> {
+        self.resources_with(saved, identity)
     }
     /// Reclaims only reservations whose signed job and empty staging prove cleanup completed.
     pub fn reconcile_capacity(
@@ -376,7 +410,7 @@ impl Preparation {
             .filter(|limit| *limit <= 9_007_199_254_740_991)
             .ok_or("source_read_budget_invalid")?;
         self.journal
-            .write("preparation-state.json", &state, identity)
+            .write(&self.plan.state_name(), &state, identity)
     }
     pub fn stage(
         &mut self,
@@ -481,7 +515,12 @@ impl Preparation {
         if job.resource.id != copy.id {
             return Err("source_cache_cleanup_pending".into());
         }
-        job.adopt(saved, identity, &self.journal.root.join("stage"), gate)?;
+        job.adopt(
+            saved,
+            identity,
+            &self.journal.root.join(self.plan.stage_name()),
+            gate,
+        )?;
         Ok(job)
     }
     pub(super) fn stage_with(
@@ -503,7 +542,7 @@ impl Preparation {
         let _capacity_owner = self.reconcile_with(saved, identity, &check)?;
         let mut state = self.progress(saved, identity)?;
         let entry = self.plan.entry_at(state.position())?;
-        let stage = self.journal.root.join("stage");
+        let stage = self.journal.root.join(self.plan.stage_name());
         crate::native_runtime::absolute_directory(&stage)?;
         let dir = Dir::open_ambient_dir(&stage, ambient_authority())
             .map_err(|_| "source_stage_unavailable")?;
@@ -540,7 +579,7 @@ impl Preparation {
             let maximum = state.reserve_attempt(entry, self.plan.export, budget.remaining()?)?;
             let id = state.attempt.as_ref().ok_or("source_journal_invalid")?;
             self.journal
-                .write("preparation-state.json", &state, identity)?;
+                .write(&self.plan.state_name(), &state, identity)?;
             check()?;
             budget.reserve(&self.plan.source, id, maximum)?;
             self.approval.stage_to(
@@ -575,7 +614,7 @@ impl Preparation {
         budget.shrink(&self.plan.source, &copy.id, copy.bytes)?;
         state.resource = Some(copy.clone());
         self.journal
-            .write("preparation-state.json", &state, identity)?;
+            .write(&self.plan.state_name(), &state, identity)?;
         Ok(copy)
     }
 }
