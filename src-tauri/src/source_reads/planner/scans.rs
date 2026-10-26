@@ -99,6 +99,29 @@ fn same_selection(left: &[SourceFile], right: &[SourceFile]) -> bool {
     };
     sorted(left) == sorted(right)
 }
+pub(super) fn require_no_job_history(
+    prep: &Preparation,
+    gate: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    for (index, entry) in fs::read_dir(&prep.journal.root)
+        .map_err(|_| "source_journal_invalid")?
+        .enumerate()
+    {
+        if index >= 50_000 {
+            return Err("source_inventory_partial".into());
+        }
+        gate()?;
+        if entry
+            .map_err(|_| "source_journal_invalid")?
+            .file_name()
+            .to_string_lossy()
+            .starts_with("prepared-")
+        {
+            return Err("source_journal_invalid".into());
+        }
+    }
+    Ok(())
+}
 // Keep the shared source job owner while observing its signed descriptors; no cache bytes are opened.
 fn known(
     prep: &Preparation,
@@ -115,16 +138,7 @@ fn known(
         .ok_or("source_journal_invalid")?;
     let root = base.join("photo-reads").join(&prep.plan.source);
     if matches!(fs::symlink_metadata(&root), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
-        for entry in fs::read_dir(&prep.journal.root).map_err(|_| "source_journal_invalid")? {
-            if entry
-                .map_err(|_| "source_journal_invalid")?
-                .file_name()
-                .to_string_lossy()
-                .starts_with("prepared-")
-            {
-                return Err("source_journal_invalid".into());
-            }
-        }
+        require_no_job_history(prep, gate)?;
         return Ok(Known {
             current: Default::default(),
             keys: Default::default(),
@@ -341,6 +355,7 @@ pub(super) fn transition(
         &Progress {
             plan_hash: next.hash.clone(),
             abandoned: false,
+            handoff_started: None,
             read: Budget { used: 0, limit: 0 },
             attempt: None,
             resource: None,

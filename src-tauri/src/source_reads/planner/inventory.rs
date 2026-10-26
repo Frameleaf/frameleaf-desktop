@@ -103,6 +103,7 @@ impl Progress {
         self.read
             .reserve(entry.bytes, "source_read_budget_exhausted")?;
         self.attempt = Some(uuid::Uuid::new_v4().to_string());
+        self.handoff_started = Some(false);
         self.attempt_bytes = (maximum < entry.bytes).then_some(maximum);
         Ok(maximum)
     }
@@ -221,6 +222,7 @@ impl Preparation {
                 .ok_or("source_staging_budget_exceeded")?,
         });
         state.resource = None;
+        state.handoff_started = None;
         state.attempt = None;
         state.attempt_bytes = None;
         self.journal

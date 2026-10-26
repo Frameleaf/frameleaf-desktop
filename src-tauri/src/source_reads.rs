@@ -925,6 +925,348 @@ mod tests {
         assert_eq!(archived["abandoned"], true);
     }
     #[test]
+    fn abandoned_discard_reclaims_only_owned_attempts_without_resetting_history() {
+        for partial in [false, true] {
+            let f = Fixture::new();
+            let mut prep = Preparation::open_with(
+                &f.root.join("data"),
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                crate::photo_sources::SourceFile {
+                    relative: "original.jpg".into(),
+                    bytes: 10,
+                },
+                true,
+            )
+            .unwrap();
+            prep.approve_with(&f.saved, &f.identity, 20).unwrap();
+            let copy = prep
+                .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+            let cache = prep.journal.root.join("stage").join(&copy.id);
+            if partial {
+                fs::write(cache.join("original"), b"part").unwrap();
+                fs::remove_file(cache.join("receipt.json")).unwrap();
+                let mut state: serde_json::Value = prep
+                    .journal
+                    .read("preparation-state.json", &f.identity)
+                    .unwrap();
+                state["resource"] = serde_json::Value::Null;
+                prep.journal
+                    .write("preparation-state.json", &state, &f.identity)
+                    .unwrap();
+            }
+            let scan = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .is_err());
+            prep.abandon_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .unwrap();
+            let state_before = fs::read(prep.journal.root.join("preparation-state.json")).unwrap();
+            fs::remove_file(f.approval.root().join("original.jpg")).unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &scan, &|| Err(
+                    "source_copy_cancelled".into()
+                ))
+                .is_err());
+            assert!(cache.join("original").exists());
+            fs::write(cache.join("unexpected"), b"retain").unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .is_err());
+            assert!(cache.join("original").exists());
+            fs::remove_file(cache.join("unexpected")).unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &scan, &|| {
+                    if cache.exists() {
+                        Ok(())
+                    } else {
+                        Err("source_copy_cancelled".into())
+                    }
+                })
+                .is_err());
+            assert!(!cache.exists());
+            assert_eq!(
+                crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                    .unwrap()
+                    .remaining()
+                    .unwrap(),
+                crate::private_inputs::LIMIT - 10
+            );
+            let discarded = prep
+                .discard_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .unwrap();
+            assert!(discarded.abandoned);
+            assert_eq!((discarded.spent, discarded.remaining), (10, 0));
+            assert!(!cache.exists());
+            assert_eq!(
+                fs::read(prep.journal.root.join("preparation-state.json")).unwrap(),
+                state_before
+            );
+            assert_eq!(
+                crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                    .unwrap()
+                    .remaining()
+                    .unwrap(),
+                crate::private_inputs::LIMIT
+            );
+            prep.discard_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .unwrap();
+        }
+    }
+    #[test]
+    fn archived_discard_preserves_successor_cache_and_half_handoff_job_intent() {
+        for half_handoff in [false, true] {
+            let f = Fixture::new();
+            let entry = crate::photo_sources::SourceFile {
+                relative: "original.jpg".into(),
+                bytes: 10,
+            };
+            let mut prep = Preparation::open_with(
+                &f.root.join("data"),
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                entry.clone(),
+                true,
+            )
+            .unwrap();
+            prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+            let copy = prep
+                .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+            let old = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+            prep.abandon_with(&f.saved, &f.identity, &old, &|| Ok(()))
+                .unwrap();
+            let next = prep
+                .rescan_with(&f.saved, &f.identity, vec![entry], &old, &|| Ok(()))
+                .unwrap();
+            prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+            let fresh = prep
+                .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+            let plan: serde_json::Value = prep
+                .journal
+                .read("preparation-plan.json", &f.identity)
+                .unwrap();
+            let fresh_path = prep
+                .journal
+                .root
+                .join(format!(
+                    "stage-{}",
+                    plan["generation"]["id"].as_str().unwrap()
+                ))
+                .join(&fresh.id);
+            if !half_handoff {
+                let active_path = prep.journal.root.join(format!(
+                    "preparation-state-{}.json",
+                    plan["generation"]["id"].as_str().unwrap()
+                ));
+                let active_before = fs::read(&active_path).unwrap();
+                prep.discard_with(&f.saved, &f.identity, &old, &|| Ok(()))
+                    .unwrap();
+                assert!(!prep.journal.root.join("stage").join(&copy.id).exists());
+                assert_eq!(fs::read(&active_path).unwrap(), active_before);
+                assert_eq!(
+                    fs::read(fresh_path.join("original")).unwrap(),
+                    b"abcdefghij"
+                );
+                assert_eq!(
+                    crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                        .unwrap()
+                        .remaining()
+                        .unwrap(),
+                    crate::private_inputs::LIMIT - 10
+                );
+                continue;
+            }
+            let job = Job::open(
+                &f.root.join("data"),
+                &f.saved,
+                &f.identity,
+                copy.source_id(),
+                &copy.resource_key(),
+                &copy.version(),
+                Some(State::new(copy.clone(), 0, 0).unwrap()),
+            )
+            .unwrap();
+            assert_eq!(
+                prep.discard_with(&f.saved, &f.identity, &old, &|| Ok(()))
+                    .err()
+                    .as_deref(),
+                Some("source_read_already_running")
+            );
+            let job_path = job.journal.root.join("state.json");
+            drop(job);
+            let before = fs::read(&job_path).unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &old, &|| Ok(()))
+                .is_err());
+            assert!(prep
+                .journal
+                .root
+                .join("stage")
+                .join(&copy.id)
+                .join("original")
+                .exists());
+            assert_eq!(fs::read(&job_path).unwrap(), before);
+            let mut job_state: State = Journal {
+                root: job_path.parent().unwrap().to_owned(),
+            }
+            .read("state.json", &f.identity)
+            .unwrap();
+            job_state.stage = Some(copy.id.clone());
+            Journal {
+                root: job_path.parent().unwrap().to_owned(),
+            }
+            .write("state.json", &job_state, &f.identity)
+            .unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &old, &|| Ok(()))
+                .is_err());
+            assert_eq!(
+                prep.view(&f.saved, &f.identity).unwrap().scan_id,
+                next.scan_id
+            );
+            assert_eq!(
+                fs::read(fresh_path.join("original")).unwrap(),
+                b"abcdefghij"
+            );
+            let moved = job_path.parent().unwrap().join("stage").join(&copy.id);
+            fs::rename(prep.journal.root.join("stage").join(&copy.id), &moved).unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &old, &|| Ok(()))
+                .is_err());
+            assert_eq!(fs::read(moved.join("original")).unwrap(), b"abcdefghij");
+        }
+    }
+    #[test]
+    fn discard_preserves_first_handoff_intent_when_job_store_disappears() {
+        for legacy in [false, true] {
+            let f = Fixture::new();
+            let mut prep = Preparation::open_with(
+                &f.root.join("data"),
+                &f.saved,
+                &f.identity,
+                f.approval.clone(),
+                crate::photo_sources::SourceFile {
+                    relative: "original.jpg".into(),
+                    bytes: 10,
+                },
+                true,
+            )
+            .unwrap();
+            prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+            let copy = prep
+                .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+                .unwrap();
+            let jobs = f.root.join("data/photo-reads").join(copy.source_id());
+            let record = jobs
+                .join(job_key(&copy.resource_key(), &copy.version()))
+                .join("state.json");
+            assert!(prep
+                .handoff_with(&f.saved, &f.identity, &|| {
+                    if record.exists() {
+                        Err("source_copy_cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            assert!(record.exists());
+            let scan = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+            prep.abandon_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .unwrap();
+            if legacy {
+                let mut state: serde_json::Value = prep
+                    .journal
+                    .read("preparation-state.json", &f.identity)
+                    .unwrap();
+                state.as_object_mut().unwrap().remove("handoffStarted");
+                prep.journal
+                    .write("preparation-state.json", &state, &f.identity)
+                    .unwrap();
+            }
+            let before = fs::read(prep.journal.root.join("preparation-state.json")).unwrap();
+            fs::rename(&jobs, f.root.join("retained-job-intent")).unwrap();
+            assert!(prep
+                .discard_with(&f.saved, &f.identity, &scan, &|| Ok(()))
+                .is_err());
+            assert!(!jobs.exists());
+            assert_eq!(
+                fs::read(
+                    prep.journal
+                        .root
+                        .join("stage")
+                        .join(&copy.id)
+                        .join("original")
+                )
+                .unwrap(),
+                b"abcdefghij"
+            );
+            assert_eq!(
+                fs::read(prep.journal.root.join("preparation-state.json")).unwrap(),
+                before
+            );
+            assert_eq!(
+                crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                    .unwrap()
+                    .remaining()
+                    .unwrap(),
+                crate::private_inputs::LIMIT - 10
+            );
+        }
+    }
+    #[test]
+    fn discard_does_not_conceal_missing_job_history() {
+        let f = Fixture::new();
+        let entry = crate::photo_sources::SourceFile {
+            relative: "original.jpg".into(),
+            bytes: 10,
+        };
+        let mut prep = Preparation::open_with(
+            &f.root.join("data"),
+            &f.saved,
+            &f.identity,
+            f.approval.clone(),
+            entry.clone(),
+            true,
+        )
+        .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        prep.finish_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let old = prep.view(&f.saved, &f.identity).unwrap().scan_id;
+        fs::write(f.approval.root().join("original.jpg"), b"klmnopqrst").unwrap();
+        let scan = prep
+            .rescan_with(&f.saved, &f.identity, vec![entry], &old, &|| Ok(()))
+            .unwrap();
+        prep.approve_with(&f.saved, &f.identity, 10).unwrap();
+        let copy = prep
+            .stage_with(&f.saved, &f.identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        prep.abandon_with(&f.saved, &f.identity, &scan.scan_id, &|| Ok(()))
+            .unwrap();
+        let jobs = f.root.join("data/photo-reads").join(copy.source_id());
+        let retained = f.root.join("retained-jobs");
+        fs::rename(&jobs, &retained).unwrap();
+        assert!(prep
+            .discard_with(&f.saved, &f.identity, &scan.scan_id, &|| Ok(()))
+            .is_err());
+        assert!(!jobs.exists());
+        fs::rename(&retained, &jobs).unwrap();
+        prep.discard_with(&f.saved, &f.identity, &scan.scan_id, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            crate::private_inputs::InputBudget::open(&f.root.join("data"), &f.identity)
+                .unwrap()
+                .remaining()
+                .unwrap(),
+            crate::private_inputs::LIMIT - 10
+        );
+    }
+    #[test]
     fn rescan_preserves_history_reuses_unchanged_resources_and_never_refills_allowances() {
         let f = Fixture::new();
         let entries = || {

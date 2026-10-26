@@ -1,4 +1,5 @@
 mod capacity;
+mod discard;
 mod inventory;
 mod scans;
 use super::*;
@@ -24,6 +25,9 @@ struct Progress {
     plan_hash: String,
     #[serde(default, skip_serializing_if = "is_false")]
     abandoned: bool,
+    // Absence is legacy; it cannot prove that a verified cache was never claimed by a job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_started: Option<bool>,
     read: Budget,
     attempt: Option<String>,
     resource: Option<StagedCopy>,
@@ -249,6 +253,7 @@ impl Preparation {
                 &Progress {
                     plan_hash: hash(&plan)?,
                     abandoned: false,
+                    handoff_started: None,
                     read: Budget { used: 0, limit: 0 },
                     attempt: None,
                     resource: None,
@@ -307,26 +312,46 @@ impl Preparation {
         identity: &DeviceIdentity,
     ) -> Result<Progress, String> {
         self.require_owner()?;
-        self.approval.validate(saved, identity)?;
-        self.plan.validate_photos(&self.approval)?;
         let active: Plan = self.journal.read("preparation-plan.json", identity)?;
         if hash(&active)? != self.plan_hash {
             return Err("source_scan_changed".into());
         }
-        let state: Progress = self.journal.read(&self.plan.state_name(), identity)?;
-        if state.plan_hash != self.plan_hash
+        self.recorded_progress(saved, identity, &self.plan, &self.plan_hash)
+    }
+    fn recorded_progress(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        plan: &Plan,
+        expected: &str,
+    ) -> Result<Progress, String> {
+        self.require_owner()?;
+        self.approval.validate(saved, identity)?;
+        if plan.source != self.plan.source
+            || plan.scope != self.plan.scope
+            || plan.export != self.plan.export
+            || hash(plan)? != expected
+        {
+            return Err("source_journal_invalid".into());
+        }
+        plan.validate_photos(&self.approval)?;
+        let total_bytes = plan.total()?;
+        let state: Progress = self.journal.read(&plan.state_name(), identity)?;
+        if state.plan_hash != expected
             || state.read.used > state.read.limit
             || state.read.limit > 9_007_199_254_740_991
-            || state.position() > self.plan.count()
+            || state.position() > plan.count()
             || state.completion.as_ref().is_some_and(|done| {
                 done.position == 0
                     || done.staged_bytes < done.position as u64
-                    || done.staged_bytes > self.total_bytes
+                    || done.staged_bytes > total_bytes
             })
-            || (state.position() == self.plan.count()
+            || (state.position() == plan.count()
                 && (state.resource.is_some() || state.attempt.is_some()))
             || state.released_bytes.unwrap_or(0) > state.staged_bytes()
             || state.attempt.as_ref().is_some_and(|id| !canonical_uuid(id))
+            || (state.handoff_started.is_some() && state.attempt.is_none())
+            || (state.handoff_started == Some(true) && state.resource.is_none())
             || state
                 .resource
                 .as_ref()
@@ -334,7 +359,7 @@ impl Preparation {
         {
             return Err("source_journal_invalid".into());
         }
-        state.reservation(&self.plan)?;
+        state.reservation(plan)?;
         Ok(state)
     }
     fn current(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
@@ -608,11 +633,21 @@ impl Preparation {
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<Arc<Job>, String> {
         gate()?;
-        let state = self.progress(saved, identity)?;
+        let mut state = self.progress(saved, identity)?;
         if state.abandoned {
             return Err("source_scan_abandoned".into());
         }
-        let copy = state.resource.ok_or("source_stage_unavailable")?;
+        let copy = state
+            .resource
+            .as_ref()
+            .ok_or("source_stage_unavailable")?
+            .clone();
+        if state.handoff_started != Some(true) {
+            state.handoff_started = Some(true);
+            gate()?;
+            self.journal
+                .write(&self.plan.state_name(), &state, identity)?;
+        }
         let base = self
             .journal
             .root

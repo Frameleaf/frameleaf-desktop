@@ -312,6 +312,34 @@ fn actual_native_reference_publication() {
         assert_eq!((scan.spent, scan.remaining), (0, 0));
         assert_ne!(scan.scan_id, first_scan);
         let publication_before = fs::read(journal.root.join(&name)).unwrap();
+        let capacity_before = crate::private_inputs::InputBudget::open(&base, &identity)
+            .unwrap()
+            .remaining()
+            .unwrap();
+        let mut pending = Preparation::resume(&base, &next, &identity, &source).unwrap();
+        pending
+            .approve(&next, &identity, edited.len() as u64)
+            .unwrap();
+        let staged = pending
+            .stage_with(&next, &identity, &AtomicBool::new(false), &|| Ok(()))
+            .unwrap();
+        let pending_plan: Value = pending
+            .journal
+            .read("preparation-plan.json", &identity)
+            .unwrap();
+        let pending_cache = pending
+            .journal
+            .root
+            .join(format!(
+                "stage-{}",
+                pending_plan["generation"]["id"].as_str().unwrap()
+            ))
+            .join(&staged.id);
+        let pending_state = pending.journal.root.join(format!(
+            "preparation-state-{}.json",
+            pending_plan["generation"]["id"].as_str().unwrap()
+        ));
+        drop(pending);
         fs::remove_file(source_root.join("original.jpg")).unwrap();
         let ended = scan_owner
             .prepare_reference(
@@ -328,12 +356,45 @@ fn actual_native_reference_publication() {
         scan_owner.stop().await.unwrap();
         assert!(ended.abandoned);
         assert!(!ended.prepared);
-        assert_eq!((ended.spent, ended.remaining), (0, 0));
+        assert_eq!((ended.spent, ended.remaining), (edited.len() as u64, 0));
         assert_eq!(ended.scan_id, scan.scan_id);
         assert_eq!(fs::read(&job_record).unwrap(), job_before);
         assert_eq!(
             fs::read(journal.root.join(&name)).unwrap(),
             publication_before
+        );
+        let abandoned_before = fs::read(&pending_state).unwrap();
+        let discarded = scan_owner
+            .prepare_reference(
+                base.clone(),
+                next.clone(),
+                source.clone(),
+                PreparationAction::Discard {
+                    expected_scan: ended.scan_id.clone(),
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        scan_owner.stop().await.unwrap();
+        assert!(discarded.abandoned);
+        assert_eq!(
+            (discarded.spent, discarded.remaining),
+            (edited.len() as u64, 0)
+        );
+        assert!(!pending_cache.exists());
+        assert_eq!(fs::read(&pending_state).unwrap(), abandoned_before);
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
+        assert_eq!(
+            fs::read(journal.root.join(&name)).unwrap(),
+            publication_before
+        );
+        assert_eq!(
+            crate::private_inputs::InputBudget::open(&base, &identity)
+                .unwrap()
+                .remaining()
+                .unwrap(),
+            capacity_before
         );
         fs::write(source_root.join("original.jpg"), edited).unwrap();
         let restarted = scan_owner

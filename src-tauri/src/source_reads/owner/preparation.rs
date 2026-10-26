@@ -13,6 +13,9 @@ pub enum PreparationAction {
         additional: u64,
     },
     Reconcile,
+    Discard {
+        expected_scan: String,
+    },
     Abandon {
         expected_scan: String,
     },
@@ -38,7 +41,10 @@ impl Requests {
         let selected_source = source.clone();
         self.prepare_owned(source, notify, move |cancelled, stop| {
             stop()?;
-            let identity = if matches!(&action, PreparationAction::Abandon { .. }) {
+            let identity = if matches!(
+                &action,
+                PreparationAction::Abandon { .. } | PreparationAction::Discard { .. }
+            ) {
                 crate::credentials::identity()?
             } else {
                 authority(&base, &saved, &selected_source)?
@@ -66,6 +72,10 @@ impl Requests {
                     &expected_scan,
                     stop,
                 ),
+                PreparationAction::Discard { expected_scan } => {
+                    Preparation::resume_control(&base, &saved, &identity, &selected_source)?
+                        .discard(&saved, &identity, &expected_scan, stop)
+                }
                 PreparationAction::Abandon { expected_scan } => {
                     Preparation::resume_control(&base, &saved, &identity, &selected_source)?
                         .abandon(&saved, &identity, &expected_scan, stop)
