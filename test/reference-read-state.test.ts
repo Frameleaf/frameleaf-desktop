@@ -9,6 +9,8 @@ const scan={resources:2,scanId:'a'.repeat(64),current:true,abandoned:false,prepa
 const work={operation:'prepare' as const,sourceId,scanId:scan.scanId,requestId:'00000000-0000-4000-8000-000000000001',state:'preparing',code:null as string|null};
 const publication={resourceKey:'c'.repeat(64),recordId:'d'.repeat(64),originalFileName:'Synthetic pending.jpg',state:'publish'};
 const publicationWork={...work,operation:'publish' as const,state:'publishing'};
+const serving={selectionId:'e'.repeat(64),resources:2,maxTransferBytes:20};
+const servingWork={operation:'serve' as const,sourceId,selectionId:serving.selectionId,requestId:work.requestId,state:'waiting',code:null as string|null};
 const recoveryWork={operation:'recover' as const,sourceId,resourceKey:publication.resourceKey,recordId:publication.recordId,requestId:work.requestId,state:'recovering',code:null as string|null};
 function component(selected: typeof scan|null=scan, cryptoMode: 'uuid'|'bytes'|'none'='uuid'){
  const source=readFileSync(new URL('../src/ReferenceRead.svelte',import.meta.url),'utf8');
@@ -16,17 +18,17 @@ function component(selected: typeof scan|null=scan, cryptoMode: 'uuid'|'bytes'|'
  const pending:{name:string;args:Record<string,unknown>;resolve(v:unknown):void;reject(e:unknown):void}[]=[];
  let mount!:()=>()=>void;let event!:(e:{payload:unknown})=>void;let sequence=0;let settled=0;let active=false;let unlistened=false;
  const exports:Record<string,unknown>={};
- const code=ts.transpileModule(`${script}\nexport { start, startRecovery, startPublication, pause, checkStatus }; export const current=()=>({work,message,ready,startPending,pausePending});`,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
- runInNewContext(code,{exports,$state:(v:unknown)=>v,$props:()=>({sourceId,scan:selected,publications:[publication],disabled:false,onActiveChange:(v:boolean)=>active=v,onSettled:()=>settled++}),crypto:cryptoMode==='uuid'?{randomUUID:()=>`00000000-0000-4000-8000-${String(++sequence).padStart(12,'0')}`} : cryptoMode==='bytes'?{getRandomValues:(bytes:Uint8Array)=>{bytes.fill(7);return bytes;}}:{},require:(name:string)=>{
+ const code=ts.transpileModule(`${script}\nexport { start, startRecovery, startPublication, startServing, pause, checkStatus }; export const current=()=>({work,message,ready,startPending,pausePending});`,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+ runInNewContext(code,{exports,$state:(v:unknown)=>v,$props:()=>({sourceId,scan:selected,publications:[publication],serving,disabled:false,onActiveChange:(v:boolean)=>active=v,onSettled:()=>settled++}),crypto:cryptoMode==='uuid'?{randomUUID:()=>`00000000-0000-4000-8000-${String(++sequence).padStart(12,'0')}`} : cryptoMode==='bytes'?{getRandomValues:(bytes:Uint8Array)=>{bytes.fill(7);return bytes;}}:{},require:(name:string)=>{
   if(name==='svelte')return{onMount:(callback:typeof mount)=>mount=callback};
   if(name==='@tauri-apps/api/event')return{listen:async(channel:string,callback:typeof event)=>{assert.equal(channel,'photo-reference-work');event=callback;return()=>unlistened=true;}};
   assert.equal(name,'@tauri-apps/api/core');return{invoke:(name:string,args:Record<string,unknown>)=>new Promise((resolve,reject)=>pending.push({name,args,resolve,reject}))};
  }});
  return {...exports,pending,mount:()=>mount(),emit:(payload:unknown)=>event({payload}),observed:()=>({active,settled,unlistened})}as unknown as{
-  start():Promise<void>;startPublication():Promise<void>;startRecovery(value:typeof publication):Promise<void>;pause():Promise<void>;checkStatus():Promise<void>;current():{work:typeof work|typeof recoveryWork|typeof publicationWork|null;message:string;ready:boolean;startPending:boolean;pausePending:boolean};pending:typeof pending;mount():()=>void;emit(v:unknown):void;observed():{active:boolean;settled:number;unlistened:boolean};
+  startServing():Promise<void>;start():Promise<void>;startPublication():Promise<void>;startRecovery(value:typeof publication):Promise<void>;pause():Promise<void>;checkStatus():Promise<void>;current():{work:typeof work|typeof recoveryWork|typeof publicationWork|typeof servingWork|null;message:string;ready:boolean;startPending:boolean;pausePending:boolean};pending:typeof pending;mount():()=>void;emit(v:unknown):void;observed():{active:boolean;settled:number;unlistened:boolean};
  };
 }
-async function loaded(selected:typeof scan|null=scan,snapshot:typeof work|typeof recoveryWork|typeof publicationWork|null=null){const view=component(selected);const unmount=view.mount();await setImmediate();assert.equal(view.pending[0].name,'photo_reference_work_status');view.pending[0].resolve(snapshot);await setImmediate();return{view,unmount};}
+async function loaded(selected:typeof scan|null=scan,snapshot:typeof work|typeof recoveryWork|typeof publicationWork|typeof servingWork|null=null){const view=component(selected);const unmount=view.mount();await setImmediate();assert.equal(view.pending[0].name,'photo_reference_work_status');view.pending[0].resolve(snapshot);await setImmediate();return{view,unmount};}
 test('opening the panel checks status and never starts a read',{timeout:5000},async()=>{
  const {view,unmount}=await loaded();assert.equal(view.pending.length,1);assert.equal(view.observed().active,false);assert.equal(view.current().ready,true);unmount();assert.equal(view.observed().unlistened,true);
 });
@@ -143,4 +145,18 @@ test('restored publication excludes reads and recovery until confirmed stop',{ti
  view.emit({...recoveryWork,state:'stopped'});assert.equal(view.observed().active,true);
  const pause=view.pause();view.pending[1].reject('source_read_shutdown_unconfirmed');await pause;
  assert.equal(view.observed().active,true);assert.equal(view.observed().settled,0);unmount();
+});
+
+test('serving binds the displayed selection and stays active during a policy pause',async()=>{
+ const {view,unmount}=await loaded();const call=view.startServing();const request=view.pending[1];
+ assert.equal(request.name,'start_photo_reference_serving');assert.equal(request.args.sourceId,sourceId);
+ assert.equal(request.args.expectedSelection,serving.selectionId);assert.equal(request.args.requestId,work.requestId);
+ assert.deepEqual(Object.keys(request.args).sort(),['expectedSelection','requestId','sourceId']);
+ request.resolve(servingWork);await call;assert.equal(view.observed().active,true);
+ view.emit({...servingWork,state:'paused',code:'on_battery'});assert.equal(view.observed().active,true);assert.equal(view.observed().settled,0);
+ view.emit({...servingWork,selectionId:'f'.repeat(64),state:'stopped'});assert.equal(view.observed().active,true);
+ const paused=view.pause();assert.equal(view.pending[2].name,'pause_photo_reference_serving');
+ assert.equal(view.pending[2].args.expectedSelection,serving.selectionId);
+ view.pending[2].resolve({...servingWork,state:'paused',code:null});await paused;
+ assert.equal(view.observed().active,false);assert.equal(view.observed().settled,1);unmount();
 });

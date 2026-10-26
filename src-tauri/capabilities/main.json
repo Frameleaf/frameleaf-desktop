@@ -26,6 +26,8 @@
     "allow-approve-photo-reference-transfer",
     "allow-control-photo-reference",
     "allow-start-photo-reference-read",
+    "allow-start-photo-reference-serving",
+    "allow-pause-photo-reference-serving",
     "allow-pause-photo-reference-read",
     "allow-photo-reference-work-status",
     "allow-start-photo-reference-publication",

@@ -141,65 +141,7 @@ impl Requests {
             return Err("source_read_request_invalid".into());
         }
         self.prepare_owned_checked(source.clone(), Arc::new(|_| {}), false, move |_, stop| {
-            let identity = crate::credentials::identity()?;
-            let scope = || {
-                let consent = crate::credentials::load::<crate::source_consent::Consent>(
-                    crate::source_consent::CREDENTIAL,
-                )?
-                .ok_or("source_approval_required")?;
-                if consent.source_id() != source {
-                    return Err("source_approval_changed".into());
-                }
-                consent.reference_metadata_scope(&saved, &identity)
-            };
-            let expected_scope = scope()?;
-            let check = || {
-                stop()?;
-                if scope()? != expected_scope {
-                    return Err("source_approval_changed".into());
-                }
-                Ok(())
-            };
-            let mut status =
-                Preparation::reference_status(&base, &saved, &identity, &source, &check)?;
-            let mut publications = super::super::publication::catalog(
-                &base.join("photo-reads").join(&source).join("publications"),
-                &saved,
-                &identity,
-                &source,
-                &expected_scope,
-                &check,
-            )?;
-            for publication in &mut publications {
-                check()?;
-                if publication.state == "recorded" {
-                    if let Some(receipt) = &publication.receipt {
-                        match Job::transfer_status(
-                            &base,
-                            &saved,
-                            &identity,
-                            &publication.resource_key,
-                            receipt,
-                            &expected_scope,
-                        ) {
-                            Ok(transfer) => publication.transfer = Some(transfer),
-                            Err(code) => publication.transfer_error = Some(code),
-                        }
-                    }
-                }
-            }
-            if status.is_none() && !publications.is_empty() {
-                status = Some(crate::source_reads::ReferenceStatus {
-                    source_id: source.clone(),
-                    scans: Vec::new(),
-                    publications: Vec::new(),
-                });
-            }
-            if let Some(value) = &mut status {
-                value.publications = publications;
-            }
-            check()?;
-            Ok(status)
+            recorded_status(&base, &saved, &source, stop)
         })
         .await
     }
@@ -364,4 +306,74 @@ pub(super) fn prepare_one(
         stop()
     };
     preparation.stage_and_handoff(saved, identity, cancelled, &gate)
+}
+
+// Shared by metadata display and the owned serving snapshot, without opening an original.
+pub(super) fn recorded_status(
+    base: &Path,
+    saved: &SavedConnection,
+    source: &str,
+    stop: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Option<crate::source_reads::ReferenceStatus>, String> {
+    let identity = crate::credentials::identity()?;
+    let scope = || {
+        let consent = crate::credentials::load::<crate::source_consent::Consent>(
+            crate::source_consent::CREDENTIAL,
+        )?
+        .ok_or("source_approval_required")?;
+        if consent.source_id() != source {
+            return Err("source_approval_changed".into());
+        }
+        consent.reference_metadata_scope(saved, &identity)
+    };
+    let expected_scope = scope()?;
+    let check = || {
+        stop()?;
+        if scope()? != expected_scope {
+            return Err("source_approval_changed".into());
+        }
+        Ok(())
+    };
+    let mut status = Preparation::reference_status(base, saved, &identity, source, &check)?;
+    let mut publications = super::super::publication::catalog(
+        &base.join("photo-reads").join(source).join("publications"),
+        saved,
+        &identity,
+        source,
+        &expected_scope,
+        &check,
+    )?;
+    for publication in &mut publications {
+        check()?;
+        if publication.state == "recorded" {
+            if let Some(receipt) = &publication.receipt {
+                match Job::transfer_status(
+                    base,
+                    saved,
+                    &identity,
+                    &publication.resource_key,
+                    receipt,
+                    &expected_scope,
+                ) {
+                    Ok(transfer) => publication.transfer = Some(transfer),
+                    Err(code) => publication.transfer_error = Some(code),
+                }
+            }
+        }
+    }
+    if status.is_none() && !publications.is_empty() {
+        status = Some(crate::source_reads::ReferenceStatus {
+            source_id: source.to_owned(),
+            scans: Vec::new(),
+            publications: Vec::new(),
+            serving: None,
+        });
+    }
+    if let Some(value) = &mut status {
+        value.serving = super::serving::Selection::from_publications(source, &publications)?
+            .map(|selected| selected.summary);
+        value.publications = publications;
+    }
+    check()?;
+    Ok(status)
 }

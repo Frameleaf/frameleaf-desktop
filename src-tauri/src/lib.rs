@@ -469,6 +469,8 @@ pub fn run() {
             source_reference_commands::approve_photo_reference_transfer,
             source_reference_commands::control_photo_reference,
             source_reference_commands::start_photo_reference_read,
+            source_reference_commands::start_photo_reference_serving,
+            source_reference_commands::pause_photo_reference_serving,
             source_reference_commands::pause_photo_reference_read,
             source_reference_commands::photo_reference_work_status,
             source_reference_commands::start_photo_reference_publication,

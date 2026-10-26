@@ -287,6 +287,67 @@ pub(crate) async fn approve_photo_reference_transfer(
         .approve_reference_transfer(import_base(&app)?, saved.clone(), input)
         .await
 }
+#[tauri::command]
+pub(crate) async fn start_photo_reference_serving(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    expected_selection: String,
+    request_id: String,
+) -> Result<source_reads::ReferenceWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    require_reference_source(saved, &source_id)?;
+    let request = source_reads::ServingRequest {
+        source_id,
+        selection_id: expected_selection,
+        request_id,
+    };
+    let events = app.clone();
+    // Installation returns promptly; the application owner keeps and drains the serving worker.
+    app.state::<source_reads::Requests>()
+        .start_reference_serving(
+            import_base(&app)?,
+            saved.clone(),
+            request,
+            std::sync::Arc::new(move |work| {
+                let _ = events.emit(
+                    "photo-reference-work",
+                    source_reads::ReferenceWork::Serve(work),
+                );
+            }),
+        )
+        .await
+        .map(source_reads::ReferenceWork::Serve)
+}
+#[tauri::command]
+pub(crate) async fn pause_photo_reference_serving(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    source_id: String,
+    expected_selection: String,
+    request_id: String,
+) -> Result<source_reads::ReferenceWork, String> {
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    // Stopping a matching owned request needs no new keystore access or provider permission.
+    app.state::<source_reads::Requests>()
+        .pause_reference_serving(
+            saved,
+            source_reads::ServingRequest {
+                source_id,
+                selection_id: expected_selection,
+                request_id,
+            },
+        )
+        .await
+        .map(source_reads::ReferenceWork::Serve)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

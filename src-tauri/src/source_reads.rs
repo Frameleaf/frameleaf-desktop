@@ -14,7 +14,7 @@ use crate::{
 use cap_std::{ambient_authority, fs::Dir};
 pub use owner::{
     PreparationAction, PreparationRequest, PreparationWork, RecoveryRequest, RecoveryWork,
-    ReferenceWork, Requests, View,
+    ReferenceWork, Requests, ServingRequest, ServingSelection, ServingWork, View,
 };
 pub use planner::{Preparation, PreparationView, PreparedResource, ReferenceStatus};
 pub(crate) use publication::validate_directory as validate_publication_store;
@@ -2613,6 +2613,109 @@ mod tests {
             state_id: state.into(),
             additional,
         }
+    }
+    #[test]
+    fn transfer_metadata_exposes_the_actual_cost_of_reading_the_original() {
+        let f = Fixture::new();
+        let job = f.job(0, 6);
+        let receipt = transfer_receipt(&f);
+        let view = job
+            .transfer_view(
+                &f.saved,
+                &f.identity,
+                &receipt,
+                &f.resource.scope_fingerprint(),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["readCost"],
+            f.resource.read_cost()
+        );
+    }
+    #[test]
+    fn serving_selection_is_exact_and_uses_only_existing_read_and_transfer_allowances() {
+        let f = Fixture::new();
+        let job = f.job(0, 6);
+        let scope = f.resource.scope_fingerprint();
+        let receipt = transfer_receipt(&f);
+        let view = || {
+            job.transfer_view(&f.saved, &f.identity, &receipt, &scope)
+                .unwrap()
+        };
+        let mut entry = publication::PublicationStatus {
+            resource_key: f.resource.resource_key(),
+            record_id: "a".repeat(64),
+            original_file_name: "original.jpg".into(),
+            state: "recorded".into(),
+            receipt: Some(receipt.clone()),
+            transfer: Some(view()),
+            transfer_error: None,
+        };
+        let select = |entries: &[publication::PublicationStatus]| {
+            owner::serving::Selection::from_publications(f.resource.source_id(), entries).unwrap()
+        };
+        assert!(select(&[entry.clone()]).is_none());
+        let mut state = job.recorded_state(&f.saved, &f.identity).unwrap();
+        state.upload.limit = 10;
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        entry.transfer = Some(view());
+        assert!(select(&[entry.clone()]).is_none());
+        state.stage = Some(f.resource.id.clone());
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        entry.transfer = Some(view());
+        let selected = select(&[entry.clone()]).unwrap();
+        assert_eq!(
+            (
+                selected.summary.resources,
+                selected.summary.max_transfer_bytes
+            ),
+            (1, 10)
+        );
+        entry.record_id = "b".repeat(64);
+        assert_ne!(
+            selected.summary.selection_id,
+            select(&[entry.clone()]).unwrap().summary.selection_id
+        );
+        entry.state = "publish".into();
+        assert!(select(&[entry.clone()]).is_none());
+        entry.state = "recorded".into();
+        state.stage = None;
+        state.read.limit = 10;
+        job.journal
+            .write("state.json", &state, &f.identity)
+            .unwrap();
+        entry.transfer = Some(view());
+        assert!(select(&[entry.clone()]).is_some());
+        let entries: Vec<_> = (0..257)
+            .map(|i| {
+                let mut entry = entry.clone();
+                entry.resource_key = format!("{i:064x}");
+                entry.transfer.as_mut().unwrap().resource_key = entry.resource_key.clone();
+                entry
+            })
+            .collect();
+        let selected = select(&entries).unwrap();
+        let mut cursor = 0;
+        assert_eq!(selected.batch(&mut cursor).len(), 256);
+        assert_ne!(cursor, 0); // The worker polls the remaining batch before its idle wait.
+        assert_eq!(selected.batch(&mut cursor).len(), 1);
+        assert_eq!(cursor, 0);
+        assert_eq!(selected.batch(&mut cursor).len(), 256);
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        assert_eq!(
+            selected.summary.selection_id,
+            select(&reversed).unwrap().summary.selection_id
+        );
+        assert!(owner::serving::Selection::from_publications(
+            f.resource.source_id(),
+            &[entry.clone(), entry]
+        )
+        .is_err());
     }
     #[test]
     fn transfer_approval_is_exact_snapshot_bound_and_preserves_original_read_allowances() {

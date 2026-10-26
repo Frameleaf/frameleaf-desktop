@@ -3,6 +3,7 @@ mod preparation;
 mod publication;
 mod reading;
 mod recovery;
+pub(in crate::source_reads) mod serving;
 use super::Job;
 use crate::connection::{DeviceIdentity, SavedConnection};
 use cap_std::{ambient_authority, fs::Dir};
@@ -10,6 +11,7 @@ pub use preparation::PreparationAction;
 pub use reading::{PreparationRequest, PreparationWork};
 pub use recovery::{RecoveryRequest, RecoveryWork};
 use serde::Serialize;
+pub use serving::{ServingRequest, ServingSelection, ServingWork};
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -101,12 +103,14 @@ enum OperationKey {
     Prepare(reading::Key),
     Publication(reading::Key),
     Recovery(recovery::Key),
+    Serving(serving::Key),
 }
 impl OperationKey {
     fn request_id(&self) -> &str {
         match self {
             Self::Prepare(key) | Self::Publication(key) => &key.request.request_id,
             Self::Recovery(key) => &key.request.request_id,
+            Self::Serving(key) => &key.request.request_id,
         }
     }
     fn preparation(&self) -> Option<&reading::Key> {
@@ -134,6 +138,7 @@ impl OperationKey {
         match self {
             Self::Prepare(key) | Self::Publication(key) => key.matches(saved, source),
             Self::Recovery(key) => key.matches(saved, source),
+            Self::Serving(key) => key.matches(saved, source),
         }
     }
     fn view(&self, view: View) -> ReferenceWork {
@@ -141,6 +146,7 @@ impl OperationKey {
             Self::Prepare(key) => ReferenceWork::Prepare(key.view(view)),
             Self::Publication(key) => ReferenceWork::Publish(key.view(view)),
             Self::Recovery(key) => ReferenceWork::Recover(key.view(view)),
+            Self::Serving(key) => ReferenceWork::Serve(key.view(view)),
         }
     }
 }
@@ -150,6 +156,7 @@ pub enum ReferenceWork {
     Prepare(PreparationWork),
     Publish(PreparationWork),
     Recover(RecoveryWork),
+    Serve(ServingWork),
 }
 struct Running {
     operation: Option<OperationKey>,
@@ -234,6 +241,7 @@ impl Requests {
         self.closing.store(true, Ordering::Release);
         self.stop().await
     }
+    #[cfg(test)]
     async fn install<F, Fut>(
         &self,
         source: String,
@@ -340,29 +348,6 @@ impl Requests {
             .filter(|key| key.matches(saved, source))
             .map(|key| key.view(self.status())))
     }
-    /// Called only after local reference approval and resource allowances exist; no UI activates it yet.
-    pub async fn start(
-        &self,
-        base: PathBuf,
-        saved: SavedConnection,
-        source: String,
-        notify: Arc<dyn Fn(View) + Send + Sync>,
-    ) -> Result<View, String> {
-        if !super::canonical_uuid(&source) {
-            return Err("source_read_request_invalid".into());
-        }
-        self.install(source.clone(), notify, move |progress, signal| {
-            run(
-                base,
-                saved,
-                source,
-                progress,
-                signal,
-                crate::resource_policy::sample,
-            )
-        })
-        .await
-    }
     #[cfg(test)]
     pub(in crate::source_reads) async fn start_for_test(
         &self,
@@ -376,7 +361,7 @@ impl Requests {
             return Err("source_read_request_invalid".into());
         }
         self.install(source.clone(), notify, move |progress, signal| {
-            run(base, saved, source, progress, signal, sample)
+            run(base, saved, source, progress, signal, sample, None)
         })
         .await
     }
@@ -488,29 +473,76 @@ async fn run(
     progress: Progress,
     mut signal: Signal,
     sample: fn() -> crate::resource_policy::Snapshot,
+    expected_selection: Option<String>,
 ) -> Result<(), String> {
     let initial_base = base.clone();
     let initial_saved = saved.clone();
     let initial_source = source.clone();
     let stop = signal.cancelled.clone();
-    let lease = tauri::async_runtime::spawn_blocking(move || {
-        if stop.load(Ordering::Acquire) {
-            return Err("source_delivery_interrupted".into());
-        }
-        authority(&initial_base, &initial_saved, &initial_source)?;
-        PollLease::acquire(&initial_base, &initial_source)
-    })
-    .await
-    .map_err(|_| "source_read_shutdown_unconfirmed")??;
+    let (lease, selection, identity, expected_scope) =
+        tauri::async_runtime::spawn_blocking(move || {
+            if stop.load(Ordering::Acquire) {
+                return Err("source_delivery_interrupted".into());
+            }
+            let identity = authority(&initial_base, &initial_saved, &initial_source)?;
+            let lease = PollLease::acquire(&initial_base, &initial_source)?;
+            let selection = if let Some(expected) = expected_selection {
+                let status = preparation::recorded_status(
+                    &initial_base,
+                    &initial_saved,
+                    &initial_source,
+                    &|| {
+                        if stop.load(Ordering::Acquire) {
+                            Err("source_delivery_interrupted".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?
+                .ok_or("source_serving_selection_changed")?;
+                let selected =
+                    serving::Selection::from_publications(&initial_source, &status.publications)?
+                        .ok_or("source_serving_selection_changed")?;
+                if selected.summary.selection_id != expected {
+                    return Err("source_serving_selection_changed".into());
+                }
+                Some(selected)
+            } else {
+                None
+            };
+            let scope = if selection.is_some() {
+                Some(serving::scope(&initial_saved, &identity, &initial_source)?)
+            } else {
+                None
+            };
+            Ok::<_, String>((lease, selection, identity, scope))
+        })
+        .await
+        .map_err(|_| "source_read_shutdown_unconfirmed")??;
     let lease = Arc::new(lease);
+    if let Some(scope) = &expected_scope {
+        signal
+            .wait(crate::resource_bridge::issue_grant(
+                &saved, &identity, &source, scope,
+            ))
+            .await
+            .ok_or("source_delivery_interrupted")??;
+    }
+    let mut cursor = 0;
     while !signal.cancelled.load(Ordering::Acquire) {
         let current_base = base.clone();
         let current_saved = saved.clone();
         let current_source = source.clone();
         let current_lease = lease.clone();
+        let current_scope = expected_scope.clone();
         let (identity, refusal) = tauri::async_runtime::spawn_blocking(move || {
             current_lease.check()?;
             let identity = authority(&current_base, &current_saved, &current_source)?;
+            if let Some(scope) = current_scope {
+                if serving::scope(&current_saved, &identity, &current_source)? != scope {
+                    return Err("source_approval_changed".into());
+                }
+            }
             Ok::<_, String>((identity, sample().refusal(64 * 1024 * 1024)))
         })
         .await
@@ -522,12 +554,16 @@ async fn run(
             progress.set("paused", Some(code.into()));
         } else {
             progress.set("waiting", None);
+            let resources = selection
+                .as_ref()
+                .map(|selected| selected.batch(&mut cursor));
             let Some(result) = signal
                 .wait(crate::resource_bridge::poll(
                     &saved,
                     &identity,
                     &source,
                     2 * 1024 * 1024 * 1024,
+                    resources,
                 ))
                 .await
             else {
@@ -574,6 +610,9 @@ async fn run(
                     sample,
                 )
                 .await?;
+            } else if cursor != 0 {
+                // Check the remaining selection before sleeping so later requests cannot age out behind empty batches.
+                continue;
             }
         }
         if signal

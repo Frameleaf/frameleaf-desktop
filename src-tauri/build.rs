@@ -62,6 +62,8 @@ fn main() {
             "approve_photo_reference_transfer",
             "control_photo_reference",
             "start_photo_reference_read",
+            "start_photo_reference_serving",
+            "pause_photo_reference_serving",
             "pause_photo_reference_read",
             "photo_reference_work_status",
             "start_photo_reference_publication",

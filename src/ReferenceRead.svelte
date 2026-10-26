@@ -4,9 +4,10 @@
   import { onMount } from 'svelte';
   type Scan = { resources: number; scanId: string; current: boolean; abandoned: boolean; prepared: boolean; additionalReadAllowance: number; nextReadBytes: number | null };
   type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string };
-  type Work = { sourceId: string; requestId: string; state: string; code: string | null } & ({ operation: 'prepare'; scanId: string } | { operation: 'publish'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string });
-  let { sourceId, scan = null, publications = [], disabled = false, onActiveChange, onSettled }: {
-    sourceId: string; scan?: Scan | null; publications?: Publication[]; disabled?: boolean; onActiveChange: (active: boolean) => void; onSettled: () => void;
+  type Serving = { selectionId: string; resources: number; maxTransferBytes: number };
+  type Work = { sourceId: string; requestId: string; state: string; code: string | null } & ({ operation: 'prepare'; scanId: string } | { operation: 'publish'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string } | { operation: 'serve'; selectionId: string });
+  let { sourceId, scan = null, publications = [], serving = null, disabled = false, onActiveChange, onSettled }: {
+    sourceId: string; scan?: Scan | null; publications?: Publication[]; serving?: Serving | null; disabled?: boolean; onActiveChange: (active: boolean) => void; onSettled: () => void;
   } = $props();
   let work = $state<Work | null>(null);
   let visibleRecoveries = $state(20);
@@ -21,6 +22,8 @@
   let unlisten: UnlistenFn | undefined;
   const observed = new Map<string, Work>();
   const errors: Record<string, string> = {
+    source_serving_selection_changed: 'The approved serving selection changed. Refresh its metadata before starting again.',
+    source_upload_budget_exhausted: 'The saved transfer allowance is exhausted. Refresh the source metadata to review it.',
     source_preparation_incomplete: 'Finish preparing the selected originals before publishing this scan.',
     source_publication_changed: 'The saved publication record changed. Refresh its metadata before recovering its receipt.',
     source_publication_not_committed: 'This attempt has not reached publication. Its earlier receipt and pending metadata are kept.',
@@ -34,24 +37,24 @@
     source_read_operation_changed: 'This preparation request changed. Check status before pausing it again.',
     source_scan_changed: 'The saved scan changed. Refresh its metadata before preparing an original.',
     source_scan_abandoned: 'This scan was abandoned. Scan the same selection again before preparing originals.',
-    source_read_budget_exhausted: 'This scan needs more original-read allowance. Refresh its metadata to review the exact amount.',
+    source_read_budget_exhausted: 'The saved original-read allowance is exhausted. Refresh the source metadata before continuing.',
     source_staging_budget_exceeded: 'Private staging is full. Finish existing source work or review retained cache before trying again.',
     source_cache_cleanup_pending: 'A retained attempt needs recovery or cache cleanup. Saved originals and spent allowances are kept.',
-    on_battery: 'Preparation is paused on battery power. Connect external power, then prepare explicitly.',
-    power_unknown: 'External power could not be checked. Preparation remains stopped.',
-    metered_network: 'Preparation is paused on a metered connection.',
-    network_unknown: 'Network cost could not be checked. Preparation remains stopped.',
-    memory_low: 'There is not enough available memory to prepare this original safely.',
-    memory_unknown: 'Available memory could not be checked. Preparation remains stopped.',
-    source_delivery_interrupted: 'Preparation was interrupted. Retained staging and spent allowances are kept.',
+    on_battery: 'External power is required for source work. Connect power before continuing.',
+    power_unknown: 'External power could not be checked.',
+    metered_network: 'An unmetered connection is required for source work.',
+    network_unknown: 'Network cost could not be checked.',
+    memory_low: 'There is not enough available memory for this source operation.',
+    memory_unknown: 'Available memory could not be checked.',
+    source_delivery_interrupted: 'Source work was interrupted. Retained staging and spent allowances are kept.',
     source_item_changed: 'The selected original changed. Retained staging is kept; review a new scan before reading again.',
     photos_original_unavailable: 'Photos could not export this original. Retained staging and spent allowances are kept.',
     photos_permission_required: 'Photos access is unavailable or was revoked. Retained staging is kept.',
-    source_photo_session_changed: 'Reconnect this source to the current sign-in before preparing originals.',
+    source_photo_session_changed: 'Reconnect this source to the current sign-in before continuing.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'Source work needs attention. Check its status; retained data is kept.'; }
   function uncertain(value: Work | null) { return !!value && ['source_read_shutdown_unconfirmed', 'source_copy_shutdown_unconfirmed'].includes(value.code ?? ''); }
-  function finished(value: Work | null) { return !!value && ['stopped', 'paused', 'needs-attention'].includes(value.state) && !uncertain(value); }
+  function finished(value: Work | null) { return !!value && ['stopped', 'paused', 'needs-attention'].includes(value.state) && !(value.operation === 'serve' && value.state === 'paused' && value.code !== null) && !uncertain(value); }
   function activeWork() { return !!work && !finished(work); }
   function announce() { if (alive) onActiveChange(!ready || checking || startPending || pausePending || activeWork()); }
   function valid(value: unknown): value is Work {
@@ -62,12 +65,15 @@
       && (v.code === null || typeof v.code === 'string') && (
         v.operation === 'prepare' && digest(v.scanId) && ['starting', 'preparing', 'stopped', 'paused', 'needs-attention'].includes(v.state)
         || v.operation === 'publish' && digest(v.scanId) && ['starting', 'publishing', 'stopped', 'paused', 'needs-attention'].includes(v.state)
+        || v.operation === 'serve' && digest(v.selectionId) && ['starting', 'waiting', 'serving', 'stopped', 'paused', 'needs-attention'].includes(v.state)
         || v.operation === 'recover' && digest(v.resourceKey) && digest(v.recordId) && ['starting', 'recovering', 'stopped', 'paused', 'needs-attention'].includes(v.state)
       );
   }
   function same(a: Work | null, b: Work) {
-    return !!a && a.sourceId === b.sourceId && a.requestId === b.requestId && (a.operation !== 'recover' && b.operation !== 'recover'
-      ? a.operation === b.operation && a.scanId === b.scanId : a.operation === 'recover' && b.operation === 'recover' && a.resourceKey === b.resourceKey && a.recordId === b.recordId);
+    return !!a && a.sourceId === b.sourceId && a.requestId === b.requestId && (
+      a.operation === 'serve' && b.operation === 'serve' && a.selectionId === b.selectionId
+      || a.operation === 'recover' && b.operation === 'recover' && a.resourceKey === b.resourceKey && a.recordId === b.recordId
+      || (a.operation === 'prepare' || a.operation === 'publish') && a.operation === b.operation && a.scanId === b.scanId);
   }
   function settle() {
     announce();
@@ -80,9 +86,10 @@
     if (same(work, value) && uncertain(work) && !trustedSnapshot && !uncertain(value)) return;
     if (same(work, value) && finished(work) && !finished(value)) return;
     work = value;
-    if (value.code) message = explain(value.code);
-    else if (value.state === 'paused') message = value.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : value.operation === 'publish' ? 'Publication paused. Saved receipts and pending attempts are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
-    else if (value.state === 'stopped') message = value.operation === 'recover' ? 'Receipt recovery stopped. Refreshing saved publication records…' : value.operation === 'publish' ? 'Publication stopped. Refreshing saved publication records…' : 'Preparation stopped. Refreshing saved scan progress…';
+    if (value.operation === 'serve' && value.state === 'paused' && value.code) message = 'Serving is paused by power, network, or memory policy. It will check again while this worker remains active.';
+    else if (value.code) message = explain(value.code);
+    else if (value.state === 'paused') message = value.operation === 'serve' ? 'Serving paused. Saved allowances and reference records are kept.' : value.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : value.operation === 'publish' ? 'Publication paused. Saved receipts and pending attempts are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
+    else if (value.state === 'stopped') message = value.operation === 'serve' ? 'Serving stopped. Refreshing saved transfer allowances…' : value.operation === 'recover' ? 'Receipt recovery stopped. Refreshing saved publication records…' : value.operation === 'publish' ? 'Publication stopped. Refreshing saved publication records…' : 'Preparation stopped. Refreshing saved scan progress…';
     else message = '';
     settle();
   }
@@ -141,11 +148,15 @@
     if (!canPublish() || !scan) return;
     await launch({ operation: 'publish', sourceId, scanId: scan.scanId });
   }
+  async function startServing() {
+    if (!idle() || !serving || !/^[a-f0-9]{64}$/.test(serving.selectionId) || serving.resources < 1) return;
+    await launch({ operation: 'serve', sourceId, selectionId: serving.selectionId });
+  }
   async function startRecovery(value: Publication) {
     if (!canRecover(value)) return;
     await launch({ operation: 'recover', sourceId, resourceKey: value.resourceKey, recordId: value.recordId });
   }
-  async function launch(target: { sourceId: string } & ({ operation: 'prepare'; scanId: string } | { operation: 'publish'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string })) {
+  async function launch(target: { sourceId: string } & ({ operation: 'prepare'; scanId: string } | { operation: 'publish'; scanId: string } | { operation: 'recover'; resourceKey: string; recordId: string } | { operation: 'serve'; selectionId: string })) {
     let requestId: string;
     try { requestId = newRequestId(); }
     catch { message = 'Secure request IDs are unavailable. Restart Frameleaf before preparing an original.'; return; }
@@ -157,6 +168,7 @@
       const reply = requested.operation === 'prepare'
         ? await invoke<Work>('start_photo_reference_read', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
         : requested.operation === 'publish' ? await invoke<Work>('start_photo_reference_publication', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
+        : requested.operation === 'serve' ? await invoke<Work>('start_photo_reference_serving', { sourceId: requested.sourceId, expectedSelection: requested.selectionId, requestId: requested.requestId })
         : await invoke<Work>('start_photo_reference_recovery', { sourceId: requested.sourceId, resourceKey: requested.resourceKey, expectedRecord: requested.recordId, requestId: requested.requestId });
       if (!current()) return;
       if (!valid(reply) || !same(requested, reply)) throw 'source_read_shutdown_unconfirmed';
@@ -177,11 +189,12 @@
       const reply = requested.operation === 'prepare'
         ? await invoke<Work>('pause_photo_reference_read', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
         : requested.operation === 'publish' ? await invoke<Work>('pause_photo_reference_publication', { sourceId: requested.sourceId, expectedScan: requested.scanId, requestId: requested.requestId })
+        : requested.operation === 'serve' ? await invoke<Work>('pause_photo_reference_serving', { sourceId: requested.sourceId, expectedSelection: requested.selectionId, requestId: requested.requestId })
         : await invoke<Work>('pause_photo_reference_recovery', { sourceId: requested.sourceId, resourceKey: requested.resourceKey, expectedRecord: requested.recordId, requestId: requested.requestId });
       if (!current()) return;
-      if (!valid(reply) || !same(requested, reply) || reply.state !== 'paused') throw 'source_read_shutdown_unconfirmed';
+      if (!valid(reply) || !same(requested, reply) || reply.state !== 'paused' || reply.code !== null) throw 'source_read_shutdown_unconfirmed';
       work = reply;
-      message = requested.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : requested.operation === 'publish' ? 'Publication paused. Saved receipts and pending attempts are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
+      message = requested.operation === 'serve' ? 'Serving paused. Saved allowances and reference records are kept.' : requested.operation === 'recover' ? 'Receipt recovery paused. Saved publication records are kept.' : requested.operation === 'publish' ? 'Publication paused. Saved receipts and pending attempts are kept.' : 'Preparation paused. Retained staging and spent allowances are kept.';
     } catch (error) {
       if (current()) { message = explain(error); work = { ...requested, state: 'needs-attention', code: 'source_read_shutdown_unconfirmed' }; }
     } finally { if (current()) { pausePending = false; settle(); } }
@@ -194,17 +207,22 @@
   <p class="footnote">Prepare one selected original at a time using the saved read or export allowance. Originals stay in their source; this action starts no server upload.</p>
   {#if checking}<p role="status">Checking source work status…</p>{/if}
   {#if activeWork()}
-    <p role="status">{pausePending ? 'Pausing and waiting for source work to stop…' : uncertain(work) ? 'Source work stop remains unconfirmed.' : work?.operation === 'recover' ? 'Recovering the saved server receipt…' : work?.operation === 'publish' ? 'Publishing the completed scan’s reference metadata…' : 'Preparing one original within its saved allowance…'}</p>
-    <progress aria-label={work?.operation === 'recover' ? 'Recovering saved server receipt' : work?.operation === 'publish' ? 'Publishing completed scan' : 'Preparing one approved original'}></progress>
-    <button class="secondary" disabled={pausePending} onclick={pause}>{work?.operation === 'recover' ? 'Pause receipt recovery' : work?.operation === 'publish' ? 'Pause publication' : 'Pause preparation'}</button>
+    <p role="status">{pausePending ? 'Pausing and waiting for source work to stop…' : uncertain(work) ? 'Source work stop remains unconfirmed.' : work?.operation === 'serve' ? work.code ? 'Serving is waiting for resource policy to allow work.' : work.state === 'serving' ? 'Serving an approved original…' : 'Waiting for requests for approved originals…' : work?.operation === 'recover' ? 'Recovering the saved server receipt…' : work?.operation === 'publish' ? 'Publishing the completed scan’s reference metadata…' : 'Preparing one original within its saved allowance…'}</p>
+    <progress aria-label={work?.operation === 'serve' ? 'Serving approved originals' : work?.operation === 'recover' ? 'Recovering saved server receipt' : work?.operation === 'publish' ? 'Publishing completed scan' : 'Preparing one approved original'}></progress>
+    <button class="secondary" disabled={pausePending} onclick={pause}>{work?.operation === 'serve' ? 'Pause serving' : work?.operation === 'recover' ? 'Pause receipt recovery' : work?.operation === 'publish' ? 'Pause publication' : 'Pause preparation'}</button>
   {/if}
   {#if message}<p role="status">{message}</p>{/if}
   <button class="text-button" disabled={checking || pausePending || startPending} onclick={checkStatus}>Check source work status</button>
   {#if canStart()}<button class="secondary" onclick={() => start()}>{scan?.nextReadBytes === null ? 'Recover staged original' : 'Prepare next original within allowance'}</button>{/if}
   {#if scan?.current && !scan.abandoned && scan.prepared}
     <h4>Publish prepared references</h4>
-    <p class="footnote">Publish this completed scan’s metadata to your server. This starts no original read or upload. Original access from your server is not yet available for desktop references.</p>
+    <p class="footnote">Publish this completed scan’s metadata to your server. This starts no original read or upload. Serving originals requires a separate start within the saved allowances.</p>
     <button class="secondary" disabled={!canPublish()} onclick={startPublication}>Publish {scan.resources.toLocaleString()} prepared references</button>
+  {/if}
+  {#if serving}
+    <h4>Serve approved originals</h4>
+    <p class="footnote">Allow your server to request the {serving.resources.toLocaleString()} eligible published {serving.resources === 1 ? 'original' : 'originals'} while this app is running. At most {serving.maxTransferBytes.toLocaleString()} bytes can be transferred using the saved allowances. Existing read allowance may be used if staging needs to be recreated. Recorded staging does not confirm availability.</p>
+    <button class="secondary" disabled={!idle()} onclick={startServing}>Start serving {serving.resources.toLocaleString()} approved {serving.resources === 1 ? 'original' : 'originals'}</button>
   {/if}
   {#if publications.some(value => ['publish', 'complete', 'recorded'].includes(value.state))}
     <h4>Recover a server receipt</h4>

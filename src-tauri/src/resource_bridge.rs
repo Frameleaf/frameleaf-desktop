@@ -435,17 +435,51 @@ fn source_request(
         .json(&serde_json::json!({"payload": payload})))
 }
 
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResource {
+    pub resource_key: String,
+    pub version: String,
+}
+fn poll_payload(max_bytes: u64, resources: Option<&[ReadResource]>) -> Result<String, String> {
+    if max_bytes == 0 || max_bytes > MAX_TIMESTAMP {
+        return Err("source_read_capacity_invalid".into());
+    }
+    if resources.is_some_and(|values| {
+        values.is_empty()
+            || values.len() > 256
+            || values.iter().any(|value| {
+                !crate::native_runtime::digest_valid(&value.resource_key, 64)
+                    || !crate::native_runtime::digest_valid(&value.version, 64)
+            })
+    }) {
+        return Err("source_read_selection_invalid".into());
+    }
+    let mut value = serde_json::json!({"maxBytes":max_bytes});
+    if let Some(resources) = resources {
+        value["resources"] =
+            serde_json::to_value(resources).map_err(|_| "source_read_payload_invalid")?;
+    }
+    serde_json::to_string(&value).map_err(|_| "source_read_payload_invalid".into())
+}
+fn selected(claim: &ReadClaim, resources: Option<&[ReadResource]>) -> Result<(), String> {
+    if resources.is_some_and(|values| {
+        !values
+            .iter()
+            .any(|value| value.resource_key == claim.resource_key && value.version == claim.version)
+    }) {
+        return Err("source_read_request_invalid".into());
+    }
+    Ok(())
+}
 pub async fn poll(
     saved: &SavedConnection,
     identity: &DeviceIdentity,
     source_id: &str,
     max_bytes: u64,
+    resources: Option<&[ReadResource]>,
 ) -> Result<Option<ReadClaim>, String> {
-    if max_bytes == 0 || max_bytes > MAX_TIMESTAMP {
-        return Err("source_read_capacity_invalid".into());
-    }
-    let payload = serde_json::to_string(&serde_json::json!({"maxBytes": max_bytes}))
-        .map_err(|_| "source_read_payload_invalid")?;
+    let payload = poll_payload(max_bytes, resources)?;
     let signed = reserve_source_proof(saved, identity, source_id, SourceOperation::Poll, &payload)?;
     let response: PollResponse = crate::transport::json(
         source_request(&signed, SourceOperation::Poll, &payload)?
@@ -456,6 +490,7 @@ pub async fn poll(
     .await?;
     if let Some(claim) = &response.request {
         claim.validate(&signed.source, max_bytes, now()?)?;
+        selected(claim, resources)?;
     }
     Ok(response.request)
 }
@@ -940,6 +975,32 @@ pub struct PollResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_poll_is_bounded_and_refuses_a_claim_outside_the_exact_pair() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/source-read-v1.json")).unwrap();
+        let claim: ReadClaim = serde_json::from_value(fixture["request"].clone()).unwrap();
+        let resource = ReadResource {
+            resource_key: claim.resource_key.clone(),
+            version: claim.version.clone(),
+        };
+        let resources = vec![resource.clone(); 256];
+        let payload = poll_payload(100, Some(&resources)).unwrap();
+        assert!(payload.len() <= 65536);
+        assert!(selected(&claim, Some(&resources)).is_ok());
+        assert!(poll_payload(100, Some(&[])).is_err());
+        assert!(poll_payload(100, Some(&vec![resource.clone(); 257])).is_err());
+        assert!(selected(
+            &claim,
+            Some(&[ReadResource {
+                version: "f".repeat(64),
+                ..resource
+            }])
+        )
+        .is_err());
+        assert!(!poll_payload(100, None).unwrap().contains("resources"));
+    }
+
     use serde_json::{json, Value};
 
     fn fixture() -> (Value, SavedConnection, DeviceIdentity) {

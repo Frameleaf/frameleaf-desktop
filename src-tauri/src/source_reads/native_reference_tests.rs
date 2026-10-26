@@ -1027,20 +1027,86 @@ fn actual_native_reference_publication() {
             json!({"phase":"serving-ready","bytes":fresh[0].bytes,"originalReadAllowance":0,"transferAllowance":fresh[0].bytes}),
         );
         assert_eq!(read_fixture_message(&mut input)["command"], "start-serving");
+        let metadata = approvals
+            .reference_status(base.clone(), next.clone(), source.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        approvals.stop().await.unwrap();
+        let selected = metadata.serving.unwrap();
+        assert_eq!(selected.resources, 1);
+        let request = ServingRequest {
+            source_id: source.clone(),
+            selection_id: selected.selection_id,
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
         let serving = Requests::default();
+        let mut stale = request.clone();
+        stale.selection_id = "f".repeat(64);
+        let (send, mut receive) = tokio::sync::watch::channel(View::default());
         serving
-            .start_for_test(
+            .start_serving_for_test(
                 base.clone(),
                 next.clone(),
-                source.clone(),
+                stale,
+                Arc::new(move |work| {
+                    send.send_replace(View {
+                        source_id: work.request.source_id,
+                        state: work.state,
+                        code: work.code,
+                    });
+                }),
+                allowed_preparation_policy,
+            )
+            .await
+            .unwrap();
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            receive.wait_for(|view| view.state == "needs-attention"),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            refusal.code.as_deref(),
+            Some("source_serving_selection_changed")
+        );
+        serving.stop().await.unwrap();
+        serving
+            .start_serving_for_test(
+                base.clone(),
+                next.clone(),
+                request.clone(),
                 Arc::new(|_| {}),
                 allowed_preparation_policy,
             )
             .await
             .unwrap();
+        serving
+            .start_serving_for_test(
+                base.clone(),
+                next.clone(),
+                request.clone(),
+                Arc::new(|_| {}),
+                allowed_preparation_policy,
+            )
+            .await
+            .unwrap();
+        let mut foreign = request.clone();
+        foreign.request_id = uuid::Uuid::new_v4().to_string();
+        assert!(serving
+            .pause_reference_serving(&next, foreign)
+            .await
+            .is_err());
         report(json!({"phase":"serving-started"}));
         assert_eq!(read_fixture_message(&mut input)["command"], "stop-serving");
-        serving.stop().await.unwrap();
+        let paused = serving
+            .pause_reference_serving(&next, request)
+            .await
+            .unwrap();
+        assert_eq!(paused.state, "paused");
+        assert!(paused.code.is_none());
         assert!(!serving.is_active());
         let job = Job::resume(
             &base,

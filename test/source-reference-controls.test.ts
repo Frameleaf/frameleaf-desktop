@@ -102,7 +102,7 @@ test('reference UI commands are permitted only in the packaged local main window
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
   const commands = [...ui.matchAll(/invoke(?:<[^\n]*?>)?\('([^']+)'/g)].map(match => match[1]);
-  assert.equal(commands.length, 10);
+  assert.equal(commands.length, 12);
   for (const command of commands) {
     assert.ok(manifest.includes(`"${command}"`), `${command} must exist in the application ACL manifest`);
     assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`));
@@ -173,8 +173,11 @@ test('transfer approval binds the publication and exact budget state without gra
  const call=view.approveTransfer(publication);const request=view.pending[1];assert.equal(request.name,'approve_photo_reference_transfer');
  assert.deepEqual(JSON.parse(JSON.stringify(request.args)),{input:{sourceId:status.sourceId,resourceKey:publication.resourceKey,recordId:publication.recordId,stateId:transfer.stateId,additional:7}});
  const approved={...transfer,stateId:'a'.repeat(64),uploadRemaining:10,additionalUpload:0};request.resolve(approved);await call;
- assert.match(view.current().message,/Transfer allowance saved/);assert.equal(view.pending.length,2);
- await view.approveTransfer(publication);assert.equal(view.pending.length,2);unmount();
+ assert.match(view.current().message,/Transfer allowance saved/);assert.equal(view.pending.length,3);
+ assert.equal(view.pending[2].name,'photo_reference_status');assert.equal(view.current().busy,true);
+ const refreshed={...displayed,publications:[{...publication,transfer:approved}],serving:{selectionId:'b'.repeat(64),resources:1,maxTransferBytes:10}};
+ view.pending[2].resolve(refreshed);await setImmediate();assert.equal(view.current().status,refreshed);assert.equal(view.current().busy,false);
+ await view.approveTransfer(publication);assert.equal(view.pending.length,3);unmount();
 });
 test('a changed or malformed transfer reply cannot claim a grant or replace displayed history', async () => {
  for(const change of [{readRemaining:10},{uploadUsed:10},{resourceId:'other'},{stateId:transfer.stateId},{additionalUpload:7}]){

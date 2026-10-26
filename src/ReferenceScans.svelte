@@ -5,7 +5,7 @@
   type Scan = { scanId: string; current: boolean; abandoned: boolean; spent: number; resources: number; completed: number; reservedBytes: number; discardable: boolean; remaining: number; nextReadBytes: number | null; additionalReadAllowance: number; canRescan: boolean; prepared: boolean };
   type Transfer = { resourceKey: string; resourceId: string; version: string; stateId: string; bytes: number; readUsed: number; readRemaining: number; uploadUsed: number; uploadRemaining: number; additionalUpload: number; cacheRecorded: boolean };
   type Publication = { resourceKey: string; recordId: string; originalFileName: string; state: string; receipt: { publishedAt: string } | null; transfer?: Transfer | null; transferError?: string | null };
-  type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[] };
+  type ReferenceStatus = { sourceId: string; scans: Scan[]; publications?: Publication[]; serving?: { selectionId: string; resources: number; maxTransferBytes: number } | null };
   let { sourceId, photos = false }: { sourceId: string; photos?: boolean } = $props();
   let status = $state<ReferenceStatus | null>(null);
   let busy = $state(false);
@@ -73,6 +73,7 @@
     if (busy || reading || !status?.publications?.includes(publication) || publication.state !== 'recorded' || !previous?.cacheRecorded || previous.additionalUpload <= 0) return;
     const request = ++serial; const source = sourceId;
     busy = true; message = ''; confirmation = null;
+    let approved = false;
     const current = () => alive && serial === request && sourceId === source;
     try {
       const reply = await invoke<Transfer>('approve_photo_reference_transfer', { input: { sourceId: source, resourceKey: publication.resourceKey, recordId: publication.recordId, stateId: previous.stateId, additional: previous.additionalUpload } });
@@ -81,10 +82,11 @@
         || !/^[a-f0-9]{64}$/.test(reply.stateId) || reply.stateId === previous.stateId
         || reply.readUsed !== previous.readUsed || reply.readRemaining !== previous.readRemaining || reply.uploadUsed !== previous.uploadUsed
         || reply.uploadRemaining !== previous.uploadRemaining + previous.additionalUpload || reply.additionalUpload !== 0 || !reply.cacheRecorded) throw 'source_transfer_state_changed';
-      status = { ...status!, publications: status!.publications!.map(value => value === publication ? { ...value, transfer: reply } : value) };
+      status = { ...status!, serving: null, publications: status!.publications!.map(value => value === publication ? { ...value, transfer: reply } : value) };
       message = 'Transfer allowance saved. No original read or transfer was started.';
+      approved = true;
     } catch (error) { if (current()) message = explain(error); }
-    finally { if (current()) busy = false; }
+    finally { if (current()) { busy = false; if (approved) { const note = message; void refresh(); message = note; } } }
   }
   function confirmDiscard(scan: Scan) {
     if (!busy && !reading && status?.scans.includes(scan) && scan.abandoned && scan.discardable) confirmation = scan.scanId;
@@ -127,7 +129,7 @@
 <section aria-label="Saved reference scans" aria-busy={busy}>
   <h3>Saved reference scans</h3>
   <p class="footnote">Inspect saved preparation and staging reservations without opening or downloading originals.</p>
-  <ReferenceRead {sourceId} scan={status?.scans.find(value => value.current) ?? null} publications={status?.publications ?? []} disabled={busy} onActiveChange={value => reading = value} onSettled={() => void refresh()} />
+  <ReferenceRead {sourceId} scan={status?.scans.find(value => value.current) ?? null} publications={status?.publications ?? []} serving={status?.serving ?? null} disabled={busy} onActiveChange={value => reading = value} onSettled={() => void refresh()} />
   <button class="text-button" disabled={busy || reading} onclick={refresh}>Refresh saved scans</button>
   {#if busy}<p role="status">Checking saved reference work…</p>{/if}
   {#if message}<p role="status">{message}</p>{/if}
