@@ -11,7 +11,7 @@ import tarfile
 from pathlib import Path
 
 from build_host_server import stage_server
-from build_host_studio import bind_authoring_commands
+from build_host_studio import bind_authoring_commands, studio_node_matches
 from build_runtime import BuildError, build_environment, git_blob, run, sha256
 
 
@@ -56,7 +56,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     env["TOKIO_WORKER_THREADS"] = "2"
     package = json.loads(git_blob(git, source, revision, "package.json", env))
     match = re.fullmatch(r"pnpm@(\d+\.\d+\.\d+)", package.get("packageManager", ""))
-    if not match or run([node, "--version"], cwd=work, env=env) != "v26.11.1":
+    configuration = json.loads(git_blob(git, source, revision, "studio/engine-build.json", env))
+    node_version = run([node, "--version"], cwd=work, env=env)
+    if not match or not studio_node_matches(configuration, node_version):
         raise BuildError("host_web_toolchain_unapproved")
     archive = work / "source.tar"
     run(
@@ -95,7 +97,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if run([pnpm, "--version"], cwd=snapshot, env=env) != match[1]:
         raise BuildError("host_web_pnpm_unapproved")
     configuration = json.loads((snapshot / "studio/engine-build.json").read_text())
-    if configuration.get("node") != "26.11.1" or not re.fullmatch(
+    if not studio_node_matches(configuration, node_version) or not re.fullmatch(
         r"\d+\.\d+\.\d+", configuration.get("npm", "")
     ):
         raise BuildError("host_web_studio_toolchain_invalid")
@@ -104,6 +106,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         "sourceRevision": revision,
         "sourceArchiveSha256": sha256(archive),
         "nodeSha256": sha256(node),
+        "nodeVersion": configuration["node"],
         "lockfileSha256": sha256(snapshot / "pnpm-lock.yaml"),
         "studioLockfileSha256": sha256(snapshot / "studio/engine-package-lock.json"),
         "pnpmVersion": match[1],

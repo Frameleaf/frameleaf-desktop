@@ -531,7 +531,9 @@ not complete workflow/server/UI, redistribution or installed-platform approval.
 
 `python3 tools/build_host_web.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
 builds the shared photo UI and Studio editor into `www/` from an exact Git
-archive. The selected source's Studio attestation config supplies npm's version;
+archive. The `--node` executable must match `studio/engine-build.json` in that
+revision; this authoring pin is separate from the native host's Node 26.11.1
+runtime. The same attestation config supplies npm's version;
 bootstrap npm installs it only into the new private toolchain prefix, with
 lifecycle scripts disabled. Studio preparation verifies its pinned upstream
 archive, patches and adapted-source digest. The existing adapter build preserves
@@ -651,7 +653,8 @@ redistribution qualification remain pending.
 ### Native Studio worker draft
 
 `tools/build_host_studio.py` is a source-pinned authoring recipe. It snapshots a
-selected server revision, prepares the existing pinned engine, builds and attests
+selected server revision and requires its exact Studio authoring Node pin, then
+prepares the existing pinned engine, builds and attests
 its headless harness, then uses the existing bundled-worker packager. The staged
 worker includes its JavaScript runtime packages, subtitle sidecar, notices and
 server font resources. Required entries and font headers are checked before the

@@ -12,7 +12,7 @@ import tarfile
 from pathlib import Path
 
 from build_host_server import stage_server
-from build_runtime import BuildError, build_environment, run, sha256
+from build_runtime import BuildError, build_environment, git_blob, run, sha256
 
 
 
@@ -22,6 +22,15 @@ _WINDOWS_AUTHORING_INPUTS = {
     "adapter.mjs": "d6670c9e97d2176734200f82a6c680e38807578761584f178760332d8d7d9581",
     "vite.config.mjs": "055c98e461916cf58ffcbc93c78f3c50dd72a0f28d35b1dbcdc0f234f26357cb",
 }
+
+
+def studio_node_matches(configuration: object, actual_version: str) -> bool:
+    version = configuration.get("node") if isinstance(configuration, dict) else None
+    return (
+        isinstance(version, str)
+        and re.fullmatch(r"\d+\.\d+\.\d+", version) is not None
+        and actual_version == "v" + version
+    )
 
 
 def adapt_authoring_command(name: str, source: str) -> str:
@@ -168,7 +177,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     env["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
     env["RAYON_NUM_THREADS"] = "1"
     env["TOKIO_WORKER_THREADS"] = "1"
-    if run([node, "--version"], cwd=work, env=env) != "v26.11.1":
+    configuration = json.loads(git_blob(git, source, revision, "studio/engine-build.json", env))
+    node_version = run([node, "--version"], cwd=work, env=env)
+    if not studio_node_matches(configuration, node_version):
         raise BuildError("host_studio_node_unapproved")
     archive = work / "source.tar"
     run(
@@ -197,7 +208,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         contents.extractall(snapshot, filter="data")
     configuration = json.loads((snapshot / "studio/engine-build.json").read_text())
     if (
-        configuration.get("node") != "26.11.1"
+        not studio_node_matches(configuration, node_version)
         or not re.fullmatch(r"\d+\.\d+\.\d+", configuration.get("npm", ""))
         or not re.fullmatch(r"[a-f0-9]{40}", configuration.get("upstreamCommit", ""))
         or not re.fullmatch(r"[a-f0-9]{64}", configuration.get("sourceSha256", ""))
@@ -210,6 +221,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         "sourceRevision": revision,
         "sourceArchiveSha256": sha256(archive),
         "nodeSha256": sha256(node),
+        "nodeVersion": configuration["node"],
         "npmVersion": configuration["npm"],
         "studioLockfileSha256": configuration["lockfileSha256"],
         "platform": platform.system() + "-" + platform.machine(),
