@@ -32,7 +32,7 @@ struct Target {
     file_created_at: String,
     file_modified_at: String,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Receipt {
     pub source_id: String,
@@ -249,6 +249,106 @@ impl Publication {
             state,
         })
     }
+    fn open_recovery(
+        root: &Path,
+        binding: Binding,
+        identity: &DeviceIdentity,
+    ) -> Result<Self, String> {
+        if !crate::native_runtime::digest_valid(&binding.resource_key, 64) {
+            return Err("source_publication_invalid".into());
+        }
+        let journal = Journal {
+            root: root.to_owned(),
+        };
+        let name = format!("{}.json", binding.resource_key);
+        let state: State = journal.read(&name, identity)?;
+        state.validate()?;
+        if state.binding != binding {
+            return Err("source_approval_changed".into());
+        }
+        let publication = Self {
+            journal,
+            name,
+            state,
+        };
+        publication.recovery_path()?;
+        Ok(publication)
+    }
+    pub(super) fn recover(
+        base: &Path,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        source: &str,
+        scope: String,
+        resource_key: String,
+    ) -> Result<Self, String> {
+        if !canonical_uuid(source) {
+            return Err("source_read_request_invalid".into());
+        }
+        Self::open_recovery(
+            &base.join("photo-reads").join(source).join("publications"),
+            Binding {
+                server: normalize_server(&saved.server)?.to_string(),
+                server_id: saved.server_id.clone(),
+                owner_id: saved.account_id.clone(),
+                device_id: saved.device_id.clone().ok_or("source_approval_changed")?,
+                installation_id: identity.installation_id.clone(),
+                source_id: source.into(),
+                scope,
+                resource_key,
+            },
+            identity,
+        )
+    }
+    pub(super) fn recovery_path(&self) -> Result<String, String> {
+        let (run, item) = if let Some(a) = &self.state.pending {
+            if !matches!(a.phase, Phase::Publish | Phase::Complete) {
+                return Err("source_publication_not_committed".into());
+            }
+            (&a.run_id, &a.item_id)
+        } else {
+            let r = &self
+                .state
+                .current
+                .as_ref()
+                .ok_or("source_publication_not_committed")?
+                .receipt;
+            (&r.run_id, &r.item_id)
+        };
+        Ok(format!("runs/{run}/items/{item}/reference"))
+    }
+    pub(super) fn recover_receipt(
+        &mut self,
+        value: Value,
+        identity: &DeviceIdentity,
+    ) -> Result<(), String> {
+        self.recovery_path()?;
+        if self
+            .state
+            .pending
+            .as_ref()
+            .is_some_and(|a| a.phase == Phase::Publish)
+        {
+            return self.ack(value, identity);
+        }
+        let receipt: Receipt =
+            serde_json::from_value(value).map_err(|_| "source_reference_receipt_invalid")?;
+        if self.receipt() != Some(&receipt) {
+            return Err("source_reference_receipt_invalid".into());
+        }
+        Ok(())
+    }
+    pub(super) fn recovery_completion(&self) -> Option<(String, Value)> {
+        let a = self
+            .state
+            .pending
+            .as_ref()
+            .filter(|a| a.phase == Phase::Complete)?;
+        Some((
+            format!("runs/{}", a.run_id),
+            json!({"state":"complete","inventoryComplete":true}),
+        ))
+    }
     pub(super) fn receipt(&self) -> Option<&Receipt> {
         self.state.current.as_ref().map(|p| &p.receipt)
     }
@@ -463,6 +563,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.root.parent().unwrap());
         }
+    }
+    #[test]
+    fn receipt_recovery_never_allocates_or_reposts_an_attempt() {
+        let f = Fixture::new();
+        assert!(Publication::open_recovery(&f.root, f.binding.clone(), &f.identity).is_err());
+        assert!(!f.root.exists());
+        let mut p = f.open();
+        assert!(p.recovery_path().is_err());
+        f.advance_to_publish(&mut p);
+        let before = p.next().unwrap();
+        let response = f.response(&p);
+        drop(p);
+        let mut p = Publication::open_recovery(&f.root, f.binding.clone(), &f.identity).unwrap();
+        assert_eq!(p.next().unwrap(), before);
+        assert_eq!(p.recovery_path().unwrap(), before.1);
+        assert!(p.recovery_completion().is_none());
+        let mut foreign = response.clone();
+        foreign["ownerId"] = json!("66666666-6666-4666-8666-666666666666");
+        assert!(p.recover_receipt(foreign, &f.identity).is_err());
+        assert_eq!(p.next().unwrap(), before);
+        p.recover_receipt(response.clone(), &f.identity).unwrap();
+        assert_eq!(p.recovery_path().unwrap(), before.1);
+        let completion = p.recovery_completion().unwrap();
+        assert_eq!(
+            completion.1,
+            json!({"state":"complete","inventoryComplete":true})
+        );
+        // An unknown completion reply is recovered with GET before PATCH, using the same receipt.
+        drop(p);
+        let mut p = Publication::open_recovery(&f.root, f.binding.clone(), &f.identity).unwrap();
+        let mut changed = response.clone();
+        changed["publishedAt"] = json!("2026-10-25T04:00:00.000Z");
+        assert!(p.recover_receipt(changed, &f.identity).is_err());
+        p.recover_receipt(response.clone(), &f.identity).unwrap();
+        f.complete(&mut p);
+        drop(p);
+        let mut p = Publication::open_recovery(&f.root, f.binding.clone(), &f.identity).unwrap();
+        assert!(p.next().is_none());
+        assert_eq!(p.recovery_path().unwrap(), before.1);
+        p.recover_receipt(response, &f.identity).unwrap();
+        assert!(p.next().is_none());
+        assert!(p.recovery_completion().is_none());
+        let mut foreign = f.binding.clone();
+        foreign.scope = "f".repeat(64);
+        assert!(Publication::open_recovery(&f.root, foreign, &f.identity).is_err());
+        assert!(Publication::open_recovery(
+            &f.root,
+            f.binding.clone(),
+            &DeviceIdentity::generate()
+        )
+        .is_err());
     }
     #[test]
     fn empty_directory_and_interrupted_first_write_can_restart_without_a_request() {

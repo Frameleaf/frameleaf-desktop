@@ -195,49 +195,64 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn stop_cancels_capability_wait_before_inventory_or_publication() {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let source = "44444444-4444-4444-8444-444444444444";
-        let base = std::env::temp_dir().join(format!(
-            "frameleaf-publication-stop-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let saved = SavedConnection {
-            server: format!("https://{address}/"),
-            server_id: "synthetic".into(),
-            account_id: "11111111-1111-4111-8111-111111111111".into(),
-            token: "synthetic-publication-session".into(),
-            name: "Synthetic".into(),
-            device_name: "Synthetic".into(),
-            mode: "client-worker".into(),
-            device_id: Some("22222222-2222-4222-8222-222222222222".into()),
-        };
-        let owner = Requests::default();
-        owner
-            .publish_reference(base.clone(), saved, source.into(), Arc::new(|_| {}))
-            .await
-            .unwrap();
-        let (mut stream, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        for recovery in [false, true] {
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let source = "44444444-4444-4444-8444-444444444444";
+            let base = std::env::temp_dir().join(format!(
+                "frameleaf-publication-stop-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let saved = SavedConnection {
+                server: format!("https://{address}/"),
+                server_id: "synthetic".into(),
+                account_id: "11111111-1111-4111-8111-111111111111".into(),
+                token: "synthetic-publication-session".into(),
+                name: "Synthetic".into(),
+                device_name: "Synthetic".into(),
+                mode: "client-worker".into(),
+                device_id: Some("22222222-2222-4222-8222-222222222222".into()),
+            };
+            let owner = Requests::default();
+            if recovery {
+                owner
+                    .recover_reference(
+                        base.clone(),
+                        saved,
+                        source.into(),
+                        "a".repeat(64),
+                        Arc::new(|_| {}),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                owner
+                    .publish_reference(base.clone(), saved, source.into(), Arc::new(|_| {}))
+                    .await
+                    .unwrap();
+            }
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(owner.is_active());
+            tokio::time::timeout(std::time::Duration::from_secs(2), owner.stop())
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(owner.is_active());
-        tokio::time::timeout(std::time::Duration::from_secs(2), owner.stop())
+            let mut hello = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut hello),
+            )
             .await
             .unwrap()
             .unwrap();
-        let mut hello = Vec::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.read_to_end(&mut hello),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(!owner.is_active());
-        assert_eq!(owner.status().state, "stopped");
-        assert!(!base.exists());
+            assert!(!owner.is_active());
+            assert_eq!(owner.status().state, "stopped");
+            assert!(!base.exists());
+        }
     }
 }

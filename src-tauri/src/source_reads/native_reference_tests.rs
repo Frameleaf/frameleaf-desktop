@@ -21,20 +21,29 @@ fn report(value: Value) {
     println!("REFERENCE_PUBLICATION {value}");
     std::io::stdout().flush().unwrap();
 }
-async fn publish(base: &Path, saved: &SavedConnection, source: &str) -> View {
+async fn action(base: &Path, saved: &SavedConnection, source: &str, recover: Option<&str>) -> View {
     let owner = Requests::default();
     let (send, mut receive) = tokio::sync::watch::channel(View::default());
-    owner
-        .publish_reference(
-            base.to_owned(),
-            saved.clone(),
-            source.into(),
-            Arc::new(move |value| {
-                send.send_replace(value);
-            }),
-        )
-        .await
-        .unwrap();
+    let notify: Arc<dyn Fn(View) + Send + Sync> = Arc::new(move |value| {
+        send.send_replace(value);
+    });
+    if let Some(key) = recover {
+        owner
+            .recover_reference(
+                base.to_owned(),
+                saved.clone(),
+                source.into(),
+                key.into(),
+                notify,
+            )
+            .await
+            .unwrap();
+    } else {
+        owner
+            .publish_reference(base.to_owned(), saved.clone(), source.into(), notify)
+            .await
+            .unwrap();
+    }
     let view = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         receive.wait_for(|v| {
@@ -146,26 +155,68 @@ fn actual_native_reference_publication() {
             .join("stage")
             .join(before["stage"].as_str().unwrap())
             .join("original");
+        let job_record = job.journal.root.join("state.json");
+        let job_before = fs::read(&job_record).unwrap();
         drop(job);
-        let first = publish(&base, &saved, &source).await;
+        let first = action(&base, &saved, &source, None).await;
         assert_eq!(first.code.as_deref(), Some("server_http_503"));
         report(
             json!({"phase":"lost-receipt","sourceId":source,"resourceKey":selected.resource_key,"sha256":selected.sha256,"bytes":selected.bytes}),
         );
         assert_eq!(read_fixture_message(&mut input)["command"], "resume");
-        let second = publish(&base, &saved, &source).await;
+        let edited = b"owner-edited independent original after lost reply";
+        fs::write(source_root.join("original.jpg"), edited).unwrap();
+        assert!(Job::resume(
+            &base,
+            &saved,
+            &identity,
+            &source,
+            &selected.resource_key,
+            &selected.version
+        )
+        .is_err());
+        assert_eq!(
+            action(&base, &saved, &source, None).await.state,
+            "needs-attention"
+        );
+        let journal = Journal {
+            root: base.join("photo-reads").join(&source).join("publications"),
+        };
+        let name = format!("{}.json", selected.resource_key);
+        let pending_before = fs::read(journal.root.join(&name)).unwrap();
+        let second = action(&base, &saved, &source, Some(&selected.resource_key)).await;
         assert_eq!(
             second.code.as_deref(),
             Some("source_reference_receipt_invalid")
         );
+        assert_eq!(fs::read(journal.root.join(&name)).unwrap(), pending_before);
         report(json!({"phase":"foreign-receipt-refused"}));
         assert_eq!(read_fixture_message(&mut input)["command"], "resume");
-        assert_eq!(publish(&base, &saved, &source).await.state, "stopped");
-        // A completed-run replay also keeps the original logical asset and item identity.
-        assert_eq!(publish(&base, &saved, &source).await.state, "stopped");
-        let journal = Journal {
-            root: base.join("photo-reads").join(&source).join("publications"),
-        };
+        assert_eq!(
+            action(&base, &saved, &source, Some(&selected.resource_key))
+                .await
+                .code
+                .as_deref(),
+            Some("server_http_409")
+        );
+        assert_eq!(fs::read(journal.root.join(&name)).unwrap(), pending_before);
+        report(json!({"phase":"current-binding-refused","pendingAttemptUnchanged":true}));
+        assert_eq!(read_fixture_message(&mut input)["command"], "resume");
+        assert_eq!(
+            action(&base, &saved, &source, Some(&selected.resource_key))
+                .await
+                .state,
+            "stopped"
+        );
+        // Completed recovery uses GET only; a missing original cannot authorize a read.
+        fs::remove_file(source_root.join("original.jpg")).unwrap();
+        assert_eq!(
+            action(&base, &saved, &source, Some(&selected.resource_key))
+                .await
+                .state,
+            "stopped"
+        );
+        fs::write(source_root.join("original.jpg"), edited).unwrap();
         let state: Value = journal
             .read(&format!("{}.json", selected.resource_key), &identity)
             .unwrap();
@@ -173,27 +224,21 @@ fn actual_native_reference_publication() {
         let receipt = &state["current"]["receipt"];
         assert_eq!(receipt["storage"], "reference");
         assert_eq!(receipt["resourceId"], receipt["itemId"]);
-        let job = Job::resume(
+        assert!(Job::resume(
             &base,
             &saved,
             &identity,
             &source,
             &selected.resource_key,
-            &selected.version,
+            &selected.version
         )
-        .unwrap();
-        let after = serde_json::to_value(job.state(&saved, &identity).unwrap()).unwrap();
-        assert_eq!(before["read"], after["read"]);
-        assert_eq!(before["upload"], after["upload"]);
+        .is_err());
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
         assert_eq!(fs::read(&stage).unwrap(), original);
-        assert_eq!(
-            fs::read(source_root.join("original.jpg")).unwrap(),
-            original
-        );
+        assert_eq!(fs::read(source_root.join("original.jpg")).unwrap(), edited);
         report(
-            json!({"phase":"complete","receipt":receipt,"independentOriginalUnchanged":true,"cacheRetained":true,"readAndUploadAllowancesUnchanged":true}),
+            json!({"phase":"complete","receipt":receipt,"editedOriginalRetained":true,"originalValidationStillRequired":true,"cacheRetained":true,"readAndUploadAllowancesUnchanged":true}),
         );
-        drop(job);
         // Simulate local sign-out; its inactive record must never be usable by an original reader.
         credentials::delete(CREDENTIAL).unwrap();
         credentials::delete("connection").unwrap();
@@ -223,24 +268,26 @@ fn actual_native_reference_publication() {
         reconnected.register(&next, &identity).await.unwrap();
         crate::source_consent::persist(&reconnected, &next, &identity).unwrap();
         assert!(reconnected.copy_approval(&next, &identity).is_err());
-        assert_eq!(publish(&base, &next, &source).await.state, "stopped");
+        assert_eq!(
+            action(&base, &next, &source, Some(&selected.resource_key))
+                .await
+                .state,
+            "stopped"
+        );
         let current: Value = journal
             .read(&format!("{}.json", selected.resource_key), &identity)
             .unwrap();
         assert_eq!(&current["current"]["receipt"], receipt);
-        let job = Job::resume(
+        assert!(Job::resume(
             &base,
             &next,
             &identity,
             &source,
             &selected.resource_key,
-            &selected.version,
+            &selected.version
         )
-        .unwrap();
-        let after = serde_json::to_value(job.state(&next, &identity).unwrap()).unwrap();
-        assert_eq!(before["read"], after["read"]);
-        assert_eq!(before["upload"], after["upload"]);
-        drop(job);
+        .is_err());
+        assert_eq!(fs::read(&job_record).unwrap(), job_before);
         report(
             json!({"phase":"reconnected","receipt":receipt,"readAndUploadAllowancesUnchanged":true}),
         );
@@ -257,10 +304,7 @@ fn actual_native_reference_publication() {
             .await
             .unwrap();
         assert_eq!(fs::read(&stage).unwrap(), original);
-        assert_eq!(
-            fs::read(source_root.join("original.jpg")).unwrap(),
-            original
-        );
+        assert_eq!(fs::read(source_root.join("original.jpg")).unwrap(), edited);
         report(json!({"phase":"forgotten","originalAndCacheRetained":true}));
     });
 }

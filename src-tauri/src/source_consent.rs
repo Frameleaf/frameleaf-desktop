@@ -378,6 +378,18 @@ impl Consent {
         }
         Ok(approval)
     }
+    /// Metadata reconciliation grants neither provider access nor an original-read capability.
+    pub(crate) fn reference_metadata_scope(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<String, String> {
+        self.require_bound_session(saved, identity)?;
+        if self.mode != SourceMode::Reference || !self.registered || !self.allow_download {
+            return Err("source_approval_required".into());
+        }
+        Ok(self.approval.fingerprint())
+    }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()
     }
@@ -661,8 +673,24 @@ mod tests {
         consent.accept(&saved(), &ack).unwrap();
         ack["mode"] = json!("copy");
         assert!(consent.accept(&saved(), &ack).is_err());
+        assert!(consent
+            .reference_metadata_scope(&saved(), &identity)
+            .is_err());
         consent.registered = true;
         consent.reference_approval(&saved(), &identity).unwrap();
+        let scope = consent
+            .reference_metadata_scope(&saved(), &identity)
+            .unwrap();
+        assert_eq!(scope, consent.approval.fingerprint());
+        let mut next = saved();
+        next.token = "changed-session".into();
+        assert!(consent.reference_metadata_scope(&next, &identity).is_err());
+        assert!(consent
+            .reference_record(&saved(), &identity)
+            .unwrap()
+            .unwrap()
+            .reference_metadata_scope(&saved(), &identity)
+            .is_err());
         assert_eq!(
             consent.copy_approval(&saved(), &identity).err().as_deref(),
             Some("source_copy_mode_required")
@@ -701,7 +729,14 @@ mod tests {
             .unwrap()
             .require(&saved(), &identity)
             .is_err());
+        assert!(copy.reference_metadata_scope(&saved(), &identity).is_err());
         std::fs::remove_dir(root).unwrap();
+        assert_eq!(
+            consent
+                .reference_metadata_scope(&saved(), &identity)
+                .unwrap(),
+            scope
+        );
     }
     #[test]
     fn fresh_session_signature_cannot_turn_reference_consent_into_copy_permission() {
