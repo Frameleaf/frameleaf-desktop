@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: a1f01319ec7172d145d3d102477f363e0d5cb2f5
+          ref: 1c258e8e7ab610a21e82d1457a38dcfd35c5cfd3
           path: catalogue-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -44,8 +44,8 @@ jobs:
           import base64, hashlib, json, os, re, stat, subprocess, sys, urllib.parse, urllib.request, zipfile
           sys.path.insert(0, str(Path.cwd() / 'tools'))
           from build_runtime import build_environment, inventory, relative, sha256
-          revision = '1bf2ad55521c49f574cba2f450eb13d49652ea80'
-          build_head = '17746c741329c3a9829a5e658c24b95d7337efd4'
+          revision = '4588eeb3994e7bd2bcb813536f34dd684e74857d'
+          build_head = '1bbe1463aa0b57e32f83db40e4c82ff2e9d4ca5c'
           artifact_id = os.environ['INPUT_ARTIFACT_ID']
           artifact_sha = os.environ['INPUT_ARTIFACT_SHA256']
           assert re.fullmatch(r'[1-9][0-9]{0,19}', artifact_id)
@@ -82,7 +82,7 @@ jobs:
                   assert item.file_size < 4 * 1024**3
               bundle.extractall(candidate)
           manifest = json.loads((candidate / 'manifest.json').read_text())
-          assert manifest['sourceRevision'] == revision and manifest['epoch'] == 16
+          assert manifest['sourceRevision'] == revision and manifest['epoch'] == 17
           assert manifest['platform'] == 'windows' and manifest['architecture'] == 'x86_64'
           assert manifest['provider'] == 'CPUExecutionProvider' and manifest['moduleNamespace'] == 'frameleaf_ml'
           assert manifest['python'] == 'python/python.exe'
@@ -90,8 +90,8 @@ jobs:
           assert inventory(payload) == manifest['files']
           before = inventory(candidate)
           catalogue = subprocess.check_output(['git', '-C', 'catalogue-source', 'show',
-              'a1f01319ec7172d145d3d102477f363e0d5cb2f5:server/resources/desktop/model-catalogue.json'])
-          assert hashlib.sha256(catalogue).hexdigest() == 'ce92c0c9429400993cbd850f0914d6cc054d5f9d95a304c82f23ba0f7a3a3e6c'
+              '1c258e8e7ab610a21e82d1457a38dcfd35c5cfd3:server/resources/desktop/model-catalogue.json'])
+          assert hashlib.sha256(catalogue).hexdigest() == '5567a073e3b5bef9d6e2854fb54793493fb340e339be7cc235854ccd567506ba'
           profiles = [p for p in json.loads(catalogue)['profiles']
                       if p['runtimeSourceRevision'] == revision and p['spec']['provider'] == 'CPUExecutionProvider']
           assert len(profiles) == 5 and len({p['modelKey'] for p in profiles}) == 5

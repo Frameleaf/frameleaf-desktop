@@ -1393,8 +1393,8 @@ mod tests {
     fn precision_corrected_cpu_profiles_preserve_prior_bindings_and_require_complete_groups() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(catalogue["epoch"], 13);
-        assert_eq!(profiles.len(), 72);
+        assert_eq!(catalogue["epoch"], 14);
+        assert_eq!(profiles.len(), 77);
         assert_eq!(
             digest(
                 &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..27].to_vec())).unwrap()
@@ -1443,8 +1443,8 @@ mod tests {
     fn current_cpu_and_coreml_profiles_preserve_history_and_require_complete_clip_groups() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(catalogue["epoch"], 13);
-        assert_eq!(profiles.len(), 72);
+        assert_eq!(catalogue["epoch"], 14);
+        assert_eq!(profiles.len(), 77);
         assert_eq!(
             digest(
                 &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..32].to_vec())).unwrap()
@@ -1528,8 +1528,8 @@ mod tests {
     fn current_main_profiles_preserve_every_prior_binding_and_require_complete_groups() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(catalogue["epoch"], 13);
-        assert_eq!(profiles.len(), 72);
+        assert_eq!(catalogue["epoch"], 14);
+        assert_eq!(profiles.len(), 77);
         assert_eq!(
             digest(
                 &serde_json_canonicalizer::to_vec(&Value::Array(profiles[..52].to_vec())).unwrap()
@@ -1577,5 +1577,42 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+    #[test]
+    fn windows_allocator_source_preserves_cpu_bindings_and_provider_scope() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        let source = "4588eeb3994e7bd2bcb813536f34dd684e74857d";
+        let current: Vec<_> = profiles
+            .iter()
+            .filter(|p| p["runtimeSourceRevision"] == source)
+            .collect();
+        assert_eq!(current.len(), 5);
+        for profile in current {
+            let previous = profiles
+                .iter()
+                .find(|old| {
+                    old["runtimeSourceRevision"] == "1bf2ad55521c49f574cba2f450eb13d49652ea80"
+                        && old["modelKey"] == profile["modelKey"]
+                        && old["spec"]["provider"] == "CPUExecutionProvider"
+                })
+                .unwrap();
+            let mut normalized = (*profile).clone();
+            normalized["runtimeSourceRevision"] = previous["runtimeSourceRevision"].clone();
+            assert_eq!(&normalized, previous);
+        }
+        assert_eq!(
+            setup_profiles("ViT-B-16-SigLIP-384__webli", source, "CPUExecutionProvider")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(setup_profiles(
+            "ViT-B-16-SigLIP-384__webli",
+            source,
+            "CoreMLExecutionProvider"
+        )
+        .unwrap()
+        .is_empty());
     }
 }
