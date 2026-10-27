@@ -258,7 +258,6 @@ pub struct NativeManager {
     child: Child,
     tree: crate::process_tree::ProcessTree,
     shutdown_confirmed: bool,
-    #[cfg(unix)]
     shutdown_signalled: bool,
     receipt: mpsc::Receiver<Result<Vec<u8>, String>>,
     installation_id: String,
@@ -551,7 +550,6 @@ impl NativeManager {
             child,
             tree,
             shutdown_confirmed: false,
-            #[cfg(unix)]
             shutdown_signalled: false,
             receipt,
             installation_id: id.into(),
