@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 9bbe7c64e720fceee2fcba0f72055c945f56b19a
+          ref: a1f01319ec7172d145d3d102477f363e0d5cb2f5
           path: catalogue-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -44,9 +44,8 @@ jobs:
           import base64, hashlib, json, os, re, stat, subprocess, sys, urllib.parse, urllib.request, zipfile
           sys.path.insert(0, str(Path.cwd() / 'tools'))
           from build_runtime import build_environment, inventory, relative, sha256
-          revision = 'f2c451a6bf71ca3f3aec986e07f0852937268e2f'
-          run_id = 39504442584
-          build_head = '91203102137fcff723ff91525eb8ebf624f64f1a'
+          revision = '1bf2ad55521c49f574cba2f450eb13d49652ea80'
+          build_head = os.environ['GITHUB_SHA']
           artifact_id = os.environ['INPUT_ARTIFACT_ID']
           artifact_sha = os.environ['INPUT_ARTIFACT_SHA256']
           assert re.fullmatch(r'[1-9][0-9]{0,19}', artifact_id)
@@ -55,10 +54,12 @@ jobs:
           output.mkdir()
           def api(path):
               return json.loads(subprocess.check_output(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/' + path]))
+          artifact = api(f'actions/artifacts/{artifact_id}')
+          run_id = artifact['workflow_run']['id']
           run = api(f'actions/runs/{run_id}')
+          assert run['path'] == '.github/workflows/runtime-pack.yml'
           assert run['head_sha'] == build_head and run['event'] == 'workflow_dispatch'
           assert run['status'] == 'completed' and run['conclusion'] == 'success'
-          artifact = api(f'actions/artifacts/{artifact_id}')
           assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == build_head
           assert artifact['name'] == 'cpu-runtime-candidate-Windows' and not artifact['expired']
           assert 0 < artifact['size_in_bytes'] < 4 * 1024**3
@@ -81,7 +82,7 @@ jobs:
                   assert item.file_size < 4 * 1024**3
               bundle.extractall(candidate)
           manifest = json.loads((candidate / 'manifest.json').read_text())
-          assert manifest['sourceRevision'] == revision and manifest['epoch'] == 15
+          assert manifest['sourceRevision'] == revision and manifest['epoch'] == 16
           assert manifest['platform'] == 'windows' and manifest['architecture'] == 'x86_64'
           assert manifest['provider'] == 'CPUExecutionProvider' and manifest['moduleNamespace'] == 'frameleaf_ml'
           assert manifest['python'] == 'python/python.exe'
@@ -89,8 +90,8 @@ jobs:
           assert inventory(payload) == manifest['files']
           before = inventory(candidate)
           catalogue = subprocess.check_output(['git', '-C', 'catalogue-source', 'show',
-              '9bbe7c64e720fceee2fcba0f72055c945f56b19a:server/resources/desktop/model-catalogue.json'])
-          assert hashlib.sha256(catalogue).hexdigest() == '27330f1a63b94fc6f9bd485b85773563bb0b662e583f0c88b96f10b06e36264c'
+              'a1f01319ec7172d145d3d102477f363e0d5cb2f5:server/resources/desktop/model-catalogue.json'])
+          assert hashlib.sha256(catalogue).hexdigest() == 'ce92c0c9429400993cbd850f0914d6cc054d5f9d95a304c82f23ba0f7a3a3e6c'
           profiles = [p for p in json.loads(catalogue)['profiles']
                       if p['runtimeSourceRevision'] == revision and p['spec']['provider'] == 'CPUExecutionProvider']
           assert len(profiles) == 5 and len({p['modelKey'] for p in profiles}) == 5
