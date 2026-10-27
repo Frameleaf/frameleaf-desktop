@@ -582,15 +582,16 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
 
 
 test("runtime sources are approved only for their qualified provider and platform targets", async (t) => {
-  for (const [source, cpuTargets] of [
+  for (const [source, cpuTargets, coremlTargets = ["macos-aarch64"]] of [
     ["f2c451a6bf71ca3f3aec986e07f0852937268e2f", ["linux-x86_64", "windows-x86_64"]],
     ["088560702a69022b6eee705d8a67306f1075cea0", ["macos-aarch64"]],
     ["1bf2ad55521c49f574cba2f450eb13d49652ea80", ["linux-x86_64", "macos-aarch64"]],
+    ["4588eeb3994e7bd2bcb813536f34dd684e74857d", ["windows-x86_64"], []],
   ]) {
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   for (const [name, profile] of Object.entries(profiles)) {
     const targets = Object.entries(profile.additionalSources ?? {}).filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
-    assert.deepEqual(targets, name === "cpu-ort" ? cpuTargets : name === "coreml-ort" ? ["macos-aarch64"] : []);
+    assert.deepEqual(targets, name === "cpu-ort" ? cpuTargets : name === "coreml-ort" ? coremlTargets : []);
   }
   const { packageConfiguration } = await import("./package_desktop.mjs");
   for (const [platform, architecture, provider, allowed] of [
@@ -599,7 +600,7 @@ test("runtime sources are approved only for their qualified provider and platfor
     ["windows", "x86_64", "CPUExecutionProvider", cpuTargets.includes("windows-x86_64")],
     ["macos", "x86_64", "CPUExecutionProvider", false],
     ["macos", "aarch64", "CPUExecutionProvider", cpuTargets.includes("macos-aarch64")],
-    ["macos", "aarch64", "CoreMLExecutionProvider", true],
+    ["macos", "aarch64", "CoreMLExecutionProvider", coremlTargets.includes("macos-aarch64")],
   ]) {
     const f = await fixture(t);
     const provenance = { schemaVersion: 1, sourceRepository: "Frameleaf/frameleaf-app", sourceRevision: source,
