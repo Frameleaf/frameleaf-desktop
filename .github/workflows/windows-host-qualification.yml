@@ -2,16 +2,10 @@ name: Private Windows full host lifecycle and installer
 on:
   workflow_call:
     inputs:
-      artifact_id:
+      release_asset_id:
         required: true
         type: string
-      artifact_sha256:
-        required: true
-        type: string
-      build_head:
-        required: true
-        type: string
-      signature_hex:
+      release_asset_sha256:
         required: true
         type: string
 permissions:
@@ -20,7 +14,7 @@ permissions:
 jobs:
   qualify:
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -49,12 +43,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          HOST_ARTIFACT: ${{ inputs.artifact_id }}
-          HOST_DIGEST: ${{ inputs.artifact_sha256 }}
-          HOST_HEAD: ${{ inputs.build_head }}
-          HOST_SIGNATURE: ${{ inputs.signature_hex }}
+          HOST_ASSET: ${{ inputs.release_asset_id }}
+          HOST_DIGEST: ${{ inputs.release_asset_sha256 }}
         run: |
-          python tools/prepare_windows_host_qualification.py --output "$env:RUNNER_TEMP/fl-windows-full-host-qualification" --artifact "$env:HOST_ARTIFACT" --digest "$env:HOST_DIGEST" --head "$env:HOST_HEAD" --signature "$env:HOST_SIGNATURE"
+          python tools/prepare_windows_host_qualification.py --output "$env:RUNNER_TEMP/fl-windows-full-host-qualification" --asset "$env:HOST_ASSET" --digest "$env:HOST_DIGEST"
           if ($LASTEXITCODE) { throw 'Full host signature or inventory was refused' }
       - name: Select a fresh state under the runner account's private profile
         shell: pwsh
@@ -94,10 +86,17 @@ jobs:
               assert attached(volume), 'Cloud filter did not attach to the disposable test volume'
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Restore pinned Windows Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: src-tauri/target
+          key: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
       - run: npm ci
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - name: Start, stop and restart through the genuine compiled Windows authority
+        id: host-lifecycle
         shell: pwsh
         env:
           FRAMELEAF_TEST_HOST_CANDIDATE: ${{ runner.temp }}/fl-windows-full-host-qualification/input/bundle
@@ -182,3 +181,10 @@ jobs:
             ${{ runner.temp }}/fl-windows-full-host-qualification/installer/FrameleafNativeHost-internal.exe
           retention-days: 7
           if-no-files-found: warn
+      - name: Retain pinned Rust dependencies after the lifecycle check
+        if: ${{ !cancelled() && (steps.host-lifecycle.outcome == 'success' || steps.host-lifecycle.outcome == 'failure') && steps.rust-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: src-tauri/target
+          key: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
