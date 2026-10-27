@@ -1,6 +1,9 @@
 mod common;
+#[path = "common/factory_profiles.rs"]
+mod factory_profiles;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
+use factory_profiles::profiles_for_runtime;
 use frameleaf_desktop::{
     ml_transport::{AcceptedQualification, QualificationChallenge},
     model_catalogue::{approved_profile, ApprovedProfile},
@@ -163,7 +166,24 @@ fn actual_factory_runtime_qualifies_the_bound_challenge_and_refuses_nonce_replay
         store,
         installed,
     };
-    let p = profile();
+    let catalogue: Value =
+        serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+    let profiles = profiles_for_runtime(
+        &catalogue,
+        f.installed.source_revision(),
+        f.installed.provider(),
+    );
+    let profile = profiles
+        .first()
+        .expect("factory runtime has no approved model profiles");
+    let p = approved_profile(
+        profile["modelName"].as_str().unwrap(),
+        &profile["spec"]["entries"],
+        f.installed.source_revision(),
+        f.installed.provider(),
+    )
+    .unwrap()
+    .unwrap();
     let attestation = f.store.attestation(&f.installed).unwrap();
     let clock = || {
         SystemTime::now()
@@ -331,12 +351,11 @@ fn actual_factory_runtime_serves_three_qualified_roles_in_one_owned_process() {
         serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
     let mut profiles = Vec::new();
     let mut proofs = Vec::new();
-    for profile in catalogue["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|p| p["runtimeSourceRevision"] == f.installed.source_revision())
-    {
+    for profile in profiles_for_runtime(
+        &catalogue,
+        f.installed.source_revision(),
+        f.installed.provider(),
+    ) {
         let p = approved_profile(
             profile["modelName"].as_str().unwrap(),
             &profile["spec"]["entries"],
