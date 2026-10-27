@@ -45,7 +45,7 @@ jobs:
           sys.path.insert(0, str(Path.cwd() / 'tools'))
           from build_runtime import build_environment, inventory, relative, sha256
           revision = '1bf2ad55521c49f574cba2f450eb13d49652ea80'
-          build_head = os.environ['GITHUB_SHA']
+          build_head = '17746c741329c3a9829a5e658c24b95d7337efd4'
           artifact_id = os.environ['INPUT_ARTIFACT_ID']
           artifact_sha = os.environ['INPUT_ARTIFACT_SHA256']
           assert re.fullmatch(r'[1-9][0-9]{0,19}', artifact_id)
@@ -147,6 +147,18 @@ jobs:
                       '--output', str(report_path)], cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT,
                       timeout=spec['deadlineSeconds'] + 30)
               report = json.loads(report_path.read_text())
+              if result.returncode != 0 and report.get('reason') == 'native_qualification_failed':
+                  diagnostic = (
+                      'import asyncio,hashlib;from pathlib import Path;'
+                      'from frameleaf_ml.native_qualification import QualificationSpec,qualify;'
+                      'import sys;spec=Path(sys.argv[1]);raw=spec.read_bytes();'
+                      'asyncio.run(qualify(QualificationSpec.model_validate_json(raw),'
+                      'Path(sys.argv[2]),spec.parent,hashlib.sha256(raw).hexdigest()))'
+                  )
+                  with (output / f'profile-{index}-diagnostic.log').open('w') as log:
+                      subprocess.run([str(payload / manifest['python']), '-I', '-B', '-c', diagnostic,
+                          str(spec_path), str(cache)], cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT,
+                          timeout=spec['deadlineSeconds'] + 30)
               assert result.returncode == 0 and report['state'] == 'ready-cpu', report
               assert report['modelKey'] == profile['modelKey'] and report['provider'] == 'CPUExecutionProvider'
               assert report['bindingSha256'] == sha256(spec_path) and report['fixtureSha256'] == spec['fixtureSha256']
