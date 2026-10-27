@@ -119,54 +119,49 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: src-tauri/target
-          key: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+          key: windows-2022-rust-1.95.0-target-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+      - name: Restore pinned Rust dependency sources
+        id: rust-sources
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo/registry
+          key: windows-2022-rust-1.95.0-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
       - run: npm ci
       - run: npm test
       - run: npm run check
       - run: python -m unittest discover -s tools -p test_qualify_windows_controller.py -v
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - id: rust-tests
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --message-format=json | Tee-Object -FilePath "$env:RUNNER_TEMP/fl-windows-desktop/cargo-test.jsonl"
+          if ($LASTEXITCODE) { throw 'Windows Rust tests failed' }
       - name: Qualify actual Windows credential persistence in the disposable runner
         timeout-minutes: 5
         shell: python
         env:
           FRAMELEAF_TEST_DISPOSABLE_KEYSTORE: '1'
         run: |
+          import os, subprocess, sys
           from pathlib import Path
-          import os, subprocess
-          assert os.environ['GITHUB_ACTIONS'] == 'true'
-          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
-          subprocess.run(['cargo', 'build', '--locked', '--manifest-path', 'src-tauri/Cargo.toml',
-              '--bin', 'frameleaf-native-host'], check=True)
-          env = dict(os.environ)
-          env['FRAMELEAF_TEST_CONTROLLER'] = str(Path('src-tauri/target/debug/frameleaf-native-host.exe').resolve(strict=True))
-          test = 'credentials::qualification::disposable_runner_epoch_persistence'
-          command = ['cargo', 'test', '--locked', '--manifest-path', 'src-tauri/Cargo.toml', '--lib']
-          tests = subprocess.check_output([*command, '--', '--list'], text=True)
-          assert tests.splitlines().count(test + ': test') == 1
-          subprocess.run([*command, test, '--', '--exact', '--ignored'], env=env, check=True)
+          output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-desktop'
+          subprocess.run([sys.executable, 'tools/qualify_windows_library.py', '--receipts',
+              str(output / 'cargo-test.jsonl'), '--kind', 'credentials', '--output',
+              str(output / 'credential-qualification.json')], check=True)
       - name: Qualify Windows package directory and receipt authority in the disposable runner
         if: runner.environment == 'github-hosted'
         shell: pwsh
         run: |
-          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
-          if ($LASTEXITCODE) { throw 'Windows package test discovery failed' }
-          $fixtures = @($tests | Select-String '^host_install::windows::package::tests::disposable_runner_.*: test$')
-          if ($fixtures.Count -ne 3) { throw 'Windows package qualification fixtures are missing' }
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
+          python tools/qualify_windows_library.py --receipts "$env:RUNNER_TEMP/fl-windows-desktop/cargo-test.jsonl" --kind package --output "$env:RUNNER_TEMP/fl-windows-desktop/package-qualification.json"
           if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Qualify an isolated synthetic Windows cloud provider
         timeout-minutes: 5
         shell: pwsh
         run: |
-          $test = 'copy_source::windows_cloud_tests::disposable_cloud_provider_qualification'
-          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not ($tests -match "^${test}: test$")) { throw 'The real CfApi qualification test is missing' }
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib $test -- --exact --ignored --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/qualify_windows_library.py --receipts "$env:RUNNER_TEMP/fl-windows-desktop/cargo-test.jsonl" --kind cloud --output "$env:RUNNER_TEMP/fl-windows-desktop/cloud-qualification.json"
+          if ($LASTEXITCODE) { throw 'Windows cloud provider qualification failed' }
       - name: Build the internal Windows desktop installer
         shell: python
         run: |
@@ -245,6 +240,10 @@ jobs:
             src-tauri/target/debug/frameleaf-desktop.exe
             src-tauri/target/debug/frameleaf-native-host.exe
             ${{ runner.temp }}/fl-windows-desktop/result.json
+            ${{ runner.temp }}/fl-windows-desktop/cargo-test.jsonl
+            ${{ runner.temp }}/fl-windows-desktop/credential-qualification.json
+            ${{ runner.temp }}/fl-windows-desktop/package-qualification.json
+            ${{ runner.temp }}/fl-windows-desktop/cloud-qualification.json
             ${{ runner.temp }}/fl-windows-desktop/runtime-identity.json
             ${{ runner.temp }}/fl-windows-desktop/controller-qualification.json
           retention-days: 7
@@ -255,4 +254,11 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: src-tauri/target
-          key: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+          key: windows-2022-rust-1.95.0-target-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+      - name: Retain pinned Rust dependency sources
+        if: ${{ !cancelled() && (steps.rust-tests.outcome == 'success' || steps.rust-tests.outcome == 'failure') && steps.rust-sources.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo/registry
+          key: windows-2022-rust-1.95.0-registry-${{ hashFiles('src-tauri/Cargo.lock') }}

@@ -91,7 +91,14 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: src-tauri/target
-          key: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+          key: windows-2022-rust-1.95.0-target-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+      - name: Restore pinned Rust dependency sources
+        id: rust-sources
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo/registry
+          key: windows-2022-rust-1.95.0-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
       - run: npm ci
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -187,4 +194,11 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: src-tauri/target
-          key: windows-2022-rust-1.95.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+          key: windows-2022-rust-1.95.0-target-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+      - name: Retain pinned Rust dependency sources
+        if: ${{ !cancelled() && (steps.host-lifecycle.outcome == 'success' || steps.host-lifecycle.outcome == 'failure') && steps.rust-sources.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo/registry
+          key: windows-2022-rust-1.95.0-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
