@@ -114,7 +114,26 @@ pub(crate) fn opened_stamp(file: &cap_std::fs::File) -> Result<String, String> {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        };
         let info = windows_file_id(file.as_raw_handle())?;
+        let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                basic.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err("source_identity_unavailable".into());
+        }
+        let changed = unsafe { basic.assume_init() }.ChangeTime;
+        if changed < 0 {
+            return Err("source_identity_unavailable".into());
+        }
         let id: String = info
             .FileId
             .Identifier
@@ -122,7 +141,7 @@ pub(crate) fn opened_stamp(file: &cap_std::fs::File) -> Result<String, String> {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         Ok(format!(
-            "{value}:file-id-v2:{}:{id}",
+            "{value}:file-id-v2:{}:{id}:change-time-v1:{changed}",
             info.VolumeSerialNumber
         ))
     }
@@ -1783,6 +1802,50 @@ mod tests {
             check_source_root(&legacy, &current).unwrap_err(),
             "source_approval_upgrade_required"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stamp_observes_change_time_without_reading_original_data() {
+        use cap_std::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, SetFileInformationByHandle, FILE_BASIC_INFO,
+        };
+        let path = std::env::temp_dir().join(format!("frameleaf-change-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let _cleanup = Partial(Some(path.clone()));
+        fs::write(path.join("photo.jpg"), b"original").unwrap();
+        let dir = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
+        let name = Path::new("photo.jpg");
+        let before = dir.symlink_metadata(name).unwrap();
+        let expected = path_stamp(&dir, name, &before).unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path.join(name))
+            .unwrap();
+        let basic = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: i64::try_from(before.creation_time()).unwrap() - 10_000_000,
+            FileAttributes: 0,
+        };
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    (&basic as *const FILE_BASIC_INFO).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            },
+            0
+        );
+        drop(file);
+        let after = dir.symlink_metadata(name).unwrap();
+        assert_eq!(stamp(&before).unwrap(), stamp(&after).unwrap());
+        assert_ne!(expected, path_stamp(&dir, name, &after).unwrap());
     }
 
     #[cfg(windows)]

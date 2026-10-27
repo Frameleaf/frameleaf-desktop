@@ -1233,6 +1233,11 @@ mod tests {
             "67726e0fc55b3f8c88325df8f4df0d545968664de3fd511a309e70904335411b",
             "0767a6997a02500e5ba303d234356514d6954bc94fcdc3b4fb254a6901a57ece",
             "de920faa258c7190b0071832332170ab78319c956a9dcf1792c3d0660e43276b",
+            "710e4b75e702dc7fb357c7d9adfd46f112e72f2b293b7be7e2fae37027a2a350",
+            "2cd27bb7a97708f19bad89e56859e01a1c2a6d8e914715e40c4c6fe62a9756cf",
+            "a11e0dab1527fdf467089fee98931d8a611bd08ab73ff0fca3ce43b8251e580b",
+            "25ff5dadce6d2aca3a2592925fb8e9c2ea61d4d55a5faaa0cdaf512508e73c8a",
+            "63314b45995dff4db24beb827e5578329926e424ba123ecdd258a34684405cc3",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
