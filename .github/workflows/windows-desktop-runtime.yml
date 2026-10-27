@@ -120,6 +120,25 @@ jobs:
       - run: python -m unittest discover -s tools -p test_qualify_windows_controller.py -v
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Qualify actual Windows credential persistence in the disposable runner
+        timeout-minutes: 5
+        shell: python
+        env:
+          FRAMELEAF_TEST_DISPOSABLE_KEYSTORE: '1'
+        run: |
+          from pathlib import Path
+          import os, subprocess
+          assert os.environ['GITHUB_ACTIONS'] == 'true'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          subprocess.run(['cargo', 'build', '--locked', '--manifest-path', 'src-tauri/Cargo.toml',
+              '--bin', 'frameleaf-native-host'], check=True)
+          env = dict(os.environ)
+          env['FRAMELEAF_TEST_CONTROLLER'] = str(Path('src-tauri/target/debug/frameleaf-native-host.exe').resolve(strict=True))
+          test = 'credentials::qualification::disposable_runner_epoch_persistence'
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'src-tauri/Cargo.toml', '--lib']
+          tests = subprocess.check_output([*command, '--', '--list'], text=True)
+          assert tests.splitlines().count(test + ': test') == 1
+          subprocess.run([*command, test, '--', '--exact', '--ignored'], env=env, check=True)
       - name: Qualify Windows package directory and receipt authority in the disposable runner
         if: runner.environment == 'github-hosted'
         shell: pwsh
