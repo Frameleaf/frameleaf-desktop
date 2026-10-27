@@ -582,19 +582,23 @@ test("current CoreML desktop source packages only on qualified macOS ARM64", asy
 
 
 test("runtime sources are approved only for their qualified provider and platform targets", async (t) => {
-  for (const source of ["f2c451a6bf71ca3f3aec986e07f0852937268e2f", "088560702a69022b6eee705d8a67306f1075cea0", "1bf2ad55521c49f574cba2f450eb13d49652ea80"]) {
-  const memoryReportSource = source !== "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
+  for (const [source, cpuTargets] of [
+    ["f2c451a6bf71ca3f3aec986e07f0852937268e2f", ["linux-x86_64", "windows-x86_64"]],
+    ["088560702a69022b6eee705d8a67306f1075cea0", ["macos-aarch64"]],
+    ["1bf2ad55521c49f574cba2f450eb13d49652ea80", ["linux-x86_64", "macos-aarch64"]],
+  ]) {
   const profiles = JSON.parse(await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8")).profiles;
   for (const [name, profile] of Object.entries(profiles)) {
     const targets = Object.entries(profile.additionalSources ?? {}).filter(([, sources]) => sources.includes(source)).map(([target]) => target).sort();
-    assert.deepEqual(targets, memoryReportSource ? (name === "cuda-ort" ? [] : ["macos-aarch64"]) : name === "cpu-ort" ? ["linux-x86_64", "windows-x86_64"] : name === "coreml-ort" ? ["macos-aarch64"] : []);
+    assert.deepEqual(targets, name === "cpu-ort" ? cpuTargets : name === "coreml-ort" ? ["macos-aarch64"] : []);
   }
   const { packageConfiguration } = await import("./package_desktop.mjs");
   for (const [platform, architecture, provider, allowed] of [
-    ["linux", "x86_64", "CPUExecutionProvider", !memoryReportSource],
-    ["windows", "x86_64", "CPUExecutionProvider", !memoryReportSource],
+    ["linux", "x86_64", "CPUExecutionProvider", cpuTargets.includes("linux-x86_64")],
+    ["linux", "aarch64", "CPUExecutionProvider", false],
+    ["windows", "x86_64", "CPUExecutionProvider", cpuTargets.includes("windows-x86_64")],
     ["macos", "x86_64", "CPUExecutionProvider", false],
-    ["macos", "aarch64", "CPUExecutionProvider", memoryReportSource],
+    ["macos", "aarch64", "CPUExecutionProvider", cpuTargets.includes("macos-aarch64")],
     ["macos", "aarch64", "CoreMLExecutionProvider", true],
   ]) {
     const f = await fixture(t);
