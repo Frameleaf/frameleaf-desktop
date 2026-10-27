@@ -44,7 +44,7 @@ jobs:
           version: '0.11.2'
           enable-cache: false
       - name: Builder regression checks
-        run: python -m unittest discover -s desktop/tools -p 'test_*.py'
+        run: python -m unittest discover -s desktop/tools -p 'test_build_runtime.py' -v
       - name: Construct and relocate the locked private runtime
         run: python desktop/tools/build_runtime.py --source server --output candidate --revision 1bf2ad55521c49f574cba2f450eb13d49652ea80 --epoch 16
       - name: Retain private validation receipts

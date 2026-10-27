@@ -25,13 +25,14 @@ class HostSourceArchiveTests(unittest.TestCase):
                 source.mkdir()
                 fixtures = {'package.json': b'{"packageManager":"pnpm@12.11.2"}\n',
                             'pnpm-lock.yaml': b'canonical lock\n', 'LICENSE': b'fixture license\n',
-                            'studio/engine-package-lock.json': b'{}\n'}
+                            'studio/engine-package-lock.json': b'{}\n',
+                            'studio/engine-build.json': b'{"node":"26.11.1"}\n'}
                 for name in ['pnpm-workspace.yaml', '.pnpmfile.cjs', 'mise.lock',
                              'packages/sdk/fixture', 'packages/ui/fixture',
                              'packages/justified-layout-wasm/fixture', 'packages/patches/fixture',
                              'packages/plugin-sdk/fixture', 'packages/plugin-core/fixture',
                              'web/fixture', 'i18n/fixture', 'licenses/fixture',
-                             'studio/engine-build.json', 'server/resources/studio-fonts/fixture',
+                             'server/resources/studio-fonts/fixture',
                              'server/src/utils/studio-fonts.generated.ts',
                              'scripts/frameleaf-studio-contracts.mjs', 'scripts/frameleaf-studio-rights.mjs']:
                     fixtures[name] = b'fixture\n'
