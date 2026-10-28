@@ -352,6 +352,26 @@ async function finishCheckpointAttempt(path, binding) {
   await checkpointSyncDirectory(path);
 }
 
+async function checkpointCapacity(c, root, execute, check) {
+  const identity = await checkpointIdentity(root, true);
+  const raw = await execute([join(c.runtime, c.entryPoints.psql), "-h", "127.0.0.1", "-p", String(c.databasePort),
+    "-U", "frameleaf", "-d", "frameleaf", "-w", "-XAt", "-v", "ON_ERROR_STOP=1", "-c",
+    "SELECT pg_database_size(current_database())::text"], { PGPASSWORD: c.password }, { capture: true, timeout: 30_000 });
+  check();
+  if (typeof raw !== "string" || !/^[1-9][0-9]{0,18}\r?\n?$/.test(raw) || BigInt(raw.trim()) > 9223372036854775807n)
+    fail("host_checkpoint_capacity_unknown");
+  let volume;
+  try { volume = await fs.statfs(root, { bigint: true }); }
+  catch { fail("host_checkpoint_capacity_unknown"); }
+  check();
+  if (typeof volume.bsize !== "bigint" || volume.bsize <= 0n || typeof volume.bavail !== "bigint" || volume.bavail < 0n ||
+    await checkpointIdentity(root, true) !== identity) fail("host_checkpoint_capacity_unknown");
+  // Estimate dump, staging, encrypted backup and readback; preserve 2 GiB for the live database.
+  // shortcut: admission estimate only; enforce reserved growth budgets before full-host capacity qualification.
+  const required = 4n * BigInt(raw.trim()) + 2n * 1024n ** 3n;
+  if (volume.bsize * volume.bavail < required) fail("host_checkpoint_space_insufficient");
+}
+
 /** Called only by the live owner, which serializes requests and owns the database process tree. */
 export async function createHostCheckpoint(c, operationId, execute, cancelled = () => false) {
   validateConfig(c);
@@ -397,6 +417,7 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
     await discardCheckpointAttempt(staging, binding);
     check();
   }
+  await checkpointCapacity(c, root, execute, check);
   // No database bytes enter the random preparation directory before the ownership intent is durable.
   const preparing = await fs.mkdtemp(join(root, "." + operationId + ".preparing-"));
   const files = { directory: await checkpointIdentity(preparing, true) };
@@ -1130,7 +1151,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       const work = request.action === "cleanup-checkpoint"
         ? cleanupHostCheckpoint(c, request.checkpoint)
         : createHostCheckpoint(c, request.operationId,
-          (args, extra) => command(args, extra, false, { quiet: true, timeout: 7_200_000 }),
+          (args, extra, options = {}) => command(args, extra, false, { quiet: true, timeout: 7_200_000, ...options }),
           () => cancelled || (app && (app.exitCode !== null || app.signalCode !== null)) || pg.exitCode !== null || pg.signalCode !== null);
       checkpointWork = work;
       void work.finally(() => { if (checkpointWork === work) checkpointWork = undefined; }).catch(() => {});

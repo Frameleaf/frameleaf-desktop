@@ -39,6 +39,7 @@ async function fixture(t) {
   const calls = [];
   const bytes = Buffer.from("synthetic custom database dump");
   const execute = async (args, env) => {
+    if (args[0] === join(c.runtime, c.entryPoints.psql)) return "1048576\n";
     calls.push({ args, env });
     if (args[0] === join(c.runtime, c.entryPoints.pgDump)) {
       assert.equal(env.PGPASSWORD, c.password);
@@ -278,6 +279,7 @@ fs.unlink=async path=>{if(phase==='published'&&path===join(target,'checkpoint-at
 syncBuiltinESMExports();
 const {createHostCheckpoint}=await import(${JSON.stringify(agent)});
 await createHostCheckpoint(c,operationId,async args=>{
+ if(args[0]===join(c.runtime,c.entryPoints.psql))return '1048576\\n';
  if(args.includes('--format=custom')) {
   await fs.writeFile(args[args.indexOf('--file')+1],'synthetic custom database dump');
   if(phase==='dump')process.exit(71);
@@ -406,4 +408,86 @@ test('interrupted incomplete-attempt deletion resumes from the matching remainin
   await createHostCheckpoint(f.c, operationId, f.execute);
   assert.deepEqual((await readdir(f.path)).sort(), ['checkpoint.json', 'database.dump']);
   assert.equal(f.calls.length, 2);
+});
+
+test('checkpoint capacity refuses insufficient or unknown headroom before allocating dump files', async t => {
+  const f = await fixture(t);
+  const original = filesystem.statfs;
+  const gib = 1024n ** 3n;
+  let databaseBytes = String(gib);
+  let blocks = 6n * gib / 4096n - 1n;
+  let queries = 0;
+  const execute = async (args, env, options) => {
+    if (args[0] !== join(f.c.runtime, f.c.entryPoints.psql)) return f.execute(args, env);
+    queries++;
+    assert.equal(env.PGPASSWORD, f.c.password);
+    assert.ok(!args.includes(f.c.password));
+    assert.ok(args.includes('SELECT pg_database_size(current_database())::text'));
+    assert.equal(options.capture, true);
+    return databaseBytes + '\n';
+  };
+  filesystem.statfs = async (path, options) => {
+    assert.equal(path, join(f.c.state, 'checkpoints'));
+    assert.equal(options.bigint, true);
+    return { bsize: 4096n, bavail: blocks };
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(createHostCheckpoint(f.c, operationId, execute), /host_checkpoint_space_insufficient/);
+    assert.equal(queries, 1);
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(await readdir(join(f.c.state, 'checkpoints')), []);
+    blocks++;
+    for (const invalid of ['-1', '0', '1.5', '1\n1', '9223372036854775808', '9'.repeat(40)]) {
+      databaseBytes = invalid;
+      await assert.rejects(createHostCheckpoint(f.c, operationId, execute), /host_checkpoint_capacity_unknown/);
+    }
+    databaseBytes = String(gib);
+    filesystem.statfs = async () => { throw Error('synthetic filesystem unavailable'); };
+    syncBuiltinESMExports();
+    await assert.rejects(createHostCheckpoint(f.c, operationId, execute), /host_checkpoint_capacity_unknown/);
+    assert.equal(f.calls.length, 0);
+  } finally { filesystem.statfs = original; syncBuiltinESMExports(); }
+});
+
+test('checkpoint capacity admits exact estimated headroom and never blocks verified receipt reuse', async t => {
+  const f = await fixture(t);
+  const original = filesystem.statfs;
+  let queries = 0;
+  const execute = async (args, env, options) => {
+    if (args[0] !== join(f.c.runtime, f.c.entryPoints.psql)) return f.execute(args, env);
+    queries++;
+    assert.equal(options.capture, true);
+    return String(1024n ** 3n) + '\n';
+  };
+  filesystem.statfs = async () => ({ bsize: 4096n, bavail: 6n * (1024n ** 3n) / 4096n });
+  syncBuiltinESMExports();
+  try {
+    const receipt = await createHostCheckpoint(f.c, operationId, execute);
+    assert.equal(queries, 1);
+    filesystem.statfs = async () => { throw Error('verified retries need no new space'); };
+    syncBuiltinESMExports();
+    assert.deepEqual(await createHostCheckpoint(f.c, operationId, execute), receipt);
+    assert.equal(queries, 1);
+    assert.equal(f.calls.length, 2);
+  } finally { filesystem.statfs = original; syncBuiltinESMExports(); }
+});
+
+test('cancellation after database sizing stops before filesystem inspection or dump allocation', async t => {
+  const f = await fixture(t);
+  const original = filesystem.statfs;
+  let cancelled = false;
+  let inspected = false;
+  filesystem.statfs = async () => { inspected = true; throw Error('cancelled capacity must not inspect'); };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(createHostCheckpoint(f.c, operationId, async args => {
+      assert.equal(args[0], join(f.c.runtime, f.c.entryPoints.psql));
+      cancelled = true;
+      return '1048576\n';
+    }, () => cancelled), /host_checkpoint_cancelled/);
+    assert.equal(inspected, false);
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(await readdir(join(f.c.state, 'checkpoints')), []);
+  } finally { filesystem.statfs = original; syncBuiltinESMExports(); }
 });

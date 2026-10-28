@@ -71,7 +71,8 @@ test('database-only hosting checkpoints and cleans up without opening the API or
       })().finally(stop);
     });
     await work;
-    assert.deepEqual(calls.map(c => c.name), ['postgres','pgIsready','psql','pgDump','pgRestore','pgCtl']);
+    assert.deepEqual(calls.map(c => c.name), ['postgres','pgIsready','psql','psql','pgDump','pgRestore','pgCtl']);
+    assert.equal(calls[3].args.at(-1), 'SELECT pg_database_size(current_database())::text');
     assert.ok(calls[0].args.includes('default_transaction_read_only=on'));
     assert.equal(calls.find(c => c.name==='pgDump').options.env.PGPASSWORD,c.password);
     assert.ok(!JSON.stringify(calls.map(c=>c.args)).includes(c.password));

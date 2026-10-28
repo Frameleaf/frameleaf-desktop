@@ -100,6 +100,7 @@ export function managerError(error: unknown): string {
     native_shutdown_unconfirmed: 'Database shutdown was not confirmed, so this operation stays locked. Check its state, then resume to verify shutdown.',
     native_backup_journal_invalid: 'Backup recovery records could not be verified. Keep the existing operation and review it in Manager.',
     native_backup_verification_failed: 'The backup could not be verified. The operation stays locked; review it before resuming.',
+    native_checkpoint_failed: 'The database checkpoint could not finish. Check free space on the server, then review the backup in Manager before retrying.',
     native_checkpoint_unavailable: 'The database checkpoint is unavailable. Check the native runtime and operation state in Manager.',
     native_library_identity_invalid: 'The library recovery identity could not be verified. Review the installed profile in Manager.',
     native_backup_engine_changed: 'The installed backup engine could not be verified. Repair the signed runtime before retrying.',

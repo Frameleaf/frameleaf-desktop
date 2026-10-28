@@ -76,3 +76,8 @@ test('restore intent requires a fresh compatible review and preserves one execut
  assert.equal(parseBackupRestoreIntent(JSON.stringify(intent),{...owner,deviceId:crypto.randomUUID()}),null);
  assert.notEqual(backupRestoreKey(owner),intentKey(owner));
 });
+
+test('checkpoint failure offers disk-space recovery guidance without claiming the cause is known', () => {
+ assert.match(managerError('native_checkpoint_failed'), /free space/i);
+ assert.match(managerError('native_checkpoint_failed'), /review.*Manager/i);
+});
