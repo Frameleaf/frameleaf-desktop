@@ -12,20 +12,22 @@ import { tmpdir } from 'node:os';
 import { join, basename, toNamespacedPath } from 'node:path';
 import { claimState, runHost, validateConfig, canonicalHostPathMatches } from '../runtime/host-agent.mjs';
 
-async function fixture(t, body) {
+async function fixture(t, body, { server = false } = {}) {
   const state = await realpath(await mkdtemp(join(tmpdir(), 'Frameleaf Desktop Host ü database-')));
   t.after(() => rm(state, { recursive: true, force: true }));
   const occupied = createServer();
   await new Promise(resolve => occupied.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => occupied.close(resolve)));
+  t.after(() => occupied.listening ? new Promise(resolve => occupied.close(resolve)) : undefined);
+  const apiPort = occupied.address().port;
   const probe = createServer();
   await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   const databasePort = probe.address().port;
   await new Promise(resolve => probe.close(resolve));
+  if (server) await new Promise(resolve => occupied.close(resolve));
   const suffix = process.platform === 'win32' ? '.exe' : '';
-  const c = { mode: 'database', state, runtime: join(state, 'runtime'), manifestSha256: 'a'.repeat(64),
+  const c = { mode: server ? 'server' : 'database', state, runtime: join(state, 'runtime'), manifestSha256: 'a'.repeat(64),
     sourceRevision: 'b'.repeat(40), postgresMajor: '19', password: 'synthetic private database password',
-    databasePort, apiPort: occupied.address().port,
+    databasePort, apiPort,
     entryPoints: Object.fromEntries(['node','server','postgres','initdb','createdb','psql','pgIsready','pgCtl','pgDump','pgRestore',
       'hdr','studioBrowserGuard','studio'].map(name => [name, 'bin/'+name+suffix])) };
   Object.assign(c.entryPoints, { ffmpeg: 'media/ffmpeg'+suffix, ffprobe: 'media/ffprobe'+suffix,
@@ -38,12 +40,17 @@ async function fixture(t, body) {
   subprocess.default.spawn = (file, args, options) => {
     const name = basename(file).replace(/\.exe$/, '');
     calls.push({ name, args, options });
-    assert.ok(['postgres','psql','pgIsready','pgCtl','pgDump','pgRestore'].includes(name), 'unexpected process: '+name);
+    assert.ok(['postgres','psql','pgIsready','pgCtl','pgDump','pgRestore', ...(server ? ['node'] : [])].includes(name), 'unexpected process: '+name);
     const child = new EventEmitter();
     Object.assign(child, { pid: 4242 + calls.length, exitCode: null, signalCode: null, stdout: new PassThrough(), stderr: new PassThrough() });
-    const exit = () => { if (child.exitCode !== null) return; child.exitCode=0; child.stdout.end(); child.stderr.end(); child.emit('exit',0,null); child.emit('close',0,null); };
-    child.kill = exit;
+    const exit = (code = 0) => { if (child.exitCode !== null) return; child.exitCode=code; child.stdout.end(); child.stderr.end(); child.emit('exit',code,null); child.emit('close',code,null); };
+    child.kill = () => exit();
     if (name === 'postgres') { pg=child; writeFileSync(join(args[args.indexOf('-D')+1],'postmaster.pid'),String(child.pid)+'\n'); }
+    else if (name === 'node') {
+      child.connected = true;
+      child.send = (_value, callback) => { callback(null); child.connected = false; exit(1); };
+      queueMicrotask(() => child.emit('message', { secret: 'synthetic private ownership message' }));
+    }
     else queueMicrotask(() => {
       if (name === 'psql') child.stdout.write(exists ? '1\n' : '\n');
       if (name === 'pgDump') writeFileSync(args[args.indexOf('--file')+1], 'PGDMP synthetic offline dump');
@@ -56,6 +63,21 @@ async function fixture(t, body) {
   try { await body({ c, calls, missing: () => { exists=false; } }); }
   finally { subprocess.default.spawn=original; syncBuiltinESMExports(); pg?.kill(); }
 }
+
+test('failed server drain retains a bounded diagnostic of the earlier ownership failure', async t => {
+  const diagnostics = [];
+  t.mock.method(process.stderr, 'write', chunk => { diagnostics.push(String(chunk)); return true; });
+  await fixture(t, async ({ c, calls }) => {
+    await assert.rejects(runHost(c, new Promise(() => {}), () => assert.fail('invalid owner must not become ready')),
+      /host_server_drain_failed/);
+    assert.deepEqual(diagnostics.map(value => JSON.parse(value)), [
+      { state: 'host-operation-failed', code: 'host_server_protocol_invalid' },
+    ]);
+    assert.equal(calls.at(-1).name, 'pgCtl');
+    for (const value of [c.password, c.state, c.runtime, 'synthetic private ownership message'])
+      assert.ok(!diagnostics.join('').includes(value));
+  }, { server: true });
+});
 
 test('database-only hosting checkpoints and cleans up without opening the API or starting application services', async t => {
   await fixture(t, async ({ c, calls }) => {

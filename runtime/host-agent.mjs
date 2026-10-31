@@ -853,7 +853,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       constants.O_NOFOLLOW,
     0o600,
   );
-  let pg, app, appOwner, studio, checkpointWork;
+  let pg, app, appOwner, studio, checkpointWork, operationFailure;
   const children = new Set();
   let cancelled = false;
   stopping.then(() => {
@@ -1163,6 +1163,10 @@ export async function runHost(c, stopping, ready, restoreSession) {
       appOwner?.check();
       studio?.check();
     }
+  } catch (error) {
+    operationFailure = /^host_[a-z_]{1,64}$/.test(error?.message)
+      ? error.message : "native_host_failed";
+    throw error;
   } finally {
     cancelled = true;
     await checkpointWork?.catch(() => {});
@@ -1217,7 +1221,13 @@ export async function runHost(c, stopping, ready, restoreSession) {
     await log.close();
     if ((restoreOnly || validateOnly) && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
       stopError ??= new Error("host_restore_shutdown_unconfirmed");
-    if (stopError) throw stopError;
+    if (stopError) {
+      // Keep the original failure visible when failed cleanup becomes the final error.
+      if (operationFailure) process.stderr.write(JSON.stringify({
+        state: "host-operation-failed", code: operationFailure,
+      }) + "\n");
+      throw stopError;
+    }
   }
 }
 async function main() {
