@@ -63,9 +63,10 @@ jobs:
           RUNTIME_SIGNATURE_HEX: ${{ inputs.runtime_signature_hex }}
         run: |
           from pathlib import Path
-          import json, os, re, stat, subprocess, sys, zipfile
+          import json, os, re, shutil, subprocess, sys
           sys.path.insert(0, str(Path.cwd() / 'tools'))
-          from build_runtime import inventory, relative, sha256
+          from build_runtime import inventory, sha256
+          from prepare_windows_host_qualification import prepare
           signature = os.environ['RUNTIME_SIGNATURE_HEX']
           assert re.fullmatch(r'[a-f0-9]{128}', signature)
           source = '4588eeb3994e7bd2bcb813536f34dd684e74857d'
@@ -73,34 +74,15 @@ jobs:
           assert source in profiles['cpu-ort']['additionalSources']['windows-x86_64']
           output = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-desktop'
           output.mkdir()
-          def api(path):
-              return json.loads(subprocess.check_output(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/' + path]))
-          run = api('actions/runs/40444074862')
-          head = '1bbe1463aa0b57e32f83db40e4c82ff2e9d4ca5c'
-          assert run['head_sha'] == head and run['status'] == 'completed' and run['conclusion'] == 'success'
-          artifact = api('actions/artifacts/12707622091')
-          assert artifact['workflow_run']['id'] == 40444074862 and artifact['workflow_run']['head_sha'] == head
-          assert artifact['name'] == 'cpu-runtime-candidate-Windows' and not artifact['expired']
-          assert 0 < artifact['size_in_bytes'] < 4 * 1024**3
-          archive = output / 'runtime.zip'
-          with archive.open('wb') as stream:
-              subprocess.run(['gh', 'api', 'repos/Frameleaf/frameleaf-desktop/actions/artifacts/12707622091/zip'], stdout=stream, check=True)
-          assert sha256(archive) == '660961f0edd1dd60a3221fbe0b46c72b6b4b6f06d9ad3425e300763662bc82b5'
+          # Actions artifacts expire while queued; this signed input is retained in the private draft.
+          retained = output / 'host-input'
+          prepared = prepare(retained, '680496531',
+              'c5830dd2fb64b943c420f01d4d09f72bd7e9f8ea6a9fb913558cc43ec79fa081')
           candidate = output / 'runtime'
-          candidate.mkdir()
-          with zipfile.ZipFile(archive) as bundle:
-              entries = bundle.infolist()
-              assert 0 < len(entries) <= 100000 and sum(item.file_size for item in entries) < 12 * 1024**3
-              names = set()
-              for item in entries:
-                  name = relative(item.filename.rstrip('/'))
-                  assert name.lower() not in names and not item.flag_bits & 1
-                  names.add(name.lower())
-                  assert stat.S_IFMT(item.external_attr >> 16) in {0, stat.S_IFDIR if item.is_dir() else stat.S_IFREG}
-                  assert item.file_size < 4 * 1024**3
-              bundle.extractall(candidate)
+          shutil.move(str(Path(prepared['candidate']) / 'payload/ml'), candidate)
+          shutil.rmtree(retained)
           assert sha256(candidate / 'manifest.json') == '44c945e9053dcba02c04d32b1e3c4e5580f9410a3c07f28618ec1ed4f0468e6c'
-          (candidate / 'manifest.sig').write_bytes(bytes.fromhex(signature))
+          assert (candidate / 'manifest.sig').read_bytes() == bytes.fromhex(signature)
           verifier = Path('tools/sign_runtime.mjs').resolve().as_uri()
           code = 'import(' + json.dumps(verifier) + ').then(async m=>console.log(JSON.stringify(await m.verifySignedCandidate(process.argv[1]))))'
           checked = json.loads(subprocess.check_output(['node', '--input-type=module', '--eval', code, str(candidate)], text=True))
