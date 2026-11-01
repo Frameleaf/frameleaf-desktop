@@ -20,6 +20,7 @@ mod model_cache;
 pub mod model_catalogue;
 pub mod native_predictor;
 pub mod native_runtime;
+mod package_lease;
 pub mod photo_sources;
 mod process_tree;
 pub mod release_policy;

@@ -5,14 +5,15 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 use uuid::Uuid;
 
-struct Fixture(PathBuf, Value);
+struct Fixture(PathBuf, Value, PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir()
+        let candidate = std::env::temp_dir()
             .canonicalize()
             .unwrap()
             .join(format!("frameleaf-host-{}", Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
+        let root = candidate.join("payload");
+        fs::create_dir_all(&root).unwrap();
         let paths = BTreeMap::from([
             ("node", "node"),
             ("server", "server/main.js"),
@@ -81,12 +82,12 @@ impl Fixture {
                 json!({"bytes":7,"sha256":format!("{:x}",Sha256::digest(b"fixture"))}),
             );
         }
-        let spec = json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,
+        let spec = json!({"schemaVersion":1,"protocolVersion":2,"epoch":1,
             "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
             "sourceRevision":"a".repeat(40),"nodeVersion":"26.11.1",
             "postgresVersion":"19beta4","vectorVersion":"0.8.7","certified":false,
             "entryPoints":paths,"files":files});
-        Self(root, spec)
+        Self(root, spec, candidate)
     }
     fn verify(&self) -> Result<VerifiedHostRuntime, String> {
         let key = SigningKey::from_bytes(&[42; 32]);
@@ -102,7 +103,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.2);
     }
 }
 
@@ -113,7 +114,7 @@ fn host_start_refuses_a_linked_database_before_launching_any_process() {
     let fixture = Fixture::new();
     let state = fixture.0.with_extension("state");
     fs::create_dir(&state).unwrap();
-    let _cleanup = Fixture(state.clone(), json!(null));
+    let _cleanup = Fixture(state.clone(), json!(null), state.clone());
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     std::os::unix::fs::symlink(&fixture.0, state.join("database")).unwrap();
@@ -129,6 +130,24 @@ fn host_start_refuses_a_linked_database_before_launching_any_process() {
 }
 
 #[test]
+fn host_start_refuses_maintenance_before_creating_private_state() {
+    use zeroize::Zeroizing;
+    let fixture = Fixture::new();
+    let verified = fixture.verify().unwrap();
+    fs::write(fixture.2.join(".package-maintenance"), b"").unwrap();
+    let state = fixture.2.join("state");
+    let result = verified.start(
+        &state,
+        &Zeroizing::new("synthetic-host-password-with-enough-length".into()),
+        54321,
+        54322,
+    );
+    assert!(matches!(result, Err(ref code) if code == "host_package_maintenance"));
+    assert!(!state.exists());
+    assert!(fixture.verify().is_ok());
+}
+
+#[test]
 fn host_runtime_requires_signed_complete_source_pinned_components() {
     let mut fixture = Fixture::new();
     assert!(fixture.verify().is_ok());
@@ -138,7 +157,7 @@ fn host_runtime_requires_signed_complete_source_pinned_components() {
         ("vectorVersion", json!("0.8.6")),
         ("nodeVersion", json!("26.0.0")),
         ("certified", json!(true)),
-        ("protocolVersion", json!(2)),
+        ("protocolVersion", json!(1)),
         ("epoch", json!(0)),
         ("platform", json!("other")),
         ("sourceRevision", json!("main")),
@@ -260,7 +279,7 @@ process.on('message',message=>{if(message==='frameleaf:stop')server.close(()=>pr
         .join(format!("frameleaf-host-state-{}", Uuid::new_v4()));
     fs::create_dir(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-    let cleanup = Fixture(state.clone(), json!(null));
+    let cleanup = Fixture(state.clone(), json!(null), state.clone());
     let verified = fixture.verify().unwrap();
     let password = Zeroizing::new("synthetic-host-password-with-enough-length".to_string());
     for cycle in 0..3 {

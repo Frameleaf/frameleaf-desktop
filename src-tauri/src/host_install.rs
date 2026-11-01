@@ -21,6 +21,7 @@ impl Layout {
             runtime: base.join("Runtimes").join(manifest),
             controller: base
                 .join("Controllers")
+                .join(manifest)
                 .join(controller)
                 .join("frameleaf-native-host"),
             profiles: base.join("Profiles"),
@@ -168,6 +169,24 @@ pub fn finalize(manifest: &str, controller: &str) -> Result<serde_json::Value, S
         Err("host_install_platform_unsupported".into())
     }
 }
+/// Installer-only fencing; no arbitrary destination, credentials, process IDs or command cross this API.
+pub fn prepare_maintenance(manifest: &str, controller: &str) -> Result<serde_json::Value, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        posix::root()?;
+        let layout = Layout::new(manifest, controller)?;
+        posix::verify_resources(&layout, manifest, controller)?;
+        posix::fence(&layout)?;
+        Ok(
+            serde_json::json!({"protocolVersion":1,"state":"maintenance-prepared","serverStarted":false}),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
+    }
+}
 /// Linux installers explicitly select the account; a package-manager process has no console user.
 pub fn provision(manifest: &str, controller: &str, uid: &str) -> Result<serde_json::Value, String> {
     #[cfg(target_os = "linux")]
@@ -262,12 +281,16 @@ mod posix {
             Path::new(BASE),
             &PathBuf::from(BASE).join("Runtimes"),
             &PathBuf::from(BASE).join("Controllers"),
+            &PathBuf::from(BASE).join("Controllers").join(manifest),
             &layout.profiles,
         ] {
             root_directory(path)?;
         }
         // Byte-identical reinstall can provision a missing console-user profile.
         admit_versions(layout, || verify_resources(layout, manifest, controller))?;
+        if layout.runtime.exists() {
+            fence(layout)?;
+        }
         Ok(
             serde_json::json!({"protocolVersion":1,"state":"install-prepared","serverStarted":false}),
         )
@@ -420,7 +443,11 @@ mod posix {
         }
         Ok(())
     }
-    fn verify_resources(layout: &Layout, manifest: &str, controller: &str) -> Result<(), String> {
+    pub(super) fn verify_resources(
+        layout: &Layout,
+        manifest: &str,
+        controller: &str,
+    ) -> Result<(), String> {
         protect(&layout.runtime, &mut BTreeSet::new())?;
         protect(&layout.controller, &mut BTreeSet::new())?;
         let binary = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
@@ -451,6 +478,49 @@ mod posix {
         }
         Ok(())
     }
+    fn profiles_idle(layout: &Layout) -> Result<(), String> {
+        protect(&layout.profiles, &mut BTreeSet::new())?;
+        for (index, entry) in fs::read_dir(&layout.profiles)
+            .map_err(|_| "host_install_profile_changed")?
+            .enumerate()
+        {
+            if index >= 1024 {
+                return Err("host_install_profile_limit".into());
+            }
+            let entry = entry.map_err(|_| "host_install_profile_changed")?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or("host_install_profile_changed")?;
+            let uid: u32 = name.parse().map_err(|_| "host_install_profile_changed")?;
+            if uid == 0 || name != uid.to_string() {
+                return Err("host_install_profile_changed".into());
+            }
+            protect(&entry.path(), &mut BTreeSet::new())?;
+            let state = entry.path().join("state");
+            match fs::symlink_metadata(&state) {
+                Ok(info) => {
+                    if !info.is_dir() || info.uid() != uid || info.mode() & 0o7777 != 0o700 {
+                        return Err("host_install_profile_changed".into());
+                    }
+                    #[cfg(target_os = "macos")]
+                    crate::manager_host::no_acl(&state)?;
+                    crate::host_state::Owner::package_idle(&state)?;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && fs::read_dir(entry.path())
+                            .map_err(|_| "host_install_profile_changed")?
+                            .next()
+                            .is_none() => {}
+                _ => return Err("host_install_profile_changed".into()),
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn fence(layout: &Layout) -> Result<(), String> {
+        let writer = crate::package_lease::Maintenance::acquire(&layout.runtime)?;
+        profiles_idle(layout)?;
+        writer.fence()
+    }
     pub(super) fn finalize(
         layout: &Layout,
         manifest: &str,
@@ -458,6 +528,7 @@ mod posix {
         user: Option<(u32, u32)>,
     ) -> Result<serde_json::Value, String> {
         verify_resources(layout, manifest, controller)?;
+        let writer = crate::package_lease::Maintenance::acquire(&layout.runtime)?;
         root_directory(&layout.profiles)?;
         if let Some((uid, gid)) = user {
             let parent = layout.profiles.join(uid.to_string());
@@ -466,6 +537,15 @@ mod posix {
             private_leaf(&parent.join("manager"), uid, gid)?;
         }
         write_record(layout, manifest, controller)?;
+        if layout
+            .runtime
+            .join(".package-maintenance")
+            .try_exists()
+            .map_err(|_| "host_package_state_unavailable")?
+        {
+            profiles_idle(layout)?;
+        }
+        writer.finish()?;
         Ok(
             serde_json::json!({"protocolVersion":1,"state":"resources-installed","profileReady":user.is_some(),"manifestSha256":manifest,"controllerSha256":controller,"serverStarted":false,"runtimeQualified":false,"redistributable":false}),
         )
@@ -545,6 +625,7 @@ mod tests {
             layout.controller,
             PathBuf::from(base)
                 .join("Controllers")
+                .join("a".repeat(64))
                 .join("b".repeat(64))
                 .join("frameleaf-native-host")
         );
@@ -595,6 +676,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
+        assert!(prepare_maintenance(&"a".repeat(64), &"b".repeat(64)).is_err());
         assert!(prepare(&"a".repeat(64), &"b".repeat(64)).is_err());
         assert!(finalize(&"a".repeat(64), &"b".repeat(64)).is_err());
     }

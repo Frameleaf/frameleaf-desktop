@@ -57,7 +57,7 @@ class MacHostInstallerTests(unittest.TestCase):
             self.assertEqual((runtime / 'payload' / 'node').read_bytes(), b'synthetic node')
             self.assertEqual((runtime / 'payload' / 'node').stat().st_mode & 0o777, 0o755)
             self.assertEqual((candidate / 'payload' / 'node').stat().st_mode & 0o777, 0o700)
-            self.assertEqual((base / 'Controllers' / digest / 'frameleaf-native-host').read_bytes(), helper.read_bytes())
+            self.assertEqual((base / 'Controllers' / ('a' * 64) / digest / 'frameleaf-native-host').read_bytes(), helper.read_bytes())
             self.assertEqual(list((base / 'Profiles').iterdir()), [])
             self.assertEqual((out / 'scripts' / 'frameleaf-native-host').read_bytes(), helper.read_bytes())
             with self.assertRaises(BuildError):

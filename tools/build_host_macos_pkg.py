@@ -26,7 +26,7 @@ def validate_identities(manifest: str, controller: str) -> None:
 
 def installer_scripts(manifest: str, controller: str) -> dict[str, str]:
     validate_identities(manifest, controller)
-    installed = '/' + (BASE / 'Controllers' / controller / 'frameleaf-native-host').as_posix()
+    installed = '/' + (BASE / 'Controllers' / manifest / controller / 'frameleaf-native-host').as_posix()
     header = '#!/bin/sh\nset -eu\n[ "${3:-}" = / ] || exit 64\n'
     env = '/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C '
     return {
@@ -52,7 +52,7 @@ def stage_package(candidate: Path, controller: Path, output: Path, manifest_hash
         if not stat.S_ISREG(regular(candidate / name).st_mode):
             raise BuildError('host_install_manifest_invalid')
         shutil.copy2(candidate / name, runtime / name)
-    helper = base / 'Controllers' / controller_hash / 'frameleaf-native-host'
+    helper = base / 'Controllers' / manifest_hash / controller_hash / 'frameleaf-native-host'
     helper.parent.mkdir(parents=True)
     shutil.copy2(controller, helper)
     if sha256(helper) != controller_hash:

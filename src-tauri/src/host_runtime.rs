@@ -116,7 +116,7 @@ impl VerifiedHostRuntime {
             serde_json::from_str(include_str!("../../runtime/host-database.json"))
                 .map_err(|_| "host_release_contract_invalid")?;
         if manifest.schema_version != 1
-            || manifest.protocol_version != 1
+            || manifest.protocol_version != 2
             || minimum_epoch == 0
             || manifest.epoch < minimum_epoch
             || manifest.platform != std::env::consts::OS
@@ -262,6 +262,7 @@ struct HostStart<'a> {
 struct HostOwner {
     tree: crate::process_tree::ProcessTree,
     terminated: Mutex<bool>,
+    _code_lease: crate::package_lease::CodeLease,
 }
 impl HostOwner {
     fn terminate(&self) {
@@ -342,6 +343,12 @@ impl VerifiedHostRuntime {
         {
             return Err("host_config_invalid".into());
         }
+        if state.starts_with(&self.root) || self.root.starts_with(state) {
+            return Err("host_state_overlaps_runtime".into());
+        }
+        let code_lease = crate::package_lease::CodeLease::acquire(
+            self.root.parent().ok_or("native_manager_layout_invalid")?,
+        )?;
         crate::runtime_store::private_directory(state)?;
         crate::host_storage::check(state)?;
         let database = state.join("database");
@@ -349,9 +356,6 @@ impl VerifiedHostRuntime {
             Ok(_) => crate::host_storage::check(&database)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err("host_storage_unavailable".into()),
-        }
-        if state.starts_with(&self.root) || self.root.starts_with(state) {
-            return Err("host_state_overlaps_runtime".into());
         }
         let lease = private_file(&state.join("lease.lock"), false)?;
         lease.try_lock().map_err(|_| "host_already_owned")?;
@@ -382,6 +386,7 @@ impl VerifiedHostRuntime {
         if let Some(system_root) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", system_root);
         }
+        code_lease.inherit(&mut command);
         crate::process_tree::configure(&mut command);
         let mut child = command.spawn().map_err(|_| "host_agent_start_failed")?;
         let tree = match crate::process_tree::ProcessTree::attach(&child) {
@@ -398,6 +403,7 @@ impl VerifiedHostRuntime {
         let owner = Arc::new(HostOwner {
             tree,
             terminated: Mutex::new(false),
+            _code_lease: code_lease,
         });
         let pid = child.id();
         let monitor_owner = owner.clone();

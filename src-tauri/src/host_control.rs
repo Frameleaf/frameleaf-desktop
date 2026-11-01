@@ -249,8 +249,9 @@ pub fn run() -> Result<(), String> {
         return stopped(&invalid);
     }
     separate_paths(&config.candidate, &config.state)?;
-    let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
     let runtime = verify_candidate(&config.candidate, &config.manifest_sha256)?;
+    let _code_lease = crate::package_lease::CodeLease::acquire(&config.candidate)?;
+    let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
