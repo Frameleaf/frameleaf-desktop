@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
+import * as managerState from '../src/manager-state.ts';
 import { controlIntent, restoreIntent, intentKey, managerError, localProfilePending, profileSetupCopy, type ManagerView } from '../src/manager-state.ts';
 test('profile setup copy distinguishes local preparation from system authorization', () => {
  const local=profileSetupCopy(false), authorized=profileSetupCopy(true);
@@ -15,6 +18,34 @@ test('local profile authorization survives reload and ends only after backend an
  for(const state of [undefined,'idle','profile-ready','needs-attention','manager-ready'])assert.equal(localProfilePending(state,false),false);
 });
 const manager:ManagerView={origin:'https://manager.test:9443',managerId:'11111111-1111-4111-8111-111111111111',deviceId:'22222222-2222-4222-8222-222222222222',installationId:'aaaaaaaaaaaa',expiresAt:1900000000000,scopes:['status','start','stop','restart','backup'],certificateSha256:null};
+test('startup restores durable recovery requests before an unreachable Manager status request', async () => {
+ const owner={...manager,scopes:[...manager.scopes,'restore']};
+ const pending=managerState.controlIntent(owner,'backup',null);
+ const review=managerState.backupReviewIntent(owner,'a'.repeat(64),null);
+ const restore=managerState.createBackupRestoreIntent(owner,{id:review.key,snapshot:review.snapshot,installationId:owner.installationId,expires:Date.now()+900000,state:'prepared',libraryId:owner.installationId,release:'frameleaf-v3.0.0-1',targetRelease:'frameleaf-v3.0.0-1',createdAt:1,mediaIncluded:false,requiresRuntimeChange:false},null);
+ const saved=new Map([
+  [managerState.intentKey(owner),JSON.stringify(pending)],
+  [managerState.backupReviewKey(owner),JSON.stringify(review)],
+  [managerState.backupRestoreKey(owner),JSON.stringify(restore)],
+ ]);
+ const source=readFileSync(new URL('../src/ManagerPanel.svelte',import.meta.url),'utf8');
+ const startup=source.match(/async function restore\(\) \{[\s\S]*?\n  \}\n  onMount/)?.[0].replace(/\n  onMount$/,'');
+ assert.ok(startup);
+ const run=new Function('invoke','localStorage','checkStatus','helpers',`
+  const {restoreIntent,intentKey,restoreBackupReview,backupReviewKey,parseBackupRestoreIntent,backupRestoreKey}=helpers;
+  let manager=null,pending=null,recoveryIntent=null,restorePending=null,origin='',selectedBackup='';
+  ${stripTypeScriptTypes(startup)}
+  return (async()=>{let error;try{await restore();}catch(value){error=value;}
+   return {pending,recoveryIntent,restorePending,selectedBackup,error};})();
+ `);
+ const unreachable=Error('manager_unreachable_or_certificate_invalid');
+ const result=await run(async()=>owner,{getItem:(key:string)=>saved.get(key)??null},async()=>{throw unreachable;},managerState);
+ assert.equal(result.error,unreachable);
+ assert.deepEqual(result.pending,pending);
+ assert.deepEqual(result.recoveryIntent,review);
+ assert.deepEqual(result.restorePending,restore);
+ assert.equal(result.selectedBackup,review.snapshot);
+});
 test('a retry keeps its durable request key and cannot silently switch action',()=>{
  const initial=controlIntent(manager,'stop',null);
  assert.equal(controlIntent(manager,'stop',initial).key,initial.key);
