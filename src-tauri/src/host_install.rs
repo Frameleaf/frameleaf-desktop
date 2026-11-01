@@ -219,6 +219,80 @@ pub fn prepare_repair(manifest: &str, controller: &str) -> Result<serde_json::Va
         Err("host_install_platform_unsupported".into())
     }
 }
+/// Debian's trusted bootstrap prepares replacement even if the versioned controller is missing.
+pub fn prepare_linux_package(
+    manifest: &str,
+    controller: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        posix::root()?;
+        posix::prepare_linux_package(&Layout::new(manifest, controller)?, manifest, controller)?;
+        Ok(
+            serde_json::json!({"protocolVersion":1,"state":"package-prepared","serverStarted":false,"runtimeQualified":false}),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
+    }
+}
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn package_bootstrap(
+    path: &std::path::Path,
+    digest: &str,
+    protect: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    protect(path)?;
+    let info = std::fs::symlink_metadata(path).map_err(|_| "host_install_controller_changed")?;
+    if !info.is_file() || info.nlink() != 1 || info.mode() & 0o022 != 0 || info.mode() & 0o111 == 0
+    {
+        return Err("host_install_controller_changed".into());
+    }
+    let binary = crate::runtime_store::read_bounded(path, 256 * 1024 * 1024)?;
+    if binary.is_empty() || format!("{:x}", Sha256::digest(binary)) != digest {
+        return Err("host_install_controller_changed".into());
+    }
+    Ok(())
+}
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn package_tree(
+    layout: &Layout,
+    manifest: &str,
+    controller: &str,
+    mut protect: impl FnMut(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::{fs, io::ErrorKind};
+    repair_tree(&layout.runtime, 100_000, &mut protect)?;
+    let directory = layout
+        .controller
+        .parent()
+        .ok_or("host_install_path_invalid")?;
+    match fs::symlink_metadata(directory) {
+        Ok(info) if info.is_dir() => {
+            repair_tree(directory, 100_000, &mut protect)?;
+            match fs::symlink_metadata(&layout.controller) {
+                Ok(info) if info.is_file() => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                _ => return Err("host_install_repair_path_invalid".into()),
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        _ => return Err("host_install_repair_path_invalid".into()),
+    }
+    let path = layout.runtime.join("installation.json");
+    if receipt_present(&path)? {
+        // The installed controller may be gone; the protected receipt still must name this identity.
+        let record = Installation::decode(&crate::runtime_store::read_bounded(&path, 4096)?)?;
+        if record.manifest_sha256 != manifest || record.controller_sha256 != controller {
+            return Err("host_install_record_invalid".into());
+        }
+    }
+    Ok(())
+}
 #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 fn repair_guard(
     candidate: &std::path::Path,
@@ -632,6 +706,44 @@ mod posix {
         )?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn prepare_linux_package(
+        layout: &Layout,
+        manifest: &str,
+        controller: &str,
+    ) -> Result<(), String> {
+        let bootstrap = PathBuf::from(BASE)
+            .join("Bootstrap")
+            .join(controller)
+            .join("frameleaf-native-host");
+        let verify = || {
+            package_bootstrap(&bootstrap, controller, |path| {
+                protect(path, &mut BTreeSet::new())
+            })
+        };
+        verify()?;
+        root_directory(&PathBuf::from(BASE).join("Runtimes"))?;
+        root_directory(&layout.runtime)?;
+        let _guard = repair_guard(
+            &layout.runtime,
+            || {
+                verify()?;
+                for path in [
+                    PathBuf::from(BASE).join("Controllers"),
+                    PathBuf::from(BASE).join("Controllers").join(manifest),
+                    layout.profiles.clone(),
+                ] {
+                    root_directory(&path)?;
+                }
+                let mut checked = BTreeSet::new();
+                package_tree(layout, manifest, controller, |path| {
+                    protect(path, &mut checked)
+                })
+            },
+            || profiles_idle(layout),
+        )?;
+        Ok(())
+    }
     pub(super) fn finalize(
         layout: &Layout,
         manifest: &str,
@@ -735,6 +847,78 @@ mod tests {
         assert!(f.0.join(".package-maintenance").is_file());
         drop(repair_guard(&f.0, || Ok(()), || Ok(())).unwrap());
         assert!(f.0.join(".package-maintenance").is_file());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn package_recovery_accepts_missing_or_damaged_controller_only_with_exact_receipt() {
+        use std::os::unix::fs::symlink;
+        let f = RepairFixture::new();
+        let layout = Layout {
+            runtime: f.0.join("runtime"),
+            controller: f.0.join("controller/frameleaf-native-host"),
+            profiles: f.0.join("profiles"),
+        };
+        std::fs::create_dir(&layout.runtime).unwrap();
+        let m = "a".repeat(64);
+        let h = "b".repeat(64);
+        let receipt = serde_json::to_vec(
+            &serde_json::json!({"schemaVersion":1,"manifestSha256":m,"controllerSha256":h}),
+        )
+        .unwrap();
+        std::fs::write(layout.runtime.join("installation.json"), &receipt).unwrap();
+        package_tree(&layout, &m, &h, |_| Ok(())).unwrap();
+        std::fs::create_dir(layout.controller.parent().unwrap()).unwrap();
+        std::fs::write(&layout.controller, b"corrupt bytes must not execute").unwrap();
+        let guard = repair_guard(
+            &layout.runtime,
+            || package_tree(&layout, &m, &h, |_| Ok(())),
+            || Ok(()),
+        )
+        .unwrap();
+        drop(guard);
+        assert!(layout.runtime.join(".package-maintenance").exists());
+        assert!(crate::package_lease::CodeLease::acquire(&layout.runtime).is_err());
+        assert!(package_tree(&layout, &m, &"c".repeat(64), |_| Ok(())).is_err());
+        assert!(package_tree(&layout, &"c".repeat(64), &h, |_| Ok(())).is_err());
+        std::fs::write(layout.runtime.join("installation.json"), b"broken receipt").unwrap();
+        assert!(package_tree(&layout, &m, &h, |_| Ok(())).is_err());
+        std::fs::write(layout.runtime.join("installation.json"), receipt).unwrap();
+        std::fs::remove_file(&layout.controller).unwrap();
+        std::fs::create_dir(&layout.controller).unwrap();
+        assert!(package_tree(&layout, &m, &h, |_| Ok(())).is_err());
+        std::fs::remove_dir(&layout.controller).unwrap();
+        symlink(layout.runtime.join("installation.json"), &layout.controller).unwrap();
+        assert!(package_tree(&layout, &m, &h, |_| Ok(())).is_err());
+        std::fs::remove_file(&layout.controller).unwrap();
+        std::fs::remove_file(layout.runtime.join("installation.json")).unwrap();
+        package_tree(&layout, &m, &h, |_| Ok(())).unwrap();
+        assert!(layout.runtime.join(".package-maintenance").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn package_bootstrap_requires_immutable_regular_matching_executable() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let f = RepairFixture::new();
+        let binary = f.0.join("bootstrap");
+        std::fs::write(&binary, b"verified bootstrap").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"verified bootstrap"));
+        package_bootstrap(&binary, &digest, |_| Ok(())).unwrap();
+        assert!(package_bootstrap(&binary, &digest, |_| Err("unprotected".into())).is_err());
+        std::fs::write(&binary, b"tampered").unwrap();
+        assert!(package_bootstrap(&binary, &digest, |_| Ok(())).is_err());
+        std::fs::write(&binary, b"verified bootstrap").unwrap();
+        std::fs::hard_link(&binary, f.0.join("alias")).unwrap();
+        assert!(package_bootstrap(&binary, &digest, |_| Ok(())).is_err());
+        std::fs::remove_file(f.0.join("alias")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(package_bootstrap(&binary, &digest, |_| Ok(())).is_err());
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(package_bootstrap(&binary, &digest, |_| Ok(())).is_err());
+        std::fs::remove_file(&binary).unwrap();
+        symlink(f.0.join("missing"), &binary).unwrap();
+        assert!(package_bootstrap(&binary, &digest, |_| Ok(())).is_err());
     }
     #[cfg(unix)]
     #[test]

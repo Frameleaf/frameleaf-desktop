@@ -100,7 +100,7 @@ class LinuxHostDebTests(unittest.TestCase):
             marker, fail = root / 'called', root / 'fail'
             runtime = root / 'opt/frameleaf/Runtimes' / ('a' * 64)
             helper = root / 'helper'
-            helper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(marker)) + '\n[ ! -e ' + shlex.quote(str(fail)) + ' ] || exit 73\nif [ "$1" = --prepare-repair ]; then : > ' + shlex.quote(str(runtime / '.package-maintenance')) + '; fi\n')
+            helper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(marker)) + '\n[ ! -e ' + shlex.quote(str(fail)) + ' ] || exit 73\nif [ "$1" = --prepare-linux-package ] && [ -d ' + shlex.quote(str(runtime)) + ' ]; then : > ' + shlex.quote(str(runtime / '.package-maintenance')) + '; fi\n')
             helper.chmod(0o755)
             digest = hashlib.sha256(helper.read_bytes()).hexdigest()
             # Simulate root metadata only within temporary fixtures; never elevate or install.
@@ -127,10 +127,10 @@ class LinuxHostDebTests(unittest.TestCase):
             shutil.copy2(helper, installed)
             self.assertEqual(run('bootstrap', 'postinst', 'configure'), 0)
             self.assertEqual(run('runtime', 'preinst', 'install'), 0)
-            self.assertTrue(marker.read_text().startswith('--prepare-install '))
+            self.assertTrue(marker.read_text().startswith('--prepare-linux-package '))
             runtime.mkdir(parents=True)
             self.assertEqual(run('runtime', 'preinst', 'upgrade'), 0)
-            self.assertTrue(marker.read_text().splitlines()[-1].startswith('--prepare-repair '))
+            self.assertTrue(marker.read_text().splitlines()[-1].startswith('--prepare-linux-package '))
             fail.touch()
             self.assertEqual(run('runtime', 'prerm', 'upgrade'), 73)
             before = marker.read_bytes()

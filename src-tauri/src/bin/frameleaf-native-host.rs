@@ -7,7 +7,8 @@ fn main() {
             if mode == "--prepare-install"
                 || mode == "--finalize-install"
                 || mode == "--prepare-maintenance"
-                || mode == "--prepare-repair" =>
+                || mode == "--prepare-repair"
+                || mode == "--prepare-linux-package" =>
         {
             match (manifest.to_str(), controller.to_str()) {
                 (Some(manifest), Some(controller)) => {
@@ -17,6 +18,8 @@ fn main() {
                         frameleaf_desktop::host_install::prepare_maintenance(manifest, controller)
                     } else if mode == "--prepare-repair" {
                         frameleaf_desktop::host_install::prepare_repair(manifest, controller)
+                    } else if mode == "--prepare-linux-package" {
+                        frameleaf_desktop::host_install::prepare_linux_package(manifest, controller)
                     } else {
                         frameleaf_desktop::host_install::finalize(manifest, controller)
                     };
