@@ -157,6 +157,24 @@ class WindowsDatabaseTests(unittest.TestCase):
                 stage_dependencies(prefix, dependencies, "dumpbin", {})
             self.assertFalse((prefix / "bin/linked.dll").exists())
 
+    def test_private_dll_imports_require_a_copy_in_the_runtime_loader_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix, dependencies = root / "pg", root / "dependencies"
+            (prefix / "bin").mkdir(parents=True)
+            (prefix / "lib").mkdir()
+            (prefix / "bin/postgres.exe").write_bytes(b"synthetic PE")
+            (prefix / "lib/private.dll").write_bytes(b"synthetic dependency")
+            with patch("build_host_database_windows.run", return_value="  private.dll\n  KERNEL32.dll"):
+                with self.assertRaisesRegex(BuildError, "host_database_dll_missing:private.dll"):
+                    stage_dependencies(prefix, dependencies, "dumpbin", {"PATH": str(prefix / "lib")})
+                # Identical copies elsewhere must not hide the usable copy in bin.
+                (prefix / "bin/PRIVATE.dll").write_bytes(b"synthetic dependency")
+                stage_dependencies(prefix, dependencies, "dumpbin", {})
+                (prefix / "lib/private.dll").write_bytes(b"different dependency")
+                with self.assertRaisesRegex(BuildError, "host_database_dll_collision"):
+                    stage_dependencies(prefix, dependencies, "dumpbin", {})
+
     def test_qualification_drains_owned_state_and_erases_the_password_on_failure(self):
         lock = {"postgresVersion": "19beta4", "pgvectorVersion": "0.8.7"}
         expected = {
