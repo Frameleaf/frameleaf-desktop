@@ -110,6 +110,38 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
+    let mut fixture = Fixture::new();
+    let verified = fixture.verify().unwrap();
+    let engine = verified.backup_engine().unwrap();
+    assert_eq!(engine.executable, fixture.0.join("backup/restic"));
+    assert_eq!(engine.sha256, format!("{:x}", Sha256::digest(b"fixture")));
+    assert_eq!(
+        serde_json::to_value(&engine).unwrap(),
+        json!({"executable":fixture.0.join("backup/restic"),"sha256":engine.sha256})
+    );
+    fs::write(&engine.executable, b"changed").unwrap();
+    assert_eq!(verified.backup_engine().unwrap().sha256, engine.sha256);
+    assert_eq!(
+        fixture.verify().err().as_deref(),
+        Some("runtime_artifact_changed")
+    );
+    fs::write(&engine.executable, b"fixture").unwrap();
+    fs::write(fixture.0.join("backup/alternate"), b"fixture").unwrap();
+    fixture.1["entryPoints"]["backupEngine"] = json!("backup/alternate");
+    fixture.1["files"]["backup/alternate"] = fixture.1["files"]["backup/restic"].clone();
+    assert_eq!(
+        fixture
+            .verify()
+            .unwrap()
+            .backup_engine()
+            .unwrap()
+            .executable,
+        fixture.0.join("backup/alternate")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn owned_checkpoint_transport_matches_receipts_and_cancels_without_a_second_channel_slot() {

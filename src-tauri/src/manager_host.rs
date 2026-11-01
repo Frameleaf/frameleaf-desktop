@@ -318,6 +318,7 @@ impl Programs<'_> {
             protocol_version: u32,
             installation: Binding<'a>,
             controller_sha256: &'a str,
+            backup_engine: crate::host_runtime::BackupEngine,
             name: &'a str,
             release: &'a str,
             password: &'a str,
@@ -338,6 +339,7 @@ impl Programs<'_> {
                 api_port: config.api_port,
             },
             controller_sha256: &controller_hash,
+            backup_engine: self.runtime.backup_engine()?,
             name: &config.name,
             release: &config.release,
             password,
@@ -805,15 +807,19 @@ mod tests {
         fs::create_dir(&output).unwrap();
         let data = output.join("data");
         crate::runtime_store::private_directory(&data).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:9443").unwrap();
-        drop(port);
-        let origin = "https://127.0.0.1:9443";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!(
+            "https://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        let origin = origin.as_str();
         let tls =
             TlsIdentity::load_or_create("aaaaaaaaaaaa", origin, || Ok(None), |_| Ok(())).unwrap();
         let controller = fs::canonicalize("/bin/echo").unwrap();
         let mut input=Zeroizing::new(serde_json::to_vec(&serde_json::json!({
           "protocolVersion":2,"installation":{"runtime":"native","id":"aaaaaaaaaaaa","controller":controller,"candidate":output.join("runtime"),"state":output.join("state"),"manifestSha256":"b".repeat(64),"sourceRevision":"c".repeat(40),"certified":false,"databasePort":54329,"apiPort":2283},
-          "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"name":"Synthetic owner fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":tls.wire()
+          "controllerSha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap())),"backupEngine":{"executable":controller,"sha256":format!("{:x}",Sha256::digest(fs::read(&controller).unwrap()))},"name":"Synthetic owner fixture","release":"frameleaf-v3.0.0-1","password":"synthetic native database password","tls":tls.wire()
         })).unwrap());
         input.push(b'\n');
         let client = reqwest::Client::builder()
