@@ -37,9 +37,10 @@ struct EntryPoints {
     ml_manifest: String,
     manager: String,
     manager_web_index: String,
+    backup_engine: String,
 }
 impl EntryPoints {
-    fn paths(&self) -> [&str; 26] {
+    fn paths(&self) -> [&str; 27] {
         [
             &self.node,
             &self.server,
@@ -67,6 +68,7 @@ impl EntryPoints {
             &self.ml_manifest,
             &self.manager,
             &self.manager_web_index,
+            &self.backup_engine,
         ]
     }
 }
@@ -132,6 +134,8 @@ impl VerifiedHostRuntime {
             return Err("host_manifest_incompatible".into());
         }
         for name in manifest.entry_points.paths().into_iter().chain([
+            "backup/LICENSE",
+            "backup/component.json",
             "studio/engine-build.json",
             "studio/guard/studio-browser-guard.mjs",
             "studio/tools/bundled-worker-fonts.mjs",

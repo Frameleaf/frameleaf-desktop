@@ -41,9 +41,12 @@ impl Fixture {
             ("mlManifest", "ml/manifest.json"),
             ("manager", "manager/app/build/main.js"),
             ("managerWebIndex", "manager/app/ui/dist/index.html"),
+            ("backupEngine", "backup/restic"),
         ]);
         let mut files = serde_json::Map::new();
         for name in paths.values().copied().chain([
+            "backup/LICENSE",
+            "backup/component.json",
             "studio/engine-build.json",
             "studio/guard/studio-browser-guard.mjs",
             "studio/tools/bundled-worker-fonts.mjs",
@@ -694,8 +697,8 @@ fn factory_host_nested_ml_installs_qualifies_and_predicts() {
 }
 
 #[test]
-fn manager_backend_and_recovery_ui_are_mandatory_signed_host_roles() {
-    for role in ["manager", "managerWebIndex"] {
+fn manager_backend_recovery_ui_and_backup_engine_are_mandatory_signed_host_roles() {
+    for role in ["manager", "managerWebIndex", "backupEngine"] {
         let mut fixture = Fixture::new();
         fixture.verify().unwrap();
         fixture.1["entryPoints"]
