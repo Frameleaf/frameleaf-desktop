@@ -207,14 +207,206 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
 const AGENT: &str = include_str!("../../runtime/host-agent.mjs");
+
+pub(crate) fn checkpoint_operation_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| {
+        id.to_string() == value
+            && (1..=8).contains(&id.get_version_num())
+            && id.get_variant() == uuid::Variant::RFC4122
+    })
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct CheckpointDump {
+    bytes: u64,
+    sha256: String,
+}
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+enum AgentEvent {
+    #[serde(rename_all = "camelCase")]
+    Checkpoint {
+        schema_version: u32,
+        operation_id: String,
+        manifest_sha256: String,
+        source_revision: String,
+        postgres_major: String,
+        database_format: String,
+        dump: CheckpointDump,
+    },
+    #[serde(rename_all = "camelCase")]
+    CheckpointFailed {
+        operation_id: String,
+        code: String,
+    },
+    Stopped,
+}
+struct CheckpointProtocol {
+    pending: Mutex<Option<(String, bool)>>,
+    failed: AtomicBool,
+    stopping: AtomicBool,
+    manifest_sha256: String,
+    source_revision: String,
+}
+impl CheckpointProtocol {
+    fn new(manifest_sha256: String, source_revision: String) -> Self {
+        Self {
+            pending: Mutex::new(None),
+            failed: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            manifest_sha256,
+            source_revision,
+        }
+    }
+    fn begin(&self, operation: &str) -> Result<(), String> {
+        if !checkpoint_operation_id(operation) {
+            return Err("host_checkpoint_request_invalid".into());
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "host_checkpoint_protocol_invalid")?;
+        if pending.is_some() {
+            return Err("host_checkpoint_busy".into());
+        }
+        *pending = Some((operation.to_owned(), false));
+        Ok(())
+    }
+    fn finish(&self, event: &AgentEvent) -> Result<(), String> {
+        let operation = match event {
+            AgentEvent::Checkpoint { operation_id, .. }
+            | AgentEvent::CheckpointFailed { operation_id, .. } => operation_id,
+            AgentEvent::Stopped => return Err("host_checkpoint_protocol_invalid".into()),
+        };
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "host_checkpoint_protocol_invalid")?;
+        if !pending
+            .as_ref()
+            .is_some_and(|(expected, accepted)| expected == operation && *accepted)
+        {
+            return Err("host_checkpoint_protocol_invalid".into());
+        }
+        pending.take();
+        Ok(())
+    }
+    fn parse(&self, raw: &[u8]) -> Result<AgentEvent, String> {
+        let invalid = || "host_checkpoint_protocol_invalid".to_owned();
+        if raw.len() > 8192 || !raw.ends_with(b"\n") || raw[..raw.len() - 1].contains(&b'\n') {
+            return Err(invalid());
+        }
+        let event: AgentEvent = serde_json::from_slice(raw).map_err(|_| invalid())?;
+        let operation = match &event {
+            AgentEvent::Checkpoint {
+                schema_version,
+                operation_id,
+                manifest_sha256,
+                source_revision,
+                postgres_major,
+                database_format,
+                dump,
+            } => {
+                if *schema_version != 1
+                    || manifest_sha256 != &self.manifest_sha256
+                    || source_revision != &self.source_revision
+                    || postgres_major != "19"
+                    || database_format != "frameleaf-canonical"
+                    || dump.bytes == 0
+                    || dump.bytes > 9_007_199_254_740_991
+                    || !digest_valid(&dump.sha256, 64)
+                {
+                    return Err(invalid());
+                }
+                operation_id
+            }
+            AgentEvent::CheckpointFailed { operation_id, code } => {
+                if code != "host_checkpoint_failed" {
+                    return Err(invalid());
+                }
+                operation_id
+            }
+            AgentEvent::Stopped => {
+                return if self.stopping.load(Ordering::Acquire) {
+                    Ok(event)
+                } else {
+                    Err(invalid())
+                }
+            }
+        };
+        let mut pending = self.pending.lock().map_err(|_| invalid())?;
+        match pending.as_mut() {
+            Some((expected, accepted)) if expected == operation && !*accepted => {
+                *accepted = true;
+            }
+            _ => return Err(invalid()),
+        }
+        drop(pending);
+        Ok(event)
+    }
+}
+fn agent_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, String> {
+    let mut raw = Vec::new();
+    let count = Read::by_ref(reader)
+        .take(8193)
+        .read_until(b'\n', &mut raw)
+        .map_err(|_| "host_agent_pipe_failed")?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if count > 8192 || !raw.ends_with(b"\n") {
+        return Err("host_checkpoint_protocol_invalid".into());
+    }
+    Ok(Some(raw))
+}
+fn read_agent_output(
+    mut reader: impl BufRead,
+    ready: mpsc::Sender<Result<(), String>>,
+    checkpoints: mpsc::SyncSender<AgentEvent>,
+    protocol: Arc<CheckpointProtocol>,
+    fault: impl FnOnce(),
+) {
+    let result = (|| -> Result<(), String> {
+        let raw = agent_line(&mut reader)?.ok_or("host_readiness_failed")?;
+        if serde_json::from_slice::<serde_json::Value>(&raw).ok()
+            != Some(serde_json::json!({"state":"running"}))
+        {
+            return Err("host_readiness_failed".into());
+        }
+        let _ = ready.send(Ok(()));
+        let mut stopped = false;
+        while let Some(raw) = agent_line(&mut reader)? {
+            if stopped {
+                return Err("host_checkpoint_protocol_invalid".into());
+            }
+            match protocol.parse(&raw)? {
+                AgentEvent::Stopped => stopped = true,
+                event => checkpoints
+                    .try_send(event)
+                    .map_err(|_| "host_checkpoint_protocol_invalid")?,
+            }
+        }
+        if !protocol.stopping.load(Ordering::Acquire) {
+            return Err("host_agent_pipe_failed".into());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        protocol.failed.store(true, Ordering::Release);
+        let _ = ready.send(Err("host_readiness_failed".into()));
+        fault();
+    }
+}
 
 fn private_file(path: &Path, append: bool) -> Result<File, String> {
     let mut options = OpenOptions::new();
@@ -327,6 +519,10 @@ pub struct HostProcess {
     ready: Receiver<Result<(), String>>,
     exited: Receiver<Result<(), String>>,
     stopped: Option<Result<(), String>>,
+    protocol: Arc<CheckpointProtocol>,
+    checkpoints: Receiver<AgentEvent>,
+    checkpoint_started: Option<Instant>,
+    ready_seen: bool,
 }
 impl VerifiedHostRuntime {
     /// Credentials are native-only; callers persist them in the OS credential store before first start.
@@ -435,6 +631,11 @@ impl VerifiedHostRuntime {
             drop(_lease);
             let _ = exit_sender.send(result);
         });
+        let protocol = Arc::new(CheckpointProtocol::new(
+            self.manifest_sha256.clone(),
+            self.manifest.source_revision.clone(),
+        ));
+        let (checkpoint_sender, checkpoints) = mpsc::sync_channel(1);
         let mut process = HostProcess {
             owner,
             pid,
@@ -442,29 +643,23 @@ impl VerifiedHostRuntime {
             ready,
             exited,
             stopped: None,
+            protocol: protocol.clone(),
+            checkpoints,
+            checkpoint_started: None,
+            ready_seen: false,
         };
         let Some(output) = output else {
             return Err("host_agent_pipe_failed".into());
         };
+        let output_owner = process.owner.clone();
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let mut reader = BufReader::new(output);
-            let result = Read::by_ref(&mut reader)
-                .take(8193)
-                .read_until(b'\n', &mut bytes)
-                .map_err(|_| "host_readiness_failed".to_string())
-                .and_then(|_| {
-                    if bytes.len() > 8192
-                        || serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                            != Some(serde_json::json!({"state":"running"}))
-                    {
-                        Err("host_readiness_failed".into())
-                    } else {
-                        Ok(())
-                    }
-                });
-            let _ = sender.send(result);
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            read_agent_output(
+                BufReader::new(output),
+                sender,
+                checkpoint_sender,
+                protocol,
+                || output_owner.terminate(),
+            )
         });
         process
             .input
@@ -479,6 +674,9 @@ impl VerifiedHostRuntime {
 impl HostProcess {
     /// Only this owned child's exit channel is authoritative; never reconnect to a saved PID.
     pub fn is_running(&mut self) -> Result<bool, String> {
+        if self.protocol.failed.load(Ordering::Acquire) {
+            return Err("host_checkpoint_protocol_invalid".into());
+        }
         if let Some(result) = &self.stopped {
             return result.clone().map(|()| false);
         }
@@ -517,6 +715,7 @@ impl HostProcess {
                     if !self.is_running()? {
                         return Err("host_process_exited".into());
                     }
+                    self.ready_seen = true;
                     return Ok(true);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -543,13 +742,59 @@ impl HostProcess {
             self.stopped = Some(Err(error.clone()));
             return Err(error);
         }
-        if let Ok(result) = self.exited.try_recv() {
-            self.stopped = Some(result);
+        if !self.is_running()? {
             return Err("host_process_exited".into());
         }
+        self.ready_seen = true;
         Ok(())
     }
+    pub fn request_checkpoint(&mut self, operation: &str) -> Result<(), String> {
+        if !self.ready_seen
+            || self.protocol.stopping.load(Ordering::Acquire)
+            || !self.is_running()?
+        {
+            return Err("host_checkpoint_unavailable".into());
+        }
+        self.protocol.begin(operation)?;
+        self.checkpoint_started = Some(Instant::now());
+        let wire = format!(
+            "{}\n",
+            serde_json::json!({"protocolVersion":1,"action":"checkpoint","operationId":operation})
+        );
+        self.input
+            .as_mut()
+            .ok_or("host_agent_pipe_failed")?
+            .write_all(wire.as_bytes())
+            .map_err(|_| "host_agent_pipe_failed".into())
+    }
+    pub fn poll_checkpoint(&mut self) -> Result<Option<serde_json::Value>, String> {
+        if self.protocol.failed.load(Ordering::Acquire) {
+            return Err("host_checkpoint_protocol_invalid".into());
+        }
+        match self.checkpoints.try_recv() {
+            Ok(event) => {
+                if self.checkpoint_started.take().is_none() {
+                    return Err("host_checkpoint_protocol_invalid".into());
+                }
+                self.protocol.finish(&event)?;
+                serde_json::to_value(event)
+                    .map(Some)
+                    .map_err(|_| "host_checkpoint_protocol_invalid".into())
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if self
+                    .checkpoint_started
+                    .is_some_and(|start| start.elapsed() >= Duration::from_secs(7200))
+                {
+                    return Err("host_checkpoint_timeout".into());
+                }
+                Ok(None)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err("host_agent_pipe_failed".into()),
+        }
+    }
     pub fn stop(&mut self) -> Result<(), String> {
+        self.protocol.stopping.store(true, Ordering::Release);
         if let Some(result) = &self.stopped {
             return result.clone();
         }
@@ -575,5 +820,153 @@ impl Drop for HostProcess {
             self.owner.terminate();
             let _ = self.exited.recv_timeout(Duration::from_secs(10));
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const OPERATION: &str = "11111111-1111-4111-8111-111111111111";
+    fn receipt() -> serde_json::Value {
+        serde_json::json!({"state":"checkpoint","schemaVersion":1,"operationId":OPERATION,
+            "manifestSha256":"a".repeat(64),"sourceRevision":"b".repeat(40),"postgresMajor":"19",
+            "databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"c".repeat(64)}})
+    }
+    fn wire(value: &serde_json::Value) -> Vec<u8> {
+        format!("{value}\n").into_bytes()
+    }
+
+    #[test]
+    fn checkpoint_receipts_require_an_outstanding_operation_and_its_exact_runtime() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        assert!(protocol.parse(&wire(&receipt())).is_err());
+        protocol.begin(OPERATION).unwrap();
+        assert!(protocol.begin(OPERATION).is_err());
+        for (field, value) in [
+            (
+                "operationId",
+                serde_json::json!("22222222-2222-4222-8222-222222222222"),
+            ),
+            ("manifestSha256", serde_json::json!("d".repeat(64))),
+            ("sourceRevision", serde_json::json!("e".repeat(40))),
+            ("schemaVersion", serde_json::json!(2)),
+            ("postgresMajor", serde_json::json!("18")),
+            ("databaseFormat", serde_json::json!("immich-source")),
+            ("extra", serde_json::json!(true)),
+            (
+                "dump",
+                serde_json::json!({"bytes":0,"sha256":"c".repeat(64)}),
+            ),
+            (
+                "dump",
+                serde_json::json!({"bytes":9007199254740992u64,"sha256":"c".repeat(64)}),
+            ),
+            ("dump", serde_json::json!({"bytes":1,"sha256":"not-a-hash"})),
+            (
+                "dump",
+                serde_json::json!({"bytes":1.5,"sha256":"c".repeat(64)}),
+            ),
+        ] {
+            let mut changed = receipt();
+            changed[field] = value;
+            assert!(protocol.parse(&wire(&changed)).is_err(), "accepted {field}");
+        }
+        let event = protocol.parse(&wire(&receipt())).unwrap();
+        protocol.finish(&event).unwrap();
+        assert!(protocol.parse(&wire(&receipt())).is_err());
+        for value in [
+            "../outside",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(protocol.begin(value).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_failures_are_scoped_and_never_carry_untrusted_error_details() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        protocol.begin(OPERATION).unwrap();
+        let failure = serde_json::json!({"state":"checkpoint-failed","operationId":OPERATION,"code":"host_checkpoint_failed"});
+        let mut secret = failure.clone();
+        secret["code"] = serde_json::json!("synthetic-private-error");
+        assert!(protocol.parse(&wire(&secret)).is_err());
+        assert!(protocol.parse(&wire(&failure)).is_ok());
+        assert!(protocol.parse(b"{\n").is_err());
+        assert!(protocol.parse(&vec![b'x'; 8193]).is_err());
+        assert!(protocol
+            .parse(&wire(&serde_json::json!({"state":"stopped"})))
+            .is_err());
+        protocol.stopping.store(true, Ordering::Release);
+        assert!(protocol
+            .parse(&wire(&serde_json::json!({"state":"stopped"})))
+            .is_ok());
+    }
+
+    #[test]
+    fn checkpoint_duplicate_is_refused_before_the_first_response_is_consumed() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        protocol.begin(OPERATION).unwrap();
+        let first = protocol.parse(&wire(&receipt())).unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.try_send(first).unwrap();
+        let drained = rx.try_recv().unwrap();
+        // The consumer has drained the channel but has not yet finished the operation.
+        assert!(protocol.parse(&wire(&receipt())).is_err());
+        protocol.finish(&drained).unwrap();
+        let next = "22222222-2222-4222-8222-222222222222";
+        protocol.begin(next).unwrap();
+        assert!(protocol.finish(&drained).is_err());
+        let mut next_receipt = receipt();
+        next_receipt["operationId"] = serde_json::json!(next);
+        let next_event = protocol.parse(&wire(&next_receipt)).unwrap();
+        assert!(protocol.finish(&drained).is_err());
+        protocol.finish(&next_event).unwrap();
+    }
+
+    #[test]
+    fn output_reader_rejects_a_duplicate_receipt_instead_of_blocking_on_a_full_channel() {
+        let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
+        protocol.begin(OPERATION).unwrap();
+        let (ready_tx, ready) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let failed = AtomicBool::new(false);
+        let input = format!(
+            "{{\"state\":\"running\"}}\n{}{}",
+            String::from_utf8(wire(&receipt())).unwrap(),
+            String::from_utf8(wire(&receipt())).unwrap()
+        );
+        read_agent_output(
+            std::io::Cursor::new(input),
+            ready_tx,
+            tx,
+            protocol.clone(),
+            || failed.store(true, Ordering::Release),
+        );
+        assert!(ready.recv().unwrap().is_ok());
+        assert!(failed.load(Ordering::Acquire));
+        assert!(protocol.failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_failure_and_stopped_receipt_drain_without_overflowing_the_checkpoint_channel() {
+        let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
+        protocol.begin(OPERATION).unwrap();
+        protocol.stopping.store(true, Ordering::Release);
+        let (ready_tx, ready) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let input = format!("{{\"state\":\"running\"}}\n{{\"state\":\"checkpoint-failed\",\"operationId\":\"{OPERATION}\",\"code\":\"host_checkpoint_failed\"}}\n{{\"state\":\"stopped\"}}\n");
+        read_agent_output(
+            std::io::Cursor::new(input),
+            ready_tx,
+            tx,
+            protocol.clone(),
+            || panic!("valid cancellation was refused"),
+        );
+        assert!(ready.recv().unwrap().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(!protocol.failed.load(Ordering::Acquire));
     }
 }
