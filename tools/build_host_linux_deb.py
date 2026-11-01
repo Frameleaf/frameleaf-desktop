@@ -140,6 +140,11 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
             search = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[([^\]]*)\]', dynamic)
             if len(search) > 1:
                 raise BuildError('host_elf_search_path_ambiguous')
+            paths = search[0].split(':') if search else []
+            expanded = search_directories(path, paths)
+            for reference, directory in zip(paths, expanded):
+                if '$' in reference and not directory.resolve().is_relative_to(tree.resolve()):
+                    raise BuildError('host_install_origin_dependency_invalid')
             patchelf = shutil.which('patchelf')
             if not patchelf:
                 raise BuildError('host_install_elf_tools_missing')
@@ -153,7 +158,6 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
             for name, target in targets.items():
                 run([patchelf, '--replace-needed', name, target.name, analyzed], cwd=work, env=env)
             if search:
-                expanded = search_directories(path, search[0].split(':'))
                 run([patchelf, '--set-rpath', ':'.join(map(str, expanded)), analyzed], cwd=work, env=env)
             if sha256(path) != digest:
                 raise BuildError('host_install_staged_runtime_changed')
