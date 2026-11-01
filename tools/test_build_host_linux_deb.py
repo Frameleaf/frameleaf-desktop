@@ -76,18 +76,22 @@ class LinuxHostDebTests(unittest.TestCase):
                         return '(SONAME) Library soname: [libpython3.so]\n(NEEDED) Shared library: [$ORIGIN/../lib/libpython3.12.so.1.0]\n(RUNPATH) Library runpath: [$ORIGIN]'
                     return '(SONAME) Library soname: [libpython3.12.so.1.0]'
                 return 'shlibs:Depends=libc6 (>= 2.39)' if args[0] == 'dpkg-shlibdeps' else ''
-            with patch('build_host_linux_deb.run', side_effect=command) as call:
+            with patch('build_host_linux_deb.run', side_effect=command) as call, patch('build_host_linux_deb.shutil.which', return_value='/trusted/patchelf'):
                 self.assertIn('libc6', dependencies(tree, 'frameleaf-fixture', root / 'work'))
-                changes = [item.args[0] for item in call.call_args_list if item.args[0][0] == 'patchelf']
+                changes = [item.args[0] for item in call.call_args_list if item.args[0][0] == '/trusted/patchelf']
                 self.assertTrue(changes)
                 self.assertEqual(changes[0][1:4], ['--replace-needed', '$ORIGIN/../lib/libpython3.12.so.1.0', target.name])
                 copy = changes[0][-1]
                 self.assertTrue(copy.is_relative_to(root / 'work'))
                 self.assertFalse(copy.is_relative_to(tree))
-                self.assertIn(['patchelf', '--set-rpath', str(library), copy], changes)
+                self.assertIn(['/trusted/patchelf', '--set-rpath', str(library), copy], changes)
                 self.assertNotIn('-e' + str(shim), call.call_args.args[0])
                 self.assertIn('-e' + str(copy), call.call_args.args[0])
                 self.assertEqual(shim.read_bytes(), original)
+            with patch('build_host_linux_deb.run', side_effect=command), patch('build_host_linux_deb.shutil.which', return_value=None):
+                with self.assertRaisesRegex(BuildError, 'host_install_elf_tools_missing'):
+                    dependencies(tree, 'frameleaf-fixture', root / 'without-tool')
+                self.assertFalse((root / 'without-tool/origin-analysis').exists())
 
     def test_origin_needed_refuses_a_library_outside_the_staged_package(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -257,3 +261,35 @@ class LinuxHostDebTests(unittest.TestCase):
             result = dependencies(tree, 'frameleaf-fixture', root / 'work')
             self.assertIn('libc6', result)
             self.assertNotIn('frameleaf-fixture', result)
+
+    @unittest.skipUnless(
+        os.sys.platform.startswith('linux')
+        and all(shutil.which(tool) for tool in ['gcc', 'readelf', 'patchelf', 'dpkg-shlibdeps']),
+        'requires Linux native dependency build tools',
+    )
+    def test_real_native_addon_with_origin_dependency_preserves_staged_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'package with spaces'
+            library = tree / 'lib'
+            library.mkdir(parents=True)
+            (root / 'answer.c').write_text('int answer(void) { return 42; }')
+            (root / 'addon.c').write_text('#include <stdio.h>\nextern int answer(void); int addon(void) { puts("fixture"); return answer(); }')
+            target, addon = library / 'libanswer.so.1', library / 'answer.node'
+            for command in [
+                ['gcc', '-shared', '-fPIC', root / 'answer.c', '-Wl,-soname,libanswer.so.1', '-o', target],
+                ['gcc', '-shared', '-fPIC', root / 'addon.c', '-L' + str(library), '-l:libanswer.so.1', '-Wl,-soname,answer.node', '-Wl,-rpath,$ORIGIN', '-o', addon],
+                ['patchelf', '--replace-needed', 'libanswer.so.1', '$ORIGIN/libanswer.so.1', addon],
+            ]:
+                subprocess.run(command, check=True, capture_output=True)
+            originals = {path: path.read_bytes() for path in [target, addon]}
+            result = dependencies(tree, 'frameleaf-fixture', root / 'work')
+            self.assertIn('libc6', result)
+            self.assertNotIn('frameleaf-fixture', result)
+            for path, contents in originals.items():
+                self.assertEqual(path.read_bytes(), contents)
+            copies = list((root / 'work/origin-analysis').iterdir())
+            self.assertEqual(len(copies), 1)
+            metadata = subprocess.check_output(['readelf', '-d', copies[0]], text=True)
+            self.assertIn('Shared library: [libanswer.so.1]', metadata)
+            self.assertNotIn('Shared library: [$ORIGIN/', metadata)
