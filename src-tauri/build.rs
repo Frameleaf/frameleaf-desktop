@@ -42,6 +42,7 @@ fn main() {
             "installed_local_hosts",
             "local_host_status",
             "prepare_local_host",
+            "provision_local_host_profile",
             "cancel_local_host_start",
             "stop_local_host_manager",
             "connect_server",

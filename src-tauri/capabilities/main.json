@@ -49,6 +49,7 @@
     "allow-installed-local-hosts",
     "allow-local-host-status",
     "allow-prepare-local-host",
+    "allow-provision-local-host-profile",
     "allow-cancel-local-host-start",
     "allow-stop-local-host-manager",
     "allow-authorize-local-manager",
