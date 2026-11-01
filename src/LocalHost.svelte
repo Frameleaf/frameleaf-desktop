@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { managerError } from './manager-state';
+  import { managerError, localProfilePending } from './manager-state';
   type Installation = { manifestSha256: string; controllerSha256: string };
   type View = { state: string; code: string | null; backgroundActive: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
@@ -12,6 +12,8 @@
   let view = $state<View | null>(null);
   let busy = $state(false);
   let starting = $state(false);
+  let provisioning = $state(false);
+  const profilePending = $derived(localProfilePending(view?.state, provisioning));
   let disposed = false;
   let failure = $state('');
   let notice = $state('');
@@ -23,6 +25,10 @@
     if (value.startsWith('manager_') || value === 'native_manager_not_ready' || value === 'native_host_busy') return managerError(value);
     if (value === 'host_install_platform_unsupported') return 'Native server installation is not available on this platform in this build. You can connect to an existing server.';
     if (value === 'host_install_profile_required') return 'Run the server component installer while signed in to this computer, then try again.';
+    if (value === 'host_install_linux_profile_required') return 'Prepare a private server profile for your account before starting local management.';
+    if (value === 'host_profile_authorization_cancelled') return 'System authorization was cancelled. You can try again.';
+    if (value === 'host_profile_authorization_unavailable') return 'System authorization is unavailable. Check your desktop’s authorization service, then try again.';
+    if (value === 'host_profile_prepare_failed') return 'The server profile could not be prepared. Check that your installed Frameleaf components are up to date. Your existing library has been preserved.';
     if (value === 'host_package_maintenance' || value === 'host_package_busy') return 'Server component maintenance is unfinished or the component is in use. Local management is unavailable until maintenance completes.';
     if (value.startsWith('host_package_')) return 'The server component installation could not be verified. Local management is blocked; your existing library has been preserved.';
     if (value === 'native_manager_start_cancelled') return 'Local setup was cancelled.';
@@ -51,7 +57,7 @@
   onMount(() => {
     if (!native) return;
     let unlisten: UnlistenFn | undefined;
-    void listen('native-host-exit-blocked', () => { notice = 'Stop the photo server in Manager, then stop local management before quitting. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
+    void listen('native-host-exit-blocked', () => { notice = profilePending ? 'Finish or dismiss the system authorization request before quitting.' : 'Stop the photo server in Manager, then stop local management before quitting. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
     void refresh();
     return () => { disposed = true; unlisten?.(); };
   });
@@ -76,6 +82,17 @@
       const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
     } finally { busy = false; }
   }
+  async function provisionProfile() {
+    if (busy || !native || !selected) return;
+    busy = true; provisioning = true; onactive(true); failure = ''; notice = '';
+    try {
+      show(await invoke<View>('provision_local_host_profile', { manifestSha256: selected }));
+      notice = 'Your private server profile is ready. You can now prepare local Manager.';
+    } catch (error) {
+      failure = explain(error);
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
+    } finally { busy = false; provisioning = false; }
+  }
   async function photos() {
     busy = true; failure = ''; notice = '';
     try { await invoke('open_local_photos'); }
@@ -95,10 +112,15 @@
 </script>
 
 <section class="status-panel" aria-label="Local library setup" aria-busy={busy}>
-  <h2>{starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer'}</h2>
+  <h2>{profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer'}</h2>
   <p>Keep your photo library here and manage it from Frameleaf. Server management and photo-server startup are separate steps.</p>
   {#if failure}<p class="message error" role="alert">{failure}</p>{/if}
   {#if notice}<p class="message" role="status">{notice}</p>{/if}
+  {#if profilePending}<p role="status">Finish or dismiss the system authorization request, then check installation to continue.</p>{/if}
+  {#if view?.code === 'host_install_linux_profile_required' || view?.code?.startsWith('host_profile_')}
+    <p>Your system may ask for administrator authorization to create private server folders for your account. Frameleaf does not receive your administrator password. This step does not start the photo server.</p>
+    <button class="primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare my server profile</button>
+  {/if}
   {#if native && !busy && !failure && installations.length === 0}
     <p>Install the Frameleaf server component, then check again. Your existing photo folders are kept separate.</p>
   {/if}
@@ -129,10 +151,10 @@
   <div class="actions">
     {#if !view?.backgroundActive || view?.state === 'needs-attention'}<button class="primary" disabled={busy || !native || !selected} onclick={prepare}>Prepare local Manager</button>{/if}
     {#if starting}<button class="secondary" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
-    {#if view?.backgroundActive}<button class="secondary" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
+    {#if view?.backgroundActive && !profilePending}<button class="secondary" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
     <button class="text-button" disabled={busy || !native} onclick={refresh}>Check installation</button>
   </div>
-  <p class="footnote">Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.</p>
+  <p class="footnote">{profilePending ? 'Finish or dismiss the system authorization request before quitting.' : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}</p>
 </section>
 
 <style>

@@ -73,7 +73,10 @@ impl HostSetup {
     pub(crate) fn require_management_origin(&self, origin: &str) -> Result<(), String> {
         let view = self.snapshot();
         if view.origin.as_deref() == Some(origin)
-            && matches!(view.state.as_str(), "starting" | "stopping")
+            && matches!(
+                view.state.as_str(),
+                "starting" | "stopping" | "provisioning"
+            )
         {
             return Err("native_host_busy".into());
         }
@@ -95,6 +98,52 @@ impl HostSetup {
                 }
             }
         }
+        Ok(self.snapshot())
+    }
+    pub(crate) async fn provision(&self, manifest: String) -> Result<View, String> {
+        #[cfg(target_os = "linux")]
+        {
+            let record = Installation::read(&manifest)?;
+            self.provision_record(record, crate::profile_elevation::provision)
+                .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = manifest;
+            Err("host_install_platform_unsupported".into())
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    async fn provision_record<F>(
+        &self,
+        installation: Installation,
+        provision: F,
+    ) -> Result<View, String>
+    where
+        F: FnOnce(&Installation) -> Result<(), String> + Send + 'static,
+    {
+        let owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
+        if owner.is_some() {
+            return Err("native_host_stop_required".into());
+        }
+        self.active.store(true, Ordering::Release);
+        self.set("provisioning", None, Some(installation.clone()));
+        let record = installation.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || provision(&record))
+            .await
+            .map_err(|_| "host_profile_prepare_failed".to_string())
+            .and_then(|result| result);
+        self.active.store(false, Ordering::Release);
+        self.set(
+            if result.is_ok() {
+                "profile-ready"
+            } else {
+                "needs-attention"
+            },
+            result.as_ref().err().cloned(),
+            Some(installation),
+        );
+        result?;
         Ok(self.snapshot())
     }
     pub(crate) async fn start(&self, manifest: String) -> Result<View, String> {
@@ -334,16 +383,21 @@ pub(crate) async fn authorize_owner(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
-fn require_leaf(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn require_leaf(path: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let info = std::fs::symlink_metadata(path).map_err(|_| "host_install_profile_required")?;
+        let required = if cfg!(target_os = "linux") {
+            "host_install_linux_profile_required"
+        } else {
+            "host_install_profile_required"
+        };
+        let info = std::fs::symlink_metadata(path).map_err(|_| required.to_string())?;
         if !info.is_dir()
             || info.uid() != unsafe { libc::geteuid() }
             || info.mode() & 0o7777 != 0o700
         {
-            return Err("host_install_profile_required".into());
+            return Err(required.into());
         }
         #[cfg(target_os = "macos")]
         crate::manager_host::no_acl(path)?;
@@ -499,6 +553,10 @@ mod tests {
         assert!(setup
             .require_management_origin("https://nas.example")
             .is_ok());
+        setup.set("provisioning", None, Some(record.clone()));
+        assert!(setup
+            .require_management_origin("https://127.0.0.1:9443")
+            .is_err());
         setup.cancel();
         assert!(setup.cancel.load(Ordering::Acquire));
         setup.set("manager-ready", None, Some(record));
@@ -506,6 +564,55 @@ mod tests {
             .require_management_origin("https://127.0.0.1:9443")
             .is_ok());
         assert!(setup.snapshot().background_active);
+    }
+    #[tokio::test]
+    async fn profile_setup_serializes_authorization_and_never_starts_a_manager() {
+        let setup = Arc::new(HostSetup::default());
+        let record: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let inspect = setup.clone();
+        let view = setup
+            .provision_record(record.clone(), move |_| {
+                assert!(inspect.background_active());
+                assert_eq!(inspect.snapshot().state, "provisioning");
+                assert!(inspect.owner.try_lock().is_err());
+                assert!(inspect
+                    .require_management_origin("https://127.0.0.1:9443")
+                    .is_err());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.state, "profile-ready");
+        assert_eq!(view.installation, Some(record.clone()));
+        assert!(!view.background_active);
+        assert!(setup.owner.lock().await.is_none());
+        let held = setup.owner.lock().await;
+        assert_eq!(
+            setup
+                .provision_record(record.clone(), |_| panic!(
+                    "busy setup must not request authorization"
+                ))
+                .await
+                .err()
+                .unwrap(),
+            "native_host_busy"
+        );
+        drop(held);
+        assert_eq!(
+            setup
+                .provision_record(record.clone(), |_| Err(
+                    "host_profile_authorization_cancelled".into()
+                ))
+                .await
+                .err()
+                .unwrap(),
+            "host_profile_authorization_cancelled"
+        );
+        let view = setup.snapshot();
+        assert_eq!(view.state, "needs-attention");
+        assert_eq!(view.installation, Some(record));
+        assert!(!view.background_active);
+        assert!(setup.owner.lock().await.is_none());
     }
     #[cfg(unix)]
     #[test]

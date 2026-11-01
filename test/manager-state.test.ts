@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { controlIntent, restoreIntent, intentKey, managerError, type ManagerView } from '../src/manager-state.ts';
+import { controlIntent, restoreIntent, intentKey, managerError, localProfilePending, type ManagerView } from '../src/manager-state.ts';
+test('local profile authorization survives reload and ends only after backend and request complete',()=>{
+ assert.equal(localProfilePending('provisioning',false),true);
+ assert.equal(localProfilePending('provisioning',true),true);
+ assert.equal(localProfilePending('profile-ready',true),true);
+ for(const state of [undefined,'idle','profile-ready','needs-attention','manager-ready'])assert.equal(localProfilePending(state,false),false);
+});
 const manager:ManagerView={origin:'https://manager.test:9443',managerId:'11111111-1111-4111-8111-111111111111',deviceId:'22222222-2222-4222-8222-222222222222',installationId:'aaaaaaaaaaaa',expiresAt:1900000000000,scopes:['status','start','stop','restart','backup'],certificateSha256:null};
 test('a retry keeps its durable request key and cannot silently switch action',()=>{
  const initial=controlIntent(manager,'stop',null);
