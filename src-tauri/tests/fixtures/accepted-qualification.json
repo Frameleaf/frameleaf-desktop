@@ -1,0 +1,58 @@
+{
+  "report": {
+    "protocolVersion": 1,
+    "modelKey": "clip:93f4dc772f817655256678095702dd151c8714e238fccbd7a49f544960fb52a6",
+    "provider": "CPUExecutionProvider",
+    "preprocessingSha256": "ac01469c44faed12f8fa2cac6649e3f1f2b7191a5161b1abe1b02f350570cf53",
+    "fixtureSha256": "af289cd05aec6d98fd5f1bb759d499d5fc00c7d15e267ab3430ad4ed722ca483",
+    "bindingSha256": "c53ede795fb9a86ecba813f1e4f279ee4fa16e9109ed245db5ae8f1d144cd2c5",
+    "runtimeFingerprint": "b92441eb36a0e9cac784add7b061ddbf91430b437aba17b0e8166d7deb7a4b4a",
+    "runtime": {
+      "system": "Darwin",
+      "release": "fixture",
+      "architecture": "arm64",
+      "processor": "été😀",
+      "python": "3.12.13",
+      "ort": "1.30.0",
+      "packages": {
+        "onnxruntime": "1.30.0"
+      },
+      "providers": [
+        "CPUExecutionProvider"
+      ],
+      "gpus": [],
+      "totalMemoryBytes": 8589934592
+    },
+    "coldMilliseconds": 120,
+    "warmMilliseconds": 10,
+    "reason": null,
+    "state": "ready-cpu",
+    "execution": [
+      {
+        "state": "ready-cpu",
+        "reason": null,
+        "nodes": {
+          "CPUExecutionProvider": 123
+        },
+        "microseconds": {
+          "CPUExecutionProvider": 1e-07
+        }
+      }
+    ]
+  },
+  "response": {
+    "id": "d621bd72-ad35-4199-95ab-76300756a38e",
+    "deviceId": "445bc2b6-f4cd-439e-b8bb-7e84d7ee0550",
+    "sessionId": "1117c1ca-0495-46e9-b579-f321520c2b1a",
+    "authorizationEpoch": 2,
+    "modelKey": "clip:93f4dc772f817655256678095702dd151c8714e238fccbd7a49f544960fb52a6",
+    "configSha256": "14bfea12f13110670d5518cc800a19d321be0205ed50ca64e61dce6ba11a0090",
+    "inputKind": "text",
+    "bindingSha256": "c53ede795fb9a86ecba813f1e4f279ee4fa16e9109ed245db5ae8f1d144cd2c5",
+    "manifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "runtimeFingerprint": "b92441eb36a0e9cac784add7b061ddbf91430b437aba17b0e8166d7deb7a4b4a",
+    "reportSha256": "49a36bce56366b06d983d3ab1bab9a7fde0b3bd0342ed9bb90f3db5daa0fc4cc",
+    "qualifiedAt": "2026-10-15T20:00:00Z",
+    "expiresAt": "2026-10-15T21:00:00Z"
+  }
+}

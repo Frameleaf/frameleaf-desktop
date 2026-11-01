@@ -1,0 +1,94 @@
+//! OS process ownership; the Python gate opens only after this owner is installed.
+use std::process::{Child, Command};
+
+#[cfg(unix)]
+pub struct ProcessTree(i32);
+#[cfg(windows)]
+pub struct ProcessTree(std::os::windows::io::OwnedHandle);
+
+pub fn configure(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        // A single bounded ML job must yield CPU time to foreground applications.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::getpriority(libc::PRIO_PROCESS, 0) >= 10
+                    || libc::setpriority(libc::PRIO_PROCESS, 0, 10) == 0
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(
+            0x08000000 | windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS,
+        );
+    }
+}
+impl ProcessTree {
+    pub fn attach(child: &Child) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Ok(Self(
+                child
+                    .id()
+                    .try_into()
+                    .map_err(|_| "runtime_process_invalid")?,
+            ))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            };
+            // An unnamed non-inherited job terminates every child when this process loses ownership.
+            unsafe {
+                let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if raw.is_null() {
+                    return Err("runtime_process_owner_failed".into());
+                }
+                let handle = OwnedHandle::from_raw_handle(raw);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    raw,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of_val(&info) as u32,
+                ) == 0
+                    || AssignProcessToJobObject(raw, child.as_raw_handle()) == 0
+                {
+                    return Err("runtime_process_owner_failed".into());
+                }
+                Ok(Self(handle))
+            }
+        }
+    }
+    pub fn terminate(&self) {
+        #[cfg(unix)]
+        // Each child is created in its own group; a negative PID addresses only that group.
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(
+                    self.0.as_raw_handle(),
+                    1,
+                );
+            }
+        }
+    }
+}

@@ -1,0 +1,60 @@
+name: Private Windows media candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_ffmpeg.py'
+      - 'tools/test_build_host_ffmpeg.py'
+      - 'tools/build_host_database.py'
+      - 'tools/build_host_plugin.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_runtime.py'
+      - 'tools/relocate_macos.py'
+      - '.github/workflows/windows-host-media.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-media-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  media:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 947568067639827de73e2de7260103df697c7f51
+          path: server-source
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /mise.lock
+            /server/base-image/packages/ffmpeg.json
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Check source pins and archive extraction guards
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p test_build_host_ffmpeg.py -v
+          if ($LASTEXITCODE) { throw 'Native media packaging tests failed' }
+      - name: Stage source-pinned portable binaries and qualify CPU codecs
+        shell: pwsh
+        run: |
+          python tools/build_host_ffmpeg.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 947568067639827de73e2de7260103df697c7f51 --output "$env:RUNNER_TEMP/frameleaf-windows-media"
+          if ($LASTEXITCODE) { throw 'Native media qualification failed' }
+      - name: Retain private component and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-private-media-candidate
+          path: |
+            ${{ runner.temp }}/frameleaf-windows-media/media/
+            ${{ runner.temp }}/frameleaf-windows-media/qualification.json
+            ${{ runner.temp }}/frameleaf-windows-media/command-error.log
+          retention-days: 7
+          if-no-files-found: warn

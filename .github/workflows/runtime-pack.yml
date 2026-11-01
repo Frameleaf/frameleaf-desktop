@@ -1,0 +1,66 @@
+name: Private CPU runtime candidate
+on:
+  pull_request:
+    paths:
+      - 'tools/**'
+      - 'runtime/**'
+      - 'src-tauri/src/native_runtime.rs'
+      - 'src-tauri/src/runtime_store.rs'
+      - 'src-tauri/src/process_tree.rs'
+      - '.github/workflows/runtime-pack.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cpu-runtime-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: 25b22c16e47a27a2eb50017d838497abce850d11
+          path: server
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Builder regression checks
+        run: python -m unittest discover -s desktop/tools -p 'test_*.py'
+      - name: Construct and relocate the locked private runtime
+        run: python desktop/tools/build_runtime.py --source server --output candidate --revision 25b22c16e47a27a2eb50017d838497abce850d11 --epoch 4
+      - name: Retain private validation receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-receipts-${{ runner.os }}
+          path: |
+            candidate/manifest.json
+            candidate/payload/provenance.json
+            candidate/payload/requirements.txt
+            candidate/payload/build-requirements.txt
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-failure-${{ runner.os }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3

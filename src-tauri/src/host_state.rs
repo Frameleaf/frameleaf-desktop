@@ -1,0 +1,446 @@
+//! The fixed journal inode is also the controller lease. A torn write is never a clean-stop proof.
+use cap_std::fs::{Dir, OpenOptions};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+use uuid::Uuid;
+
+const NAME: &str = "controller-state.json";
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Phase {
+    Active,
+    Stopped,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Marker {
+    schema_version: u32,
+    pub installation_id: String,
+    pub manifest_sha256: String,
+    pub profile_identity: String,
+    pub generation: Uuid,
+    pub phase: Phase,
+}
+pub(crate) struct Owner {
+    path: PathBuf,
+    root: Dir,
+    file: File,
+    profile_identity: String,
+    active: Option<Marker>,
+    writable: bool,
+}
+fn identity(root: &Dir) -> Result<String, String> {
+    let value =
+        crate::copy_source::root_identity(root).map_err(|_| "host_profile_identity_unavailable")?;
+    Ok(format!("{:x}", Sha256::digest(value.as_bytes())))
+}
+pub(crate) fn options(write: bool) -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .create(write)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        // No delete sharing: the leased file and its parent cannot be replaced while owned.
+        options.share_mode(3).custom_flags(0x00200000);
+    }
+    options
+}
+pub(crate) fn valid_file(file: &File) -> Result<(), String> {
+    let meta = file
+        .metadata()
+        .map_err(|_| "host_controller_state_invalid")?;
+    if !meta.is_file() || meta.len() > 4096 {
+        return Err("host_controller_state_invalid".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 || meta.mode() & 0o077 != 0 {
+            return Err("host_controller_state_invalid".into());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        if meta.file_attributes() & 0x400 != 0
+            || unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0
+        {
+            return Err("host_controller_state_invalid".into());
+        }
+        if unsafe { info.assume_init() }.nNumberOfLinks != 1 {
+            return Err("host_controller_state_invalid".into());
+        }
+    }
+    Ok(())
+}
+impl Owner {
+    pub fn acquire(path: &Path, writable: bool) -> Result<Self, String> {
+        if writable {
+            crate::runtime_store::private_directory(path)?;
+        }
+        let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt;
+            if root
+                .dir_metadata()
+                .map_err(|_| "host_state_not_private")?
+                .mode()
+                & 0o077
+                != 0
+            {
+                return Err("host_state_not_private".into());
+            }
+        }
+        let file = root
+            .open_with(NAME, &options(writable))
+            .map_err(|_| "host_controller_state_unavailable")?
+            .into_std();
+        valid_file(&file)?;
+        if writable {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        }
+        .map_err(|_| "host_controller_already_owned")?;
+        let profile_identity = identity(&root)?;
+        let owner = Self {
+            path: path.into(),
+            root,
+            file,
+            profile_identity,
+            active: None,
+            writable,
+        };
+        owner.placement()?;
+        Ok(owner)
+    }
+    fn placement(&self) -> Result<(), String> {
+        let current = Dir::from_std_file(crate::host_storage::directory(&self.path)?);
+        if identity(&current)? != self.profile_identity {
+            return Err("host_profile_identity_changed".into());
+        }
+        valid_file(&self.file)?;
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt as CapMetadataExt;
+            use std::os::unix::fs::MetadataExt as StdMetadataExt;
+            let entry = self
+                .root
+                .symlink_metadata(NAME)
+                .map_err(|_| "host_profile_identity_changed")?;
+            let held = self
+                .file
+                .metadata()
+                .map_err(|_| "host_profile_identity_changed")?;
+            if entry.dev() != held.dev() || entry.ino() != held.ino() {
+                return Err("host_profile_identity_changed".into());
+            }
+        }
+        Ok(())
+    }
+    fn read(&mut self) -> Result<Option<Marker>, String> {
+        self.placement()?;
+        self.file
+            .rewind()
+            .map_err(|_| "host_controller_state_invalid")?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut self.file)
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "host_controller_state_invalid")?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() > 4096 {
+            return Err("host_controller_state_invalid".into());
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| "host_controller_state_invalid".into())
+    }
+    fn binding(&self, marker: &Marker, id: &str, sha: &str) -> Result<(), String> {
+        if marker.schema_version != 1
+            || marker.installation_id != id
+            || marker.manifest_sha256 != sha
+            || marker.generation.is_nil()
+        {
+            return Err("host_controller_binding_changed".into());
+        }
+        if marker.profile_identity != self.profile_identity {
+            return Err("host_profile_identity_changed".into());
+        }
+        Ok(())
+    }
+    fn write(&mut self, marker: &Marker) -> Result<(), String> {
+        if !self.writable {
+            return Err("host_controller_read_only".into());
+        }
+        self.placement()?;
+        let bytes = serde_json::to_vec(marker).map_err(|_| "host_controller_state_invalid")?;
+        // Keep the locked inode fixed. A partial write is invalid; fsync completes before any host effect.
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.set_len(0))
+            .and_then(|_| self.file.write_all(&bytes))
+            .and_then(|_| self.file.sync_all())
+            .map_err(|_| "host_controller_state_write_failed".into())
+    }
+    pub fn activate(&mut self, id: &str, sha: &str) -> Result<(), String> {
+        match self.read()? {
+            Some(marker) => {
+                self.binding(&marker, id, sha)?;
+                if marker.phase != Phase::Stopped {
+                    return Err("host_recovery_requires_manager".into());
+                }
+            }
+            None => {
+                for entry in self
+                    .root
+                    .entries()
+                    .map_err(|_| "host_controller_state_invalid")?
+                {
+                    if entry
+                        .map_err(|_| "host_controller_state_invalid")?
+                        .file_name()
+                        != NAME
+                    {
+                        return Err("host_recovery_requires_manager".into());
+                    }
+                }
+            }
+        }
+        let marker = Marker {
+            schema_version: 1,
+            installation_id: id.into(),
+            manifest_sha256: sha.into(),
+            profile_identity: self.profile_identity.clone(),
+            generation: Uuid::new_v4(),
+            phase: Phase::Active,
+        };
+        self.write(&marker)?;
+        self.active = Some(marker);
+        Ok(())
+    }
+    pub fn clean_stop(&mut self) -> Result<(), String> {
+        let mut marker = self.active.clone().ok_or("host_controller_state_invalid")?;
+        let current = self.read()?.ok_or("host_controller_state_invalid")?;
+        if current.generation != marker.generation || current.phase != Phase::Active {
+            return Err("host_controller_binding_changed".into());
+        }
+        self.binding(&current, &marker.installation_id, &marker.manifest_sha256)?;
+        marker.phase = Phase::Stopped;
+        self.write(&marker)?;
+        self.active = None;
+        Ok(())
+    }
+    /// Keep this lease alive through Manager shutdown so a controller cannot start concurrently.
+    pub(crate) fn admit_idle(&mut self, id: &str, sha: &str) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(id, 12)
+            || !crate::native_runtime::digest_valid(sha, 64)
+        {
+            return Err("host_controller_binding_changed".into());
+        }
+        if self.read()?.is_some() {
+            return self.inspect(id, sha).map(|_| ());
+        }
+        for entry in self
+            .root
+            .entries()
+            .map_err(|_| "host_controller_state_invalid")?
+        {
+            if entry
+                .map_err(|_| "host_controller_state_invalid")?
+                .file_name()
+                != NAME
+            {
+                return Err("host_recovery_requires_manager".into());
+            }
+        }
+        self.placement()
+    }
+    pub fn inspect(&mut self, id: &str, sha: &str) -> Result<Marker, String> {
+        let marker = self.read()?.ok_or("host_recovery_requires_manager")?;
+        self.binding(&marker, id, sha)?;
+        if marker.phase != Phase::Stopped {
+            return Err("host_recovery_requires_manager".into());
+        }
+        // Older direct-host ownership must also be absent. The PID file is never read or adopted.
+        let _host_lease = match self.root.open_with("lease.lock", &options(false)) {
+            Ok(file) => {
+                let file = file.into_std();
+                valid_file(&file)?;
+                file.try_lock_shared().map_err(|_| "host_already_owned")?;
+                Some(file)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("host_process_state_requires_review".into()),
+        };
+        match self.root.symlink_metadata("database") {
+            Ok(_) => {
+                crate::native_runtime::absolute_directory(&self.path.join("database"))?;
+                match self.root.symlink_metadata("database/postmaster.pid") {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err("host_process_state_requires_review".into()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("host_process_state_requires_review".into()),
+        }
+        self.placement()?;
+        Ok(marker)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-host-owner-{}", uuid::Uuid::new_v4()));
+            crate::runtime_store::private_directory(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    const ID: &str = "aaaaaaaaaaaa";
+    fn sha() -> String {
+        "b".repeat(64)
+    }
+
+    #[test]
+    fn controller_lease_excludes_inspection_from_before_start_until_shutdown() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        assert!(Owner::acquire(&fixture.0, true).is_err());
+        assert!(Owner::acquire(&fixture.0, false).is_err());
+        owner.activate(ID, &sha()).unwrap();
+        drop(owner);
+        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        assert_eq!(
+            inspector.inspect(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+    }
+
+    #[test]
+    fn only_matching_clean_stop_and_current_physical_root_can_be_inspected() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.activate(ID, &sha()).unwrap();
+        owner.clean_stop().unwrap();
+        drop(owner);
+        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        assert_eq!(inspector.inspect(ID, &sha()).unwrap().phase, Phase::Stopped);
+        assert!(inspector.inspect("cccccccccccc", &sha()).is_err());
+        assert!(inspector.inspect(ID, &"d".repeat(64)).is_err());
+        drop(inspector);
+        let copy = Fixture::new();
+        fs::copy(fixture.0.join(NAME), copy.0.join(NAME)).unwrap();
+        let mut inspector = Owner::acquire(&copy.0, false).unwrap();
+        assert_eq!(
+            inspector.inspect(ID, &sha()).unwrap_err(),
+            "host_profile_identity_changed"
+        );
+    }
+
+    #[test]
+    fn absent_torn_legacy_or_live_database_state_never_proves_stopped() {
+        let fixture = Fixture::new();
+        assert!(Owner::acquire(&fixture.0, false).is_err());
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        fs::write(fixture.0.join("legacy-data"), b"retained").unwrap();
+        assert_eq!(
+            owner.activate(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        fs::remove_file(fixture.0.join("legacy-data")).unwrap();
+        owner.activate(ID, &sha()).unwrap();
+        owner.clean_stop().unwrap();
+        drop(owner);
+        fs::create_dir(fixture.0.join("database")).unwrap();
+        let pid = fixture.0.join("database/postmaster.pid");
+        fs::write(&pid, b"not-a-pid-to-adopt").unwrap();
+        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        assert_eq!(
+            inspector.inspect(ID, &sha()).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        assert_eq!(fs::read(&pid).unwrap(), b"not-a-pid-to-adopt");
+        drop(inspector);
+        fs::write(fixture.0.join(NAME), b"{").unwrap();
+        let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
+        assert!(inspector.inspect(ID, &sha()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_refuses_symlinks_and_hardlinks_and_a_replaced_root() {
+        let fixture = Fixture::new();
+        let external = fixture.0.with_extension("external");
+        fs::write(&external, b"retained").unwrap();
+        std::os::unix::fs::symlink(&external, fixture.0.join(NAME)).unwrap();
+        assert!(Owner::acquire(&fixture.0, true).is_err());
+        fs::remove_file(fixture.0.join(NAME)).unwrap();
+        fs::hard_link(&external, fixture.0.join(NAME)).unwrap();
+        assert!(Owner::acquire(&fixture.0, true).is_err());
+        fs::remove_file(fixture.0.join(NAME)).unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.activate(ID, &sha()).unwrap();
+        let moved = fixture.0.with_extension("moved");
+        fs::rename(&fixture.0, &moved).unwrap();
+        fs::create_dir(&fixture.0).unwrap();
+        assert!(owner.clean_stop().is_err());
+        drop(owner);
+        assert_eq!(fs::read(&external).unwrap(), b"retained");
+        fs::remove_file(external).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+    #[test]
+    fn idle_shutdown_proof_holds_the_controller_lease_and_refuses_active_or_foreign_state() {
+        let f = Fixture::new();
+        let mut owner = Owner::acquire(&f.0, true).unwrap();
+        owner.admit_idle(ID, &sha()).unwrap();
+        assert!(Owner::acquire(&f.0, true).is_err());
+        owner.activate(ID, &sha()).unwrap();
+        assert!(owner.admit_idle(ID, &sha()).is_err());
+        owner.clean_stop().unwrap();
+        owner.admit_idle(ID, &sha()).unwrap();
+        assert!(owner.admit_idle("cccccccccccc", &sha()).is_err());
+        let g = Fixture::new();
+        let mut other = Owner::acquire(&g.0, true).unwrap();
+        fs::write(g.0.join("unreviewed-data"), b"preserve").unwrap();
+        assert!(other.admit_idle(ID, &sha()).is_err());
+        assert_eq!(fs::read(g.0.join("unreviewed-data")).unwrap(), b"preserve");
+    }
+}

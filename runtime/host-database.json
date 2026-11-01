@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "certified": false,
+  "postgresImage": "docker.io/library/postgres:19beta4-bookworm@sha256:4c618d9a30e0b88078b9371a0499d7055da9ab7f5afe386a460758eac9857f06",
+  "postgresVersion": "19beta4",
+  "postgresSourceSha256": "83157ee9c599d03b2f7a3d73ef3a56ec24e0e79cc2b3501a64d1364f56398c86",
+  "pgvectorVersion": "0.8.7",
+  "pgvectorSourceSha256": "cac0b10c360f05b2d521200105ba3697e773d4cd3731f5a915a7e37ebe0bea85"
+}

@@ -1,0 +1,28 @@
+{
+  "synthetic": true,
+  "pairing": {
+    "pairingId": "66666666-6666-4666-8666-666666666666",
+    "managerId": "22222222-2222-4222-8222-222222222222",
+    "origin": "https://manager.test:9443",
+    "deviceId": "11111111-1111-4111-8111-111111111111",
+    "installationId": "aaaaaaaaaaaa",
+    "publicKey": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+    "scopes": [
+      "status",
+      "start",
+      "stop",
+      "restart",
+      "backup"
+    ],
+    "secret": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "approvedAt": 1700000000000,
+    "expiresAt": 1700000300000
+  },
+  "pairingMessage": "[\"frameleaf-manager/pair/v1\",\"22222222-2222-4222-8222-222222222222\",\"https://manager.test:9443\",\"66666666-6666-4666-8666-666666666666\",\"11111111-1111-4111-8111-111111111111\",\"aaaaaaaaaaaa\",\"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=\",[\"status\",\"start\",\"stop\",\"restart\",\"backup\"],\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",1700000000000,1700000300000]",
+  "pairingSignature": "al5wBLHFb4QHUEdH22z5i4v4zYsoFJ8eey+/+LvOHeyki7i8Hh1XyeavffpxrlJihnVMh/wTn2nJsy40vPIfBA==",
+  "body": "{\"action\":\"stop\",\"key\":\"44444444-4444-4444-8444-444444444444\"}",
+  "requestMessage": "[\"frameleaf-manager/request/v1\",\"22222222-2222-4222-8222-222222222222\",\"https://manager.test:9443\",\"33333333-3333-4333-8333-333333333333\",\"11111111-1111-4111-8111-111111111111\",\"aaaaaaaaaaaa\",\"stop\",\"POST\",\"/manager-api/desktop/control\",\"366c452302d6ee80958199dbcd156b3a03fa2ed591d3ba940ef8cf30445b05b7\",1700000000000,\"55555555-5555-4555-8555-555555555555\",\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]",
+  "requestSignature": "eg0dhjLCb0DJgj285bFmfpGHqR/D0+w3Reerao2RYKEtAGe8LCF25aOBz3LARdueFV3y4+dIC8UA6h2IeR4bDg==",
+  "certificatePem": "-----BEGIN CERTIFICATE-----\nMIIDvjCCAiagAwIBAgIJAIdfXcUyg7LtMA0GCSqGSIb3DQEBCwUAMBQxEjAQBgNV\nBAMMCTEyNy4wLjAuMTAeFw0yNjEwMTcwODQ2MTZaFw0yNzEwMTcwODQ2MTZaMBQx\nEjAQBgNVBAMMCTEyNy4wLjAuMTCCAaIwDQYJKoZIhvcNAQEBBQADggGPADCCAYoC\nggGBAM1dfW8ZYdUhjsKtk03kSHX7/Er5P2qn/1oymujie7Dg33PF2qMg9560xK9T\nsW0AcoFNrmlI/cSP5/+QX5yt9Y+0EblXT/cA9G7xg5T1FgxtK/jGO22Z5QaGH2Ay\nRYl7KrV9AfKlMeYuWJqmkrICjSHnbM2tQEAye6Z0kEt7kewzhXs6gIpk6YhrsTxb\nx2aPzGRp97O00UAAZaCDyPU8zsyTbW000BUGAb5lUDD5YTTS7yO/naafSGOkKUHp\nwKLbMr3jatPdk0YsOpjEU1iAJogoko16CyInS9DjAmaWj9Ml2Fx7T15iJXngHa67\nDBnsUnOXyitmx6uVQAi7pWhZrPxcqt8vvJvZJGH9WFHNvpdBdpi85kVgR48/Jx86\nZNbymhTdgvUt6FMG431P0M/BD8poP69sk1LtxuOQ7QZa+XvyYUakIYtRxliAKE8E\nf0m8ZfYUy3tV9DeTl32rU5AV3VUvGhYnBhhW4lBBlRHNuCifWbOxR8ho1yuHdLM+\nGRRH9wIDAQABoxMwETAPBgNVHREECDAGhwR/AAABMA0GCSqGSIb3DQEBCwUAA4IB\ngQAyjOZuT2qTyav6imwQea45Fe7OTfRbhN194xEUxgYqy9BGz+nYtkLgO4oN31rl\n1+5+7ZSDB+EYc7KViPROXjONXpUZZ6ogjwJTQS59t1O6WhlduMRkqG0xoB7TIfxP\nJulf+xA/8DFSpW8Kikb66jH9ncrLwV1zkfpECXLZhayG8C7lWAvT2jTEfVKKIgC5\nprzhpDGm0SleMvVPp1jweYYzjzVToUcjC31Ok9+2+OP1FWtmScoa0G9uaaHrJPt9\nb4wT+YXf1YnrIaxYGZNAuh93r7Hnc7lN90RKq4R5v6GAPX/K/2RViPE0VCMkMjmk\n+1KJaSBkA9GKU40hlRGXt4ah0ZIJCohW4Do88jKLk6kQlhxpqgsxYrjzoI2ky6yM\nR+NO7OX/M5zbu7nk59K3kpmQn+MAbmChJqyN1dVnQ1AJWZeQAnk1n034Y+gcfWYy\nrY+jifn7FFYGbNtC1daGCEKNbihc3AiXrfe9mfkgZsq/rVPKK2D8Ct9L/D62Qn7K\nJQo=\n-----END CERTIFICATE-----\n",
+  "certificateSha256": "71cbb32b7d9030cd0538b25b21e56435213114661605a4f64fb5806919bb5adb"
+}

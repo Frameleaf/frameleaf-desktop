@@ -1,0 +1,1100 @@
+//! Signed private runtimes; no shell, ambient Python or server-selected executable.
+use ed25519_dalek::{Signature, VerifyingKey};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Artifact {
+    pub(crate) sha256: String,
+    pub(crate) bytes: u64,
+}
+#[derive(Clone, Copy, Default, Deserialize)]
+enum ModuleNamespace {
+    #[default]
+    #[serde(rename = "immich_ml")]
+    Immich,
+    #[serde(rename = "frameleaf_ml")]
+    Frameleaf,
+}
+impl ModuleNamespace {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Immich => "immich_ml",
+            Self::Frameleaf => "frameleaf_ml",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Manifest {
+    schema_version: u32,
+    protocol_version: u32,
+    epoch: u64,
+    platform: String,
+    architecture: String,
+    provider: String,
+    python: String,
+    source_revision: String,
+    #[serde(default)]
+    module_namespace: ModuleNamespace,
+    files: BTreeMap<String, Artifact>,
+}
+
+pub(crate) fn digest_valid(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+pub(crate) fn relative(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.len() > 4096 || value.contains(['\\', ':']) {
+        return Err("runtime_path_invalid".into());
+    }
+    for part in value.split('/') {
+        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if part.is_empty()
+            || matches!(part, "." | "..")
+            || part.ends_with(['.', ' '])
+            || part.chars().any(char::is_control)
+            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return Err("runtime_path_invalid".into());
+        }
+    }
+    Ok(PathBuf::from(value))
+}
+fn no_link(path: &Path) -> Result<fs::Metadata, String> {
+    let meta = fs::symlink_metadata(path).map_err(|_| "runtime_file_unavailable")?;
+    if meta.file_type().is_symlink() {
+        return Err("runtime_link_forbidden".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err("runtime_link_forbidden".into());
+        }
+    }
+    Ok(meta)
+}
+pub(crate) fn absolute_directory(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("runtime_root_invalid".into());
+    }
+    for ancestor in path.ancestors() {
+        if !no_link(ancestor)?.is_dir() {
+            return Err("runtime_root_invalid".into());
+        }
+    }
+    Ok(())
+}
+fn inventory(root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = BTreeSet::new();
+    let mut count = 0;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).map_err(|_| "runtime_inventory_failed")? {
+            count += 1;
+            if count > 100_000 {
+                return Err("runtime_inventory_limit".into());
+            }
+            let path = entry.map_err(|_| "runtime_inventory_failed")?.path();
+            let meta = no_link(&path)?;
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                let name = path
+                    .strip_prefix(root)
+                    .map_err(|_| "runtime_path_invalid")?
+                    .to_str()
+                    .ok_or("runtime_path_invalid")?
+                    .replace('\\', "/");
+                relative(&name)?;
+                files.insert(name);
+            } else {
+                return Err("runtime_special_file_forbidden".into());
+            }
+        }
+    }
+    Ok(files)
+}
+
+pub struct VerifiedRuntime {
+    root: PathBuf,
+    manifest: Manifest,
+    manifest_sha256: String,
+}
+impl VerifiedRuntime {
+    /// Trusted keys and rollback floor come from the app/release authority, never the NAS or pack itself.
+    pub fn verify(
+        root: &Path,
+        raw: &[u8],
+        signature: &[u8; 64],
+        trusted: &[VerifyingKey],
+        minimum_epoch: u64,
+    ) -> Result<Self, String> {
+        if raw.is_empty()
+            || raw.len() > 8 * 1024 * 1024
+            || !trusted.iter().any(|key| {
+                key.verify_strict(raw, &Signature::from_bytes(signature))
+                    .is_ok()
+            })
+        {
+            return Err("runtime_signature_invalid".into());
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(raw).map_err(|_| "runtime_manifest_invalid")?;
+        if manifest.schema_version != 1
+            || manifest.protocol_version != 1
+            || manifest.epoch < minimum_epoch
+            || manifest.epoch == 0
+            || manifest.platform != std::env::consts::OS
+            || manifest.architecture != std::env::consts::ARCH
+            || !matches!(
+                manifest.provider.as_str(),
+                "CPUExecutionProvider"
+                    | "CUDAExecutionProvider"
+                    | "CoreMLExecutionProvider"
+                    | "OpenVINOExecutionProvider"
+                    | "MIGraphXExecutionProvider"
+            )
+            || !digest_valid(&manifest.source_revision, 40)
+            || manifest.files.is_empty()
+            || manifest.files.len() > 100_000
+        {
+            return Err("runtime_manifest_incompatible".into());
+        }
+        relative(&manifest.python)?;
+        if !manifest.files.contains_key(&manifest.python) {
+            return Err("runtime_interpreter_unapproved".into());
+        }
+        let verified = Self {
+            root: root.to_path_buf(),
+            manifest,
+            manifest_sha256: format!("{:x}", Sha256::digest(raw)),
+        };
+        verified.check_files()?;
+        Ok(verified)
+    }
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.manifest.epoch
+    }
+    pub(crate) fn copy_payload(&self, destination: &Path) -> Result<(), String> {
+        self.check_files()?;
+        for (name, artifact) in &self.manifest.files {
+            let source = self.root.join(relative(name)?);
+            let target = destination.join(relative(name)?);
+            fs::create_dir_all(target.parent().ok_or("runtime_path_invalid")?)
+                .map_err(|_| "runtime_copy_failed")?;
+            let metadata = no_link(&source)?;
+            let input = File::open(source).map_err(|_| "runtime_copy_failed")?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(&target).map_err(|_| "runtime_copy_failed")?;
+            let copied = std::io::copy(&mut input.take(artifact.bytes + 1), &mut output)
+                .map_err(|_| "runtime_copy_failed")?;
+            if copied != artifact.bytes {
+                return Err("runtime_artifact_changed".into());
+            }
+            output.sync_all().map_err(|_| "runtime_copy_failed")?;
+            fs::set_permissions(target, metadata.permissions())
+                .map_err(|_| "runtime_copy_failed")?;
+        }
+        self.check_files()
+    }
+    pub fn provider(&self) -> &str {
+        &self.manifest.provider
+    }
+    pub fn source_revision(&self) -> &str {
+        &self.manifest.source_revision
+    }
+    fn check_files(&self) -> Result<(), String> {
+        verify_files(&self.root, &self.manifest.files)
+    }
+}
+
+pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> Result<(), String> {
+    absolute_directory(root)?;
+    let mut folded = BTreeSet::new();
+    let mut total = 0u64;
+    for (name, artifact) in files {
+        relative(name)?;
+        total = total
+            .checked_add(artifact.bytes)
+            .ok_or("runtime_size_invalid")?;
+        if !folded.insert(name.to_lowercase())
+            || !digest_valid(&artifact.sha256, 64)
+            || artifact.bytes > 16 * 1024 * 1024 * 1024
+            || total > 64 * 1024 * 1024 * 1024
+        {
+            return Err("runtime_artifact_invalid".into());
+        }
+    }
+    if inventory(root)? != files.keys().cloned().collect() {
+        return Err("runtime_inventory_mismatch".into());
+    }
+    for (name, artifact) in files {
+        let path = root.join(relative(name)?);
+        let meta = no_link(&path)?;
+        if !meta.is_file() || meta.len() != artifact.bytes {
+            return Err("runtime_artifact_changed".into());
+        }
+        let mut file = File::open(path).map_err(|_| "runtime_file_unavailable")?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        let mut read = 0;
+        loop {
+            let count = file.read(&mut buffer).map_err(|_| "runtime_read_failed")?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            if read > artifact.bytes {
+                return Err("runtime_artifact_changed".into());
+            }
+            hasher.update(&buffer[..count]);
+        }
+        if read != artifact.bytes || format!("{:x}", hasher.finalize()) != artifact.sha256 {
+            return Err("runtime_artifact_changed".into());
+        }
+    }
+    Ok(())
+}
+
+const START: &[u8] = b"frameleaf-native-start\n";
+const GATE: &str = r#"import os,sys,runpy,threading,signal
+expected=b'frameleaf-native-start\n'
+assert sys.stdin.buffer.read(len(expected))==expected
+def lost_parent():
+    os.read(sys.stdin.fileno(),1)
+    if os.name=='posix':
+        os.killpg(os.getpgrp(),signal.SIGKILL)
+    os._exit(125)
+threading.Thread(target=lost_parent,daemon=True).start()
+sys.argv=sys.argv[1:]
+runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
+"#;
+
+pub struct NativeSidecar {
+    child: std::process::Child,
+    tree: crate::process_tree::ProcessTree,
+    scratch: PathBuf,
+    token: zeroize::Zeroizing<String>,
+    stopped: bool,
+    exit_status: Option<std::process::ExitStatus>,
+    lease: Option<std::sync::Arc<File>>,
+}
+impl NativeSidecar {
+    pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
+        self.lease = Some(lease);
+    }
+    pub fn working_dir(&self) -> &Path {
+        &self.scratch
+    }
+    pub fn authorization(&self) -> &str {
+        self.token.as_str()
+    }
+    pub fn is_running(&mut self) -> Result<bool, String> {
+        if self.stopped {
+            return Ok(false);
+        }
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(|_| "runtime_process_status_failed")?
+        {
+            self.tree.terminate();
+            self.exit_status = Some(status);
+            self.stopped = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    pub fn stop(&mut self) -> Result<(), String> {
+        if !self.stopped {
+            self.tree.terminate();
+            let _ = self.child.kill();
+            self.child
+                .wait()
+                .map_err(|_| "runtime_process_stop_failed")?;
+            self.stopped = true;
+        }
+        Ok(())
+    }
+}
+impl Drop for NativeSidecar {
+    fn drop(&mut self) {
+        let _ = self.stop();
+        let _ = fs::remove_dir_all(&self.scratch);
+    }
+}
+impl VerifiedRuntime {
+    pub fn start_sidecar(
+        &self,
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<NativeSidecar, String> {
+        if port < 1024 {
+            return Err("runtime_port_invalid".into());
+        }
+        self.launch(
+            cache,
+            private_root,
+            Invocation::Serve {
+                port,
+                qualified: &[],
+            },
+        )
+    }
+    pub fn start_qualified_sidecar(
+        &self,
+        qualified: &QualifiedRuntime,
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<NativeSidecar, String> {
+        self.start_bound_sidecar(&[qualified], cache, private_root, port)
+    }
+    pub fn start_bound_sidecar(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+    ) -> Result<NativeSidecar, String> {
+        if !(1..=64).contains(&qualified.len())
+            || port < 1024
+            || qualified
+                .iter()
+                .any(|item| item.manifest_sha256 != self.manifest_sha256)
+        {
+            return Err("runtime_qualification_binding_invalid".into());
+        }
+        self.launch(cache, private_root, Invocation::Serve { port, qualified })
+    }
+    fn launch(
+        &self,
+        cache: &Path,
+        private_root: &Path,
+        invocation: Invocation<'_>,
+    ) -> Result<NativeSidecar, String> {
+        use rand::RngCore;
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        self.check_files()?;
+        absolute_directory(cache)?;
+        absolute_directory(private_root)?;
+        let scratch = private_root.join(format!("inference-{}", uuid::Uuid::new_v4()));
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&scratch)
+            .map_err(|_| "runtime_scratch_failed")?;
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let token = zeroize::Zeroizing::new(
+            secret
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        zeroize::Zeroize::zeroize(&mut secret);
+        let module = match &invocation {
+            Invocation::Serve { qualified, .. } => {
+                let write = || -> Result<(), String> {
+                    for (index, item) in qualified.iter().enumerate() {
+                        write_private(
+                            &scratch.join(format!("qualification-{index}.json")),
+                            &item.spec,
+                        )?;
+                        let report = serde_json::to_vec(&item.report)
+                            .map_err(|_| "runtime_qualification_report_invalid")?;
+                        write_private(&scratch.join(format!("report-{index}.json")), &report)?;
+                    }
+                    Ok(())
+                };
+                if let Err(error) = write() {
+                    let _ = fs::remove_dir_all(&scratch);
+                    return Err(error);
+                }
+                "native_runtime"
+            }
+            Invocation::Qualify {
+                spec,
+                fixture,
+                name,
+            } => {
+                let write = || -> Result<(), String> {
+                    write_private(&scratch.join("qualification.json"), spec)?;
+                    write_private(&scratch.join(name), fixture)
+                };
+                if let Err(error) = write() {
+                    let _ = fs::remove_dir_all(&scratch);
+                    return Err(error);
+                }
+                "native_qualification"
+            }
+        };
+        let mut command = Command::new(self.root.join(relative(&self.manifest.python)?));
+        command
+            .env_clear()
+            .arg("-I")
+            .arg("-B")
+            .arg("-c")
+            .arg(GATE)
+            .arg(format!(
+                "{}.{module}",
+                self.manifest.module_namespace.prefix()
+            ))
+            .arg("--cache-dir")
+            .arg(cache)
+            .current_dir(&scratch)
+            .env("FRAMELEAF_ML_AUTH_TOKEN", token.as_str())
+            .env("TMPDIR", &scratch)
+            .env("TMP", &scratch)
+            .env("TEMP", &scratch)
+            .env("XDG_CACHE_HOME", scratch.join("cache"))
+            .env("HF_HOME", scratch.join("huggingface"))
+            .env("TORCH_HOME", scratch.join("torch"))
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
+            .env("OMP_NUM_THREADS", "1")
+            .env("OPENBLAS_NUM_THREADS", "1")
+            .env("MKL_NUM_THREADS", "1")
+            .env("MACHINE_LEARNING_MODEL_INTRA_OP_THREADS", "4")
+            .env("MACHINE_LEARNING_MODEL_INTER_OP_THREADS", "1")
+            .env("MACHINE_LEARNING_REQUEST_THREADS", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match invocation {
+            Invocation::Serve { port, qualified } => {
+                if qualified.len() > 1 {
+                    // Older signed runtimes must reject this invocation rather than use only the last pair.
+                    command.arg("--binding-set");
+                }
+                for index in 0..qualified.len() {
+                    command
+                        .arg("--spec")
+                        .arg(scratch.join(format!("qualification-{index}.json")))
+                        .arg("--qualification-report")
+                        .arg(scratch.join(format!("report-{index}.json")));
+                }
+                command
+                    .arg("--port")
+                    .arg(port.to_string())
+                    .arg("--provider")
+                    .arg(self.provider());
+            }
+            Invocation::Qualify { .. } => {
+                command
+                    .arg("--spec")
+                    .arg(scratch.join("qualification.json"))
+                    .arg("--output")
+                    .arg(scratch.join("report.json"));
+            }
+        }
+        #[cfg(unix)]
+        command.env("PATH", "/usr/bin:/bin");
+        #[cfg(windows)]
+        {
+            // Windows needs its OS directory for platform DLL discovery, never an inherited PATH.
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                command.env("PATH", Path::new(&root).join("System32"));
+                command.env("SystemRoot", root);
+            }
+        }
+        crate::process_tree::configure(&mut command);
+        let child = match command.spawn() {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&scratch);
+                return Err("runtime_start_failed".into());
+            }
+        };
+        let mut child = child;
+        let tree = match crate::process_tree::ProcessTree::attach(&child) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&scratch);
+                return Err(error);
+            }
+        };
+        let mut owner = NativeSidecar {
+            child,
+            tree,
+            scratch,
+            token,
+            stopped: false,
+            exit_status: None,
+            lease: None,
+        };
+        owner
+            .child
+            .stdin
+            .as_mut()
+            .ok_or("runtime_gate_failed")?
+            .write_all(START)
+            .map_err(|_| "runtime_gate_failed")?;
+        Ok(owner)
+    }
+}
+
+enum Invocation<'a> {
+    Serve {
+        port: u16,
+        qualified: &'a [&'a QualifiedRuntime],
+    },
+    Qualify {
+        spec: &'a [u8],
+        fixture: &'a [u8],
+        name: &'a str,
+    },
+}
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|_| "runtime_fixture_write_failed".into())
+}
+
+pub struct QualifiedRuntime {
+    spec: Vec<u8>,
+    report: serde_json::Value,
+    manifest_sha256: String,
+}
+impl QualifiedRuntime {
+    pub(crate) fn specification(&self) -> &[u8] {
+        &self.spec
+    }
+    pub fn report(&self) -> &serde_json::Value {
+        &self.report
+    }
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+}
+impl VerifiedRuntime {
+    /// Blocking operation: worker orchestration runs this outside the UI executor.
+    pub fn qualify(
+        &self,
+        cache: &Path,
+        private_root: &Path,
+        spec: &[u8],
+        fixture: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<QualifiedRuntime, String> {
+        use std::{
+            sync::atomic::Ordering,
+            time::{Duration, Instant},
+        };
+        if cancel.load(Ordering::Acquire) {
+            return Err("runtime_cancelled".into());
+        }
+        if spec.is_empty()
+            || spec.len() > 4 * 1024 * 1024
+            || fixture.is_empty()
+            || fixture.len() > 16 * 1024 * 1024
+        {
+            return Err("runtime_qualification_input_invalid".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(spec).map_err(|_| "runtime_qualification_input_invalid")?;
+        let name = value["fixtureFile"]
+            .as_str()
+            .ok_or("runtime_qualification_input_invalid")?;
+        let deadline = value
+            .get("deadlineSeconds")
+            .map(|v| v.as_u64().unwrap_or(0))
+            .unwrap_or(120);
+        relative(name)?;
+        if name.contains('/')
+            || matches!(name, "qualification.json" | "report.json")
+            || value["protocolVersion"] != 1
+            || value["provider"] != self.provider()
+            || value["modelKey"]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 256)
+                .is_none()
+            || value["preprocessingSha256"]
+                .as_str()
+                .filter(|s| digest_valid(s, 64))
+                .is_none()
+            || value["fixtureSha256"] != format!("{:x}", Sha256::digest(fixture))
+            || !(1..=600).contains(&deadline)
+        {
+            return Err("runtime_qualification_input_invalid".into());
+        }
+        let mut child = self.launch(
+            cache,
+            private_root,
+            Invocation::Qualify {
+                spec,
+                fixture,
+                name,
+            },
+        )?;
+        let ends = Instant::now() + Duration::from_secs(deadline);
+        while child.is_running()? {
+            if cancel.load(Ordering::Acquire) {
+                return Err("runtime_cancelled".into());
+            }
+            if Instant::now() >= ends {
+                return Err("runtime_qualification_timeout".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err("runtime_cancelled".into());
+        }
+        if !child.exit_status.is_some_and(|status| status.success()) {
+            return Err("runtime_qualification_failed".into());
+        }
+        let path = child.scratch.join("report.json");
+        let meta = no_link(&path)?;
+        if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+            return Err("runtime_qualification_report_invalid".into());
+        }
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|file| file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+            .map_err(|_| "runtime_qualification_report_invalid")?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("runtime_qualification_report_invalid".into());
+        }
+        let report: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "runtime_qualification_report_invalid")?;
+        validate_report(&report, &value, &format!("{:x}", Sha256::digest(spec)))?;
+        self.check_files()?;
+        Ok(QualifiedRuntime {
+            spec: spec.to_vec(),
+            report,
+            manifest_sha256: self.manifest_sha256.clone(),
+        })
+    }
+}
+fn validate_report(
+    report: &serde_json::Value,
+    spec: &serde_json::Value,
+    binding: &str,
+) -> Result<(), String> {
+    let invalid = || String::from("runtime_qualification_report_invalid");
+    for field in [
+        "modelKey",
+        "provider",
+        "preprocessingSha256",
+        "fixtureSha256",
+    ] {
+        if report[field] != spec[field] {
+            return Err(invalid());
+        }
+    }
+    if report["protocolVersion"] != 1
+        || report["bindingSha256"] != binding
+        || !report["reason"].is_null()
+        || report["runtimeFingerprint"]
+            .as_str()
+            .filter(|s| digest_valid(s, 64))
+            .is_none()
+        || !["coldMilliseconds", "warmMilliseconds"].iter().all(|key| {
+            report[*key]
+                .as_f64()
+                .is_some_and(|v| v.is_finite() && (0.0..=600_000.0).contains(&v))
+        })
+    {
+        return Err(invalid());
+    }
+    let provider = spec["provider"].as_str().ok_or_else(invalid)?;
+    if !matches!(provider, "CPUExecutionProvider" | "CUDAExecutionProvider") {
+        return Err(invalid());
+    }
+    let execution = report["execution"]
+        .as_array()
+        .filter(|v| !v.is_empty() && v.len() <= 64)
+        .ok_or_else(invalid)?;
+    let mut mixed = false;
+    for item in execution {
+        let nodes = item["nodes"].as_object().ok_or_else(invalid)?;
+        if !item["reason"].is_null()
+            || nodes
+                .get(provider)
+                .and_then(|v| v.as_u64())
+                .is_none_or(|n| n == 0)
+            || nodes.iter().any(|(key, v)| {
+                (key != provider && key != "CPUExecutionProvider")
+                    || !v.as_u64().is_some_and(|n| n > 0 && n <= 200_000)
+            })
+        {
+            return Err(invalid());
+        }
+        let state = if provider == "CPUExecutionProvider" {
+            "ready-cpu"
+        } else if nodes.contains_key("CPUExecutionProvider") {
+            mixed = true;
+            "ready-mixed"
+        } else {
+            "ready-accelerator"
+        };
+        if item["state"] != state {
+            return Err(invalid());
+        }
+    }
+    let state = if provider == "CPUExecutionProvider" {
+        "ready-cpu"
+    } else if mixed {
+        "ready-mixed"
+    } else {
+        "ready-accelerator"
+    };
+    if report["state"] != state {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn qualification_cannot_start_a_different_runtime_manifest() {
+        let runtime = VerifiedRuntime {
+            root: PathBuf::new(),
+            manifest: serde_json::from_value(serde_json::json!({
+                "schemaVersion":1,"protocolVersion":1,"epoch":1,
+                "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
+                "provider":"CPUExecutionProvider","python":"python", "sourceRevision":"a".repeat(40),"files":{}
+            })).unwrap(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let qualified = QualifiedRuntime {
+            spec: vec![],
+            report: serde_json::Value::Null,
+            manifest_sha256: "b".repeat(64),
+        };
+        assert_eq!(
+            runtime
+                .start_qualified_sidecar(
+                    &qualified,
+                    Path::new("missing"),
+                    Path::new("missing"),
+                    19999
+                )
+                .err()
+                .unwrap(),
+            "runtime_qualification_binding_invalid"
+        );
+        for bindings in [vec![], vec![&qualified], vec![&qualified; 65]] {
+            assert_eq!(
+                runtime
+                    .start_bound_sidecar(
+                        &bindings,
+                        Path::new("missing"),
+                        Path::new("missing"),
+                        19999
+                    )
+                    .err()
+                    .unwrap(),
+                "runtime_qualification_binding_invalid"
+            );
+        }
+    }
+    #[test]
+    fn python_gate_registers_the_executed_main_module() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-gate-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("test_identity.py"),"import sys,unittest\nclass Identity(unittest.TestCase):\n def test_main(self):\n  self.assertEqual(sys.modules['__main__'].__spec__.name,'unittest.__main__')\n").unwrap();
+        let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+        command
+            .args(["-I", "-B", "-c", GATE, "unittest", "discover", "-s"])
+            .arg(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(START).unwrap();
+        let status = child.wait().unwrap();
+        drop(pipe);
+        let mut errors = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .take(4096)
+            .read_to_string(&mut errors)
+            .unwrap();
+        tree.terminate();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            status.success(),
+            "executed module was not registered as __main__: {errors}"
+        );
+    }
+    #[test]
+    fn python_gate_allows_normal_qualification_process_exit() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+        command
+            .args(["-I", "-B", "-c", GATE, "this"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        child.stdin.as_mut().unwrap().write_all(START).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= end {
+                tree.terminate();
+                let _ = child.wait();
+                panic!("normal Python exit hung");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[test]
+    fn python_gate_terminates_when_parent_pipe_closes() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+        command
+            .args([
+                "-I",
+                "-B",
+                "-c",
+                GATE,
+                "http.server",
+                "--bind",
+                "127.0.0.1",
+                "0",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().expect("CI Python required for gate test");
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(START).unwrap();
+        drop(pipe);
+        let end = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= end {
+                tree.terminate();
+                let _ = child.wait();
+                panic!("parent pipe guardian failed");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // macOS can complete the explicit exit before delivering this process's group SIGKILL.
+            assert!(status.signal() == Some(libc::SIGKILL) || status.code() == Some(125));
+        }
+        #[cfg(windows)]
+        assert_eq!(status.code(), Some(125));
+    }
+}
+
+#[cfg(test)]
+mod accepted_qualification_tests {
+    use super::*;
+    use crate::{
+        ml_transport::AcceptedQualification, model_catalogue::approved_profile, worker::SavedWorker,
+    };
+    use serde_json::{json, Value};
+    const AT: i64 = 1_792_094_400_000;
+    fn fixture() -> (
+        crate::model_catalogue::ApprovedProfile,
+        QualifiedRuntime,
+        Value,
+        SavedWorker,
+    ) {
+        let catalogue: Value =
+            serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+        let data: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/accepted-qualification.json"
+        ))
+        .unwrap();
+        let p = catalogue["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["spec"]["modelKey"] == data["response"]["modelKey"])
+            .unwrap();
+        let profile = approved_profile(
+            p["modelName"].as_str().unwrap(),
+            &p["spec"]["entries"],
+            p["runtimeSourceRevision"].as_str().unwrap(),
+            p["spec"]["provider"].as_str().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let response = data["response"].clone();
+        let mut report = data["report"].clone();
+        report["coldMilliseconds"] = json!(120.0);
+        let qualified = QualifiedRuntime {
+            spec: profile
+                .challenge(response["id"].as_str().unwrap())
+                .unwrap()
+                .0,
+            report,
+            manifest_sha256: "a".repeat(64),
+        };
+        let worker: SavedWorker = serde_json::from_value(json!({"serverId":"server","accountId":"account","deviceId":"445bc2b6-f4cd-439e-b8bb-7e84d7ee0550","sessionId":"1117c1ca-0495-46e9-b579-f321520c2b1a","authorizationEpoch":2,"workerToken":"a".repeat(64),"expiresAt":"2026-10-15T22:00:00Z","nextSequence":1})).unwrap();
+        (profile, qualified, response, worker)
+    }
+    #[test]
+    fn accepted_evidence_binds_local_runtime_and_survives_only_ordinary_token_renewal() {
+        let (profile, qualified, response, mut worker) = fixture();
+        let grant = AcceptedQualification::bind(
+            &worker,
+            &profile,
+            &qualified,
+            &serde_json::to_vec(&response).unwrap(),
+            AT,
+        )
+        .unwrap();
+        assert_eq!(grant.id(), response["id"].as_str().unwrap());
+        worker.worker_token = "b".repeat(64);
+        worker.next_sequence = 9;
+        assert!(grant.validate_authority(&worker, AT).is_ok());
+        for (field, value) in [
+            ("serverId", json!("other")),
+            ("accountId", json!("other")),
+            ("deviceId", json!("other")),
+            ("sessionId", json!("other")),
+            ("authorizationEpoch", json!(3)),
+        ] {
+            let mut changed = serde_json::to_value(&worker).unwrap();
+            changed[field] = value;
+            assert!(grant
+                .validate_authority(&serde_json::from_value(changed).unwrap(), AT)
+                .is_err());
+        }
+        assert!(grant.validate_authority(&worker, AT + 3_600_000).is_err());
+        assert!(grant.validate_runtime(&qualified, AT).is_ok());
+        let config: Value = serde_json::from_slice(qualified.specification()).unwrap();
+        let task_wire = json!({"id":"ff8f1290-3c1d-4695-8696-af493be01fe0","taskId":"c39d4385-84f8-4c37-a643-1b98fc12df93",
+            "deviceId":worker.device_id,"sessionId":worker.session_id,"authorizationEpoch":2,"generation":1,
+            "qualificationId":response["id"],"qualificationExpiresAt":response["expiresAt"],"modelKey":response["modelKey"],
+            "configJson":serde_json::to_string(&config["entries"]).unwrap(),"configSha256":response["configSha256"],
+            "inputSha256":"b".repeat(64),"inputKind":"text","maxInputBytes":1024,"expiresAt":"2026-10-15T20:01:00Z","executionDeadline":"2026-10-15T20:03:00Z"});
+        let task = serde_json::from_value(task_wire.clone()).unwrap();
+        assert!(grant.validate_task(&worker, &task, AT).is_ok());
+        for (field, value) in [
+            (
+                "qualificationId",
+                json!("c39d4385-84f8-4c37-a643-1b98fc12df93"),
+            ),
+            ("qualificationExpiresAt", json!("2026-10-15T21:00:01Z")),
+            ("inputKind", json!("image")),
+            ("configSha256", json!("c".repeat(64))),
+        ] {
+            let mut changed = task_wire.clone();
+            changed[field] = value;
+            assert!(grant
+                .validate_task(&worker, &serde_json::from_value(changed).unwrap(), AT)
+                .is_err());
+        }
+    }
+    #[test]
+    fn accepted_evidence_rejects_altered_runtime_report_model_association_and_lifetime() {
+        let (profile, qualified, response, worker) = fixture();
+        for (field, value) in [
+            ("id", json!("ff8f1290-3c1d-4695-8696-af493be01fe0")),
+            ("modelKey", json!("other")),
+            ("configSha256", json!("b".repeat(64))),
+            ("bindingSha256", json!("b".repeat(64))),
+            ("manifestSha256", json!("b".repeat(64))),
+            ("runtimeFingerprint", json!("b".repeat(64))),
+            ("reportSha256", json!("b".repeat(64))),
+            ("inputKind", json!("image")),
+            ("deviceId", json!("other")),
+            ("sessionId", json!("other")),
+            ("authorizationEpoch", json!(3)),
+            ("qualifiedAt", json!("2026-10-15T20:05:00Z")),
+            ("expiresAt", json!("2026-10-15T21:00:01Z")),
+            ("expiresAt", json!("2026-10-15T19:00:00Z")),
+            ("extra", json!(true)),
+        ] {
+            let mut changed = response.clone();
+            changed[field] = value;
+            assert!(
+                AcceptedQualification::bind(
+                    &worker,
+                    &profile,
+                    &qualified,
+                    &serde_json::to_vec(&changed).unwrap(),
+                    AT
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+}
