@@ -20,6 +20,22 @@ const TEST: &str =
 const ROLE: &str = "FRAMELEAF_MANAGER_TEST_ROLE";
 const ROOT: &str = "FRAMELEAF_MANAGER_TEST_ROOT";
 
+// Start the worker before libtest can write its banner into the receipt pipe.
+// SAFETY: Windows CRT invokes this retained, valid C initializer before main.
+#[used]
+#[unsafe(link_section = ".CRT$XCU")]
+static WORKER_ENTRY: extern "C" fn() = worker_entry;
+
+extern "C" fn worker_entry() {
+    if std::env::var(ROLE).as_deref() != Ok("worker") {
+        return;
+    }
+    let result = std::panic::catch_unwind(|| {
+        worker(&PathBuf::from(std::env::var_os(ROOT).unwrap()));
+    });
+    std::process::exit(if result.is_ok() { 0 } else { 101 });
+}
+
 fn command(role: &str, root: &Path) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -47,6 +63,23 @@ fn record(root: &Path, name: &str, pid: u32) {
     let temporary = root.join(format!(".{name}"));
     fs::write(&temporary, pid.to_string()).unwrap();
     fs::rename(temporary, root.join(name)).unwrap();
+}
+
+fn worker(root: &Path) {
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input).unwrap();
+    assert_eq!(input, "synthetic-bootstrap\n");
+    let mut command = command("browser", root);
+    command.creation_flags(DETACHED_PROCESS);
+    let mut browser = command.spawn().unwrap();
+    record(root, "browser", browser.id());
+    wait_for(&root.join("action"));
+    if fs::read(root.join("action")).unwrap().as_slice() == b"bad-receipt" {
+        let mut output = std::io::stdout();
+        std::io::Write::write_all(&mut output, b"invalid\n").unwrap();
+        std::io::Write::flush(&mut output).unwrap();
+    }
+    browser.wait().unwrap();
 }
 
 async fn role(role: &str, root: &Path) {
@@ -96,16 +129,7 @@ async fn role(role: &str, root: &Path) {
             }
             drop(owner);
         }
-        "worker" => {
-            let mut input = String::new();
-            std::io::stdin().lock().read_line(&mut input).unwrap();
-            assert_eq!(input, "synthetic-bootstrap\n");
-            let mut command = command("browser", root);
-            command.creation_flags(DETACHED_PROCESS);
-            let mut browser = command.spawn().unwrap();
-            record(root, "browser", browser.id());
-            browser.wait().unwrap();
-        }
+        "worker" => panic!("Manager worker bypassed its pre-libtest entry point"),
         "browser" => {
             let mut leaf = command("leaf", root).spawn().unwrap();
             record(root, "leaf", leaf.id());
@@ -222,7 +246,9 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
         if mode == "owner-loss" {
             fixture.owner.as_mut().unwrap().kill().unwrap();
         } else {
-            fs::write(fixture.root.join("action"), mode.as_bytes()).unwrap();
+            let action = fixture.root.join(".action");
+            fs::write(&action, mode.as_bytes()).unwrap();
+            fs::rename(action, fixture.root.join("action")).unwrap();
         }
         for handle in &fixture.handles {
             assert_eq!(
