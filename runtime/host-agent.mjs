@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { delimiter, isAbsolute, join, dirname, basename } from "node:path";
 import { createInterface } from "node:readline";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 const fail = (code) => {
   throw new Error(code);
@@ -13,6 +14,7 @@ const fail = (code) => {
 // Enable only after private Chromium, fonts and installed lifecycle qualification.
 const STUDIO_ENABLED = false;
 const RESTORE_SESSION = Symbol("private restore session");
+const RESTORE_VALIDATION = Symbol("private read-only restore validation");
 // Read only the dedicated child IPC channel; stdout is never readiness evidence.
 export function studioReadyUntil(message, engineDigest, now = Date.now()) {
   if (!message || message.protocolVersion !== 1)
@@ -128,8 +130,14 @@ export function checkpointRequest(line) {
 }
 export function checkpointControlRequest(c, line) {
   try {
-    if (typeof line !== "string" || Buffer.byteLength(line) > 1024) throw Error();
+    if (typeof line !== "string" || Buffer.byteLength(line) > 4096) throw Error();
     const value = JSON.parse(line);
+    if (value?.action === "verify-restore") {
+      if (c.mode !== "restore-prepare" || Object.keys(value).sort().join(",") !== "action,operationId,prepared,protocolVersion,verificationId" || value.protocolVersion !== 1 || typeof value.verificationId !== "string" || !CHECKPOINT_ID.test(value.verificationId)) throw Error();
+      const prepared = preparedRestoreReceipt(c, value.prepared);
+      if (prepared.binding.operationId !== value.operationId) throw Error();
+      return {protocolVersion:1, action:"verify-restore", operationId:value.operationId, prepared, verificationId:value.verificationId};
+    }
     if (value?.action === "prepare-restore") {
       if (c.mode !== "restore-prepare" || Object.keys(value).sort().join(",") !== "action,binding,operationId,protocolVersion" || value.protocolVersion !== 1) throw Error();
       const binding = restoreInputBinding(c, value.binding);
@@ -156,19 +164,21 @@ async function checkpointDirectory(path, create = false) {
   if (!meta.isDirectory() || meta.isSymbolicLink() ||
     (process.platform !== "win32" && (meta.mode & 0o077) !== 0)) fail("host_checkpoint_not_private");
 }
-async function checkpointHash(path, check) {
+async function checkpointHash(path, check, maximum = Number.MAX_SAFE_INTEGER) {
   const named = await fs.lstat(path, { bigint: true });
   if (!named.isFile() || named.isSymbolicLink()) fail("host_checkpoint_changed");
   const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await file.stat({ bigint: true });
     if (before.dev !== named.dev || before.ino !== named.ino || !before.isFile() || before.nlink !== 1n || before.size <= 0n ||
-      before.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+      before.size > BigInt(maximum) ||
       (process.platform !== "win32" && (before.mode & 0o077n) !== 0n)) fail("host_checkpoint_changed");
     const hash = createHash("sha256"); let bytes = 0;
-    for await (const chunk of file.createReadStream({ autoClose: false })) {
+    for await (const chunk of file.createReadStream({ autoClose: false, highWaterMark: Math.min(64 * 1024, maximum + 1) })) {
       check();
-      bytes += chunk.length; hash.update(chunk);
+      bytes += chunk.length;
+      if (bytes > maximum) fail("host_checkpoint_changed");
+      hash.update(chunk);
     }
     const after = await file.stat({ bigint: true });
     const stillNamed = await fs.lstat(path, { bigint: true });
@@ -201,17 +211,17 @@ export async function cleanupHostCheckpoint(c, supplied) {
   validateConfig(c);
   const expected = retirementReceipt(c, supplied);
   await checkpointDirectory(c.state);
-  if (await fs.realpath(c.state) !== c.state) fail("host_checkpoint_changed");
+  if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_checkpoint_changed");
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root);
-  if (await fs.realpath(root) !== root) fail("host_checkpoint_changed");
+  if (!canonicalHostPathMatches(await fs.realpath(root), root)) fail("host_checkpoint_changed");
   const target = join(root, expected.operationId), marker = join(root, "." + expected.operationId + ".retired.json");
   let retired = false, markerIdentity;
   try {
     const named = await fs.lstat(marker);
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 ||
       (process.platform !== "win32" && (named.mode & 0o077) !== 0) ||
-      (await fs.realpath(marker)) !== marker) fail("host_checkpoint_changed");
+      !canonicalHostPathMatches(await fs.realpath(marker), marker)) fail("host_checkpoint_changed");
     const value = retirementReceipt(c, JSON.parse(await stateFile(marker, 4096)));
     if (JSON.stringify(value) !== JSON.stringify(expected)) fail("host_checkpoint_changed");
     retired = true; markerIdentity = named;
@@ -231,7 +241,7 @@ export async function cleanupHostCheckpoint(c, supplied) {
   catch (error) { if (error.code !== "ENOENT" || !retired) throw error; }
   if (directory) {
     await checkpointDirectory(target);
-    if (await fs.realpath(target) !== target) fail("host_checkpoint_changed");
+    if (!canonicalHostPathMatches(await fs.realpath(target), target)) fail("host_checkpoint_changed");
     const names = (await fs.readdir(target)).sort();
     if (names.some(name => !["checkpoint.json", "database.dump"].includes(name)) ||
       (!retired && names.join(",") !== "checkpoint.json,database.dump")) fail("host_checkpoint_changed");
@@ -239,7 +249,7 @@ export async function cleanupHostCheckpoint(c, supplied) {
     for (const name of names) {
       const path = join(target, name), before = await fs.lstat(path);
       if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
-        (await fs.realpath(path)) !== path) fail("host_checkpoint_changed");
+        !canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_checkpoint_changed");
       if (name === "checkpoint.json") {
         if (JSON.stringify(retirementReceipt(c, JSON.parse(await stateFile(path, 4096)))) !== JSON.stringify(expected))
           fail("host_checkpoint_changed");
@@ -271,11 +281,16 @@ export async function cleanupHostCheckpoint(c, supplied) {
   return { ...expected, state: "checkpoint-cleaned" };
 }
 
+export function canonicalHostPathMatches(actual, expected, platform = process.platform) {
+  // Node strips the local-drive verbatim prefix returned by Rust canonicalize on Windows.
+  return actual === expected || (platform === "win32" && /^\\\\\?\\[A-Za-z]:\\/.test(expected) && actual === expected.slice(4));
+}
+
 async function checkpointIdentity(path, directory = false) {
   const meta = await fs.lstat(path, { bigint: true });
   if (meta.isSymbolicLink() || (directory ? !meta.isDirectory() : !meta.isFile() || meta.nlink !== 1n) ||
     meta.ino <= 0n || (process.platform !== "win32" && (meta.mode & 0o077n) !== 0n) ||
-    await fs.realpath(path) !== path) fail("host_checkpoint_changed");
+    !canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_checkpoint_changed");
   return `${meta.dev}:${meta.ino}`;
 }
 async function checkpointAttempt(path, binding) {
@@ -346,7 +361,7 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
   await checkpointDirectory(c.state);
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root, true);
-  if (await fs.realpath(c.state) !== c.state || await fs.realpath(root) !== root) fail("host_checkpoint_changed");
+  if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state) || !canonicalHostPathMatches(await fs.realpath(root), root)) fail("host_checkpoint_changed");
   await checkpointSyncDirectory(c.state);
   // Any retirement intent forbids regenerating a different live dump under the same operation ID.
   try {
@@ -699,22 +714,52 @@ export function ownHostServer(child) {
   };
 }
 
+/** Internal controller locator only; no caller-supplied paths and no activation authority. */
+export async function readHostDatabase(profile, supplied) {
+  if (supplied === undefined) return join(profile, "database");
+  try {
+    const reference = structuredClone(supplied);
+    if (!reference || Object.keys(reference).sort().join(",") !== "attemptId,identities,operationId" ||
+      typeof reference.operationId !== "string" || !CHECKPOINT_ID.test(reference.operationId) ||
+      typeof reference.attemptId !== "string" || !CHECKPOINT_ID.test(reference.attemptId) ||
+      !Array.isArray(reference.identities) || reference.identities.length !== 5 ||
+      !reference.identities.every(value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)))
+      fail("host_database_reference_invalid");
+    const root = join(profile, "restore-targets"), operation = join(root, reference.operationId),
+      target = join(operation, reference.attemptId), database = join(target, "database");
+    const paths = [profile, root, operation, target, database];
+    for (let i = 0; i < paths.length; i++) {
+      await checkpointIdentity(paths[i], true);
+      const meta = await fs.lstat(paths[i], { bigint: true });
+      // Match the controller's native identity namespace, including Windows' high/low file index.
+      const identity = process.platform === "win32"
+        ? `${meta.dev}:${meta.ino >> 32n}:${meta.ino & 0xffffffffn}` : `${meta.dev}:${meta.ino}`;
+      if (createHash("sha256").update(identity).digest("hex") !== reference.identities[i])
+        fail("host_database_reference_invalid");
+    }
+    return database;
+  } catch { fail("host_database_reference_invalid"); }
+}
+
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
-  if (restoreSession !== undefined && restoreSession?.[RESTORE_SESSION] !== true) fail("host_restore_authority_invalid");
   const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
+  const validateOnly = restoreSession?.[RESTORE_VALIDATION] === true;
+  if ((restoreSession !== undefined && !restoreOnly && !validateOnly) || (validateOnly && c.mode !== "database")) fail("host_restore_authority_invalid");
   if (c.mode === "checkpoint-cleanup" || c.mode === "restore-prepare") {
     // Maintenance starts no original database; restore writes only a separate owned attempt.
     await checkpointDirectory(c.state);
-    if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
+    if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_state_not_private");
     await stateFile(join(c.state, "host-state.json"), 4096).catch(() => fail("host_state_invalid"));
     await claimState(c);
     let pending, cancelled = false;
     void stopping.then(() => { cancelled = true; });
     ready(request => {
-      if (cancelled || pending || request.action !== (c.mode === "restore-prepare" ? "prepare-restore" : "cleanup-checkpoint"))
+      if (cancelled || pending || !(c.mode === "restore-prepare" ? ["prepare-restore", "verify-restore"] : ["cleanup-checkpoint"]).includes(request.action))
         return Promise.reject(new Error("host_checkpoint_unavailable"));
-      const work = c.mode === "restore-prepare" ? restoreHostDatabase(c, request.binding, stopping) : cleanupHostCheckpoint(c, request.checkpoint);
+      const work = request.action === "verify-restore"
+        ? validateHostRestoreTarget(c, request.prepared, stopping).then(checked => ({state:"restore-verified", prepared:checked.receipt, offlineChecksums:true, schemaValidated:true, verificationId:request.verificationId}))
+        : c.mode === "restore-prepare" ? restoreHostDatabase(c, request.binding, stopping) : cleanupHostCheckpoint(c, request.checkpoint);
       pending = work;
       void work.finally(() => { if (pending === work) pending = undefined; }).catch(() => {});
       return work;
@@ -723,13 +768,16 @@ export async function runHost(c, stopping, ready, restoreSession) {
     finally { cancelled = true; await pending?.catch(() => {}); }
     return;
   }
+  const databaseReference = c.databaseReference === undefined ? undefined : structuredClone(c.databaseReference);
+  const data = await readHostDatabase(c.state, databaseReference);
+  const selectedDatabase = databaseReference !== undefined;
   const databaseOnly = c.mode === "database";
   if (!databaseOnly && !restoreOnly) await portFree(c.apiPort);
   await portFree(c.databasePort);
   if (databaseOnly) {
     try {
       await checkpointDirectory(c.state);
-      if (await fs.realpath(c.state) !== c.state) fail("host_state_not_private");
+      if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_state_not_private");
       await stateFile(join(c.state, "host-state.json"), 4096);
     } catch (error) {
       if (error.code === "ENOENT") fail("host_database_missing");
@@ -762,7 +810,6 @@ export async function runHost(c, stopping, ready, restoreSession) {
       fail("host_state_not_private");
   }
   const executable = (name) => join(c.runtime, c.entryPoints[name]);
-  const data = join(c.state, "database");
   const env = hostEnvironment(c);
   const logPath = join(c.state, "host.log");
   try {
@@ -806,8 +853,9 @@ export async function runHost(c, stopping, ready, restoreSession) {
     const child = launch(args, extra, undefined, !options.quiet);
     let output = "",
       oversized = false;
-    if (options.quiet) {
-      child.stdout.resume(); child.stderr.resume();
+    if (options.quiet) child.stderr.resume();
+    if (options.quiet && !options.capture) {
+      child.stdout.resume();
     } else child.stdout.on("data", (chunk) => {
       if (Buffer.byteLength(output) + chunk.length > 65536) {
         oversized = true;
@@ -843,7 +891,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       if (error.code !== "ENOENT") throw error;
     }
     if (restoreOnly && initialized) fail("host_restore_target_not_empty");
-    if (databaseOnly && !initialized) fail("host_database_missing");
+    if ((databaseOnly || selectedDatabase) && !initialized) fail("host_database_missing");
     if (!initialized) {
       try {
         await fs.lstat(data);
@@ -871,6 +919,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       }
     }
     if (cancelled) fail("host_cancelled");
+    if (selectedDatabase) await readHostDatabase(c.state, databaseReference);
     pg = launch([
       executable("postgres"),
       "-D",
@@ -926,7 +975,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
     if (database.trim() !== "" && database.trim() !== "1")
       fail("host_database_provisioning_failed");
     if (restoreOnly && database.trim() !== "") fail("host_restore_target_not_empty");
-    if (databaseOnly && database.trim() === "") fail("host_database_missing");
+    if ((databaseOnly || selectedDatabase) && database.trim() === "") fail("host_database_missing");
     if (database.trim() === "")
       await command(
         [
@@ -1038,6 +1087,21 @@ export async function runHost(c, stopping, ready, restoreSession) {
         );
       }
     }
+    if (validateOnly) {
+      const binding = restoreSession.prepared.binding;
+      const validation = JSON.parse(await command([executable("psql"), "-h", "127.0.0.1", "-p", String(c.databasePort), "-U", "frameleaf", "-d", "frameleaf", "-XAt", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT json_build_object('postgresMajor',current_setting('server_version_num')::int / 10000,'vectorVersion',(SELECT extversion FROM pg_extension WHERE extname='vector'),'canonical',to_regclass('public.user') IS NOT NULL AND to_regclass('public.asset') IS NOT NULL AND to_regclass('public.album') IS NOT NULL,'readOnly',current_setting('transaction_read_only')='on')"], {PGPASSWORD:c.password}, false, {quiet:true, capture:true}));
+      if (validation.postgresMajor !== 19 || validation.vectorVersion !== "0.8.7" || validation.canonical !== true || validation.readOnly !== true) fail("host_restore_canonical_invalid");
+      const report = JSON.parse(await command([executable("node"), executable("server"), "frameleaf-admin", "validate-restore"], {
+        DB_HOSTNAME:"127.0.0.1", DB_PORT:String(c.databasePort), DB_USERNAME:"frameleaf", DB_PASSWORD:c.password, DB_DATABASE_NAME:"frameleaf",
+        FRAMELEAF_MANAGER_ORIGIN:"restored_library", FRAMELEAF_MANAGER_INSTALLATION:binding.installationId,
+        FRAMELEAF_MANAGER_RESTORE_OPERATION_ID:binding.operationId,
+        FRAMELEAF_MEDIA_LOCATION:join(restoreSession.original.state,"media"), FRAMELEAF_BUILD_DATA:join(c.runtime,"build"),
+        FRAMELEAF_HDR_BINDING:executable("hdr"), FRAMELEAF_STUDIO_WORKER:"false",
+      }, false, {quiet:true, capture:true, timeout:7_200_000}));
+      if (cancelled || !isDeepStrictEqual(report, {protocolVersion:1, state:"restore-schema-valid", installationId:binding.installationId, operationId:binding.operationId})) fail("host_restore_canonical_invalid");
+      restoreSession.validated = true;
+    }
     ready((request) => {
       if (checkpointWork || cancelled || (app && (app.exitCode !== null || app.signalCode !== null)) || pg.exitCode !== null || pg.signalCode !== null)
         return Promise.reject(new Error("host_checkpoint_unavailable"));
@@ -1108,7 +1172,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
         await exited(child, 5000);
       }
     await log.close();
-    if (restoreOnly && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
+    if ((restoreOnly || validateOnly) && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
       stopError ??= new Error("host_restore_shutdown_unconfirmed");
     if (stopError) throw stopError;
   }
@@ -1135,11 +1199,11 @@ async function main() {
       }
       const request = checkpointControlRequest(config, line);
       if (!checkpoint || pending) fail("host_checkpoint_unavailable");
-      const cleanup = request.action === "cleanup-checkpoint", restore = request.action === "prepare-restore";
+      const cleanup = request.action === "cleanup-checkpoint", verify = request.action === "verify-restore", restore = request.action === "prepare-restore" || verify;
       pending = checkpoint(request)
         .then(receipt => process.stdout.write(JSON.stringify(restore ? receipt : { ...receipt, state: cleanup ? "checkpoint-cleaned" : "checkpoint" }) + "\n"))
-        .catch(() => process.stdout.write(JSON.stringify({ state: restore ? "restore-prepare-failed" : cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
-          operationId: request.operationId, code: restore ? "host_restore_failed" : cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
+        .catch(() => process.stdout.write(JSON.stringify({ state: verify ? "restore-verify-failed" : restore ? "restore-prepare-failed" : cleanup ? "checkpoint-cleanup-failed" : "checkpoint-failed",
+          operationId: request.operationId, ...(verify ? {verificationId:request.verificationId} : {}), code: verify ? "host_restore_verification_failed" : restore ? "host_restore_failed" : cleanup ? "host_checkpoint_cleanup_failed" : "host_checkpoint_failed" }) + "\n"))
         .finally(() => { pending = undefined; });
     }
     stop();
@@ -1172,10 +1236,10 @@ if (process.env.FRAMELEAF_HOST_AGENT === "1") {
 async function restoreInputJson(path) {
   if ((await fs.lstat(path)).size > 4096) fail("host_restore_input_invalid");
   const identity = await checkpointIdentity(path);
-  const before = await checkpointHash(path, () => {});
+  const before = await checkpointHash(path, () => {}, 4096);
   const raw = await stateFile(path, 4096);
   if (Buffer.byteLength(raw) !== before.bytes || createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
-    JSON.stringify(await checkpointHash(path, () => {})) !== JSON.stringify(before) || await checkpointIdentity(path) !== identity)
+    JSON.stringify(await checkpointHash(path, () => {}, 4096)) !== JSON.stringify(before) || await checkpointIdentity(path) !== identity)
     fail("host_restore_input_invalid");
   return JSON.parse(raw);
 }
@@ -1209,8 +1273,9 @@ function restoreInputRecovery(c, value) {
 }
 
 /** Fixed-path staged input validation only; restore effects require the later exclusive controller operation. */
-export async function readHostRestoreInput(c, supplied) {
+export async function readHostRestoreInput(c, supplied, check = () => {}) {
   try {
+    check();
     validateConfig(c);
     const binding = restoreInputBinding(c, supplied), root = join(c.state, "restore-input"), target = join(root, binding.operationId), input = join(target, "input");
     const identities = new Map();
@@ -1223,11 +1288,11 @@ export async function readHostRestoreInput(c, supplied) {
     const recovery = restoreInputRecovery(c, await restoreInputJson(join(input, "recovery.json")));
     if (recovery.libraryId !== binding.libraryId || createHash("sha256").update(JSON.stringify(recovery)).digest("hex") !== binding.recoverySha256)
       fail("host_restore_input_invalid");
-    const dump = join(input, "database.dump"), actual = await checkpointHash(dump, () => {});
+    const dump = join(input, "database.dump"), actual = await checkpointHash(dump, check);
     if (JSON.stringify(actual) !== JSON.stringify(recovery.checkpoint.dump)) fail("host_restore_input_invalid");
     for (const [path, identity] of identities) if (await checkpointIdentity(path, true) !== identity) fail("host_restore_input_invalid");
     return { binding, recovery, dump };
-  } catch { fail("host_restore_input_invalid"); }
+  } catch (error) { if (error?.message === "host_restore_cancelled") throw error; fail("host_restore_input_invalid"); }
 }
 
 
@@ -1241,11 +1306,11 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision) fail("host_restore_runtime_required");
   const profileIdentity = await checkpointIdentity(c.state, true);
   const root = join(c.state, "restore-targets"), operationRoot = join(root, input.binding.operationId);
-  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (await fs.realpath(path) !== path) fail("host_restore_input_invalid");}
+  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (!canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_restore_input_invalid");}
   const attemptId = randomUUID(), target = join(operationRoot, attemptId);
   await fs.mkdir(target, {mode:0o700});
   const targetIdentity = await checkpointIdentity(target, true);
-  const inner = {...c, state:target, mode:"server"};
+  const inner = {...c, state:target, mode:"server", databaseReference:undefined};
   await claimState(inner);
   const intent = {schemaVersion:1, binding:input.binding, attemptId, profileIdentity, targetIdentity};
   const record = await fs.open(join(target,"restore-target.json"),"wx",0o600);
@@ -1267,4 +1332,266 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   await checkpointSyncDirectory(target);await checkpointSyncDirectory(operationRoot);
   if (cancelled) fail("host_restore_cancelled");
   return receipt;
+}
+
+/** Normalize receipt identity without granting filesystem or activation authority. */
+function preparedRestoreReceipt(c, supplied) {
+  if (
+    !supplied ||
+    Object.keys(supplied).sort().join(",") !==
+      "attemptId,binding,databaseIdentity,profileIdentity,schemaVersion,state,targetIdentity,validation" ||
+    supplied.schemaVersion !== 1 ||
+    supplied.state !== "restore-prepared" ||
+    typeof supplied.attemptId !== "string" ||
+    !CHECKPOINT_ID.test(supplied.attemptId) ||
+    ![
+      supplied.profileIdentity,
+      supplied.targetIdentity,
+      supplied.databaseIdentity,
+    ].every(
+      (value) =>
+        typeof value === "string" &&
+        value.length <= 128 &&
+        /^[0-9]+:[0-9]+$/.test(value),
+    ) ||
+    !isDeepStrictEqual(supplied.validation, {
+      postgresMajor: 19,
+      vectorVersion: "0.8.7",
+      canonical: true,
+      executionStateReconstructed: true,
+    })
+  )
+    fail("host_restore_target_invalid");
+  return {
+    schemaVersion: 1,
+    state: "restore-prepared",
+    binding: restoreInputBinding(c, supplied.binding),
+    attemptId: supplied.attemptId,
+    profileIdentity: supplied.profileIdentity,
+    targetIdentity: supplied.targetIdentity,
+    databaseIdentity: supplied.databaseIdentity,
+    validation: {
+      postgresMajor: 19,
+      vectorVersion: "0.8.7",
+      canonical: true,
+      executionStateReconstructed: true,
+    },
+  };
+}
+
+/** Recheck prepared evidence only; exclusive activation must still verify offline database state. */
+export async function readHostRestoreTarget(configuration, supplied, check = () => {}) {
+  try {
+    const c = {
+      ...configuration,
+      entryPoints: { ...configuration.entryPoints },
+    };
+    check();
+    validateConfig(c);
+    const receipt = preparedRestoreReceipt(c, supplied);
+    const root = join(c.state, "restore-targets"),
+      operationRoot = join(root, receipt.binding.operationId);
+    const target = join(operationRoot, receipt.attemptId),
+      database = join(target, "database");
+    const identities = new Map();
+    for (const path of [c.state, root, operationRoot, target, database])
+      identities.set(path, await checkpointIdentity(path, true));
+    if (
+      identities.get(c.state) !== receipt.profileIdentity ||
+      identities.get(target) !== receipt.targetIdentity ||
+      identities.get(database) !== receipt.databaseIdentity
+    )
+      fail("host_restore_target_invalid");
+    const intent = {
+      schemaVersion: 1,
+      binding: receipt.binding,
+      attemptId: receipt.attemptId,
+      profileIdentity: receipt.profileIdentity,
+      targetIdentity: receipt.targetIdentity,
+    };
+    const marker = {
+      schemaVersion: 1,
+      manifestSha256: c.manifestSha256,
+      sourceRevision: c.sourceRevision,
+      postgresMajor: c.postgresMajor,
+    };
+    async function verifyRecords() {
+      if (
+        !isDeepStrictEqual(
+          await restoreInputJson(join(target, "restore-target.json")),
+          intent,
+        ) ||
+        !isDeepStrictEqual(
+          await restoreInputJson(join(target, "restore-result.json")),
+          receipt,
+        ) ||
+        !isDeepStrictEqual(
+          await restoreInputJson(join(target, "host-state.json")),
+          marker,
+        )
+      )
+        fail("host_restore_target_invalid");
+      try {
+        await fs.lstat(join(database, "postmaster.pid"));
+        fail("host_restore_target_invalid");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const path = join(database, "PG_VERSION"),
+        before = await checkpointHash(path, check, 16),
+        raw = await stateFile(path, 16);
+      if (
+        raw.trim() !== c.postgresMajor ||
+        Buffer.byteLength(raw) !== before.bytes ||
+        createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
+        !isDeepStrictEqual(await checkpointHash(path, () => {}, 16), before)
+      )
+        fail("host_restore_target_invalid");
+    }
+    await verifyRecords();
+    const input = await readHostRestoreInput(c, receipt.binding, check);
+    if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision)
+      fail("host_restore_target_invalid");
+    for (const [path, identity] of identities)
+      if ((await checkpointIdentity(path, true)) !== identity)
+        fail("host_restore_target_invalid");
+    await verifyRecords();
+    for (const [path, identity] of identities)
+      if ((await checkpointIdentity(path, true)) !== identity)
+        fail("host_restore_target_invalid");
+    return { receipt, target, database };
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
+    fail("host_restore_target_invalid");
+  }
+}
+/** Read-only evidence under the controller's exclusive leases; this never activates a database. */
+export async function verifyHostRestoreTarget(
+  configuration,
+  supplied,
+  stopping,
+) {
+  let child,
+    cancelled = false,
+    spawnFailed = false;
+  const deadline = Date.now() + 2 * 60 * 60_000;
+  void stopping.then(() => {
+    cancelled = true;
+  });
+  function check() {
+    if (cancelled) fail("host_restore_cancelled");
+    if (Date.now() > deadline) fail("host_restore_offline_invalid");
+  }
+  try {
+    const c = {
+      ...configuration,
+      entryPoints: { ...configuration.entryPoints },
+    };
+    const expected = structuredClone(supplied);
+    const checked = await readHostRestoreTarget(c, expected, check);
+    check();
+    const tool = c.entryPoints.pgChecksums;
+    if (
+      typeof tool !== "string" ||
+      tool.includes("\\") ||
+      tool.includes(":") ||
+      tool.split("/").some((part) => !part || part === "." || part === "..") ||
+      basename(tool) !==
+        "pg_checksums" + (process.platform === "win32" ? ".exe" : "")
+    )
+      fail("host_restore_offline_invalid");
+    async function tree() {
+      const entries = new Map(),
+        pending = [checked.database];
+      while (pending.length) {
+        check();
+        const path = pending.pop(),
+          meta = await fs.lstat(path, { bigint: true });
+        const directory = meta.isDirectory(),
+          identity = await checkpointIdentity(path, directory);
+        if (identity !== meta.dev + ":" + meta.ino || entries.size >= 100_000)
+          fail("host_restore_offline_invalid");
+        entries.set(path, {
+          identity,
+          directory,
+          size: meta.size,
+          modified: meta.mtimeNs,
+        });
+        if (directory) {
+          const handle = await fs.opendir(path);
+          for await (const entry of handle) {
+            check();
+            if (entries.size + pending.length >= 100_000)
+              fail("host_restore_offline_invalid");
+            pending.push(join(path, entry.name));
+          }
+          if ((await checkpointIdentity(path, true)) !== identity)
+            fail("host_restore_offline_invalid");
+        }
+      }
+      return entries;
+    }
+    const before = await tree();
+    check();
+    child = spawn(
+      join(c.runtime, tool),
+      ["--check", "--pgdata", checked.database],
+      {
+        cwd: checked.target,
+        env: hostEnvironment(c),
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    child.on("error", () => {
+      spawnFailed = true;
+    });
+    while (!(await exited(child, 100))) check();
+    check();
+    if (spawnFailed || child.exitCode !== 0 || child.signalCode !== null)
+      fail("host_restore_offline_invalid");
+    if (
+      !isDeepStrictEqual(await tree(), before) ||
+      !isDeepStrictEqual(await readHostRestoreTarget(c, expected, check), checked)
+    )
+      fail("host_restore_offline_invalid");
+    check();
+    return { ...checked, offlineChecksums: true };
+  } catch (error) {
+    if (error?.message === "host_restore_cancelled") throw error;
+    fail("host_restore_offline_invalid");
+  } finally {
+    if (child && !(await exited(child, 100))) {
+      child.kill();
+      if (!(await exited(child, 5000))) {
+        child.kill("SIGKILL");
+        if (!(await exited(child, 5000)))
+          fail("host_restore_offline_stop_unconfirmed");
+      }
+    }
+  }
+}
+
+
+/** Offline checks surround an owned read-only SQL inspection; neither phase admits application writers. */
+export async function validateHostRestoreTarget(configuration, supplied, stopping) {
+  const c = {...configuration, entryPoints:{...configuration.entryPoints}}, expected = structuredClone(supplied);
+  let cancelled = false;
+  void stopping.then(() => { cancelled = true; });
+  try {
+    const checked = await verifyHostRestoreTarget(c, expected, stopping);
+    if (cancelled) fail("host_restore_cancelled");
+    const session = {[RESTORE_VALIDATION]:true, original:c, prepared:checked.receipt};
+    let finish, ready = false;
+    const finished = new Promise(resolve => { finish = resolve; });
+    await runHost({...c, state:checked.target, mode:"database", databaseReference:undefined}, Promise.race([stopping,finished]), () => {ready=true;finish();}, session);
+    if (cancelled) fail("host_restore_cancelled");
+    if (!ready || !session.validated) fail("host_restore_canonical_invalid");
+    const final = await verifyHostRestoreTarget(c, expected, stopping);
+    if (cancelled) fail("host_restore_cancelled");
+    return {...final, schemaValidated:true};
+  } catch (error) {
+    if (cancelled || error?.message === "host_restore_cancelled") fail("host_restore_cancelled");
+    fail("host_restore_canonical_invalid");
+  }
 }

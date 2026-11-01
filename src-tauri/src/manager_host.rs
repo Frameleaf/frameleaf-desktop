@@ -794,22 +794,34 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires compiled Manager/private Node and new owned fixture directory; no installed authority or keychain claim"]
     async fn compiled_manager_runs_through_the_private_supervisor_owner() {
-        compiled_manager_owner(false).await;
+        compiled_manager_owner(false, false).await;
     }
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires compiled Manager/private Node and new owned fixture directory; no installed authority or keychain claim"]
     async fn compiled_manager_revokes_stale_device_grant() {
-        compiled_manager_owner(true).await;
+        compiled_manager_owner(true, false).await;
     }
     #[cfg(unix)]
-    async fn compiled_manager_owner(revoke_only: bool) {
+    #[tokio::test]
+    #[ignore = "requires compiled Manager/private Node and new owned fixture directory; no installed authority or keychain claim"]
+    async fn compiled_manager_restore_review_is_scoped_and_refuses_unverified_execution() {
+        compiled_manager_owner(false, true).await;
+    }
+    #[cfg(unix)]
+    async fn compiled_manager_owner(revoke_only: bool, recovery: bool) {
         let node = PathBuf::from(std::env::var("FRAMELEAF_TEST_NODE").unwrap());
         let manager = PathBuf::from(std::env::var("FRAMELEAF_TEST_MANAGER").unwrap());
         let output = PathBuf::from(std::env::var("FRAMELEAF_TEST_OUTPUT").unwrap());
         assert!(node.is_absolute() && manager.is_absolute() && output.is_absolute());
         fs::create_dir_all(&output).unwrap();
-        let output = output.join(if revoke_only { "device-revoke" } else { "full" });
+        let output = output.join(if recovery {
+            "recovery"
+        } else if revoke_only {
+            "device-revoke"
+        } else {
+            "full"
+        });
         fs::create_dir(&output).unwrap();
         let data = output.join("data");
         crate::runtime_store::private_directory(&data).unwrap();
@@ -891,6 +903,7 @@ mod tests {
                 &configuration,
                 &identity,
                 Zeroizing::new(password.into()),
+                false,
                 None,
                 |_| Err("credential_store_locked_or_unavailable".into()),
             )
@@ -909,6 +922,7 @@ mod tests {
             &configuration,
             &identity,
             Zeroizing::new(password.into()),
+            recovery,
             None,
             |record| {
                 let encoded = Zeroizing::new(serde_json::to_string(record).unwrap());
@@ -937,6 +951,64 @@ mod tests {
             .unwrap();
         assert_eq!(status["manager"]["id"], paired.manager_id);
         assert_eq!(status["installation"]["id"], configuration.installation_id);
+        if recovery {
+            use crate::manager::{send, Command, Scope};
+            assert!(paired.scopes.contains(&Scope::Restore));
+            let key = uuid::Uuid::new_v4();
+            let accepted = send(
+                &stored,
+                &identity,
+                Command::ReviewRestore {
+                    snapshot: "1".repeat(64),
+                    key,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(accepted["id"], key.to_string());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let review = send(
+                    &stored,
+                    &identity,
+                    Command::RestoreReview {
+                        id: key,
+                        snapshot: "1".repeat(64),
+                    },
+                )
+                .await
+                .unwrap();
+                if review["state"] != "preparing" {
+                    assert_eq!(review["state"], "failed");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned fixture review did not finish"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // The fixture engine is echo: real Manager must reject absent readback before any host mutation.
+            assert_eq!(
+                send(
+                    &stored,
+                    &identity,
+                    Command::Restore {
+                        review_id: key,
+                        key: uuid::Uuid::new_v4()
+                    }
+                )
+                .await
+                .err()
+                .unwrap(),
+                "native_restore_review_not_ready"
+            );
+            let status = send(&stored, &identity, Command::Status {}).await.unwrap();
+            assert_eq!(status["operations"], serde_json::json!([]));
+            owner.shutdown(Duration::from_secs(5)).await.unwrap();
+            assert!(!owner.is_running().unwrap());
+            return;
+        }
         let photos =
             crate::host_setup::photos_owner(&mut owner, &configuration, &identity, &stored)
                 .await
@@ -966,6 +1038,7 @@ mod tests {
             &configuration,
             &identity,
             Zeroizing::new(password.into()),
+            false,
             Some(stored),
             |_| panic!("existing grant must not be replaced"),
         )
@@ -1009,6 +1082,7 @@ mod tests {
                 &configuration,
                 &identity,
                 Zeroizing::new(password.into()),
+                false,
                 Some(existing),
                 |_| panic!("must preserve existing pairing"),
             )

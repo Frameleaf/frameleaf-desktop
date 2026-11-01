@@ -129,6 +129,7 @@ fn javascript_golden_messages_signatures_and_certificate_fingerprint_match() {
         &identity(),
         "https://manager.test:9443",
         1700000000000,
+        &SCOPES,
     )
     .unwrap();
     assert_eq!(pairing_message(&approval), fixture["pairingMessage"]);
@@ -189,7 +190,8 @@ fn pairing_and_response_validation_refuse_changed_authority_and_unknown_fields()
             &approval,
             &identity(),
             "https://manager.test:9443",
-            1700000000000
+            1700000000000,
+            &SCOPES,
         )
         .is_err());
     }
@@ -199,7 +201,8 @@ fn pairing_and_response_validation_refuse_changed_authority_and_unknown_fields()
         &approval,
         &identity(),
         "https://manager.test:9443",
-        1700000000000
+        1700000000000,
+        &SCOPES,
     )
     .is_err());
     for origin in [
@@ -240,6 +243,7 @@ fn actual_compiled_manager_pairs_signs_reauthenticates_and_cleans_failed_persist
             origin,
             password.into(),
             Some(certificate.clone()),
+            false,
             |saved| {
                 *record.lock().unwrap() = Some(
                     serde_json::from_value::<SavedManager>(serde_json::to_value(saved).unwrap())
@@ -270,6 +274,7 @@ fn actual_compiled_manager_pairs_signs_reauthenticates_and_cleans_failed_persist
                 origin,
                 password.into(),
                 Some(certificate),
+                false,
                 |value| {
                     *failed.lock().unwrap() = value.id.clone();
                     Err("credential_store_locked_or_unavailable".into())
@@ -319,4 +324,165 @@ fn a_private_token_in_an_operation_error_never_reaches_the_webview() {
     let status = json!({"manager":{"id":saved().manager_id,"origin":saved().origin},"installation":{"id":saved().installation_id,"name":"Fixture","release":"frameleaf-v3.0.0-1","port":2283},"operations":[operation]});
     let reply = validate_reply(&saved(), &Command::Status {}, status).unwrap();
     assert!(!reply.to_string().contains(&saved().token));
+}
+
+#[test]
+fn backup_review_commands_require_explicit_scope_and_bind_request_and_reply() {
+    let request_id = Uuid::new_v4();
+    let commands = [
+        json!({"kind":"backups"}),
+        json!({"kind":"review-restore","snapshot":"a".repeat(64),"key":request_id}),
+        json!({"kind":"restore-review","id":request_id,"snapshot":"a".repeat(64)}),
+    ];
+    let mut owner = saved();
+    for value in commands {
+        let command: Command = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            prepare(
+                &owner,
+                &identity(),
+                &command,
+                1700000000000,
+                &Uuid::new_v4().to_string()
+            )
+            .err()
+            .unwrap(),
+            "manager_scope_denied"
+        );
+        owner.scopes.push(Scope::Restore);
+        let request = prepare(
+            &owner,
+            &identity(),
+            &command,
+            1700000000000,
+            &Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(request.path.starts_with("/manager-api/desktop/"));
+        assert!(body
+            .get("snapshot")
+            .is_none_or(|v| v == &json!("a".repeat(64))));
+        owner.scopes.retain(|scope| *scope != Scope::Restore);
+    }
+    let command: Command = serde_json::from_value(
+        json!({"kind":"review-restore","snapshot":"a".repeat(64),"key":request_id}),
+    )
+    .unwrap();
+    let accepted = json!({"id":request_id,"snapshot":"a".repeat(64),"installationId":owner.installation_id,"state":"preparing"});
+    assert!(validate_reply(&owner, &command, accepted.clone()).is_ok());
+    let mut changed = accepted;
+    changed["snapshot"] = json!("b".repeat(64));
+    assert!(validate_reply(&owner, &command, changed).is_err());
+    let command: Command = serde_json::from_value(
+        json!({"kind":"restore-review","id":request_id,"snapshot":"a".repeat(64)}),
+    )
+    .unwrap();
+    let status = json!({"id":request_id,"snapshot":"a".repeat(64),"installationId":owner.installation_id,"expires":1700000900000u64,"state":"prepared","libraryId":"a".repeat(12),"release":"frameleaf-v3.0.0-1","targetRelease":"frameleaf-v3.0.0-1","createdAt":1234,"mediaIncluded":false,"requiresRuntimeChange":false});
+    assert!(validate_reply(&owner, &command, status.clone()).is_ok());
+    for (key, value) in [
+        ("mediaIncluded", json!(true)),
+        ("installationId", json!("b".repeat(12))),
+        ("privatePath", json!("/private/data")),
+    ] {
+        let mut changed = status.clone();
+        changed[key] = value;
+        assert!(validate_reply(&owner, &command, changed).is_err());
+    }
+}
+
+#[test]
+fn backup_list_rejects_malformed_or_private_metadata() {
+    let entry = json!({"id":"a".repeat(64),"time":"2026-10-18T09:00:00Z"});
+    assert!(validate_reply(&saved(), &Command::Backups {}, json!([entry.clone()])).is_ok());
+    for (key, value) in [
+        ("id", json!("short")),
+        ("time", json!("invalid")),
+        ("privatePath", json!("/private/data")),
+    ] {
+        let mut changed = entry.clone();
+        changed[key] = value;
+        assert!(validate_reply(&saved(), &Command::Backups {}, json!([changed])).is_err());
+    }
+    assert!(validate_reply(&saved(), &Command::Backups {}, json!(vec![entry; 1001])).is_err());
+}
+
+#[test]
+fn recovery_pairing_accepts_only_the_explicitly_requested_permission_set() {
+    let fixture: Value = serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+    let mut approval: Pairing = serde_json::from_value(fixture["pairing"].clone()).unwrap();
+    approval.scopes.push(Scope::Restore);
+    assert!(validate_pairing(
+        &approval,
+        &identity(),
+        "https://manager.test:9443",
+        1700000000000,
+        &SCOPES
+    )
+    .is_err());
+    let mut requested = SCOPES.to_vec();
+    requested.push(Scope::Restore);
+    assert!(validate_pairing(
+        &approval,
+        &identity(),
+        "https://manager.test:9443",
+        1700000000000,
+        &requested
+    )
+    .is_ok());
+    approval.scopes.push(Scope::Update);
+    assert!(validate_pairing(
+        &approval,
+        &identity(),
+        "https://manager.test:9443",
+        1700000000000,
+        &requested
+    )
+    .is_err());
+}
+
+#[test]
+fn restore_execution_uses_explicit_scope_and_accepts_only_bound_public_restore_operations() {
+    let id = Uuid::new_v4();
+    let key = Uuid::new_v4();
+    let mut owner = saved();
+    for value in [
+        json!({"kind":"restore","reviewId":id,"key":key}),
+        json!({"kind":"restore-operation","id":id}),
+        json!({"kind":"resume-restore","id":id}),
+    ] {
+        let command: Command = serde_json::from_value(value).unwrap();
+        assert!(prepare(
+            &owner,
+            &identity(),
+            &command,
+            1700000000000,
+            &Uuid::new_v4().to_string()
+        )
+        .is_err());
+        owner.scopes.push(Scope::Restore);
+        assert!(prepare(
+            &owner,
+            &identity(),
+            &command,
+            1700000000000,
+            &Uuid::new_v4().to_string()
+        )
+        .is_ok());
+        owner.scopes.retain(|v| *v != Scope::Restore);
+    }
+    let command: Command =
+        serde_json::from_value(json!({"kind":"restore-operation","id":id})).unwrap();
+    let operation = json!({"id":id,"kind":"restore","state":"running","step":"native-restore-verify","completed":vec!["native-backup-verified";40],"error":null,"createdAt":1,"updatedAt":2});
+    assert!(validate_reply(&owner, &command, operation.clone()).is_ok());
+    for (field, value) in [
+        ("kind", json!("stop")),
+        ("id", json!(key)),
+        ("receipts", json!({"private":"secret"})),
+        ("completed", json!(vec!["step"; 65])),
+    ] {
+        let mut changed = operation.clone();
+        changed[field] = value;
+        assert!(validate_reply(&owner, &command, changed).is_err());
+    }
 }

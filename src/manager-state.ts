@@ -51,6 +51,18 @@ export function managerError(error: unknown): string {
     manager_pair_again: 'This computer’s Manager access expired or was revoked. Disconnect and pair again with Manager.',
     manager_pairing_expired: 'This computer’s Manager access expired. Disconnect and pair again with Manager.',
     manager_scope_denied: 'This Manager grant does not allow that action.',
+    manager_recovery_approval_required: 'Disconnect Manager, then pair again with backup recovery permission.',
+    manager_recovery_unavailable: 'Backup review needs an updated native Frameleaf Manager.',
+    manager_review_busy: 'Another backup review is still running. Check its existing request.',
+    manager_review_changed: 'This review could not be matched to the current backup and installation.',
+    manager_review_failed: 'The backup could not be verified for recovery.',
+    manager_backup_unavailable: 'Database backups are not available in this Manager.',
+    manager_restore_pending: 'Keep the existing database restore request until its outcome is confirmed.',
+    manager_restore_review_required: 'Review this backup again before confirming a database restore.',
+    native_restore_review_expired: 'The backup review expired before this restore was accepted. Review the backup again.',
+    native_restore_review_not_ready: 'This backup review is not ready. Check it before restoring.',
+    native_restore_runtime_change_required: 'This backup needs a different server runtime. Keep the current library and update the recovery runtime first.',
+    manager_review_pending: 'Finish checking the current review before choosing another backup.',
     manager_operation_pending: 'Resolve the existing request before starting another action.',
     manager_operation_in_progress: 'Another Manager operation is active. Resolve it in Manager before starting a new action.',
     manager_operation_not_recoverable: 'This operation cannot be resumed now. Check its latest state in Manager.',
@@ -84,4 +96,53 @@ export function managerError(error: unknown): string {
     operation_interrupted: 'This operation was interrupted. Check its state, then resume when ready.',
   };
   return Object.hasOwn(messages, code) ? messages[code]! : 'Manager could not finish this request. Check its operation state before retrying.';
+}
+
+export type BackupEntry = { id: string; time: string };
+export type BackupReviewIntent = Pick<ManagerView, 'origin' | 'managerId' | 'deviceId' | 'installationId'> & { snapshot: string; key: string };
+export type BackupReview = { id: string; snapshot: string; installationId: string; expires: number } & (
+  { state: 'preparing' | 'failed' | 'expired' | 'interrupted' } |
+  { state: 'prepared'; libraryId: string; release: string; targetRelease: string; createdAt: number; mediaIncluded: false; requiresRuntimeChange: boolean }
+);
+export function backupReviewKey(manager: ManagerView) { return `frameleaf.manager-review:${manager.managerId}:${manager.installationId}`; }
+export function restoreBackupReview(raw: string | null, manager: ManagerView): BackupReviewIntent | null {
+  try {
+    if (!raw || raw.length > 2048) return null;
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'deviceId,installationId,key,managerId,origin,snapshot') return null;
+    if (value.origin !== manager.origin || value.managerId !== manager.managerId || value.deviceId !== manager.deviceId || value.installationId !== manager.installationId || !uuid(value.key) || value.key === '00000000-0000-0000-0000-000000000000' || typeof value.snapshot !== 'string' || !/^[a-f0-9]{64}$/.test(value.snapshot)) return null;
+    return value;
+  } catch { return null; }
+}
+export function backupReviewIntent(manager: ManagerView, snapshot: string, prior: BackupReviewIntent | null): BackupReviewIntent {
+  if (!manager.scopes.includes('restore')) throw Error('manager_scope_denied');
+  if (typeof snapshot !== 'string' || !/^[a-f0-9]{64}$/.test(snapshot)) throw Error('manager_request_invalid');
+  if (prior) {
+    if (prior.snapshot !== snapshot || !restoreBackupReview(JSON.stringify(prior), manager)) throw Error('manager_review_pending');
+    return prior;
+  }
+  return { origin: manager.origin, managerId: manager.managerId, deviceId: manager.deviceId, installationId: manager.installationId, snapshot, key: crypto.randomUUID() };
+}
+
+export type BackupRestoreIntent = BackupReviewIntent & { reviewId: string; id?: string };
+export type BackupRestoreOperation = Omit<Operation, 'kind'> & { kind: 'restore' };
+export function backupRestoreKey(manager: ManagerView) { return `frameleaf.manager-restore:${manager.managerId}:${manager.installationId}`; }
+export function parseBackupRestoreIntent(raw: string | null, manager: ManagerView): BackupRestoreIntent | null {
+  try {
+    if (!raw || raw.length > 2048) return null;
+    const value = JSON.parse(raw);
+    if (!value || Array.isArray(value) || typeof value !== 'object' || !uuid(value.reviewId) || value.reviewId === '00000000-0000-0000-0000-000000000000' || (value.id !== undefined && (!uuid(value.id) || value.id === '00000000-0000-0000-0000-000000000000'))) return null;
+    const { reviewId, id, ...binding } = value;
+    if (!restoreBackupReview(JSON.stringify(binding), manager)) return null;
+    return value;
+  } catch { return null; }
+}
+export function createBackupRestoreIntent(manager: ManagerView, review: BackupReview, prior: BackupRestoreIntent | null): BackupRestoreIntent {
+  if (!manager.scopes.includes('restore')) throw Error('manager_scope_denied');
+  if (prior) {
+    if (prior.reviewId !== review.id || prior.snapshot !== review.snapshot || !parseBackupRestoreIntent(JSON.stringify(prior), manager)) throw Error('manager_restore_pending');
+    return prior;
+  }
+  if (review.state !== 'prepared' || review.expires <= Date.now() || review.installationId !== manager.installationId || review.requiresRuntimeChange || !uuid(review.id) || review.id === '00000000-0000-0000-0000-000000000000') throw Error('manager_restore_review_required');
+  return { ...backupReviewIntent(manager, review.snapshot, null), reviewId: review.id };
 }

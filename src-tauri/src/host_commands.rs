@@ -80,6 +80,7 @@ pub(crate) async fn authorize_local_manager(
     setup: State<'_, HostSetup>,
     password: String,
     allow_management: bool,
+    allow_recovery: bool,
 ) -> Result<crate::manager::View, String> {
     let password = zeroize::Zeroizing::new(password);
     require_local(&window)?;
@@ -88,7 +89,7 @@ pub(crate) async fn authorize_local_manager(
     }
     let state = app.state::<crate::DesktopState>();
     let _lock = state.0.lock().await;
-    setup.authorize(password).await
+    setup.authorize(password, allow_recovery).await
 }
 
 #[tauri::command]

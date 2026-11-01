@@ -95,7 +95,7 @@ fn stamp(meta: &Metadata) -> Result<String, String> {
     };
     Ok(format!("{}:{modified}:{extra}", meta.len()))
 }
-fn opened_stamp(file: &cap_std::fs::File) -> Result<String, String> {
+pub(crate) fn opened_stamp(file: &cap_std::fs::File) -> Result<String, String> {
     let value = stamp(&file.metadata().map_err(|_| "source_identity_unavailable")?)?;
     #[cfg(unix)]
     {
@@ -763,7 +763,7 @@ fn link(meta: &Metadata) -> bool {
     }
     meta.is_symlink()
 }
-fn parent_dir(root: &Dir, relative: &Path) -> Result<(Dir, std::path::PathBuf), String> {
+pub(crate) fn parent_dir(root: &Dir, relative: &Path) -> Result<(Dir, std::path::PathBuf), String> {
     let mut dir = root.try_clone().map_err(|_| "source_item_unavailable")?;
     let parts: Vec<_> = relative.components().collect();
     let (leaf, parents) = parts.split_last().ok_or("source_item_invalid")?;
@@ -791,7 +791,7 @@ fn parent_dir(root: &Dir, relative: &Path) -> Result<(Dir, std::path::PathBuf), 
     }
     Ok((dir, leaf.as_os_str().into()))
 }
-fn staged_file(dir: &Dir, relative: &Path) -> Result<cap_std::fs::File, String> {
+pub(crate) fn staged_file(dir: &Dir, relative: &Path) -> Result<cap_std::fs::File, String> {
     let (dir, name) = parent_dir(dir, relative)?;
     let meta = dir
         .symlink_metadata(&name)
@@ -809,7 +809,7 @@ fn staged_file(dir: &Dir, relative: &Path) -> Result<cap_std::fs::File, String> 
     Ok(file)
 }
 
-fn unchanged(
+pub(crate) fn unchanged(
     dir: &Dir,
     relative: &Path,
     source: &cap_std::fs::File,

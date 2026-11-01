@@ -26,11 +26,12 @@ const makeOperation=(action,state='running')=>({id:operationId,kind:action,state
 async function fixture(scenario,run,viewport={width:1100,height:1000},colorScheme='light'){
  const context=await browser.newContext({viewport,colorScheme});
  const calls=[],keys=new Map(),errors=[];
- let paired=!['pair','localhost'].includes(scenario),authorized=scenario!=='reauth',lost=scenario==='lost',current=scenario==='resume'?makeOperation('stop','interrupted'):null;
+ let paired=!['pair','localhost'].includes(scenario),authorized=!['reauth','recovery-reauth'].includes(scenario),lost=scenario==='lost',current=['resume','recovery-reauth'].includes(scenario)?makeOperation('stop','interrupted'):null;
  const localRecord={schemaVersion:1,manifestSha256:'a'.repeat(64),controllerSha256:'b'.repeat(64)};
  let local={state:'idle',code:null,backgroundActive:false,installation:null,origin:null};
  let refuseLocalStop=true;
- const manager={...view,...(scenario==='localhost'?{origin:'https://127.0.0.1:9443',certificateSha256:wire.certificateSha256}:{}),scopes:scenario==='readonly'?['status']:view.scopes};
+ let reviewLost=scenario==='recovery',reviewReady=false;const reviews=new Map(),restores=new Map();let restoreLost=scenario==='recovery-restore',restored=null;
+ const manager={...view,...(scenario==='localhost'?{origin:'https://127.0.0.1:9443',certificateSha256:wire.certificateSha256}:{}),scopes:scenario==='readonly'?['status']:scenario.startsWith('recovery')?[...view.scopes,'restore']:view.scopes};
  await context.exposeBinding('__managerInvoke',async(_source,command,args={})=>{
   calls.push({command,args:structuredClone(args)});
   if(command==='plugin:event|listen')return 1;
@@ -41,17 +42,37 @@ async function fixture(scenario,run,viewport={width:1100,height:1000},colorSchem
   if(command==='stop_local_host_manager'){if(refuseLocalStop){refuseLocalStop=false;throw 'host_controller_already_owned';}local={...local,state:'idle',backgroundActive:false};return local;}
   if(command==='restore_connection')return null;
   if(command==='worker_setup_status')return {state:'stopped',code:null,control:'stopped',workloads:[]};
-  if(command==='authorize_local_manager'){assert.deepEqual(Object.keys(args).sort(),['allowManagement','password']);assert.equal(args.password,password);assert.equal(args.allowManagement,true);await new Promise(resolve=>setTimeout(resolve,300));paired=true;return manager;}
+  if(command==='authorize_local_manager'){assert.deepEqual(Object.keys(args).sort(),['allowManagement','allowRecovery','password']);assert.equal(args.password,password);assert.equal(args.allowManagement,true);assert.equal(typeof args.allowRecovery,'boolean');if(args.allowRecovery)manager.scopes=[...view.scopes,'restore'];await new Promise(resolve=>setTimeout(resolve,300));paired=true;return manager;}
   if(command==='open_local_photos'){assert.equal(scenario,'localhost');assert.ok(paired&&local.backgroundActive);assert.deepEqual(args,{});return;}
   if(command==='manager_view')return paired?manager:null;
   if(command==='manager_certificate_fingerprint')return wire.certificateSha256;
-  if(command==='pair_manager'){assert.equal(args.password,password);assert.equal(args.allowManagement,true);paired=true;return {...manager,certificateSha256:args.certificate?.sha256||null};}
+  if(command==='pair_manager'){assert.equal(args.password,password);assert.equal(args.allowManagement,true);assert.equal(typeof args.allowRecovery,'boolean');if(args.allowRecovery)manager.scopes=[...view.scopes,'restore'];paired=true;return {...manager,certificateSha256:args.certificate?.sha256||null};}
   if(command==='reauthenticate_manager'){assert.equal(args.password,password);authorized=true;return;}
   if(command==='disconnect_manager'){assert.equal(args.password,password);paired=false;return;}
   if(command==='manager_request'){
    const request=args.command;
    if(scenario==='devicechanged'&&paired)throw 'manager_device_changed';
    if(request.kind==='status')return {manager:{id:manager.managerId,origin:manager.origin},installation:{id:manager.installationId,name:scenario==='localhost'?'My local library':'Example NAS',release:'frameleaf-v3.0.0-1',port:2283},operations:current?[current]:[]};
+   if(request.kind==='backups'){if(!authorized)throw 'manager_recent_auth_required';assert.ok(manager.scopes.includes('restore'));return [{id:'a'.repeat(64),time:new Date().toISOString()}];}
+   if(request.kind==='review-restore'){
+    assert.ok(manager.scopes.includes('restore'));assert.equal(request.snapshot,'a'.repeat(64));
+    if(!reviews.has(request.key))reviews.set(request.key,{snapshot:request.snapshot});
+    if(reviewLost){reviewLost=false;throw 'manager_response_interrupted';}
+    return {id:request.key,snapshot:request.snapshot,installationId:manager.installationId,state:'preparing'};
+   }
+   if(request.kind==='restore-review'){
+    assert.ok(reviews.has(request.id));assert.equal(request.snapshot,reviews.get(request.id).snapshot);
+    return {id:request.id,snapshot:request.snapshot,installationId:manager.installationId,expires:Date.now()+900000,state:reviewReady?'prepared':'preparing',...(reviewReady?{libraryId:manager.installationId,release:'frameleaf-v3.0.0-1',targetRelease:'frameleaf-v3.0.0-1',createdAt:Date.now()-86400000,mediaIncluded:false,requiresRuntimeChange:false}:{})};
+   }
+   if(request.kind==='restore'){
+    if(!authorized)throw 'manager_recent_auth_required';assert.ok(reviews.has(request.reviewId));
+    if(scenario==='recovery-restore-expired')throw 'native_restore_review_expired';
+    if(!restores.has(request.key)){restored=makeOperation('restore');restores.set(request.key,restored);}
+    if(restoreLost){restoreLost=false;throw 'manager_response_interrupted';}
+    return {id:restored.id};
+   }
+   if(request.kind==='restore-operation'){if(!authorized)throw 'manager_recent_auth_required';assert.equal(request.id,restored.id);return restored;}
+   if(request.kind==='resume-restore'){if(!authorized)throw 'manager_recent_auth_required';assert.equal(request.id,restored.id);restored={...restored,state:'running',error:null};return {id:restored.id};}
    if(request.kind==='control'){
     if(!authorized)throw 'manager_recent_auth_required';
     if(!keys.has(request.key)){current=makeOperation(request.action);keys.set(request.key,current);}
@@ -73,7 +94,7 @@ async function fixture(scenario,run,viewport={width:1100,height:1000},colorSchem
   const ui=page.getByRole('region',{name:'Server management'});
   await ui.getByRole('heading',{name:'Server management'}).waitFor();
   if(!['pair','localhost','devicechanged'].includes(scenario))await ui.getByText('Example NAS',{exact:true}).waitFor();
-  await run({page,ui,calls,keys,loseNext:()=>{lost=true;},finish:()=>{current={...current,state:'complete',completed:[current.kind],updatedAt:Date.now()};}});
+  await run({page,ui,calls,keys,reviews,restores,finishRestore:()=>{restored={...restored,state:'complete',step:'native-restore-started',completed:['native-restore-started'],updatedAt:Date.now()};},interruptRestore:()=>{restored={...restored,state:'interrupted'};authorized=false;},finishReview:()=>{reviewReady=true;},loseNext:()=>{lost=true;},finish:()=>{current={...current,state:'complete',completed:[current.kind],updatedAt:Date.now()};}});
   assert.deepEqual(errors,[]);
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'horizontal overflow');
  }finally{await context.close();}
@@ -100,6 +121,7 @@ try{
   const input=local.getByLabel('Local Manager password',{exact:true});
   await input.fill(password);assert.ok(await authorize.isDisabled());
   await local.getByLabel('Allow this computer to manage this local server.').check();
+  await local.getByLabel('Also allow backup recovery reviews and restore operations.').check();
   assert.ok(await authorize.isEnabled());await authorize.click();
   assert.equal(await input.inputValue(),'');
   await local.getByText('Local management is authorized.',{exact:false}).waitFor();
@@ -134,6 +156,7 @@ try{
   await ui.getByLabel('Manager password',{exact:true}).fill(password);
   const pair=ui.getByRole('button',{name:'Pair with Manager',exact:true});assert.ok(await pair.isDisabled());
   await ui.getByLabel('Allow this computer to start, stop and restart this server, and create database backups.').check();
+  await ui.getByLabel('Also allow backup recovery reviews and restore operations.').check();
   await ui.getByText('Use a certificate for a private Manager',{exact:true}).click();
   await ui.getByLabel('Public certificate',{exact:true}).fill(wire.certificatePem);
   assert.ok(await pair.isDisabled());
@@ -145,7 +168,7 @@ try{
   await ui.getByLabel('I verified this certificate fingerprint.').check();
   await ui.screenshot({path:join(output,'manager-pair-certificate.png')});
   await pair.click();await ui.getByText('Example NAS',{exact:true}).waitFor();
-  const request=calls.find(value=>value.command==='pair_manager');assert.equal(request.args.certificate.sha256,wire.certificateSha256);
+  const request=calls.find(value=>value.command==='pair_manager');assert.equal(request.args.certificate.sha256,wire.certificateSha256);assert.equal(request.args.allowRecovery,true);
   assert.ok(!(await page.textContent('body')).includes(password));
   assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(password));
  });
@@ -196,7 +219,95 @@ try{
   await ui.getByRole('button',{name:'Start server',exact:true}).click();
   await ui.getByRole('alert').waitFor();assert.equal(calls.filter(value=>value.args?.command?.kind==='control').length,0);
  });
- process.stdout.write('Manager UI browser flows passed: pairing/certificate consent, lost reply+reload, recent auth+confirmation, resume+disconnect, readonly/narrow/dark, storage failure.\n');
+ await fixture('recovery',async({page,ui,calls,reviews,finishReview})=>{
+  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
+  await ui.getByRole('button',{name:'Review selected backup',exact:true}).click();
+  await ui.getByRole('button',{name:'Check backup review',exact:true}).waitFor();
+  const original=calls.find(value=>value.args?.command?.kind==='review-restore').args.command.key;
+  assert.ok((await page.evaluate(()=>JSON.stringify(localStorage))).includes(original));
+  await page.reload({waitUntil:'networkidle'});
+  await ui.getByRole('button',{name:'Check backup review',exact:true}).click();
+  await ui.getByText('Backup review is in progress. Check again when ready.',{exact:true}).waitFor();
+  const retries=calls.filter(value=>value.args?.command?.kind==='review-restore');assert.equal(retries.length,2);assert.equal(retries[1].args.command.key,original);assert.equal(reviews.size,1);
+  finishReview();await ui.getByRole('button',{name:'Check backup review',exact:true}).click();
+  await ui.getByText('Backup review is ready.',{exact:true}).waitFor();
+  await ui.getByRole('button',{name:'Restore this backup',exact:true}).waitFor();
+  assert.equal(calls.filter(value=>value.args?.command?.kind==='control').length,0);
+  await ui.screenshot({path:join(output,'manager-backup-review.png')});
+  await ui.getByRole('button',{name:'Choose another backup',exact:true}).click();
+  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(original));
+ });
+ await fixture('recovery-reauth',async({ui,calls})=>{
+  await ui.getByText('Interrupted',{exact:true}).waitFor();
+  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
+  await ui.getByLabel('Manager password',{exact:true}).fill(password);
+  await ui.getByRole('button',{name:'Authorize and review',exact:true}).click();
+  await ui.getByRole('button',{name:'Review selected backup',exact:true}).waitFor();
+  assert.equal(calls.filter(value=>['resume','control'].includes(value.args?.command?.kind)).length,0);
+ });
+ await fixture('recovery-storage',async({page,ui,calls})=>{
+  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
+  await page.evaluate(()=>{Storage.prototype.setItem=function(){throw new DOMException('synthetic storage failure','QuotaExceededError');};});
+  await ui.getByRole('button',{name:'Review selected backup',exact:true}).click();
+  await ui.getByRole('alert').waitFor();
+  assert.equal(calls.filter(value=>value.args?.command?.kind==='review-restore').length,0);
+ });
+ async function reviewed(ui,finishReview){
+  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
+  await ui.getByRole('button',{name:'Review selected backup',exact:true}).click();
+  finishReview();await ui.getByRole('button',{name:'Check backup review',exact:true}).click();
+  await ui.getByRole('button',{name:'Restore this backup',exact:true}).click();
+  assert.equal(await ui.getByRole('button',{name:'Restore database',exact:true}).isDisabled(),true);
+ }
+ await fixture('recovery-restore',async({page,ui,calls,restores,finishReview,finishRestore})=>{
+  await reviewed(ui,finishReview);
+  assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,0);
+  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
+  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
+  await ui.getByRole('button',{name:'Check database restore',exact:true}).waitFor();
+  const first=calls.find(v=>v.args?.command?.kind==='restore').args.command;
+  assert.notEqual(first.key,first.reviewId);assert.equal(restores.size,1);
+  await page.reload({waitUntil:'networkidle'});
+  await ui.getByRole('button',{name:'Check database restore',exact:true}).click();
+  await ui.getByText('Database restore is running. Keep the computer and server connected.',{exact:true}).waitFor();
+  const requests=calls.filter(v=>v.args?.command?.kind==='restore');assert.equal(requests.length,2);assert.equal(requests[1].args.command.key,first.key);assert.equal(restores.size,1);
+  assert.equal(await ui.getByRole('button',{name:'Start server',exact:true}).isDisabled(),true);
+  finishRestore();await ui.getByRole('button',{name:'Check database restore',exact:true}).click();
+  await ui.getByText('Database restore completed. The server reported ready.',{exact:true}).waitFor();
+  await ui.screenshot({path:join(output,'manager-database-restore.png')});
+  await ui.getByRole('button',{name:'Finish restore',exact:true}).click();
+  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(first.key));
+  assert.equal(calls.filter(v=>['control','resume'].includes(v.args?.command?.kind)).length,0);
+ });
+ await fixture('recovery-restore-resume',async({ui,calls,finishReview,interruptRestore})=>{
+  await reviewed(ui,finishReview);
+  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
+  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
+  interruptRestore();await ui.getByRole('button',{name:'Check database restore',exact:true}).click();
+  await ui.getByLabel('Manager password',{exact:true}).fill(password);
+  await ui.getByRole('button',{name:'Authorize database restore',exact:true}).click();
+  await ui.getByRole('button',{name:'Resume database restore',exact:true}).click();
+  await ui.getByText('Database restore is running. Keep the computer and server connected.',{exact:true}).waitFor();
+  assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,1);
+  assert.equal(calls.filter(v=>v.args?.command?.kind==='resume-restore').length,1);
+  assert.equal(calls.filter(v=>['control','resume'].includes(v.args?.command?.kind)).length,0);
+ });
+ await fixture('recovery-restore-storage',async({page,ui,calls,finishReview})=>{
+  await reviewed(ui,finishReview);
+  await page.evaluate(()=>{Storage.prototype.setItem=function(){throw new DOMException('synthetic storage failure','QuotaExceededError');};});
+  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
+  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
+  await ui.getByRole('alert').waitFor();assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,0);
+ });
+ await fixture('recovery-restore-expired',async({page,ui,calls,finishReview})=>{
+  await reviewed(ui,finishReview);
+  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
+  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
+  await ui.getByText('The backup review expired before this restore was accepted. Review the backup again.',{exact:true}).waitFor();
+  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes('frameleaf.manager-restore:'));
+  assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,1);
+ });
+ process.stdout.write('Manager UI browser flows passed: pairing/certificate consent, lost reply+reload, recent auth+confirmation, resume+disconnect, readonly/narrow/dark, storage failure, backup review/reload/consent/isolated recent auth.\n');
 }finally{
  await browser?.close();if(vite.exitCode===null) vite.kill('SIGTERM');await ended;
 }

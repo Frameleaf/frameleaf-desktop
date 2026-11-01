@@ -212,6 +212,7 @@ impl HostSetup {
     pub(crate) async fn authorize(
         &self,
         password: zeroize::Zeroizing<String>,
+        allow_recovery: bool,
     ) -> Result<crate::manager::View, String> {
         require_password(&password)?;
         let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
@@ -230,6 +231,7 @@ impl HostSetup {
             &running.configuration,
             &identity,
             password,
+            allow_recovery,
             existing,
             |saved| crate::credentials::save(crate::manager::CREDENTIAL, saved),
         )
@@ -351,6 +353,7 @@ pub(crate) async fn authorize_owner(
     configuration: &Configuration,
     identity: &crate::connection::DeviceIdentity,
     password: zeroize::Zeroizing<String>,
+    allow_recovery: bool,
     existing: Option<crate::manager::SavedManager>,
     persist: impl FnOnce(&crate::manager::SavedManager) -> Result<(), String>,
 ) -> Result<crate::manager::View, String> {
@@ -358,6 +361,9 @@ pub(crate) async fn authorize_owner(
     let certificate = manager.management_identity(configuration)?;
     if let Some(saved) = existing {
         let view = local_grant(&saved, identity, configuration, &certificate.sha256)?;
+        if allow_recovery && !view.scopes.contains(&crate::manager::Scope::Restore) {
+            return Err("manager_recovery_approval_required".into());
+        }
         crate::manager::reauthenticate(&saved, password.to_string()).await?;
         crate::manager::send(&saved, identity, crate::manager::Command::Status {}).await?;
         manager.management_identity(configuration)?;
@@ -373,6 +379,7 @@ pub(crate) async fn authorize_owner(
         &configuration.origin,
         password.to_string(),
         Some(certificate),
+        allow_recovery,
         |saved| {
             manager.management_identity(configuration)?;
             local_grant(saved, identity, configuration, &fingerprint)?;

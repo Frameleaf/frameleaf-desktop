@@ -53,9 +53,37 @@ impl Action {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Command {
     Status {},
-    Control { action: Action, key: Uuid },
-    Operation { id: Uuid },
-    Resume { action: Action, id: Uuid },
+    Backups {},
+    ReviewRestore {
+        snapshot: String,
+        key: Uuid,
+    },
+    RestoreReview {
+        id: Uuid,
+        snapshot: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Restore {
+        review_id: Uuid,
+        key: Uuid,
+    },
+    RestoreOperation {
+        id: Uuid,
+    },
+    ResumeRestore {
+        id: Uuid,
+    },
+    Control {
+        action: Action,
+        key: Uuid,
+    },
+    Operation {
+        id: Uuid,
+    },
+    Resume {
+        action: Action,
+        id: Uuid,
+    },
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -259,6 +287,16 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             "invalid_credentials" => "manager_invalid_credentials",
             "already_claimed" => "manager_already_claimed",
             "invalid_claim_proof" => "manager_claim_proof_changed",
+            "native_recovery_unavailable" | "desktop_route_unavailable" => {
+                "manager_recovery_unavailable"
+            }
+            "native_restore_review_busy" => "manager_review_busy",
+            "native_restore_review_changed" => "manager_review_changed",
+            "native_restore_verification_failed" => "manager_review_failed",
+            "native_backup_unavailable" => "manager_backup_unavailable",
+            "native_restore_review_expired"
+            | "native_restore_review_not_ready"
+            | "native_restore_runtime_change_required" => code,
             _ => "manager_request_failed",
         }
         .into());
@@ -371,11 +409,12 @@ fn validate_pairing(
     identity: &DeviceIdentity,
     origin: &str,
     now: u64,
+    scopes: &[Scope],
 ) -> Result<(), String> {
     if value.origin != origin
         || value.device_id != identity.installation_id
         || value.public_key != identity.public_key()
-        || value.scopes != SCOPES
+        || value.scopes != scopes
         || !identifier(&value.manager_id)
         || !identifier(&value.pairing_id)
         || !hex(&value.installation_id, 12)
@@ -393,6 +432,7 @@ pub async fn pair(
     origin: &str,
     password: String,
     certificate: Option<CertificateTrust>,
+    allow_recovery: bool,
     persist: impl FnOnce(&SavedManager) -> Result<(), String>,
 ) -> Result<View, String> {
     canonical_origin(origin)?;
@@ -405,12 +445,16 @@ pub async fn pair(
         certificate.as_ref().map(|value| value.sha256.as_str()),
     )?;
     let session = login(&client, origin, &password).await?;
+    let mut scopes = SCOPES.to_vec();
+    if allow_recovery {
+        scopes.push(Scope::Restore);
+    }
     let result=async{
-        let approval:Pairing=browser(&client,origin,&session,"desktop-grants/approve",json!({"password":password.as_str(),"deviceId":identity.installation_id,"publicKey":identity.public_key(),"scopes":SCOPES})).await?;
-        validate_pairing(&approval,identity,origin,clock()?)?;
+        let approval:Pairing=browser(&client,origin,&session,"desktop-grants/approve",json!({"password":password.as_str(),"deviceId":identity.installation_id,"publicKey":identity.public_key(),"scopes":scopes})).await?;
+        validate_pairing(&approval,identity,origin,clock()?,&scopes)?;
         let issued:Issued=reply(client.post(format!("{origin}/manager-api/desktop/redeem")).json(&json!({"pairingId":approval.pairing_id,"secret":approval.secret,"signature":identity.sign(&pairing_message(&approval))})).send().await.map_err(|_|"manager_pairing_interrupted")?).await?;
         let now=clock()?;
-        if !identifier(&issued.id)||issued.manager_id!=approval.manager_id||issued.origin!=origin||issued.device_id!=identity.installation_id||issued.installation_id!=approval.installation_id||issued.scopes!=SCOPES||!hex(&issued.token,64)||issued.expires_at<=now||issued.expires_at>now.saturating_add(LIFETIME+WINDOW)||issued.recent_until!=approval.approved_at+RECENT{return Err("manager_pairing_binding_changed".into());}
+        if !identifier(&issued.id)||issued.manager_id!=approval.manager_id||issued.origin!=origin||issued.device_id!=identity.installation_id||issued.installation_id!=approval.installation_id||issued.scopes!=scopes||!hex(&issued.token,64)||issued.expires_at<=now||issued.expires_at>now.saturating_add(LIFETIME+WINDOW)||issued.recent_until!=approval.approved_at+RECENT{return Err("manager_pairing_binding_changed".into());}
         let saved=SavedManager{origin:origin.into(),manager_id:issued.manager_id.clone(),device_id:issued.device_id.clone(),installation_id:issued.installation_id.clone(),public_key:identity.public_key(),id:issued.id.clone(),token:issued.token.clone(),expires_at:issued.expires_at,recent_until:issued.recent_until,scopes:issued.scopes.clone(),certificate_pem:certificate.map(|value|value.pem)};
         if let Err(error)=persist(&saved){
             let revoked=browser::<Value>(&client,origin,&session,"desktop-grants/revoke",json!({"id":saved.id,"password":password.as_str()})).await;
@@ -477,6 +521,48 @@ fn prepare(
     }
     let (scope, path, body) = match command {
         Command::Status {} => (Scope::Status, "/manager-api/desktop/status", json!({})),
+        Command::Backups {} => (Scope::Restore, "/manager-api/desktop/backups", json!({})),
+        Command::Restore { review_id, key } => {
+            if review_id.is_nil() || key.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Restore,
+                "/manager-api/desktop/restore",
+                json!({"reviewId":review_id,"key":key}),
+            )
+        }
+        Command::RestoreOperation { id } | Command::ResumeRestore { id } => {
+            if id.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            let path = if matches!(command, Command::RestoreOperation { .. }) {
+                "/manager-api/desktop/restore-operation"
+            } else {
+                "/manager-api/desktop/resume-restore"
+            };
+            (Scope::Restore, path, json!({"id":id}))
+        }
+        Command::ReviewRestore { snapshot, key } => {
+            if !hex(snapshot, 64) || key.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Restore,
+                "/manager-api/desktop/review-restore",
+                json!({"snapshot":snapshot,"key":key}),
+            )
+        }
+        Command::RestoreReview { id, snapshot } => {
+            if !hex(snapshot, 64) || id.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Restore,
+                "/manager-api/desktop/restore-review",
+                json!({"id":id}),
+            )
+        }
         Command::Control { action, key } => (
             action.scope(),
             "/manager-api/desktop/control",
@@ -587,9 +673,9 @@ pub async fn disconnect(saved: &SavedManager, password: String) -> Result<(), St
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Operation {
+struct Operation<K = Action, const MAX: usize = 32> {
     id: String,
-    kind: Action,
+    kind: K,
     state: String,
     step: Option<String>,
     completed: Vec<String>,
@@ -597,7 +683,7 @@ struct Operation {
     created_at: u64,
     updated_at: u64,
 }
-impl Operation {
+impl<K, const MAX: usize> Operation<K, MAX> {
     fn valid(&self) -> bool {
         let label = |value: &str| {
             !value.is_empty()
@@ -614,13 +700,18 @@ impl Operation {
                 self.state.as_str(),
                 "running" | "interrupted" | "failed" | "complete"
             )
-            && self.completed.len() <= 32
+            && self.completed.len() <= MAX
             && self.completed.iter().all(|value| label(value))
             && self.step.as_deref().is_none_or(label)
             && self.error.as_deref().is_none_or(label)
             && self.created_at <= self.updated_at
             && self.updated_at <= 9_007_199_254_740_991
     }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RestoreKind {
+    Restore,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -647,6 +738,35 @@ struct Status {
 #[serde(deny_unknown_fields)]
 struct Accepted {
     id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupEntry {
+    id: String,
+    time: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewAccepted {
+    id: String,
+    snapshot: String,
+    installation_id: String,
+    state: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewState {
+    id: String,
+    snapshot: String,
+    installation_id: String,
+    state: String,
+    expires: u64,
+    library_id: Option<String>,
+    release: Option<String>,
+    target_release: Option<String>,
+    created_at: Option<u64>,
+    media_included: Option<bool>,
+    requires_runtime_change: Option<bool>,
 }
 fn public_error(operation: &mut Value) {
     if let Some(error) = operation["error"].as_str() {
@@ -677,6 +797,87 @@ fn validate_reply(
 ) -> Result<Value, String> {
     let invalid = || "manager_response_invalid".to_string();
     match command {
+        Command::RestoreOperation { id } => {
+            let operation: Operation<RestoreKind, 64> =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if operation.id != id.to_string() || !operation.valid() {
+                return Err(invalid());
+            }
+            public_error(&mut value);
+        }
+        Command::Restore { .. } | Command::ResumeRestore { .. } => {
+            let accepted: Accepted =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if Uuid::parse_str(&accepted.id).is_err()
+                || accepted.id == Uuid::nil().to_string()
+                || matches!(command, Command::ResumeRestore {id} if accepted.id != id.to_string())
+            {
+                return Err(invalid());
+            }
+        }
+        Command::Backups {} => {
+            let entries: Vec<BackupEntry> =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if entries.len() > 1000
+                || entries.iter().any(|entry| {
+                    !hex(&entry.id, 64)
+                        || entry.time.len() > 64
+                        || time::OffsetDateTime::parse(
+                            &entry.time,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .is_err()
+                })
+            {
+                return Err(invalid());
+            }
+        }
+        Command::ReviewRestore { snapshot, key } => {
+            let accepted: ReviewAccepted =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if accepted.id != key.to_string()
+                || accepted.snapshot != *snapshot
+                || accepted.installation_id != saved.installation_id
+                || accepted.state != "preparing"
+            {
+                return Err(invalid());
+            }
+        }
+        Command::RestoreReview { id, snapshot } => {
+            let status: ReviewState =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if status.id != id.to_string()
+                || status.snapshot != *snapshot
+                || status.installation_id != saved.installation_id
+                || status.expires > 9_007_199_254_740_991
+            {
+                return Err(invalid());
+            }
+            let release = |value: &str| {
+                value.starts_with("frameleaf-v")
+                    && value.len() <= 128
+                    && value
+                        .bytes()
+                        .all(|v| v.is_ascii_alphanumeric() || b"._-".contains(&v))
+            };
+            if status.state == "prepared" {
+                if !status.library_id.as_deref().is_some_and(|v| hex(v, 12))
+                    || !status.release.as_deref().is_some_and(release)
+                    || !status.target_release.as_deref().is_some_and(release)
+                    || status.created_at.is_none_or(|v| v > 9_007_199_254_740_991)
+                    || status.media_included != Some(false)
+                    || status.requires_runtime_change.is_none()
+                {
+                    return Err(invalid());
+                }
+            } else if !matches!(
+                status.state.as_str(),
+                "preparing" | "failed" | "expired" | "interrupted"
+            ) || value.as_object().is_none_or(|v| v.len() != 5)
+            {
+                return Err(invalid());
+            }
+        }
         Command::Status {} => {
             let status: Status = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
             if status.manager.id != saved.manager_id

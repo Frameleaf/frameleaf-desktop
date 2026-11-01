@@ -19,6 +19,7 @@
   let notice = $state('');
   let managerPassword = $state('');
   let allowManagement = $state(false);
+  let allowRecovery = $state(false);
   let authorized = $state(false);
   function explain(code: unknown): string {
     const value = String(code);
@@ -74,7 +75,7 @@
     const password = managerPassword; managerPassword = '';
     busy = true; failure = ''; notice = '';
     try {
-      await invoke('authorize_local_manager', { password, allowManagement });
+      await invoke('authorize_local_manager', { password, allowManagement, allowRecovery });
       authorized = true; onmanagerchange();
       notice = 'Local management is authorized. Use the server controls below to start your photo server.';
     } catch (error) {
@@ -143,6 +144,7 @@
         <label for="local-manager-password">Local Manager password</label>
         <input id="local-manager-password" type="password" bind:value={managerPassword} required minlength="14" maxlength="256" disabled={busy || !native} autocomplete="current-password" />
         <label class="check"><input type="checkbox" bind:checked={allowManagement} required disabled={busy || !native} />Allow this computer to manage this local server.</label>
+        <label class="check"><input type="checkbox" bind:checked={allowRecovery} disabled={busy || !native} />Also allow backup recovery reviews and restore operations.</label>
         <button class="primary" disabled={busy || !native || !allowManagement || managerPassword.length < 14}>Authorize local management</button>
         <p class="footnote">Keep this password for recovery. The app saves a separate management grant in your secure credential store.</p>
       </form>

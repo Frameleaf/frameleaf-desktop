@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
+import * as managerState from '../src/manager-state.ts';
 import { controlIntent, restoreIntent, intentKey, managerError, localProfilePending, type ManagerView } from '../src/manager-state.ts';
 test('local profile authorization survives reload and ends only after backend and request complete',()=>{
  assert.equal(localProfilePending('provisioning',false),true);
@@ -8,6 +11,34 @@ test('local profile authorization survives reload and ends only after backend an
  for(const state of [undefined,'idle','profile-ready','needs-attention','manager-ready'])assert.equal(localProfilePending(state,false),false);
 });
 const manager:ManagerView={origin:'https://manager.test:9443',managerId:'11111111-1111-4111-8111-111111111111',deviceId:'22222222-2222-4222-8222-222222222222',installationId:'aaaaaaaaaaaa',expiresAt:1900000000000,scopes:['status','start','stop','restart','backup'],certificateSha256:null};
+test('startup restores durable recovery requests before an unreachable Manager status request', async () => {
+ const owner={...manager,scopes:[...manager.scopes,'restore']};
+ const pending=managerState.controlIntent(owner,'backup',null);
+ const review=managerState.backupReviewIntent(owner,'a'.repeat(64),null);
+ const restore=managerState.createBackupRestoreIntent(owner,{id:review.key,snapshot:review.snapshot,installationId:owner.installationId,expires:Date.now()+900000,state:'prepared',libraryId:owner.installationId,release:'frameleaf-v3.0.0-1',targetRelease:'frameleaf-v3.0.0-1',createdAt:1,mediaIncluded:false,requiresRuntimeChange:false},null);
+ const saved=new Map([
+  [managerState.intentKey(owner),JSON.stringify(pending)],
+  [managerState.backupReviewKey(owner),JSON.stringify(review)],
+  [managerState.backupRestoreKey(owner),JSON.stringify(restore)],
+ ]);
+ const source=readFileSync(new URL('../src/ManagerPanel.svelte',import.meta.url),'utf8');
+ const startup=source.match(/async function restore\(\) \{[\s\S]*?\n  \}\n  onMount/)?.[0].replace(/\n  onMount$/,'');
+ assert.ok(startup);
+ const run=new Function('invoke','localStorage','checkStatus','helpers',`
+  const {restoreIntent,intentKey,restoreBackupReview,backupReviewKey,parseBackupRestoreIntent,backupRestoreKey}=helpers;
+  let manager=null,pending=null,recoveryIntent=null,restorePending=null,origin='',selectedBackup='';
+  ${stripTypeScriptTypes(startup)}
+  return (async()=>{let error;try{await restore();}catch(value){error=value;}
+   return {pending,recoveryIntent,restorePending,selectedBackup,error};})();
+ `);
+ const unreachable=Error('manager_unreachable_or_certificate_invalid');
+ const result=await run(async()=>owner,{getItem:(key:string)=>saved.get(key)??null},async()=>{throw unreachable;},managerState);
+ assert.equal(result.error,unreachable);
+ assert.deepEqual(result.pending,pending);
+ assert.deepEqual(result.recoveryIntent,review);
+ assert.deepEqual(result.restorePending,restore);
+ assert.equal(result.selectedBackup,review.snapshot);
+});
 test('a retry keeps its durable request key and cannot silently switch action',()=>{
  const initial=controlIntent(manager,'stop',null);
  assert.equal(controlIntent(manager,'stop',initial).key,initial.key);
@@ -32,4 +63,34 @@ test('remote or native diagnostic text is never echoed as a UI error',()=>{
 });
 test('prototype property names cannot become UI error content',()=>{
  for(const code of ['constructor','toString','__proto__'])assert.equal(typeof managerError(code),'string');
+});
+
+test('backup review request keys survive retries and stay bound to Manager and snapshot', async () => {
+ const {backupReviewIntent,restoreBackupReview,backupReviewKey}=await import('../src/manager-state.ts');
+ const owner={...manager,scopes:[...manager.scopes,'restore']},snapshot='a'.repeat(64);
+ const intent=backupReviewIntent(owner,snapshot,null);
+ assert.equal(backupReviewIntent(owner,snapshot,intent).key,intent.key);
+ assert.deepEqual(restoreBackupReview(JSON.stringify(intent),owner),intent);
+ assert.equal(restoreBackupReview(JSON.stringify(intent),{...owner,installationId:'bbbbbbbbbbbb'}),null);
+ assert.equal(restoreBackupReview(JSON.stringify({...intent,path:'/private'}),owner),null);
+ assert.equal(restoreBackupReview(JSON.stringify({...intent,snapshot:[snapshot]}),owner),null);
+ assert.throws(()=>backupReviewIntent(manager,snapshot,null),/manager_scope_denied/);
+ assert.throws(()=>backupReviewIntent(owner,'b'.repeat(64),intent),/manager_review_pending/);
+ assert.notEqual(backupReviewKey(owner),intentKey(owner));
+});
+
+test('restore intent requires a fresh compatible review and preserves one execution key across reload', async () => {
+ const {createBackupRestoreIntent,parseBackupRestoreIntent,backupRestoreKey}=await import('../src/manager-state.ts');
+ const owner={...manager,scopes:[...manager.scopes,'restore']};
+ const review={id:crypto.randomUUID(),snapshot:'a'.repeat(64),installationId:owner.installationId,expires:Date.now()+900000,state:'prepared' as const,libraryId:owner.installationId,release:'frameleaf-v3.0.0-1',targetRelease:'frameleaf-v3.0.0-1',createdAt:1,mediaIncluded:false as const,requiresRuntimeChange:false};
+ const intent=createBackupRestoreIntent(owner,review,null);
+ assert.notEqual(intent.key,review.id);
+ assert.equal(createBackupRestoreIntent(owner,review,intent).key,intent.key);
+ assert.deepEqual(parseBackupRestoreIntent(JSON.stringify(intent),owner),intent);
+ for(const patch of [{expires:0},{requiresRuntimeChange:true},{installationId:'b'.repeat(12)},{state:'preparing'}])assert.throws(()=>createBackupRestoreIntent(owner,{...review,...patch},null));
+ assert.throws(()=>createBackupRestoreIntent(manager,review,null),/manager_scope_denied/);
+ assert.throws(()=>createBackupRestoreIntent(owner,{...review,id:crypto.randomUUID()},intent),/manager_restore_pending/);
+ for(const patch of [{reviewId:'bad'},{id:'00000000-0000-0000-0000-000000000000'},{password:'secret'},{snapshot:['a'.repeat(64)]}])assert.equal(parseBackupRestoreIntent(JSON.stringify({...intent,...patch}),owner),null);
+ assert.equal(parseBackupRestoreIntent(JSON.stringify(intent),{...owner,deviceId:crypto.randomUUID()}),null);
+ assert.notEqual(backupRestoreKey(owner),intentKey(owner));
 });

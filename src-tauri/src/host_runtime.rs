@@ -264,6 +264,11 @@ impl CheckpointReceipt {
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }
+    pub(crate) fn matches_restore_runtime(&self, prepared: &PreparedRestore) -> bool {
+        self.operation_id == prepared.binding.operation_id
+            && self.manifest_sha256 == prepared.binding.manifest_sha256
+            && self.source_revision == prepared.binding.source_revision
+    }
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1
             || !checkpoint_operation_id(&self.operation_id)
@@ -289,7 +294,7 @@ pub(crate) struct RestoreBinding {
     review_id: String,
     snapshot_id: String,
     pub(crate) installation_id: String,
-    manifest_sha256: String,
+    pub(crate) manifest_sha256: String,
     source_revision: String,
     library_id: String,
     recovery_sha256: String,
@@ -312,7 +317,7 @@ impl RestoreBinding {
         Ok(())
     }
 }
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RestoreValidation {
     postgres_major: u32,
@@ -322,10 +327,118 @@ struct RestoreValidation {
 }
 fn restore_identity(value: &str) -> bool {
     let parts: Vec<_> = value.split(':').collect();
-    parts.len() == 2
+    value.len() <= 128
+        && parts.len() == 2
         && parts
             .iter()
             .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+}
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PreparedRestore {
+    schema_version: u32,
+    state: String,
+    pub(crate) binding: RestoreBinding,
+    pub(crate) attempt_id: String,
+    profile_identity: String,
+    target_identity: String,
+    database_identity: String,
+    validation: RestoreValidation,
+}
+impl PreparedRestore {
+    pub(crate) fn validate_reference(
+        &self,
+        reference: &crate::host_database::Reference,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if !reference.binds_restore(
+            &self.binding.operation_id,
+            &self.attempt_id,
+            [
+                &self.profile_identity,
+                &self.target_identity,
+                &self.database_identity,
+            ],
+        ) {
+            return Err("host_restore_proof_invalid".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.binding.validate()?;
+        if self.schema_version != 1
+            || self.state != "restore-prepared"
+            || !checkpoint_operation_id(&self.attempt_id)
+            || ![
+                &self.profile_identity,
+                &self.target_identity,
+                &self.database_identity,
+            ]
+            .iter()
+            .all(|id| restore_identity(id))
+            || self.validation.postgres_major != 19
+            || self.validation.vector_version != "0.8.7"
+            || !self.validation.canonical
+            || !self.validation.execution_state_reconstructed
+        {
+            return Err("host_restore_request_invalid".into());
+        }
+        Ok(())
+    }
+}
+// Only a successfully correlated private agent event can construct this capability.
+pub(crate) struct VerifiedRestore {
+    pub(crate) prepared: PreparedRestore,
+    pub(crate) reference: crate::host_database::Reference,
+    pub(crate) generation: uuid::Uuid,
+    pub(crate) verification_id: String,
+    _sealed: (),
+}
+impl VerifiedRestore {
+    #[cfg(test)]
+    pub(crate) fn test_capture(
+        profile: &Path,
+        generation: uuid::Uuid,
+        prepared: PreparedRestore,
+    ) -> Self {
+        Self::capture(
+            profile,
+            generation,
+            prepared,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap()
+    }
+    fn capture(
+        profile: &Path,
+        generation: uuid::Uuid,
+        prepared: PreparedRestore,
+        verification_id: String,
+    ) -> Result<Self, String> {
+        prepared.validate()?;
+        if generation.is_nil() || !checkpoint_operation_id(&verification_id) {
+            return Err("host_restore_proof_invalid".into());
+        }
+        let reference = crate::host_database::Reference::capture(
+            profile,
+            &prepared.binding.operation_id,
+            &prepared.attempt_id,
+        )?;
+        if !reference.matches_node_identities([
+            &prepared.profile_identity,
+            &prepared.target_identity,
+            &prepared.database_identity,
+        ]) {
+            return Err("host_restore_proof_invalid".into());
+        }
+        Ok(Self {
+            prepared,
+            reference,
+            generation,
+            verification_id,
+            _sealed: (),
+        })
+    }
 }
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
@@ -375,13 +488,31 @@ enum AgentEvent {
         operation_id: String,
         code: String,
     },
+    #[serde(rename_all = "camelCase")]
+    RestoreVerified {
+        prepared: PreparedRestore,
+        offline_checksums: bool,
+        schema_validated: bool,
+        verification_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    RestoreVerifyFailed {
+        operation_id: String,
+        code: String,
+        verification_id: String,
+    },
     Stopped,
+}
+struct PendingVerification {
+    prepared: PreparedRestore,
+    verification_id: String,
 }
 struct PendingCheckpoint {
     operation: String,
     accepted: bool,
     cleanup: Option<CheckpointReceipt>,
     restore: Option<RestoreBinding>,
+    verify: Option<PendingVerification>,
 }
 struct CheckpointProtocol {
     pending: Mutex<Option<PendingCheckpoint>>,
@@ -401,7 +532,7 @@ impl CheckpointProtocol {
         }
     }
     fn begin(&self, operation: &str) -> Result<(), String> {
-        self.begin_request(operation, None, None)
+        self.begin_request(operation, None, None, None)
     }
     fn begin_cleanup(&self, receipt: &CheckpointReceipt) -> Result<(), String> {
         receipt.validate()?;
@@ -410,7 +541,7 @@ impl CheckpointProtocol {
         {
             return Err("host_checkpoint_request_invalid".into());
         }
-        self.begin_request(&receipt.operation_id, Some(receipt.clone()), None)
+        self.begin_request(&receipt.operation_id, Some(receipt.clone()), None, None)
     }
     fn begin_restore(&self, binding: &RestoreBinding) -> Result<(), String> {
         binding.validate()?;
@@ -419,13 +550,33 @@ impl CheckpointProtocol {
         {
             return Err("host_restore_request_invalid".into());
         }
-        self.begin_request(&binding.operation_id, None, Some(binding.clone()))
+        self.begin_request(&binding.operation_id, None, Some(binding.clone()), None)
+    }
+    fn begin_verify_restore(&self, prepared: &PreparedRestore) -> Result<String, String> {
+        prepared.validate()?;
+        if prepared.binding.manifest_sha256 != self.manifest_sha256
+            || prepared.binding.source_revision != self.source_revision
+        {
+            return Err("host_restore_request_invalid".into());
+        }
+        let verification_id = uuid::Uuid::new_v4().to_string();
+        self.begin_request(
+            &prepared.binding.operation_id,
+            None,
+            None,
+            Some(PendingVerification {
+                prepared: prepared.clone(),
+                verification_id: verification_id.clone(),
+            }),
+        )?;
+        Ok(verification_id)
     }
     fn begin_request(
         &self,
         operation: &str,
         cleanup: Option<CheckpointReceipt>,
         restore: Option<RestoreBinding>,
+        verify: Option<PendingVerification>,
     ) -> Result<(), String> {
         if !checkpoint_operation_id(operation) {
             return Err("host_checkpoint_request_invalid".into());
@@ -442,6 +593,7 @@ impl CheckpointProtocol {
             accepted: false,
             cleanup,
             restore,
+            verify,
         });
         Ok(())
     }
@@ -452,7 +604,9 @@ impl CheckpointProtocol {
             | AgentEvent::CheckpointCleanupFailed { operation_id, .. }
             | AgentEvent::CheckpointFailed { operation_id, .. } => operation_id,
             AgentEvent::RestorePrepared { binding, .. } => &binding.operation_id,
-            AgentEvent::RestorePrepareFailed { operation_id, .. } => operation_id,
+            AgentEvent::RestorePrepareFailed { operation_id, .. }
+            | AgentEvent::RestoreVerifyFailed { operation_id, .. } => operation_id,
+            AgentEvent::RestoreVerified { prepared, .. } => &prepared.binding.operation_id,
             AgentEvent::Stopped => return Err("host_checkpoint_protocol_invalid".into()),
         };
         let mut pending = self
@@ -548,6 +702,33 @@ impl CheckpointProtocol {
                 }
                 operation_id
             }
+            AgentEvent::RestoreVerified {
+                prepared,
+                offline_checksums,
+                schema_validated,
+                verification_id,
+            } => {
+                prepared.validate().map_err(|_| invalid())?;
+                if !offline_checksums
+                    || !schema_validated
+                    || !checkpoint_operation_id(verification_id)
+                {
+                    return Err(invalid());
+                }
+                &prepared.binding.operation_id
+            }
+            AgentEvent::RestoreVerifyFailed {
+                operation_id,
+                code,
+                verification_id,
+            } => {
+                if code != "host_restore_verification_failed"
+                    || !checkpoint_operation_id(verification_id)
+                {
+                    return Err(invalid());
+                }
+                operation_id
+            }
             AgentEvent::Stopped => {
                 return if self.stopping.load(Ordering::Acquire) {
                     Ok(event)
@@ -565,12 +746,17 @@ impl CheckpointProtocol {
             event,
             AgentEvent::RestorePrepared { .. } | AgentEvent::RestorePrepareFailed { .. }
         );
+        let verify = matches!(
+            event,
+            AgentEvent::RestoreVerified { .. } | AgentEvent::RestoreVerifyFailed { .. }
+        );
         match pending.as_mut() {
             Some(expected)
                 if expected.operation == *operation
                     && !expected.accepted
                     && expected.cleanup.is_some() == cleanup
-                    && expected.restore.is_some() == restore =>
+                    && expected.restore.is_some() == restore
+                    && expected.verify.is_some() == verify =>
             {
                 if let (Some(receipt), AgentEvent::CheckpointCleaned { .. }) =
                     (&expected.cleanup, &event)
@@ -593,6 +779,20 @@ impl CheckpointProtocol {
                 {
                     if binding != returned {
                         return Err(invalid());
+                    }
+                }
+                if let Some(expected) = &expected.verify {
+                    match &event {
+                        AgentEvent::RestoreVerified {
+                            prepared,
+                            verification_id,
+                            ..
+                        } if expected.prepared == *prepared
+                            && expected.verification_id == *verification_id => {}
+                        AgentEvent::RestoreVerifyFailed {
+                            verification_id, ..
+                        } if expected.verification_id == *verification_id => {}
+                        _ => return Err(invalid()),
                     }
                 }
                 expected.accepted = true;
@@ -700,6 +900,9 @@ pub(crate) enum HostMode {
     RestorePrepare,
 }
 impl HostMode {
+    pub(crate) fn uses_database(self) -> bool {
+        matches!(self, Self::Server | Self::Database)
+    }
     pub(crate) fn ready_state(self) -> &'static str {
         match self {
             Self::Server => "running",
@@ -715,6 +918,8 @@ impl HostMode {
 struct HostStart<'a> {
     mode: HostMode,
     state: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database_reference: Option<&'a crate::host_database::Reference>,
     runtime: &'a Path,
     manifest_sha256: &'a str,
     source_revision: &'a str,
@@ -793,7 +998,17 @@ pub struct HostProcess {
     checkpoints: Receiver<AgentEvent>,
     checkpoint_started: Option<Instant>,
     ready_seen: bool,
+    profile: PathBuf,
+    controller_generation: Option<uuid::Uuid>,
+    verified_restore: Option<VerifiedRestore>,
     mode: HostMode,
+}
+fn direct_profile(state: &Path) -> Result<(), String> {
+    // Controller-managed profiles must enter through their exact journal owner.
+    match std::fs::symlink_metadata(state.join("controller-state.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_controller_required".into()),
+    }
 }
 impl VerifiedHostRuntime {
     /// Credentials are native-only; callers persist them in the OS credential store before first start.
@@ -804,7 +1019,14 @@ impl VerifiedHostRuntime {
         database_port: u16,
         api_port: u16,
     ) -> Result<HostProcess, String> {
-        self.start_mode(state, password, database_port, api_port, HostMode::Server)
+        self.start_mode(
+            state,
+            password,
+            database_port,
+            api_port,
+            HostMode::Server,
+            None,
+        )
     }
     pub(crate) fn start_mode(
         &self,
@@ -813,7 +1035,19 @@ impl VerifiedHostRuntime {
         database_port: u16,
         api_port: u16,
         mode: HostMode,
+        mut owner: Option<&mut crate::host_state::Owner>,
     ) -> Result<HostProcess, String> {
+        let (database_reference, controller_generation) = if let Some(owner) = owner.as_mut() {
+            let (profile, reference, generation) =
+                owner.launch_state(&self.manifest_sha256, mode)?;
+            if profile != state {
+                return Err("host_controller_binding_changed".into());
+            }
+            (reference, Some(generation))
+        } else {
+            direct_profile(state)?;
+            (None, None)
+        };
         self.check_files()?;
         if password.len() < 24
             || password.len() > 512
@@ -836,8 +1070,11 @@ impl VerifiedHostRuntime {
         } else {
             crate::host_storage::check(state)?;
         }
-        if !matches!(mode, HostMode::CheckpointCleanup | HostMode::RestorePrepare) {
-            let database = state.join("database");
+        if mode.uses_database() {
+            let database = match &database_reference {
+                Some(reference) => reference.resolve(state)?,
+                None => state.join("database"),
+            };
             match std::fs::symlink_metadata(&database) {
                 Ok(_) => crate::host_storage::check(&database)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -850,6 +1087,11 @@ impl VerifiedHostRuntime {
             serde_json::to_vec(&HostStart {
                 mode,
                 state,
+                database_reference: if mode.uses_database() {
+                    database_reference.as_ref()
+                } else {
+                    None
+                },
                 runtime: &self.root,
                 manifest_sha256: &self.manifest_sha256,
                 source_revision: &self.manifest.source_revision,
@@ -861,6 +1103,11 @@ impl VerifiedHostRuntime {
             })
             .map_err(|_| "host_config_invalid")?,
         );
+        if let Some(owner) = owner.as_mut() {
+            owner.launch_state(&self.manifest_sha256, mode)?;
+        } else {
+            direct_profile(state)?;
+        }
         let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
         command
             .args(["--input-type=module", "--eval", AGENT])
@@ -935,6 +1182,9 @@ impl VerifiedHostRuntime {
             checkpoints,
             checkpoint_started: None,
             ready_seen: false,
+            profile: state.into(),
+            controller_generation,
+            verified_restore: None,
             mode,
         };
         let Some(output) = output else {
@@ -1048,6 +1298,7 @@ impl HostProcess {
         self.send_checkpoint_request(&receipt.operation_id, Some(receipt))
     }
     pub(crate) fn request_restore(&mut self, binding: &RestoreBinding) -> Result<(), String> {
+        self.verified_restore = None;
         if self.mode != HostMode::RestorePrepare
             || !self.ready_seen
             || self.protocol.stopping.load(Ordering::Acquire)
@@ -1058,6 +1309,27 @@ impl HostProcess {
         self.protocol.begin_restore(binding)?;
         self.checkpoint_started = Some(Instant::now());
         let request = serde_json::json!({"protocolVersion":1,"action":"prepare-restore","operationId":binding.operation_id,"binding":binding});
+        self.input
+            .as_mut()
+            .ok_or("host_agent_pipe_failed")?
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|_| "host_agent_pipe_failed".into())
+    }
+    pub(crate) fn request_verify_restore(
+        &mut self,
+        prepared: &PreparedRestore,
+    ) -> Result<(), String> {
+        self.verified_restore = None;
+        if self.mode != HostMode::RestorePrepare
+            || !self.ready_seen
+            || self.protocol.stopping.load(Ordering::Acquire)
+            || !self.is_running()?
+        {
+            return Err("host_restore_unavailable".into());
+        }
+        let verification_id = self.protocol.begin_verify_restore(prepared)?;
+        self.checkpoint_started = Some(Instant::now());
+        let request = serde_json::json!({"protocolVersion":1,"action":"verify-restore","operationId":prepared.binding.operation_id,"prepared":prepared,"verificationId":verification_id});
         self.input
             .as_mut()
             .ok_or("host_agent_pipe_failed")?
@@ -1101,6 +1373,22 @@ impl HostProcess {
                     return Err("host_checkpoint_protocol_invalid".into());
                 }
                 self.protocol.finish(&event)?;
+                if let (
+                    Some(generation),
+                    AgentEvent::RestoreVerified {
+                        prepared,
+                        verification_id,
+                        ..
+                    },
+                ) = (self.controller_generation, &event)
+                {
+                    self.verified_restore = Some(VerifiedRestore::capture(
+                        &self.profile,
+                        generation,
+                        prepared.clone(),
+                        verification_id.clone(),
+                    )?);
+                }
                 serde_json::to_value(event)
                     .map(Some)
                     .map_err(|_| "host_checkpoint_protocol_invalid".into())
@@ -1116,6 +1404,26 @@ impl HostProcess {
             }
             Err(mpsc::TryRecvError::Disconnected) => Err("host_agent_pipe_failed".into()),
         }
+    }
+    pub(crate) fn take_verified_restore(
+        &mut self,
+        operation: &str,
+        nonce: &str,
+    ) -> Result<VerifiedRestore, String> {
+        let proof = self
+            .verified_restore
+            .take()
+            .ok_or("host_restore_proof_invalid")?;
+        if self.stopped != Some(Ok(()))
+            || self.protocol.failed.load(Ordering::Acquire)
+            || self.checkpoint_started.is_some()
+            || proof.prepared.binding.operation_id != operation
+            || proof.verification_id != nonce
+        {
+            return Err("host_restore_proof_invalid".into());
+        }
+        proof.reference.resolve(&self.profile)?;
+        Ok(proof)
     }
     pub fn stop(&mut self) -> Result<(), String> {
         self.protocol.stopping.store(true, Ordering::Release);
@@ -1172,6 +1480,196 @@ mod checkpoint_tests {
             "attemptId":"33333333-3333-4333-8333-333333333333","profileIdentity":"1:2","targetIdentity":"1:3","databaseIdentity":"1:4",
             "validation":{"postgresMajor":19,"vectorVersion":"0.8.7","canonical":true,"executionStateReconstructed":true}})
     }
+    #[test]
+    fn verified_restore_authority_is_bound_to_the_native_physical_target_and_generation() {
+        let profile = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-verified-{}", uuid::Uuid::new_v4()));
+        let operation = profile.join("restore-targets").join(OPERATION);
+        let target = operation.join("33333333-3333-4333-8333-333333333333");
+        for path in [
+            &profile,
+            &profile.join("restore-targets"),
+            &operation,
+            &target,
+            &target.join("database"),
+        ] {
+            crate::runtime_store::private_directory(path).unwrap();
+        }
+        let mut value = prepared();
+        for (field, path) in [
+            ("profileIdentity", profile.clone()),
+            ("targetIdentity", target.clone()),
+            ("databaseIdentity", target.join("database")),
+        ] {
+            let root =
+                cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&path).unwrap());
+            let id = crate::copy_source::root_identity(&root).unwrap();
+            #[cfg(windows)]
+            let id = {
+                let parts: Vec<_> = id.split(':').collect();
+                format!(
+                    "{}:{}",
+                    parts[0],
+                    (parts[1].parse::<u64>().unwrap() << 32) | parts[2].parse::<u64>().unwrap()
+                )
+            };
+            value[field] = serde_json::json!(id);
+        }
+        let expected: PreparedRestore = serde_json::from_value(value.clone()).unwrap();
+        let generation = uuid::Uuid::new_v4();
+        let proof =
+            VerifiedRestore::capture(&profile, generation, expected.clone(), OPERATION.into())
+                .unwrap();
+        assert_eq!(proof.generation, generation);
+        assert_eq!(
+            proof.reference.resolve(&profile).unwrap(),
+            target.join("database")
+        );
+        assert!(VerifiedRestore::capture(
+            &profile,
+            uuid::Uuid::nil(),
+            expected.clone(),
+            OPERATION.into()
+        )
+        .is_err());
+        value["databaseIdentity"] = serde_json::json!("1:999");
+        assert!(VerifiedRestore::capture(
+            &profile,
+            generation,
+            serde_json::from_value(value).unwrap(),
+            OPERATION.into()
+        )
+        .is_err());
+        // Exercise one-shot admission on the real HostProcess cache without an installed host pack.
+        let mut command = std::process::Command::new("node");
+        command
+            .args(["--eval", "process.stdin.resume()"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let owner = Arc::new(HostOwner {
+            tree: crate::process_tree::ProcessTree::attach(&child).unwrap(),
+            terminated: Mutex::new(false),
+            _code_lease: crate::package_lease::CodeLease::acquire(&profile).unwrap(),
+        });
+        let (_, ready) = mpsc::channel();
+        let (_, exited) = mpsc::channel();
+        let (_, checkpoints) = mpsc::sync_channel(1);
+        let mut process = HostProcess {
+            owner,
+            pid: child.id(),
+            input: None,
+            ready,
+            exited,
+            stopped: Some(Ok(())),
+            protocol: Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40))),
+            checkpoints,
+            checkpoint_started: None,
+            ready_seen: true,
+            profile: profile.clone(),
+            controller_generation: Some(generation),
+            verified_restore: None,
+            mode: HostMode::RestorePrepare,
+        };
+        for mutation in [
+            "valid",
+            "operation",
+            "nonce",
+            "running",
+            "failed-stop",
+            "pending",
+            "protocol",
+        ] {
+            process.verified_restore = Some(
+                VerifiedRestore::capture(&profile, generation, expected.clone(), OPERATION.into())
+                    .unwrap(),
+            );
+            process.stopped = Some(Ok(()));
+            process.checkpoint_started = None;
+            process.protocol.failed.store(false, Ordering::Release);
+            match mutation {
+                "running" => process.stopped = None,
+                "failed-stop" => process.stopped = Some(Err("host_shutdown_failed".into())),
+                "pending" => process.checkpoint_started = Some(Instant::now()),
+                "protocol" => process.protocol.failed.store(true, Ordering::Release),
+                _ => {}
+            }
+            let operation = if mutation == "operation" {
+                "22222222-2222-4222-8222-222222222222"
+            } else {
+                OPERATION
+            };
+            let nonce = if mutation == "nonce" {
+                "33333333-3333-4333-8333-333333333333"
+            } else {
+                OPERATION
+            };
+            assert_eq!(
+                process.take_verified_restore(operation, nonce).is_ok(),
+                mutation == "valid",
+                "{mutation}"
+            );
+            assert!(process.take_verified_restore(OPERATION, OPERATION).is_err());
+        }
+        process.owner.terminate();
+        child.wait().unwrap();
+        drop(process);
+        std::fs::write(target.join("database/postmaster.pid"), b"not adopted").unwrap();
+        assert!(
+            VerifiedRestore::capture(&profile, generation, expected, OPERATION.into()).is_err()
+        );
+        std::fs::remove_dir_all(profile).unwrap();
+    }
+    #[test]
+    fn verified_restore_matches_the_entire_pending_prepared_receipt_and_checksum_proof() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        let expected: PreparedRestore = serde_json::from_value(prepared()).unwrap();
+        let mut verified = serde_json::json!({"state":"restore-verified","prepared":expected,"offlineChecksums":true,"schemaValidated":true});
+        assert!(protocol.parse(&wire(&verified)).is_err());
+        let verification_id = protocol.begin_verify_restore(&expected).unwrap();
+        verified["verificationId"] = serde_json::json!(verification_id);
+        assert!(protocol.begin_verify_restore(&expected).is_err());
+        assert!(protocol.parse(&wire(&prepared())).is_err());
+        for mutation in [
+            "attempt",
+            "database",
+            "binding",
+            "checksum",
+            "schema",
+            "missing-schema",
+            "path",
+        ] {
+            let mut changed = verified.clone();
+            match mutation {
+                "attempt" => changed["prepared"]["attemptId"] = serde_json::json!(OPERATION),
+                "database" => changed["prepared"]["databaseIdentity"] = serde_json::json!("1:999"),
+                "binding" => {
+                    changed["prepared"]["binding"]["snapshotId"] = serde_json::json!("0".repeat(64))
+                }
+                "checksum" => changed["offlineChecksums"] = serde_json::json!(false),
+                "schema" => changed["schemaValidated"] = serde_json::json!(false),
+                "missing-schema" => {
+                    changed.as_object_mut().unwrap().remove("schemaValidated");
+                }
+                _ => changed["path"] = serde_json::json!("/outside"),
+            }
+            assert!(protocol.parse(&wire(&changed)).is_err(), "{mutation}");
+        }
+        let accepted = protocol.parse(&wire(&verified)).unwrap();
+        assert!(protocol.parse(&wire(&verified)).is_err());
+        protocol.finish(&accepted).unwrap();
+        assert!(protocol.parse(&wire(&verified)).is_err());
+        protocol.begin_verify_restore(&expected).unwrap();
+        assert!(
+            protocol.parse(&wire(&verified)).is_err(),
+            "a delayed prior verification must not satisfy a fresh retry"
+        );
+    }
+
     #[test]
     fn restore_receipt_requires_exact_pending_binding_and_canonical_validation() {
         let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
