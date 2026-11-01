@@ -22,6 +22,16 @@ from build_runtime import (
     sha256,
 )
 
+# SemVer 2.0 suggested regex, Tom Preston-Werner and contributors (CC BY 3.0).
+# https://semver.org/spec/v2.0.0.html | https://creativecommons.org/licenses/by/3.0/
+# Adapted for fullmatch and ASCII-only numeric identifiers.
+SEMVER = re.compile(
+    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+    r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?",
+    re.ASCII,
+)
+
 
 def ignored(directory: str, names: list[str]) -> set[str]:
     return (
@@ -74,7 +84,7 @@ def clean_runtime_metadata(runtime: Path) -> None:
             or name not in dependencies
             or workspace.get("name") != name
             or not isinstance(version, str)
-            or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version)
+            or not SEMVER.fullmatch(version)
         ):
             raise BuildError("host_server_package_metadata_invalid")
         dependencies[name] = version
