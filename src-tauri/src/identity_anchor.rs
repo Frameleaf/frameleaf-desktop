@@ -23,16 +23,20 @@ pub(crate) fn read() -> Result<Option<String>, String> {
 pub(crate) fn write(value: &str) -> Result<(), String> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let directory = crate::credential_lock::directory()?;
+    let temporary = directory.join(format!(".installation-{}.json", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join("installation.json"))
+        .open(&temporary)
         .map_err(|_| "runtime_epoch_binding_invalid")?;
-    file.write_all(&serde_json::to_vec(value).map_err(|_| "runtime_epoch_binding_invalid")?)
+    let written = file
+        .write_all(&serde_json::to_vec(value).map_err(|_| "runtime_epoch_binding_invalid")?)
         .and_then(|()| file.sync_all())
-        .map_err(|_| "runtime_epoch_binding_invalid")?;
+        .and_then(|()| std::fs::hard_link(&temporary, directory.join("installation.json")));
+    let _ = std::fs::remove_file(&temporary);
+    written.map_err(|_| "runtime_epoch_binding_invalid")?;
     std::fs::File::open(directory)
         .and_then(|file| file.sync_all())
         .map_err(|_| "runtime_epoch_binding_invalid".into())
