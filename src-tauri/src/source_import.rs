@@ -1015,63 +1015,66 @@ impl SourceJobs {
         value.state = "copying".into();
         value.code = None;
         *status.lock().map_err(|_| "source_status_unavailable")? = value.clone();
-        let task = tauri::async_runtime::spawn(async move {
-            let notify = |value: ImportView| {
-                if let Ok(mut current) = status.lock() {
-                    *current = value.clone();
-                }
-                let _ = app.emit_to("main", "photo-import", value);
-            };
-            let result = async {
-                let identity = credentials::identity()?;
-                let source =
-                    credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
-                let journal = Journal::new(&base, source.source_id())?;
-                let network = Mutex::new((
-                    std::time::Instant::now() - std::time::Duration::from_secs(2),
-                    None,
-                ));
-                let gate = || {
-                    if stop.load(Ordering::Acquire) {
-                        return Err("source_copy_cancelled".into());
+        // Network probes and journal I/O must not occupy an async worker.
+        let task = tauri::async_runtime::spawn_blocking(move || {
+            tauri::async_runtime::block_on(async move {
+                let notify = |value: ImportView| {
+                    if let Ok(mut current) = status.lock() {
+                        *current = value.clone();
                     }
-                    current(&saved, &identity, source.source_id())?;
-                    let mut snapshot = network.lock().map_err(|_| "network_unknown")?;
-                    if snapshot.0.elapsed() >= std::time::Duration::from_secs(1) {
-                        *snapshot = (
-                            std::time::Instant::now(),
-                            crate::resource_policy::sample().unmetered,
-                        );
-                    }
-                    match snapshot.1 {
-                        Some(true) => Ok(()),
-                        Some(false) => Err("metered_network".into()),
-                        None => Err("network_unknown".into()),
-                    }
+                    let _ = app.emit_to("main", "photo-import", value);
                 };
-                execute(
-                    &transport::client()?,
-                    &crate::connection::normalize_server(&saved.server)?,
-                    &saved,
-                    &identity,
-                    &source,
-                    &journal,
-                    &stop,
-                    &gate,
-                    &notify,
-                )
-                .await
-            }
-            .await;
-            if let Err(code) = result {
-                if let Ok(mut current) = status.lock() {
-                    if current.state == "copying" {
-                        current.state = "needs-attention".into();
-                        current.code = Some(code);
-                        let _ = app.emit_to("main", "photo-import", current.clone());
+                let result = async {
+                    let identity = credentials::identity()?;
+                    let source = credentials::load::<Consent>(CREDENTIAL)?
+                        .ok_or("source_approval_required")?;
+                    let journal = Journal::new(&base, source.source_id())?;
+                    let network = Mutex::new((
+                        std::time::Instant::now() - std::time::Duration::from_secs(2),
+                        None,
+                    ));
+                    let gate = || {
+                        if stop.load(Ordering::Acquire) {
+                            return Err("source_copy_cancelled".into());
+                        }
+                        current(&saved, &identity, source.source_id())?;
+                        let mut snapshot = network.lock().map_err(|_| "network_unknown")?;
+                        if snapshot.0.elapsed() >= std::time::Duration::from_secs(1) {
+                            *snapshot = (
+                                std::time::Instant::now(),
+                                crate::resource_policy::sample().unmetered,
+                            );
+                        }
+                        match snapshot.1 {
+                            Some(true) => Ok(()),
+                            Some(false) => Err("metered_network".into()),
+                            None => Err("network_unknown".into()),
+                        }
+                    };
+                    execute(
+                        &transport::client()?,
+                        &crate::connection::normalize_server(&saved.server)?,
+                        &saved,
+                        &identity,
+                        &source,
+                        &journal,
+                        &stop,
+                        &gate,
+                        &notify,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(code) = result {
+                    if let Ok(mut current) = status.lock() {
+                        if current.state == "copying" {
+                            current.state = "needs-attention".into();
+                            current.code = Some(code);
+                            let _ = app.emit_to("main", "photo-import", current.clone());
+                        }
                     }
                 }
-            }
+            });
         });
         *self.running.lock().await = Some(Running { cancel, task });
         Ok(value)
