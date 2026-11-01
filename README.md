@@ -802,7 +802,7 @@ Native profile roots require root-owned, non-writable, ACL-free parents as well 
 
 TLS keystore records use the same complete profile binding as the database credential, under a separate account namespace. The profile lease remains held across TLS persistence and bootstrap. A changed runtime/configuration requires the future managed migration to preserve and rebind both secrets; automatic replacement currently refuses.
 
-The ignored Unix test `actual_postgres_restore_selection_finalization_and_writer_admission`
+The ignored cross-platform test `actual_postgres_restore_selection_finalization_and_writer_admission`
 exercises the compiled controller with a real synthetic PostgreSQL restore. Set
 `FRAMELEAF_TEST_HOST_PACK` to a complete measured candidate directory containing
 `manifest.json` and `payload`, and `FRAMELEAF_TEST_RESTORE_ROOT` to a new absolute
@@ -821,3 +821,7 @@ and starts the selected server before comparing selected and retained original r
 It retains the synthetic profile and receipt for inspection. Use a fresh fixture root
 for each run. This does not establish release trust, OS credential storage, installed
 application acceptance, or GPU qualification.
+
+Windows CI checks that this ignored test is compiled. Actual Windows execution
+requires a complete Windows candidate with private database, Manager, backup and
+media dependencies; compilation alone does not qualify Windows restore.
