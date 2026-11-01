@@ -13,6 +13,10 @@ permissions:
   actions: read
 jobs:
   qualify:
+    permissions:
+      # Draft assets require push access; the token is exposed only during acquisition.
+      contents: write
+      actions: read
     runs-on: windows-2022
     timeout-minutes: 60
     env:

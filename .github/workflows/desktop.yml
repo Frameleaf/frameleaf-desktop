@@ -274,7 +274,8 @@ jobs:
   package-windows-runtime:
     if: ${{ !inputs.windows_cloud_probe && (inputs.windows_runtime_signature_hex != '' && inputs.windows_host_assets_artifact_id == '' && inputs.windows_host_candidate_asset_id == '') }}
     permissions:
-      contents: read
+      # GitHub requires push access to read unpublished draft release inputs.
+      contents: write
       actions: read
     uses: ./.github/workflows/windows-desktop-runtime.yml
     with:
@@ -295,7 +296,8 @@ jobs:
   qualify-windows-host:
     if: ${{ !inputs.windows_cloud_probe && (inputs.windows_host_candidate_asset_id != '') }}
     permissions:
-      contents: read
+      # GitHub requires push access to read unpublished draft release inputs.
+      contents: write
       actions: read
     uses: ./.github/workflows/windows-host-qualification.yml
     with:
