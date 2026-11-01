@@ -901,6 +901,8 @@ impl NativeManager {
         if self.shutdown_confirmed {
             return Ok(());
         }
+        #[cfg(all(test, windows))]
+        windows_tests::cleanup_barrier();
         self.tree
             .terminate_child_confirmed(&mut self.child, &mut self.shutdown_signalled, timeout)
             .map_err(|_| "native_manager_shutdown_unconfirmed")?;

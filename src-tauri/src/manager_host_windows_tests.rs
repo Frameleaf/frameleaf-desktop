@@ -59,6 +59,15 @@ fn wait_for(path: &Path) {
     }
 }
 
+pub(super) fn cleanup_barrier() {
+    if std::env::var(ROLE).as_deref() != Ok("owner") {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+    fs::write(root.join("cleanup-entered"), b"ready").unwrap();
+    wait_for(&root.join("cleanup-release"));
+}
+
 fn record(root: &Path, name: &str, pid: u32) {
     let temporary = root.join(format!(".{name}"));
     fs::write(&temporary, pid.to_string()).unwrap();
@@ -283,6 +292,13 @@ async fn manager_owns_descendants_through_shutdown_and_owner_loss() {
             let action = fixture.root.join(".action");
             fs::write(&action, mode.as_bytes()).unwrap();
             fs::rename(action, fixture.root.join("action")).unwrap();
+            wait_for(&fixture.root.join("cleanup-entered"));
+            assert!(
+                lease.try_lock().is_err(),
+                "cleanup released its code lease early"
+            );
+            assert!(crate::host_state::Owner::acquire(&fixture.root.join("state"), true).is_err());
+            fs::write(fixture.root.join("cleanup-release"), b"release").unwrap();
         }
         for handle in &fixture.handles {
             assert_eq!(
