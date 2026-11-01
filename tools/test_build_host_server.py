@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +39,58 @@ class HostServerTests(unittest.TestCase):
                     self.assertFalse((root / name).exists())
                 self.assertEqual((root / "dist/main.js").read_text(), "export const value = 42;")
                 self.assertEqual(retained.read_text(), "dependency source provenance")
+
+    def test_build_receipt_describes_cleaned_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "source"
+            source.mkdir()
+            node = root / "node"
+            node.write_text("fixture node")
+            deployed = root / "deployment-fixture"
+            deployed.mkdir()
+            dependencies = {}
+            for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+                package = deployed / "node_modules" / name / "package.json"
+                package.parent.mkdir(parents=True)
+                package.write_text(json.dumps({"name": name, "version": "1.2.3"}))
+                dependencies[name] = "file:///private/build/" + name
+            (deployed / "package.json").write_text(json.dumps({"dependencies": dependencies}))
+            for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo", "dist/main.js", "resources/studio/subtitle-sidecar.mjs"]:
+                path = deployed / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture")
+            verifier = source / "docker/scripts/verify-server-package.mjs"
+            verifier.parent.mkdir(parents=True)
+            verifier.write_text("fixture verifier")
+            (source / "pnpm-lock.yaml").write_text("fixture source lock")
+            output = root / "output"
+
+            def command(arguments, **kwargs):
+                if arguments[0] == node:
+                    return "v26.11.1"
+                if "archive" in arguments:
+                    archive = arguments[arguments.index("--output") + 1]
+                    with tarfile.open(archive, "w") as contents:
+                        contents.add(source, arcname=".")
+                elif "--version" in arguments:
+                    return "10.0.0"
+                elif "deploy" in arguments:
+                    shutil.copytree(deployed, arguments[-1])
+                return ""
+
+            with patch("build_host_server.shutil.which", side_effect=lambda name: "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.run", side_effect=command):
+                build(source, "a" * 40, node, output)
+            receipt = json.loads((output / "qualification.json").read_text())
+            runtime = output / "server"
+            self.assertEqual(receipt["qualification"], "passed")
+            self.assertEqual(receipt["files"], build_host_server.inventory(runtime))
+            metadata = json.loads((runtime / "package.json").read_text())
+            self.assertEqual(metadata["dependencies"], {name: "1.2.3" for name in dependencies})
+            for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:
+                self.assertFalse((runtime / name).exists())
+                self.assertNotIn(name, receipt["files"])
+            self.assertEqual((runtime / "dist/main.js").read_text(), "fixture")
 
     def test_runtime_metadata_refuses_wrong_or_unversioned_workspace_packages(self):
         for invalid in [None, {"name": "other", "version": "1.2.3"}, *[{"name": "@frameleaf/plugin-sdk", "version": value} for value in ["file:///private-build", "1.2.3-alpha..1", "01.2.3", "1.02.3", "1.2.03", "1.2.3-01", "1.2.3+build..meta", "١.2.3"]]]:
