@@ -66,7 +66,7 @@ def qualified_files(root: Path, directory: str, revision: str = SOURCE) -> dict:
 
 
 def api(path: str) -> dict:
-    return json.loads(subprocess.check_output(['gh', 'api', REPOSITORY + path]))
+    return json.loads(subprocess.check_output(['gh', 'api', (REPOSITORY + path).rstrip('/')]))
 
 
 def obtain(work: Path, name: str, artifact: int, digest: str, run: int, head: str,

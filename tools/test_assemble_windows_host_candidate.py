@@ -13,6 +13,13 @@ from build_runtime import BuildError, inventory
 
 
 class WindowsHostAssemblyTests(unittest.TestCase):
+    def test_repository_metadata_uses_canonical_endpoint_without_a_trailing_slash(self):
+        for path in ['', 'releases/419477762', 'actions/artifacts/1']:
+            with self.subTest(path=path), patch.object(assembler.subprocess, 'check_output', return_value=b'{"private":true}') as request:
+                self.assertEqual(assembler.api(path), {'private': True})
+                expected = 'repos/Frameleaf/frameleaf-desktop' + ('/' + path if path else '')
+                request.assert_called_once_with(['gh', 'api', expected])
+
     def test_source_equivalence_is_checked_before_any_component_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
