@@ -45,6 +45,8 @@ fn main() {
             "provision_local_host_profile",
             "cancel_local_host_start",
             "stop_local_host_manager",
+            "update_local_host",
+            "recover_local_host_update",
             "connect_server",
             "restore_connection",
             "sign_out",
