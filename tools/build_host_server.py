@@ -22,6 +22,16 @@ from build_runtime import (
     sha256,
 )
 
+# SemVer 2.0 suggested regex, Tom Preston-Werner and contributors (CC BY 3.0).
+# https://semver.org/spec/v2.0.0.html | https://creativecommons.org/licenses/by/3.0/
+# Adapted for fullmatch and ASCII-only numeric identifiers.
+SEMVER = re.compile(
+    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+    r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?",
+    re.ASCII,
+)
+
 
 def ignored(directory: str, names: list[str]) -> set[str]:
     return (
@@ -55,6 +65,37 @@ def stage_server(source: Path, destination: Path) -> dict:
                 raise BuildError("host_server_special_file_forbidden")
     shutil.copytree(source, destination, symlinks=True, ignore=ignored)
     return inventory(destination)
+
+
+def clean_runtime_metadata(runtime: Path) -> None:
+    package = runtime / "package.json"
+    regular(package)
+    metadata = json.loads(package.read_text())
+    dependencies = metadata.get("dependencies") if isinstance(metadata, dict) else None
+    if not isinstance(dependencies, dict):
+        raise BuildError("host_server_package_metadata_invalid")
+    for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+        path = runtime / "node_modules" / name / "package.json"
+        regular(path)
+        workspace = json.loads(path.read_text())
+        version = workspace.get("version") if isinstance(workspace, dict) else None
+        if (
+            not isinstance(workspace, dict)
+            or name not in dependencies
+            or workspace.get("name") != name
+            or not isinstance(version, str)
+            or not SEMVER.fullmatch(version)
+        ):
+            raise BuildError("host_server_package_metadata_invalid")
+        dependencies[name] = version
+    # Source/lock identity stays in the build receipt, not deployer's local file URLs.
+    package.write_text(json.dumps(metadata, indent=2) + "\n")
+    for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:
+        path = runtime / name
+        if path.exists() or path.is_symlink():
+            if not stat.S_ISREG(regular(path).st_mode):
+                raise BuildError("host_server_package_metadata_invalid")
+            path.unlink()
 
 
 def build(source: Path, revision: str, node: Path, output: Path) -> None:
@@ -155,7 +196,9 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
                 ]
             )
             runtime = output / "server"
-            report["files"] = stage_server(deployed, runtime)
+            stage_server(deployed, runtime)
+            clean_runtime_metadata(runtime)
+            report["files"] = inventory(runtime)
             command(
                 [
                     node,
