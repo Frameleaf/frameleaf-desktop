@@ -249,7 +249,13 @@ def assemble(
     if os.name != "nt":
         directories.append("perl")
     for name in directories:
-        stage_server(host / name, payload / name)
+        source = host / name
+        if name == "licenses":
+            try:
+                source.lstat()
+            except FileNotFoundError:
+                continue
+        stage_server(source, payload / name)
     stage_server(manager, payload / "manager")
     stage_server(backup, payload / "backup")
     if backup_component(payload / "backup") != backup_record:
