@@ -702,6 +702,8 @@ impl NativeManager {
     }
     #[cfg(windows)]
     fn cleanup_windows(&mut self, timeout: Duration) -> Result<(), String> {
+        #[cfg(test)]
+        windows_tests::cleanup_barrier();
         self.tree
             .terminate_confirmed(timeout)
             .map_err(|_| "native_manager_shutdown_unconfirmed")?;
