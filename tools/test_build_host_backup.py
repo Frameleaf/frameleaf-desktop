@@ -1,0 +1,68 @@
+import bz2
+import hashlib
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+from build_host_backup import artifact, unpack
+from build_runtime import BuildError
+
+
+class BackupEngineTests(unittest.TestCase):
+    def test_supported_targets_have_fixed_upstream_digests(self):
+        for system, machine in [('Darwin', 'arm64'), ('Darwin', 'x86_64'), ('Linux', 'aarch64'), ('Linux', 'x86_64'), ('Windows', 'AMD64')]:
+            pin = artifact(system, machine)
+            self.assertRegex(pin['sha256'], r'^[a-f0-9]{64}$')
+            self.assertTrue(pin['url'].startswith('https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_'))
+        for system, machine in [('Windows', 'ARM64'), ('Linux', 'i686'), ('Other', 'x86_64')]:
+            with self.assertRaises(BuildError):
+                artifact(system, machine)
+
+    def test_digest_is_checked_before_decompression_or_destination_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / 'restic.bz2'
+            archive.write_bytes(b'not compressed')
+            with self.assertRaisesRegex(BuildError, 'digest_mismatch'):
+                unpack(archive, root / 'restic', '0' * 64)
+            self.assertFalse((root / 'restic').exists())
+
+    def test_bzip_binary_is_bounded_and_nonempty(self):
+        for content, limit, valid in [(b'engine', 64, True), (b'', 64, False), (b'x' * 65, 64, False)]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive = root / 'restic.bz2'
+                archive.write_bytes(bz2.compress(content))
+                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+                with patch('build_host_backup.MAX_BINARY_BYTES', limit):
+                    if valid:
+                        unpack(archive, root / 'restic', digest)
+                        self.assertEqual((root / 'restic').read_bytes(), content)
+                    else:
+                        with self.assertRaises(BuildError):
+                            unpack(archive, root / 'restic', digest)
+
+    def test_zip_allows_one_exact_regular_executable_only(self):
+        for names, mode, valid in [(['restic.exe'], stat.S_IFREG, True), (['../restic.exe'], stat.S_IFREG, False), (['restic.exe', 'extra'], stat.S_IFREG, False), (['restic.exe'], stat.S_IFLNK, False)]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive = root / 'restic.zip'
+                with zipfile.ZipFile(archive, 'w') as output:
+                    for name in names:
+                        entry = zipfile.ZipInfo(name)
+                        entry.external_attr = (mode | 0o755) << 16
+                        output.writestr(entry, b'engine')
+                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+                if valid:
+                    unpack(archive, root / 'engine.exe', digest)
+                    self.assertEqual((root / 'engine.exe').read_bytes(), b'engine')
+                else:
+                    with self.assertRaises(BuildError):
+                        unpack(archive, root / 'engine.exe', digest)
+
+
+if __name__ == '__main__':
+    unittest.main()
