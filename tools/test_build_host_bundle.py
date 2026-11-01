@@ -63,7 +63,10 @@ class HostBundleTests(unittest.TestCase):
             for label, os_name, empty in [('current', os.name, False),
                                           ('windows-empty', 'nt', True),
                                           ('windows-populated', 'nt', False),
-                                          ('posix-empty', 'posix', True)]:
+                                          ('posix-empty', 'posix', True),
+                                          ('without-licenses', os.name, False)]:
+                if label == 'without-licenses':
+                    shutil.rmtree(host / 'licenses')
                 library = host / 'libraries/fixture'
                 if empty:
                     library.unlink(missing_ok=True)
@@ -86,7 +89,12 @@ class HostBundleTests(unittest.TestCase):
                         continue
                     assemble(host, ml, manager, backup, output, "a" * 40, 2)
                     manifest = json.loads((output / "manifest.json").read_text())
+                    if label == 'without-licenses':
+                        self.assertFalse((output / 'payload/licenses').exists())
                     for name, contents in notices.items():
+                        if label == 'without-licenses':
+                            self.assertNotIn(name, manifest['files'])
+                            continue
                         self.assertEqual((output / "payload" / name).read_bytes(), contents)
                         self.assertEqual(manifest["files"][name], {
                             "bytes": len(contents), "sha256": hashlib.sha256(contents).hexdigest(),
