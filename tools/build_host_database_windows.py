@@ -79,6 +79,8 @@ def stage_dependencies(prefix: Path, dependencies: Path, dumpbin: str, env: dict
         if key in private and sha256(private[key]) != sha256(binary):
             raise BuildError("host_database_dll_collision")
         private[key] = binary
+    # Qualification and shipped tools load private dependencies from bin, not the build PATH.
+    loadable = {binary.name.lower() for binary in binaries if binary.parent == prefix / "bin"}
     for binary in binaries:
         imports = re.findall(r"^\s+([\w.+-]+\.dll)\s*$", run(
             [dumpbin, "/nologo", "/dependents", binary], cwd=prefix, env=env
@@ -87,7 +89,7 @@ def stage_dependencies(prefix: Path, dependencies: Path, dumpbin: str, env: dict
             raise BuildError("host_database_pe_imports_missing")
         for name in imports:
             key = name.lower()
-            if key not in private and key not in SYSTEM_DLLS and not key.startswith(("api-ms-win-", "ext-ms-win-")):
+            if key not in loadable and key not in SYSTEM_DLLS and not key.startswith(("api-ms-win-", "ext-ms-win-")):
                 raise BuildError("host_database_dll_missing:" + key)
 
 
