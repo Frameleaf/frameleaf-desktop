@@ -190,13 +190,34 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
         .join("restore-targets")
         .join(&prepared.binding.operation_id)
         .join(&prepared.attempt_id);
+    let intent = fs::read(target.join("activation-intent.json")).unwrap();
     assert_eq!(
-        fs::read(target.join("activation-intent.json")).unwrap(),
+        intent,
         fs::read(target.join("activation-complete.json")).unwrap()
     );
+    let selected = owner.read().unwrap().unwrap().database_reference;
+    let recovery = state
+        .join("restore-safety")
+        .join(&prepared.binding.operation_id)
+        .join("recovery.json");
+    let backup = fs::read(&recovery).unwrap();
     // Lost acknowledgements revalidate and finalize without repeating selection or the safety backup.
     let proof = verified(&runtime, &mut owner, &state, &password, ports, &prepared);
-    owner.finalize_restore(proof, safety).unwrap();
+    owner.finalize_restore(proof, safety.clone()).unwrap();
+    let final_state = owner.read().unwrap().unwrap();
+    assert_eq!(final_state.database_reference, selected);
+    assert!(!final_state.restore_pending);
+    assert!(!state.join(ACTIVATION).exists());
+    assert_eq!(
+        fs::read(target.join("activation-intent.json")).unwrap(),
+        intent
+    );
+    assert_eq!(
+        fs::read(target.join("activation-complete.json")).unwrap(),
+        intent
+    );
+    assert_eq!(fs::read(&recovery).unwrap(), backup);
+    safety.verify_readback(&owner.root, &prepared).unwrap();
     owner
         .activate(&id, runtime.manifest_sha256(), HostMode::Server)
         .unwrap();
