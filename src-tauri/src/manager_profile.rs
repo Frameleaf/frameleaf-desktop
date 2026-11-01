@@ -33,6 +33,12 @@ struct ProfileGuard {
     state: cap_std::fs::Dir,
     data: cap_std::fs::Dir,
 }
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the open file description until its CLOEXEC copies close.
+        let _ = self._lease.unlock();
+    }
+}
 impl Profile {
     pub(crate) fn binding(&self) -> &str {
         &self.binding_sha256
@@ -675,6 +681,24 @@ mod tests {
         );
         drop(profile);
         competing.try_lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_drop_releases_setup_lease_with_a_fork_style_descriptor_copy() {
+        let f = Fixture::new();
+        let profile = f.create();
+        let inherited = profile.guard.as_ref().unwrap()._lease.try_clone().unwrap();
+        let dir =
+            cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&f.1.data).unwrap());
+        let competing = dir
+            .open_with(".setup.lock", &crate::host_state::options(true))
+            .unwrap()
+            .into_std();
+        assert!(competing.try_lock().is_err());
+        drop(profile);
+        competing.try_lock().unwrap();
+        drop(inherited);
     }
 
     #[test]

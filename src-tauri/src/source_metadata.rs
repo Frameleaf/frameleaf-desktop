@@ -145,7 +145,7 @@ pub(crate) fn probe(dir: &Dir, name: &Path, meta: &Metadata) -> Result<Observati
                 .map_err(|_| "source_metadata_unavailable")?
                 != meta.modified().map_err(|_| "source_metadata_unavailable")?
         {
-            #[cfg(test)]
+            #[cfg(debug_assertions)]
             eprintln!("source_identity/windows_probe root={} expected_len={} opened_len={} expected_dir={} opened_dir={} expected_attributes={:#x} opened_attributes={:#x} expected_modified={:?} opened_modified={:?}", name == Path::new("."), meta.len(), opened.len(), meta.is_dir(), opened.is_dir(), meta.file_attributes(), opened.file_attributes(), meta.modified(), opened.modified());
             return Err("source_item_changed".into());
         }

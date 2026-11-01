@@ -18,6 +18,8 @@ use zeroize::{Zeroize, Zeroizing};
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Config {
     protocol_version: u32,
+    #[serde(default)]
+    mode: crate::host_runtime::HostMode,
     installation_id: String,
     candidate: PathBuf,
     state: PathBuf,
@@ -214,14 +216,28 @@ fn stopped(invalid: &AtomicBool) -> Result<(), String> {
     emit(json!({"protocolVersion":1,"state":"stopped"}))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CheckpointCommand {
-    protocol_version: u32,
-    action: String,
-    operation_id: String,
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+enum CheckpointCommand {
+    #[serde(rename_all = "camelCase")]
+    Checkpoint {
+        protocol_version: u32,
+        operation_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    CleanupCheckpoint {
+        protocol_version: u32,
+        operation_id: String,
+        checkpoint: crate::host_runtime::CheckpointReceipt,
+    },
+    #[serde(rename_all = "camelCase")]
+    PrepareRestore {
+        protocol_version: u32,
+        operation_id: String,
+        binding: crate::host_runtime::RestoreBinding,
+    },
 }
-fn read_owner_command(input: &mut impl BufRead) -> Result<Option<String>, String> {
+fn read_owner_command(input: &mut impl BufRead) -> Result<Option<CheckpointCommand>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     let count = Read::by_ref(input)
         .take(1025)
@@ -235,17 +251,40 @@ fn read_owner_command(input: &mut impl BufRead) -> Result<Option<String>, String
     }
     let command: CheckpointCommand =
         serde_json::from_slice(&bytes).map_err(|_| "host_control_command_invalid")?;
-    if command.protocol_version != 1
-        || command.action != "checkpoint"
-        || !crate::host_runtime::checkpoint_operation_id(&command.operation_id)
-    {
+    let (protocol_version, operation_id) = match &command {
+        CheckpointCommand::Checkpoint {
+            protocol_version,
+            operation_id,
+        } => (protocol_version, operation_id),
+        CheckpointCommand::CleanupCheckpoint {
+            protocol_version,
+            operation_id,
+            checkpoint,
+        } => {
+            if checkpoint.validate().is_err() || checkpoint.operation_id() != operation_id {
+                return Err("host_control_command_invalid".into());
+            }
+            (protocol_version, operation_id)
+        }
+        CheckpointCommand::PrepareRestore {
+            protocol_version,
+            operation_id,
+            binding,
+        } => {
+            if binding.validate().is_err() || binding.operation_id != *operation_id {
+                return Err("host_control_command_invalid".into());
+            }
+            (protocol_version, operation_id)
+        }
+    };
+    if *protocol_version != 1 || !crate::host_runtime::checkpoint_operation_id(operation_id) {
         return Err("host_control_command_invalid".into());
     }
-    Ok(Some(command.operation_id))
+    Ok(Some(command))
 }
 fn read_owner_commands(
     input: &mut impl BufRead,
-    sender: mpsc::SyncSender<String>,
+    sender: mpsc::SyncSender<CheckpointCommand>,
     cancelled: &AtomicBool,
     invalid: &AtomicBool,
 ) {
@@ -294,24 +333,40 @@ pub fn run() -> Result<(), String> {
     separate_paths(&config.candidate, &config.state)?;
     let runtime = verify_candidate(&config.candidate, &config.manifest_sha256)?;
     let _code_lease = crate::package_lease::CodeLease::acquire(&config.candidate)?;
+    if config.mode != crate::host_runtime::HostMode::Server {
+        if config.mode == crate::host_runtime::HostMode::CheckpointCleanup {
+            crate::host_storage::check_cleanup(&config.state)?;
+        } else {
+            crate::host_storage::check(&config.state)?;
+        }
+        if config.mode == crate::host_runtime::HostMode::Database {
+            crate::host_storage::check(&config.state.join("database"))?;
+        }
+        candidate_file(&config.state.join("host-state.json"), 4096)?;
+    }
     let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
-    crate::host_storage::check(&config.state)?;
+    if config.mode == crate::host_runtime::HostMode::CheckpointCleanup {
+        crate::host_storage::check_cleanup(&config.state)?;
+    } else {
+        crate::host_storage::check(&config.state)?;
+    }
     owner.activate(&config.installation_id, &config.manifest_sha256)?;
-    let mut process = runtime.start(
+    let mut process = runtime.start_mode(
         &config.state,
         &password,
         config.database_port,
         config.api_port,
+        config.mode,
     )?;
     if !process.wait_ready_or_cancel(Duration::from_secs(240), &cancelled)? {
         owner.clean_stop()?;
         return stopped(&invalid);
     }
     if emit(
-        json!({"protocolVersion":1,"state":"running", "manifestSha256":runtime.manifest_sha256(),
+        json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
         "sourceRevision":runtime.source_revision(),"certified":runtime.certified()}),
     )
     .is_err()
@@ -321,8 +376,35 @@ pub fn run() -> Result<(), String> {
         return Err("host_control_output_unavailable".into());
     }
     while !cancelled.load(Ordering::Acquire) {
-        if let Ok(operation) = command_receiver.try_recv() {
-            if process.request_checkpoint(&operation).is_err() {
+        if let Ok(command) = command_receiver.try_recv() {
+            let result = match command {
+                CheckpointCommand::Checkpoint { operation_id, .. } => {
+                    if matches!(
+                        config.mode,
+                        crate::host_runtime::HostMode::CheckpointCleanup
+                            | crate::host_runtime::HostMode::RestorePrepare
+                    ) {
+                        Err("host_checkpoint_unavailable".into())
+                    } else {
+                        process.request_checkpoint(&operation_id)
+                    }
+                }
+                CheckpointCommand::CleanupCheckpoint { checkpoint, .. } => {
+                    if config.mode == crate::host_runtime::HostMode::RestorePrepare {
+                        Err("host_checkpoint_unavailable".into())
+                    } else {
+                        process.request_checkpoint_cleanup(&checkpoint)
+                    }
+                }
+                CheckpointCommand::PrepareRestore { binding, .. } => {
+                    if binding.installation_id != config.installation_id {
+                        Err("host_restore_request_invalid".into())
+                    } else {
+                        process.request_restore(&binding)
+                    }
+                }
+            };
+            if result.is_err() {
                 invalid.store(true, Ordering::Release);
                 break;
             }
@@ -369,13 +451,67 @@ mod tests {
         let mut input = BufReader::new(bytes.as_bytes());
         assert_eq!(
             read_owner_command(&mut input).unwrap(),
-            Some(operation.to_owned())
+            Some(CheckpointCommand::Checkpoint {
+                protocol_version: 1,
+                operation_id: operation.to_owned()
+            })
         );
         assert_eq!(read_owner_command(&mut input).unwrap(), None);
         assert_eq!(read_owner_command(&mut &b""[..]).unwrap(), None);
         for raw in ["{}\n".to_owned(), format!("{request}"), "x".repeat(1025),
             format!("{{\"protocolVersion\":1,\"action\":\"checkpoint\",\"operationId\":\"{operation}\",\"path\":\"/outside\"}}\n")] {
             assert!(read_owner_command(&mut raw.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn cleanup_input_requires_a_strict_receipt_for_the_same_operation() {
+        let operation = "11111111-1111-4111-8111-111111111111";
+        let receipt = json!({"schemaVersion":1,"operationId":operation,"manifestSha256":"a".repeat(64),
+            "sourceRevision":"b".repeat(40),"postgresMajor":"19","databaseFormat":"frameleaf-canonical",
+            "dump":{"bytes":27,"sha256":"c".repeat(64)}});
+        let request = json!({"protocolVersion":1,"action":"cleanup-checkpoint","operationId":operation,"checkpoint":receipt});
+        assert!(read_owner_command(&mut format!("{request}\n").as_bytes()).is_ok());
+        for (key, value) in [
+            ("checkpoint", json!(null)),
+            ("path", json!("/outside")),
+            ("operationId", json!("22222222-2222-4222-8222-222222222222")),
+        ] {
+            let mut changed = request.clone();
+            changed[key] = value;
+            assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+        }
+        let mut changed = request.clone();
+        changed["checkpoint"]["dump"]["bytes"] = json!(0);
+        assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn restore_input_requires_exact_binding_for_the_same_operation() {
+        let operation = "11111111-1111-4111-8111-111111111111";
+        let binding = json!({"schemaVersion":1,"runtime":"native","operationId":operation,
+            "reviewId":"22222222-2222-4222-8222-222222222222","snapshotId":"c".repeat(64),"installationId":"d".repeat(12),
+            "manifestSha256":"a".repeat(64),"sourceRevision":"b".repeat(40),"libraryId":"e".repeat(12),"recoverySha256":"f".repeat(64)});
+        let request = json!({"protocolVersion":1,"action":"prepare-restore","operationId":operation,"binding":binding});
+        assert!(read_owner_command(&mut format!("{request}\n").as_bytes()).is_ok());
+        for changed in [
+            {
+                let mut v = request.clone();
+                v["binding"]["runtime"] = json!("docker");
+                v
+            },
+            {
+                let mut v = request.clone();
+                v["binding"]["path"] = json!("/outside");
+                v
+            },
+            {
+                let mut v = request.clone();
+                v["operationId"] = json!("22222222-2222-4222-8222-222222222222");
+                v
+            },
+        ] {
+            assert!(read_owner_command(&mut format!("{changed}\n").as_bytes()).is_err());
         }
     }
 
@@ -423,6 +559,36 @@ mod tests {
             "manifestSha256":"a".repeat(64),"password":"synthetic-password-long-enough",
             "databasePort":54321,"apiPort":54322});
         assert!(config(&serde_json::to_vec(&good).unwrap()).is_ok());
+        assert_eq!(
+            config(&serde_json::to_vec(&good).unwrap()).unwrap().mode,
+            crate::host_runtime::HostMode::Server
+        );
+        let mut maintenance = good.clone();
+        maintenance["mode"] = json!("database");
+        assert_eq!(
+            config(&serde_json::to_vec(&maintenance).unwrap())
+                .unwrap()
+                .mode,
+            crate::host_runtime::HostMode::Database
+        );
+        maintenance["mode"] = json!("checkpoint-cleanup");
+        assert_eq!(
+            config(&serde_json::to_vec(&maintenance).unwrap())
+                .unwrap()
+                .mode,
+            crate::host_runtime::HostMode::CheckpointCleanup
+        );
+        maintenance["mode"] = json!("restore-prepare");
+        assert_eq!(
+            config(&serde_json::to_vec(&maintenance).unwrap())
+                .unwrap()
+                .mode,
+            crate::host_runtime::HostMode::RestorePrepare
+        );
+        for invalid in [json!(null), json!("backup"), json!(true)] {
+            maintenance["mode"] = invalid;
+            assert!(config(&serde_json::to_vec(&maintenance).unwrap()).is_err());
+        }
         // Joining a Windows verbatim path normalizes away the traversal before validation.
         let parent_path = |leaf: &str| {
             json!(format!(

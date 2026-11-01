@@ -12,7 +12,7 @@ struct Volume {
     available_bytes: u64,
 }
 
-fn admit(volume: &Volume) -> Result<(), String> {
+fn admit_cleanup(volume: &Volume) -> Result<(), String> {
     let supported = match std::env::consts::OS {
         "macos" => matches!(volume.filesystem.as_str(), "apfs" | "hfs"),
         "linux" => matches!(volume.filesystem.as_str(), "ext" | "xfs" | "btrfs" | "zfs"),
@@ -22,6 +22,11 @@ fn admit(volume: &Volume) -> Result<(), String> {
     if !supported || !volume.local || volume.read_only {
         return Err("host_database_volume_unsupported".into());
     }
+    Ok(())
+}
+
+fn admit(volume: &Volume) -> Result<(), String> {
+    admit_cleanup(volume)?;
     if volume.available_bytes < MINIMUM_FREE_BYTES {
         return Err("host_database_space_insufficient".into());
     }
@@ -32,6 +37,13 @@ pub(crate) fn check(path: &Path) -> Result<(), String> {
     let directory = directory(path)?;
     cloud_storage_check(path, &directory)?;
     admit(&inspect(&directory)?)
+}
+
+/// Retirement may reclaim storage below the startup floor; all volume and cloud checks still apply.
+pub(crate) fn check_cleanup(path: &Path) -> Result<(), String> {
+    let directory = directory(path)?;
+    cloud_storage_check(path, &directory)?;
+    admit_cleanup(&inspect(&directory)?)
 }
 
 /// Open the physical directory without following links; inspection does not require startup headroom.
@@ -364,6 +376,40 @@ mod tests {
             admit(&volume).unwrap_err(),
             "host_database_volume_unsupported"
         );
+    }
+
+    #[test]
+    fn cleanup_storage_keeps_volume_safety_without_startup_headroom() {
+        let mut volume = Volume {
+            filesystem: if cfg!(target_os = "macos") {
+                "apfs"
+            } else if cfg!(windows) {
+                "NTFS"
+            } else {
+                "ext"
+            }
+            .into(),
+            local: true,
+            read_only: false,
+            available_bytes: 0,
+        };
+        assert_eq!(
+            admit(&volume).unwrap_err(),
+            "host_database_space_insufficient"
+        );
+        assert!(admit_cleanup(&volume).is_ok());
+        volume.local = false;
+        assert_eq!(
+            admit_cleanup(&volume).unwrap_err(),
+            "host_database_volume_unsupported"
+        );
+        volume.local = true;
+        volume.read_only = true;
+        assert!(admit_cleanup(&volume).is_err());
+        volume.read_only = false;
+        volume.filesystem = "nfs".into();
+        assert!(admit_cleanup(&volume).is_err());
+        assert!(check_cleanup(Path::new("relative")).is_err());
     }
 
     #[test]

@@ -243,11 +243,89 @@ pub(crate) fn checkpoint_operation_id(value: &str) -> bool {
     })
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CheckpointDump {
     bytes: u64,
     sha256: String,
+}
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CheckpointReceipt {
+    schema_version: u32,
+    operation_id: String,
+    manifest_sha256: String,
+    source_revision: String,
+    postgres_major: String,
+    database_format: String,
+    dump: CheckpointDump,
+}
+impl CheckpointReceipt {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || !checkpoint_operation_id(&self.operation_id)
+            || !digest_valid(&self.manifest_sha256, 64)
+            || !digest_valid(&self.source_revision, 40)
+            || self.postgres_major != "19"
+            || self.database_format != "frameleaf-canonical"
+            || self.dump.bytes == 0
+            || self.dump.bytes > 9_007_199_254_740_991
+            || !digest_valid(&self.dump.sha256, 64)
+        {
+            return Err("host_checkpoint_request_invalid".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RestoreBinding {
+    schema_version: u32,
+    runtime: String,
+    pub(crate) operation_id: String,
+    review_id: String,
+    snapshot_id: String,
+    pub(crate) installation_id: String,
+    manifest_sha256: String,
+    source_revision: String,
+    library_id: String,
+    recovery_sha256: String,
+}
+impl RestoreBinding {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.runtime != "native"
+            || !checkpoint_operation_id(&self.operation_id)
+            || !checkpoint_operation_id(&self.review_id)
+            || !digest_valid(&self.snapshot_id, 64)
+            || !digest_valid(&self.recovery_sha256, 64)
+            || !digest_valid(&self.installation_id, 12)
+            || !digest_valid(&self.library_id, 12)
+            || !digest_valid(&self.manifest_sha256, 64)
+            || !digest_valid(&self.source_revision, 40)
+        {
+            return Err("host_restore_request_invalid".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreValidation {
+    postgres_major: u32,
+    vector_version: String,
+    canonical: bool,
+    execution_state_reconstructed: bool,
+}
+fn restore_identity(value: &str) -> bool {
+    let parts: Vec<_> = value.split(':').collect();
+    parts.len() == 2
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
 }
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
@@ -263,14 +341,50 @@ enum AgentEvent {
         dump: CheckpointDump,
     },
     #[serde(rename_all = "camelCase")]
+    CheckpointCleaned {
+        schema_version: u32,
+        operation_id: String,
+        manifest_sha256: String,
+        source_revision: String,
+        postgres_major: String,
+        database_format: String,
+        dump: CheckpointDump,
+    },
+    #[serde(rename_all = "camelCase")]
+    CheckpointCleanupFailed {
+        operation_id: String,
+        code: String,
+    },
+    #[serde(rename_all = "camelCase")]
     CheckpointFailed {
+        operation_id: String,
+        code: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    RestorePrepared {
+        schema_version: u32,
+        binding: RestoreBinding,
+        attempt_id: String,
+        profile_identity: String,
+        target_identity: String,
+        database_identity: String,
+        validation: RestoreValidation,
+    },
+    #[serde(rename_all = "camelCase")]
+    RestorePrepareFailed {
         operation_id: String,
         code: String,
     },
     Stopped,
 }
+struct PendingCheckpoint {
+    operation: String,
+    accepted: bool,
+    cleanup: Option<CheckpointReceipt>,
+    restore: Option<RestoreBinding>,
+}
 struct CheckpointProtocol {
-    pending: Mutex<Option<(String, bool)>>,
+    pending: Mutex<Option<PendingCheckpoint>>,
     failed: AtomicBool,
     stopping: AtomicBool,
     manifest_sha256: String,
@@ -287,6 +401,32 @@ impl CheckpointProtocol {
         }
     }
     fn begin(&self, operation: &str) -> Result<(), String> {
+        self.begin_request(operation, None, None)
+    }
+    fn begin_cleanup(&self, receipt: &CheckpointReceipt) -> Result<(), String> {
+        receipt.validate()?;
+        if receipt.manifest_sha256 != self.manifest_sha256
+            || receipt.source_revision != self.source_revision
+        {
+            return Err("host_checkpoint_request_invalid".into());
+        }
+        self.begin_request(&receipt.operation_id, Some(receipt.clone()), None)
+    }
+    fn begin_restore(&self, binding: &RestoreBinding) -> Result<(), String> {
+        binding.validate()?;
+        if binding.manifest_sha256 != self.manifest_sha256
+            || binding.source_revision != self.source_revision
+        {
+            return Err("host_restore_request_invalid".into());
+        }
+        self.begin_request(&binding.operation_id, None, Some(binding.clone()))
+    }
+    fn begin_request(
+        &self,
+        operation: &str,
+        cleanup: Option<CheckpointReceipt>,
+        restore: Option<RestoreBinding>,
+    ) -> Result<(), String> {
         if !checkpoint_operation_id(operation) {
             return Err("host_checkpoint_request_invalid".into());
         }
@@ -297,13 +437,22 @@ impl CheckpointProtocol {
         if pending.is_some() {
             return Err("host_checkpoint_busy".into());
         }
-        *pending = Some((operation.to_owned(), false));
+        *pending = Some(PendingCheckpoint {
+            operation: operation.to_owned(),
+            accepted: false,
+            cleanup,
+            restore,
+        });
         Ok(())
     }
     fn finish(&self, event: &AgentEvent) -> Result<(), String> {
         let operation = match event {
             AgentEvent::Checkpoint { operation_id, .. }
+            | AgentEvent::CheckpointCleaned { operation_id, .. }
+            | AgentEvent::CheckpointCleanupFailed { operation_id, .. }
             | AgentEvent::CheckpointFailed { operation_id, .. } => operation_id,
+            AgentEvent::RestorePrepared { binding, .. } => &binding.operation_id,
+            AgentEvent::RestorePrepareFailed { operation_id, .. } => operation_id,
             AgentEvent::Stopped => return Err("host_checkpoint_protocol_invalid".into()),
         };
         let mut pending = self
@@ -312,7 +461,7 @@ impl CheckpointProtocol {
             .map_err(|_| "host_checkpoint_protocol_invalid")?;
         if !pending
             .as_ref()
-            .is_some_and(|(expected, accepted)| expected == operation && *accepted)
+            .is_some_and(|expected| expected.operation == *operation && expected.accepted)
         {
             return Err("host_checkpoint_protocol_invalid".into());
         }
@@ -327,6 +476,15 @@ impl CheckpointProtocol {
         let event: AgentEvent = serde_json::from_slice(raw).map_err(|_| invalid())?;
         let operation = match &event {
             AgentEvent::Checkpoint {
+                schema_version,
+                operation_id,
+                manifest_sha256,
+                source_revision,
+                postgres_major,
+                database_format,
+                dump,
+            }
+            | AgentEvent::CheckpointCleaned {
                 schema_version,
                 operation_id,
                 manifest_sha256,
@@ -354,6 +512,42 @@ impl CheckpointProtocol {
                 }
                 operation_id
             }
+            AgentEvent::CheckpointCleanupFailed { operation_id, code } => {
+                if code != "host_checkpoint_cleanup_failed" {
+                    return Err(invalid());
+                }
+                operation_id
+            }
+            AgentEvent::RestorePrepared {
+                schema_version,
+                binding,
+                attempt_id,
+                profile_identity,
+                target_identity,
+                database_identity,
+                validation,
+            } => {
+                binding.validate().map_err(|_| invalid())?;
+                if *schema_version != 1
+                    || !checkpoint_operation_id(attempt_id)
+                    || ![profile_identity, target_identity, database_identity]
+                        .iter()
+                        .all(|id| restore_identity(id))
+                    || validation.postgres_major != 19
+                    || validation.vector_version != "0.8.7"
+                    || !validation.canonical
+                    || !validation.execution_state_reconstructed
+                {
+                    return Err(invalid());
+                }
+                &binding.operation_id
+            }
+            AgentEvent::RestorePrepareFailed { operation_id, code } => {
+                if code != "host_restore_failed" {
+                    return Err(invalid());
+                }
+                operation_id
+            }
             AgentEvent::Stopped => {
                 return if self.stopping.load(Ordering::Acquire) {
                     Ok(event)
@@ -363,9 +557,45 @@ impl CheckpointProtocol {
             }
         };
         let mut pending = self.pending.lock().map_err(|_| invalid())?;
+        let cleanup = matches!(
+            event,
+            AgentEvent::CheckpointCleaned { .. } | AgentEvent::CheckpointCleanupFailed { .. }
+        );
+        let restore = matches!(
+            event,
+            AgentEvent::RestorePrepared { .. } | AgentEvent::RestorePrepareFailed { .. }
+        );
         match pending.as_mut() {
-            Some((expected, accepted)) if expected == operation && !*accepted => {
-                *accepted = true;
+            Some(expected)
+                if expected.operation == *operation
+                    && !expected.accepted
+                    && expected.cleanup.is_some() == cleanup
+                    && expected.restore.is_some() == restore =>
+            {
+                if let (Some(receipt), AgentEvent::CheckpointCleaned { .. }) =
+                    (&expected.cleanup, &event)
+                {
+                    let mut returned = serde_json::to_value(&event).map_err(|_| invalid())?;
+                    returned
+                        .as_object_mut()
+                        .ok_or_else(invalid)?
+                        .remove("state");
+                    if returned != serde_json::to_value(receipt).map_err(|_| invalid())? {
+                        return Err(invalid());
+                    }
+                }
+                if let (
+                    Some(binding),
+                    AgentEvent::RestorePrepared {
+                        binding: returned, ..
+                    },
+                ) = (&expected.restore, &event)
+                {
+                    if binding != returned {
+                        return Err(invalid());
+                    }
+                }
+                expected.accepted = true;
             }
             _ => return Err(invalid()),
         }
@@ -392,12 +622,13 @@ fn read_agent_output(
     ready: mpsc::Sender<Result<(), String>>,
     checkpoints: mpsc::SyncSender<AgentEvent>,
     protocol: Arc<CheckpointProtocol>,
+    mode: HostMode,
     fault: impl FnOnce(),
 ) {
     let result = (|| -> Result<(), String> {
         let raw = agent_line(&mut reader)?.ok_or("host_readiness_failed")?;
         if serde_json::from_slice::<serde_json::Value>(&raw).ok()
-            != Some(serde_json::json!({"state":"running"}))
+            != Some(serde_json::json!({"state":mode.ready_state()}))
         {
             return Err("host_readiness_failed".into());
         }
@@ -459,9 +690,30 @@ fn private_file(path: &Path, append: bool) -> Result<File, String> {
     Ok(file)
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum HostMode {
+    #[default]
+    Server,
+    Database,
+    CheckpointCleanup,
+    RestorePrepare,
+}
+impl HostMode {
+    pub(crate) fn ready_state(self) -> &'static str {
+        match self {
+            Self::Server => "running",
+            Self::Database => "database-ready",
+            Self::CheckpointCleanup => "checkpoint-cleanup-ready",
+            Self::RestorePrepare => "restore-prepare-ready",
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostStart<'a> {
+    mode: HostMode,
     state: &'a Path,
     runtime: &'a Path,
     manifest_sha256: &'a str,
@@ -541,6 +793,7 @@ pub struct HostProcess {
     checkpoints: Receiver<AgentEvent>,
     checkpoint_started: Option<Instant>,
     ready_seen: bool,
+    mode: HostMode,
 }
 impl VerifiedHostRuntime {
     /// Credentials are native-only; callers persist them in the OS credential store before first start.
@@ -550,6 +803,16 @@ impl VerifiedHostRuntime {
         password: &Zeroizing<String>,
         database_port: u16,
         api_port: u16,
+    ) -> Result<HostProcess, String> {
+        self.start_mode(state, password, database_port, api_port, HostMode::Server)
+    }
+    pub(crate) fn start_mode(
+        &self,
+        state: &Path,
+        password: &Zeroizing<String>,
+        database_port: u16,
+        api_port: u16,
+        mode: HostMode,
     ) -> Result<HostProcess, String> {
         self.check_files()?;
         if password.len() < 24
@@ -568,17 +831,24 @@ impl VerifiedHostRuntime {
             self.root.parent().ok_or("native_manager_layout_invalid")?,
         )?;
         crate::runtime_store::private_directory(state)?;
-        crate::host_storage::check(state)?;
-        let database = state.join("database");
-        match std::fs::symlink_metadata(&database) {
-            Ok(_) => crate::host_storage::check(&database)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("host_storage_unavailable".into()),
+        if mode == HostMode::CheckpointCleanup {
+            crate::host_storage::check_cleanup(state)?;
+        } else {
+            crate::host_storage::check(state)?;
+        }
+        if !matches!(mode, HostMode::CheckpointCleanup | HostMode::RestorePrepare) {
+            let database = state.join("database");
+            match std::fs::symlink_metadata(&database) {
+                Ok(_) => crate::host_storage::check(&database)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("host_storage_unavailable".into()),
+            }
         }
         let lease = private_file(&state.join("lease.lock"), false)?;
         lease.try_lock().map_err(|_| "host_already_owned")?;
         let message = Zeroizing::new(
             serde_json::to_vec(&HostStart {
+                mode,
                 state,
                 runtime: &self.root,
                 manifest_sha256: &self.manifest_sha256,
@@ -665,6 +935,7 @@ impl VerifiedHostRuntime {
             checkpoints,
             checkpoint_started: None,
             ready_seen: false,
+            mode,
         };
         let Some(output) = output else {
             return Err("host_agent_pipe_failed".into());
@@ -676,6 +947,7 @@ impl VerifiedHostRuntime {
                 sender,
                 checkpoint_sender,
                 protocol,
+                mode,
                 || output_owner.terminate(),
             )
         });
@@ -767,18 +1039,52 @@ impl HostProcess {
         Ok(())
     }
     pub fn request_checkpoint(&mut self, operation: &str) -> Result<(), String> {
-        if !self.ready_seen
+        self.send_checkpoint_request(operation, None)
+    }
+    pub(crate) fn request_checkpoint_cleanup(
+        &mut self,
+        receipt: &CheckpointReceipt,
+    ) -> Result<(), String> {
+        self.send_checkpoint_request(&receipt.operation_id, Some(receipt))
+    }
+    pub(crate) fn request_restore(&mut self, binding: &RestoreBinding) -> Result<(), String> {
+        if self.mode != HostMode::RestorePrepare
+            || !self.ready_seen
+            || self.protocol.stopping.load(Ordering::Acquire)
+            || !self.is_running()?
+        {
+            return Err("host_restore_unavailable".into());
+        }
+        self.protocol.begin_restore(binding)?;
+        self.checkpoint_started = Some(Instant::now());
+        let request = serde_json::json!({"protocolVersion":1,"action":"prepare-restore","operationId":binding.operation_id,"binding":binding});
+        self.input
+            .as_mut()
+            .ok_or("host_agent_pipe_failed")?
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|_| "host_agent_pipe_failed".into())
+    }
+    fn send_checkpoint_request(
+        &mut self,
+        operation: &str,
+        cleanup: Option<&CheckpointReceipt>,
+    ) -> Result<(), String> {
+        if self.mode == HostMode::RestorePrepare
+            || !self.ready_seen
             || self.protocol.stopping.load(Ordering::Acquire)
             || !self.is_running()?
         {
             return Err("host_checkpoint_unavailable".into());
         }
-        self.protocol.begin(operation)?;
-        self.checkpoint_started = Some(Instant::now());
-        let wire = format!(
-            "{}\n",
+        let request = if let Some(receipt) = cleanup {
+            self.protocol.begin_cleanup(receipt)?;
+            serde_json::json!({"protocolVersion":1,"action":"cleanup-checkpoint","operationId":operation,"checkpoint":receipt})
+        } else {
+            self.protocol.begin(operation)?;
             serde_json::json!({"protocolVersion":1,"action":"checkpoint","operationId":operation})
-        );
+        };
+        self.checkpoint_started = Some(Instant::now());
+        let wire = format!("{request}\n");
         self.input
             .as_mut()
             .ok_or("host_agent_pipe_failed")?
@@ -856,6 +1162,80 @@ mod checkpoint_tests {
         format!("{value}\n").into_bytes()
     }
 
+    fn restore_binding() -> RestoreBinding {
+        serde_json::from_value(serde_json::json!({"schemaVersion":1,"runtime":"native","operationId":OPERATION,
+            "reviewId":"22222222-2222-4222-8222-222222222222","snapshotId":"c".repeat(64),"installationId":"d".repeat(12),
+            "manifestSha256":"a".repeat(64),"sourceRevision":"b".repeat(40),"libraryId":"e".repeat(12),"recoverySha256":"f".repeat(64)})).unwrap()
+    }
+    fn prepared() -> serde_json::Value {
+        serde_json::json!({"schemaVersion":1,"state":"restore-prepared","binding":restore_binding(),
+            "attemptId":"33333333-3333-4333-8333-333333333333","profileIdentity":"1:2","targetIdentity":"1:3","databaseIdentity":"1:4",
+            "validation":{"postgresMajor":19,"vectorVersion":"0.8.7","canonical":true,"executionStateReconstructed":true}})
+    }
+    #[test]
+    fn restore_receipt_requires_exact_pending_binding_and_canonical_validation() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        assert!(protocol.parse(&wire(&prepared())).is_err());
+        let binding = restore_binding();
+        protocol.begin_restore(&binding).unwrap();
+        assert!(protocol.begin_restore(&binding).is_err());
+        assert!(protocol.parse(&wire(&receipt())).is_err());
+        for changed in [
+            {
+                let mut v = prepared();
+                v["binding"]["reviewId"] = serde_json::json!(OPERATION);
+                v
+            },
+            {
+                let mut v = prepared();
+                v["binding"]["snapshotId"] = serde_json::json!("0".repeat(64));
+                v
+            },
+            {
+                let mut v = prepared();
+                v["validation"]["canonical"] = serde_json::json!(false);
+                v
+            },
+            {
+                let mut v = prepared();
+                v["validation"]["executionStateReconstructed"] = serde_json::json!(false);
+                v
+            },
+            {
+                let mut v = prepared();
+                v["attemptId"] = serde_json::json!("../outside");
+                v
+            },
+            {
+                let mut v = prepared();
+                v["targetIdentity"] = serde_json::json!("/outside");
+                v
+            },
+            {
+                let mut v = prepared();
+                v["path"] = serde_json::json!("/outside");
+                v
+            },
+        ] {
+            assert!(protocol.parse(&wire(&changed)).is_err());
+        }
+        let event = protocol.parse(&wire(&prepared())).unwrap();
+        protocol.finish(&event).unwrap();
+        assert!(protocol.parse(&wire(&prepared())).is_err());
+        protocol.begin(OPERATION).unwrap();
+        assert!(protocol.parse(&wire(&prepared())).is_err());
+        let other = CheckpointProtocol::new("0".repeat(64), "b".repeat(40));
+        assert!(other.begin_restore(&binding).is_err());
+        let failure = serde_json::json!({"state":"restore-prepare-failed","operationId":OPERATION,"code":"host_restore_failed"});
+        let failed = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        failed.begin_restore(&binding).unwrap();
+        let mut changed = failure.clone();
+        changed["code"] = serde_json::json!("private-error");
+        assert!(failed.parse(&wire(&changed)).is_err());
+        let event = failed.parse(&wire(&failure)).unwrap();
+        failed.finish(&event).unwrap();
+    }
+
     #[test]
     fn checkpoint_receipts_require_an_outstanding_operation_and_its_exact_runtime() {
         let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
@@ -904,6 +1284,31 @@ mod checkpoint_tests {
     }
 
     #[test]
+    fn cleanup_receipts_cannot_cross_actions_or_change_the_expected_dump() {
+        let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
+        let mut expected = receipt();
+        expected.as_object_mut().unwrap().remove("state");
+        let expected: CheckpointReceipt = serde_json::from_value(expected).unwrap();
+        protocol.begin_cleanup(&expected).unwrap();
+        assert!(protocol.parse(&wire(&receipt())).is_err());
+        let mut cleaned = receipt();
+        cleaned["state"] = serde_json::json!("checkpoint-cleaned");
+        let mut changed = cleaned.clone();
+        changed["dump"]["sha256"] = serde_json::json!("d".repeat(64));
+        assert!(protocol.parse(&wire(&changed)).is_err());
+        let event = protocol.parse(&wire(&cleaned)).unwrap();
+        protocol.finish(&event).unwrap();
+        protocol.begin(OPERATION).unwrap();
+        assert!(protocol.parse(&wire(&cleaned)).is_err());
+        let event = protocol.parse(&wire(&receipt())).unwrap();
+        protocol.finish(&event).unwrap();
+        protocol.begin_cleanup(&expected).unwrap();
+        let failure = serde_json::json!({"state":"checkpoint-cleanup-failed", "operationId":OPERATION, "code":"host_checkpoint_cleanup_failed"});
+        let event = protocol.parse(&wire(&failure)).unwrap();
+        protocol.finish(&event).unwrap();
+    }
+
+    #[test]
     fn checkpoint_failures_are_scoped_and_never_carry_untrusted_error_details() {
         let protocol = CheckpointProtocol::new("a".repeat(64), "b".repeat(40));
         protocol.begin(OPERATION).unwrap();
@@ -945,6 +1350,45 @@ mod checkpoint_tests {
     }
 
     #[test]
+    fn database_readiness_cannot_be_confused_with_a_running_application() {
+        for (mode, state, accepted) in [
+            (HostMode::Server, "running", true),
+            (HostMode::Database, "database-ready", true),
+            (HostMode::Server, "database-ready", false),
+            (HostMode::Database, "running", false),
+            (HostMode::RestorePrepare, "restore-prepare-ready", true),
+            (HostMode::RestorePrepare, "checkpoint-cleanup-ready", false),
+            (HostMode::CheckpointCleanup, "restore-prepare-ready", false),
+            (
+                HostMode::CheckpointCleanup,
+                "checkpoint-cleanup-ready",
+                true,
+            ),
+            (HostMode::CheckpointCleanup, "database-ready", false),
+            (HostMode::CheckpointCleanup, "running", false),
+            (HostMode::Server, "checkpoint-cleanup-ready", false),
+            (HostMode::Database, "checkpoint-cleanup-ready", false),
+        ] {
+            let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
+            protocol.stopping.store(true, Ordering::Release);
+            let (ready_tx, ready) = mpsc::channel();
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let failed = AtomicBool::new(false);
+            let input = format!("{{\"state\":\"{state}\"}}\n{{\"state\":\"stopped\"}}\n");
+            read_agent_output(
+                std::io::Cursor::new(input),
+                ready_tx,
+                tx,
+                protocol,
+                mode,
+                || failed.store(true, Ordering::Release),
+            );
+            assert_eq!(ready.recv().unwrap().is_ok(), accepted);
+            assert_eq!(failed.load(Ordering::Acquire), !accepted);
+        }
+    }
+
+    #[test]
     fn output_reader_rejects_a_duplicate_receipt_instead_of_blocking_on_a_full_channel() {
         let protocol = Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40)));
         protocol.begin(OPERATION).unwrap();
@@ -961,6 +1405,7 @@ mod checkpoint_tests {
             ready_tx,
             tx,
             protocol.clone(),
+            HostMode::Server,
             || failed.store(true, Ordering::Release),
         );
         assert!(ready.recv().unwrap().is_ok());
@@ -981,6 +1426,7 @@ mod checkpoint_tests {
             ready_tx,
             tx,
             protocol.clone(),
+            HostMode::Server,
             || panic!("valid cancellation was refused"),
         );
         assert!(ready.recv().unwrap().is_ok());
