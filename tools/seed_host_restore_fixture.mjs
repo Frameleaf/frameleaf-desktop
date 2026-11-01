@@ -31,11 +31,13 @@ const startDatabase = directory => command("pgCtl", ["-D", directory, "-l", join
   "-o", `-h 127.0.0.1 -p ${c.databasePort}`, "-w", "start"]);
 if (mode === "selected") {
   assert.equal(await sql("SELECT value->>'label' FROM system_metadata WHERE key='native-owner-qualification'"), "selected");
+  assert.equal(await sql("SELECT value->>'fixtureRow' FROM system_metadata WHERE key='native-owner-qualification'"), "original-seeded-row");
   console.log(JSON.stringify({ selectedRows: true }));
 } else if (mode === "original") {
   await startDatabase(database);
   try {
     assert.equal(await sql("SELECT value->>'label' FROM system_metadata WHERE key='native-owner-qualification'"), "original-current");
+    assert.equal(await sql("SELECT value->>'fixtureRow' FROM system_metadata WHERE key='native-owner-qualification'"), "original-seeded-row");
   } finally { await stopDatabase(database); }
   console.log(JSON.stringify({ originalRows: true }));
 } else {
@@ -97,7 +99,7 @@ if (mode === "selected") {
         FRAMELEAF_MANAGER_INSTALLATION: installation.id, FRAMELEAF_MANAGER_RESTORE_OPERATION_ID: randomUUID(),
         FRAMELEAF_MEDIA_LOCATION: join(c.state, "media"), FRAMELEAF_BUILD_DATA: join(c.runtime, "build"),
         FRAMELEAF_HDR_BINDING: join(c.runtime, c.entryPoints.hdr), UV_THREADPOOL_SIZE: "1" }, timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
-    await sql(`INSERT INTO system_metadata(key,value) VALUES('native-owner-qualification','{"label":"selected"}')`);
+    await sql(`INSERT INTO system_metadata(key,value) VALUES('native-owner-qualification','{"label":"selected","fixtureRow":"original-seeded-row"}')`);
     await stopDatabase(database);
     const service = new NativeService(store, { protocolVersion: 2, installation, backupKey: key, password: c.password,
       controllerSha256: "e".repeat(64), backupEngine: { executable, sha256: executableSha },
@@ -107,7 +109,7 @@ if (mode === "selected") {
     const snapshot = store.history()[0].receipts["native-backup-verified"];
     const review = await prepareNativeRestoreReview(store, backups, { installation, libraryId: installation.id, release: context.release }, snapshot.snapshotId);
     await startDatabase(database);
-    await sql(`UPDATE system_metadata SET value='{"label":"original-current"}' WHERE key='native-owner-qualification'`);
+    await sql(`UPDATE system_metadata SET value='{"label":"original-current","fixtureRow":"original-seeded-row"}' WHERE key='native-owner-qualification'`);
     await stopDatabase(database);
     const operation = store.start("restore", randomUUID(), { reviewId: review.id, ...identity }).operation;
     const result = await runNativeRestorePrebackup(store, adapter, backups, context, operation);
@@ -118,11 +120,17 @@ if (mode === "selected") {
     console.log(JSON.stringify({ binding, safety: { snapshotId: result.snapshotId,
       recoverySha256: digest(result.recovery), checkpoint } }));
   } finally {
-    await adapter.stop();
-    store.close();
-    if (initialized) {
-      try { await command("pgCtl", ["-D", database, "status"]); await stopDatabase(database); }
-      catch (error) { assert.equal(error.code, 3, "fixture shutdown must be confirmed"); }
+    try {
+      await adapter.stop();
+    } finally {
+      try {
+        store.close();
+      } finally {
+        if (initialized) {
+          try { await command("pgCtl", ["-D", database, "status"]); await stopDatabase(database); }
+          catch (error) { assert.equal(error.code, 3, "fixture shutdown must be confirmed"); }
+        }
+      }
     }
   }
 }
