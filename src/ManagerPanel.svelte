@@ -107,12 +107,12 @@
     origin = manager.origin;
     try { pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager); }
     catch { throw Error('manager_local_state_unavailable'); }
-    await checkStatus();
     try { recoveryIntent = restoreBackupReview(localStorage.getItem(backupReviewKey(manager)), manager); }
     catch { throw Error('manager_local_state_unavailable'); }
     if (recoveryIntent) selectedBackup = recoveryIntent.snapshot;
     try { restorePending = parseBackupRestoreIntent(localStorage.getItem(backupRestoreKey(manager)), manager); }
     catch { throw Error('manager_local_state_unavailable'); }
+    await checkStatus();
   }
   onMount(() => { if (native) void perform(restore); });
   async function reviewCertificate() {
