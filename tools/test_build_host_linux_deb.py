@@ -119,25 +119,26 @@ class LinuxHostDebTests(unittest.TestCase):
     def test_origin_search_paths_cannot_escape_before_analysis(self):
         for tag in ['RPATH', 'RUNPATH']:
             for reference in ['$ORIGIN/../../outside', '${ORIGIN}/../../outside', '$ORIGIN/zalias']:
-                with self.subTest(tag=tag, reference=reference), tempfile.TemporaryDirectory() as temp:
-                    root = Path(temp).resolve()
-                    tree = root / 'tree'
-                    library = tree / 'lib'
-                    library.mkdir(parents=True)
-                    (library / 'shim.so').write_bytes(b'\x7fELFfixture')
-                    (library / 'private.so.1').write_bytes(b'\x7fELFfixture')
-                    (root / 'outside').mkdir()
-                    if reference.endswith('/zalias'):
-                        try:
-                            (library / 'zalias').symlink_to(root / 'outside', target_is_directory=True)
-                        except (OSError, NotImplementedError):
-                            self.skipTest('directory symlink creation unavailable')
-                    metadata = f'(NEEDED) Shared library: [$ORIGIN/private.so.1]\n({tag}) Library search path: [{reference}]'
-                    with patch('build_host_linux_deb.run', return_value=metadata) as command, patch('build_host_linux_deb.shutil.which', return_value='/trusted/patchelf'):
-                        with self.assertRaisesRegex(BuildError, 'host_install_origin_dependency_invalid'):
-                            dependencies(tree, 'frameleaf-fixture', root / 'work')
-                        self.assertTrue(all(call.args[0][0] == 'readelf' for call in command.call_args_list))
-                        self.assertFalse((root / 'work/origin-analysis').exists())
+                for needed in ['$ORIGIN/private.so.1', 'libc.so.6']:
+                    with self.subTest(tag=tag, reference=reference, needed=needed), tempfile.TemporaryDirectory() as temp:
+                        root = Path(temp).resolve()
+                        tree = root / 'tree'
+                        library = tree / 'lib'
+                        library.mkdir(parents=True)
+                        (library / 'shim.so').write_bytes(b'\x7fELFfixture')
+                        (library / 'private.so.1').write_bytes(b'\x7fELFfixture')
+                        (root / 'outside').mkdir()
+                        if reference.endswith('/zalias'):
+                            try:
+                                (library / 'zalias').symlink_to(root / 'outside', target_is_directory=True)
+                            except (OSError, NotImplementedError):
+                                self.skipTest('directory symlink creation unavailable')
+                        metadata = f'(NEEDED) Shared library: [{needed}]\n({tag}) Library search path: [{reference}]'
+                        with patch('build_host_linux_deb.run', return_value=metadata) as command, patch('build_host_linux_deb.shutil.which', return_value='/trusted/patchelf'):
+                            with self.assertRaisesRegex(BuildError, 'host_install_origin_dependency_invalid'):
+                                dependencies(tree, 'frameleaf-fixture', root / 'work')
+                            self.assertTrue(all(call.args[0][0] == 'readelf' for call in command.call_args_list))
+                            self.assertFalse((root / 'work/origin-analysis').exists())
 
     @unittest.skipUnless(os.name == 'posix' and os.getuid() != 0, 'requires ordinary POSIX account')
     def test_unmodified_hooks_refuse_nonroot_before_touching_installed_paths(self):

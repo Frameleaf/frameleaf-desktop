@@ -130,21 +130,21 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
         analyzed = path
         needed = re.findall(r'\(NEEDED\).*?\[([^\]]+)\]', dynamic)
         origin = [name for name in needed if name.startswith(('$ORIGIN/', '${ORIGIN}/'))]
+        search = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[([^\]]*)\]', dynamic)
+        if len(search) > 1:
+            raise BuildError('host_elf_search_path_ambiguous')
+        paths = search[0].split(':') if search else []
+        expanded = search_directories(path, paths)
+        for reference, directory in zip(paths, expanded):
+            if '$' in reference and not directory.resolve().is_relative_to(tree.resolve()):
+                raise BuildError('host_install_origin_dependency_invalid')
         if origin:
             targets = {}
-            for name, expanded in zip(origin, search_directories(path, origin)):
-                target = expanded.resolve(strict=True)
+            for name, dependency in zip(origin, search_directories(path, origin)):
+                target = dependency.resolve(strict=True)
                 if not target.is_relative_to(tree.resolve()) or not stat.S_ISREG(regular(target).st_mode):
                     raise BuildError('host_install_origin_dependency_invalid')
                 targets[name] = target
-            search = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[([^\]]*)\]', dynamic)
-            if len(search) > 1:
-                raise BuildError('host_elf_search_path_ambiguous')
-            paths = search[0].split(':') if search else []
-            expanded = search_directories(path, paths)
-            for reference, directory in zip(paths, expanded):
-                if '$' in reference and not directory.resolve().is_relative_to(tree.resolve()):
-                    raise BuildError('host_install_origin_dependency_invalid')
             patchelf = shutil.which('patchelf')
             if not patchelf:
                 raise BuildError('host_install_elf_tools_missing')
