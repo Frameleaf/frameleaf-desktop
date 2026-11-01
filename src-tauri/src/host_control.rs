@@ -462,6 +462,12 @@ pub fn run() -> Result<(), String> {
                         process.request_verify_restore(&prepared)
                     }
                 }
+                CheckpointCommand::SelectRestore { .. }
+                | CheckpointCommand::FinalizeRestore { .. }
+                    if config.mode != crate::host_runtime::HostMode::RestorePrepare =>
+                {
+                    Err("host_restore_unavailable".into())
+                }
                 CheckpointCommand::SelectRestore {
                     operation_id,
                     verification_id,
@@ -474,9 +480,6 @@ pub fn run() -> Result<(), String> {
                     safety,
                     ..
                 } => {
-                    if config.mode != crate::host_runtime::HostMode::RestorePrepare {
-                        return Err("host_restore_unavailable".into());
-                    }
                     process.stop()?;
                     owner.clean_stop()?;
                     let proof = process.take_verified_restore(&operation_id, &verification_id)?;
