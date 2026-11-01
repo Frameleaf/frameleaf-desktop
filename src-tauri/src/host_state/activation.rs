@@ -730,6 +730,10 @@ mod tests {
         let proof = f.proof();
         let safety = f.safety();
         f.owner.select_restore(proof, safety.clone()).unwrap();
+        let intent = fs::read(f.path.join(ACTIVATION)).unwrap();
+        let selected = f.owner.read().unwrap().unwrap().database_reference;
+        let recovery = f.path.join("restore-safety").join(OP).join("recovery.json");
+        let backup = fs::read(&recovery).unwrap();
         for _ in 0..2 {
             f.owner
                 .activate(
@@ -742,6 +746,20 @@ mod tests {
             f.owner.finalize_restore(proof, safety.clone()).unwrap();
             assert!(!f.owner.read().unwrap().unwrap().restore_pending);
             assert!(!f.path.join(ACTIVATION).exists());
+            assert_eq!(
+                f.owner.read().unwrap().unwrap().database_reference,
+                selected
+            );
+            assert_eq!(
+                fs::read(f.target.join("activation-intent.json")).unwrap(),
+                intent
+            );
+            assert_eq!(
+                fs::read(f.target.join("activation-complete.json")).unwrap(),
+                intent
+            );
+            assert_eq!(fs::read(&recovery).unwrap(), backup);
+            safety.verify_readback(&f.owner.root, &f.prepared).unwrap();
         }
         assert_eq!(
             fs::read(f.target.join("activation-intent.json")).unwrap(),
