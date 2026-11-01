@@ -18,6 +18,15 @@ fn main() {
                 _ => Err("host_install_identity_invalid".into()),
             }
         }
+        [mode, manifest, controller, uid] if mode == "--provision-install" => {
+            match (manifest.to_str(), controller.to_str(), uid.to_str()) {
+                (Some(manifest), Some(controller), Some(uid)) => {
+                    frameleaf_desktop::host_install::provision(manifest, controller, uid)
+                        .map(|receipt| println!("{}", receipt))
+                }
+                _ => Err("host_install_identity_invalid".into()),
+            }
+        }
         _ => Err("host_control_arguments_invalid".into()),
     };
     if let Err(code) = result {
