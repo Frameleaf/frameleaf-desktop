@@ -42,6 +42,104 @@ class LinuxHostDebTests(unittest.TestCase):
                 self.assertIn('-xframeleaf-fixture', args)
                 self.assertNotIn('--ignore-missing-info', args)
 
+    def test_native_addon_sonames_keep_dependency_analysis_without_library_version_mapping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'tree'
+            tree.mkdir()
+            names = ['sharp-linux-x64-0.35.5.node', 'bare-fs@4.bare', 'bare-path@3.bare', 'bare-url@2.bare', 'bcrypt_lib.node']
+            for name in names:
+                (tree / name).write_bytes(b'\x7fELFfixture')
+            def command(args, **kwargs):
+                return '(SONAME) Library soname: [' + args[-1].name + ']' if args[0] == 'readelf' else 'shlibs:Depends=libc6 (>= 2.39)'
+            with patch('build_host_linux_deb.run', side_effect=command) as call:
+                self.assertIn('libc6', dependencies(tree, 'frameleaf-fixture', root / 'work'))
+                self.assertEqual((root / 'work/debian/shlibs.local').read_text(), '')
+                args = call.call_args.args[0]
+                self.assertEqual(sum(str(arg).startswith('-e') for arg in args), len(names))
+                self.assertNotIn('--ignore-missing-info', args)
+
+    def test_origin_needed_is_normalized_only_in_a_private_analysis_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'tree'
+            library = tree / 'lib'
+            library.mkdir(parents=True)
+            shim = library / 'libpython3.so'
+            target = library / 'libpython3.12.so.1.0'
+            for path in [shim, target]:
+                path.write_bytes(b'\x7fELFfixture')
+            original = shim.read_bytes()
+            def command(args, **kwargs):
+                if args[0] == 'readelf':
+                    if args[-1] == shim:
+                        return '(SONAME) Library soname: [libpython3.so]\n(NEEDED) Shared library: [$ORIGIN/../lib/libpython3.12.so.1.0]\n(RUNPATH) Library runpath: [$ORIGIN]'
+                    return '(SONAME) Library soname: [libpython3.12.so.1.0]'
+                return 'shlibs:Depends=libc6 (>= 2.39)' if args[0] == 'dpkg-shlibdeps' else ''
+            with patch('build_host_linux_deb.run', side_effect=command) as call, patch('build_host_linux_deb.shutil.which', return_value='/trusted/patchelf'):
+                self.assertIn('libc6', dependencies(tree, 'frameleaf-fixture', root / 'work'))
+                changes = [item.args[0] for item in call.call_args_list if item.args[0][0] == '/trusted/patchelf']
+                self.assertTrue(changes)
+                self.assertEqual(changes[0][1:4], ['--replace-needed', '$ORIGIN/../lib/libpython3.12.so.1.0', target.name])
+                copy = changes[0][-1]
+                self.assertTrue(copy.is_relative_to(root / 'work'))
+                self.assertFalse(copy.is_relative_to(tree))
+                self.assertIn(['/trusted/patchelf', '--set-rpath', str(library), copy], changes)
+                self.assertNotIn('-e' + str(shim), call.call_args.args[0])
+                self.assertIn('-e' + str(copy), call.call_args.args[0])
+                self.assertEqual(shim.read_bytes(), original)
+            with patch('build_host_linux_deb.run', side_effect=command), patch('build_host_linux_deb.shutil.which', return_value=None):
+                with self.assertRaisesRegex(BuildError, 'host_install_elf_tools_missing'):
+                    dependencies(tree, 'frameleaf-fixture', root / 'without-tool')
+                self.assertFalse((root / 'without-tool/origin-analysis').exists())
+
+    def test_origin_needed_refuses_a_library_outside_the_staged_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'tree'
+            tree.mkdir()
+            (tree / 'shim').write_bytes(b'\x7fELFfixture')
+            (root / 'outside.so.1').write_bytes(b'\x7fELFoutside')
+            with patch('build_host_linux_deb.run', return_value='(NEEDED) Shared library: [$ORIGIN/../outside.so.1]'):
+                with self.assertRaisesRegex(BuildError, 'host_install_origin_dependency_invalid'):
+                    dependencies(tree, 'frameleaf-fixture', root / 'work')
+
+    def test_addon_sonames_refuse_paths_unknown_extensions_and_invalid_versions(self):
+        for name in ['/tmp/addon.node', 'addon.node/escape', 'bare-fs@bad.bare', 'unknown.plugin']:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                tree = root / 'tree'
+                tree.mkdir()
+                (tree / 'addon').write_bytes(b'\x7fELFfixture')
+                with patch('build_host_linux_deb.run', return_value='(SONAME) Library soname: [' + name + ']') as call:
+                    with self.assertRaisesRegex(BuildError, 'host_install_private_soname_unsupported'):
+                        dependencies(tree, 'frameleaf-fixture', root / 'work')
+                    self.assertEqual(call.call_count, 1)
+
+    def test_origin_search_paths_cannot_escape_before_analysis(self):
+        for tag in ['RPATH', 'RUNPATH']:
+            for reference in ['$ORIGIN/../../outside', '${ORIGIN}/../../outside', '$ORIGIN/zalias']:
+                for needed in ['$ORIGIN/private.so.1', 'libc.so.6']:
+                    with self.subTest(tag=tag, reference=reference, needed=needed), tempfile.TemporaryDirectory() as temp:
+                        root = Path(temp).resolve()
+                        tree = root / 'tree'
+                        library = tree / 'lib'
+                        library.mkdir(parents=True)
+                        (library / 'shim.so').write_bytes(b'\x7fELFfixture')
+                        (library / 'private.so.1').write_bytes(b'\x7fELFfixture')
+                        (root / 'outside').mkdir()
+                        if reference.endswith('/zalias'):
+                            try:
+                                (library / 'zalias').symlink_to(root / 'outside', target_is_directory=True)
+                            except (OSError, NotImplementedError):
+                                self.skipTest('directory symlink creation unavailable')
+                        metadata = f'(NEEDED) Shared library: [{needed}]\n({tag}) Library search path: [{reference}]'
+                        with patch('build_host_linux_deb.run', return_value=metadata) as command, patch('build_host_linux_deb.shutil.which', return_value='/trusted/patchelf'):
+                            with self.assertRaisesRegex(BuildError, 'host_install_origin_dependency_invalid'):
+                                dependencies(tree, 'frameleaf-fixture', root / 'work')
+                            self.assertTrue(all(call.args[0][0] == 'readelf' for call in command.call_args_list))
+                            self.assertFalse((root / 'work/origin-analysis').exists())
+
     @unittest.skipUnless(os.name == 'posix' and os.getuid() != 0, 'requires ordinary POSIX account')
     def test_unmodified_hooks_refuse_nonroot_before_touching_installed_paths(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -187,3 +285,35 @@ class LinuxHostDebTests(unittest.TestCase):
             result = dependencies(tree, 'frameleaf-fixture', root / 'work')
             self.assertIn('libc6', result)
             self.assertNotIn('frameleaf-fixture', result)
+
+    @unittest.skipUnless(
+        os.sys.platform.startswith('linux')
+        and all(shutil.which(tool) for tool in ['gcc', 'readelf', 'patchelf', 'dpkg-shlibdeps']),
+        'requires Linux native dependency build tools',
+    )
+    def test_real_native_addon_with_origin_dependency_preserves_staged_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'package with spaces'
+            library = tree / 'lib'
+            library.mkdir(parents=True)
+            (root / 'answer.c').write_text('int answer(void) { return 42; }')
+            (root / 'addon.c').write_text('#include <stdio.h>\nextern int answer(void); int addon(void) { puts("fixture"); return answer(); }')
+            target, addon = library / 'libanswer.so.1', library / 'answer.node'
+            for command in [
+                ['gcc', '-shared', '-fPIC', root / 'answer.c', '-Wl,-soname,libanswer.so.1', '-o', target],
+                ['gcc', '-shared', '-fPIC', root / 'addon.c', '-L' + str(library), '-l:libanswer.so.1', '-Wl,-soname,answer.node', '-Wl,-rpath,$ORIGIN', '-o', addon],
+                ['patchelf', '--replace-needed', 'libanswer.so.1', '$ORIGIN/libanswer.so.1', addon],
+            ]:
+                subprocess.run(command, check=True, capture_output=True)
+            originals = {path: path.read_bytes() for path in [target, addon]}
+            result = dependencies(tree, 'frameleaf-fixture', root / 'work')
+            self.assertIn('libc6', result)
+            self.assertNotIn('frameleaf-fixture', result)
+            for path, contents in originals.items():
+                self.assertEqual(path.read_bytes(), contents)
+            copies = list((root / 'work/origin-analysis').iterdir())
+            self.assertEqual(len(copies), 1)
+            metadata = subprocess.check_output(['readelf', '-d', copies[0]], text=True)
+            self.assertIn('Shared library: [libanswer.so.1]', metadata)
+            self.assertNotIn('Shared library: [$ORIGIN/', metadata)
