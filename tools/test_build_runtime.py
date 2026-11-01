@@ -234,10 +234,6 @@ class RuntimeBuilderTests(unittest.TestCase):
             self.assertNotEqual(environment["HOME"], "private")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RuntimeFailureReceiptTests(unittest.TestCase):
     def test_inventory_reports_the_exact_case_collision(self):
         from types import SimpleNamespace
@@ -312,3 +308,7 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                         environment["PATH"], str(Path(system) / "System32")
                     )
                     self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
+
+
+if __name__ == "__main__":
+    unittest.main()

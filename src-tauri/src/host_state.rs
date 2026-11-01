@@ -611,7 +611,7 @@ mod tests {
         // Neither cleanup nor preparation may depend on the original selected database.
         for mode in [
             crate::host_runtime::HostMode::CheckpointCleanup,
-            crate::host_runtime::HostMode::CheckpointCleanup,
+            crate::host_runtime::HostMode::RestorePrepare,
         ] {
             owner.activate(ID, &sha(), mode).unwrap();
             assert_eq!(

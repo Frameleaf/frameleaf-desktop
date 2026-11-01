@@ -1,6 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { workerStatus, safeMode } from '../src/mode-state.ts';
+
+test('local setup commands are registered and permitted only in the packaged main window', () => {
+  const ui = readFileSync(new URL('../src/LocalHost.svelte', import.meta.url), 'utf8');
+  const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
+  const handler = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8').match(/tauri::generate_handler!\[([\s\S]*?)\]/)?.[1] ?? '';
+  const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
+  const commands = [...ui.matchAll(/\binvoke(?:<[^>]+>)?\(\s*['"]([a-z_]+)['"]/g)].map(match => match[1]);
+  assert.ok(commands.includes('provision_local_host_profile'));
+  for (const command of commands) {
+    assert.match(handler, new RegExp(`\\b${command}\\b`), `missing invoke handler: ${command}`);
+    assert.ok(manifest.includes(JSON.stringify(command)), `missing app command: ${command}`);
+    assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`), `missing permission: ${command}`);
+  }
+  assert.equal(capability.local, true);
+  assert.deepEqual(capability.windows, ['main']);
+  assert.equal(capability.remote, undefined);
+});
 
 test('persisted modes reject unknown values without treating them as hosting', () => {
   assert.equal(safeMode('local-server'), 'local-server');
