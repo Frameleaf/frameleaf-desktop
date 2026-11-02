@@ -106,7 +106,19 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
                     if payload.exists():
                         shutil.rmtree(payload)
         finally:
-            (output / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
+            partial = output / 'qualification.json.part'
+            try:
+                partial.write_text(json.dumps(report, indent=2) + '\n')
+                partial.replace(output / 'qualification.json')
+            except OSError:
+                report['qualification'] = 'failed'
+                report.pop('files', None)
+                try:
+                    if payload.exists():
+                        shutil.rmtree(payload)
+                finally:
+                    partial.unlink(missing_ok=True)
+                raise
 
 
 if __name__ == '__main__':
