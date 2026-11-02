@@ -570,6 +570,7 @@ export function hostEnvironment(c) {
       ...(process.platform === "win32" ? [] : ["/bin"]),
     ].join(delimiter),
     HOME: join(c.state, "home"),
+    USERPROFILE: join(c.state, "home"),
     LANG: "C",
     ...(process.platform === "win32"
       ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows", NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" }

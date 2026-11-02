@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -165,6 +166,17 @@ test("host media commands use private binaries without inheriting the caller env
   const delimiter = process.platform === "win32" ? ";" : ":";
   assert.ok(env.PATH.split(delimiter).includes(join(cfg.runtime, "media")));
   assert.equal(env.PATH.split(delimiter)[0], join(cfg.runtime, "media"));
+});
+test("host child resolves its home inside the private profile", () => {
+  const env = hostEnvironment(config(join(tmpdir(), "frameleaf-private-home-原本")));
+  assert.equal(env.USERPROFILE, env.HOME);
+  const child = spawnSync(
+    process.execPath,
+    ["-e", "process.stdout.write(require('node:os').homedir())"],
+    { env, encoding: "utf8", timeout: 10000 },
+  );
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, env.HOME);
 });
 test("host Node options preserve captured Windows paths without inheriting caller options", () => {
   const cfg = config("/private/state");
