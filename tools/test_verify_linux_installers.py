@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,6 +39,10 @@ if case == ROLE + '-writable': (root / 'manifest.sig').chmod(0o666)
                  'image-extract-fail', 'crypto-fail']
         cases += [role + '-' + failure for role in ['deb', 'image']
                   for failure in ['private-directory', 'private-signature', 'nonexecutable', 'writable']]
+        if sys.platform == 'linux':
+            for tool in ['mksquashfs', 'unsquashfs']:
+                self.assertIsNotNone(shutil.which(tool), tool + ' is required on Linux')
+            cases += ['real-valid', 'real-private-directory']
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory(prefix='installer modes ') as temp:
                 root = Path(temp)
@@ -53,7 +58,8 @@ if case == ROLE + '-writable': (root / 'manifest.sig').chmod(0o666)
                 executable(binaries / 'uname', '#!/bin/sh\necho Linux\n')
                 executable(binaries / 'mktemp', '#!/bin/sh\nmkdir \"$CHECK_ROOT/scratch\"\nprintf \"%s\" \"$CHECK_ROOT/scratch\"\n')
                 executable(binaries / 'dpkg-deb', '#!/usr/bin/env python3\nROLE="deb"\n' + producer)
-                executable(binaries / 'unsquashfs', '#!/usr/bin/env python3\nROLE="image"\n' + producer)
+                if not case.startswith('real-'):
+                    executable(binaries / 'unsquashfs', '#!/usr/bin/env python3\nROLE="image"\n' + producer)
                 executable(binaries / 'node', '''#!/usr/bin/env python3
 import os, sys
 from pathlib import Path
@@ -71,14 +77,24 @@ with open(os.environ['CHECK_ROOT'] + '/verified.txt', 'a') as output: output.wri
 [ "$1" = --appimage-offset ] || exit 29
 if [ "$CHECK_CASE" = invalid-offset ]; then echo invalid; else echo 4096; fi
 ''')
+                if case.startswith('real-'):
+                    stored = root / 'stored'
+                    subprocess.run([str(binaries / 'dpkg-deb'), '--extract', 'fixture', str(stored)],
+                                   env={**os.environ, 'CHECK_CASE': 'deb-private-directory' if case.endswith('private-directory') else 'valid'},
+                                   check=True, capture_output=True, timeout=30)
+                    image = root / 'fixture.squashfs'
+                    subprocess.run(['mksquashfs', str(stored), str(image), '-noappend', '-no-progress', '-processors', '1'],
+                                   check=True, capture_output=True, timeout=30)
+                    prefix = b'#!/bin/sh\n[ "$1" = --appimage-offset ] || exit 29\necho 4096\nexit 0\n'
+                    (bundle / 'appimage/Frameleaf Candidate.AppImage').write_bytes(prefix.ljust(4096, b'\0') + image.read_bytes())
                 if case == 'duplicate':
                     (bundle / 'deb/duplicate.deb').touch()
                 result = subprocess.run(['bash', str(root / 'tools/verify_linux_installers.sh')], cwd=root,
                                         env={**os.environ, 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
-                                             'CHECK_CASE': case, 'CHECK_ROOT': str(root)}, capture_output=True, text=True)
-                self.assertEqual(result.returncode == 0, case == 'valid', result.stdout + result.stderr)
+                                             'CHECK_CASE': case, 'CHECK_ROOT': str(root)}, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode == 0, case in {'valid', 'real-valid'}, result.stdout + result.stderr)
                 self.assertFalse((root / 'scratch').exists())
-                if case == 'valid':
+                if case in {'valid', 'real-valid'}:
                     self.assertEqual(len((root / 'verified.txt').read_text().splitlines()), 2)
                 elif case.endswith('private-directory'):
                     self.assertIn('. has 0700', result.stderr)
