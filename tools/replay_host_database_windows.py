@@ -30,7 +30,7 @@ def extract_candidate(archive, output, expected_digest, revision, lock):
             raise BuildError('host_database_replay_inventory_invalid')
         names = set()
         for item in entries:
-            name = relative(item.filename.rstrip('/')).casefold()
+            name = relative(item.orig_filename.rstrip('/')).casefold()
             if name in names or stat.S_ISLNK(item.external_attr >> 16) or item.external_attr & 0x400:
                 raise BuildError('host_database_replay_path_invalid')
             names.add(name)

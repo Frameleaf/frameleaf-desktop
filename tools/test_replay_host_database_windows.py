@@ -20,6 +20,10 @@ class DatabaseReplayTests(unittest.TestCase):
             bundle.writestr('qualification.json', json.dumps(receipt))
             bundle.writestr('postgres/bin/initdb.exe', b'fixture')
             for name, value in extra:
+                if isinstance(name, str):
+                    raw_name = zipfile.ZipInfo(name)
+                    raw_name.filename = name
+                    name = raw_name
                 bundle.writestr(name, value)
         return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
 
