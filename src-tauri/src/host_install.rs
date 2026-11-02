@@ -1,5 +1,7 @@
 //! Fixed-path installer phases only; never starts a host or reads a user's library.
 use std::path::PathBuf;
+#[cfg(windows)]
+mod windows;
 #[cfg(target_os = "linux")]
 const BASE: &str = "/opt/frameleaf";
 #[cfg(not(target_os = "linux"))]
@@ -16,6 +18,9 @@ impl Layout {
         {
             return Err("host_install_identity_invalid".into());
         }
+        #[cfg(windows)]
+        let base = windows::base()?;
+        #[cfg(not(windows))]
         let base = PathBuf::from(BASE);
         Ok(Self {
             runtime: base.join("Runtimes").join(manifest),
@@ -23,7 +28,11 @@ impl Layout {
                 .join("Controllers")
                 .join(manifest)
                 .join(controller)
-                .join("frameleaf-native-host"),
+                .join(if cfg!(windows) {
+                    "frameleaf-native-host.exe"
+                } else {
+                    "frameleaf-native-host"
+                }),
             profiles: base.join("Profiles"),
         })
     }
@@ -1053,22 +1062,25 @@ mod tests {
     #[test]
     fn installer_layout_uses_only_fixed_versioned_system_paths() {
         let layout = Layout::new(&"a".repeat(64), &"b".repeat(64)).unwrap();
-        let base = if cfg!(target_os = "linux") {
+        #[cfg(windows)]
+        let base = windows::base().unwrap();
+        #[cfg(not(windows))]
+        let base = PathBuf::from(if cfg!(target_os = "linux") {
             "/opt/frameleaf"
         } else {
             "/Library/Application Support/Frameleaf"
-        };
-        assert_eq!(
-            layout.runtime,
-            PathBuf::from(base).join("Runtimes").join("a".repeat(64))
-        );
+        });
+        assert_eq!(layout.runtime, base.join("Runtimes").join("a".repeat(64)));
         assert_eq!(
             layout.controller,
-            PathBuf::from(base)
-                .join("Controllers")
+            base.join("Controllers")
                 .join("a".repeat(64))
                 .join("b".repeat(64))
-                .join("frameleaf-native-host")
+                .join(if cfg!(windows) {
+                    "frameleaf-native-host.exe"
+                } else {
+                    "frameleaf-native-host"
+                })
         );
         for value in ["", "../escape", "/tmp", &"A".repeat(64)] {
             assert!(Layout::new(value, &"b".repeat(64)).is_err());
