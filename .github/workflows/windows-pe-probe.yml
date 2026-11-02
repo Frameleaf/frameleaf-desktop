@@ -1,0 +1,49 @@
+name: Windows PE inspector qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-pe-probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        id: msys
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+          path-type: strict
+      - name: Check fixture mutations and strict inspector guards
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p test_qualify_windows_pe.py -v
+          if ($LASTEXITCODE) { throw 'PE fixture mutation tests failed' }
+          python -m unittest discover -s tools -p test_relocate_windows.py -v
+          if ($LASTEXITCODE) { throw 'PE closure tests failed' }
+      - name: Qualify actual inspection and relocated Windows loading
+        shell: pwsh
+        env:
+          MSYS_ROOT: ${{ steps.msys.outputs.msys2-location }}
+        run: |
+          $dependencies = Join-Path $env:MSYS_ROOT 'ucrt64'
+          python tools/qualify_windows_pe.py --dependencies $dependencies --work "$env:RUNNER_TEMP/fl-pe-probe" | Tee-Object -FilePath "$env:RUNNER_TEMP/windows-pe-qualification.json"
+          if ($LASTEXITCODE) { throw 'Actual Windows PE qualification failed' }
+      - name: Retain qualification receipt without fixture binaries
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-pe-inspector-qualification
+          path: ${{ runner.temp }}/windows-pe-qualification.json
+          if-no-files-found: error
+          retention-days: 7
