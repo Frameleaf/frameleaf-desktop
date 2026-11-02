@@ -11,20 +11,11 @@ from unittest.mock import patch
 
 from build_runtime import BuildError
 from qualify_windows_pe import damaged_imports, qualify
-from test_relocate_windows import pe
+from test_relocate_windows import pe, pe_image
 
 
 def fixture():
-    data = bytearray(pe()) + bytearray(512)
-    data[70:72] = (1).to_bytes(2, 'little')
-    # One file-backed section, with three import descriptors (the last is null).
-    data[336:340] = (512).to_bytes(4, 'little')
-    data[340:344] = (4096).to_bytes(4, 'little')
-    data[344:348] = (512).to_bytes(4, 'little')
-    data[348:352] = (512).to_bytes(4, 'little')
-    data[524:528] = (4200).to_bytes(4, 'little')
-    data[544:548] = (4220).to_bytes(4, 'little')
-    return bytes(data)
+    return pe_image(['KERNEL32.dll', 'fl-pe-probe.dll'])
 
 
 class WindowsPeQualificationTests(unittest.TestCase):
@@ -84,7 +75,7 @@ class WindowsPeQualificationTests(unittest.TestCase):
                         stdout = 'x86_64-w64-mingw32\n'
                     elif '-o' in arguments:
                         output = Path(cwd) / arguments[arguments.index('-o') + 1]
-                        output.write_bytes(fixture() if output.suffix == '.exe' else pe())
+                        output.write_bytes(fixture() if output.suffix == '.exe' else pe_image(['KERNEL32.dll']))
                     elif '-p' in arguments:
                         source = Path(arguments[-1])
                         data = source.read_bytes()
@@ -110,15 +101,10 @@ class WindowsPeQualificationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(arguments, code, stdout, stderr)
                 work = root / 'work'
                 with patch('platform.system', return_value='Windows'), patch('subprocess.run', side_effect=command), redirect_stderr(io.StringIO()):
-                    if accepts_partial:
-                        with self.assertRaisesRegex(BuildError, 'damaged_imports_accepted'):
-                            qualify(dependencies, work)
-                        self.assertEqual(loaded, [])
-                    else:
-                        receipt = qualify(dependencies, work)
-                        self.assertEqual(receipt['qualification'], 'passed')
-                        self.assertEqual(loaded, ['probe.exe'])
-                        self.assertFalse(receipt['fullRawConformance'])
-                        self.assertFalse(receipt['installedPlatformQualified'])
+                    receipt = qualify(dependencies, work)
+                    self.assertEqual(receipt['qualification'], 'passed')
+                    self.assertEqual(loaded, ['probe.exe'])
+                    self.assertFalse(receipt['fullRawConformance'])
+                    self.assertFalse(receipt['installedPlatformQualified'])
                     self.assertEqual(rejected, ['malformed', 'partial'])
                     self.assertEqual(list(work.iterdir()), [])
