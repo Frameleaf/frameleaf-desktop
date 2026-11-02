@@ -13,6 +13,38 @@ from build_runtime import BuildError
 
 
 class PluginToolPinTests(unittest.TestCase):
+    def test_known_folder_verification_refuses_runner_or_malformed_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary).resolve()
+            folders = {}
+            for key, directory in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+                location = work / "home/AppData" / directory
+                location.mkdir(parents=True)
+                folders[key] = str(location)
+            with patch.object(build_host_plugin, "run", return_value=json.dumps(folders)):
+                self.assertEqual(build_host_plugin.windows_compiler_cache(work, {}), folders)
+            for value in [None, {}, {**folders, "APPDATA": str(work)},
+                          {**folders, "LOCALAPPDATA": "relative"}, {**folders, "APPDATA": 3}]:
+                with self.subTest(value=value), \
+                     patch.object(build_host_plugin, "run", return_value=json.dumps(value)), \
+                     self.assertRaises(BuildError):
+                    build_host_plugin.windows_compiler_cache(work, {})
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows Known Folder API")
+    def test_real_windows_known_folders_stay_in_the_private_compiler_profile(self):
+        from build_runtime import build_environment
+        with tempfile.TemporaryDirectory(prefix="compiler-cache-é-") as temporary:
+            work = Path(temporary).resolve()
+            env = build_environment(work, os.environ)
+            expected = {}
+            for key, directory in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+                location = work / "home/AppData" / directory
+                location.mkdir(parents=True)
+                env[key] = str(location)
+                expected[key] = location
+            found = build_host_plugin.windows_compiler_cache(work, env)
+            self.assertEqual({key: Path(value).resolve() for key, value in found.items()}, expected)
+
     def test_windows_compiler_has_private_existing_appdata_before_any_tool_runs(self):
         class EnvironmentChecked(Exception):
             pass
