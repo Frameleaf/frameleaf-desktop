@@ -72,6 +72,7 @@ impl Installation {
         Ok(record)
     }
 }
+/// Read existing protected machine installations without creating or starting a runtime.
 pub(crate) fn installed() -> Result<Vec<Installation>, String> {
     if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
         return Err("host_install_platform_unsupported".into());
@@ -87,6 +88,7 @@ pub(crate) fn installed() -> Result<Vec<Installation>, String> {
     )
 }
 
+/// Protect each bounded inventory entry before reading its receipt; omit unfinished versions.
 fn installed_records(
     root: &std::path::Path,
     mut protect: impl FnMut(&std::path::Path) -> Result<(), String>,
@@ -825,6 +827,7 @@ mod tests {
         }
     }
     #[test]
+    /// Missing and unfinished versions stay untouched; receipt reads require protected ancestry.
     fn inventory_is_read_only_bounded_and_reads_only_protected_complete_versions() {
         use std::{cell::RefCell, collections::BTreeSet};
         let fixture = InventoryFixture::new();
@@ -893,6 +896,7 @@ mod tests {
         .is_err());
     }
     #[test]
+    /// Malformed inventories must fail rather than return a partial installation list.
     fn inventory_refuses_invalid_names_files_and_more_than_64_versions() {
         let fixture = InventoryFixture::new();
         let root = &fixture.0;

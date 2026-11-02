@@ -135,6 +135,7 @@ mod tests {
         );
     }
     #[test]
+    /// Invalid alternate inventory makes accidental environment-based redirection observable.
     fn caller_environment_and_working_directory_cannot_redirect_the_machine_anchor() {
         let root = base().unwrap();
         let inventory = serde_json::to_string(&super::super::installed().unwrap()).unwrap();
