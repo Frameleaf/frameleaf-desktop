@@ -858,3 +858,5 @@ and private certificate approval applies only to HTTPS. The separate Library Ser
 connection and desktop-owned native Manager retain their existing transport rules.
 
 Windows machine layout discovery resolves the OS-owned Program Files x64 folder, verifies its physical protected path, and uses the Windows controller filename. The lookup initializes COM on the calling thread and balances only its own initialization reference. This is read-only layout support; Windows installation and full-host startup remain gated.
+
+Windows installed-host discovery now reads installation receipts from the same protected OS-derived location. Missing and unfinished versions are omitted; malformed entries, unprotected paths and inventories above 64 versions are refused. The local IPC accepts no path and discovery creates no directories. Windows CI checks environment poisoning with a deliberately invalid alternate inventory; installed-device discovery and privileged installation remain separate acceptance gates.
