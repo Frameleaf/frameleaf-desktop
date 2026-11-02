@@ -15,6 +15,7 @@ from relocate_windows import closure, inspect_pe, pe_imports
 
 
 def damaged_imports(data: bytes) -> tuple[bytes, bytes]:
+    """Damage only the known fixture import directory or its second import name."""
     # Only mutate the known two-import compiler fixture; this is not a product PE parser.
     if not pe_imports(data[:69656]):
         raise BuildError('host_pe_probe_fixture_invalid')
@@ -43,6 +44,7 @@ def damaged_imports(data: bytes) -> tuple[bytes, bytes]:
 
 
 def qualify(dependencies: Path, work: Path) -> dict:
+    """Compile and relocate known imports, then report success only after fixture cleanup."""
     if platform.system() != 'Windows':
         raise BuildError('host_pe_probe_windows_required')
     if not work.is_absolute() or work.exists() or work.is_symlink() or dependencies.name != 'ucrt64':
