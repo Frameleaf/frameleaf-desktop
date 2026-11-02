@@ -32,6 +32,15 @@ export async function packageConfiguration(candidate, policy) {
   );
   if (profiles.schemaVersion !== 1 || approved.length !== 1)
     throw new Error("runtime_bundle_source_unapproved");
+  if (platform === "linux") {
+    // linuxdeploy rewrites ELF files under usr/lib; keep the signed runtime outside that scan.
+    const files = {
+      "/usr/share/Frameleaf/native-runtime/manifest.json": join(candidate, "manifest.json"),
+      "/usr/share/Frameleaf/native-runtime/manifest.sig": join(candidate, "manifest.sig"),
+      "/usr/share/Frameleaf/native-runtime/payload": join(candidate, "payload"),
+    };
+    return { bundle: { linux: { deb: { files }, appimage: { files }, rpm: { files } } } };
+  }
   return {
     bundle: {
       resources: {

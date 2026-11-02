@@ -489,11 +489,11 @@ async fn start_worker_setup(
             .app_local_data_dir()
             .map_err(|_| "app_data_directory_unavailable")?
             .join("worker"),
-        bundle: app
-            .path()
-            .resource_dir()
-            .map_err(|_| "app_resources_unavailable")?
-            .join("native-runtime"),
+        bundle: worker_setup::bundled_runtime(
+            &app.path()
+                .resource_dir()
+                .map_err(|_| "app_resources_unavailable")?,
+        ),
     };
     let handle = app.clone();
     app.state::<worker_setup::WorkerSetup>()
