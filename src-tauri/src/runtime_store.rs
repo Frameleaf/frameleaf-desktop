@@ -81,36 +81,44 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .and_then(|_| file.sync_all())
         .map_err(|_| "runtime_store_write_failed".into())
 }
+/// Admit a private data directory; existing Windows permissions are checked, never repaired.
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
-    absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
-    if !path.exists() {
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let mut builder = builder;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(path)
-            .map_err(|_| "runtime_store_directory_failed")?;
-    }
-    absolute_directory(path)?;
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(path)
-            .map_err(|_| "runtime_store_directory_failed")?
-            .permissions()
-            .mode()
-            & 0o077
-            != 0
-        {
-            return Err("runtime_store_directory_not_private".into());
-        }
+        crate::windows_protection::private_directory(path)
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
+        if !path.exists() {
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let mut builder = builder;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(path)
+                .map_err(|_| "runtime_store_directory_failed")?;
+        }
+        absolute_directory(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(path)
+                .map_err(|_| "runtime_store_directory_failed")?
+                .permissions()
+                .mode()
+                & 0o077
+                != 0
+            {
+                return Err("runtime_store_directory_not_private".into());
+            }
+        }
+        Ok(())
+    }
 }
 impl RuntimeStore {
     /// App-owned trust keys and minimum epoch must never come from a server response or runtime pack.
