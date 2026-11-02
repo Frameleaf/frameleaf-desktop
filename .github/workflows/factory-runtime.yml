@@ -3,10 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: 'Targets to prepare for the signed desktop release'
+        description: 'Runtime targets (Windows can be built independently)'
         type: choice
         default: macos-linux
-        options: [macos-linux, all, linux]
+        options: [macos-linux, all, linux, windows]
       epoch:
         description: 'Runtime epoch admitted by the release policy'
         type: string

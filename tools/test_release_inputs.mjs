@@ -51,3 +51,9 @@ test("private installer inputs require a successful main factory dispatch", () =
     assert.throws(() => validateFactoryRun(changed, "Frameleaf/frameleaf-desktop"), /runtime_run_untrusted/);
   }
 });
+
+test("factory Windows selection builds one native target without changing the full matrix", () => {
+  assert.deepEqual(releaseMatrix("windows"), { include: [
+    { os: "windows-2022", target: "windows-x86_64" },
+  ] });
+});
