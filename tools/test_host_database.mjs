@@ -235,3 +235,21 @@ test('canonical host paths allow only the Windows local-drive verbatim prefix di
     assert.equal(canonicalHostPathMatches('/private/profile', '/private/alias', platform), false);
   }
 });
+
+test('physical Windows state comparisons require a captured root and volume identity', () => {
+  const physicalRoot = String.raw`\\.\GLOBALROOT\Device\HarddiskVolume3\private\profile`;
+  const canonicalRoot = String.raw`C:\private\profile`;
+  const binding = { physicalRoot, canonicalRoot, volumeSerial: 42 };
+  assert.equal(canonicalHostPathMatches(`${canonicalRoot}\\database`, `${physicalRoot}\\database`, 'win32', binding, 42n), true);
+  assert.equal(canonicalHostPathMatches(canonicalRoot, physicalRoot, 'win32', binding, 42n), true);
+  for (const [actual, expected, captured, device] of [
+    [canonicalRoot, physicalRoot, undefined, 42n],
+    [canonicalRoot, physicalRoot, binding, 43n],
+    [`${canonicalRoot}\\database`, `${physicalRoot}2\\database`, binding, 42n],
+    [`${canonicalRoot}\\database`, `${physicalRoot}\\..\\database`, binding, 42n],
+    [canonicalRoot.replace('C:', 'D:'), physicalRoot, binding, 42n],
+    [canonicalRoot, physicalRoot.replace('Volume3', 'Volume4'), binding, 42n],
+    [`${canonicalRoot}\\alias`, `${physicalRoot}\\database`, binding, 42n],
+  ]) assert.equal(canonicalHostPathMatches(actual, expected, 'win32', captured, device), false);
+  assert.equal(canonicalHostPathMatches(canonicalRoot, physicalRoot, 'linux', binding, 42n), false);
+});

@@ -1,4 +1,14 @@
 //! Read-only Windows package admission; never edits an ACL.
+#[cfg(windows)]
+pub(crate) const NODE_PATH_OPTIONS: &str = "--preserve-symlinks --preserve-symlinks-main";
+#[cfg(windows)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StatePathBinding {
+    physical_root: String,
+    canonical_root: String,
+    volume_serial: u32,
+}
 fn stable_volume_root(path: &str) -> Option<&str> {
     let prefix = [
         r"\\?\GLOBALROOT\Device\HarddiskVolume",
@@ -111,8 +121,9 @@ mod native {
             DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
         },
         Storage::FileSystem::{
-            GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, READ_CONTROL, VOLUME_NAME_NT,
+            GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            READ_CONTROL, VOLUME_NAME_NT,
         },
     };
     const ERROR: &str = "native_manager_unprotected";
@@ -217,24 +228,61 @@ mod native {
         if meta.file_attributes() & 0x400 != 0 || (!meta.is_file() && !meta.is_dir()) {
             return Err(ERROR.into());
         }
+        let nt = opened_path(&file, VOLUME_NAME_NT)?;
+        // The device spelling preserves the opened NT object and supports process creation.
+        let value = format!(r"\\.\GLOBALROOT{nt}");
+        stable_volume_root(&value).ok_or(ERROR)?;
+        Ok(PathBuf::from(value))
+    }
+    fn opened_path(file: &File, flags: u32) -> Result<String, String> {
         let mut buffer = vec![0u16; 32768];
         let size = unsafe {
             GetFinalPathNameByHandleW(
                 file.as_raw_handle(),
                 buffer.as_mut_ptr(),
                 buffer.len() as u32,
-                VOLUME_NAME_NT,
+                flags,
             )
         } as usize;
         if size == 0 || size >= buffer.len() {
             return Err(ERROR.into());
         }
-        let nt = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
-        // The device spelling preserves the opened NT object and supports process creation.
-        let value = format!(r"\\.\GLOBALROOT{nt}");
-        stable_volume_root(&value).ok_or(ERROR)?;
-        Ok(PathBuf::from(value))
+        String::from_utf16(&buffer[..size]).map_err(|_| ERROR.into())
     }
+    pub(crate) fn state_path_binding(path: &Path) -> Result<super::StatePathBinding, String> {
+        let file = OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .share_mode(3)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| ERROR)?;
+        let meta = file.metadata().map_err(|_| ERROR)?;
+        if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
+            return Err(ERROR.into());
+        }
+        let physical_root = format!(r"\\.\GLOBALROOT{}", opened_path(&file, VOLUME_NAME_NT)?);
+        stable_volume_root(&physical_root).ok_or(ERROR)?;
+        if Path::new(&physical_root) != path {
+            return Err(ERROR.into());
+        }
+        let dos = opened_path(&file, 0)?;
+        let canonical_root = dos.strip_prefix(r"\\?\").ok_or(ERROR)?.to_owned();
+        let bytes = canonical_root.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b":\\" {
+            return Err(ERROR.into());
+        }
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(ERROR.into());
+        }
+        let info = unsafe { info.assume_init() };
+        Ok(super::StatePathBinding {
+            physical_root,
+            canonical_root,
+            volume_serial: info.dwVolumeSerialNumber,
+        })
+    }
+
     pub(crate) fn stable_state_path(path: &Path) -> Result<PathBuf, String> {
         let captured = match std::fs::symlink_metadata(path) {
             Ok(_) => stable_path(path),
@@ -451,23 +499,66 @@ mod native {
             std::fs::remove_dir_all(scratch).unwrap();
         }
         #[test]
+        fn actual_node_keeps_physical_main_and_dependency_paths() {
+            let scratch = std::env::temp_dir()
+                .join(format!("frameleaf-node-modules-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).unwrap();
+            let captured = stable_path(&scratch).unwrap();
+            std::fs::write(
+                scratch.join("main.cjs"),
+                "process.stdout.write(JSON.stringify([__filename,require('./child.cjs')]));",
+            )
+            .unwrap();
+            std::fs::write(scratch.join("child.cjs"), "module.exports=__filename;").unwrap();
+            let node = std::process::Command::new("node")
+                .args(["-p", "process.execPath"])
+                .output()
+                .unwrap();
+            assert!(node.status.success());
+            let node =
+                stable_path(Path::new(String::from_utf8(node.stdout).unwrap().trim())).unwrap();
+            let output = std::process::Command::new(node)
+                .arg(captured.join("main.cjs"))
+                .env_clear()
+                .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+                .env("NODE_OPTIONS", super::super::NODE_PATH_OPTIONS)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&scratch).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let paths: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                paths,
+                vec![
+                    captured.join("main.cjs").to_str().unwrap(),
+                    captured.join("child.cjs").to_str().unwrap()
+                ]
+            );
+        }
+        #[test]
         fn captured_state_is_accepted_by_the_actual_node_canonical_check() {
             let scratch =
                 std::env::temp_dir().join(format!("frameleaf-node-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&scratch).unwrap();
             let captured = stable_state_path(&scratch).unwrap();
+            let binding = state_path_binding(&captured).unwrap();
             let agent = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()
                 .join("runtime/host-agent.mjs");
             let agent = url::Url::from_file_path(agent).unwrap();
             let script = format!(
-                "import {{ canonicalHostPathMatches }} from {}; import fs from 'node:fs/promises'; const expected = process.argv[1]; const actual = await fs.realpath(expected); if (!canonicalHostPathMatches(actual, expected)) throw new Error(JSON.stringify({{actual,expected}}));",
+                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); if (!await isCanonicalHostPath(expected, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(expected),expected,binding}}));",
                 serde_json::to_string(agent.as_str()).unwrap(),
             );
             let output = std::process::Command::new("node")
                 .args(["--input-type=module", "--eval", &script])
                 .arg(&captured)
+                .arg(serde_json::to_string(&binding).unwrap())
                 .output()
                 .unwrap();
             std::fs::remove_dir_all(&scratch).unwrap();
@@ -506,7 +597,7 @@ mod native {
     }
 }
 #[cfg(windows)]
-pub(crate) use native::{protect, stable_path, stable_state_path};
+pub(crate) use native::{protect, stable_path, stable_state_path, state_path_binding};
 
 #[cfg(test)]
 mod tests {
