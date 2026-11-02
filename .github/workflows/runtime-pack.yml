@@ -2,7 +2,8 @@ name: Private CPU runtime candidate
 on:
   pull_request:
     paths:
-      - 'tools/**'
+      - 'tools/build_runtime.py'
+      - 'tools/test_build_runtime.py'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
       - 'src-tauri/src/runtime_store.rs'
