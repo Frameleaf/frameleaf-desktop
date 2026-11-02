@@ -50,15 +50,22 @@ class WindowsHostAssetsTests(unittest.TestCase):
                 revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source,
                                                    env=git_environment, text=True).strip()
                 node = Path(environment['NODE_BINARY'])
+                tar = root / ('archive-tools/tar.exe' if os.name == 'nt' else 'archive-tools/tar')
+                tar.parent.mkdir()
+                tar.write_bytes(b'test tar identity; not executed')
+                tar.chmod(0o755)
                 output = root / 'build-output'
                 def command(arguments, **kwargs):
                     if arguments == [node, '--version']: return 'v22.23.4'
                     if arguments[-1] == '--version': return '12.11.2'
-                    if arguments[1] == 'install': raise BuildError('test_dependency_install_boundary')
+                    if arguments[1] == 'install':
+                        self.assertEqual(real_which('tar', path=kwargs['env']['PATH']), str(tar))
+                        self.assertEqual(real_which('git', path=kwargs['env']['PATH']), real_which('git'))
+                        raise BuildError('test_dependency_install_boundary')
                     return run(arguments, **kwargs)
                 real_which = builder.shutil.which
                 with mock.patch.object(builder, 'run', side_effect=command), mock.patch.object(
-                    builder.shutil, 'which', side_effect=lambda name: real_which('git') if name == 'git' else str(node)
+                    builder.shutil, 'which', side_effect=lambda name: real_which('git') if name == 'git' else str(tar if name == 'tar' else node)
                 ):
                     with self.assertRaisesRegex(BuildError, '^test_dependency_install_boundary$'):
                         builder.build(source, revision, node, output)

@@ -12,6 +12,7 @@ on:
       - 'tools/build_host_database.py'
       - 'tools/build_runtime.py'
       - 'tools/source_archive.py'
+      - 'tools/test_host_source_archives.py'
       - 'tools/test_windows_host_assets.py'
       - 'runtime/studio-browser-guard*'
       - '.github/workflows/windows-host-assets.yml'
@@ -64,7 +65,7 @@ jobs:
       - name: Check component staging and archive boundaries
         shell: pwsh
         run: |
-          foreach ($test in @('test_build_host_web.py', 'test_build_host_plugin.py', 'test_build_host_studio.py', 'test_windows_host_assets.py')) {
+          foreach ($test in @('test_build_host_web.py', 'test_build_host_plugin.py', 'test_build_host_studio.py', 'test_host_source_archives.py', 'test_windows_host_assets.py')) {
             python -m unittest discover -s tools -p $test -v
             if ($LASTEXITCODE) { throw "Host asset packaging tests failed: $test" }
           }

@@ -34,8 +34,10 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         raise BuildError("host_web_source_invalid")
     if output.exists() or output.is_symlink():
         raise BuildError("host_web_output_invalid")
-    git, pnpm, bootstrap = (shutil.which(name) for name in ["git", "pnpm", "npm"])
-    if not git or not pnpm or not bootstrap or not node.is_file():
+    git, pnpm, bootstrap, tar = (
+        shutil.which(name) for name in ["git", "pnpm", "npm", "tar"]
+    )
+    if not git or not pnpm or not bootstrap or not tar or not node.is_file():
         raise BuildError("host_web_build_tools_missing")
     output.mkdir(mode=0o700)
     work = output / "work"
@@ -46,6 +48,8 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             str(node.parent),
             str(Path(pnpm).parent),
             str(Path(bootstrap).parent),
+            str(Path(git).parent),
+            str(Path(tar).parent),
             os.defpath,
         ]
     )

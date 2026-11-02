@@ -86,15 +86,21 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         raise BuildError("host_studio_source_invalid")
     if output.exists() or output.is_symlink():
         raise BuildError("host_studio_output_invalid")
-    git, bootstrap = shutil.which("git"), shutil.which("npm")
-    if not git or not bootstrap or not node.is_file():
+    git, bootstrap, tar = (shutil.which(name) for name in ["git", "npm", "tar"])
+    if not git or not bootstrap or not tar or not node.is_file():
         raise BuildError("host_studio_build_tools_missing")
     output.mkdir(mode=0o700)
     work = output / "work"
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
     env["PATH"] = os.pathsep.join(
-        [str(node.parent), str(Path(bootstrap).parent), os.defpath]
+        [
+            str(node.parent),
+            str(Path(bootstrap).parent),
+            str(Path(git).parent),
+            str(Path(tar).parent),
+            os.defpath,
+        ]
     )
     env["FRAMELEAF_BUILD_ERROR_LOG"] = str(output / "command-error.log")
     env["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
