@@ -207,3 +207,27 @@ class HostGeodataTests(unittest.TestCase):
             self.assertEqual(report['qualification'], 'failed')
             self.assertNotIn('files', report)
             self.assertFalse((root / 'output/geodata').exists())
+
+    def test_receipt_write_or_publication_failure_removes_payload_and_partial_receipt(self):
+        for failure in ['write', 'replace']:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                source, revision, _, content = self.fixture(root)
+                write, replace = Path.write_text, Path.replace
+                def write_receipt(path, *args, **kwargs):
+                    if failure == 'write' and path.name.startswith('qualification.json'):
+                        path.write_bytes(b'{"qualification":"passed",')
+                        raise OSError('receipt write denied')
+                    return write(path, *args, **kwargs)
+                def publish(path, destination):
+                    if failure == 'replace' and path.name.startswith('qualification.json'):
+                        raise OSError('receipt publication denied')
+                    return replace(path, destination)
+                with patch('build_host_geodata.download', side_effect=lambda url, path, digest:
+                           path.write_bytes(content[url.rsplit('/', 1)[1]])), \
+                        patch.object(Path, 'write_text', write_receipt), patch.object(Path, 'replace', publish), \
+                        self.assertRaises(OSError):
+                    build(source, revision, root / 'output')
+                self.assertFalse((root / 'output/geodata').exists())
+                self.assertFalse((root / 'output/qualification.json').exists())
+                self.assertFalse((root / 'output/qualification.json.part').exists())
