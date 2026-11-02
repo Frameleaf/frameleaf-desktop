@@ -121,11 +121,15 @@ The workflow requires no Windows private key or client secret in GitHub or Infis
 ### Azure Artifact Signing setup
 
 Create an Artifact Signing account and complete Microsoft's identity validation,
-then create a **Public Trust** certificate profile. The prepared account is
+then create a **Public Trust** certificate profile. The provisioned account is
 `frameleaf`, resource group `frameleaf-signing`, East US, Basic tier
 (US$9.99/month, 5,000 signatures included; US$0.005 per additional signature).
-Account creation and billing approval are separate from the workflow change;
-these names describe the prepared form, not provisioned resources.
+The subscription was upgraded to pay-as-you-go and the signing account deployed
+successfully on November 2, 2026. Its tenant, subscription, endpoint and account
+values are provisioned in GitHub's `desktop-release` environment. Identity
+validation, acceptance of the Artifact Signing service terms, the Identity
+Verifier role, a Public Trust profile and the GitHub signing identity remain
+outstanding; live signing is not yet qualified.
 
 Create a dedicated Entra application/service principal for this repository with
 one federated credential:
