@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import * as subprocess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
+import fsPromises from 'node:fs/promises';
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile, lstat } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -252,4 +253,65 @@ test('physical Windows state comparisons require a captured root and volume iden
     [`${canonicalRoot}\\alias`, `${physicalRoot}\\database`, binding, 42n],
   ]) assert.equal(canonicalHostPathMatches(actual, expected, 'win32', captured, device), false);
   assert.equal(canonicalHostPathMatches(canonicalRoot, physicalRoot, 'linux', binding, 42n), false);
+});
+
+
+test('all startup modes reject a noncanonical profile before any state writes', async t => {
+  for (const mode of [undefined, 'server', 'database', 'checkpoint-cleanup', 'restore-prepare']) {
+    await fixture(t, async ({ c, calls }) => {
+      c.mode = mode;
+      const api = createServer();
+      await new Promise(resolve => api.listen(0, '127.0.0.1', resolve));
+      c.apiPort = api.address().port;
+      await new Promise(resolve => api.close(resolve));
+      const before = (await readdir(c.state)).sort();
+      const marker = await readFile(join(c.state, 'host-state.json'));
+      const version = await readFile(join(c.state, 'database/PG_VERSION'));
+      const original = fsPromises.realpath;
+      fsPromises.realpath = async (path, ...options) => path === c.state
+        ? join(c.state, 'rebound') : original(path, ...options);
+      syncBuiltinESMExports();
+      let failure;
+      try {
+        try { await runHost(c, Promise.resolve(), () => assert.fail('noncanonical profile became ready')); }
+        catch (error) { failure = error; }
+      } finally {
+        fsPromises.realpath = original;
+        syncBuiltinESMExports();
+      }
+      assert.deepEqual((await readdir(c.state)).sort(), before, mode);
+      assert.deepEqual(calls, [], mode);
+      assert.deepEqual(await readFile(join(c.state, 'host-state.json')), marker);
+      assert.deepEqual(await readFile(join(c.state, 'database/PG_VERSION')), version);
+      assert.match(failure?.message ?? '', /host_state_not_private/, mode);
+    });
+  }
+});
+
+test('volume-root bindings compare roots and descendants without relaxing components', () => {
+  const physicalRoot = String.raw`\\.\GLOBALROOT\Device\HarddiskVolume3` + '\\';
+  const canonicalRoot = 'C:\\';
+  const binding = { physicalRoot, canonicalRoot, volumeSerial: 42 };
+  assert.equal(canonicalHostPathMatches(canonicalRoot, physicalRoot, 'win32', binding, 42n), true);
+  assert.equal(canonicalHostPathMatches(canonicalRoot + 'database', physicalRoot + 'database', 'win32', binding, 42n), true);
+  for (const suffix of ['\\database', '..\\database', 'database\\', 'database.', 'database ', 'database:stream', 'database/child']) {
+    assert.equal(canonicalHostPathMatches(canonicalRoot + suffix, physicalRoot + suffix, 'win32', binding, 42n), false, suffix);
+  }
+  for (const changed of [{ ...binding, physicalRoot: physicalRoot + '\\' },
+    { ...binding, canonicalRoot: canonicalRoot + '\\' }]) {
+    assert.equal(canonicalHostPathMatches(changed.canonicalRoot, changed.physicalRoot, 'win32', changed, 42n), false);
+  }
+  for (const [physical, canonical] of [[physicalRoot, canonicalRoot + 'mounted'],
+    [physicalRoot + 'profile', canonicalRoot]]) {
+    const captured = { ...binding, physicalRoot: physical, canonicalRoot: canonical };
+    assert.equal(canonicalHostPathMatches(canonical, physical, 'win32', captured, 42n), true);
+    const expected = physical + (physical.endsWith('\\') ? '' : '\\') + 'database';
+    const actual = canonical + (canonical.endsWith('\\') ? '' : '\\') + 'database';
+    assert.equal(canonicalHostPathMatches(actual, expected, 'win32', captured, 42n), true);
+  }
+  for (const changed of [{ ...binding, physicalRoot: physicalRoot + 'profile\\' },
+    { ...binding, canonicalRoot: canonicalRoot + 'profile\\' }]) {
+    assert.equal(canonicalHostPathMatches(changed.canonicalRoot, changed.physicalRoot, 'win32', changed, 42n), false);
+  }
+  assert.equal(canonicalHostPathMatches(canonicalRoot, physicalRoot, 'win32', binding, 43n), false);
 });

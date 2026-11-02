@@ -288,12 +288,16 @@ export function canonicalHostPathMatches(actual, expected, platform = process.pl
       !/^\\\\\.\\GLOBALROOT\\Device\\HarddiskVolume[1-9][0-9]*\\/.test(binding.physicalRoot) ||
       !/^[A-Za-z]:\\/.test(binding.canonicalRoot) || !Number.isInteger(binding.volumeSerial) ||
       binding.volumeSerial < 0 || binding.volumeSerial > 0xffffffff || device !== BigInt(binding.volumeSerial)) return false;
-    if (expected !== binding.physicalRoot && !expected.startsWith(`${binding.physicalRoot}\\`)) return false;
-    const suffix = expected.slice(binding.physicalRoot.length);
-    const parts = [...binding.physicalRoot.slice(4).split("\\"), ...binding.canonicalRoot.slice(3).split("\\"), ...(suffix ? suffix.slice(1).split("\\") : [])];
-    if (parts.some(part => !part || part === "." || part === ".." || /[:/\0]/.test(part) || /[. ]$/.test(part)) ||
-      (suffix && suffix.slice(1).split("\\").some(part => !part))) return false;
-    return actual === binding.canonicalRoot + suffix;
+    const prefix = binding.physicalRoot.endsWith("\\") ? binding.physicalRoot : `${binding.physicalRoot}\\`;
+    if (expected !== binding.physicalRoot && !expected.startsWith(prefix)) return false;
+    const descendants = expected === binding.physicalRoot ? [] : expected.slice(prefix.length).split("\\");
+    const physical = binding.physicalRoot.slice(4).split("\\"), canonical = binding.canonicalRoot.slice(3).split("\\");
+    // Only volume roots have a structural trailing separator.
+    if (physical.length === 4 && physical.at(-1) === "") physical.pop();
+    if (canonical.length === 1 && canonical[0] === "") canonical.pop();
+    if ([...physical, ...canonical, ...descendants].some(part => !part || part === "." || part === ".." || /[:/\0]/.test(part) || /[. ]$/.test(part))) return false;
+    return actual === binding.canonicalRoot + (descendants.length
+      ? (binding.canonicalRoot.endsWith("\\") ? "" : "\\") + descendants.join("\\") : "");
   }
   return actual === expected || (platform === "win32" && /^\\\\\?\\[A-Za-z]:\\/.test(expected) && actual === expected.slice(4));
 }
@@ -786,6 +790,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
     return;
   }
   const databaseReference = c.databaseReference === undefined ? undefined : structuredClone(c.databaseReference);
+  if (!await isCanonicalHostPath(c.state, c.statePathBinding)) fail("host_state_not_private");
   const data = await readHostDatabase(c.state, databaseReference, c.statePathBinding);
   const selectedDatabase = databaseReference !== undefined;
   const databaseOnly = c.mode === "database";

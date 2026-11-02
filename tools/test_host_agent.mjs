@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -255,7 +255,7 @@ test("port conflict refuses hosting before creating state", async () => {
   const { createServer } = await import("node:net");
   const { readdir } = await import("node:fs/promises");
   const { runHost } = await import("../runtime/host-agent.mjs");
-  const root = await mkdtemp(join(tmpdir(), "frameleaf-host-conflict-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "frameleaf-host-conflict-")));
   const occupied = createServer();
   await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve));
   try {
@@ -279,7 +279,7 @@ test(
     const { createServer } = await import("node:net");
     const { mkdir, symlink } = await import("node:fs/promises");
     const { runHost } = await import("../runtime/host-agent.mjs");
-    const root = await mkdtemp(join(tmpdir(), "frameleaf-host-linked-"));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "frameleaf-host-linked-")));
     const state = join(root, "state");
     const outside = join(root, "outside");
     await mkdir(state, { mode: 0o700 });
