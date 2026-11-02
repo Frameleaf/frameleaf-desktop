@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from build_runtime import BuildError, build_environment, run
-from source_archive import require_lf_archive
+from source_archive import verify_source_archive
 
 
 class ArchiveReady(Exception):
@@ -21,7 +21,7 @@ class HostSourceArchiveTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_every_builder_archives_committed_bytes_under_crlf_settings(self):
         git = shutil.which("git")
-        canonical = b"Synthetic source license fixture\n"
+        canonical = b"Synthetic source license fixture $Format:%H$\n"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             env = build_environment(root, os.environ)
@@ -62,13 +62,18 @@ class HostSourceArchiveTests(unittest.TestCase):
                 if arguments == [node, "--version"]:
                     return "v26.11.1"
                 self.assertIn("archive", arguments)
-                run(arguments, cwd=cwd, env=env)
+                return run(arguments, cwd=cwd, env=env)
+
+            def validated(*arguments):
+                verify_source_archive(*arguments)
                 raise ArchiveReady()
 
-            for attribute in [None, 'crlf', 'lf', 'export-ignore']:
+            for attribute in [None, 'crlf', 'lf', 'export-ignore', 'export-subst']:
                 info = source / '.git/info/attributes'
                 if attribute == 'export-ignore':
                     info.write_text('**/excluded.txt text eol=crlf export-ignore\n**/ignored export-ignore\n**/ignored/*.txt text eol=crlf\n', encoding='utf-8')
+                elif attribute == 'export-subst':
+                    info.write_text('LICENSE export-subst\n', encoding='utf-8')
                 elif attribute:
                     info.write_text('LICENSE text eol=' + attribute + '\n', encoding='utf-8')
                 elif info.exists():
@@ -77,14 +82,15 @@ class HostSourceArchiveTests(unittest.TestCase):
                     with self.subTest(builder=name, attribute=attribute):
                         module = importlib.import_module("build_host_" + name)
                         output = root / f'{name}-{attribute}'
-                        expected = self.assertRaisesRegex(BuildError, 'source_archive_eol') if attribute == 'crlf' else self.assertRaises(ArchiveReady)
+                        expected = self.assertRaisesRegex(BuildError, 'source_archive_not_canonical') if attribute in {'crlf', 'export-subst'} else self.assertRaises(ArchiveReady)
                         with (
                             patch.object(module.shutil, "which", side_effect=lambda tool: git if tool == "git" else str(root / tool)),
                             patch.object(module, "run", side_effect=command),
+                            patch.object(module, "verify_source_archive", side_effect=validated),
                             expected,
                         ):
                             module.build(source, revision, node, output)
-                        if attribute == 'crlf':
+                        if attribute in {'crlf', 'export-subst'}:
                             self.assertFalse((output / 'work/source.tar').exists())
                         else:
                             with tarfile.open(output / "work/source.tar") as archive:
@@ -111,11 +117,15 @@ class HostSourceArchiveTests(unittest.TestCase):
                 subprocess.run([git, *arguments], cwd=source, env=env, check=True, capture_output=True)
             revision = subprocess.check_output([git, 'rev-parse', 'HEAD'], cwd=source, env=env, text=True).strip()
             (source / '.gitattributes').write_text('*.txt text eol=lf\n', encoding='utf-8')
-            with self.assertRaisesRegex(BuildError, 'source_archive_eol'):
-                require_lf_archive(git, source, revision, [name], env)
-            (source / '.git/info/attributes').write_text('*.txt text eol=lf\n', encoding='utf-8')
-            require_lf_archive(git, source, revision, [name], env)
             archive = root / 'source.tar'
-            run([git, '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'archive', '--format=tar', '--output', archive, revision, name], cwd=source, env=env)
+            def create_archive():
+                run([git, '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'archive', '--format=tar', '--output', archive, revision, name], cwd=source, env=env)
+            create_archive()
+            with self.assertRaisesRegex(BuildError, 'source_archive_not_canonical'):
+                verify_source_archive(git, source, revision, [name], archive, env)
+            self.assertFalse(archive.exists())
+            (source / '.git/info/attributes').write_text('*.txt text eol=lf\n', encoding='utf-8')
+            create_archive()
+            verify_source_archive(git, source, revision, [name], archive, env)
             with tarfile.open(archive) as contents:
                 self.assertEqual(contents.extractfile(name).read(), b'committed bytes\n')

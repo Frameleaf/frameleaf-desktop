@@ -21,7 +21,7 @@ from build_runtime import (
     run,
     sha256,
 )
-from source_archive import require_lf_archive
+from source_archive import verify_source_archive
 
 # SemVer 2.0 suggested regex, Tom Preston-Werner and contributors (CC BY 3.0).
 # https://semver.org/spec/v2.0.0.html | https://creativecommons.org/licenses/by/3.0/
@@ -142,7 +142,6 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         "studio/tools",
         "docker/scripts/verify-server-package.mjs",
     ]
-    require_lf_archive(git, source, revision, archive_paths, env)
     run(
         [
             git,
@@ -158,6 +157,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         cwd=source,
         env=env,
     )
+    verify_source_archive(git, source, revision, archive_paths, archive, env)
     snapshot = work / "source"
     snapshot.mkdir(mode=0o700)
     with tarfile.open(archive) as contents:

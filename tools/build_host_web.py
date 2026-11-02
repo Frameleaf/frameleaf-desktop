@@ -12,7 +12,7 @@ from pathlib import Path
 
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, git_blob, run, sha256
-from source_archive import require_lf_archive
+from source_archive import verify_source_archive
 
 
 def stage_web(source: Path, destination: Path) -> dict:
@@ -75,7 +75,6 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         "scripts/frameleaf-studio-contracts.mjs",
         "scripts/frameleaf-studio-rights.mjs",
     ]
-    require_lf_archive(git, source, revision, archive_paths, env)
     run(
         [
             git,
@@ -91,6 +90,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         cwd=source,
         env=env,
     )
+    verify_source_archive(git, source, revision, archive_paths, archive, env)
     snapshot = work / "source"
     snapshot.mkdir(mode=0o700)
     with tarfile.open(archive) as contents:

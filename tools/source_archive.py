@@ -1,45 +1,48 @@
-"""Reject Git archive attributes that change canonical source line endings."""
+"""Verify generated source archives against their selected Git objects."""
+import hashlib
+import io
 from pathlib import Path
 import subprocess
+import tarfile
 
 from build_runtime import BuildError
 
 
-def require_lf_archive(git: str, source: Path, revision: str, paths: list[str], env: dict[str, str]) -> None:
-    """Check included regular files for an already-approved revision and path selection."""
+def verify_source_archive(git: str, source: Path, revision: str, paths: list[str], archive: Path, env: dict[str, str]) -> None:
+    """Reject altered included bytes before extraction or compilation of a caller-owned archive."""
     try:
-        files = subprocess.run([git, "ls-tree", "-r", "-z", revision, "--", *paths],
-                               cwd=source, env=env, capture_output=True, timeout=60, check=True)
-        if files.stdout and not files.stdout.endswith(b"\0"):
-            raise BuildError("host_source_archive_attributes_invalid")
-        entries, parents = {}, {}
-        for record in files.stdout.split(b"\0")[:-1]:
-            header, separator, path = record.partition(b"\t")
-            if not separator:
-                raise BuildError("host_source_archive_attributes_invalid")
-            entries[path] = header.split(b" ", 1)[0]
-            parts = path.split(b"/")
-            parents[path] = [b"/".join(parts[:end]) for end in range(1, len(parts) + 1)]
-        names = sorted({name for lineage in parents.values() for name in lineage})
-        attributes = subprocess.run([git, "check-attr", "--source=" + revision, "-z", "--stdin", "eol", "export-ignore"],
-                                    input=b"".join(name + b"\0" for name in names), cwd=source, env=env,
-                                    capture_output=True, timeout=60, check=True)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise BuildError("host_source_archive_attributes_unavailable") from error
-    fields = attributes.stdout.split(b"\0")
-    if fields.pop() != b"" or len(fields) != 6 * len(names):
-        raise BuildError("host_source_archive_attributes_invalid")
-    effective = {name: {} for name in names}
-    for index in range(0, len(fields), 3):
-        path, attribute, value = fields[index:index + 3]
-        if path not in effective or attribute not in {b"eol", b"export-ignore"} or attribute in effective[path]:
-            raise BuildError("host_source_archive_attributes_invalid")
-        effective[path][attribute] = value
-    for path, mode in entries.items():
-        if mode not in {b"100644", b"100755"}:
-            continue
-        if any(effective[parent][b"export-ignore"] == b"set" for parent in parents[path]):
-            continue
-        # Git archive honors repository-local attributes even when core.eol is LF.
-        if effective[path][b"eol"] not in {b"unspecified", b"unset", b"lf"}:
-            raise BuildError("host_source_archive_eol_not_lf")
+        result = subprocess.run([git, "ls-tree", "-r", "-z", revision, "--", *paths],
+                                cwd=source, env=env, capture_output=True, timeout=60, check=True)
+        if result.stdout and not result.stdout.endswith(b"\0"):
+            raise ValueError("incomplete Git tree")
+        objects = {}
+        for record in result.stdout.split(b"\0")[:-1]:
+            header, name = record.split(b"\t", 1)
+            mode, kind, oid = header.split(b" ")
+            objects[name] = (mode, kind, oid.decode("ascii"))
+        with tarfile.open(archive) as contents:
+            for member in contents:
+                if member.isdir():
+                    continue
+                mode, kind, oid = objects[member.name.encode("utf-8", "surrogateescape")]
+                if kind != b"blob" or len(oid) not in {40, 64}:
+                    raise ValueError("unexpected Git object")
+                if member.isfile() and mode in {b"100644", b"100755"}:
+                    stream, size = contents.extractfile(member), member.size
+                elif member.issym() and mode == b"120000":
+                    target = member.linkname.encode("utf-8", "surrogateescape")
+                    stream, size = io.BytesIO(target), len(target)
+                else:
+                    raise ValueError("unexpected archive entry")
+                # Git object IDs include the blob header; this is compatibility, not new cryptography.
+                digest = hashlib.new("sha1" if len(oid) == 40 else "sha256", usedforsecurity=False)
+                digest.update(b"blob " + str(size).encode("ascii") + b"\0")
+                with stream:
+                    while block := stream.read(1024 * 1024):
+                        digest.update(block)
+                if digest.hexdigest() != oid:
+                    raise ValueError("archive bytes differ from Git")
+    except (OSError, subprocess.SubprocessError, tarfile.TarError, ValueError, KeyError) as error:
+        # The archive belongs to the fresh build directory; do not retain an unverified input.
+        archive.unlink(missing_ok=True)
+        raise BuildError("host_source_archive_not_canonical") from error
