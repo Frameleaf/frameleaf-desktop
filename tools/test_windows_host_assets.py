@@ -49,7 +49,7 @@ class WindowsHostAssetsTests(unittest.TestCase):
                                cwd=source, env=git_environment, check=True, capture_output=True)
                 revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source,
                                                    env=git_environment, text=True).strip()
-                node = Path(environment['NODE_BINARY'])
+                node = Path(environment['STUDIO_NODE_BINARY'])
                 tar = root / ('archive-tools/tar.exe' if os.name == 'nt' else 'archive-tools/tar')
                 tar.parent.mkdir()
                 tar.write_bytes(b'test tar identity; not executed')
@@ -81,6 +81,7 @@ class WindowsHostAssetsTests(unittest.TestCase):
                 receipt = json.loads((output / 'qualification.json').read_text())
                 self.assertEqual(receipt['qualification'], 'failed')
                 self.assertEqual(receipt['npmVersion'], '12.2.0')
+                self.assertEqual(receipt['nodeSha256'], hashlib.sha256(node.read_bytes()).hexdigest())
                 self.assertEqual(json.loads((output / 'work/source/studio/engine-build.json').read_text()), configuration)
 
     def archive_script(self):

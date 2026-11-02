@@ -653,7 +653,7 @@ server font resources. Required entries and font headers are checked before the
 package is accepted; Git LFS pointers are not usable font payloads.
 
 The `Windows host assets` workflow builds the current photo UI, core plugin and
-Studio worker serially from source `93c2e261e346229665fc9e2973b0e1be34caece2`
+Studio worker serially from source `2f4959aed747ff33f07f2756c44b4692ef40565a`
 ([shared tooling fix](https://github.com/Frameleaf/frameleaf-app/pull/780)).
 That source review must clear before promoting this producer.
 Its single 90-minute job retains `host-assets.tar.gz` with each qualified payload

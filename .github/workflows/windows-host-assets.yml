@@ -28,7 +28,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     env:
-      HOST_SOURCE_REVISION: 93c2e261e346229665fc9e2973b0e1be34caece2
+      HOST_SOURCE_REVISION: 2f4959aed747ff33f07f2756c44b4692ef40565a
       UV_THREADPOOL_SIZE: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -69,6 +69,11 @@ jobs:
             python -m unittest discover -s tools -p $test -v
             if ($LASTEXITCODE) { throw "Host asset packaging tests failed: $test" }
           }
+      - name: Check the selected source's native Studio launchers
+        shell: pwsh
+        run: |
+          & $env:STUDIO_NODE_BINARY --test "$env:GITHUB_WORKSPACE/application-source/studio/tools/adapter-launch.test.mjs"
+          if ($LASTEXITCODE) { throw 'Selected source Studio launcher tests failed' }
       - name: Build the current photo UI, plugin and Studio worker serially
         shell: pwsh
         run: |
