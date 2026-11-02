@@ -1,7 +1,12 @@
 //! Read-only Windows package admission; never edits an ACL.
 fn stable_volume_root(path: &str) -> Option<&str> {
-    const PREFIX: &str = r"\\?\GLOBALROOT\Device\HarddiskVolume";
-    let rest = path.strip_prefix(PREFIX)?;
+    let prefix = [
+        r"\\?\GLOBALROOT\Device\HarddiskVolume",
+        r"\\.\GLOBALROOT\Device\HarddiskVolume",
+    ]
+    .into_iter()
+    .find(|prefix| path.starts_with(prefix))?;
+    let rest = path.strip_prefix(prefix)?;
     let end = rest.find('\\')?;
     let number = &rest[..end];
     if number.is_empty()
@@ -11,7 +16,7 @@ fn stable_volume_root(path: &str) -> Option<&str> {
     {
         return None;
     }
-    let root_end = PREFIX.len() + end + 1;
+    let root_end = prefix.len() + end + 1;
     let tail = &path[root_end..];
     if !tail.is_empty()
         && tail.split('\\').any(|part| {
@@ -225,7 +230,8 @@ mod native {
             return Err(ERROR.into());
         }
         let nt = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
-        let value = format!(r"\\?\GLOBALROOT{nt}");
+        // The device spelling preserves the opened NT object and supports process creation.
+        let value = format!(r"\\.\GLOBALROOT{nt}");
         stable_volume_root(&value).ok_or(ERROR)?;
         Ok(PathBuf::from(value))
     }
@@ -351,7 +357,7 @@ mod native {
                 system
                     .to_str()
                     .unwrap()
-                    .strip_prefix(r"\\?\GLOBALROOT")
+                    .strip_prefix(r"\\.\GLOBALROOT")
                     .unwrap(),
             );
             let requested = alias.path();
@@ -363,7 +369,7 @@ mod native {
                 malicious
                     .to_str()
                     .unwrap()
-                    .strip_prefix(r"\\?\GLOBALROOT")
+                    .strip_prefix(r"\\.\GLOBALROOT")
                     .unwrap(),
             );
             assert_eq!(
@@ -415,6 +421,25 @@ pub(crate) use native::{protect, stable_path};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_kernel_paths_keep_the_same_physical_volume_boundary() {
+        let root = r"\\.\GLOBALROOT\Device\HarddiskVolume12\";
+        let file = format!(r"{root}Windows\System32\cmd.exe");
+        assert_eq!(stable_volume_root(&file), Some(root));
+        let components = filesystem_components(&file).unwrap();
+        assert_eq!(components.first().copied(), Some(root));
+        assert_eq!(components.last().copied(), Some(file.as_str()));
+        assert_eq!(components.len(), 4);
+        for bad in [
+            r"\\.\C:\Windows\cmd.exe",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume0\file",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\..\file",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume12\file:stream",
+            r"\\.\GLOBALROOT\Device\Mup\share\file",
+        ] {
+            assert!(filesystem_components(bad).is_none(), "{bad}");
+        }
+    }
     #[test]
     fn stable_paths_reject_drive_network_device_and_component_aliases() {
         let root = r"\\?\GLOBALROOT\Device\HarddiskVolume12\";
