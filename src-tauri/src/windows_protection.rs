@@ -235,6 +235,19 @@ mod native {
         stable_volume_root(&value).ok_or(ERROR)?;
         Ok(PathBuf::from(value))
     }
+    pub(crate) fn stable_state_path(path: &Path) -> Result<PathBuf, String> {
+        let captured = match std::fs::symlink_metadata(path) {
+            Ok(_) => stable_path(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path.parent().ok_or(ERROR)?;
+                let name = path.file_name().ok_or(ERROR)?;
+                stable_path(parent).map(|parent| parent.join(name))
+            }
+            Err(_) => Err(ERROR.into()),
+        }?;
+        stable_volume_root(captured.to_str().ok_or(ERROR)?).ok_or(ERROR)?;
+        Ok(captured)
+    }
     pub(crate) fn protect(
         path: &Path,
         checked: &mut BTreeSet<std::path::PathBuf>,
@@ -389,6 +402,55 @@ mod native {
             std::fs::remove_dir_all(scratch).unwrap();
         }
         #[test]
+        fn captured_existing_and_missing_state_ignore_later_dos_alias_rebinding() {
+            let scratch = std::env::temp_dir()
+                .join(format!("frameleaf-state-alias-{}", uuid::Uuid::new_v4()));
+            for existing in [false, true] {
+                let original = scratch.join(format!("original-{existing}"));
+                let replacement = scratch.join(format!("replacement-{existing}"));
+                std::fs::create_dir_all(&original).unwrap();
+                std::fs::create_dir_all(&replacement).unwrap();
+                if existing {
+                    std::fs::create_dir(original.join("state")).unwrap();
+                }
+                let original_device = stable_path(&original).unwrap();
+                let replacement_device = stable_path(&replacement).unwrap();
+                let mut alias = DriveAlias::create(
+                    original_device
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix(r"\\.\GLOBALROOT")
+                        .unwrap(),
+                );
+                let requested = alias.path().with_file_name("state");
+                let captured = stable_state_path(&requested).unwrap();
+                alias.redirect(
+                    replacement_device
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix(r"\\.\GLOBALROOT")
+                        .unwrap(),
+                );
+                if !existing {
+                    std::fs::create_dir(&captured).unwrap();
+                }
+                std::fs::write(captured.join("probe"), b"owned original state").unwrap();
+                assert_eq!(
+                    std::fs::read(original.join("state/probe")).unwrap(),
+                    b"owned original state"
+                );
+                assert!(!requested.exists());
+                assert!(!replacement.join("state").exists());
+                assert!(alias.cleanup(), "owned state DOS alias cleanup failed");
+            }
+            assert!(stable_state_path(&scratch.join("missing/child")).is_err());
+            assert!(!scratch.join("missing").exists());
+            for name in ["state.", "state ", "state:stream"] {
+                assert!(stable_state_path(&scratch.join(name)).is_err());
+            }
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+        #[test]
         fn relative_code_path_never_uses_the_process_working_directory() {
             assert!(stable_path(Path::new("relative-code")).is_err());
         }
@@ -416,7 +478,7 @@ mod native {
     }
 }
 #[cfg(windows)]
-pub(crate) use native::{protect, stable_path};
+pub(crate) use native::{protect, stable_path, stable_state_path};
 
 #[cfg(test)]
 mod tests {
