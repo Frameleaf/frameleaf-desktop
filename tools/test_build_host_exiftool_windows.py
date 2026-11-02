@@ -23,6 +23,13 @@ class WindowsExifToolTests(unittest.TestCase):
         self.assertNotIn('globalFallback', result)
         self.assertIn('exports.exiftoolPath = exiftoolPath;', result)
 
+    def test_adaptation_preserves_utf8_and_crlf_outside_the_replaced_body(self):
+        source = '// Café — vendor notice\r\n' + self.source.replace('\n', '\r\n')
+        adapted = adapt_exiftool_path(source, '39.0.1')
+        self.assertTrue(adapted.startswith('// Café — vendor notice\r\nexports.exiftoolPath = exiftoolPath;\r\n'))
+        self.assertTrue(adapted.endswith('//# sourceMappingURL=ExiftoolPath.js.map\r\n'))
+        self.assertNotIn('\n', adapted.replace('\r\n', ''))
+
     def test_changed_or_already_adapted_source_is_refused(self):
         for source, version in [(self.source, "40.0.0"),
                                 (self.source.replace('async function', 'function'), "39.0.1"),
@@ -133,7 +140,17 @@ const { exiftoolPath } = require(modulePath);
                         with self.assertRaises((BuildError, OSError)):
                             build(source, root / 'output')
                     else:
-                        build(source, root / 'output')
+                        original_read = Path.read_text
+                        original_write = Path.write_text
+                        def read_utf8(path, *args, **kwargs):
+                            self.assertEqual(kwargs.get('encoding'), 'utf-8')
+                            return original_read(path, *args, **kwargs)
+                        def write_utf8(path, *args, **kwargs):
+                            self.assertEqual(kwargs.get('encoding'), 'utf-8')
+                            self.assertEqual(kwargs.get('newline'), '\n')
+                            return original_write(path, *args, **kwargs)
+                        with patch.object(Path, 'read_text', read_utf8), patch.object(Path, 'write_text', write_utf8):
+                            build(source, root / 'output')
                         report = json.loads((root / 'output/qualification.json').read_text())
                         self.assertEqual(report['qualification'], 'passed')
                         self.assertEqual(report['originalModuleSha256'], expected)

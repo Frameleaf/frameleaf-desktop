@@ -22,12 +22,14 @@ def adapt_exiftool_path(source: str, version: str) -> str:
         raise BuildError("host_exiftool_vendor_source_changed")
     before, body = source.split(start)
     _, after = body.split(end)
-    return before + start + '''
+    newline = '\r\n' if '\r\n' in source else '\n'
+    replacement = '''
     const executable = _path.resolve(__dirname, "../../exiftool-vendored.exe/bin/exiftool.exe");
     if (!_fs.existsSync(executable)) throw new Error("Private ExifTool executable is missing");
     return executable;
 }
-''' + end + after
+'''
+    return before + start + replacement.replace('\n', newline) + end + after
 
 
 def build(server: Path, output: Path) -> None:
@@ -36,7 +38,7 @@ def build(server: Path, output: Path) -> None:
     if not all(path.is_absolute() for path in [server, output]) or output.exists() or output.is_symlink():
         raise BuildError("host_exiftool_output_invalid")
     regular(server / "qualification.json")
-    receipt = json.loads((server / "qualification.json").read_text())
+    receipt = json.loads((server / "qualification.json").read_text(encoding="utf-8"))
     if receipt.get("qualification") != "passed" or not receipt.get("files"):
         raise BuildError("host_exiftool_input_unqualified")
     if receipt.get("platform") != "Windows-AMD64":
@@ -55,8 +57,8 @@ def build(server: Path, output: Path) -> None:
             raise BuildError("host_exiftool_input_inventory_mismatch")
         vendor = output / "server/node_modules/exiftool-vendored"
         executable_vendor = output / "server/node_modules/exiftool-vendored.exe"
-        version = json.loads((vendor / "package.json").read_text())["version"]
-        executable_version = json.loads((executable_vendor / "package.json").read_text())["version"]
+        version = json.loads((vendor / "package.json").read_text(encoding="utf-8"))["version"]
+        executable_version = json.loads((executable_vendor / "package.json").read_text(encoding="utf-8"))["version"]
         if executable_version != "13.59.3":
             raise BuildError("host_exiftool_executable_version_unapproved")
         for name in ["bin/exiftool.exe", "bin/exiftool_files/perl.exe", "bin/exiftool_files/perl532.dll",
@@ -68,14 +70,14 @@ def build(server: Path, output: Path) -> None:
         report["originalModuleSha256"] = sha256(module)
         if report["originalModuleSha256"] != VENDOR_MODULE_SHA256:
             raise BuildError("host_exiftool_vendor_source_changed")
-        module.write_text(adapt_exiftool_path(module.read_text(), version))
+        module.write_bytes(adapt_exiftool_path(module.read_bytes().decode("utf-8"), version).encode("utf-8"))
         report["adaptedModuleSha256"] = sha256(module)
         report["vendorVersion"] = version
         report["executableVendorVersion"] = executable_version
         report["files"] = {"server": inventory(output / "server")}
         report["qualification"] = "passed"
     finally:
-        (output / "qualification.json").write_text(json.dumps(report, indent=2) + "\n")
+        (output / "qualification.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
 if __name__ == "__main__":
