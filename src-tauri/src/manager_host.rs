@@ -16,9 +16,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-#[cfg(any(windows, test))]
-mod windows_protection;
-
 #[cfg(target_os = "macos")]
 pub(crate) fn no_acl(path: &Path) -> Result<(), String> {
     use std::os::fd::AsRawFd;
@@ -57,7 +54,7 @@ pub(crate) fn no_acl(path: &Path) -> Result<(), String> {
 pub(crate) fn protect(path: &Path, checked: &mut BTreeSet<PathBuf>) -> Result<(), String> {
     #[cfg(windows)]
     {
-        windows_protection::protect(path, checked)
+        crate::windows_protection::protect(path, checked)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -376,6 +373,8 @@ impl Programs<'_> {
             .env("MANAGER_RUNTIME", "native")
             .env("MANAGER_ORIGIN", &config.origin)
             .env("MANAGER_DATA", &config.data);
+        #[cfg(windows)]
+        command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
         let mut manager = NativeManager::spawn(
             &mut command,
             input,

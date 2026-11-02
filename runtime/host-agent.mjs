@@ -211,17 +211,17 @@ export async function cleanupHostCheckpoint(c, supplied) {
   validateConfig(c);
   const expected = retirementReceipt(c, supplied);
   await checkpointDirectory(c.state);
-  if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_checkpoint_changed");
+  if (!await isCanonicalHostPath(c.state, c.statePathBinding)) fail("host_checkpoint_changed");
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root);
-  if (!canonicalHostPathMatches(await fs.realpath(root), root)) fail("host_checkpoint_changed");
+  if (!await isCanonicalHostPath(root, c.statePathBinding)) fail("host_checkpoint_changed");
   const target = join(root, expected.operationId), marker = join(root, "." + expected.operationId + ".retired.json");
   let retired = false, markerIdentity;
   try {
     const named = await fs.lstat(marker);
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 ||
       (process.platform !== "win32" && (named.mode & 0o077) !== 0) ||
-      !canonicalHostPathMatches(await fs.realpath(marker), marker)) fail("host_checkpoint_changed");
+      !await isCanonicalHostPath(marker, c.statePathBinding)) fail("host_checkpoint_changed");
     const value = retirementReceipt(c, JSON.parse(await stateFile(marker, 4096)));
     if (JSON.stringify(value) !== JSON.stringify(expected)) fail("host_checkpoint_changed");
     retired = true; markerIdentity = named;
@@ -241,7 +241,7 @@ export async function cleanupHostCheckpoint(c, supplied) {
   catch (error) { if (error.code !== "ENOENT" || !retired) throw error; }
   if (directory) {
     await checkpointDirectory(target);
-    if (!canonicalHostPathMatches(await fs.realpath(target), target)) fail("host_checkpoint_changed");
+    if (!await isCanonicalHostPath(target, c.statePathBinding)) fail("host_checkpoint_changed");
     const names = (await fs.readdir(target)).sort();
     if (names.some(name => !["checkpoint.json", "database.dump"].includes(name)) ||
       (!retired && names.join(",") !== "checkpoint.json,database.dump")) fail("host_checkpoint_changed");
@@ -249,7 +249,7 @@ export async function cleanupHostCheckpoint(c, supplied) {
     for (const name of names) {
       const path = join(target, name), before = await fs.lstat(path);
       if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
-        !canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_checkpoint_changed");
+        !await isCanonicalHostPath(path, c.statePathBinding)) fail("host_checkpoint_changed");
       if (name === "checkpoint.json") {
         if (JSON.stringify(retirementReceipt(c, JSON.parse(await stateFile(path, 4096)))) !== JSON.stringify(expected))
           fail("host_checkpoint_changed");
@@ -281,71 +281,92 @@ export async function cleanupHostCheckpoint(c, supplied) {
   return { ...expected, state: "checkpoint-cleaned" };
 }
 
-export function canonicalHostPathMatches(actual, expected, platform = process.platform) {
-  // Node strips the local-drive verbatim prefix returned by Rust canonicalize on Windows.
+export function canonicalHostPathMatches(actual, expected, platform = process.platform, binding, device) {
+  // Node resolves physical Windows paths back to DOS paths; compare only the native captured mapping.
+  if (platform === "win32" && expected.startsWith("\\\\.\\GLOBALROOT\\")) {
+    if (!binding || typeof binding.physicalRoot !== "string" || typeof binding.canonicalRoot !== "string" ||
+      !/^\\\\\.\\GLOBALROOT\\Device\\HarddiskVolume[1-9][0-9]*\\/.test(binding.physicalRoot) ||
+      !/^[A-Za-z]:\\/.test(binding.canonicalRoot) || !Number.isInteger(binding.volumeSerial) ||
+      binding.volumeSerial < 0 || binding.volumeSerial > 0xffffffff || device !== BigInt(binding.volumeSerial)) return false;
+    const prefix = binding.physicalRoot.endsWith("\\") ? binding.physicalRoot : `${binding.physicalRoot}\\`;
+    if (expected !== binding.physicalRoot && !expected.startsWith(prefix)) return false;
+    const descendants = expected === binding.physicalRoot ? [] : expected.slice(prefix.length).split("\\");
+    const physical = binding.physicalRoot.slice(4).split("\\"), canonical = binding.canonicalRoot.slice(3).split("\\");
+    // Only volume roots have a structural trailing separator.
+    if (physical.length === 4 && physical.at(-1) === "") physical.pop();
+    if (canonical.length === 1 && canonical[0] === "") canonical.pop();
+    if ([...physical, ...canonical, ...descendants].some(part => !part || part === "." || part === ".." || /[:/\0]/.test(part) || /[. ]$/.test(part))) return false;
+    return actual === binding.canonicalRoot + (descendants.length
+      ? (binding.canonicalRoot.endsWith("\\") ? "" : "\\") + descendants.join("\\") : "");
+  }
   return actual === expected || (platform === "win32" && /^\\\\\?\\[A-Za-z]:\\/.test(expected) && actual === expected.slice(4));
 }
+export async function isCanonicalHostPath(path, binding) {
+  const actual = await fs.realpath(path);
+  const device = process.platform === "win32" && binding ? (await fs.lstat(path, { bigint: true })).dev : undefined;
+  return canonicalHostPathMatches(actual, path, process.platform, binding, device);
+}
 
-async function checkpointIdentity(path, directory = false) {
+async function checkpointIdentity(path, directory = false, pathBinding) {
   const meta = await fs.lstat(path, { bigint: true });
   if (meta.isSymbolicLink() || (directory ? !meta.isDirectory() : !meta.isFile() || meta.nlink !== 1n) ||
     meta.ino <= 0n || (process.platform !== "win32" && (meta.mode & 0o077n) !== 0n) ||
-    !canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_checkpoint_changed");
+    !await isCanonicalHostPath(path, pathBinding)) fail("host_checkpoint_changed");
   return `${meta.dev}:${meta.ino}`;
 }
-async function checkpointAttempt(path, binding) {
+async function checkpointAttempt(path, binding, pathBinding) {
   const names = (await fs.readdir(path)).sort();
   if (!names.includes("checkpoint-attempt.json") ||
     names.some(name => !["checkpoint-attempt.json", "database.dump", ".checkpoint-record.partial", "checkpoint.json"].includes(name)) ||
     (names.includes("checkpoint.json") && (!names.includes("database.dump") || names.includes(".checkpoint-record.partial"))))
     fail("host_checkpoint_changed");
-  const marker = join(path, "checkpoint-attempt.json"), identity = await checkpointIdentity(marker);
+  const marker = join(path, "checkpoint-attempt.json"), identity = await checkpointIdentity(marker, false, pathBinding);
   const value = JSON.parse(await stateFile(marker, 8192));
   if (!value || Object.keys(value).sort().join(",") !== "binding,files,schemaVersion" || value.schemaVersion !== 1 ||
     !value.binding || Object.keys(value.binding).sort().join(",") !== Object.keys(binding).sort().join(",") ||
     Object.entries(binding).some(([key, item]) => value.binding[key] !== item) ||
     !value.files || Object.keys(value.files).sort().join(",") !== "directory,dump,intent,record" ||
     Object.values(value.files).some(item => typeof item !== "string" || !/^[0-9]+:[1-9][0-9]*$/.test(item)) ||
-    value.files.intent !== identity || await checkpointIdentity(marker) !== identity ||
-    await checkpointIdentity(path, true) !== value.files.directory) fail("host_checkpoint_changed");
+    value.files.intent !== identity || await checkpointIdentity(marker, false, pathBinding) !== identity ||
+    await checkpointIdentity(path, true, pathBinding) !== value.files.directory) fail("host_checkpoint_changed");
   for (const name of names) {
     const key = name === "database.dump" ? "dump" : name === "checkpoint-attempt.json" ? "intent" : "record";
-    if (await checkpointIdentity(join(path, name)) !== value.files[key]) fail("host_checkpoint_changed");
+    if (await checkpointIdentity(join(path, name), false, pathBinding) !== value.files[key]) fail("host_checkpoint_changed");
   }
   return { names, files: value.files };
 }
 async function checkpointReceipt(path, c, operationId, check) {
-  const directory = await checkpointIdentity(path, true);
-  const record = await checkpointIdentity(join(path, "checkpoint.json"));
+  const directory = await checkpointIdentity(path, true, c.statePathBinding);
+  const record = await checkpointIdentity(join(path, "checkpoint.json"), false, c.statePathBinding);
   const receipt = retirementReceipt(c, JSON.parse(await stateFile(join(path, "checkpoint.json"), 4096)));
   if (receipt.operationId !== operationId) fail("host_checkpoint_changed");
   const actual = await checkpointHash(join(path, "database.dump"), check);
   check();
   if (actual.bytes !== receipt.dump.bytes || actual.sha256 !== receipt.dump.sha256 ||
-    await checkpointIdentity(path, true) !== directory ||
-    await checkpointIdentity(join(path, "checkpoint.json")) !== record) fail("host_checkpoint_changed");
+    await checkpointIdentity(path, true, c.statePathBinding) !== directory ||
+    await checkpointIdentity(join(path, "checkpoint.json"), false, c.statePathBinding) !== record) fail("host_checkpoint_changed");
   return receipt;
 }
-async function discardCheckpointAttempt(path, binding) {
-  let attempt = await checkpointAttempt(path, binding);
+async function discardCheckpointAttempt(path, binding, pathBinding) {
+  let attempt = await checkpointAttempt(path, binding, pathBinding);
   if (attempt.names.includes("checkpoint.json")) fail("host_checkpoint_changed");
   for (const name of ["database.dump", ".checkpoint-record.partial"]) {
-    attempt = await checkpointAttempt(path, binding);
+    attempt = await checkpointAttempt(path, binding, pathBinding);
     if (attempt.names.includes(name)) await fs.unlink(join(path, name));
   }
-  await checkpointAttempt(path, binding);
+  await checkpointAttempt(path, binding, pathBinding);
   await checkpointSyncDirectory(path);
   // Move the empty intent aside before removing it so a crash cannot block the canonical retry path.
   const empty = join(dirname(path), "." + binding.operationId + "." + randomUUID() + ".empty");
   await fs.rename(path, empty);
   await checkpointSyncDirectory(dirname(path));
-  await checkpointAttempt(empty, binding);
+  await checkpointAttempt(empty, binding, pathBinding);
   await fs.unlink(join(empty, "checkpoint-attempt.json"));
   await fs.rmdir(empty);
   await checkpointSyncDirectory(dirname(path));
 }
-async function finishCheckpointAttempt(path, binding) {
-  await checkpointAttempt(path, binding);
+async function finishCheckpointAttempt(path, binding, pathBinding) {
+  await checkpointAttempt(path, binding, pathBinding);
   await checkpointSyncDirectory(path);
   await checkpointSyncDirectory(dirname(path));
   await fs.unlink(join(path, "checkpoint-attempt.json"));
@@ -361,7 +382,7 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
   await checkpointDirectory(c.state);
   const root = join(c.state, "checkpoints");
   await checkpointDirectory(root, true);
-  if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state) || !canonicalHostPathMatches(await fs.realpath(root), root)) fail("host_checkpoint_changed");
+  if (!await isCanonicalHostPath(c.state, c.statePathBinding) || !await isCanonicalHostPath(root, c.statePathBinding)) fail("host_checkpoint_changed");
   await checkpointSyncDirectory(c.state);
   // Any retirement intent forbids regenerating a different live dump under the same operation ID.
   try {
@@ -378,32 +399,32 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
     const names = (await fs.readdir(target)).sort().join(",");
     if (names !== "checkpoint.json,database.dump" && names !== "checkpoint-attempt.json,checkpoint.json,database.dump")
       fail("host_checkpoint_changed");
-    if (names.includes("checkpoint-attempt.json")) await checkpointAttempt(target, binding);
+    if (names.includes("checkpoint-attempt.json")) await checkpointAttempt(target, binding, c.statePathBinding);
     const receipt = await checkpointReceipt(target, c, operationId, check);
-    if (names.includes("checkpoint-attempt.json")) await finishCheckpointAttempt(target, binding);
+    if (names.includes("checkpoint-attempt.json")) await finishCheckpointAttempt(target, binding, c.statePathBinding);
     return receipt;
   }
   let partial = false;
   try { await fs.lstat(staging); partial = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
   if (partial) {
-    const attempt = await checkpointAttempt(staging, binding);
+    const attempt = await checkpointAttempt(staging, binding, c.statePathBinding);
     if (attempt.names.includes("checkpoint.json")) {
       const receipt = await checkpointReceipt(staging, c, operationId, check);
-      await checkpointAttempt(staging, binding);
+      await checkpointAttempt(staging, binding, c.statePathBinding);
       await fs.rename(staging, target);
-      await finishCheckpointAttempt(target, binding);
+      await finishCheckpointAttempt(target, binding, c.statePathBinding);
       return receipt;
     }
-    await discardCheckpointAttempt(staging, binding);
+    await discardCheckpointAttempt(staging, binding, c.statePathBinding);
     check();
   }
   // No database bytes enter the random preparation directory before the ownership intent is durable.
   const preparing = await fs.mkdtemp(join(root, "." + operationId + ".preparing-"));
-  const files = { directory: await checkpointIdentity(preparing, true) };
+  const files = { directory: await checkpointIdentity(preparing, true, c.statePathBinding) };
   for (const [key, name] of [["dump", "database.dump"], ["record", ".checkpoint-record.partial"], ["intent", "checkpoint-attempt.json"]]) {
     const file = await fs.open(join(preparing, name), "wx", 0o600);
     try { await file.sync(); } finally { await file.close(); }
-    files[key] = await checkpointIdentity(join(preparing, name));
+    files[key] = await checkpointIdentity(join(preparing, name), false, c.statePathBinding);
   }
   const intent = await fs.open(join(preparing, "checkpoint-attempt.json"), constants.O_WRONLY | constants.O_NOFOLLOW);
   try { await intent.writeFile(JSON.stringify({ schemaVersion: 1, binding, files }) + "\n"); await intent.sync(); }
@@ -413,11 +434,11 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
   await checkpointSyncDirectory(root);
   try {
     const dump = join(staging, "database.dump");
-    await checkpointAttempt(staging, binding);
+    await checkpointAttempt(staging, binding, c.statePathBinding);
     await execute([join(c.runtime, c.entryPoints.pgDump), "--host", "127.0.0.1", "--port", String(c.databasePort),
       "--username", "frameleaf", "--no-password", "--format=custom", "--file", dump, "frameleaf"], { PGPASSWORD: c.password });
     check();
-    await checkpointAttempt(staging, binding);
+    await checkpointAttempt(staging, binding, c.statePathBinding);
     await execute([join(c.runtime, c.entryPoints.pgRestore), "--list", dump], {});
     check();
     const file = await fs.open(dump, constants.O_RDWR | constants.O_NOFOLLOW);
@@ -427,7 +448,7 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
       await file.sync();
     } finally { await file.close(); }
     const receipt = { ...binding, dump: await checkpointHash(dump, check) };
-    await checkpointAttempt(staging, binding);
+    await checkpointAttempt(staging, binding, c.statePathBinding);
     const record = await fs.open(join(staging, ".checkpoint-record.partial"), constants.O_WRONLY | constants.O_NOFOLLOW);
     try {
       const meta = await record.stat({ bigint: true });
@@ -435,17 +456,17 @@ export async function createHostCheckpoint(c, operationId, execute, cancelled = 
       await record.writeFile(JSON.stringify(receipt) + "\n"); await record.sync();
     } finally { await record.close(); }
     check();
-    await checkpointAttempt(staging, binding);
+    await checkpointAttempt(staging, binding, c.statePathBinding);
     await fs.rename(join(staging, ".checkpoint-record.partial"), join(staging, "checkpoint.json"));
     await checkpointSyncDirectory(staging);
     await fs.rename(staging, target);
-    await finishCheckpointAttempt(target, binding);
+    await finishCheckpointAttempt(target, binding, c.statePathBinding);
     return receipt;
   } catch (error) {
     // Completed records are immutable retry evidence; never discard them after a publication failure.
     try {
-      const attempt = await checkpointAttempt(staging, binding);
-      if (!attempt.names.includes("checkpoint.json")) await discardCheckpointAttempt(staging, binding);
+      const attempt = await checkpointAttempt(staging, binding, c.statePathBinding);
+      if (!attempt.names.includes("checkpoint.json")) await discardCheckpointAttempt(staging, binding, c.statePathBinding);
     } catch { /* Preserve any changed or published attempt for explicit recovery. */ }
     throw error;
   }
@@ -551,7 +572,7 @@ export function hostEnvironment(c) {
     HOME: join(c.state, "home"),
     LANG: "C",
     ...(process.platform === "win32"
-      ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows" }
+      ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows", NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" }
       : {}),
   };
 }
@@ -715,7 +736,7 @@ export function ownHostServer(child) {
 }
 
 /** Internal controller locator only; no caller-supplied paths and no activation authority. */
-export async function readHostDatabase(profile, supplied) {
+export async function readHostDatabase(profile, supplied, pathBinding) {
   if (supplied === undefined) return join(profile, "database");
   try {
     const reference = structuredClone(supplied);
@@ -729,7 +750,7 @@ export async function readHostDatabase(profile, supplied) {
       target = join(operation, reference.attemptId), database = join(target, "database");
     const paths = [profile, root, operation, target, database];
     for (let i = 0; i < paths.length; i++) {
-      await checkpointIdentity(paths[i], true);
+      await checkpointIdentity(paths[i], true, pathBinding);
       const meta = await fs.lstat(paths[i], { bigint: true });
       // Match the controller's native identity namespace, including Windows' high/low file index.
       const identity = process.platform === "win32"
@@ -749,7 +770,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
   if (c.mode === "checkpoint-cleanup" || c.mode === "restore-prepare") {
     // Maintenance starts no original database; restore writes only a separate owned attempt.
     await checkpointDirectory(c.state);
-    if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_state_not_private");
+    if (!await isCanonicalHostPath(c.state, c.statePathBinding)) fail("host_state_not_private");
     await stateFile(join(c.state, "host-state.json"), 4096).catch(() => fail("host_state_invalid"));
     await claimState(c);
     let pending, cancelled = false;
@@ -769,7 +790,8 @@ export async function runHost(c, stopping, ready, restoreSession) {
     return;
   }
   const databaseReference = c.databaseReference === undefined ? undefined : structuredClone(c.databaseReference);
-  const data = await readHostDatabase(c.state, databaseReference);
+  if (!await isCanonicalHostPath(c.state, c.statePathBinding)) fail("host_state_not_private");
+  const data = await readHostDatabase(c.state, databaseReference, c.statePathBinding);
   const selectedDatabase = databaseReference !== undefined;
   const databaseOnly = c.mode === "database";
   if (!databaseOnly && !restoreOnly) await portFree(c.apiPort);
@@ -777,7 +799,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
   if (databaseOnly) {
     try {
       await checkpointDirectory(c.state);
-      if (!canonicalHostPathMatches(await fs.realpath(c.state), c.state)) fail("host_state_not_private");
+      if (!await isCanonicalHostPath(c.state, c.statePathBinding)) fail("host_state_not_private");
       await stateFile(join(c.state, "host-state.json"), 4096);
     } catch (error) {
       if (error.code === "ENOENT") fail("host_database_missing");
@@ -919,7 +941,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       }
     }
     if (cancelled) fail("host_cancelled");
-    if (selectedDatabase) await readHostDatabase(c.state, databaseReference);
+    if (selectedDatabase) await readHostDatabase(c.state, databaseReference, c.statePathBinding);
     pg = launch([
       executable("postgres"),
       "-D",
@@ -1233,13 +1255,13 @@ if (process.env.FRAMELEAF_HOST_AGENT === "1") {
 }
 
 
-async function restoreInputJson(path) {
+async function restoreInputJson(path, pathBinding) {
   if ((await fs.lstat(path)).size > 4096) fail("host_restore_input_invalid");
-  const identity = await checkpointIdentity(path);
+  const identity = await checkpointIdentity(path, false, pathBinding);
   const before = await checkpointHash(path, () => {}, 4096);
   const raw = await stateFile(path, 4096);
   if (Buffer.byteLength(raw) !== before.bytes || createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
-    JSON.stringify(await checkpointHash(path, () => {}, 4096)) !== JSON.stringify(before) || await checkpointIdentity(path) !== identity)
+    JSON.stringify(await checkpointHash(path, () => {}, 4096)) !== JSON.stringify(before) || await checkpointIdentity(path, false, pathBinding) !== identity)
     fail("host_restore_input_invalid");
   return JSON.parse(raw);
 }
@@ -1279,18 +1301,18 @@ export async function readHostRestoreInput(c, supplied, check = () => {}) {
     validateConfig(c);
     const binding = restoreInputBinding(c, supplied), root = join(c.state, "restore-input"), target = join(root, binding.operationId), input = join(target, "input");
     const identities = new Map();
-    for (const path of [c.state, root, target, input]) identities.set(path, await checkpointIdentity(path, true));
-    const marker = await restoreInputJson(join(c.state, "host-state.json"));
+    for (const path of [c.state, root, target, input]) identities.set(path, await checkpointIdentity(path, true, c.statePathBinding));
+    const marker = await restoreInputJson(join(c.state, "host-state.json"), c.statePathBinding);
     const expected = { schemaVersion: 1, manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor };
     if (Object.keys(marker).sort().join(",") !== Object.keys(expected).sort().join(",") || Object.entries(expected).some(([key, value]) => marker[key] !== value) ||
       (await fs.readdir(target)).sort().join(",") !== "input,restore-intent.json" || (await fs.readdir(input)).sort().join(",") !== "database.dump,recovery.json" ||
-      JSON.stringify(restoreInputBinding(c, await restoreInputJson(join(target, "restore-intent.json")))) !== JSON.stringify(binding)) fail("host_restore_input_invalid");
-    const recovery = restoreInputRecovery(c, await restoreInputJson(join(input, "recovery.json")));
+      JSON.stringify(restoreInputBinding(c, await restoreInputJson(join(target, "restore-intent.json"), c.statePathBinding))) !== JSON.stringify(binding)) fail("host_restore_input_invalid");
+    const recovery = restoreInputRecovery(c, await restoreInputJson(join(input, "recovery.json"), c.statePathBinding));
     if (recovery.libraryId !== binding.libraryId || createHash("sha256").update(JSON.stringify(recovery)).digest("hex") !== binding.recoverySha256)
       fail("host_restore_input_invalid");
     const dump = join(input, "database.dump"), actual = await checkpointHash(dump, check);
     if (JSON.stringify(actual) !== JSON.stringify(recovery.checkpoint.dump)) fail("host_restore_input_invalid");
-    for (const [path, identity] of identities) if (await checkpointIdentity(path, true) !== identity) fail("host_restore_input_invalid");
+    for (const [path, identity] of identities) if (await checkpointIdentity(path, true, c.statePathBinding) !== identity) fail("host_restore_input_invalid");
     return { binding, recovery, dump };
   } catch (error) { if (error?.message === "host_restore_cancelled") throw error; fail("host_restore_input_invalid"); }
 }
@@ -1304,12 +1326,12 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   const input = await readHostRestoreInput(c, supplied);
   if (cancelled) fail("host_restore_cancelled");
   if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision) fail("host_restore_runtime_required");
-  const profileIdentity = await checkpointIdentity(c.state, true);
+  const profileIdentity = await checkpointIdentity(c.state, true, c.statePathBinding);
   const root = join(c.state, "restore-targets"), operationRoot = join(root, input.binding.operationId);
-  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (!canonicalHostPathMatches(await fs.realpath(path), path)) fail("host_restore_input_invalid");}
+  for (const path of [root, operationRoot]) {await checkpointDirectory(path, true); if (!await isCanonicalHostPath(path, c.statePathBinding)) fail("host_restore_input_invalid");}
   const attemptId = randomUUID(), target = join(operationRoot, attemptId);
   await fs.mkdir(target, {mode:0o700});
-  const targetIdentity = await checkpointIdentity(target, true);
+  const targetIdentity = await checkpointIdentity(target, true, c.statePathBinding);
   const inner = {...c, state:target, mode:"server", databaseReference:undefined};
   await claimState(inner);
   const intent = {schemaVersion:1, binding:input.binding, attemptId, profileIdentity, targetIdentity};
@@ -1322,10 +1344,10 @@ export async function restoreHostDatabase(configuration, supplied, stopping) {
   const finished = new Promise(resolve => {finish=resolve;});
   await runHost(inner, Promise.race([stopping,finished]), () => {prepared=true;finish();}, session);
   if (!prepared || cancelled || !session.validation) fail("host_restore_cancelled");
-  if (await checkpointIdentity(c.state,true) !== profileIdentity || await checkpointIdentity(target,true) !== targetIdentity) fail("host_restore_input_invalid");
+  if (await checkpointIdentity(c.state, true, c.statePathBinding) !== profileIdentity || await checkpointIdentity(target, true, c.statePathBinding) !== targetIdentity) fail("host_restore_input_invalid");
   await readHostRestoreInput(c,input.binding);
   const receipt = {schemaVersion:1, state:"restore-prepared", binding:input.binding, attemptId, profileIdentity, targetIdentity,
-    databaseIdentity:await checkpointIdentity(join(target,"database"),true), validation:session.validation};
+    databaseIdentity:await checkpointIdentity(join(target,"database"), true, c.statePathBinding), validation:session.validation};
   if (cancelled) fail("host_restore_cancelled");
   const result = await fs.open(join(target,"restore-result.json"),"wx",0o600);
   try {if (cancelled) fail("host_restore_cancelled");await result.writeFile(JSON.stringify(receipt)+"\n");await result.sync();} finally {await result.close();}
@@ -1395,7 +1417,7 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
       database = join(target, "database");
     const identities = new Map();
     for (const path of [c.state, root, operationRoot, target, database])
-      identities.set(path, await checkpointIdentity(path, true));
+      identities.set(path, await checkpointIdentity(path, true, c.statePathBinding));
     if (
       identities.get(c.state) !== receipt.profileIdentity ||
       identities.get(target) !== receipt.targetIdentity ||
@@ -1418,15 +1440,15 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
     async function verifyRecords() {
       if (
         !isDeepStrictEqual(
-          await restoreInputJson(join(target, "restore-target.json")),
+          await restoreInputJson(join(target, "restore-target.json"), c.statePathBinding),
           intent,
         ) ||
         !isDeepStrictEqual(
-          await restoreInputJson(join(target, "restore-result.json")),
+          await restoreInputJson(join(target, "restore-result.json"), c.statePathBinding),
           receipt,
         ) ||
         !isDeepStrictEqual(
-          await restoreInputJson(join(target, "host-state.json")),
+          await restoreInputJson(join(target, "host-state.json"), c.statePathBinding),
           marker,
         )
       )
@@ -1453,11 +1475,11 @@ export async function readHostRestoreTarget(configuration, supplied, check = () 
     if (input.recovery.checkpoint.sourceRevision !== c.sourceRevision)
       fail("host_restore_target_invalid");
     for (const [path, identity] of identities)
-      if ((await checkpointIdentity(path, true)) !== identity)
+      if ((await checkpointIdentity(path, true, c.statePathBinding)) !== identity)
         fail("host_restore_target_invalid");
     await verifyRecords();
     for (const [path, identity] of identities)
-      if ((await checkpointIdentity(path, true)) !== identity)
+      if ((await checkpointIdentity(path, true, c.statePathBinding)) !== identity)
         fail("host_restore_target_invalid");
     return { receipt, target, database };
   } catch (error) {
@@ -1508,7 +1530,7 @@ export async function verifyHostRestoreTarget(
         const path = pending.pop(),
           meta = await fs.lstat(path, { bigint: true });
         const directory = meta.isDirectory(),
-          identity = await checkpointIdentity(path, directory);
+          identity = await checkpointIdentity(path, directory, c.statePathBinding);
         if (identity !== meta.dev + ":" + meta.ino || entries.size >= 100_000)
           fail("host_restore_offline_invalid");
         entries.set(path, {
@@ -1525,7 +1547,7 @@ export async function verifyHostRestoreTarget(
               fail("host_restore_offline_invalid");
             pending.push(join(path, entry.name));
           }
-          if ((await checkpointIdentity(path, true)) !== identity)
+          if ((await checkpointIdentity(path, true, c.statePathBinding)) !== identity)
             fail("host_restore_offline_invalid");
         }
       }

@@ -179,6 +179,11 @@ impl VerifiedHostRuntime {
                 return Err("host_component_missing".into());
             }
         }
+        #[cfg(windows)]
+        let stable_root = crate::windows_protection::stable_path(root)
+            .map_err(|_| "host_runtime_path_unavailable")?;
+        #[cfg(windows)]
+        let root = stable_root.as_path();
         verify_files(root, &manifest.files)?;
         Ok(Self {
             root: root.into(),
@@ -921,6 +926,8 @@ impl HostMode {
 struct HostStart<'a> {
     mode: HostMode,
     state: &'a Path,
+    #[cfg(windows)]
+    state_path_binding: crate::windows_protection::StatePathBinding,
     #[serde(skip_serializing_if = "Option::is_none")]
     database_reference: Option<&'a crate::host_database::Reference>,
     runtime: &'a Path,
@@ -1041,6 +1048,12 @@ impl VerifiedHostRuntime {
         mode: HostMode,
         mut owner: Option<&mut crate::host_state::Owner>,
     ) -> Result<HostProcess, String> {
+        let requested_state = state;
+        #[cfg(windows)]
+        let stable_state = crate::windows_protection::stable_state_path(state)
+            .map_err(|_| "host_state_not_private")?;
+        #[cfg(windows)]
+        let state = stable_state.as_path();
         use base64::{engine::general_purpose::STANDARD, Engine};
         let agent_source = STANDARD.encode(AGENT);
         if agent_source.len() > 262144 {
@@ -1049,7 +1062,7 @@ impl VerifiedHostRuntime {
         let (database_reference, controller_generation) = if let Some(owner) = owner.as_mut() {
             let (profile, reference, generation) =
                 owner.launch_state(&self.manifest_sha256, mode)?;
-            if profile != state {
+            if profile != requested_state {
                 return Err("host_controller_binding_changed".into());
             }
             (reference, Some(generation))
@@ -1096,6 +1109,9 @@ impl VerifiedHostRuntime {
             serde_json::to_vec(&HostStart {
                 mode,
                 state,
+                #[cfg(windows)]
+                state_path_binding: crate::windows_protection::state_path_binding(state)
+                    .map_err(|_| "host_state_not_private")?,
                 database_reference: if mode.uses_database() {
                     database_reference.as_ref()
                 } else {
@@ -1130,6 +1146,8 @@ impl VerifiedHostRuntime {
         if let Some(system_root) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", system_root);
         }
+        #[cfg(windows)]
+        command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
         crate::process_tree::configure(&mut command);
         let mut child = code_lease
             .spawn(&mut command)

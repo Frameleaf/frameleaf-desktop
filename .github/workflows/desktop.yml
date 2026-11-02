@@ -55,6 +55,11 @@ jobs:
       - run: npm test
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Use the pinned host Node for actual Windows interop tests
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Check Windows real restore test is compiled
         if: runner.os == 'Windows'

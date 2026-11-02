@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -166,6 +166,26 @@ test("host media commands use private binaries without inheriting the caller env
   assert.ok(env.PATH.split(delimiter).includes(join(cfg.runtime, "media")));
   assert.equal(env.PATH.split(delimiter)[0], join(cfg.runtime, "media"));
 });
+test("host Node options preserve captured Windows paths without inheriting caller options", () => {
+  const cfg = config("/private/state");
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const previous = process.env.NODE_OPTIONS;
+  try {
+    process.env.NODE_OPTIONS = "--require=untrusted-caller-module";
+    for (const target of ["win32", "darwin", "linux"]) {
+      Object.defineProperty(process, "platform", { ...platform, value: target });
+      const env = hostEnvironment(cfg);
+      assert.equal(
+        env.NODE_OPTIONS,
+        target === "win32" ? "--preserve-symlinks --preserve-symlinks-main" : undefined,
+      );
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    if (previous === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previous;
+  }
+});
 test("host state binds one runtime before initialization and refuses adoption or changed authority", async () => {
   const root = await mkdtemp(join(tmpdir(), "frameleaf-host-agent-"));
   try {
@@ -235,7 +255,7 @@ test("port conflict refuses hosting before creating state", async () => {
   const { createServer } = await import("node:net");
   const { readdir } = await import("node:fs/promises");
   const { runHost } = await import("../runtime/host-agent.mjs");
-  const root = await mkdtemp(join(tmpdir(), "frameleaf-host-conflict-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "frameleaf-host-conflict-")));
   const occupied = createServer();
   await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve));
   try {
@@ -259,7 +279,7 @@ test(
     const { createServer } = await import("node:net");
     const { mkdir, symlink } = await import("node:fs/promises");
     const { runHost } = await import("../runtime/host-agent.mjs");
-    const root = await mkdtemp(join(tmpdir(), "frameleaf-host-linked-"));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "frameleaf-host-linked-")));
     const state = join(root, "state");
     const outside = join(root, "outside");
     await mkdir(state, { mode: 0o700 });
