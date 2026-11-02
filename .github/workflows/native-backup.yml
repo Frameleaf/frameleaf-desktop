@@ -29,14 +29,35 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest discover -s tools -p test_build_host_backup.py
       - run: python tools/build_host_backup.py --output "${{ runner.temp }}/frameleaf-backup-engine"
-      - name: Retain private component and receipts
-        if: always()
+      - name: Archive the qualified backup component with executable modes
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import tarfile
+          root = Path(os.environ['RUNNER_TEMP']) / 'frameleaf-backup-engine'
+          receipt = json.loads((root / 'qualification.json').read_text())
+          component = json.loads((root / 'backup/component.json').read_text())
+          if receipt.get('qualification') != 'passed' or component != receipt:
+              raise SystemExit('Qualified backup component and receipt are required')
+          with tarfile.open(root / 'backup-component.tar.gz', 'w:gz') as archive:
+              archive.add(root / 'backup', arcname='backup')
+              archive.add(root / 'qualification.json', arcname='qualification.json')
+      - name: Retain qualified private component
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-backup-engine-${{ runner.os }}
+          path: ${{ runner.temp }}/frameleaf-backup-engine/backup-component.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain bounded backup diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-backup-diagnostics-${{ runner.os }}
           path: |
-            ${{ runner.temp }}/frameleaf-backup-engine/backup/
             ${{ runner.temp }}/frameleaf-backup-engine/qualification.json
             ${{ runner.temp }}/frameleaf-backup-engine/work/command-error.log
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7

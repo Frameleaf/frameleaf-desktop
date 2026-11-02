@@ -807,6 +807,8 @@ Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manag
 
 Build the private backup component with `python tools/build_host_backup.py --output /absolute/backup-output` using a new output directory. The builder verifies the pinned official restic archive and executable digests, retains its license, and exercises encrypted synthetic backup/check/restore before producing the component receipt. Assembly checks the approved target, executable and license hashes, and rechecks the staged component before constructing the host manifest. Manager backup integration and installed-host recovery qualification remain separate requirements; this component does not enable the native backup action.
 
+The backup workflow retains `backup-component.tar.gz` inside each component artifact. Extract that archive before assembly to preserve Unix executable permissions. Qualification receipts and license bytes travel with the component; failed-build diagnostics are retained separately.
+
 
 Native Manager accepts internal bootstrap protocol 2 through a single bounded private stdin record. The desktop TLS identity is generated in Rust and must be persisted through the OS keystore before use; native Manager validates its key, certificate, validity and exact origin. Native mode does not use OpenSSL or write TLS key files. The administration origin must be canonical HTTPS with a literal loopback address and an unprivileged port. Docker Manager retains its existing listener; the photo server has its separate listener.
 
