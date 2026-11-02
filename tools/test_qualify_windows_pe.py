@@ -1,4 +1,9 @@
 import tempfile
+import io
+import json
+import runpy
+import sys
+from contextlib import redirect_stdout, redirect_stderr
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -46,3 +51,19 @@ class WindowsPeQualificationTests(unittest.TestCase):
             with self.assertRaisesRegex(BuildError, 'windows_required'):
                 qualify(Path(temporary) / 'ucrt64', output)
             self.assertFalse(output.exists())
+
+    def test_missing_tool_produces_a_failed_cli_receipt_without_compiling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out, err = io.StringIO(), io.StringIO()
+            with (patch('platform.system', return_value='Windows'),
+                  patch.object(sys, 'argv', ['qualify_windows_pe.py', '--dependencies', str(root / 'ucrt64'), '--work', str(root / 'work')]),
+                  patch('subprocess.run') as command,
+                  redirect_stdout(out), redirect_stderr(err),
+                  self.assertRaises(SystemExit) as failure):
+                runpy.run_path(str(Path(__file__).with_name('qualify_windows_pe.py')), run_name='__main__')
+            self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(json.loads(out.getvalue()), {'qualification': 'failed', 'scope': 'windows-pe-inspector', 'code': 'host_pe_probe_environment_failed'})
+            self.assertIn('FileNotFoundError', err.getvalue())
+            command.assert_not_called()
+            self.assertFalse((root / 'work').exists())

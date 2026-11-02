@@ -129,6 +129,9 @@ if __name__ == '__main__':
     options = parser.parse_args()
     try:
         print(json.dumps(qualify(options.dependencies.resolve(), options.work.absolute()), indent=2))
-    except BuildError as error:
-        print(json.dumps({'qualification': 'failed', 'scope': 'windows-pe-inspector', 'code': str(error)}))
-        raise SystemExit(1)
+    except (BuildError, OSError) as error:
+        code = str(error) if isinstance(error, BuildError) else 'host_pe_probe_environment_failed'
+        print(json.dumps({'qualification': 'failed', 'scope': 'windows-pe-inspector', 'code': code}))
+        if isinstance(error, OSError):
+            sys.stderr.write(f'{type(error).__name__}: {error}\n'[-32768:])
+        raise SystemExit(1) from error
