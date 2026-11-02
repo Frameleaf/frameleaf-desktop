@@ -6,10 +6,10 @@ drafts. CodeRabbit remains independent of Actions.
 
 ## Build and signing boundaries
 
-`Desktop candidate` tests and builds private, unsigned shell smoke-test installers
+`Desktop candidate` tests and builds unsigned shell smoke-test installers
 on Windows, macOS and Linux. Those omit the ML runtime and are not release builds.
 
-`Private Linux installer candidates` is manually dispatched from `main` with a
+`Linux installer candidates` is manually dispatched from `main` with a
 `runtime_run_id` from a successful `factory-runtime.yml` main dispatch in this
 repository. The factory commit must be an ancestor of the candidate commit.
 It reuses the approved signed runtimes and builds Ubuntu 24 x86-64 and ARM64
@@ -17,16 +17,18 @@ DEB/AppImage installers, one architecture at a time. Runtime signature, inventor
 source approval and target checks run before native compilation. No signing
 credentials, version tag or publishing permissions are used.
 
-Download `frameleaf-private-installers-linux-x86_64` or
-`frameleaf-private-installers-linux-aarch64` from that run. Each contains
-`private-installers.tar.gz`; extract it to preserve the AppImage executable mode.
+Download `frameleaf-installer-candidates-linux-x86_64` or
+`frameleaf-installer-candidates-linux-aarch64` from that run. Each contains
+`installer-candidates.tar.gz`; extract it to preserve the AppImage executable mode.
 The archive includes installer checksums and `candidate.json` identifying the
 desktop commit and factory run. These are GUI/existing-server helper candidates;
 complete native hosting and installed-device qualification remain separate.
-Artifacts expire after seven days.
+Artifacts expire after seven days. [Downloads follow repository access](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts),
+not a maintainer-only policy. In a public repository, signed-in users can
+download these candidates. Only synthetic test fixtures belong in builds.
 
 ```sh
-gh workflow run linux-private-installers.yml --repo Frameleaf/frameleaf-desktop \
+gh workflow run linux-installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
   --ref main -f runtime_run_id=<successful-factory-run-id>
 ```
 

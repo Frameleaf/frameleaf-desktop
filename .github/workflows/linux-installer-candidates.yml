@@ -1,4 +1,4 @@
-name: Private Linux installer candidates
+name: Linux installer candidates
 on:
   workflow_dispatch:
     inputs:
@@ -10,7 +10,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: private-linux-installers
+  group: linux-installer-candidates
   cancel-in-progress: false
 jobs:
   prepare:
@@ -105,7 +105,7 @@ jobs:
       - run: npm test
       - run: npm run check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - name: Build private installer candidates
+      - name: Build installer candidates
         run: npm run tauri -- build --config "$GITHUB_WORKSPACE/candidate-config.json" -- --locked
       - name: Collect installers and provenance preserving executable modes
         env:
@@ -121,7 +121,7 @@ jobs:
           import tarfile
           files = [p for p in Path('src-tauri/target/release/bundle').rglob('*') if p.is_file() and p.suffix in {'.deb', '.AppImage'}]
           if len(files) != 2 or {p.suffix for p in files} != {'.deb', '.AppImage'}:
-              raise SystemExit('Missing or ambiguous private installers')
+              raise SystemExit('Missing or ambiguous installer candidates')
           output = Path('candidate-installers')
           output.mkdir()
           hashes = {}
@@ -136,14 +136,14 @@ jobs:
           (output / 'candidate.json').write_text(json.dumps({
               'sourceRevision': os.environ['GITHUB_SHA'], 'target': os.environ['CANDIDATE_TARGET'],
               'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False,
-              'scope': 'Private GUI and existing-server helper candidate; full native host qualification remains separate',
+              'scope': 'GUI and existing-server helper candidate; full native host qualification remains separate',
               'files': hashes,
           }, indent=2) + '\n')
-          with tarfile.open('private-installers.tar.gz', 'w:gz') as archive:
+          with tarfile.open('installer-candidates.tar.gz', 'w:gz') as archive:
               archive.add(output, arcname='installers')
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: frameleaf-private-installers-${{ matrix.target }}
-          path: private-installers.tar.gz
+          name: frameleaf-installer-candidates-${{ matrix.target }}
+          path: installer-candidates.tar.gz
           if-no-files-found: error
           retention-days: 7
