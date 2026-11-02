@@ -17,7 +17,11 @@ Ubuntu 24 x86-64 and ARM64 DEB/AppImage installers, one architecture at a time.
 Choose `windows` for Windows x86-64 NSIS/MSI installers. Windows candidates have
 no Authenticode signature and are for manual testing; the signed release workflow
 retains its certificate requirement. Runtime signature, inventory,
-source approval and target checks run before native compilation. No signing
+source approval and target checks run before native compilation. Linux packages
+keep the signed runtime under `/usr/share/Frameleaf/native-runtime`, outside the
+AppImage bundler's library rewrite scan. Both finished Linux installers are
+extracted and their embedded runtime signatures and inventory verified before
+upload. No signing
 credentials, version tag or publishing permissions are used.
 
 Download `frameleaf-installer-candidates-linux-x86_64` or

@@ -2,7 +2,7 @@ use crate::{connection::SavedConnection, model_cache::check_cancel};
 use serde::Serialize;
 use std::{
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -198,6 +198,21 @@ impl WorkerSetup {
         })
         .await;
     }
+}
+
+pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Some(prefix) = resources
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new("lib")))
+        .and_then(Path::parent)
+    {
+        let shared = prefix.join("share/Frameleaf/native-runtime");
+        if shared.exists() {
+            return shared;
+        }
+    }
+    resources.join("native-runtime")
 }
 
 #[derive(Clone)]
@@ -933,6 +948,34 @@ async fn prepare(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn bundled_runtime_keeps_legacy_and_development_resource_locations() {
+        let resources = std::env::temp_dir().join("frameleaf-synthetic-resources");
+        assert_eq!(
+            bundled_runtime(&resources),
+            resources.join("native-runtime")
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bundled_runtime_uses_the_immutable_shared_payload_and_legacy_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-resources-{}", uuid::Uuid::new_v4()));
+        let resources = root.join("usr/lib/Frameleaf");
+        let shared = root.join("usr/share/Frameleaf/native-runtime");
+        std::fs::create_dir_all(&resources).unwrap();
+        assert_eq!(
+            bundled_runtime(&resources),
+            resources.join("native-runtime")
+        );
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(bundled_runtime(&resources), shared);
+        assert_eq!(
+            bundled_runtime(&root.join("debug")),
+            root.join("debug/native-runtime")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn global_progress_preserves_independent_workload_results() {
         let progress = Progress {

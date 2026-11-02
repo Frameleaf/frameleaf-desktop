@@ -289,11 +289,22 @@ test("packaging maps the approved runtime into the native resource location and 
     f.policy,
   );
   const config = await packageConfiguration(f.root, f.policy);
-  assert.deepEqual(config.bundle.resources, {
-    [join(f.root, "manifest.json")]: "native-runtime/manifest.json",
-    [join(f.root, "manifest.sig")]: "native-runtime/manifest.sig",
-    [join(f.root, "payload")]: "native-runtime/payload",
-  });
+  if (process.platform === "linux") {
+    assert.equal(config.bundle.resources, undefined);
+    for (const format of ["deb", "appimage", "rpm"]) {
+      assert.deepEqual(config.bundle.linux[format].files, {
+        "/usr/share/Frameleaf/native-runtime/manifest.json": join(f.root, "manifest.json"),
+        "/usr/share/Frameleaf/native-runtime/manifest.sig": join(f.root, "manifest.sig"),
+        "/usr/share/Frameleaf/native-runtime/payload": join(f.root, "payload"),
+      });
+    }
+  } else {
+    assert.deepEqual(config.bundle.resources, {
+      [join(f.root, "manifest.json")]: "native-runtime/manifest.json",
+      [join(f.root, "manifest.sig")]: "native-runtime/manifest.sig",
+      [join(f.root, "payload")]: "native-runtime/payload",
+    });
+  }
   await writeFile(join(f.root, "payload/python"), "changed");
   await assert.rejects(
     packageConfiguration(f.root, f.policy),
@@ -464,9 +475,13 @@ for (const [source, platforms] of [
       return;
     }
     const config = await packageConfiguration(f.root, f.policy);
-    assert.equal(
-      config.bundle.resources[join(f.root, "payload")],
-      "native-runtime/payload",
-    );
+    if (process.platform === "linux") {
+      assert.equal(config.bundle.linux.appimage.files["/usr/share/Frameleaf/native-runtime/payload"], join(f.root, "payload"));
+    } else {
+      assert.equal(
+        config.bundle.resources[join(f.root, "payload")],
+        "native-runtime/payload",
+      );
+    }
   });
 }
