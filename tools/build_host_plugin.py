@@ -63,6 +63,12 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     work = output / "work"
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
+    if os.name == "nt":
+        # Wizer's Wasmtime cache needs existing Windows known folders under the private profile.
+        for key, directory in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+            location = work / "home/AppData" / directory
+            location.mkdir(parents=True, mode=0o700)
+            env[key] = str(location)
     env["PATH"] = os.pathsep.join(
         [str(node.parent), str(Path(pnpm).parent), os.defpath]
     )

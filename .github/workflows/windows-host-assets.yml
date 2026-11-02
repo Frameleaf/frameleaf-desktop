@@ -82,10 +82,13 @@ jobs:
           foreach ($component in @('web', 'plugin', 'studio')) {
             $node = if ($component -eq 'plugin') { $env:NODE_BINARY } else { $env:STUDIO_NODE_BINARY }
             python "tools/build_host_$component.py" --source "$env:GITHUB_WORKSPACE/application-source" --revision $env:HOST_SOURCE_REVISION --node $node --output "$env:RUNNER_TEMP/fl-windows-assets/$component"
-            if ($LASTEXITCODE) { throw "Genuine Windows asset build failed: $component" }
+            if ($LASTEXITCODE) {
+              "FAILED_ASSET_COMPONENT=$component" >> $env:GITHUB_ENV
+              throw "Genuine Windows asset build failed: $component"
+            }
           }
       - name: Capture bounded resolver evidence after a failed build
-        if: failure()
+        if: failure() && env.FAILED_ASSET_COMPONENT == 'web'
         continue-on-error: true
         shell: pwsh
         run: |
