@@ -438,6 +438,16 @@ removed. A submitted workflow is not qualification evidence: actual Windows
 build/runtime results, database certification and installed acceptance remain
 required; receipts retain `redistributable: false`.
 
+The [private Linux database candidate workflow](.github/workflows/linux-host-database.yml)
+runs the existing source-pinned builder on Ubuntu 24 x64 and ARM64, one target at a
+time. Start it manually from `main`; it retains the component as `prefix.tar.gz`
+with executable modes preserved, plus qualification, server and dependency/build
+diagnostics for seven days. It does not install a
+system PostgreSQL server, publish a release or provide signing credentials.
+These development components still require portable dependency packaging and
+full-host/installed qualification; `redistributable` and database certification
+remain false.
+
 ### Native host controller
 
 The desktop now contains a separate signed host-pack verifier and an owned host process controller. `release_policy::verify_host_runtime` uses the desktop's compiled release keys; host packs require the pinned Node/PostgreSQL/vector versions, the current database certification status, all component entry points, geodata inputs and a complete hash-verified payload. ML manifests cannot substitute for host manifests. The existing ML file checks are shared without changing their validation rules.
