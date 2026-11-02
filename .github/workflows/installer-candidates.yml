@@ -1,16 +1,21 @@
-name: Linux installer candidates
+name: Installer candidates
 on:
   workflow_dispatch:
     inputs:
       runtime_run_id:
-        description: 'Successful main factory-runtime run containing signed Linux runtimes'
+        description: 'Successful main factory-runtime run containing signed runtimes'
         required: true
         type: string
+      platforms:
+        description: 'Candidate targets; Windows installers are unsigned for manual testing'
+        type: choice
+        default: linux
+        options: [linux, windows]
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: linux-installer-candidates
+  group: installer-candidates
   cancel-in-progress: false
 jobs:
   prepare:
@@ -31,6 +36,7 @@ jobs:
         id: source
         env:
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          CANDIDATE_PLATFORMS: ${{ inputs.platforms }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -45,7 +51,8 @@ jobs:
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
-            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix("linux")) + "\n");
+            if (!["linux", "windows"].includes(process.env.CANDIDATE_PLATFORMS)) throw new Error("candidate_platforms_invalid");
+            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.CANDIDATE_PLATFORMS)) + "\n");
           '
   build:
     needs: prepare
@@ -84,15 +91,17 @@ jobs:
           with tarfile.open('runtime-download/runtime.tar') as archive:
               archive.extractall('release-runtime', filter='data')
       - name: Verify signed runtime before native compilation
+        shell: bash
         run: |
           node --input-type=module -e '
             import { writeFileSync } from "node:fs";
             import { packageConfiguration } from "./tools/package_desktop.mjs";
             const config = await packageConfiguration("release-runtime");
-            config.bundle.targets = ["deb", "appimage"];
+            config.bundle.targets = { linux: ["deb", "appimage"], win32: ["nsis", "msi"] }[process.platform];
             writeFileSync("candidate-config.json", JSON.stringify(config));
           '
       - name: Linux native dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
       - name: Rust stable
         run: rustup update stable && rustup default stable
@@ -104,6 +113,11 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+      - name: Use the pinned host Node for actual Windows interop tests
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build installer candidates
         shell: bash
@@ -132,8 +146,10 @@ jobs:
           import os
           import shutil
           import tarfile
-          files = [p for p in Path('src-tauri/target/release/bundle').rglob('*') if p.is_file() and p.suffix in {'.deb', '.AppImage'}]
-          if len(files) != 2 or {p.suffix for p in files} != {'.deb', '.AppImage'}:
+          import sys
+          extensions = {'linux': {'.deb', '.AppImage'}, 'win32': {'.exe', '.msi'}}[sys.platform]
+          files = [p for p in Path('src-tauri/target/release/bundle').rglob('*') if p.is_file() and p.suffix in extensions]
+          if len(files) != 2 or {p.suffix for p in files} != extensions:
               raise SystemExit('Missing or ambiguous installer candidates')
           output = Path('candidate-installers')
           output.mkdir()
@@ -148,7 +164,7 @@ jobs:
           (output / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(hashes.items())))
           (output / 'candidate.json').write_text(json.dumps({
               'sourceRevision': os.environ['GITHUB_SHA'], 'target': os.environ['CANDIDATE_TARGET'],
-              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False,
+              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False, 'osSigned': False,
               'scope': 'GUI and existing-server helper candidate; full native host qualification remains separate',
               'files': hashes,
           }, indent=2) + '\n')

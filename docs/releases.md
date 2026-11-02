@@ -9,16 +9,20 @@ drafts. CodeRabbit remains independent of Actions.
 `Desktop candidate` tests and builds unsigned shell smoke-test installers
 on Windows, macOS and Linux. Those omit the ML runtime and are not release builds.
 
-`Linux installer candidates` is manually dispatched from `main` with a
+`Installer candidates` is manually dispatched from `main` with a
 `runtime_run_id` from a successful `factory-runtime.yml` main dispatch in this
 repository. The factory commit must be an ancestor of the candidate commit.
-It reuses the approved signed runtimes and builds Ubuntu 24 x86-64 and ARM64
-DEB/AppImage installers, one architecture at a time. Runtime signature, inventory,
+It reuses the approved signed runtimes. The default `linux` selection builds
+Ubuntu 24 x86-64 and ARM64 DEB/AppImage installers, one architecture at a time.
+Choose `windows` for Windows x86-64 NSIS/MSI installers. Windows candidates have
+no Authenticode signature and are for manual testing; the signed release workflow
+retains its certificate requirement. Runtime signature, inventory,
 source approval and target checks run before native compilation. No signing
 credentials, version tag or publishing permissions are used.
 
 Download `frameleaf-installer-candidates-linux-x86_64` or
-`frameleaf-installer-candidates-linux-aarch64` from that run. Each contains
+`frameleaf-installer-candidates-linux-aarch64` for Linux, or
+`frameleaf-installer-candidates-windows-x86_64` for Windows, from that run. Each contains
 `installer-candidates.tar.gz`; extract it to preserve the AppImage executable mode.
 The archive includes installer checksums and `candidate.json` identifying the
 desktop commit and factory run. These are GUI/existing-server helper candidates;
@@ -31,8 +35,8 @@ Candidate jobs also retain verbose bundler logs and generated configuration as
 Diagnostics follow the same repository access policy.
 
 ```sh
-gh workflow run linux-installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
-  --ref main -f runtime_run_id=<successful-factory-run-id>
+gh workflow run installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
+  --ref main -f platforms=linux -f runtime_run_id=<successful-factory-run-id>
 ```
 
 `Signed desktop release` is manually dispatched from `main`. Its tag must already
