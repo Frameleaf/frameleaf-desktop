@@ -156,12 +156,10 @@ impl CodeLease {
             _ => Err("host_package_maintenance".into()),
         }
     }
-    pub(crate) fn inherit(&self, command: &mut Command) {
+    pub(crate) fn spawn(&self, command: &mut Command) -> std::io::Result<std::process::Child> {
         #[cfg(unix)]
         {
             use std::os::{fd::AsRawFd, unix::process::CommandExt};
-            self.inherited
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             let fd = self.file.as_raw_fd();
             command.env("FRAMELEAF_CODE_LEASE_FD", fd.to_string());
             // Preserve this already-open inode in Node, including after the desktop owner crashes.
@@ -178,7 +176,12 @@ impl CodeLease {
             }
         }
         #[cfg(not(unix))]
-        let _ = (&self.file, command); // Windows process owners retain the lease through Job Object cleanup.
+        let _ = &self.file; // Windows process owners retain the lease through Job Object cleanup.
+        let child = command.spawn()?;
+        #[cfg(unix)]
+        self.inherited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(child)
     }
 }
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -281,6 +284,21 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn failed_spawn_releases_the_reader_despite_a_fork_style_descriptor_copy() {
+        let f = Fixture::new();
+        let reader = CodeLease::acquire(&f.0).unwrap();
+        let inherited = reader.file.try_clone().unwrap();
+        let mut command = Command::new(f.0.join("missing-native-program"));
+        assert!(reader.spawn(&mut command).is_err());
+        drop(reader);
+        Maintenance::acquire(&f.0)
+            .unwrap()
+            .require_unfenced()
+            .unwrap();
+        drop(inherited);
+    }
+    #[cfg(unix)]
+    #[test]
     fn linked_or_write_shared_metadata_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
@@ -314,8 +332,7 @@ mod tests {
         let mut command = Command::new("node");
         command.args(["-e", "require('node:fs').fstatSync(Number(process.env.FRAMELEAF_CODE_LEASE_FD)); console.log('lease-ready'); process.stdin.resume();"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        lease.inherit(&mut command);
-        let mut child = Child(command.spawn().unwrap());
+        let mut child = Child(lease.spawn(&mut command).unwrap());
         let mut line = String::new();
         BufReader::new(child.0.stdout.take().unwrap())
             .read_line(&mut line)
