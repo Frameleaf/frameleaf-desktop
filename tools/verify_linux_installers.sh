@@ -13,7 +13,11 @@ fi
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 dpkg-deb --extract "${debs[0]}" "$scratch/deb"
-(cd "$scratch" && "$repo_root/${images[0]}" --appimage-extract > /dev/null)
+# The runtime extractor forces directories to 0700; unsquashfs restores stored modes.
+offset=$("${images[0]}" --appimage-offset)
+[[ "$offset" =~ ^[1-9][0-9]*$ ]]
+unsquashfs -strict-errors -no-progress -processors 1 -offset "$offset" \
+  -dest "$scratch/squashfs-root" "${images[0]}" usr/share/Frameleaf/native-runtime
 for prefix in "$scratch/deb" "$scratch/squashfs-root"; do
   echo "Verifying installed runtime in ${prefix##*/}"
   node --input-type=module -e '
