@@ -14,6 +14,7 @@ from pathlib import Path
 from build_host_macos_pkg import validate_identities
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, regular, run, sha256
+from relocate_linux import search_directories
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE = Path('opt/frameleaf')
@@ -124,15 +125,50 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
         with path.open('rb') as stream:
             if stream.read(4) != b'\x7fELF':
                 continue
-        elf.append(path)
         directories.add(path.parent)
         dynamic = run(['readelf', '-d', path], cwd=work, env=env)
+        analyzed = path
+        needed = re.findall(r'\(NEEDED\).*?\[([^\]]+)\]', dynamic)
+        origin = [name for name in needed if name.startswith(('$ORIGIN/', '${ORIGIN}/'))]
+        search = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[([^\]]*)\]', dynamic)
+        if len(search) > 1:
+            raise BuildError('host_elf_search_path_ambiguous')
+        paths = search[0].split(':') if search else []
+        expanded = search_directories(path, paths)
+        for reference, directory in zip(paths, expanded):
+            if '$' in reference and not directory.resolve().is_relative_to(tree.resolve()):
+                raise BuildError('host_install_origin_dependency_invalid')
+        if origin:
+            targets = {}
+            for name, dependency in zip(origin, search_directories(path, origin)):
+                target = dependency.resolve(strict=True)
+                if not target.is_relative_to(tree.resolve()) or not stat.S_ISREG(regular(target).st_mode):
+                    raise BuildError('host_install_origin_dependency_invalid')
+                targets[name] = target
+            patchelf = shutil.which('patchelf')
+            if not patchelf:
+                raise BuildError('host_install_elf_tools_missing')
+            # dpkg-shlibdeps does not expand ORIGIN in NEEDED; patch only a disposable analysis copy.
+            digest = sha256(path)
+            directory = work / 'origin-analysis'
+            directory.mkdir(exist_ok=True, mode=0o700)
+            analyzed = directory / str(len(elf))
+            shutil.copyfile(path, analyzed)
+            analyzed.chmod(0o600)
+            for name, target in targets.items():
+                run([patchelf, '--replace-needed', name, target.name, analyzed], cwd=work, env=env)
+            if search:
+                run([patchelf, '--set-rpath', ':'.join(map(str, expanded)), analyzed], cwd=work, env=env)
+            if sha256(path) != digest:
+                raise BuildError('host_install_staged_runtime_changed')
+        elf.append(analyzed)
         for soname in re.findall(r'\(SONAME\).*?\[([^\]]+)\]', dynamic):
             match = re.fullmatch(r'([A-Za-z0-9_.+-]+)\.so\.([A-Za-z0-9_.+-]+)', soname)
             if not match:
                 match = re.fullmatch(r'([A-Za-z0-9_.+-]+)-([0-9][A-Za-z0-9_.+-]*)\.so', soname)
             if not match:
-                if re.fullmatch(r'[A-Za-z0-9_.+-]+\.so', soname):
+                # Node/Bare add-ons expose SONAMEs but have no Debian shared-library version.
+                if re.fullmatch(r'[A-Za-z0-9_.+-]+(?:\.so|\.node|(?:@[0-9]+)?\.bare)', soname):
                     continue
                 raise BuildError('host_install_private_soname_unsupported')
             shlibs.add(match[1] + ' ' + match[2] + ' ' + package)
