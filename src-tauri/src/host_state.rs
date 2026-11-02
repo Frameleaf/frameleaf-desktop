@@ -490,7 +490,7 @@ mod tests {
             let lease = TransientHostLease(file);
             let inherited = lease.0.try_clone().unwrap();
             let next = root
-                .open_with("lease.lock", &options(false))
+                .open_with("lease.lock", &options(true))
                 .unwrap()
                 .into_std();
             assert!(
