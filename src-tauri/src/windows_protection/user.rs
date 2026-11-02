@@ -78,6 +78,7 @@ fn current_user() -> Result<Vec<u8>, String> {
     }
     unsafe { super::native::sid_bytes(sid) }.map_err(|_| ERROR.into())
 }
+/// Pin ownership to the process SID and stop parent ACL changes from adding foreign grants.
 fn descriptor(user: &[u8]) -> Result<Local, String> {
     let mut text = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(user.as_ptr().cast_mut().cast(), &mut text) } == 0
@@ -109,6 +110,7 @@ fn descriptor(user: &[u8]) -> Result<Local, String> {
     }
     Ok(value)
 }
+/// Refuse reparses and withhold delete sharing while an admitted object is inspected.
 fn open(path: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
         .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
@@ -161,6 +163,10 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
                 || name[..name.len() - 1].contains(&0)
                 || unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0
             {
+                #[cfg(test)]
+                eprintln!("private directory creation at {path:?}: os={}", unsafe {
+                    GetLastError()
+                });
                 return Err(ERROR.into());
             }
             if create_new {
@@ -189,6 +195,12 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
     let mut pending = vec![path];
     let mut visited = 0;
     while let Some(directory) = pending.pop() {
+        #[cfg(test)]
+        BEFORE_SCAN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&directory);
+            }
+        });
         for entry in fs::read_dir(&directory).map_err(|_| ERROR)? {
             visited += 1;
             if visited > 100_000 {
@@ -197,6 +209,7 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
             let path = entry.map_err(|_| ERROR)?.path();
             let file = open(&path)?;
             let (owner, acl, _) = super::native::security(&file)?;
+            // Elevated writes may use a trusted SYSTEM/Administrators owner; foreign grants still fail.
             if !super::private_acl(&owner, &acl, &owner, &private_trusted) {
                 #[cfg(test)]
                 eprintln!("private directory descendant policy refused: {path:?}");
@@ -226,6 +239,11 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static BEFORE_SCAN: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::{
@@ -241,6 +259,72 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn checked_descendant_cannot_be_replaced_before_enumeration() {
+        use std::{cell::Cell, rc::Rc};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_SCAN.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let root = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-scan-pin-{}", uuid::Uuid::new_v4())),
+        );
+        private_directory(&root.0).unwrap();
+        let child = root.0.join("checked");
+        private_directory(&child).unwrap();
+        let foreign = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-scan-public-{}", uuid::Uuid::new_v4())),
+        );
+        fs::create_dir(&foreign.0).unwrap();
+        let replacement = foreign.0.clone();
+        let parked = root.0.join("parked");
+        let attempted = Rc::new(Cell::new(false));
+        let replaced = Rc::new(Cell::new(false));
+        let flags = (attempted.clone(), replaced.clone());
+        BEFORE_SCAN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path.file_name() == Some(std::ffi::OsStr::new("checked")) {
+                    flags.0.set(true);
+                    if fs::rename(&child, &parked).is_ok() {
+                        fs::rename(&replacement, &child).unwrap();
+                        flags.1.set(true);
+                    }
+                }
+            }))
+        });
+        let _reset = Reset;
+        let result = private_directory(&root.0);
+        assert!(
+            attempted.get(),
+            "the replacement must target the checked child before enumeration"
+        );
+        assert!(
+            !replaced.get() || result.is_err(),
+            "an unchecked replacement must not be admitted"
+        );
+        if !replaced.get() {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn private_creation_supports_long_captured_paths() {
+        let root = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-long-private-{}", uuid::Uuid::new_v4())),
+        );
+        private_directory(&root.0).unwrap();
+        let mut path = root.0.clone();
+        for _ in 0..6 {
+            path.push("private-state-component-with-unicode-旅行");
+            private_directory(&path).unwrap();
+        }
+        assert!(path.as_os_str().encode_wide().count() > 260);
+        fs::write(path.join("owned"), b"long private path").unwrap();
+        private_directory(&root.0).unwrap();
+    }
+
     #[test]
     fn impersonated_threads_refuse_private_storage_before_creation() {
         use windows_sys::Win32::Security::{

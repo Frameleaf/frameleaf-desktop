@@ -123,8 +123,8 @@ fn safe_acl(owner: &[u8], acl: &[u8], trusted: &[Vec<u8>], ancestor: bool) -> bo
 }
 
 /// Private state rejects foreign read grants too, including grants inherited by descendants.
-fn private_acl(owner: &[u8], acl: &[u8], user: &[u8], trusted: &[Vec<u8>]) -> bool {
-    if owner != user || !safe_acl(owner, acl, trusted, false) {
+fn private_acl(owner: &[u8], acl: &[u8], expected_owner: &[u8], trusted: &[Vec<u8>]) -> bool {
+    if owner != expected_owner || !safe_acl(owner, acl, trusted, false) {
         return false;
     }
     let count = usize::from(u16::from_le_bytes([acl[4], acl[5]]));
@@ -263,6 +263,7 @@ mod native {
         }
         Ok((owner, acl.to_vec(), control))
     }
+    /// Reuse the machine-code mutation policy; private user state applies a stricter read policy.
     fn descriptor(file: &File, ancestor: bool) -> Result<bool, String> {
         let (owner, acl, _) = security(file)?;
         let trusted = trusted_sids()?;

@@ -38,7 +38,16 @@ impl RuntimeAttestation {
         &self.manifest_sha256
     }
 }
-struct Staging(PathBuf);
+pub(crate) struct Staging(pub(crate) PathBuf);
+impl Staging {
+    /// Acquire cleanup ownership only after exclusive creation; admission failures clean up our root.
+    pub(crate) fn create(path: PathBuf) -> Result<Self, String> {
+        create_private_directory(&path)?;
+        let staging = Self(path);
+        private_directory(&staging.0)?;
+        Ok(staging)
+    }
+}
 impl Drop for Staging {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -318,8 +327,7 @@ impl RuntimeStore {
         if release.exists() {
             self.read_release(id, minimum)?;
         } else {
-            let staging = Staging(self.root.join(format!(".staging-{}", Uuid::new_v4())));
-            private_directory(&staging.0)?;
+            let staging = Staging::create(self.root.join(format!(".staging-{}", Uuid::new_v4())))?;
             private_directory(&staging.0.join("payload"))?;
             verified.copy_payload(&staging.0.join("payload"))?;
             VerifiedRuntime::verify(
@@ -415,6 +423,28 @@ impl InstalledRuntime {
 #[cfg(test)]
 mod private_directory_tests {
     use super::*;
+
+    #[test]
+    fn staging_cleanup_never_owns_an_existing_directory() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "frameleaf-stage-collision-{}",
+                uuid::Uuid::new_v4()
+            ));
+        private_directory(&root).unwrap();
+        let _cleanup = Staging(root.clone());
+        let file = root.join("existing");
+        fs::write(&file, b"preserve pre-existing bytes").unwrap();
+        let stage = Staging::create(root);
+        let refused = stage.is_err();
+        drop(stage);
+        assert_eq!(fs::read(file).unwrap(), b"preserve pre-existing bytes");
+        assert!(
+            refused,
+            "a cleanup guard must never adopt an existing directory"
+        );
+    }
 
     #[test]
     fn private_staging_creation_is_exclusive_and_preserves_existing_contents() {

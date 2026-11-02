@@ -633,7 +633,7 @@ pub(crate) fn shared_cache(
 ) -> Result<std::path::PathBuf, String> {
     use crate::{
         model_cache::{check_cancel, verify_file},
-        runtime_store::private_directory,
+        runtime_store::{private_directory, Staging},
     };
     use std::{fs, path::PathBuf};
     if profiles.is_empty() || profiles.len() != caches.len() {
@@ -693,14 +693,7 @@ pub(crate) fn shared_cache(
         }
         return Ok(active);
     }
-    struct Staging(PathBuf);
-    impl Drop for Staging {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let staging = Staging(root.join(format!(".composition-{}", Uuid::new_v4())));
-    private_directory(&staging.0)?;
+    let staging = Staging::create(root.join(format!(".composition-{}", Uuid::new_v4())))?;
     for (relative, (source, bytes, hash)) in &files {
         check_cancel(cancel)?;
         verify_file(source, *bytes, hash, cancel)?;
