@@ -26,6 +26,9 @@ complete native hosting and installed-device qualification remain separate.
 Artifacts expire after seven days. [Downloads follow repository access](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts),
 not a maintainer-only policy. In a public repository, signed-in users can
 download these candidates. Only synthetic test fixtures belong in builds.
+Candidate jobs also retain verbose bundler logs and generated configuration as
+`frameleaf-installer-diagnostics-<target>` for seven days, including failed builds.
+Diagnostics follow the same repository access policy.
 
 ```sh
 gh workflow run linux-installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
