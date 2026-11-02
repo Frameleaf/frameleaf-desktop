@@ -4,6 +4,8 @@ on:
     paths:
       - 'tools/build_host_database_windows.py'
       - 'tools/test_build_host_database_windows.py'
+      - 'tools/windows_private_directory.py'
+      - 'tools/test_windows_private_directory.py'
       - 'runtime/host-database.json'
       - '.github/workflows/windows-host-database.yml'
   workflow_dispatch:
@@ -45,6 +47,8 @@ jobs:
         run: |
           python -m unittest discover -s tools -p test_build_host_database_windows.py -v
           if ($LASTEXITCODE) { throw 'Windows database packaging tests failed' }
+          python -m unittest discover -s tools -p test_windows_private_directory.py -v
+          if ($LASTEXITCODE) { throw 'Windows private-directory tests failed' }
       - name: Prepare MSVC and pinned build tools
         shell: pwsh
         run: |
@@ -114,6 +118,7 @@ jobs:
             ${{ runner.temp }}/frameleaf-windows-database/build.log
             ${{ runner.temp }}/frameleaf-windows-database/command-error.log
             ${{ runner.temp }}/frameleaf-windows-database/postgres.log
+            ${{ runner.temp }}/frameleaf-windows-database/pg-ctl-start.log
             ${{ runner.temp }}/frameleaf-windows-database/work/configured/meson-logs/meson-log.txt
           retention-days: 7
           if-no-files-found: warn
