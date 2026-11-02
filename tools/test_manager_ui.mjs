@@ -26,12 +26,12 @@ const makeOperation=(action,state='running')=>({id:operationId,kind:action,state
 async function fixture(scenario,run,viewport={width:1100,height:1000},colorScheme='light'){
  const context=await browser.newContext({viewport,colorScheme});
  const calls=[],keys=new Map(),errors=[];
- let paired=!['pair','localhost'].includes(scenario),authorized=!['reauth','recovery-reauth'].includes(scenario),lost=scenario==='lost',current=['resume','recovery-reauth'].includes(scenario)?makeOperation('stop','interrupted'):null;
+ let paired=!['pair','pair-http','localhost'].includes(scenario),authorized=!['reauth','recovery-reauth'].includes(scenario),lost=scenario==='lost',current=['resume','recovery-reauth'].includes(scenario)?makeOperation('stop','interrupted'):null;
  const localRecord={schemaVersion:1,manifestSha256:'a'.repeat(64),controllerSha256:'b'.repeat(64)};
  let local={state:'idle',code:null,backgroundActive:false,installation:null,origin:null};
  let refuseLocalStop=true;
  let reviewLost=scenario==='recovery',reviewReady=false;const reviews=new Map(),restores=new Map();let restoreLost=scenario==='recovery-restore',restored=null;
- const manager={...view,...(scenario==='localhost'?{origin:'https://127.0.0.1:9443',certificateSha256:wire.certificateSha256}:{}),scopes:scenario==='readonly'?['status']:scenario.startsWith('recovery')?[...view.scopes,'restore']:view.scopes};
+ const manager={...view,...(scenario==='pair-http'?{origin:'http://tower.local:2282'}:{}),...(scenario==='localhost'?{origin:'https://127.0.0.1:9443',certificateSha256:wire.certificateSha256}:{}),scopes:scenario==='readonly'?['status']:scenario.startsWith('recovery')?[...view.scopes,'restore']:view.scopes};
  await context.exposeBinding('__managerInvoke',async(_source,command,args={})=>{
   calls.push({command,args:structuredClone(args)});
   if(command==='plugin:event|listen')return 1;
@@ -93,7 +93,7 @@ async function fixture(scenario,run,viewport={width:1100,height:1000},colorSchem
   await page.goto(origin,{waitUntil:'networkidle'});
   const ui=page.getByRole('region',{name:'Server management'});
   await ui.getByRole('heading',{name:'Server management'}).waitFor();
-  if(!['pair','localhost','devicechanged'].includes(scenario))await ui.getByText('Example NAS',{exact:true}).waitFor();
+  if(!['pair','pair-http','localhost','devicechanged'].includes(scenario))await ui.getByText('Example NAS',{exact:true}).waitFor();
   await run({page,ui,calls,keys,reviews,restores,finishRestore:()=>{restored={...restored,state:'complete',step:'native-restore-started',completed:['native-restore-started'],updatedAt:Date.now()};},interruptRestore:()=>{restored={...restored,state:'interrupted'};authorized=false;},finishReview:()=>{reviewReady=true;},loseNext:()=>{lost=true;},finish:()=>{current={...current,state:'complete',completed:[current.kind],updatedAt:Date.now()};}});
   assert.deepEqual(errors,[]);
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'horizontal overflow');
@@ -152,7 +152,7 @@ try{
   assert.equal(calls.filter(value=>value.command==='reauthenticate_manager').length,0);
  });
  await fixture('pair',async({page,ui,calls})=>{
-  await ui.getByLabel('Manager HTTPS address').fill(view.origin);
+  await ui.getByLabel('Manager address').fill(view.origin);
   await ui.getByLabel('Manager password',{exact:true}).fill(password);
   const pair=ui.getByRole('button',{name:'Pair with Manager',exact:true});assert.ok(await pair.isDisabled());
   await ui.getByLabel('Allow this computer to start, stop and restart this server, and create database backups.').check();
@@ -171,6 +171,21 @@ try{
   const request=calls.find(value=>value.command==='pair_manager');assert.equal(request.args.certificate.sha256,wire.certificateSha256);assert.equal(request.args.allowRecovery,true);
   assert.ok(!(await page.textContent('body')).includes(password));
   assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(password));
+ });
+ await fixture('pair-http',async({ui,calls})=>{
+  await ui.getByLabel('Manager address').fill(view.origin);
+  await ui.getByText('Use a certificate for a private Manager',{exact:true}).click();
+  await ui.getByLabel('Public certificate',{exact:true}).fill(wire.certificatePem);
+  await ui.getByLabel('Manager address').fill('http://tower.local:2282');
+  await ui.getByText('HTTP sends sign-in and management traffic without encryption. Use a trusted network.',{exact:true}).waitFor();
+  assert.equal(await ui.getByLabel('Public certificate',{exact:true}).count(),0);
+  await ui.getByLabel('Manager password',{exact:true}).fill(password);
+  await ui.getByLabel('Allow this computer to start, stop and restart this server, and create database backups.').check();
+  await ui.getByRole('button',{name:'Pair with Manager',exact:true}).click();
+  await ui.getByText('Example NAS',{exact:true}).waitFor();
+  const request=calls.find(value=>value.command==='pair_manager');
+  assert.equal(request.args.origin,'http://tower.local:2282');
+  assert.equal(request.args.certificate,null);
  });
  await fixture('lost',async({page,ui,calls,keys,finish,loseNext})=>{
   await ui.getByRole('button',{name:'Start server',exact:true}).click();
