@@ -65,6 +65,20 @@ mod tests {
     use super::*;
     #[test]
     fn folder_lookup_balances_com_without_changing_existing_apartments() {
+        if std::env::var_os("FRAMELEAF_COM_STATE_CHILD").is_none() {
+            // Another test's MTA can implicitly initialize otherwise fresh threads.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host_install::windows::tests::folder_lookup_balances_com_without_changing_existing_apartments", "--nocapture", "--test-threads=1"])
+                .env("FRAMELEAF_COM_STATE_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use windows_sys::Win32::{
             Foundation::{CO_E_NOTINITIALIZED, S_OK},
             System::Com::{
