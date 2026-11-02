@@ -283,6 +283,43 @@ mod tests {
         }
     }
     #[test]
+    fn private_file_with_a_writer_that_denies_read_sharing_is_admitted_without_reading_data() {
+        use std::io::Write;
+        let root = Fixture(std::env::temp_dir().join(format!(
+            "frameleaf-private-file-share-{}",
+            uuid::Uuid::new_v4()
+        )));
+        private_directory(&root.0).unwrap();
+        let path = root.0.join("private-journal");
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(2 | 4)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"private journal bytes").unwrap();
+        writer.flush().unwrap();
+        let before = super::super::native::security(&writer).unwrap();
+        let read_data = OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
+            .share_mode(3)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL)
+            .open(&path);
+        assert!(
+            read_data.is_err(),
+            "negative control: the existing writer must actually deny read-data sharing"
+        );
+        private_directory(&root.0).unwrap();
+        assert_eq!(
+            super::super::native::security(&writer).unwrap(),
+            before,
+            "admission must not alter the file ACL"
+        );
+        drop(writer);
+        assert_eq!(fs::read(path).unwrap(), b"private journal bytes");
+    }
+
+    #[test]
     fn directory_pin_enforces_delete_sharing_unlike_a_metadata_only_handle() {
         let root = Fixture(
             std::env::temp_dir().join(format!("frameleaf-share-pin-{}", uuid::Uuid::new_v4())),
