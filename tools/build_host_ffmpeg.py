@@ -14,6 +14,7 @@ import stat
 import struct
 import tarfile
 import tomllib
+import unicodedata
 import zipfile
 from pathlib import Path
 
@@ -45,7 +46,10 @@ def ffmpeg_contract(lock: dict, descriptor: dict, target: str) -> dict:
 
 
 def unpack(archive: Path, destination: Path) -> None:
-    """Validate the entire bounded, link-free archive before writing into an empty directory."""
+    """Preflight the bounded, link-free archive before extracting into an empty directory.
+
+    The caller must exclusively own the archive and destination throughout this operation.
+    """
     if (not stat.S_ISREG(regular(archive).st_mode)
             or not stat.S_ISDIR(regular(destination).st_mode)
             or any(destination.iterdir())):
@@ -57,7 +61,7 @@ def unpack(archive: Path, destination: Path) -> None:
         for count, (name, directory, size) in enumerate(entries, 1):
             if any(character in name for character in '<>:"|?*'):
                 raise BuildError("host_ffmpeg_archive_entry_invalid")
-            name = relative(name[:-1] if name.endswith("/") else name).casefold()
+            name = unicodedata.normalize("NFC", relative(name[:-1] if name.endswith("/") else name).casefold())
             total += size
             if count > 100_000 or size < 0 or total > 2 * 1024**3:
                 raise BuildError("host_ffmpeg_archive_limit")

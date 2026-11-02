@@ -20,10 +20,14 @@ class FfmpegPackageTests(unittest.TestCase):
                 entry = tarfile.TarInfo("bin/tool")
                 entry.size, entry.mode = 7, 0o755
                 contents.addfile(entry, io.BytesIO(b"payload"))
+                unicode_entry = tarfile.TarInfo("café/normal file")
+                unicode_entry.size = 7
+                contents.addfile(unicode_entry, io.BytesIO(b"unicode"))
             destination = root / "output"
             destination.mkdir()
             unpack(archive, destination)
             self.assertEqual((destination / "bin/tool").read_bytes(), b"payload")
+            self.assertEqual((destination / "café/normal file").read_bytes(), b"unicode")
             if os.name != "nt":
                 self.assertEqual((destination / "bin/tool").stat().st_mode & 0o777, 0o755)
 
@@ -50,6 +54,9 @@ class FfmpegPackageTests(unittest.TestCase):
             [("bin/tool", "file"), ("BIN/tool", "file")],
             [("file", "file"), ("file/child", "file")],
             [("file/child", "file"), ("file", "file")],
+            [("bin/café", "file"), ("bin/cafe\u0301", "file")],
+            [("bin/café", "file"), ("bin/cafe\u0301/child", "file")],
+            [("bin/café/child", "file"), ("bin/cafe\u0301", "file")],
         ]
         cases.extend([[("good", "file"), ("link", kind)] for kind in ["symlink", "hardlink", "fifo"]])
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,6 +117,9 @@ class FfmpegPackageTests(unittest.TestCase):
                     ["bin/good", "bin/ NUL.data"],
                     ["bin/good", " bin/tool"],
                     ["bin/good", "bin/ ordinary.txt"],
+                    ["bin/café", "bin/cafe\u0301"],
+                    ["bin/café", "bin/cafe\u0301/child"],
+                    ["bin/café/child", "bin/cafe\u0301"],
                 ]
             ):
                 archive = root / f"{index}.zip"
@@ -128,9 +138,11 @@ class FfmpegPackageTests(unittest.TestCase):
             archive = root / "safe.zip"
             with zipfile.ZipFile(archive, "w") as output:
                 output.writestr("bin/ffmpeg.exe", b"regular fixture")
+                output.writestr("café/normal file", b"unicode")
             destination = root / "safe"
             destination.mkdir()
             unpack(archive, destination)
             self.assertEqual(
                 (destination / "bin/ffmpeg.exe").read_bytes(), b"regular fixture"
             )
+            self.assertEqual((destination / "café/normal file").read_bytes(), b"unicode")
