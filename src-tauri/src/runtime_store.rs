@@ -38,7 +38,19 @@ impl RuntimeAttestation {
         &self.manifest_sha256
     }
 }
-struct Staging(PathBuf);
+pub(crate) struct Staging(PathBuf);
+impl Staging {
+    /// Acquire cleanup ownership only after exclusive creation; admission failures clean up our root.
+    pub(crate) fn create(path: PathBuf) -> Result<Self, String> {
+        create_private_directory(&path)?;
+        let staging = Self(path);
+        private_directory(&staging.0)?;
+        Ok(staging)
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
 impl Drop for Staging {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -81,9 +93,54 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .and_then(|_| file.sync_all())
         .map_err(|_| "runtime_store_write_failed".into())
 }
+/// Admit a private data directory; existing Windows permissions are checked, never repaired.
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
-    absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
-    if !path.exists() {
+    #[cfg(windows)]
+    {
+        crate::windows_protection::private_directory(path)
+    }
+    #[cfg(not(windows))]
+    {
+        absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
+        if !path.exists() {
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let mut builder = builder;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(path)
+                .map_err(|_| "runtime_store_directory_failed")?;
+        }
+        absolute_directory(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(path)
+                .map_err(|_| "runtime_store_directory_failed")?
+                .permissions()
+                .mode()
+                & 0o077
+                != 0
+            {
+                return Err("runtime_store_directory_not_private".into());
+            }
+        }
+        Ok(())
+    }
+}
+/// Exclusively create private staging; callers retain cleanup ownership and admit it before use.
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        crate::windows_protection::create_private_directory(path)
+    }
+    #[cfg(not(windows))]
+    {
+        absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
         let builder = fs::DirBuilder::new();
         #[cfg(unix)]
         let mut builder = builder;
@@ -94,23 +151,8 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
         }
         builder
             .create(path)
-            .map_err(|_| "runtime_store_directory_failed")?;
+            .map_err(|_| "runtime_store_directory_failed".into())
     }
-    absolute_directory(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(path)
-            .map_err(|_| "runtime_store_directory_failed")?
-            .permissions()
-            .mode()
-            & 0o077
-            != 0
-        {
-            return Err("runtime_store_directory_not_private".into());
-        }
-    }
-    Ok(())
 }
 impl RuntimeStore {
     /// App-owned trust keys and minimum epoch must never come from a server response or runtime pack.
@@ -288,8 +330,7 @@ impl RuntimeStore {
         if release.exists() {
             self.read_release(id, minimum)?;
         } else {
-            let staging = Staging(self.root.join(format!(".staging-{}", Uuid::new_v4())));
-            private_directory(&staging.0)?;
+            let staging = Staging::create(self.root.join(format!(".staging-{}", Uuid::new_v4())))?;
             private_directory(&staging.0.join("payload"))?;
             verified.copy_payload(&staging.0.join("payload"))?;
             VerifiedRuntime::verify(
@@ -379,5 +420,48 @@ impl InstalledRuntime {
     ) -> Result<QualifiedRuntime, String> {
         self.runtime
             .qualify(cache, private_root, spec, fixture, cancel)
+    }
+}
+
+#[cfg(test)]
+mod private_directory_tests {
+    use super::*;
+
+    #[test]
+    fn staging_cleanup_never_owns_an_existing_directory() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "frameleaf-stage-collision-{}",
+                uuid::Uuid::new_v4()
+            ));
+        private_directory(&root).unwrap();
+        let _cleanup = Staging(root.clone());
+        let file = root.join("existing");
+        fs::write(&file, b"preserve pre-existing bytes").unwrap();
+        let stage = Staging::create(root);
+        let refused = stage.is_err();
+        drop(stage);
+        assert_eq!(fs::read(file).unwrap(), b"preserve pre-existing bytes");
+        assert!(
+            refused,
+            "a cleanup guard must never adopt an existing directory"
+        );
+    }
+
+    #[test]
+    fn private_staging_creation_is_exclusive_and_preserves_existing_contents() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-private-create-{}", uuid::Uuid::new_v4()));
+        assert!(!root.exists());
+        let _cleanup = Staging(root.clone());
+        create_private_directory(&root).unwrap();
+        private_directory(&root).unwrap();
+        let file = root.join("existing");
+        fs::write(&file, b"retain owned bytes").unwrap();
+        assert!(create_private_directory(&root).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"retain owned bytes");
+        private_directory(&root).unwrap();
     }
 }

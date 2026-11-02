@@ -1,4 +1,4 @@
-//! Read-only Windows package admission; never edits an ACL.
+//! Windows code admission and creation of private user directories; existing ACLs are never repaired.
 #[cfg(windows)]
 pub(crate) const NODE_PATH_OPTIONS: &str = "--preserve-symlinks --preserve-symlinks-main";
 #[cfg(windows)]
@@ -122,6 +122,32 @@ fn safe_acl(owner: &[u8], acl: &[u8], trusted: &[Vec<u8>], ancestor: bool) -> bo
     true
 }
 
+/// Private state rejects foreign read grants too, including grants inherited by descendants.
+fn private_acl(owner: &[u8], acl: &[u8], expected_owner: &[u8], trusted: &[Vec<u8>]) -> bool {
+    if owner != expected_owner || !safe_acl(owner, acl, trusted, false) {
+        return false;
+    }
+    let count = usize::from(u16::from_le_bytes([acl[4], acl[5]]));
+    let mut cursor = 8;
+    for _ in 0..count {
+        let size = usize::from(u16::from_le_bytes([acl[cursor + 2], acl[cursor + 3]]));
+        let ace = &acl[cursor..cursor + size];
+        // Foreign inherit-only read grants would expose newly created descendants too.
+        if ace[0] == 0
+            && u32::from_le_bytes(ace[4..8].try_into().unwrap()) != 0
+            && !trusted.iter().any(|sid| sid == &ace[8..])
+        {
+            return false;
+        }
+        cursor += size;
+    }
+    true
+}
+#[cfg(windows)]
+mod user;
+#[cfg(windows)]
+pub(crate) use user::{create_private_directory, private_directory};
+
 #[cfg(windows)]
 mod native {
     use super::*;
@@ -139,8 +165,8 @@ mod native {
         Foundation::LocalFree,
         Security::{
             Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
-            GetLengthSid, IsValidAcl, IsValidSid, LookupAccountNameW, ACL,
-            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
+            GetLengthSid, GetSecurityDescriptorControl, IsValidAcl, IsValidSid, LookupAccountNameW,
+            ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
         },
         Storage::FileSystem::{
             GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
@@ -157,7 +183,7 @@ mod native {
             }
         }
     }
-    unsafe fn sid_bytes(sid: PSID) -> Result<Vec<u8>, String> {
+    pub(super) unsafe fn sid_bytes(sid: PSID) -> Result<Vec<u8>, String> {
         if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
             return Err(ERROR.into());
         }
@@ -167,7 +193,7 @@ mod native {
         }
         Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), size) }.to_vec())
     }
-    fn trusted_sids() -> Result<&'static Vec<Vec<u8>>, String> {
+    pub(super) fn trusted_sids() -> Result<&'static Vec<Vec<u8>>, String> {
         static SIDS: OnceLock<Option<Vec<Vec<u8>>>> = OnceLock::new();
         SIDS.get_or_init(|| {
             let name: Vec<u16> = "NT SERVICE\\TrustedInstaller\0".encode_utf16().collect();
@@ -200,7 +226,8 @@ mod native {
         .as_ref()
         .ok_or_else(|| ERROR.into())
     }
-    fn descriptor(file: &File, ancestor: bool) -> Result<bool, String> {
+    /// Copy the owner, DACL and control bits while the opened object and descriptor remain alive.
+    pub(super) fn security(file: &File) -> Result<(Vec<u8>, Vec<u8>, u16), String> {
         let mut owner = std::ptr::null_mut();
         let mut acl: *mut ACL = std::ptr::null_mut();
         let mut raw = std::ptr::null_mut();
@@ -229,11 +256,21 @@ mod native {
             return Err(ERROR.into());
         }
         let acl = unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), size) };
-        let trusted = trusted_sids()?;
-        if !safe_acl(&owner, acl, trusted, ancestor) {
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(raw, &mut control, &mut revision) } == 0 {
             return Err(ERROR.into());
         }
-        Ok(safe_acl(&owner, acl, trusted, false))
+        Ok((owner, acl.to_vec(), control))
+    }
+    /// Reuse the machine-code mutation policy; private user state applies a stricter read policy.
+    fn descriptor(file: &File, ancestor: bool) -> Result<bool, String> {
+        let (owner, acl, _) = security(file)?;
+        let trusted = trusted_sids()?;
+        if !safe_acl(&owner, &acl, trusted, ancestor) {
+            return Err(ERROR.into());
+        }
+        Ok(safe_acl(&owner, &acl, trusted, false))
     }
     /// Resolves one opened code object; callers must verify and use only the returned spelling.
     pub(crate) fn stable_path(path: &Path) -> Result<PathBuf, String> {
@@ -771,6 +808,39 @@ mod tests {
         let size = value.len() as u16;
         value[2..4].copy_from_slice(&size.to_le_bytes());
         value
+    }
+    #[test]
+    fn private_acl_requires_the_user_owner_and_refuses_even_readonly_foreign_grants() {
+        let user = sid(&[21, 1, 2, 3, 1001]);
+        let system = sid(&[18]);
+        let admins = sid(&[32, 544]);
+        let users = sid(&[32, 545]);
+        let trusted = vec![user.clone(), system.clone(), admins.clone()];
+        let entries = vec![
+            (0, 3, 0x001f01ff, user.clone()),
+            (0, 3, 0x001f01ff, system.clone()),
+            (0, 3, 0x001f01ff, admins),
+        ];
+        let good = acl(&entries);
+        assert!(private_acl(&user, &good, &user, &trusted));
+        assert!(!private_acl(&system, &good, &user, &trusted));
+        for mask in [1, 0x001200a9, 0x10000000] {
+            for flags in [0, 3, 8, 11, 16] {
+                let mut bad = entries.clone();
+                bad.push((0, flags, mask, users.clone()));
+                assert!(!private_acl(&user, &acl(&bad), &user, &trusted));
+            }
+        }
+        assert!(!private_acl(
+            &user,
+            &good[..good.len() - 1],
+            &user,
+            &trusted
+        ));
+        assert!(
+            safe_acl(&user, &acl(&[(0, 0, 0x001200a9, users)]), &trusted, false),
+            "machine code may remain publicly readable"
+        );
     }
     #[test]
     fn acl_allows_privileged_writers_and_public_readers_only() {
