@@ -92,12 +92,16 @@ fn storage_ancestors(path: &Path) -> Result<Vec<&Path>, String> {
 pub(crate) fn separate_paths(candidate: &Path, state: &Path) -> Result<(), String> {
     // Compare physical directory identities too: case aliases cannot bypass payload/state separation.
     let candidate_id = physical_id(candidate)?;
+    let ancestors = storage_ancestors(state)?;
     let existing = if state.exists() {
-        state
+        ancestors.as_slice()
     } else {
-        state.parent().ok_or("host_control_config_invalid")?
+        ancestors
+            .get(1..)
+            .filter(|paths| !paths.is_empty())
+            .ok_or("host_control_config_invalid")?
     };
-    for ancestor in storage_ancestors(existing)? {
+    for ancestor in existing {
         if physical_id(ancestor)? == candidate_id {
             return Err("host_state_overlaps_runtime".into());
         }
@@ -685,6 +689,11 @@ mod tests {
                 storage_ancestors(Path::new(&root)).unwrap(),
                 vec![Path::new(&root)]
             );
+            let direct_state = format!(r"{root}state");
+            assert_eq!(
+                &storage_ancestors(Path::new(&direct_state)).unwrap()[1..],
+                &[Path::new(&root)]
+            );
             for bad in [
                 format!(r"{prefix}\Device"),
                 format!(r"{prefix}\Device\HarddiskVolume0\state"),
@@ -708,6 +717,13 @@ mod tests {
         let stable = crate::windows_protection::stable_path(&root).unwrap();
         let candidate = stable.join("Candidate");
         std::fs::create_dir(&candidate).unwrap();
+        let volume_root =
+            crate::windows_protection::filesystem_components(stable.to_str().unwrap()).unwrap()[0];
+        let root_state = Path::new(volume_root)
+            .join(format!("frameleaf-missing-state-{}", uuid::Uuid::new_v4()));
+        assert!(!root_state.exists());
+        assert!(separate_paths(&candidate, &root_state).is_ok());
+        assert!(!root_state.exists());
         let state = stable.join("state");
         assert!(separate_paths(&candidate, &state).is_ok());
         assert!(!state.exists());
