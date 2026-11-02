@@ -24,9 +24,10 @@ async function run(parts) {
   child.stderr.on('data', chunk => { stderr += chunk; });
   child.stdin.on('error', () => {});
   for (const part of parts) {
-    if (!child.stdin.write(part)) await Promise.race([once(child.stdin, 'drain'), ended]);
+    if (child.stdin.destroyed) break;
+    if (!child.stdin.write(part)) await Promise.race([once(child.stdin, 'drain').catch(() => {}), ended]);
   }
-  child.stdin.end();
+  if (!child.stdin.destroyed) child.stdin.end();
   const [code, signal] = await ended;
   return { code, signal, stdout, stderr };
 }
@@ -52,6 +53,11 @@ test('pipe loader rejects malformed, truncated, empty and overlong source withou
     const result = await run([input]);
     assert.deepEqual(result, { code: 1, signal: null, stdout: '', stderr: 'host_agent_source_invalid\n' });
   }
+});
+
+test('rejected source reports its fixed error while parent input is backpressured', async () => {
+  const result = await run(['A'.repeat(4 * 1024 * 1024), '\nprivate-config\n']);
+  assert.deepEqual(result, { code: 1, signal: null, stdout: '', stderr: 'host_agent_source_invalid\n' });
 });
 
 test('pipe loader redacts import errors and starts source when no configuration follows', async () => {
