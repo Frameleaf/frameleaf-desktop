@@ -44,6 +44,12 @@ jobs:
           echo "$tool_dir/bin" >> "$GITHUB_PATH"
       - name: Rust stable
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - name: Reuse Rust dependencies from successful main checks
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
       - run: python -m unittest discover -s tools -p 'test_*.py'
       - run: npm test
@@ -67,7 +73,8 @@ jobs:
             [ ! -e /opt/frameleaf ]
             [ ! -L /opt/frameleaf ]
             /usr/bin/mount -t tmpfs -o mode=0755,nodev,nosuid frameleaf-admission /opt
-            exec /usr/bin/python3 tools/qualify_linux_package_admission.py src-tauri/target/debug/frameleaf-native-host
+            /usr/bin/python3 tools/qualify_linux_package_admission.py src-tauri/target/debug/frameleaf-native-host
+            exec /usr/bin/python3 tools/qualify_linux_deb_lifecycle.py src-tauri/target/debug/frameleaf-native-host
           '
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build unsigned shell smoke-test candidate

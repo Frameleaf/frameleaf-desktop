@@ -1,0 +1,160 @@
+name: Factory desktop runtime
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Targets to prepare for the signed desktop release'
+        type: choice
+        default: macos-linux
+        options: [macos-linux, all, linux]
+      epoch:
+        description: 'Runtime epoch admitted by the release policy'
+        type: string
+        default: '6'
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: factory-desktop-runtime
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.inputs.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - id: inputs
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          RUNTIME_EPOCH: ${{ inputs.epoch }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { releaseMatrix } from './tools/release_inputs.mjs';
+          import { factorySourceRevisionFor } from './tools/factory_runtime.mjs';
+          const trust = JSON.parse(readFileSync('runtime/release-trust.json'));
+          const epoch = Number(process.env.RUNTIME_EPOCH);
+          if (!/^[1-9][0-9]*$/.test(process.env.RUNTIME_EPOCH) || !Number.isSafeInteger(epoch) || epoch < trust.minimumRuntimeEpoch)
+            throw new Error('runtime_factory_epoch_invalid');
+          const matrix = releaseMatrix(process.env.RELEASE_PLATFORMS);
+          for (const item of matrix.include) item.source_revision = factorySourceRevisionFor(item.target);
+          appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(matrix)}\n`);
+          JS
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ matrix.source_revision }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Linux ELF relocation tooling
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/frameleaf-patchelf"
+          mkdir -p "$tool_dir"
+          curl --fail --location --silent --show-error --output "$tool_dir/patchelf.tar.gz" "https://github.com/NixOS/patchelf/releases/download/0.19.1/patchelf-0.19.1-$(uname -m).tar.gz"
+          case "$(uname -m)" in
+            x86_64) digest=a6818fef80128fb354423234ecacdcca3e993913d774e5d8346bc63f70fed4cf ;;
+            aarch64) digest=a2f8f5add5910a521d35062adf2c9f55d75b65ae5508d290758787004054e702 ;;
+            *) echo 'Unapproved patchelf target' >&2; exit 1 ;;
+          esac
+          echo "$digest  $tool_dir/patchelf.tar.gz" | sha256sum --check --strict
+          tar -xzf "$tool_dir/patchelf.tar.gz" -C "$tool_dir"
+          echo "$tool_dir/bin" >> "$GITHUB_PATH"
+      - name: Build the approved unsigned runtime without signing credentials
+        env:
+          SOURCE_REVISION: ${{ matrix.source_revision }}
+          RUNTIME_EPOCH: ${{ inputs.epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s desktop/tools -p 'test_build_runtime.py'
+          python desktop/tools/build_runtime.py --source source --output candidate --revision "$SOURCE_REVISION" --epoch "$RUNTIME_EPOCH"
+          tar -cf runtime-unsigned.tar -C candidate manifest.json payload
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: unsigned-runtime-${{ matrix.target }}
+          path: runtime-unsigned.tar
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain bounded private build failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: factory-runtime-failure-${{ matrix.target }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          retention-days: 3
+          if-no-files-found: warn
+  sign:
+    needs: [prepare, build]
+    environment: desktop-release
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: unsigned-runtime-${{ matrix.target }}
+          path: unsigned-download
+      - name: Extract data only, without executing the built runtime
+        shell: python
+        run: |
+          import tarfile
+          with tarfile.open('unsigned-download/runtime-unsigned.tar') as archive:
+              archive.extractall('candidate', filter='data')
+      - name: Sign and verify the exact archive accepted by installer packaging
+        env:
+          FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+          RUNTIME_EPOCH: ${{ inputs.epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${FACTORY_PRIVATE_KEY:?Missing factory signing key}"
+          printf '%s\n' "$FACTORY_PRIVATE_KEY" | node tools/factory_runtime.mjs "$PWD/candidate" "$RUNTIME_TARGET" "$RUNTIME_EPOCH"
+          tar -cf runtime.tar -C candidate manifest.json manifest.sig payload
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: factory-runtime-${{ matrix.target }}
+          path: runtime.tar
+          retention-days: 14
+          if-no-files-found: error
