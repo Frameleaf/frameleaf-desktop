@@ -155,10 +155,24 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
             analyzed = directory / str(len(elf))
             shutil.copyfile(path, analyzed)
             analyzed.chmod(0o600)
+            libraries = directory / 'libraries'
+            libraries.mkdir(exist_ok=True, mode=0o700)
+            directories.add(libraries)
             for name, target in targets.items():
-                run([patchelf, '--replace-needed', name, target.name, analyzed], cwd=work, env=env)
-            if search:
-                run([patchelf, '--set-rpath', ':'.join(map(str, expanded)), analyzed], cwd=work, env=env)
+                target_digest = sha256(target)
+                alias = 'libframeleaf-analysis-' + target_digest + '.so.1'
+                selected = libraries / alias
+                shutil.copyfile(target, selected)
+                selected.chmod(0o600)
+                if sha256(selected) != target_digest:
+                    raise BuildError('host_install_staged_runtime_changed')
+                run([patchelf, '--set-soname', alias, selected], cwd=work, env=env)
+                run([patchelf, '--replace-needed', name, alias, analyzed], cwd=work, env=env)
+                shlibs.add('libframeleaf-analysis-' + target_digest + ' 1 ' + package)
+                if sha256(target) != target_digest:
+                    raise BuildError('host_install_staged_runtime_changed')
+            # Search the hash-bound aliases before any original RPATH or global staged directory.
+            run([patchelf, '--set-rpath', ':'.join(map(str, [libraries, *expanded])), analyzed], cwd=work, env=env)
             if sha256(path) != digest:
                 raise BuildError('host_install_staged_runtime_changed')
         elf.append(analyzed)

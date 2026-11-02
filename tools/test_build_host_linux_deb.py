@@ -80,11 +80,17 @@ class LinuxHostDebTests(unittest.TestCase):
                 self.assertIn('libc6', dependencies(tree, 'frameleaf-fixture', root / 'work'))
                 changes = [item.args[0] for item in call.call_args_list if item.args[0][0] == '/trusted/patchelf']
                 self.assertTrue(changes)
-                self.assertEqual(changes[0][1:4], ['--replace-needed', '$ORIGIN/../lib/libpython3.12.so.1.0', target.name])
-                copy = changes[0][-1]
+                alias = 'libframeleaf-analysis-' + hashlib.sha256(target.read_bytes()).hexdigest() + '.so.1'
+                replacement = next(change for change in changes if change[1] == '--replace-needed')
+                self.assertEqual(replacement[1:4], ['--replace-needed', '$ORIGIN/../lib/libpython3.12.so.1.0', alias])
+                copy = replacement[-1]
+                selected = root / 'work/origin-analysis/libraries' / alias
+                self.assertEqual(selected.read_bytes(), target.read_bytes())
+                self.assertIn(['/trusted/patchelf', '--set-soname', alias, selected], changes)
                 self.assertTrue(copy.is_relative_to(root / 'work'))
                 self.assertFalse(copy.is_relative_to(tree))
-                self.assertIn(['/trusted/patchelf', '--set-rpath', str(library), copy], changes)
+                self.assertIn(['/trusted/patchelf', '--set-rpath', str(selected.parent) + ':' + str(library), copy], changes)
+                self.assertIn('libframeleaf-analysis-' + hashlib.sha256(target.read_bytes()).hexdigest() + ' 1 frameleaf-fixture', (root / 'work/debian/shlibs.local').read_text())
                 self.assertNotIn('-e' + str(shim), call.call_args.args[0])
                 self.assertIn('-e' + str(copy), call.call_args.args[0])
                 self.assertEqual(shim.read_bytes(), original)
@@ -297,23 +303,34 @@ class LinuxHostDebTests(unittest.TestCase):
             tree = root / 'package with spaces'
             library = tree / 'lib'
             library.mkdir(parents=True)
+            wrong = tree / 'earlier-same-name'
+            wrong.mkdir()
+            (root / 'wrong.c').write_text('int answer(void) { return 17; }')
             (root / 'answer.c').write_text('int answer(void) { return 42; }')
             (root / 'addon.c').write_text('#include <stdio.h>\nextern int answer(void); int addon(void) { puts("fixture"); return answer(); }')
             target, addon = library / 'libanswer.so.1', library / 'answer.node'
             for command in [
+                ['gcc', '-shared', '-fPIC', root / 'wrong.c', '-Wl,-soname,libanswer.so.1', '-o', wrong / 'libanswer.so.1'],
                 ['gcc', '-shared', '-fPIC', root / 'answer.c', '-Wl,-soname,libanswer.so.1', '-o', target],
-                ['gcc', '-shared', '-fPIC', root / 'addon.c', '-L' + str(library), '-l:libanswer.so.1', '-Wl,-soname,answer.node', '-Wl,-rpath,$ORIGIN', '-o', addon],
+                ['gcc', '-shared', '-fPIC', root / 'addon.c', '-L' + str(library), '-l:libanswer.so.1', '-Wl,-soname,answer.node', '-Wl,-rpath,$ORIGIN/../earlier-same-name', '-o', addon],
                 ['patchelf', '--replace-needed', 'libanswer.so.1', '$ORIGIN/libanswer.so.1', addon],
             ]:
                 subprocess.run(command, check=True, capture_output=True)
-            originals = {path: path.read_bytes() for path in [target, addon]}
+            originals = {path: path.read_bytes() for path in [target, addon, wrong / 'libanswer.so.1']}
             result = dependencies(tree, 'frameleaf-fixture', root / 'work')
             self.assertIn('libc6', result)
             self.assertNotIn('frameleaf-fixture', result)
             for path, contents in originals.items():
                 self.assertEqual(path.read_bytes(), contents)
-            copies = list((root / 'work/origin-analysis').iterdir())
+            analysis = root / 'work/origin-analysis'
+            copies = [path for path in analysis.iterdir() if path.is_file()]
             self.assertEqual(len(copies), 1)
+            alias = 'libframeleaf-analysis-' + hashlib.sha256(originals[target]).hexdigest() + '.so.1'
             metadata = subprocess.check_output(['readelf', '-d', copies[0]], text=True)
-            self.assertIn('Shared library: [libanswer.so.1]', metadata)
+            self.assertIn('Shared library: [' + alias + ']', metadata)
             self.assertNotIn('Shared library: [$ORIGIN/', metadata)
+            self.assertIn(str(analysis / 'libraries') + ':', metadata)
+            import ctypes
+            selected = ctypes.CDLL(str(analysis / 'libraries' / alias))
+            self.assertEqual(selected.answer(), 42)
+            self.assertEqual(ctypes.CDLL(str(wrong / 'libanswer.so.1')).answer(), 17)
