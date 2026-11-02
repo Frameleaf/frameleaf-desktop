@@ -61,6 +61,9 @@ jobs:
         with:
           node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Qualify Windows package directory authority in disposable runner
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_creates_protected_directories_and_refuses_existing_unsafe_objects -- --ignored --exact
       - name: Check Windows real restore test is compiled
         if: runner.os == 'Windows'
         shell: pwsh
