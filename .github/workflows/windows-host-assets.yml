@@ -14,6 +14,7 @@ on:
       - 'tools/source_archive.py'
       - 'tools/test_host_source_archives.py'
       - 'tools/test_windows_host_assets.py'
+      - 'tools/diagnose_studio_resolution.mjs'
       - 'runtime/studio-browser-guard*'
       - '.github/workflows/windows-host-assets.yml'
   workflow_dispatch:
@@ -82,6 +83,15 @@ jobs:
             $node = if ($component -eq 'plugin') { $env:NODE_BINARY } else { $env:STUDIO_NODE_BINARY }
             python "tools/build_host_$component.py" --source "$env:GITHUB_WORKSPACE/application-source" --revision $env:HOST_SOURCE_REVISION --node $node --output "$env:RUNNER_TEMP/fl-windows-assets/$component"
             if ($LASTEXITCODE) { throw "Genuine Windows asset build failed: $component" }
+          }
+      - name: Capture bounded resolver evidence after a failed build
+        if: failure()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $source = "$env:RUNNER_TEMP/fl-windows-assets/web/work/source"
+          if (Test-Path "$source/studio/engine/node_modules/vite-plus/package.json") {
+            & $env:STUDIO_NODE_BINARY tools/diagnose_studio_resolution.mjs $source *> "$env:RUNNER_TEMP/fl-windows-assets/web/resolution-diagnostics.log"
           }
       - name: Archive the qualified host assets
         shell: python
@@ -154,5 +164,6 @@ jobs:
             ${{ runner.temp }}/fl-windows-assets/*/qualification.json
             ${{ runner.temp }}/fl-windows-assets/*/build.log
             ${{ runner.temp }}/fl-windows-assets/*/command-error.log
+            ${{ runner.temp }}/fl-windows-assets/*/resolution-diagnostics.log
           retention-days: 7
           if-no-files-found: ignore
