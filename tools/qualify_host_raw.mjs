@@ -236,7 +236,11 @@ try {
   assert.equal(Math.max(previewMetadata.width, previewMetadata.height), 64);
   assert.ok(previewMetadata.icc);
   assert.equal(hash(await readFile(input)), hash(original));
-  assert.deepEqual(await readdir(originals), [inputName], "RAW rendering must not create files beside the original");
+  assert.deepEqual(
+    (await readdir(originals)).map((name) => name.normalize("NFC")),
+    [inputName.normalize("NFC")],
+    "RAW rendering must not create files beside the original",
+  );
   const loadedImages = [];
   if (process.platform === "darwin") {
     for (const name of ["audit-config", "audit-cache"])
