@@ -12,6 +12,7 @@ from pathlib import Path
 
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, git_blob, run, sha256
+from source_archive import require_lf_archive
 
 
 def stage_web(source: Path, destination: Path) -> dict:
@@ -57,6 +58,24 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if not match or run([node, "--version"], cwd=work, env=env) != "v26.11.1":
         raise BuildError("host_web_toolchain_unapproved")
     archive = work / "source.tar"
+    archive_paths = [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        ".pnpmfile.cjs",
+        "LICENSE",
+        "packages/sdk",
+        "packages/ui",
+        "packages/justified-layout-wasm",
+        "packages/patches",
+        "web",
+        "i18n",
+        "licenses",
+        "studio",
+        "scripts/frameleaf-studio-contracts.mjs",
+        "scripts/frameleaf-studio-rights.mjs",
+    ]
+    require_lf_archive(git, source, revision, archive_paths, env)
     run(
         [
             git,
@@ -67,21 +86,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             "--output",
             archive,
             revision,
-            "package.json",
-            "pnpm-lock.yaml",
-            "pnpm-workspace.yaml",
-            ".pnpmfile.cjs",
-            "LICENSE",
-            "packages/sdk",
-            "packages/ui",
-            "packages/justified-layout-wasm",
-            "packages/patches",
-            "web",
-            "i18n",
-            "licenses",
-            "studio",
-            "scripts/frameleaf-studio-contracts.mjs",
-            "scripts/frameleaf-studio-rights.mjs",
+            *archive_paths,
         ],
         cwd=source,
         env=env,

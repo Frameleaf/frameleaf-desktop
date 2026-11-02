@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from build_host_database import download
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, git_blob, regular, run, sha256
+from source_archive import require_lf_archive
 
 
 def tool_pin(lock: dict, repository: str, target: str) -> dict:
@@ -71,6 +72,19 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if not match or run([node, "--version"], cwd=work, env=env) != "v26.11.1":
         raise BuildError("host_plugin_toolchain_unapproved")
     archive = work / "source.tar"
+    archive_paths = [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        ".pnpmfile.cjs",
+        "LICENSE",
+        "mise.lock",
+        "packages/sdk",
+        "packages/plugin-sdk",
+        "packages/plugin-core",
+        "packages/patches",
+    ]
+    require_lf_archive(git, source, revision, archive_paths, env)
     run(
         [
             git,
@@ -81,16 +95,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             "--output",
             archive,
             revision,
-            "package.json",
-            "pnpm-lock.yaml",
-            "pnpm-workspace.yaml",
-            ".pnpmfile.cjs",
-            "LICENSE",
-            "mise.lock",
-            "packages/sdk",
-            "packages/plugin-sdk",
-            "packages/plugin-core",
-            "packages/patches",
+            *archive_paths,
         ],
         cwd=source,
         env=env,

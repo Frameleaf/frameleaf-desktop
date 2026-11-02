@@ -13,6 +13,7 @@ from pathlib import Path
 
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, run, sha256
+from source_archive import require_lf_archive
 
 
 def stage_studio(source: Path, destination: Path) -> dict:
@@ -102,6 +103,15 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if run([node, "--version"], cwd=work, env=env) != "v26.11.1":
         raise BuildError("host_studio_node_unapproved")
     archive = work / "source.tar"
+    archive_paths = [
+        "LICENSE",
+        "studio",
+        "server/resources/studio-fonts",
+        "server/src/utils/studio-fonts.generated.ts",
+        "scripts/frameleaf-studio-contracts.mjs",
+        "scripts/frameleaf-studio-rights.mjs",
+    ]
+    require_lf_archive(git, source, revision, archive_paths, env)
     run(
         [
             git,
@@ -112,12 +122,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             "--output",
             archive,
             revision,
-            "LICENSE",
-            "studio",
-            "server/resources/studio-fonts",
-            "server/src/utils/studio-fonts.generated.ts",
-            "scripts/frameleaf-studio-contracts.mjs",
-            "scripts/frameleaf-studio-rights.mjs",
+            *archive_paths,
         ],
         cwd=source,
         env=env,
