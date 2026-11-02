@@ -1,4 +1,6 @@
 //! Host packs have separate authority and component requirements from ML packs.
+mod reap;
+
 use crate::native_runtime::{digest_valid, relative, verify_files, Artifact};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -1180,7 +1182,14 @@ impl VerifiedHostRuntime {
                     Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                     Err(_) => {
                         monitor_owner.terminate();
-                        let _ = child.wait();
+                        if reap::confirm(|| child.wait().map(|_| ())).is_err() {
+                            let _ = exit_sender.send(Err("host_process_state_failed".into()));
+                            // Ownership loss cannot authorize PID reuse or release either lease.
+                            // shortcut: retain leases until process-level recovery; automatic recovery needs identity-bound exit proof.
+                            loop {
+                                std::thread::park();
+                            }
+                        }
                         break Err("host_process_state_failed".into());
                     }
                 }
@@ -1188,6 +1197,11 @@ impl VerifiedHostRuntime {
             monitor_owner.terminate();
             // Retain both leases until termination has unblocked the pipe writer too.
             let _ = writer.join();
+            // Closing alone leaves the lock held by an unrelated fork's inherited descriptor.
+            let result = _lease
+                .unlock()
+                .map_err(|_| "host_process_state_failed".to_owned())
+                .and(result);
             drop(_lease);
             let _ = exit_sender.send(result);
         });
@@ -1308,7 +1322,13 @@ impl HostProcess {
         if let Err(error) = result {
             self.input.take();
             self.owner.terminate();
-            let _ = self.exited.recv_timeout(Duration::from_secs(10));
+            // A killed startup normally reports host_process_exited; only cleanup failure takes priority.
+            let error = match self.exited.recv_timeout(Duration::from_secs(10)) {
+                Ok(Err(cleanup_error)) if cleanup_error == "host_process_state_failed" => {
+                    cleanup_error
+                }
+                _ => error,
+            };
             self.stopped = Some(Err(error.clone()));
             return Err(error);
         }
@@ -1511,6 +1531,72 @@ mod checkpoint_tests {
             "attemptId":"33333333-3333-4333-8333-333333333333","profileIdentity":"1:2","targetIdentity":"1:3","databaseIdentity":"1:4",
             "validation":{"postgresMajor":19,"vectorVersion":"0.8.7","canonical":true,"executionStateReconstructed":true}})
     }
+    #[test]
+    fn readiness_timeout_preserves_cleanup_failure_but_not_the_expected_killed_exit() {
+        for (monitor, expected) in [
+            (
+                Some(Err("host_process_state_failed".to_owned())),
+                "host_process_state_failed",
+            ),
+            (
+                Some(Err("host_process_exited".to_owned())),
+                "host_readiness_timeout",
+            ),
+            (Some(Ok(())), "host_readiness_timeout"),
+            (None, "host_readiness_timeout"),
+        ] {
+            let profile = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-cleanup-error-{}", uuid::Uuid::new_v4()));
+            crate::runtime_store::private_directory(&profile).unwrap();
+            let mut command = std::process::Command::new("node");
+            command
+                .args(["--eval", "process.stdin.resume()"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::process_tree::configure(&mut command);
+            let mut child = command.spawn().unwrap();
+            let owner = Arc::new(HostOwner {
+                tree: crate::process_tree::ProcessTree::attach(&child).unwrap(),
+                terminated: Mutex::new(false),
+                _code_lease: crate::package_lease::CodeLease::acquire(&profile).unwrap(),
+            });
+            let (_, ready) = mpsc::channel();
+            let (exit_sender, exited) = mpsc::channel();
+            if let Some(result) = monitor {
+                exit_sender.send(result).unwrap();
+            }
+            drop(exit_sender);
+            let (_, checkpoints) = mpsc::sync_channel(1);
+            let mut process = HostProcess {
+                owner,
+                pid: child.id(),
+                input: None,
+                pending_input: None,
+                ready,
+                exited,
+                stopped: None,
+                protocol: Arc::new(CheckpointProtocol::new("a".repeat(64), "b".repeat(40))),
+                checkpoints,
+                checkpoint_started: None,
+                ready_seen: false,
+                profile: profile.clone(),
+                controller_generation: None,
+                verified_restore: None,
+                mode: HostMode::Database,
+            };
+            let actual = process.wait_ready(Duration::ZERO);
+            child.wait().unwrap();
+            let stopped = process.stopped.clone();
+            drop(process);
+            std::fs::remove_dir_all(profile).unwrap();
+            assert_eq!(stopped, Some(Err(expected.to_owned())));
+            assert_eq!(actual, Err(expected.to_owned()));
+        }
+    }
+
     #[test]
     fn verified_restore_authority_is_bound_to_the_native_physical_target_and_generation() {
         let profile = std::env::temp_dir()

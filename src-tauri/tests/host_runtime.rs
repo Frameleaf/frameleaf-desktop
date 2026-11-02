@@ -141,6 +141,29 @@ fn nonreading_bootstrap_does_not_block_startup_cancellation_or_timeout() {
             )
             .expect("startup must return before the child reads its pipe");
         assert!(start.elapsed() < Duration::from_secs(2));
+        // An unrelated fork can retain CLOEXEC descriptors until it next executes a program.
+        struct InheritedDescriptors(libc::pid_t);
+        impl Drop for InheritedDescriptors {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    while libc::waitpid(self.0, std::ptr::null_mut(), 0) == -1
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                    }
+                }
+            }
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            loop {
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+        let _inherited = InheritedDescriptors(pid);
         if cancel {
             assert_eq!(
                 process.wait_ready_or_cancel(
