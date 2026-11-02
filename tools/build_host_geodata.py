@@ -102,13 +102,17 @@ def build(source: Path, revision: str, output: Path) -> None:
         report['qualification'] = 'passed'
     finally:
         try:
-            if work.exists():
-                shutil.rmtree(work)
-            if report['qualification'] != 'passed' and data.exists():
-                shutil.rmtree(data)
-        except OSError:
-            report['qualification'] = 'failed'
-            raise
+            try:
+                if work.exists():
+                    shutil.rmtree(work)
+            except OSError:
+                report['qualification'] = 'failed'
+                raise
+            finally:
+                if report['qualification'] != 'passed':
+                    report.pop('files', None)
+                    if data.exists():
+                        shutil.rmtree(data)
         finally:
             (output / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
 

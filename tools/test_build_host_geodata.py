@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import ssl
 from http.client import IncompleteRead
 import subprocess
@@ -188,3 +189,21 @@ class HostGeodataTests(unittest.TestCase):
                  self.assertRaises(PermissionError):
                 build(source, revision, output)
             self.assertEqual(json.loads((output / 'qualification.json').read_text())['qualification'], 'failed')
+
+    def test_work_cleanup_failure_still_removes_payload_and_inventory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            source, revision, _, content = self.fixture(root)
+            remove = shutil.rmtree
+            def cleanup(path):
+                if path.name == 'work':
+                    raise OSError('work cleanup denied')
+                remove(path)
+            with patch('build_host_geodata.download', side_effect=lambda url, path, digest:
+                       path.write_bytes(content[url.rsplit('/', 1)[1]])), \
+                    patch('build_host_geodata.shutil.rmtree', side_effect=cleanup), self.assertRaises(OSError):
+                build(source, revision, root / 'output')
+            report = json.loads((root / 'output/qualification.json').read_text())
+            self.assertEqual(report['qualification'], 'failed')
+            self.assertNotIn('files', report)
+            self.assertFalse((root / 'output/geodata').exists())
