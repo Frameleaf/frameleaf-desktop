@@ -110,6 +110,64 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn nonreading_bootstrap_does_not_block_startup_cancellation_or_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let mut fixture = Fixture::new();
+    // The finite child bounds the regression even before startup delivery is fixed.
+    let source = b"#!/bin/sh\nexec /bin/sleep 3\n";
+    fs::write(fixture.0.join("node"), source).unwrap();
+    fs::set_permissions(fixture.0.join("node"), fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.1["files"]["node"] =
+        json!({"bytes":source.len(),"sha256":format!("{:x}",Sha256::digest(source))});
+    let verified = fixture.verify().unwrap();
+    for cancel in [true, false] {
+        let state = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-no-read-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let _cleanup = Fixture(state.clone(), json!(null), state.clone());
+        let start = Instant::now();
+        let mut process = verified
+            .start(
+                &state,
+                &zeroize::Zeroizing::new("synthetic-host-password-long-enough".to_string()),
+                23451,
+                23452,
+            )
+            .expect("startup must return before the child reads its pipe");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        if cancel {
+            assert_eq!(
+                process.wait_ready_or_cancel(
+                    Duration::from_secs(1),
+                    &std::sync::atomic::AtomicBool::new(true)
+                ),
+                Ok(false)
+            );
+        } else {
+            assert_eq!(
+                process.wait_ready(Duration::from_millis(50)).unwrap_err(),
+                "host_readiness_timeout"
+            );
+        }
+        assert_ne!(process.is_running(), Ok(true));
+        drop(process);
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state.join("lease.lock"))
+            .unwrap();
+        lease
+            .try_lock()
+            .expect("the owned child must be gone before the profile lease is released");
+    }
+}
+
 #[test]
 fn overlapping_host_state_is_rejected_before_any_directory_is_created() {
     let fixture = Fixture::new();
@@ -190,8 +248,11 @@ fn owned_checkpoint_transport_matches_receipts_and_cancels_without_a_second_chan
         let mut fixture = Fixture::new();
         let script = r##"#!/bin/sh
 exec /usr/bin/python3 -c '
-import sys,json
+import sys,json,base64
 mode="RESPONSE_MODE"
+if "--eval" not in sys.argv or max(map(len,sys.argv))>8000: raise RuntimeError("host_agent_argv_exceeds_budget")
+source=base64.b64decode(sys.stdin.readline().rstrip("\n"),validate=True)
+if len(source)<32768: raise RuntimeError("host_agent_source_missing")
 c=json.loads(sys.stdin.readline())
 print(json.dumps({"state":"running"}),flush=True)
 pending=None
@@ -207,7 +268,7 @@ for line in sys.stdin:
  operation="22222222-2222-4222-8222-222222222222" if mode=="wrong-operation" else pending
  print(json.dumps({"state":"checkpoint","schemaVersion":1,"operationId":operation,"manifestSha256":c["manifestSha256"],"sourceRevision":c["sourceRevision"],"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"c"*64}}),flush=True)
  pending=None
-'
+' "$@"
 "##.replace("RESPONSE_MODE", mode);
         fs::write(fixture.0.join("node"), script.as_bytes()).unwrap();
         fs::set_permissions(fixture.0.join("node"), fs::Permissions::from_mode(0o700)).unwrap();

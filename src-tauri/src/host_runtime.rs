@@ -239,6 +239,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const AGENT: &str = include_str!("../../runtime/host-agent.mjs");
+const AGENT_BOOTSTRAP: &str = include_str!("../../runtime/host-bootstrap.mjs");
 
 pub(crate) fn checkpoint_operation_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| {
@@ -996,6 +997,7 @@ pub struct HostProcess {
     owner: Arc<HostOwner>,
     pid: u32,
     input: Option<ChildStdin>,
+    pending_input: Option<Receiver<Result<ChildStdin, String>>>,
     ready: Receiver<Result<(), String>>,
     exited: Receiver<Result<(), String>>,
     stopped: Option<Result<(), String>>,
@@ -1048,6 +1050,11 @@ impl VerifiedHostRuntime {
             .map_err(|_| "host_state_overlaps_runtime")?;
         #[cfg(windows)]
         let state = stable_state.as_path();
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let agent_source = STANDARD.encode(AGENT);
+        if agent_source.len() > 262144 {
+            return Err("host_agent_source_invalid".into());
+        }
         let (database_reference, controller_generation) = if let Some(owner) = owner.as_mut() {
             let (profile, reference, generation) =
                 owner.launch_state(&self.manifest_sha256, mode)?;
@@ -1121,7 +1128,7 @@ impl VerifiedHostRuntime {
         }
         let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
         command
-            .args(["--input-type=module", "--eval", AGENT])
+            .args(["--input-type=module", "--eval", AGENT_BOOTSTRAP])
             .env_clear()
             .env("FRAMELEAF_HOST_AGENT", "1")
             .current_dir(state)
@@ -1153,6 +1160,21 @@ impl VerifiedHostRuntime {
             _code_lease: code_lease,
         });
         let pid = child.id();
+        let (input_sender, pending_input) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = (|| {
+                let mut input = input.ok_or("host_agent_pipe_failed")?;
+                input
+                    .write_all(agent_source.as_bytes())
+                    .and_then(|_| input.write_all(b"\n"))
+                    .and_then(|_| input.write_all(&message))
+                    .and_then(|_| input.write_all(b"\n"))
+                    .map_err(|_| "host_agent_pipe_failed")?;
+                Ok(input)
+            })()
+            .map_err(str::to_owned);
+            let _ = input_sender.send(result);
+        });
         let monitor_owner = owner.clone();
         let (exit_sender, exited) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1175,6 +1197,8 @@ impl VerifiedHostRuntime {
                 }
             };
             monitor_owner.terminate();
+            // Retain both leases until termination has unblocked the pipe writer too.
+            let _ = writer.join();
             drop(_lease);
             let _ = exit_sender.send(result);
         });
@@ -1183,10 +1207,11 @@ impl VerifiedHostRuntime {
             self.manifest.source_revision.clone(),
         ));
         let (checkpoint_sender, checkpoints) = mpsc::sync_channel(1);
-        let mut process = HostProcess {
+        let process = HostProcess {
             owner,
             pid,
-            input,
+            input: None,
+            pending_input: Some(pending_input),
             ready,
             exited,
             stopped: None,
@@ -1213,13 +1238,6 @@ impl VerifiedHostRuntime {
                 || output_owner.terminate(),
             )
         });
-        process
-            .input
-            .as_mut()
-            .ok_or("host_agent_pipe_failed")?
-            .write_all(&message)
-            .and_then(|_| process.input.as_mut().unwrap().write_all(b"\n"))
-            .map_err(|_| "host_agent_pipe_failed")?;
         Ok(process)
     }
 }
@@ -1258,6 +1276,21 @@ impl HostProcess {
             if remaining.is_zero() {
                 return Err("host_readiness_timeout".into());
             }
+            if let Some(pending) = &self.pending_input {
+                match pending.try_recv() {
+                    Ok(result) => {
+                        self.input = Some(result?);
+                        self.pending_input = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("host_agent_pipe_failed".into())
+                    }
+                }
+            }
             match self
                 .ready
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
@@ -1282,11 +1315,7 @@ impl HostProcess {
         self.pid
     }
     pub fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
-        let result = self
-            .ready
-            .recv_timeout(timeout)
-            .map_err(|_| "host_readiness_timeout".to_string())
-            .and_then(|result| result);
+        let result = self.wait_ready_or_cancel(timeout, &std::sync::atomic::AtomicBool::new(false));
         if let Err(error) = result {
             self.input.take();
             self.owner.terminate();
@@ -1294,10 +1323,6 @@ impl HostProcess {
             self.stopped = Some(Err(error.clone()));
             return Err(error);
         }
-        if !self.is_running()? {
-            return Err("host_process_exited".into());
-        }
-        self.ready_seen = true;
         Ok(())
     }
     pub fn request_checkpoint(&mut self, operation: &str) -> Result<(), String> {
@@ -1442,10 +1467,15 @@ impl HostProcess {
         if let Some(result) = &self.stopped {
             return result.clone();
         }
+        let interrupted_delivery = self.pending_input.take().is_some();
+        if interrupted_delivery {
+            self.owner.terminate();
+        }
         if let Some(mut input) = self.input.take() {
             let _ = input.write_all(b"stop\n");
         }
         let result = match self.exited.recv_timeout(Duration::from_secs(150)) {
+            Ok(Err(error)) if interrupted_delivery && error == "host_process_exited" => Ok(()),
             Ok(result) => result,
             Err(_) => {
                 self.owner.terminate();
@@ -1575,6 +1605,7 @@ mod checkpoint_tests {
             owner,
             pid: child.id(),
             input: None,
+            pending_input: None,
             ready,
             exited,
             stopped: Some(Ok(())),

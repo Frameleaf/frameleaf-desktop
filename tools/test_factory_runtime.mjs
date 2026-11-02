@@ -148,7 +148,7 @@ test("factory CLI never prints private-key parser input", async (t) => {
   });
 });
 
-test("factory accepts the existing target-scoped Linux ARM approval", async (t) => {
+test("factory accepts the published target-scoped Linux ARM source", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
   const arch = Object.getOwnPropertyDescriptor(process, "arch");
   try {
@@ -159,6 +159,7 @@ test("factory accepts the existing target-scoped Linux ARM approval", async (t) 
     );
     const sourceRevision =
       profiles.profiles["cpu-ort"].additionalSources["linux-aarch64"][0];
+    assert.equal(sourceRevision, "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8");
     const f = await fixture(t, { sourceRevision });
     const receipt = await signFactoryRuntime(
       f.root,
