@@ -1,0 +1,32 @@
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export function releaseMatrix(platforms) {
+  if (!["macos-linux", "all", "linux"].includes(platforms))
+    throw new Error("release_platforms_invalid");
+  return { include: [
+    ...(platforms !== "linux" ? [{ os: "macos-15", target: "macos-aarch64" }] : []),
+    ...(platforms === "all" ? [{ os: "windows-2022", target: "windows-x86_64" }] : []),
+    { os: "ubuntu-24.04", target: "linux-x86_64" },
+  ] };
+}
+
+export function validateReleaseTag(tag, versions) {
+  const number = "(?:0|[1-9][0-9]*)";
+  const identifier = `(?:${number}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)`;
+  if (typeof tag !== "string" || !new RegExp(`^v${number}\\.${number}\\.${number}(?:-${identifier}(?:\\.${identifier})*)?$`).test(tag) || /\s/.test(tag))
+    throw new Error("release_version_invalid");
+  if (!versions.length || versions.some((version) => `v${version}` !== tag))
+    throw new Error("release_version_mismatch");
+  return tag;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const root = new URL("../", import.meta.url);
+  const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+  const config = JSON.parse(await readFile(new URL("src-tauri/tauri.conf.json", root), "utf8"));
+  const cargo = await readFile(new URL("src-tauri/Cargo.toml", root), "utf8");
+  const version = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  console.log(validateReleaseTag(process.argv[2], [pkg.version, config.version, version]));
+}
