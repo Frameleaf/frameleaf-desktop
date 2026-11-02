@@ -1,6 +1,7 @@
 import tempfile
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -147,7 +148,7 @@ class WindowsDatabaseTests(unittest.TestCase):
             "extensions": ["cube", "earthdistance", "pg_trgm", "unaccent", "uuid-ossp", "vector"],
             "checksums": "on", "neighbor": 1,
         }
-        for failure in [None, "initdb", "facts"]:
+        for failure in [None, "initdb", "start", "start-timeout", "facts"]:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 output = Path(temporary)
                 prefix = output / "postgres"
@@ -155,6 +156,8 @@ class WindowsDatabaseTests(unittest.TestCase):
 
                 def command(arguments, *, cwd, env):
                     calls.append([str(arg) for arg in arguments])
+                    if Path(arguments[0]).name == "pg_ctl.exe" and arguments[-1] == "start":
+                        self.fail("pg_ctl start must not capture pipes inherited by the running server")
                     self.assertEqual(len(env["PGPASSWORD"]), 64)
                     if Path(arguments[0]).name == "initdb.exe":
                         self.assertTrue((output / "fixture-password").exists())
@@ -164,13 +167,36 @@ class WindowsDatabaseTests(unittest.TestCase):
                         (output / "fixture-data/PG_VERSION").write_text("19")
                     if "--file" in arguments:
                         Path(arguments[arguments.index("--file") + 1]).write_bytes(b"synthetic dump")
+                    if "-c" in arguments:
+                        self.assertTrue(arguments[-1].isascii(), "Windows psql argv must not depend on the ANSI code page")
+                        if "CREATE EXTENSION" in arguments[-1]:
+                            self.assertIn("unaccent(U&'caf\\00e9')", arguments[-1])
                     if "-c" in arguments and str(arguments[-1]).startswith("SELECT json_build_object"):
                         return json.dumps({**expected, "neighbor": 2} if failure == "facts" else expected)
                     return ""
 
-                with patch("build_host_database_windows.run", side_effect=command):
+                def start_command(arguments, *, cwd, env, stdin, stdout, stderr, timeout):
+                    calls.append([str(arg) for arg in arguments])
+                    self.assertEqual(Path(arguments[0]).name, "pg_ctl.exe")
+                    self.assertEqual(arguments[-1], "start")
+                    self.assertEqual(stdin, subprocess.DEVNULL)
+                    self.assertEqual(stderr, subprocess.STDOUT)
+                    self.assertEqual(timeout, 45)
+                    self.assertEqual(cwd, output)
+                    self.assertEqual(len(env["PGPASSWORD"]), 64)
+                    self.assertTrue(stdout.writable())
+                    self.assertNotEqual(stdout, subprocess.PIPE)
+                    stdout.write("synthetic owned startup output\n")
+                    if failure == "start-timeout":
+                        raise subprocess.TimeoutExpired(arguments, timeout)
+                    return subprocess.CompletedProcess(arguments, 1 if failure == "start" else 0)
+
+                with (
+                    patch("build_host_database_windows.run", side_effect=command),
+                    patch("build_host_database_windows.subprocess.run", side_effect=start_command),
+                ):
                     if failure:
-                        with self.assertRaisesRegex(BuildError, "synthetic_initdb_failure|host_database_fixture_mismatch"):
+                        with self.assertRaisesRegex((BuildError, subprocess.TimeoutExpired), "synthetic_initdb_failure|host_database_start_failed|host_database_fixture_mismatch|timed out"):
                             qualify(prefix, output, lock, {})
                     else:
                         result = qualify(prefix, output, lock, {})

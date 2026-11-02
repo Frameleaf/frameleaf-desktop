@@ -115,8 +115,16 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
             raise BuildError("host_database_major_mismatch")
         # Mark owned state before launch so a readiness failure is also drained.
         active = True
-        command([binary("pg_ctl"), "-D", data, "-l", output / "postgres.log", "-o",
-                 f"-h 127.0.0.1 -p {port}", "-w", "-t", "30", "start"])
+        # Windows pg_ctl's detached CMD child inherits captured pipes and prevents EOF.
+        with (output / "pg-ctl-start.log").open("w", encoding="utf-8") as log:
+            result = subprocess.run(
+                [binary("pg_ctl"), "-D", data, "-l", output / "postgres.log", "-o",
+                 f"-h 127.0.0.1 -p {port}", "-w", "-t", "30", "start"],
+                cwd=output, env=client_env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, timeout=45,
+            )
+        if result.returncode:
+            raise BuildError(f"host_database_start_failed:{result.returncode}")
 
     def stop() -> None:
         nonlocal active
@@ -143,7 +151,8 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
         finally:
             password_file.unlink(missing_ok=True)
         start()
-        sql("postgres", "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent('café');")
+        # SQL Unicode escapes avoid Windows psql's ANSI command-line conversion.
+        sql("postgres", "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent(U&'caf\\00e9');")
         result = {"fresh": facts("postgres")}
         backup = output / "fixture.dump"
         command([binary("pg_dump"), *args, "-d", "postgres", "--format=custom", "--no-owner", "--no-acl", "--file", backup])
