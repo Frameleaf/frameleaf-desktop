@@ -4,6 +4,8 @@ on:
     paths:
       - 'tools/build_host_database_windows.py'
       - 'tools/test_build_host_database_windows.py'
+      - 'tools/windows_private_directory.py'
+      - 'tools/test_windows_private_directory.py'
       - 'runtime/host-database.json'
       - '.github/workflows/windows-host-database.yml'
   workflow_dispatch:
