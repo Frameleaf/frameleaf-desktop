@@ -1,0 +1,72 @@
+name: Private Linux database candidate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: private-linux-database-candidate
+  cancel-in-progress: false
+env:
+  SOURCE_REVISION: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
+jobs:
+  database:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            architecture: x86_64
+          - os: ubuntu-24.04-arm
+            architecture: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ env.SOURCE_REVISION }}
+          path: server-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Check architecture and source contract
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
+          test "$(git -C server-source rev-parse HEAD)" = "$SOURCE_REVISION"
+          python -m unittest discover -s tools -p test_build_host_database.py -v
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential bison flex pkg-config libicu-dev libssl-dev uuid-dev liblz4-dev libzstd-dev libxml2-dev zlib1g-dev
+      - name: Build and qualify the native database
+        run: |
+          python tools/build_host_database.py --source "$GITHUB_WORKSPACE/server-source" --revision "$SOURCE_REVISION" --dependency-prefix /usr --output "$RUNNER_TEMP/frameleaf-linux-database"
+      - name: Record development dependency versions
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/frameleaf-linux-database" ]; then
+            dpkg-query -W build-essential bison flex pkg-config libicu-dev libssl-dev uuid-dev liblz4-dev libzstd-dev libxml2-dev zlib1g-dev > "$RUNNER_TEMP/frameleaf-linux-database/dependency-versions.txt"
+          fi
+      - name: Retain private component and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-linux-private-database-${{ matrix.architecture }}
+          path: |
+            ${{ runner.temp }}/frameleaf-linux-database/prefix/
+            ${{ runner.temp }}/frameleaf-linux-database/qualification.json
+            ${{ runner.temp }}/frameleaf-linux-database/build.log
+            ${{ runner.temp }}/frameleaf-linux-database/command-error.log
+            ${{ runner.temp }}/frameleaf-linux-database/dependency-versions.txt
+            ${{ runner.temp }}/frameleaf-linux-database/work/postgres/postgresql-19beta4/config.log
+          retention-days: 7
+          if-no-files-found: warn
