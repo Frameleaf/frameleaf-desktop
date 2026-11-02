@@ -14,6 +14,7 @@ import unittest
 
 class WindowsRawToolchainTests(unittest.TestCase):
     def test_only_the_complete_reviewed_inventory_authorizes_compilation(self):
+        """Exercise the actual workflow gate so receipt and refusal checks cannot drift from it."""
         workflow = (Path(__file__).resolve().parents[1] /
                     ".github/workflows/windows-host-raw.yml").read_text()
         gate = workflow.split(
@@ -53,6 +54,7 @@ class WindowsRawToolchainTests(unittest.TestCase):
                     })
 
     def test_archive_requires_passed_consumer_and_retains_the_toolchain_lock(self):
+        """Prevent a missing lock or failed consumer from producing a qualified archive."""
         workflow = (Path(__file__).resolve().parents[1] /
                     ".github/workflows/windows-host-raw.yml").read_text()
         archive = workflow.split(
