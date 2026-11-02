@@ -130,3 +130,21 @@ class WindowsSupportTests(unittest.TestCase):
                 support.build(source, 'a' * 40, studio, root / 'output')
             report = json.loads((root / 'output/qualification.json').read_text())
             self.assertEqual(report['qualification'], 'failed')
+
+    def test_work_cleanup_failure_still_removes_payload_and_inventory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            source, studio, pins, blob, request, calls = self.fixture(root)
+            remove = support.shutil.rmtree
+            def cleanup(path):
+                if path.name == 'work':
+                    raise OSError('work cleanup denied')
+                remove(path)
+            with patch.multiple(support, **pins), patch.object(support, 'git_blob', side_effect=blob), \
+                    patch('urllib.request.urlopen', side_effect=request), \
+                    patch.object(support.shutil, 'rmtree', side_effect=cleanup), self.assertRaises(OSError):
+                support.build(source, 'a' * 40, studio, root / 'output')
+            report = json.loads((root / 'output/qualification.json').read_text())
+            self.assertEqual(report['qualification'], 'failed')
+            self.assertNotIn('files', report)
+            self.assertFalse((root / 'output/support').exists())
