@@ -28,6 +28,10 @@
   let pending = $state<Intent | null>(null);
   let operation = $state<Operation | null>(null);
   let origin = $state('');
+  const http = $derived.by(() => {
+    try { return new URL(origin.trim()).protocol === 'http:'; }
+    catch { return false; }
+  });
   let password = $state('');
   let pem = $state('');
   let fingerprint = $state('');
@@ -126,8 +130,8 @@
     event.preventDefault();
     const secret = password; password = '';
     await perform(async () => {
-      if (pem.trim() && (!certificateApproved || !fingerprint || pem !== fingerprintPem)) throw Error('manager_certificate_approval_required');
-      manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery });
+      if (!http && pem.trim() && (!certificateApproved || !fingerprint || pem !== fingerprintPem)) throw Error('manager_certificate_approval_required');
+      manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: !http && pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery });
       pem = ''; fingerprint = ''; fingerprintPem = ''; certificateApproved = false;
       pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager);
       await restore();
@@ -371,10 +375,11 @@
   {:else}
     <form onsubmit={pair}>
       <fieldset disabled={busy || !native}>
-        <label for="manager-origin">Manager HTTPS address</label>
-        <input id="manager-origin" type="url" bind:value={origin} placeholder="https://nas.home.example:9443" required autocomplete="url" />
+        <label for="manager-origin">Manager address</label>
+        <input id="manager-origin" type="url" bind:value={origin} placeholder="http://tower.local:2282" required autocomplete="url" />
         <label for="manager-password">Manager password</label>
         <input id="manager-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" />
+        {#if http}<p class="footnote">HTTP sends sign-in and management traffic without encryption. Use a trusted network.</p>{:else}
         <details>
           <summary>Use a certificate for a private Manager</summary>
           <p class="footnote">Use Manager’s public PEM certificate when it is not trusted by your computer. Never paste a private key.</p>
@@ -387,9 +392,10 @@
             <label class="check"><input type="checkbox" bind:checked={certificateApproved} />I verified this certificate fingerprint.</label>
           {/if}
         </details>
+        {/if}
         <label class="check"><input type="checkbox" bind:checked={allowManagement} required />Allow this computer to start, stop and restart this server, and create database backups.</label>
         <label class="check"><input type="checkbox" bind:checked={allowRecovery} />Also allow backup recovery reviews and restore operations.</label>
-        <button class="primary" disabled={!allowManagement || (!!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
+        <button class="primary" disabled={!allowManagement || (!http && !!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
         <p class="footnote">Your Manager password is used for this sign-in and is not saved. The separate management grant stays in your computer’s secure credential store.</p>
       </fieldset>
     </form>

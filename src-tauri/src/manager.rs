@@ -1,4 +1,4 @@
-use crate::connection::{normalize_server, DeviceIdentity};
+use crate::connection::DeviceIdentity;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{Client, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -177,7 +177,7 @@ struct Login {
 }
 #[derive(ZeroizeOnDrop)]
 struct Session {
-    cookie: String,
+    credential: String,
     csrf: String,
 }
 fn hex(value: &str, length: usize) -> bool {
@@ -197,8 +197,25 @@ pub(crate) fn clock() -> Result<u64, String> {
         .filter(|value| *value <= 9_007_199_254_740_991)
         .ok_or_else(|| "clock_invalid".into())
 }
+pub fn normalize_manager(value: &str) -> Result<url::Url, String> {
+    if value.contains('\\') {
+        return Err("manager_origin_invalid".into());
+    }
+    let url = url::Url::parse(value.trim()).map_err(|_| "manager_origin_invalid")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err("manager_origin_invalid".into());
+    }
+    Ok(url)
+}
 fn canonical_origin(value: &str) -> Result<String, String> {
-    let url = normalize_server(value)?;
+    let url = normalize_manager(value)?;
     let origin = url.origin().ascii_serialization();
     if value != origin {
         return Err("manager_origin_invalid".into());
@@ -230,7 +247,14 @@ fn certificate_der(pem: &str) -> Result<Vec<u8>, String> {
 pub fn certificate_fingerprint(pem: &str) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(certificate_der(pem)?)))
 }
-pub fn manager_client(pem: Option<&str>, approved: Option<&str>) -> Result<Client, String> {
+pub fn manager_client(
+    origin: &str,
+    pem: Option<&str>,
+    approved: Option<&str>,
+) -> Result<Client, String> {
+    if normalize_manager(origin)?.scheme() == "http" && (pem.is_some() || approved.is_some()) {
+        return Err("manager_http_certificate_invalid".into());
+    }
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
@@ -311,23 +335,36 @@ async fn login(client: &Client, origin: &str, password: &str) -> Result<Session,
         .send()
         .await
         .map_err(|_| "manager_unreachable_or_certificate_invalid")?;
-    session_response(response).await
+    session_response(response, origin).await
 }
-async fn session_response(response: Response) -> Result<Session, String> {
-    let cookies: Vec<_> = response
+async fn session_response(response: Response, origin: &str) -> Result<Session, String> {
+    let http = normalize_manager(origin)?.scheme() == "http";
+    let prefix = if http {
+        ""
+    } else {
+        "__Host-frameleaf-manager="
+    };
+    let credentials: Vec<_> = response
         .headers()
-        .get_all(reqwest::header::SET_COOKIE)
+        .get_all(if http {
+            "x-frameleaf-manager-session"
+        } else {
+            "set-cookie"
+        })
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .filter_map(|value| value.split(';').next())
-        .filter(|value| value.starts_with("__Host-frameleaf-manager="))
+        .filter_map(|value| {
+            if http {
+                Some(value)
+            } else {
+                value.split(';').next()
+            }
+        })
+        .filter(|value| value.starts_with(prefix))
         .collect();
-    let cookie = if cookies.len() == 1
-        && hex(
-            cookies[0].trim_start_matches("__Host-frameleaf-manager="),
-            64,
-        ) {
-        Some(cookies[0].to_string())
+    let credential = if credentials.len() == 1 && hex(credentials[0].trim_start_matches(prefix), 64)
+    {
+        Some(credentials[0].to_string())
     } else {
         None
     };
@@ -336,7 +373,7 @@ async fn session_response(response: Response) -> Result<Session, String> {
         return Err("manager_response_invalid".into());
     }
     Ok(Session {
-        cookie: cookie.ok_or("manager_response_invalid")?,
+        credential: credential.ok_or("manager_response_invalid")?,
         csrf: value.csrf.clone(),
     })
 }
@@ -364,7 +401,7 @@ pub(crate) async fn claim_local(
         .send()
         .await
         .map_err(|_| "manager_claim_interrupted")?;
-    let session = session_response(response).await?;
+    let session = session_response(response, origin).await?;
     let _ = browser::<Value>(client, origin, &session, "logout", json!({})).await;
     Ok(())
 }
@@ -379,7 +416,14 @@ async fn browser<T: DeserializeOwned>(
         client
             .post(format!("{origin}/manager-api/{path}"))
             .header("origin", origin)
-            .header("cookie", &session.cookie)
+            .header(
+                if origin.starts_with("http://") {
+                    "x-frameleaf-manager-session"
+                } else {
+                    "cookie"
+                },
+                &session.credential,
+            )
             .header("x-csrf-token", &session.csrf)
             .json(&body)
             .send()
@@ -441,6 +485,7 @@ pub async fn pair(
         return Err("manager_login_details_invalid".into());
     }
     let client = manager_client(
+        origin,
         certificate.as_ref().map(|value| value.pem.as_str()),
         certificate.as_ref().map(|value| value.sha256.as_str()),
     )?;
@@ -604,7 +649,11 @@ fn saved_client(saved: &SavedManager) -> Result<Client, String> {
         .as_deref()
         .map(certificate_fingerprint)
         .transpose()?;
-    manager_client(saved.certificate_pem.as_deref(), fingerprint.as_deref())
+    manager_client(
+        &saved.origin,
+        saved.certificate_pem.as_deref(),
+        fingerprint.as_deref(),
+    )
 }
 pub async fn send(
     saved: &SavedManager,

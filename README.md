@@ -852,4 +852,9 @@ Windows kernel-volume storage separation stops physical-identity ancestry checks
 
 Windows profile credential bindings use normalized volume-GUID names captured from opened handles, alongside physical state/data identities. These names are metadata only; physical kernel paths remain execution authority. An existing reservation without its matching credential requires recovery. Unix bindings are unchanged. Reboot, keystore and installed-server acceptance remain unverified.
 
+Manager pairing accepts explicit HTTP or HTTPS origins. HTTP home-lab management
+is unencrypted; use a trusted network. HTTPS continues to validate certificates,
+and private certificate approval applies only to HTTPS. The separate Library Server
+connection and desktop-owned native Manager retain their existing transport rules.
+
 Windows machine layout discovery resolves the OS-owned Program Files x64 folder, verifies its physical protected path, and uses the Windows controller filename. The lookup initializes COM on the calling thread and balances only its own initialization reference. This is read-only layout support; Windows installation and full-host startup remain gated.
