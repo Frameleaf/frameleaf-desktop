@@ -123,7 +123,7 @@ fn open(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 /// Hold protected ancestry during admission; inspect existing descendants without changing ACLs.
-pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
+fn directory(path: &Path, create_new: bool) -> Result<(), String> {
     crate::native_runtime::absolute_directory(path.parent().ok_or(ERROR)?)?;
     let user = current_user()?;
     let private_trusted = vec![
@@ -161,7 +161,11 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
             {
                 return Err(ERROR.into());
             }
+            if create_new {
+                return Ok(());
+            }
         }
+        Ok(_) if create_new => return Err("runtime_store_directory_exists".into()),
         Ok(_) => {}
         Err(_) => return Err(ERROR.into()),
     }
@@ -194,6 +198,16 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Admission may reuse an existing private directory; it never repairs permissions.
+pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
+    directory(path, false)
+}
+
+/// Return ownership only for a newly created protected directory, never an existing stage.
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
+    directory(path, true)
 }
 
 #[cfg(test)]

@@ -481,16 +481,7 @@ impl CopyApproval {
         }
         let id = stage_id.to_string();
         let path = destination.join(&id);
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let mut builder = builder;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&path)
+        crate::runtime_store::create_private_directory(&path)
             .map_err(|_| "source_stage_unavailable")?;
         let mut cleanup = Partial(Some(path.clone()));
         crate::runtime_store::private_directory(&path)?;

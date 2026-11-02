@@ -120,6 +120,28 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
         Ok(())
     }
 }
+/// Exclusively create private staging; callers retain cleanup ownership and admit it before use.
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        crate::windows_protection::create_private_directory(path)
+    }
+    #[cfg(not(windows))]
+    {
+        absolute_directory(path.parent().ok_or("runtime_store_path_invalid")?)?;
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(path)
+            .map_err(|_| "runtime_store_directory_failed".into())
+    }
+}
 impl RuntimeStore {
     /// App-owned trust keys and minimum epoch must never come from a server response or runtime pack.
     pub fn new(root: &Path, keys: Vec<VerifyingKey>, minimum_epoch: u64) -> Result<Self, String> {
@@ -387,5 +409,26 @@ impl InstalledRuntime {
     ) -> Result<QualifiedRuntime, String> {
         self.runtime
             .qualify(cache, private_root, spec, fixture, cancel)
+    }
+}
+
+#[cfg(test)]
+mod private_directory_tests {
+    use super::*;
+
+    #[test]
+    fn private_staging_creation_is_exclusive_and_preserves_existing_contents() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-private-create-{}", uuid::Uuid::new_v4()));
+        assert!(!root.exists());
+        let _cleanup = Staging(root.clone());
+        create_private_directory(&root).unwrap();
+        private_directory(&root).unwrap();
+        let file = root.join("existing");
+        fs::write(&file, b"retain owned bytes").unwrap();
+        assert!(create_private_directory(&root).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"retain owned bytes");
+        private_directory(&root).unwrap();
     }
 }

@@ -791,11 +791,22 @@ mod tests {
             profile.validate().unwrap();
             let cache = root.join(format!("source-{index}"));
             let model = cache.join(family).join(name);
+            for path in [&cache, &cache.join(family), &model] {
+                crate::runtime_store::private_directory(path).unwrap();
+            }
             for role in ["detection", "recognition"] {
-                std::fs::create_dir_all(model.join(role)).unwrap();
+                crate::runtime_store::private_directory(&model.join(role)).unwrap();
                 std::fs::write(model.join(role).join("model.onnx"), &bytes).unwrap();
             }
-            std::fs::create_dir_all(model.join(&reference).parent().unwrap()).unwrap();
+            let mut parent = model.clone();
+            for part in std::path::Path::new(&reference)
+                .parent()
+                .unwrap()
+                .components()
+            {
+                parent.push(part);
+                crate::runtime_store::private_directory(&parent).unwrap();
+            }
             std::fs::write(model.join(&reference), revision).unwrap();
             std::fs::write(
                 model.join(".frameleaf-staged.json"),
