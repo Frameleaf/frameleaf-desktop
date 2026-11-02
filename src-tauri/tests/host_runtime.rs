@@ -155,8 +155,11 @@ fn owned_checkpoint_transport_matches_receipts_and_cancels_without_a_second_chan
         let mut fixture = Fixture::new();
         let script = r##"#!/bin/sh
 exec /usr/bin/python3 -c '
-import sys,json
+import sys,json,base64
 mode="RESPONSE_MODE"
+if "--eval" not in sys.argv or max(map(len,sys.argv))>8000: raise RuntimeError("host_agent_argv_exceeds_budget")
+source=base64.b64decode(sys.stdin.readline().rstrip("\n"),validate=True)
+if len(source)<32768: raise RuntimeError("host_agent_source_missing")
 c=json.loads(sys.stdin.readline())
 print(json.dumps({"state":"running"}),flush=True)
 pending=None
@@ -172,7 +175,7 @@ for line in sys.stdin:
  operation="22222222-2222-4222-8222-222222222222" if mode=="wrong-operation" else pending
  print(json.dumps({"state":"checkpoint","schemaVersion":1,"operationId":operation,"manifestSha256":c["manifestSha256"],"sourceRevision":c["sourceRevision"],"postgresMajor":"19","databaseFormat":"frameleaf-canonical","dump":{"bytes":27,"sha256":"c"*64}}),flush=True)
  pending=None
-'
+' "$@"
 "##.replace("RESPONSE_MODE", mode);
         fs::write(fixture.0.join("node"), script.as_bytes()).unwrap();
         fs::set_permissions(fixture.0.join("node"), fs::Permissions::from_mode(0o700)).unwrap();

@@ -234,6 +234,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const AGENT: &str = include_str!("../../runtime/host-agent.mjs");
+const AGENT_BOOTSTRAP: &str = include_str!("../../runtime/host-bootstrap.mjs");
 
 pub(crate) fn checkpoint_operation_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| {
@@ -1037,6 +1038,11 @@ impl VerifiedHostRuntime {
         mode: HostMode,
         mut owner: Option<&mut crate::host_state::Owner>,
     ) -> Result<HostProcess, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let agent_source = STANDARD.encode(AGENT);
+        if agent_source.len() > 262144 {
+            return Err("host_agent_source_invalid".into());
+        }
         let (database_reference, controller_generation) = if let Some(owner) = owner.as_mut() {
             let (profile, reference, generation) =
                 owner.launch_state(&self.manifest_sha256, mode)?;
@@ -1110,7 +1116,7 @@ impl VerifiedHostRuntime {
         }
         let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
         command
-            .args(["--input-type=module", "--eval", AGENT])
+            .args(["--input-type=module", "--eval", AGENT_BOOTSTRAP])
             .env_clear()
             .env("FRAMELEAF_HOST_AGENT", "1")
             .current_dir(state)
@@ -1206,7 +1212,9 @@ impl VerifiedHostRuntime {
             .input
             .as_mut()
             .ok_or("host_agent_pipe_failed")?
-            .write_all(&message)
+            .write_all(agent_source.as_bytes())
+            .and_then(|_| process.input.as_mut().unwrap().write_all(b"\n"))
+            .and_then(|_| process.input.as_mut().unwrap().write_all(&message))
             .and_then(|_| process.input.as_mut().unwrap().write_all(b"\n"))
             .map_err(|_| "host_agent_pipe_failed")?;
         Ok(process)
