@@ -18,8 +18,8 @@ use windows_sys::Win32::{
         GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     },
     Storage::FileSystem::{
-        CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, READ_CONTROL,
+        CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL,
     },
     System::Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
 };
@@ -110,12 +110,14 @@ fn descriptor(user: &[u8]) -> Result<Local, String> {
     }
     Ok(value)
 }
-/// Refuse reparses and withhold delete sharing while an admitted object is inspected.
+/// Data/list access makes the no-delete share lock effective; metadata-only opens do not pin names.
 fn open(path: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
         .share_mode(3)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+        )
         .open(path)
         .map_err(|_| ERROR)?;
     let info = file.metadata().map_err(|_| ERROR)?;
@@ -258,8 +260,10 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+type ScanHook = Box<dyn FnMut(&Path)>;
+#[cfg(test)]
 thread_local! {
-    static BEFORE_SCAN: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_SCAN: std::cell::RefCell<Option<ScanHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -278,6 +282,37 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn directory_pin_enforces_delete_sharing_unlike_a_metadata_only_handle() {
+        let root = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-share-pin-{}", uuid::Uuid::new_v4())),
+        );
+        private_directory(&root.0).unwrap();
+        let parked = root.0.with_extension("parked");
+        let _parked_cleanup = Fixture(parked.clone());
+        let metadata_only = OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .share_mode(3)
+            .custom_flags(
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | FILE_FLAG_OPEN_REPARSE_POINT
+                    | FILE_FLAG_OPEN_NO_RECALL,
+            )
+            .open(&root.0)
+            .unwrap();
+        fs::rename(&root.0, &parked)
+            .expect("negative control: metadata-only handles do not pin the directory name");
+        fs::rename(&parked, &root.0).unwrap();
+        drop(metadata_only);
+        let pin = open(&root.0).unwrap();
+        assert!(
+            fs::rename(&root.0, &parked).is_err(),
+            "the admission handle must prevent replacement"
+        );
+        drop(pin);
+        fs::rename(&root.0, &parked).expect("the pin must release delete sharing after admission");
+    }
+
     #[test]
     fn checked_descendant_cannot_be_replaced_before_enumeration() {
         use std::{cell::Cell, rc::Rc};
