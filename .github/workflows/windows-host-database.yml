@@ -160,6 +160,7 @@ jobs:
           with (Path(os.environ['RUNNER_TEMP']) / 'frameleaf-database-replay.zip').open('xb') as stream:
               subprocess.run(['gh', 'api', endpoint + '/zip'], stdout=stream, check=True)
       - name: Replay isolated loader and database qualification with no build credentials
+        id: replay
         env:
           COMPONENT_ARCHIVE_SHA256: ${{ inputs.artifact_sha256 }}
         shell: pwsh
@@ -188,6 +189,41 @@ jobs:
           $actual.Sddl | Set-Content -LiteralPath (Join-Path $probe 'root-acl.txt')
           python tools/replay_host_database_windows.py --archive "$env:RUNNER_TEMP/frameleaf-database-replay.zip" --output "$probe/candidate" --sha256 "$env:COMPONENT_ARCHIVE_SHA256" --source-revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
           if ($LASTEXITCODE) { throw 'Retained database qualification failed; inspect loader receipt' }
+      - name: Trace the failing restricted-token loader with the installed Microsoft debugger
+        if: failure() && steps.replay.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $root = $env:FRAMELEAF_DATABASE_REPLAY_PROBE
+          if (!$root -or !(Test-Path -LiteralPath "$root/candidate/loader-report.json")) { throw 'No admitted replay fixture' }
+          $cdb = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Debuggers/x64/cdb.exe'
+          if (!(Test-Path -LiteralPath $cdb)) {
+            'Installed Microsoft debugger unavailable' | Set-Content -LiteralPath "$root/debugger-status.txt"
+            exit 0
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $cdb
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') { throw 'Debugger signature is not trusted Microsoft code' }
+          $registry = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\initdb.exe'
+          $existed = Test-Path -LiteralPath $registry
+          $hadFlag = $false
+          if ($existed) {
+            $key = Get-Item -LiteralPath $registry
+            $hadFlag = $key.GetValueNames() -contains 'GlobalFlag'
+            if ($hadFlag) { $old = $key.GetValue('GlobalFlag'); $kind = $key.GetValueKind('GlobalFlag') }
+          }
+          try {
+            New-Item -Path $registry -Force | Out-Null
+            New-ItemProperty -LiteralPath $registry -Name GlobalFlag -PropertyType DWord -Value 2 -Force | Out-Null
+            $binary = "$root/candidate/postgres/bin/initdb.exe"
+            $log = "$root/loader-snaps.txt"
+            $arguments = @('-o', '-g', '-G', '-logo', ('"' + $log + '"'), '-c', '"sxd 0xc0000135; g"', ('"' + $binary + '"'), '-D', ('"' + "$root/debug-data" + '"'), '--username=frameleaf', '--encoding=UTF8', '--locale=C', '--auth-local=reject', '--auth-host=reject')
+            $debug = Start-Process -FilePath $cdb -ArgumentList $arguments -NoNewWindow -PassThru
+            if (!$debug.WaitForExit(60000)) { $debug.Kill($true); $debug.WaitForExit(); 'timed-out' | Set-Content "$root/debugger-status.txt" }
+            else { "exit=$($debug.ExitCode)" | Set-Content "$root/debugger-status.txt" }
+          } finally {
+            if ($hadFlag) { New-ItemProperty -LiteralPath $registry -Name GlobalFlag -PropertyType $kind -Value $old -Force | Out-Null }
+            else { Remove-ItemProperty -LiteralPath $registry -Name GlobalFlag -ErrorAction SilentlyContinue }
+            if (!$existed -and (Get-Item -LiteralPath $registry).Property.Count -eq 0) { Remove-Item -LiteralPath $registry }
+          }
       - name: Retain bounded private replay diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -195,6 +231,8 @@ jobs:
           name: frameleaf-windows-database-replay
           path: |
             ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/root-acl.txt
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/debugger-status.txt
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/loader-snaps.txt
             ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/loader-report.json
             ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/command-error.log
             ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/postgres.log
