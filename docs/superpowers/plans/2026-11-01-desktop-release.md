@@ -26,7 +26,7 @@ signing credentials, and partial target failure must all prevent release staging
 - [x] Document credential/artifact prerequisites, platform limits and manual dispatch.
 - [x] Reproduce Windows CRLF failures and enforce LF while retaining binary fixture exceptions.
 - [x] Run workflow lint, Node checks and relevant tests; obtain independent review.
-- [ ] Open a ready-for-review PR with FD-2 in its title and report live CI separately from signing readiness.
+- [x] Open a ready-for-review PR with FD-2 in its title and report live CI separately from signing readiness.
 
 Developer ID Application certificate JZTDNMWT8T is issued, backed up in Infisical
 and provisioned to the main-only GitHub environment. App-specific notarization
