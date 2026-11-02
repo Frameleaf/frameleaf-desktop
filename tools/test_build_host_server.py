@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -9,10 +10,73 @@ from unittest.mock import patch
 
 import build_host_server
 from build_host_server import build, stage_server
-from build_runtime import BuildError
+from build_runtime import BuildError, build_environment, run as checked_run
 
 
 class HostServerTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_source_archive_preserves_canonical_bytes_with_windows_git_settings(self):
+        git = shutil.which("git")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture_env = build_environment(root, os.environ)
+            source = root / "source"
+            source.mkdir()
+            canonical = b'{"canonical":true}\n'
+            fixtures = {
+                "package.json": b'{"packageManager":"pnpm@12.11.2"}\n',
+                "pnpm-lock.yaml": b"fixture\n", "pnpm-workspace.yaml": b"fixture\n",
+                ".pnpmfile.cjs": b"fixture\n", "LICENSE": b"fixture\n",
+                "packages/sdk/fixture": b"fixture", "packages/plugin-sdk/fixture": b"fixture",
+                "packages/sql-tools/fixture": b"fixture", "packages/patches/fixture": b"fixture",
+                "server/src/schema/catalog/fixture.json": canonical,
+                "studio/runtime/fixture": b"fixture", "studio/tools/fixture": b"fixture",
+                "docker/scripts/verify-server-package.mjs": b"fixture",
+            }
+            for name, data in fixtures.items():
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            for arguments in [
+                ["init", "-q"], ["add", "."],
+                ["-c", "user.name=Frameleaf fixture", "-c", "user.email=fixture@invalid",
+                 "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + str(root / "no-hooks"),
+                 "commit", "-q", "-m", "fixture"],
+                ["config", "core.autocrlf", "true"], ["config", "core.eol", "crlf"],
+            ]:
+                subprocess.run([git, *arguments], cwd=source, env=fixture_env, check=True, capture_output=True)
+            revision = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=source, env=fixture_env, text=True).strip()
+            node = root / "node"
+            node.write_bytes(b"fixture")
+            output = root / "output"
+
+            def command(arguments, *, cwd, env):
+                if arguments[0] == node:
+                    return "v26.11.1"
+                if "archive" in arguments:
+                    return checked_run(arguments, cwd=cwd, env=env)
+                self.assertEqual(
+                    (output / "work/source/server/src/schema/catalog/fixture.json").read_bytes(), canonical
+                )
+                raise BuildError("canonical_archive_checked_before_build")
+
+            with (
+                patch("build_host_server.shutil.which", side_effect=lambda name: git if name == "git" else str(root / "pnpm")),
+                patch("build_host_server.run", side_effect=command),
+                self.assertRaisesRegex(BuildError, "canonical_archive_checked_before_build"),
+            ):
+                build(source, revision, node, output)
+
+    def test_source_archive_fixture_ignores_inherited_git_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            decoy = Path(temporary).resolve()
+            sentinel = decoy / "sentinel"
+            sentinel.write_bytes(b"unrelated repository")
+            with patch.dict(os.environ, {"GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy)}):
+                self.test_source_archive_preserves_canonical_bytes_with_windows_git_settings()
+            self.assertFalse((decoy / ".git").exists())
+            self.assertEqual(sentinel.read_bytes(), b"unrelated repository")
+
     def test_runtime_metadata_keeps_versions_without_build_machine_paths(self):
         for origin, version in [("file:///developer/private-build", "0.0.0"), ("file:///C:/Users/builder/private-build", "1.2.3-beta.1"), ("file:///developer/private-build", "1.2.3-alpha-beta.1+build.001")]:
             with self.subTest(origin=origin, version=version), tempfile.TemporaryDirectory() as temporary:
