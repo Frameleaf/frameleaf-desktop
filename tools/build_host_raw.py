@@ -26,7 +26,7 @@ from build_runtime import (
 )
 from relocate_linux import closure as elf_closure
 from relocate_macos import closure, load_commands
-from relocate_windows import closure as pe_closure
+from relocate_windows import closure as pe_closure, inspect_pe
 
 
 def raw_contract(pin: dict, patches: dict[str, bytes], libraw: dict) -> dict:
@@ -136,10 +136,13 @@ def use_pinned_windows_lensfun_database(macro: Path, prefix: Path) -> dict:
 
 
 def stage_raw(
-    prefix: Path, work: Path, output: Path, command, dependencies: Path
+    prefix: Path, work: Path, output: Path, command, dependencies: Path,
+    *, environment: dict[str, str] | None = None,
 ) -> dict:
     linux = platform.system() == "Linux"
     windows = platform.system() == "Windows"
+    if windows and environment is None:
+        raise BuildError("host_raw_inspector_environment_required")
     extension = ".exe" if windows else ""
     entries = {}
     for path in prefix.rglob("*"):
@@ -185,7 +188,7 @@ def stage_raw(
     staged = output / "raw"
     if windows:
         native = pe_closure(entries, [prefix / "bin", prefix / "lib", dependencies / "bin"], staged,
-                            lambda path: command([dependencies / "bin/objdump.exe", "-p", path]))
+                            lambda path: inspect_pe(dependencies / "bin/objdump.exe", path, cwd=work, env=environment))
         stage_server(dependencies / "share/licenses", staged / "licenses-toolchain")
     elif linux:
         directories = [
@@ -524,7 +527,7 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
                 raise BuildError("host_raw_libraw_linkage_not_pinned")
             command([cmake, "--build", work / "darktable-build", "--parallel", "1"])
             command([cmake, "--install", work / "darktable-build"])
-            report.update(stage_raw(prefix, work, output, command, dependencies))
+            report.update(stage_raw(prefix, work, output, command, dependencies, environment=env))
             report["qualification"] = "passed"
         finally:
             (output / "qualification.json").write_text(
