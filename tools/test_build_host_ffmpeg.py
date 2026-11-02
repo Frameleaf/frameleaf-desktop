@@ -57,6 +57,7 @@ class FfmpegPackageTests(unittest.TestCase):
             [("bin/café", "file"), ("bin/cafe\u0301", "file")],
             [("bin/café", "file"), ("bin/cafe\u0301/child", "file")],
             [("bin/café/child", "file"), ("bin/cafe\u0301", "file")],
+            [("bin/\u03b1\u0345\u0301", "file"), ("bin/\u03b1\u0301\u0345", "file")],
         ]
         cases.extend([[("good", "file"), ("link", kind)] for kind in ["symlink", "hardlink", "fifo"]])
         with tempfile.TemporaryDirectory() as temporary:
@@ -120,6 +121,7 @@ class FfmpegPackageTests(unittest.TestCase):
                     ["bin/café", "bin/cafe\u0301"],
                     ["bin/café", "bin/cafe\u0301/child"],
                     ["bin/café/child", "bin/cafe\u0301"],
+                    ["bin/\u03b1\u0345\u0301", "bin/\u03b1\u0301\u0345"],
                 ]
             ):
                 archive = root / f"{index}.zip"

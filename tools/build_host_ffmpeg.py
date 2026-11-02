@@ -61,7 +61,8 @@ def unpack(archive: Path, destination: Path) -> None:
         for count, (name, directory, size) in enumerate(entries, 1):
             if any(character in name for character in '<>:"|?*'):
                 raise BuildError("host_ffmpeg_archive_entry_invalid")
-            name = unicodedata.normalize("NFC", relative(name[:-1] if name.endswith("/") else name).casefold())
+            name = relative(name[:-1] if name.endswith("/") else name)
+            name = unicodedata.normalize("NFC", unicodedata.normalize("NFD", name).casefold())
             total += size
             if count > 100_000 or size < 0 or total > 2 * 1024**3:
                 raise BuildError("host_ffmpeg_archive_limit")
