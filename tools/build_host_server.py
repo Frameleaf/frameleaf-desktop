@@ -178,13 +178,20 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             log.flush()
 
         manager = [pnpm, "--config.verify-deps-before-run=false"]
+        build_manager = manager
+        if platform.system() == "Windows":
+            # Source build scripts use POSIX assignments and parameter expansion.
+            bash = Path(git).parent.parent / "bin/bash.exe"
+            if not bash.is_file():
+                raise BuildError("host_server_script_shell_missing")
+            build_manager = [*manager, "--config.script-shell=" + str(bash)]
         try:
             for selector in ["@frameleaf/sdk", "@frameleaf/plugin-sdk", "frameleaf..."]:
                 command(
                     [*manager, "--filter", selector, "install", "--frozen-lockfile"]
                 )
                 target = "frameleaf" if selector == "frameleaf..." else selector
-                command([*manager, "--filter", target, "build"])
+                command([*build_manager, "--filter", target, "build"])
             deployed = work / "deployed"
             command(
                 [

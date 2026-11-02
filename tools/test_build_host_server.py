@@ -67,6 +67,52 @@ class HostServerTests(unittest.TestCase):
             ):
                 build(source, revision, node, output)
 
+    def test_windows_build_uses_git_bash_only_for_source_scripts(self):
+        for system, has_bash in [("Windows", True), ("Windows", False), ("Linux", False), ("Darwin", False)]:
+            with self.subTest(system=system, has_bash=has_bash), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                source = root / "source"
+                source.mkdir()
+                (source / "pnpm-lock.yaml").write_text("fixture")
+                node = root / "node"
+                node.write_bytes(b"fixture")
+                git = root / "Git with spaces/cmd/git.exe"
+                bash = git.parent.parent / "bin/bash.exe"
+                if has_bash:
+                    bash.parent.mkdir(parents=True)
+                    bash.touch()
+                commands = []
+
+                def command(arguments, *, cwd, env):
+                    if arguments[0] == node:
+                        return "v26.11.1"
+                    if "archive" in arguments:
+                        with tarfile.open(arguments[arguments.index("--output") + 1], "w") as contents:
+                            contents.add(source, arcname=".")
+                    elif "--version" in arguments:
+                        return "12.11.2"
+                    else:
+                        commands.append(arguments)
+                        self.assertEqual(env["NODE_OPTIONS"], "--max-old-space-size=3072")
+                        if "build" in arguments:
+                            options = [arg for arg in arguments if str(arg).startswith("--config.script-shell=")]
+                            self.assertEqual(options, ["--config.script-shell=" + str(bash)] if system == "Windows" else [])
+                            raise BuildError("source_build_checked")
+                        self.assertFalse(any(str(arg).startswith("--config.script-shell=") for arg in arguments))
+                    return ""
+
+                expected = "host_server_script_shell_missing" if system == "Windows" and not has_bash else "source_build_checked"
+                with (
+                    patch("build_host_server.platform.system", return_value=system),
+                    patch("build_host_server.shutil.which", side_effect=lambda name: str(git if name == "git" else root / "pnpm")),
+                    patch("build_host_server.git_blob", return_value='{"packageManager":"pnpm@12.11.2"}'),
+                    patch("build_host_server.run", side_effect=command),
+                    self.assertRaisesRegex(BuildError, expected),
+                ):
+                    build(source, "a" * 40, node, root / "output")
+                if expected == "host_server_script_shell_missing":
+                    self.assertEqual(commands, [])
+
     def test_source_archive_fixture_ignores_inherited_git_repository(self):
         with tempfile.TemporaryDirectory() as temporary:
             decoy = Path(temporary).resolve()
@@ -143,7 +189,10 @@ class HostServerTests(unittest.TestCase):
                     shutil.copytree(deployed, arguments[-1])
                 return ""
 
-            with patch("build_host_server.shutil.which", side_effect=lambda name: "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.run", side_effect=command):
+            bash = root / "Git/bin/bash.exe"
+            bash.parent.mkdir(parents=True)
+            bash.touch()
+            with patch("build_host_server.shutil.which", side_effect=lambda name: str(root / "Git/cmd/git.exe") if name == "git" else "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.run", side_effect=command):
                 build(source, "a" * 40, node, output)
             receipt = json.loads((output / "qualification.json").read_text())
             runtime = output / "server"
