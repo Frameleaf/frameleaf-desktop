@@ -649,6 +649,14 @@ worker includes its JavaScript runtime packages, subtitle sidecar, notices and
 server font resources. Required entries and font headers are checked before the
 package is accepted; Git LFS pointers are not usable font payloads.
 
+The `Windows host assets` workflow builds the current photo UI, core plugin and
+Studio worker serially from reviewed source `8e85ffa3b43d7158d7fffd0dda97a3b56ed9f6a0`.
+Its single 90-minute job retains `host-assets.tar.gz` with each qualified payload
+and receipt, after checking source, Node, package-manager locks and exact file
+inventories. Build workspaces stay outside the artifact. This qualifies asset
+builds and staging; private Chromium, real rendering and complete-host acceptance
+remain separate gates.
+
 The host supplies profile-local Studio trust and scratch directories, applying
 the existing private-directory checks before launching processes. This lets the
 server write the worker's enrollment outside container-specific paths.
