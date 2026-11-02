@@ -1,4 +1,6 @@
 //! Host packs have separate authority and component requirements from ML packs.
+mod reap;
+
 use crate::native_runtime::{digest_valid, relative, verify_files, Artifact};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -1180,7 +1182,7 @@ impl VerifiedHostRuntime {
                     Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                     Err(_) => {
                         monitor_owner.terminate();
-                        let _ = child.wait();
+                        reap::confirm(|| child.wait().map(|_| ()));
                         break Err("host_process_state_failed".into());
                     }
                 }
