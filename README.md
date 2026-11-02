@@ -840,3 +840,5 @@ requires a complete Windows candidate with private database, Manager, backup and
 media dependencies; compilation alone does not qualify Windows restore.
 
 Windows kernel-volume storage separation stops physical-identity ancestry checks at the filesystem root for both supported GLOBALROOT path forms. Self, descendant, ancestor and case-alias overlap refusals remain in place. A Windows test checks separate storage without creating the state directory; installed-app acceptance remains unverified.
+
+Windows profile credential bindings use normalized volume-GUID names captured from opened handles, alongside physical state/data identities. These names are metadata only; physical kernel paths remain execution authority. An existing reservation without its matching credential requires recovery. Unix bindings are unchanged. Reboot, keystore and installed-server acceptance remain unverified.
