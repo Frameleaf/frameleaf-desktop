@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from windows_private_directory import create_private_directory
+
 import argparse
 import hashlib
 import json
@@ -115,8 +117,16 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
             raise BuildError("host_database_major_mismatch")
         # Mark owned state before launch so a readiness failure is also drained.
         active = True
-        command([binary("pg_ctl"), "-D", data, "-l", output / "postgres.log", "-o",
-                 f"-h 127.0.0.1 -p {port}", "-w", "-t", "30", "start"])
+        # Windows pg_ctl's detached CMD child inherits captured pipes and prevents EOF.
+        with (output / "pg-ctl-start.log").open("w", encoding="utf-8") as log:
+            result = subprocess.run(
+                [binary("pg_ctl"), "-D", data, "-l", output / "postgres.log", "-o",
+                 f"-h 127.0.0.1 -p {port}", "-w", "-t", "30", "start"],
+                cwd=output, env=client_env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, timeout=45,
+            )
+        if result.returncode:
+            raise BuildError(f"host_database_start_failed:{result.returncode}")
 
     def stop() -> None:
         nonlocal active
@@ -143,7 +153,8 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
         finally:
             password_file.unlink(missing_ok=True)
         start()
-        sql("postgres", "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent('café');")
+        # SQL Unicode escapes avoid Windows psql's ANSI command-line conversion.
+        sql("postgres", "CREATE EXTENSION cube; CREATE EXTENSION earthdistance; CREATE EXTENSION pg_trgm; CREATE EXTENSION unaccent; CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION vector; CREATE TABLE native_fixture (id int PRIMARY KEY, embedding vector(3)); INSERT INTO native_fixture VALUES (1,'[1,0,0]'),(2,'[0,1,0]'); CREATE INDEX native_fixture_hnsw ON native_fixture USING hnsw (embedding vector_l2_ops); SELECT earth_distance(ll_to_earth(0,0),ll_to_earth(1,1)); SELECT uuid_generate_v4(), similarity('frameleaf','frameleaf'), unaccent(U&'caf\\00e9');")
         result = {"fresh": facts("postgres")}
         backup = output / "fixture.dump"
         command([binary("pg_dump"), *args, "-d", "postgres", "--format=custom", "--no-owner", "--no-acl", "--file", backup])
@@ -172,10 +183,10 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     tools["pkg-config"] = shutil.which("pkgconf", path=str(dependencies / "tools/pkgconf"))
     if not all(tools.values()):
         raise BuildError("host_database_build_tools_missing")
-    output.mkdir(mode=0o700)
+    create_private_directory(output)
     # PostgreSQL suppresses Unix-specific subdirectories when the prefix contains postgres.
     work, prefix = output / "work", output / "postgres"
-    work.mkdir(mode=0o700)
+    create_private_directory(work)
     env = build_environment(work, os.environ)
     # Only compiler inputs cross the development environment boundary.
     for key in ["INCLUDE", "LIB", "LIBPATH"]:
