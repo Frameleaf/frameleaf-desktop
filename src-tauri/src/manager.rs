@@ -177,7 +177,7 @@ struct Login {
 }
 #[derive(ZeroizeOnDrop)]
 struct Session {
-    cookie: String,
+    credential: String,
     csrf: String,
 }
 fn hex(value: &str, length: usize) -> bool {
@@ -338,21 +338,33 @@ async fn login(client: &Client, origin: &str, password: &str) -> Result<Session,
     session_response(response, origin).await
 }
 async fn session_response(response: Response, origin: &str) -> Result<Session, String> {
-    let prefix = if normalize_manager(origin)?.scheme() == "http" {
-        "frameleaf-manager="
+    let http = normalize_manager(origin)?.scheme() == "http";
+    let prefix = if http {
+        ""
     } else {
         "__Host-frameleaf-manager="
     };
-    let cookies: Vec<_> = response
+    let credentials: Vec<_> = response
         .headers()
-        .get_all(reqwest::header::SET_COOKIE)
+        .get_all(if http {
+            "x-frameleaf-manager-session"
+        } else {
+            "set-cookie"
+        })
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .filter_map(|value| value.split(';').next())
+        .filter_map(|value| {
+            if http {
+                Some(value)
+            } else {
+                value.split(';').next()
+            }
+        })
         .filter(|value| value.starts_with(prefix))
         .collect();
-    let cookie = if cookies.len() == 1 && hex(cookies[0].trim_start_matches(prefix), 64) {
-        Some(cookies[0].to_string())
+    let credential = if credentials.len() == 1 && hex(credentials[0].trim_start_matches(prefix), 64)
+    {
+        Some(credentials[0].to_string())
     } else {
         None
     };
@@ -361,7 +373,7 @@ async fn session_response(response: Response, origin: &str) -> Result<Session, S
         return Err("manager_response_invalid".into());
     }
     Ok(Session {
-        cookie: cookie.ok_or("manager_response_invalid")?,
+        credential: credential.ok_or("manager_response_invalid")?,
         csrf: value.csrf.clone(),
     })
 }
@@ -404,7 +416,14 @@ async fn browser<T: DeserializeOwned>(
         client
             .post(format!("{origin}/manager-api/{path}"))
             .header("origin", origin)
-            .header("cookie", &session.cookie)
+            .header(
+                if origin.starts_with("http://") {
+                    "x-frameleaf-manager-session"
+                } else {
+                    "cookie"
+                },
+                &session.credential,
+            )
             .header("x-csrf-token", &session.csrf)
             .json(&body)
             .send()

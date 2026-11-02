@@ -299,7 +299,7 @@ fn actual_compiled_manager_pairs_signs_reauthenticates_and_cleans_failed_persist
         let list: Value = reply(
             client
                 .get(format!("{origin}/manager-api/desktop-grants"))
-                .header("cookie", &session.cookie)
+                .header("cookie", &session.credential)
                 .send()
                 .await
                 .unwrap(),
@@ -526,31 +526,46 @@ fn manager_http_origins_preserve_validation_and_reject_certificate_pinning() {
 }
 
 #[test]
-fn manager_http_login_uses_the_http_session_cookie() {
+fn manager_http_login_and_browser_calls_use_an_explicit_session_header() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
-        for cookie_name in ["frameleaf-manager", "__Host-frameleaf-manager"] {
+        for step in 0..3 {
             let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut request = [0; 4096];
-            assert!(socket.read(&mut request).unwrap() > 0);
+            let length = socket.read(&mut request).unwrap();
+            assert!(length > 0);
+            if step == 1 {
+                let headers = String::from_utf8_lossy(&request[..length]).to_lowercase();
+                assert!(headers.contains(&format!(
+                    "\r\nx-frameleaf-manager-session: {}\r\n",
+                    "a".repeat(64)
+                )));
+                assert!(!headers.contains("\r\ncookie:"));
+            }
             let body = json!({"csrf":"c".repeat(64)}).to_string();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: {}={}; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", cookie_name, "a".repeat(64), body.len(), body).unwrap();
+            let credential = if step == 2 {
+                format!(
+                    "Set-Cookie: frameleaf-manager={}; Path=/; HttpOnly; SameSite=Strict",
+                    "a".repeat(64)
+                )
+            } else {
+                format!("X-Frameleaf-Manager-Session: {}", "a".repeat(64))
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", credential, body.len(), body).unwrap();
         }
     });
     tauri::async_runtime::block_on(async {
         let client = manager_client(&origin, None, None).unwrap();
-        assert_eq!(
-            login(&client, &origin, "synthetic password")
-                .await
-                .unwrap()
-                .cookie,
-            format!("frameleaf-manager={}", "a".repeat(64))
-        );
+        let session = login(&client, &origin, "synthetic password").await.unwrap();
+        assert_eq!(session.credential, "a".repeat(64));
+        browser::<Value>(&client, &origin, &session, "logout", json!({}))
+            .await
+            .unwrap();
         assert!(login(&client, &origin, "synthetic password").await.is_err());
     });
     server.join().unwrap();
