@@ -132,8 +132,14 @@ class NativeRawContractTests(unittest.TestCase):
                 self.assertEqual(arguments, [output / 'raw/bin/darktable-cli.exe', '--version'])
                 return 'darktable 5.6.2'
 
-            with patch('build_host_raw.platform.system', return_value='Windows'):
-                report = stage_raw(prefix, work, output, command, dependencies)
+            environment = {"HOME": str(root / 'home')}
+            with patch('build_host_raw.platform.system', return_value='Windows'), patch(
+                'build_host_raw.inspect_pe', side_effect=lambda tool, path, *, cwd, env: command([tool, '-p', path])
+            ) as inspector:
+                report = stage_raw(prefix, work, output, command, dependencies, environment=environment)
+            self.assertEqual(inspector.call_count, 4)
+            for call in inspector.call_args_list:
+                self.assertEqual(call.kwargs, {"cwd": work, "env": environment})
             self.assertEqual(len(report['nativeClosure']['objects']), 4)
             self.assertFalse(any(name.casefold().endswith('.dbg') for name in report['files']))
             self.assertTrue((work / 'original-install-unavailable/lib/darktable/views/.debug/libslideshow.dll.dbg').is_file())
@@ -142,6 +148,11 @@ class NativeRawContractTests(unittest.TestCase):
             self.assertIn('licenses-toolchain/fixture/LICENSE', report['files'])
             self.assertIn('licenses/darktable-LICENSE', report['files'])
             self.assertIn('licenses/lensfun-tre-regex.h', report['files'])
+
+    def test_windows_staging_requires_the_isolated_inspector_environment(self):
+        with patch("build_host_raw.platform.system", return_value="Windows"):
+            with self.assertRaisesRegex(BuildError, "host_raw_inspector_environment_required"):
+                stage_raw(Path("/prefix"), Path("/work"), Path("/output"), None, Path("/ucrt64"))
 
     def test_windows_enters_the_pinned_builder(self):
         with (

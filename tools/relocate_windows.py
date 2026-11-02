@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from build_host_database_windows import SYSTEM_DLLS
@@ -16,6 +17,20 @@ PLATFORM_DLLS = SYSTEM_DLLS | {
     "usp10.dll", "uxtheme.dll", "winhttp.dll", "wininet.dll", "winspool.drv",
     "wldap32.dll", "wsock32.dll",
 }
+
+
+def inspect_pe(tool: Path, source: Path, *, cwd: Path, env: dict[str, str]) -> str:
+    try:
+        result = subprocess.run([tool, "-p", source], cwd=cwd, env=env,
+                                text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BuildError("host_pe_inspection_failed") from error
+    # Require a clean inspection before trusting a potentially partial listing.
+    if result.returncode or result.stderr.strip():
+        if error_log := env.get("FRAMELEAF_BUILD_ERROR_LOG"):
+            Path(error_log).write_text((result.stderr or result.stdout)[-32768:], encoding="utf-8")
+        raise BuildError("host_pe_inspection_failed")
+    return result.stdout.strip()
 
 
 def pe_imports(data: bytes) -> bool:
