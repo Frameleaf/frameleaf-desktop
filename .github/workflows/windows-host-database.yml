@@ -7,6 +7,15 @@ on:
       - 'runtime/host-database.json'
       - '.github/workflows/windows-host-database.yml'
   workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: 'Retained component artifact ID to replay instead of rebuilding (optional)'
+        type: string
+        default: ''
+      artifact_sha256:
+        description: 'Exact SHA-256 of the retained artifact ZIP (required for replay)'
+        type: string
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -14,6 +23,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   database:
+    if: github.event_name != 'workflow_dispatch' || (inputs.artifact_id == '' && inputs.artifact_sha256 == '')
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -115,5 +125,58 @@ jobs:
             ${{ runner.temp }}/frameleaf-windows-database/command-error.log
             ${{ runner.temp }}/frameleaf-windows-database/postgres.log
             ${{ runner.temp }}/frameleaf-windows-database/work/configured/meson-logs/meson-log.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+  replay:
+    if: github.event_name == 'workflow_dispatch' && (inputs.artifact_id != '' || inputs.artifact_sha256 != '')
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Download the exact retained component from this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT_ARTIFACT_ID: ${{ inputs.artifact_id }}
+          COMPONENT_ARCHIVE_SHA256: ${{ inputs.artifact_sha256 }}
+        shell: python
+        run: |
+          from pathlib import Path
+          import json, os, re, subprocess
+          identity = os.environ['COMPONENT_ARTIFACT_ID']
+          assert re.fullmatch(r'[1-9][0-9]*', identity), 'invalid artifact identity'
+          assert re.fullmatch(r'[a-f0-9]{64}', os.environ['COMPONENT_ARCHIVE_SHA256']), 'invalid artifact digest'
+          endpoint = 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/artifacts/' + identity
+          metadata = json.loads(subprocess.check_output(['gh', 'api', endpoint]))
+          assert metadata['name'] == 'frameleaf-windows-private-database-candidate' and not metadata['expired'], 'unexpected artifact'
+          with (Path(os.environ['RUNNER_TEMP']) / 'frameleaf-database-replay.zip').open('xb') as stream:
+              subprocess.run(['gh', 'api', endpoint + '/zip'], stdout=stream, check=True)
+      - name: Replay isolated loader and database qualification with no build credentials
+        env:
+          COMPONENT_ARCHIVE_SHA256: ${{ inputs.artifact_sha256 }}
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p 'test_replay_host_database_windows.py'
+          if ($LASTEXITCODE) { throw 'Replay guard tests failed' }
+          python tools/replay_host_database_windows.py --archive "$env:RUNNER_TEMP/frameleaf-database-replay.zip" --output "$env:RUNNER_TEMP/frameleaf-database-replay" --sha256 "$env:COMPONENT_ARCHIVE_SHA256" --source-revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
+          if ($LASTEXITCODE) { throw 'Retained database qualification failed; inspect loader receipt' }
+      - name: Retain bounded private replay diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-database-replay
+          path: |
+            ${{ runner.temp }}/frameleaf-database-replay/loader-report.json
+            ${{ runner.temp }}/frameleaf-database-replay/command-error.log
+            ${{ runner.temp }}/frameleaf-database-replay/postgres.log
+            ${{ runner.temp }}/frameleaf-database-replay/pg-ctl-start.log
           retention-days: 7
           if-no-files-found: warn
