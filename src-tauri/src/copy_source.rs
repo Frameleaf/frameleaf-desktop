@@ -463,6 +463,10 @@ impl CopyApproval {
             .map(|photos| crate::apple_photos::refresh(photos.resource(relative)?))
             .transpose()
     }
+    /// The other half of a RAW+JPEG pair in this approval, and whether `relative` is the RAW.
+    pub(crate) fn photos_raw_partner(&self, relative: &str) -> Option<(String, bool)> {
+        self.scope.photos.as_ref()?.raw_partner(relative)
+    }
     pub(crate) fn photos_key(&self, relative: &str) -> Result<String, String> {
         Ok(self
             .scope

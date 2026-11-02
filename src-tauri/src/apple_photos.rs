@@ -72,6 +72,22 @@ impl Selection {
             })
             .collect())
     }
+    /// The other half of a RAW+JPEG pair (its file) and whether `relative` is the RAW: the JPEG (Photo) stays
+    /// the one shown and the RAW (AlternatePhoto) is stacked under it, as the iPhone app does.
+    pub fn raw_partner(&self, relative: &str) -> Option<(String, bool)> {
+        let files = self.files().ok()?;
+        let this = &self.resources[files.iter().position(|f| f.relative == relative)?];
+        let other = match this.kind {
+            1 => 4,
+            4 => 1,
+            _ => return None,
+        };
+        let index = self
+            .resources
+            .iter()
+            .position(|r| r.asset == this.asset && r.kind == other)?;
+        Some((files[index].relative.clone(), this.kind == 4))
+    }
     pub fn resource(&self, relative: &str) -> Result<&Resource, String> {
         self.files()?
             .iter()
@@ -379,6 +395,27 @@ mod tests {
         assert_eq!(used, 6);
         assert_eq!(written, b"RAWMOV");
         assert!(admitted_bytes(u64::MAX, 1, u64::MAX).is_err());
+    }
+    #[test]
+    fn raw_and_jpeg_of_one_asset_are_partners_and_live_halves_are_not() {
+        let mut s = selection();
+        // a Live Photo's still and motion are never stacked
+        assert_eq!(s.raw_partner("0/IMG_001.HEIC"), None);
+        s.resources[1].kind = 4;
+        s.resources[1].filename = "IMG_001.DNG".into();
+        assert_eq!(
+            s.raw_partner("0/IMG_001.HEIC"),
+            Some(("1/IMG_001.DNG".into(), false))
+        );
+        assert_eq!(
+            s.raw_partner("1/IMG_001.DNG"),
+            Some(("0/IMG_001.HEIC".into(), true))
+        );
+        // another asset's RAW is no partner
+        s.assets = 2;
+        s.resources[1].asset = "other-id".into();
+        assert_eq!(s.raw_partner("0/IMG_001.HEIC"), None);
+        assert_eq!(s.raw_partner("9/missing.HEIC"), None);
     }
     #[test]
     fn invalid_scope_never_requests_permission() {
