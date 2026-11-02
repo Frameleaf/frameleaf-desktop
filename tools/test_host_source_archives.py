@@ -31,6 +31,7 @@ class HostSourceArchiveTests(unittest.TestCase):
                 ".pnpmfile.cjs", "mise.lock", "cosign.pub", "manager/fixture",
                 ".github/frameleaf-release.cjs", ".github/verify-release-bundle.cjs",
                 "packages/sdk/fixture", "packages/plugin-sdk/fixture", "packages/sql-tools/fixture",
+                "packages/locked-crypto/dist/fixture.js",
                 "packages/patches/fixture", "packages/plugin-core/fixture", "packages/ui/fixture",
                 "packages/justified-layout-wasm/fixture", "web/fixture", "i18n/fixture", "licenses/fixture",
                 "studio/runtime/fixture", "studio/tools/fixture", "server/resources/studio-fonts/fixture",
