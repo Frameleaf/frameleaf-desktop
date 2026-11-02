@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from windows_private_directory import create_private_directory
+
 import argparse
 import hashlib
 import json
@@ -181,10 +183,10 @@ def build(source: Path, revision: str, dependencies: Path, output: Path) -> None
     tools["pkg-config"] = shutil.which("pkgconf", path=str(dependencies / "tools/pkgconf"))
     if not all(tools.values()):
         raise BuildError("host_database_build_tools_missing")
-    output.mkdir(mode=0o700)
+    create_private_directory(output)
     # PostgreSQL suppresses Unix-specific subdirectories when the prefix contains postgres.
     work, prefix = output / "work", output / "postgres"
-    work.mkdir(mode=0o700)
+    create_private_directory(work)
     env = build_environment(work, os.environ)
     # Only compiler inputs cross the development environment boundary.
     for key in ["INCLUDE", "LIB", "LIBPATH"]:

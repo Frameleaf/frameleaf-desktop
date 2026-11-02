@@ -10,6 +10,7 @@ import sys
 import zipfile
 
 from build_host_database_windows import qualify
+from windows_private_directory import create_private_directory
 from build_runtime import BuildError, build_environment, relative, sha256
 
 
@@ -34,7 +35,7 @@ def extract_candidate(archive, output, expected_digest, revision, lock):
             if name in names or stat.S_ISLNK(item.external_attr >> 16) or item.external_attr & 0x400:
                 raise BuildError('host_database_replay_path_invalid')
             names.add(name)
-        output.mkdir(mode=0o700)
+        create_private_directory(output)
         for item in entries:
             bundle.extract(item, output)
     return receipt
