@@ -30,3 +30,9 @@ test("release selections cover the supported architectures without adding Window
   assert.deepEqual(releaseMatrix("linux").include, linux);
   assert.throws(() => releaseMatrix("anything"), /release_platforms_invalid/);
 });
+
+test("factory Windows selection builds one native target without changing the full matrix", () => {
+  assert.deepEqual(releaseMatrix("windows"), { include: [
+    { os: "windows-2022", target: "windows-x86_64" },
+  ] });
+});
