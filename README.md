@@ -535,7 +535,8 @@ not complete workflow/server/UI, redistribution or installed-platform approval.
 
 `python3 tools/build_host_web.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
 builds the shared photo UI and Studio editor into `www/` from an exact Git
-archive. The selected source's Studio attestation config supplies npm's version;
+archive. Supply the pinned Studio build Node 22.23.4, matching the selected
+source's attestation configuration. That configuration supplies npm's version;
 bootstrap npm installs it only into the new private toolchain prefix, with
 lifecycle scripts disabled. Studio preparation verifies its pinned upstream
 archive, patches and adapted-source digest. The existing adapter build preserves
@@ -658,6 +659,10 @@ and receipt, after checking source, Node, package-manager locks and exact file
 inventories. Build workspaces stay outside the artifact. This qualifies asset
 builds and staging; private Chromium, real rendering and complete-host acceptance
 remain separate gates.
+
+Web and Studio use their source-pinned build Node 22.23.4; the plugin uses Node
+26.11.1. Receipts bind each component to its actual build binary. The assembled
+host's Node 26.11.1 runtime still needs separate Studio execution qualification.
 
 The host supplies profile-local Studio trust and scratch directories, applying
 the existing private-directory checks before launching processes. This lets the

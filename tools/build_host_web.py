@@ -55,7 +55,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     env["TOKIO_WORKER_THREADS"] = "2"
     package = json.loads(git_blob(git, source, revision, "package.json", env))
     match = re.fullmatch(r"pnpm@(\d+\.\d+\.\d+)", package.get("packageManager", ""))
-    if not match or run([node, "--version"], cwd=work, env=env) != "v26.11.1":
+    if not match or run([node, "--version"], cwd=work, env=env) != "v22.23.4":
         raise BuildError("host_web_toolchain_unapproved")
     archive = work / "source.tar"
     archive_paths = [
@@ -98,7 +98,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if run([pnpm, "--version"], cwd=snapshot, env=env) != match[1]:
         raise BuildError("host_web_pnpm_unapproved")
     configuration = json.loads((snapshot / "studio/engine-build.json").read_text())
-    if configuration.get("node") != "26.11.1" or not re.fullmatch(
+    if configuration.get("node") != "22.23.4" or not re.fullmatch(
         r"\d+\.\d+\.\d+", configuration.get("npm", "")
     ):
         raise BuildError("host_web_studio_toolchain_invalid")

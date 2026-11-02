@@ -45,14 +45,22 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: '26.11.1'
+      - name: Retain the plugin Node identity
+        shell: pwsh
+        run: '"NODE_BINARY=$((Get-Command node).Source)" >> $env:GITHUB_ENV'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '22.23.4'
       - name: Prepare the source-matched package manager
         shell: pwsh
         run: |
           $package = Get-Content application-source/package.json -Raw | ConvertFrom-Json
           if ($package.packageManager -ne 'pnpm@12.11.2') { throw 'Source package manager mismatch' }
+          $studio = Get-Content application-source/studio/engine-build.json -Raw | ConvertFrom-Json
+          if ($studio.node -ne '22.23.4') { throw 'Source Studio build Node mismatch' }
           npm install --global pnpm@12.11.2
           if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
-          "NODE_BINARY=$((Get-Command node).Source)" >> $env:GITHUB_ENV
+          "STUDIO_NODE_BINARY=$((Get-Command node).Source)" >> $env:GITHUB_ENV
       - name: Check component staging and archive boundaries
         shell: pwsh
         run: |
@@ -65,7 +73,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/fl-windows-assets" | Out-Null
           foreach ($component in @('web', 'plugin', 'studio')) {
-            python "tools/build_host_$component.py" --source "$env:GITHUB_WORKSPACE/application-source" --revision $env:HOST_SOURCE_REVISION --node $env:NODE_BINARY --output "$env:RUNNER_TEMP/fl-windows-assets/$component"
+            $node = if ($component -eq 'plugin') { $env:NODE_BINARY } else { $env:STUDIO_NODE_BINARY }
+            python "tools/build_host_$component.py" --source "$env:GITHUB_WORKSPACE/application-source" --revision $env:HOST_SOURCE_REVISION --node $node --output "$env:RUNNER_TEMP/fl-windows-assets/$component"
             if ($LASTEXITCODE) { throw "Genuine Windows asset build failed: $component" }
           }
       - name: Archive the qualified host assets
@@ -89,9 +98,10 @@ jobs:
               raise SystemExit('Git and the selected source commit are required')
           environment = build_environment(root, os.environ)
           configuration = json.loads(git_blob(git, source, revision, 'studio/engine-build.json', environment))
-          if configuration.get('node') != '26.11.1':
+          if configuration.get('node') != '22.23.4':
               raise SystemExit('Pinned Studio Node version is required')
           node_sha = sha256(Path(os.environ['NODE_BINARY']))
+          studio_node_sha = sha256(Path(os.environ['STUDIO_NODE_BINARY']))
           workspace_lock = hashlib.sha256(git_blob(git, source, revision, 'pnpm-lock.yaml', environment)).hexdigest()
           studio_lock = hashlib.sha256(git_blob(git, source, revision, 'studio/engine-package-lock.json', environment)).hexdigest()
           components = [('web', 'www'), ('plugin', 'plugin'), ('studio', 'studio-worker')]
@@ -104,7 +114,7 @@ jobs:
                   or receipt.get('sourceRevision') != os.environ['HOST_SOURCE_REVISION']
                   or not re.fullmatch('[a-f0-9]{40}', receipt['sourceRevision'])
                   or receipt.get('qualification') != 'passed'
-                  or receipt.get('nodeSha256') != node_sha
+                  or receipt.get('nodeSha256') != (node_sha if name == 'plugin' else studio_node_sha)
                   or receipt.get('runtimeQualified') is not False or receipt.get('redistributable') is not False
                   or not isinstance(receipt.get('sourceArchiveSha256'), str)
                   or not re.fullmatch('[a-f0-9]{64}', receipt['sourceArchiveSha256'])

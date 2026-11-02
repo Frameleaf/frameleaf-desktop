@@ -100,7 +100,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     env["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
     env["RAYON_NUM_THREADS"] = "1"
     env["TOKIO_WORKER_THREADS"] = "1"
-    if run([node, "--version"], cwd=work, env=env) != "v26.11.1":
+    if run([node, "--version"], cwd=work, env=env) != "v22.23.4":
         raise BuildError("host_studio_node_unapproved")
     archive = work / "source.tar"
     archive_paths = [
@@ -133,7 +133,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         contents.extractall(snapshot, filter="data")
     configuration = json.loads((snapshot / "studio/engine-build.json").read_text())
     if (
-        configuration.get("node") != "26.11.1"
+        configuration.get("node") != "22.23.4"
         or not re.fullmatch(r"\d+\.\d+\.\d+", configuration.get("npm", ""))
         or not re.fullmatch(r"[a-f0-9]{40}", configuration.get("upstreamCommit", ""))
         or not re.fullmatch(r"[a-f0-9]{64}", configuration.get("sourceSha256", ""))
