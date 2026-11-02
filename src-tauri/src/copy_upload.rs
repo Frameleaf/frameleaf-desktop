@@ -220,7 +220,8 @@ fn limits(response: &Response, bytes: u64) -> Result<usize, String> {
         return Err("source_upload_capacity_exceeded".into());
     }
     match append {
-        Some(n) if n > 0 => Ok(n.min(1024 * 1024) as usize),
+        // 8 MiB like the phones: fewer round trips; a dropped send re-admits at most this much.
+        Some(n) if n > 0 => Ok(n.min(8 * 1024 * 1024) as usize),
         _ => Err("source_upload_response_invalid".into()),
     }
 }

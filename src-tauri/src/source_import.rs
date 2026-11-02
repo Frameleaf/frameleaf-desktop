@@ -51,6 +51,9 @@ struct Cursor {
     export_budget: Option<UploadBudget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_read_budget: Option<UploadBudget>,
+    /// Photos: the verified half of a RAW+JPEG pair (its file → server asset) until its partner is too.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    raw_halves: std::collections::BTreeMap<String, String>,
     position: usize,
     active: Option<Active>,
     state: String,
@@ -89,6 +92,7 @@ impl Cursor {
                 used: 0,
                 limit: manifest.total_bytes,
             }),
+            raw_halves: Default::default(),
             position: 0,
             active: None,
             state: "ready".into(),
@@ -178,6 +182,10 @@ impl Cursor {
                 .as_ref()
                 .is_some_and(|b| b.used > b.limit || manifest.provider.is_some())
             || self.manifest_hash != digest(manifest)?
+            || (!self.raw_halves.is_empty() && manifest.provider.is_none())
+            || self.raw_halves.iter().any(|(file, asset)| {
+                !uuid(asset) || !manifest.files.iter().any(|f| &f.relative == file)
+            })
             || self.position > manifest.files.len()
             || !matches!(
                 self.state.as_str(),
@@ -598,6 +606,10 @@ fn check_receipt(
     }
     Ok(())
 }
+/// A request the server refused for good (not the session, a rate limit or the network): trying again won't help.
+fn refused(error: &str) -> bool {
+    error.starts_with("server_http_4") && !matches!(error, "server_http_401" | "server_http_429")
+}
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     client: &Client,
@@ -823,6 +835,47 @@ async fn execute(
                 &copy,
                 None,
             )?;
+            // RAW+JPEG: once both halves are on the server the RAW is stacked under the JPEG, as on the iPhone.
+            // A refused stack (a Locked half, say) never holds up the backup; a lost reply is tried again.
+            if manifest.provider.is_some() {
+                let asset = active.receipt.as_ref().unwrap()["assetId"]
+                    .as_str()
+                    .ok_or("source_receipt_invalid")?
+                    .to_string();
+                let pair = consent
+                    .copy_approval(saved, identity)?
+                    .photos_raw_partner(&entry.relative);
+                if let Some((partner, is_raw)) = pair {
+                    if let Some(other) = cursor.raw_halves.get(&partner).cloned() {
+                        let ids = if is_raw {
+                            [other, asset]
+                        } else {
+                            [asset, other]
+                        };
+                        gate()?;
+                        let request = client
+                            .post(
+                                base.join("api/stacks")
+                                    .map_err(|_| "source_journal_invalid")?,
+                            )
+                            .bearer_auth(&saved.token)
+                            .json(&json!({ "assetIds": ids }));
+                        let stacked = match copy_upload::send(request, cancel).await {
+                            Ok(response) => transport::json::<Value>(response).await.map(|_| ()),
+                            Err(error) => Err(error),
+                        };
+                        match stacked {
+                            Err(e) if !refused(&e) => return Err(e),
+                            _ => {
+                                cursor.raw_halves.remove(&partner);
+                            }
+                        }
+                    } else {
+                        cursor.raw_halves.insert(entry.relative.clone(), asset);
+                    }
+                    journal.write("cursor.json", &cursor, identity)?;
+                }
+            }
             gate()?;
             copy.release(saved, identity, &journal.root.join("stage"))?;
             let base = journal
@@ -1247,6 +1300,21 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn only_a_final_refusal_gives_up_a_raw_stack() {
+        for code in ["server_http_400", "server_http_403", "server_http_404"] {
+            assert!(refused(code));
+        }
+        for code in [
+            "server_http_401",
+            "server_http_429",
+            "server_http_503",
+            "source_upload_interrupted",
+            "source_copy_cancelled",
+        ] {
+            assert!(!refused(code));
+        }
+    }
     #[test]
     fn folder_original_read_allowance_is_explicit_in_new_signed_checkpoints() {
         let f = Fixture::new();
