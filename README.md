@@ -606,7 +606,7 @@ binds a qualified Windows x64 server to its complete `exiftool-vendored.exe`
 13.59.3 package, including its executable and Perl tree. It verifies the input inventory, pinned vendor module,
 versions and required runtime/license files before removing global fallback.
 `Windows server candidate` runs on relevant packaging pull requests or manual
-dispatch from `main`, using application source candidate `2151b24c5c36a638f60e0117187ec0f7b16a940d` from Frameleaf/frameleaf-app PR #780,
+dispatch from `main`, using application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780,
 Node 26.11.1 and pnpm 12.11.2. Its single concurrency group serializes server builds,
 with a 45-minute limit per job. It retains one qualified component archive and
 bounded diagnostics for seven days; artifact access follows repository access.
