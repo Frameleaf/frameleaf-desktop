@@ -77,8 +77,9 @@ certificate `JZTDNMWT8T` was created for team `2SK9S5ZTVR` on November 1, 2026,
 expires December 1, 2027 (America/Edmonton), and its matching key/certificate/P12
 are backed up in the desktop Infisical production environment. The encrypted
 P12, password, identity, Apple ID and team ID are provisioned into the main-only
-GitHub `desktop-release` environment. Notarization still requires the owner's
-app-specific password (`APPLE_PASSWORD`); ordinary Apple account passwords must
+GitHub `desktop-release` environment. The owner's app-specific notarization
+password (`APPLE_PASSWORD`) is also backed up and provisioned; authentication
+was verified using `notarytool history`. Ordinary Apple account passwords must
 never be used for CI. Windows signing has not been acquired. The Windows path supports an existing
 exportable signing certificate; a future hardware/cloud-backed provider requires
 its supported Tauri custom signing command instead. Missing credentials stop

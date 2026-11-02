@@ -29,5 +29,6 @@ signing credentials, and partial target failure must all prevent release staging
 - [x] Open a ready-for-review PR with FD-2 in its title and report live CI separately from signing readiness.
 
 Developer ID Application certificate JZTDNMWT8T is issued, backed up in Infisical
-and provisioned to the main-only GitHub environment. App-specific notarization
-password and Windows signing remain pending. Do not commit key material.
+and provisioned to the main-only GitHub environment. The owner's app-specific
+notarization password is secured and Apple authentication verified. Windows
+signing remains pending. Do not commit key material.
