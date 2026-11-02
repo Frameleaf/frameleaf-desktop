@@ -1,0 +1,96 @@
+name: Windows server candidate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-server
+  cancel-in-progress: false
+jobs:
+  server:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      RAYON_NUM_THREADS: '1'
+      UV_THREADPOOL_SIZE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: d6d175e24fe52c8ed59e7f31ebdd1c25ea025b0c
+          path: server-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Prepare source-matched package manager
+        shell: pwsh
+        run: |
+          $package = Get-Content server-source/package.json -Raw | ConvertFrom-Json
+          if ($package.packageManager -ne 'pnpm@12.11.2') { throw 'Source package manager mismatch' }
+          npm install --global pnpm@12.11.2
+          if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
+      - name: Check production package staging guards
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tools -p test_build_host_server.py -v
+          if ($LASTEXITCODE) { throw 'Server packaging tests failed' }
+          python -m unittest discover -s tools -p test_build_host_exiftool_windows.py -v
+          if ($LASTEXITCODE) { throw 'Private ExifTool binding tests failed' }
+      - name: Compile and verify the actual private production server
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision d6d175e24fe52c8ed59e7f31ebdd1c25ea025b0c --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
+          if ($LASTEXITCODE) { throw 'Windows production server qualification failed' }
+      - name: Bind and qualify private Windows metadata runtime
+        shell: pwsh
+        run: |
+          python tools/build_host_exiftool_windows.py --server "$env:RUNNER_TEMP/fl-windows-server" --output "$env:RUNNER_TEMP/fl-windows-metadata"
+          if ($LASTEXITCODE) { throw 'Private Windows ExifTool binding failed' }
+          node tools/qualify_host_exiftool.mjs "$env:RUNNER_TEMP/fl-windows-metadata" | Tee-Object -FilePath "$env:RUNNER_TEMP/fl-windows-metadata/metadata-qualification.json"
+          if ($LASTEXITCODE) { throw 'Production metadata qualification failed' }
+      - name: Archive qualified server and metadata component
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          import os
+          import shutil
+          import tarfile
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          metadata = temporary / 'fl-windows-metadata'
+          receipt = json.loads((metadata / 'metadata-qualification.json').read_text(encoding='utf-8-sig'))
+          if receipt.get('qualification') != 'passed':
+              raise SystemExit('Metadata qualification is missing')
+          shutil.copy2(temporary / 'fl-windows-server/qualification.json', metadata / 'server-qualification.json')
+          with tarfile.open(temporary / 'windows-server-candidate.tar.gz', 'w:gz') as archive:
+              archive.add(metadata, arcname='server-candidate')
+      - name: Retain qualified component
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-server-candidate
+          path: ${{ runner.temp }}/windows-server-candidate.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain bounded qualification diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-server-diagnostics
+          path: |
+            ${{ runner.temp }}/fl-windows-server/qualification.json
+            ${{ runner.temp }}/fl-windows-server/build.log
+            ${{ runner.temp }}/fl-windows-server/command-error.log
+            ${{ runner.temp }}/fl-windows-metadata/qualification.json
+            ${{ runner.temp }}/fl-windows-metadata/metadata-qualification.json
+          retention-days: 7
+          if-no-files-found: ignore

@@ -13,17 +13,23 @@ assert.ok(runtime && isAbsolute(runtime));
 assert.equal(process.version, "v26.11.1");
 const require = createRequire(join(runtime, "server/package.json"));
 const { ExifTool } = require("exiftool-vendored");
-if (mode === "--missing-perl") {
+const windows = process.platform === "win32";
+const missingMode = windows ? "--missing-executable" : "--missing-perl";
+const missingMessage = windows
+  ? /Private ExifTool executable is missing/
+  : /Private ExifTool Perl runtime is missing/;
+if (mode === missingMode) {
   const tool = new ExifTool();
   try {
     await assert.rejects(
-      tool.version(),
-      /Private ExifTool Perl runtime is missing/,
+      // Resolve before entering the Windows process pool's startup retry loop.
+      windows ? tool.exiftoolPath() : tool.version(),
+      missingMessage,
     );
   } finally {
     await tool.end();
   }
-  console.log("private-perl-missing-refused");
+  console.log("private-runtime-missing-refused");
 } else {
   assert.equal(mode, undefined);
   const receipt = JSON.parse(
@@ -36,12 +42,17 @@ if (mode === "--missing-perl") {
       .digest("hex");
   assert.equal(
     await hash(
-      join(runtime, "server/node_modules/exiftool-vendored/dist/ExifTool.js"),
+      join(runtime, "server/node_modules/exiftool-vendored/dist/" +
+        (windows ? "ExiftoolPath.js" : "ExifTool.js")),
     ),
     receipt.adaptedModuleSha256,
   );
-  const perl = join(runtime, "perl/bin/perl");
-  assert.equal(await hash(perl), receipt.files.perl["bin/perl"].sha256);
+  const privatePath = windows
+    ? "node_modules/exiftool-vendored.exe/bin/exiftool.exe"
+    : "bin/perl";
+  const privateRoot = windows ? "server" : "perl";
+  const privateRuntime = join(runtime, privateRoot, privatePath);
+  assert.equal(await hash(privateRuntime), receipt.files[privateRoot][privatePath].sha256);
   const { MetadataRepository } = await import(
     pathToFileURL(
       join(runtime, "server/dist/repositories/metadata.repository.js"),
@@ -70,7 +81,7 @@ if (mode === "--missing-perl") {
       .toFile(source);
     await repository.writeTags(source, {
       Make: "Frameleaf synthetic fixture",
-      Model: "Private Perl",
+      Model: windows ? "Private Windows runtime" : "Private Perl",
       GPSLatitude: 51.05,
       GPSLongitude: -114.07,
       GPSLatitudeRef: "N",
@@ -79,7 +90,7 @@ if (mode === "--missing-perl") {
     });
     const tags = await repository.readTags(source);
     assert.equal(tags.Make, "Frameleaf synthetic fixture");
-    assert.equal(tags.Model, "Private Perl");
+    assert.equal(tags.Model, windows ? "Private Windows runtime" : "Private Perl");
     assert.equal(tags.ImageWidth, 96);
     assert.equal(tags.ImageHeight, 64);
     assert.equal(tags.Description, "Café — synthetic metadata");
@@ -108,17 +119,17 @@ if (mode === "--missing-perl") {
     await repository.teardown();
     await rm(temporary, { recursive: true, force: true });
   }
-  await rename(perl, perl + ".held");
+  await rename(privateRuntime, privateRuntime + ".held");
   try {
     const child = spawnSync(
       process.execPath,
-      [fileURLToPath(import.meta.url), runtime, "--missing-perl"],
+      [fileURLToPath(import.meta.url), runtime, missingMode],
       { encoding: "utf8", timeout: 15000, env: process.env },
     );
     assert.equal(child.status, 0, child.stderr || String(child.error));
-    assert.match(child.stdout, /private-perl-missing-refused/);
+    assert.match(child.stdout, /private-runtime-missing-refused/);
   } finally {
-    await rename(perl + ".held", perl);
+    await rename(privateRuntime + ".held", privateRuntime);
   }
   console.log(
     JSON.stringify(
@@ -127,12 +138,13 @@ if (mode === "--missing-perl") {
         sourceRevision: receipt.sourceRevision,
         vendorVersion: receipt.vendorVersion,
         perlSource: receipt.perlSource,
+        executableVendorVersion: receipt.executableVendorVersion,
         metadataReadWrite: true,
         unicodeMetadata: true,
         locationFreeCopy: true,
         originalUnchanged: true,
         decodedPixelsUnchanged: true,
-        missingPrivatePerlRefused: true,
+        ...(windows ? { missingPrivateExecutableRefused: true } : { missingPrivatePerlRefused: true }),
         fullMediaConformance: false,
         installedPlatformQualified: false,
       },
