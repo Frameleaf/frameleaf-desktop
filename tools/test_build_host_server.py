@@ -111,6 +111,7 @@ class HostServerTests(unittest.TestCase):
                     patch("build_host_server.platform.system", return_value=system),
                     patch("build_host_server.shutil.which", side_effect=lambda name: str(git if name == "git" else root / "pnpm")),
                     patch("build_host_server.git_blob", return_value='{"packageManager":"pnpm@12.11.2"}'),
+                    patch("build_host_server.verify_source_archive"),
                     patch("build_host_server.run", side_effect=command),
                     self.assertRaisesRegex(BuildError, expected),
                 ):
@@ -197,7 +198,7 @@ class HostServerTests(unittest.TestCase):
             bash = root / "Git/bin/bash.exe"
             bash.parent.mkdir(parents=True)
             bash.touch()
-            with patch("build_host_server.shutil.which", side_effect=lambda name: str(root / "Git/cmd/git.exe") if name == "git" else "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.run", side_effect=command):
+            with patch("build_host_server.shutil.which", side_effect=lambda name: str(root / "Git/cmd/git.exe") if name == "git" else "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.verify_source_archive"), patch("build_host_server.run", side_effect=command):
                 build(source, "a" * 40, node, output)
             receipt = json.loads((output / "qualification.json").read_text())
             runtime = output / "server"

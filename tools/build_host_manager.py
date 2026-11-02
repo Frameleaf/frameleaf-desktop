@@ -13,6 +13,7 @@ from pathlib import Path
 
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, inventory, regular, run, sha256
+from source_archive import verify_source_archive
 
 
 def stage_manager(source: Path, destination: Path, revision: str) -> dict:
@@ -127,6 +128,13 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if run([node, "--version"], cwd=work, env=env) != "v26.11.1":
         raise BuildError("host_manager_toolchain_unapproved")
     archive = work / "source.tar"
+    archive_paths = [
+        "manager",
+        "LICENSE",
+        ".github/frameleaf-release.cjs",
+        ".github/verify-release-bundle.cjs",
+        "cosign.pub",
+    ]
     run(
         [
             git,
@@ -137,15 +145,12 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             "--output",
             archive,
             revision,
-            "manager",
-            "LICENSE",
-            ".github/frameleaf-release.cjs",
-            ".github/verify-release-bundle.cjs",
-            "cosign.pub",
+            *archive_paths,
         ],
         cwd=source,
         env=env,
     )
+    verify_source_archive(git, source, revision, archive_paths, archive, env)
     snapshot = work / "source"
     snapshot.mkdir(mode=0o700)
     with tarfile.open(archive) as contents:
