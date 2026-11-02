@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from build_host_linux_deb import installer_scripts, package_names, stage_packages, archive, dependencies, build
-from build_runtime import BuildError
+from build_runtime import BuildError, run
 
 
 class LinuxHostDebTests(unittest.TestCase):
@@ -317,7 +317,17 @@ class LinuxHostDebTests(unittest.TestCase):
             ]:
                 subprocess.run(command, check=True, capture_output=True)
             originals = {path: path.read_bytes() for path in [target, addon, wrong / 'libanswer.so.1']}
-            result = dependencies(tree, 'frameleaf-fixture', root / 'work')
+            analyzer = []
+            def observe(arguments, **options):
+                if arguments[0] != 'dpkg-shlibdeps':
+                    return run(arguments, **options)
+                # External dependencies alone cannot distinguish these two private libraries.
+                result = subprocess.run([*arguments, '-v'], **options, text=True,
+                                        capture_output=True, check=True, timeout=60)
+                analyzer.append((arguments, options, result.stderr))
+                return result.stdout.strip()
+            with patch('build_host_linux_deb.run', side_effect=observe):
+                result = dependencies(tree, 'frameleaf-fixture', root / 'work')
             self.assertIn('libc6', result)
             self.assertNotIn('frameleaf-fixture', result)
             for path, contents in originals.items():
@@ -334,3 +344,18 @@ class LinuxHostDebTests(unittest.TestCase):
             selected = ctypes.CDLL(str(analysis / 'libraries' / alias))
             self.assertEqual(selected.answer(), 42)
             self.assertEqual(ctypes.CDLL(str(wrong / 'libanswer.so.1')).answer(), 17)
+            self.assertEqual(len(analyzer), 1)
+            arguments, options, diagnostics = analyzer[0]
+            selected_path = analysis / 'libraries' / alias
+            chosen = f'Using shlibs+objdump for {alias} (file {selected_path})'
+            self.assertIn(chosen, diagnostics)
+            # Force the old basename/search-order bug in disposable analysis inputs.
+            subprocess.run(['patchelf', '--replace-needed', alias, 'libanswer.so.1', copies[0]], check=True, capture_output=True)
+            subprocess.run(['patchelf', '--set-rpath', str(wrong), copies[0]], check=True, capture_output=True)
+            decoy = subprocess.run([*arguments, '-v'], **options, text=True,
+                                   capture_output=True, check=True, timeout=60)
+            self.assertEqual(decoy.stdout.strip(), 'shlibs:Depends=' + result)
+            self.assertIn(f"Using shlibs+objdump for libanswer.so.1 (file {wrong / 'libanswer.so.1'})", decoy.stderr)
+            self.assertNotIn(chosen, decoy.stderr)
+            for path, contents in originals.items():
+                self.assertEqual(path.read_bytes(), contents)
