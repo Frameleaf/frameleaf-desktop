@@ -227,8 +227,109 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(self.0.join("file"));
             let _ = fs::remove_dir(self.0.join("unsafe"));
+            let _ = fs::remove_dir(self.0.join("incorrect"));
             let _ = fs::remove_dir(self.0.join("safe"));
             let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    /// Read the actual file object; safety alone does not establish the intended machine policy.
+    fn assert_machine_descriptor(path: &Path) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Security::{
+                Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+                EqualSid, GetAce, GetSecurityDescriptorControl, IsValidAcl, IsValidSid,
+                WinBuiltinUsersSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL,
+                CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+                OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            },
+            Storage::FileSystem::{
+                FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, READ_CONTROL,
+            },
+        };
+        let file = fs::OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap();
+        let mut descriptor = Descriptor(std::ptr::null_mut());
+        let mut owner = std::ptr::null_mut();
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    std::ptr::null_mut(),
+                    &mut acl,
+                    std::ptr::null_mut(),
+                    &mut descriptor.0,
+                )
+            },
+            0
+        );
+        assert!(!descriptor.0.is_null());
+        assert!(!owner.is_null());
+        let administrator = administrators().unwrap();
+        assert_ne!(unsafe { IsValidSid(owner) }, 0);
+        assert_ne!(
+            unsafe { EqualSid(owner, administrator.as_ptr().cast_mut().cast()) },
+            0
+        );
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        assert!(!acl.is_null());
+        assert_ne!(unsafe { IsValidAcl(acl) }, 0);
+        assert_eq!(unsafe { (*acl).AceCount }, 3);
+        // File creation maps generic rights to these file-specific access masks.
+        for (index, (kind, rights)) in [
+            (WinLocalSystemSid, FILE_ALL_ACCESS),
+            (WinBuiltinAdministratorsSid, FILE_ALL_ACCESS),
+            (WinBuiltinUsersSid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut sid = [0u32; 17];
+            let mut length = std::mem::size_of_val(&sid) as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        kind,
+                        std::ptr::null_mut(),
+                        sid.as_mut_ptr().cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            let mut raw = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(acl, index as u32, &mut raw) }, 0);
+            assert!(!raw.is_null());
+            let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
+            assert!(
+                unsafe { (*ace).Header.AceSize } as usize
+                    >= std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            );
+            assert_eq!(u32::from(unsafe { (*ace).Header.AceSize }), 8 + length);
+            assert_eq!(unsafe { (*ace).Header.AceType }, 0);
+            assert_eq!(
+                unsafe { (*ace).Header.AceFlags },
+                (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
+            );
+            assert_eq!(unsafe { (*ace).Mask }, rights);
+            let actual_sid = unsafe { std::ptr::addr_of!((*ace).SidStart).cast_mut().cast() };
+            assert_ne!(unsafe { IsValidSid(actual_sid) }, 0);
+            assert_ne!(unsafe { EqualSid(actual_sid, sid.as_mut_ptr().cast()) }, 0);
         }
     }
     #[test]
@@ -253,6 +354,14 @@ mod tests {
         directory(&safe).unwrap();
         directory(&safe).unwrap();
         crate::windows_protection::protect(&safe, &mut BTreeSet::new()).unwrap();
+        assert_machine_descriptor(&safe);
+        let incorrect = fixture.0.join("incorrect");
+        Descriptor::new(&MACHINE_ACL.replace("GRGX", "GR"))
+            .unwrap()
+            .create(&incorrect)
+            .unwrap();
+        crate::windows_protection::protect(&incorrect, &mut BTreeSet::new()).unwrap();
+        assert!(std::panic::catch_unwind(|| assert_machine_descriptor(&incorrect)).is_err());
         let untrusted = fixture.0.join("unsafe");
         Descriptor::new("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)")
             .unwrap()
