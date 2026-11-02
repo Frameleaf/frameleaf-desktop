@@ -28,7 +28,10 @@
   let pending = $state<Intent | null>(null);
   let operation = $state<Operation | null>(null);
   let origin = $state('');
-  const http = $derived(origin.trim().toLowerCase().startsWith('http://'));
+  const http = $derived.by(() => {
+    try { return new URL(origin.trim()).protocol === 'http:'; }
+    catch { return false; }
+  });
   let password = $state('');
   let pem = $state('');
   let fingerprint = $state('');

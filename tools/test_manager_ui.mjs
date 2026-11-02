@@ -172,11 +172,11 @@ try{
   assert.ok(!(await page.textContent('body')).includes(password));
   assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(password));
  });
- await fixture('pair-http',async({ui,calls})=>{
+ for (const address of ['http://tower.local:2282','http:tower.local:2282','http:/tower.local:2282']) await fixture('pair-http',async({ui,calls})=>{
   await ui.getByLabel('Manager address').fill(view.origin);
   await ui.getByText('Use a certificate for a private Manager',{exact:true}).click();
   await ui.getByLabel('Public certificate',{exact:true}).fill(wire.certificatePem);
-  await ui.getByLabel('Manager address').fill('http://tower.local:2282');
+  await ui.getByLabel('Manager address').fill(address);
   await ui.getByText('HTTP sends sign-in and management traffic without encryption. Use a trusted network.',{exact:true}).waitFor();
   assert.equal(await ui.getByLabel('Public certificate',{exact:true}).count(),0);
   await ui.getByLabel('Manager password',{exact:true}).fill(password);
@@ -184,7 +184,7 @@ try{
   await ui.getByRole('button',{name:'Pair with Manager',exact:true}).click();
   await ui.getByText('Example NAS',{exact:true}).waitFor();
   const request=calls.find(value=>value.command==='pair_manager');
-  assert.equal(request.args.origin,'http://tower.local:2282');
+  assert.equal(request.args.origin,address);
   assert.equal(request.args.certificate,null);
  });
  await fixture('lost',async({page,ui,calls,keys,finish,loseNext})=>{

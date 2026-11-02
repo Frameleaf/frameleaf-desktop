@@ -516,6 +516,15 @@ fn manager_http_origins_preserve_validation_and_reject_certificate_pinning() {
     ] {
         assert!(normalize_manager(origin).is_err(), "{origin}");
     }
+    for origin in ["http:tower.local:2282", "http:/tower.local:2282"] {
+        assert_eq!(
+            normalize_manager(origin)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+            "http://tower.local:2282"
+        );
+    }
     assert!(crate::connection::normalize_server("http://tower.local").is_err());
     assert!(manager_client(
         "http://tower.local",
