@@ -67,7 +67,8 @@ jobs:
             [ ! -e /opt/frameleaf ]
             [ ! -L /opt/frameleaf ]
             /usr/bin/mount -t tmpfs -o mode=0755,nodev,nosuid frameleaf-admission /opt
-            exec /usr/bin/python3 tools/qualify_linux_package_admission.py src-tauri/target/debug/frameleaf-native-host
+            /usr/bin/python3 tools/qualify_linux_package_admission.py src-tauri/target/debug/frameleaf-native-host
+            exec /usr/bin/python3 tools/qualify_linux_deb_lifecycle.py src-tauri/target/debug/frameleaf-native-host
           '
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build unsigned shell smoke-test candidate
