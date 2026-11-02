@@ -484,7 +484,7 @@ impl CopyApproval {
         crate::runtime_store::create_private_directory(&path)
             .map_err(|_| "source_stage_unavailable")?;
         let mut cleanup = Partial(Some(path.clone()));
-        crate::runtime_store::private_directory(&path)?;
+        crate::runtime_store::private_directory(&path).map_err(|_| "source_stage_unavailable")?;
         let mut output = fs::OpenOptions::new();
         output.write(true).create_new(true);
         #[cfg(unix)]
