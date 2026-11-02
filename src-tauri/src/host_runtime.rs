@@ -1049,7 +1049,7 @@ impl VerifiedHostRuntime {
         let requested_state = state;
         #[cfg(windows)]
         let stable_state = crate::windows_protection::stable_state_path(state)
-            .map_err(|_| "host_state_overlaps_runtime")?;
+            .map_err(|_| "host_state_not_private")?;
         #[cfg(windows)]
         let state = stable_state.as_path();
         use base64::{engine::general_purpose::STANDARD, Engine};
