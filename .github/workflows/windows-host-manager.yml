@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - 'tools/build_host_manager.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_runtime.py'
       - 'tools/test_build_host_manager.py'
       - 'tools/source_archive.py'
       - '.github/workflows/windows-host-manager.yml'
