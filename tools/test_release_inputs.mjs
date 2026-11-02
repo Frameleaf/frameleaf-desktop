@@ -12,9 +12,21 @@ test("release tags must match all application versions", () => {
   assert.throws(() => validateReleaseTag("v0.1.0", []), /release_version_mismatch/);
 });
 
-test("release selection omits Windows until signing is configured", () => {
-  assert.deepEqual(releaseMatrix("macos-linux").include.map((p) => p.target), ["macos-aarch64", "linux-x86_64"]);
-  assert.equal(releaseMatrix("all").include.length, 3);
-  assert.deepEqual(releaseMatrix("linux").include, [{ os: "ubuntu-24.04", target: "linux-x86_64" }]);
+test("release selections cover the supported architectures without adding Windows implicitly", () => {
+  const linux = [
+    { os: "ubuntu-24.04", target: "linux-x86_64" },
+    { os: "ubuntu-24.04-arm", target: "linux-aarch64" },
+  ];
+  const macos = [
+    { os: "macos-15", target: "macos-aarch64" },
+    { os: "macos-15-intel", target: "macos-x86_64" },
+  ];
+  assert.deepEqual(releaseMatrix("macos-linux").include, [...macos, ...linux]);
+  assert.deepEqual(releaseMatrix("all").include, [
+    ...macos,
+    { os: "windows-2022", target: "windows-x86_64" },
+    ...linux,
+  ]);
+  assert.deepEqual(releaseMatrix("linux").include, linux);
   assert.throws(() => releaseMatrix("anything"), /release_platforms_invalid/);
 });
