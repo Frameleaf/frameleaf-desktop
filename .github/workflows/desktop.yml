@@ -44,6 +44,12 @@ jobs:
           echo "$tool_dir/bin" >> "$GITHUB_PATH"
       - name: Rust stable
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - name: Reuse Rust dependencies from successful main checks
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
       - run: python -m unittest discover -s tools -p 'test_*.py'
       - run: npm test
