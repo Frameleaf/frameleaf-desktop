@@ -6,9 +6,13 @@ export function releaseMatrix(platforms) {
   if (!["macos-linux", "all", "linux"].includes(platforms))
     throw new Error("release_platforms_invalid");
   return { include: [
-    ...(platforms !== "linux" ? [{ os: "macos-15", target: "macos-aarch64" }] : []),
+    ...(platforms !== "linux" ? [
+      { os: "macos-15", target: "macos-aarch64" },
+      { os: "macos-15-intel", target: "macos-x86_64" },
+    ] : []),
     ...(platforms === "all" ? [{ os: "windows-2022", target: "windows-x86_64" }] : []),
     { os: "ubuntu-24.04", target: "linux-x86_64" },
+    { os: "ubuntu-24.04-arm", target: "linux-aarch64" },
   ] };
 }
 
