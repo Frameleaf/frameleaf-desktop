@@ -25,12 +25,73 @@ def pe(imports=True, machine=0x8664):
     return bytes(data)
 
 
+def pe_image(names):
+    data = bytearray(pe(bool(names))) + bytearray(512)
+    data[70:72] = (1).to_bytes(2, 'little')
+    for offset, value in [(336, 512), (340, 4096), (344, 512), (348, 512)]:
+        data[offset:offset + 4] = value.to_bytes(4, 'little')
+    data[212:216] = ((len(names) + 1) * 20 if names else 0).to_bytes(4, 'little')
+    cursor = 616
+    for index, name in enumerate(names):
+        data[524 + index * 20:528 + index * 20] = (4096 + cursor - 512).to_bytes(4, 'little')
+        encoded = name.encode('ascii') + b'\0'
+        data[cursor:cursor + len(encoded)] = encoded
+        cursor += len(encoded)
+    return bytes(data)
+
+
 class InspectorTests(unittest.TestCase):
+    def test_clean_partial_listing_cannot_hide_an_import_descriptor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'probe.exe'
+            source.write_bytes(pe_image(['KERNEL32.dll', 'vendor.dll']))
+            args = [root / 'objdump.exe', '-p', source]
+            for output in ['DLL Name: KERNEL32.dll', 'DLL Name: KERNEL32.dll\nDLL Name: KERNEL32.dll']:
+                with self.subTest(output=output), patch('relocate_windows.subprocess.run', return_value=subprocess.CompletedProcess(args, 0, output, '')):
+                    with self.assertRaisesRegex(BuildError, 'host_pe_imports_missing'):
+                        inspect_pe(args[0], source, cwd=root, env={})
+
+    def test_imports_must_be_terminated_and_bound_to_unique_file_backed_sections(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'probe.exe'
+            args = [root / 'objdump.exe', '-p', source]
+            original = pe_image(['KERNEL32.dll', 'vendor.dll'])
+            cases = [original[:-1]]
+            for offset, value in [(208, 0xffff0000), (544, 0xffff0000), (344, 0xffff0000)]:
+                data = bytearray(original)
+                data[offset:offset + 4] = value.to_bytes(4, 'little')
+                cases.append(bytes(data))
+            data = bytearray(original)
+            data[70:72] = (2).to_bytes(2, 'little')
+            data[368:408] = data[328:368]
+            cases.append(bytes(data))
+            data = bytearray(original)
+            data[552:572] = data[512:532]
+            cases.append(bytes(data))
+            data = bytearray(original)
+            data[616:] = b'A' * (len(data) - 616)
+            cases.append(bytes(data))
+            output = 'DLL Name: KERNEL32.dll\nDLL Name: vendor.dll'
+            for data in cases:
+                source.write_bytes(data)
+                with self.subTest(data=data[70:72]), patch('relocate_windows.subprocess.run', return_value=subprocess.CompletedProcess(args, 0, output, '')):
+                    with self.assertRaises(BuildError):
+                        inspect_pe(args[0], source, cwd=root, env={})
+            source.write_bytes(original)
+            with patch('relocate_windows.subprocess.run', return_value=subprocess.CompletedProcess(args, 0, output, '')):
+                self.assertEqual(inspect_pe(args[0], source, cwd=root, env={}), output)
+            source.write_bytes(pe_image([]))
+            with patch('relocate_windows.subprocess.run', return_value=subprocess.CompletedProcess(args, 0, '', '')):
+                self.assertEqual(inspect_pe(args[0], source, cwd=root, env={}), '')
+
     def test_inspector_requires_clean_success_and_records_bounded_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             env = {"HOME": str(root / "home"), "FRAMELEAF_BUILD_ERROR_LOG": str(root / "error.log")}
             args = [root / "objdump.exe", "-p", root / "probe.exe"]
+            args[-1].write_bytes(pe_image(['KERNEL32.dll']))
             with patch('relocate_windows.subprocess.run', return_value=subprocess.CompletedProcess(args, 0, 'DLL Name: KERNEL32.dll\n', '')) as call:
                 self.assertEqual(inspect_pe(args[0], args[-1], cwd=root, env=env), 'DLL Name: KERNEL32.dll')
                 self.assertEqual(call.call_args.args[0], args)

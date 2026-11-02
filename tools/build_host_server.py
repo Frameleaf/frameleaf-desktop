@@ -21,6 +21,7 @@ from build_runtime import (
     run,
     sha256,
 )
+from source_archive import verify_source_archive
 
 # SemVer 2.0 suggested regex, Tom Preston-Werner and contributors (CC BY 3.0).
 # https://semver.org/spec/v2.0.0.html | https://creativecommons.org/licenses/by/3.0/
@@ -41,7 +42,7 @@ def ignored(directory: str, names: list[str]) -> set[str]:
     )
 
 
-def stage_server(source: Path, destination: Path) -> dict:
+def stage_server(source: Path, destination: Path, *, clean_metadata: bool = False) -> dict:
     if (
         not source.is_absolute()
         or not destination.is_absolute()
@@ -64,6 +65,8 @@ def stage_server(source: Path, destination: Path) -> dict:
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 raise BuildError("host_server_special_file_forbidden")
     shutil.copytree(source, destination, symlinks=True, ignore=ignored)
+    if clean_metadata:
+        clean_runtime_metadata(destination)
     return inventory(destination)
 
 
@@ -125,6 +128,22 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     if not match or run([node, "--version"], cwd=work, env=env) != "v26.11.1":
         raise BuildError("host_server_toolchain_unapproved")
     archive = work / "source.tar"
+    archive_paths = [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        ".pnpmfile.cjs",
+        "LICENSE",
+        "packages/sdk",
+        "packages/plugin-sdk",
+        "packages/sql-tools",
+        "packages/locked-crypto",
+        "packages/patches",
+        "server",
+        "studio/runtime",
+        "studio/tools",
+        "docker/scripts/verify-server-package.mjs",
+    ]
     run(
         [
             git,
@@ -135,24 +154,12 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             "--output",
             archive,
             revision,
-            "package.json",
-            "pnpm-lock.yaml",
-            "pnpm-workspace.yaml",
-            ".pnpmfile.cjs",
-            "LICENSE",
-            "packages/sdk",
-            "packages/plugin-sdk",
-            "packages/sql-tools",
-            "packages/locked-crypto",
-            "packages/patches",
-            "server",
-            "studio/runtime",
-            "studio/tools",
-            "docker/scripts/verify-server-package.mjs",
+            *archive_paths,
         ],
         cwd=source,
         env=env,
     )
+    verify_source_archive(git, source, revision, archive_paths, archive, env)
     snapshot = work / "source"
     snapshot.mkdir(mode=0o700)
     with tarfile.open(archive) as contents:
@@ -206,9 +213,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
                 ]
             )
             runtime = output / "server"
-            stage_server(deployed, runtime)
-            clean_runtime_metadata(runtime)
-            report["files"] = inventory(runtime)
+            report["files"] = stage_server(deployed, runtime, clean_metadata=True)
             command(
                 [
                     node,

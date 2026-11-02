@@ -42,7 +42,7 @@ pub(crate) async fn pair_manager(
     if credentials::load::<manager::SavedManager>(manager::CREDENTIAL)?.is_some() {
         return Err("manager_already_paired".into());
     }
-    let origin = crate::connection::normalize_server(&origin)?
+    let origin = manager::normalize_manager(&origin)?
         .origin()
         .ascii_serialization();
     let identity = credentials::identity()?;

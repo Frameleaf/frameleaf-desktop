@@ -317,16 +317,7 @@ class LinuxHostDebTests(unittest.TestCase):
             ]:
                 subprocess.run(command, check=True, capture_output=True)
             originals = {path: path.read_bytes() for path in [target, addon, wrong / 'libanswer.so.1']}
-            analyzer = []
-            def observe(arguments, **options):
-                if arguments[0] != 'dpkg-shlibdeps':
-                    return run(arguments, **options)
-                # External dependencies alone cannot distinguish these two private libraries.
-                result = subprocess.run([*arguments, '-v'], **options, text=True,
-                                        capture_output=True, check=True, timeout=60)
-                analyzer.append((arguments, options, result.stderr))
-                return result.stdout.strip()
-            with patch('build_host_linux_deb.run', side_effect=observe):
+            with patch('build_host_linux_deb.run', wraps=run) as observed:
                 result = dependencies(tree, 'frameleaf-fixture', root / 'work')
             self.assertIn('libc6', result)
             self.assertNotIn('frameleaf-fixture', result)
@@ -344,8 +335,13 @@ class LinuxHostDebTests(unittest.TestCase):
             selected = ctypes.CDLL(str(analysis / 'libraries' / alias))
             self.assertEqual(selected.answer(), 42)
             self.assertEqual(ctypes.CDLL(str(wrong / 'libanswer.so.1')).answer(), 17)
+            analyzer = [call for call in observed.call_args_list if call.args[0][0] == 'dpkg-shlibdeps']
             self.assertEqual(len(analyzer), 1)
-            arguments, options, diagnostics = analyzer[0]
+            arguments, options = analyzer[0].args[0], analyzer[0].kwargs
+            # Keep the production receipt strict; collect verbose selection evidence separately.
+            verbose = subprocess.run([*arguments, '-v'], **options, text=True,
+                                     capture_output=True, check=True, timeout=60)
+            diagnostics = verbose.stdout + verbose.stderr
             selected_path = analysis / 'libraries' / alias
             chosen = f'Using shlibs+objdump for {alias} (file {selected_path})'
             self.assertIn(chosen, diagnostics)
@@ -354,8 +350,8 @@ class LinuxHostDebTests(unittest.TestCase):
             subprocess.run(['patchelf', '--set-rpath', str(wrong), copies[0]], check=True, capture_output=True)
             decoy = subprocess.run([*arguments, '-v'], **options, text=True,
                                    capture_output=True, check=True, timeout=60)
-            self.assertEqual(decoy.stdout.strip(), 'shlibs:Depends=' + result)
-            self.assertIn(f"Using shlibs+objdump for libanswer.so.1 (file {wrong / 'libanswer.so.1'})", decoy.stderr)
-            self.assertNotIn(chosen, decoy.stderr)
+            self.assertEqual([line for line in decoy.stdout.splitlines() if line.startswith('shlibs:Depends=')], ['shlibs:Depends=' + result])
+            self.assertIn(f"Using shlibs+objdump for libanswer.so.1 (file {wrong / 'libanswer.so.1'})", decoy.stdout + decoy.stderr)
+            self.assertNotIn(chosen, decoy.stdout + decoy.stderr)
             for path, contents in originals.items():
                 self.assertEqual(path.read_bytes(), contents)

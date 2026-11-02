@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import build_host_server
 from build_host_server import build, stage_server
-from build_runtime import BuildError, build_environment, run as checked_run
+from build_runtime import BuildError, build_environment, inventory as runtime_inventory, run as checked_run
 
 
 class HostServerTests(unittest.TestCase):
@@ -111,6 +111,7 @@ class HostServerTests(unittest.TestCase):
                     patch("build_host_server.platform.system", return_value=system),
                     patch("build_host_server.shutil.which", side_effect=lambda name: str(git if name == "git" else root / "pnpm")),
                     patch("build_host_server.git_blob", return_value='{"packageManager":"pnpm@12.11.2"}'),
+                    patch("build_host_server.verify_source_archive"),
                     patch("build_host_server.run", side_effect=command),
                     self.assertRaisesRegex(BuildError, expected),
                 ):
@@ -155,7 +156,13 @@ class HostServerTests(unittest.TestCase):
                 self.assertEqual((root / "dist/main.js").read_text(), "export const value = 42;")
                 self.assertEqual(retained.read_text(), "dependency source provenance")
 
-    def test_build_receipt_describes_cleaned_runtime(self):
+    @patch("build_host_server.inventory")
+    def test_build_receipt_describes_cleaned_runtime(self, inventory):
+        def cleaned_inventory(path):
+            for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:
+                self.assertFalse((path / name).exists(), "metadata cleanup must precede the first inventory")
+            return runtime_inventory(path)
+        inventory.side_effect = cleaned_inventory
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             source = root / "source"
@@ -175,6 +182,9 @@ class HostServerTests(unittest.TestCase):
                 path = deployed / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture")
+            case_sensitive = not (deployed / "PNPM-LOCK.YAML").exists()
+            if case_sensitive:
+                (deployed / "PNPM-LOCK.YAML").write_text("retained case-distinct fixture")
             verifier = source / "docker/scripts/verify-server-package.mjs"
             verifier.parent.mkdir(parents=True)
             verifier.write_text("fixture verifier")
@@ -197,12 +207,15 @@ class HostServerTests(unittest.TestCase):
             bash = root / "Git/bin/bash.exe"
             bash.parent.mkdir(parents=True)
             bash.touch()
-            with patch("build_host_server.shutil.which", side_effect=lambda name: str(root / "Git/cmd/git.exe") if name == "git" else "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.run", side_effect=command):
+            with patch("build_host_server.shutil.which", side_effect=lambda name: str(root / "Git/cmd/git.exe") if name == "git" else "/trusted/" + name), patch("build_host_server.git_blob", return_value=json.dumps({"packageManager": "pnpm@10.0.0"})), patch("build_host_server.verify_source_archive"), patch("build_host_server.run", side_effect=command):
                 build(source, "a" * 40, node, output)
             receipt = json.loads((output / "qualification.json").read_text())
             runtime = output / "server"
             self.assertEqual(receipt["qualification"], "passed")
             self.assertEqual(receipt["files"], build_host_server.inventory(runtime))
+            if case_sensitive:
+                self.assertEqual((runtime / "PNPM-LOCK.YAML").read_text(), "retained case-distinct fixture")
+                self.assertIn("PNPM-LOCK.YAML", receipt["files"])
             metadata = json.loads((runtime / "package.json").read_text())
             self.assertEqual(metadata["dependencies"], {name: "1.2.3" for name in dependencies})
             for name in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "dist/tsconfig.build.tsbuildinfo"]:

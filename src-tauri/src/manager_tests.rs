@@ -99,7 +99,12 @@ fn rejects_expired_grants_untrusted_origins_extra_commands_and_invalid_pins() {
         certificate_fingerprint("private data").unwrap_err(),
         "manager_certificate_invalid"
     );
-    assert!(manager_client(Some("private data"), Some(&"a".repeat(64))).is_err());
+    assert!(manager_client(
+        "https://manager.test:9443",
+        Some("private data"),
+        Some(&"a".repeat(64))
+    )
+    .is_err());
 }
 #[test]
 fn accepts_only_bounded_public_operation_and_status_records() {
@@ -162,14 +167,18 @@ fn javascript_golden_messages_signatures_and_certificate_fingerprint_match() {
     let pem = fixture["certificatePem"].as_str().unwrap();
     let hash = fixture["certificateSha256"].as_str().unwrap();
     assert_eq!(certificate_fingerprint(pem).unwrap(), hash);
-    assert!(manager_client(Some(pem), Some(hash)).is_ok());
+    assert!(manager_client("https://manager.test:9443", Some(pem), Some(hash)).is_ok());
     assert_eq!(
-        manager_client(Some(pem), Some(&"0".repeat(64)))
-            .err()
-            .unwrap(),
+        manager_client(
+            "https://manager.test:9443",
+            Some(pem),
+            Some(&"0".repeat(64))
+        )
+        .err()
+        .unwrap(),
         "manager_certificate_approval_changed"
     );
-    assert!(manager_client(Some(pem), None).is_err());
+    assert!(manager_client("https://manager.test:9443", Some(pem), None).is_err());
 }
 
 #[test]
@@ -206,7 +215,7 @@ fn pairing_and_response_validation_refuse_changed_authority_and_unknown_fields()
     )
     .is_err());
     for origin in [
-        "http://manager.test",
+        "ftp://manager.test",
         "https://manager.test/path",
         "https://user@manager.test",
         "https://manager.test?q=1",
@@ -290,7 +299,7 @@ fn actual_compiled_manager_pairs_signs_reauthenticates_and_cleans_failed_persist
         let list: Value = reply(
             client
                 .get(format!("{origin}/manager-api/desktop-grants"))
-                .header("cookie", &session.cookie)
+                .header("cookie", &session.credential)
                 .send()
                 .await
                 .unwrap(),
@@ -485,4 +494,88 @@ fn restore_execution_uses_explicit_scope_and_accepts_only_bound_public_restore_o
         changed[field] = value;
         assert!(validate_reply(&owner, &command, changed).is_err());
     }
+}
+
+#[test]
+fn manager_http_origins_preserve_validation_and_reject_certificate_pinning() {
+    for origin in [
+        "http://192.168.1.20:2282",
+        "http://tower.local:2282",
+        "https://manager.test:9443",
+    ] {
+        assert_eq!(canonical_origin(origin).unwrap(), origin);
+        assert!(manager_client(origin, None, None).is_ok());
+    }
+    for origin in [
+        "http://user:pass@tower.local",
+        "http://tower.local/path",
+        "http://tower.local?x=1",
+        "http://tower.local#x",
+        "http://tower.local\\path",
+        "file:///tmp/manager",
+    ] {
+        assert!(normalize_manager(origin).is_err(), "{origin}");
+    }
+    for origin in ["http:tower.local:2282", "http:/tower.local:2282"] {
+        assert_eq!(
+            normalize_manager(origin)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+            "http://tower.local:2282"
+        );
+    }
+    assert!(crate::connection::normalize_server("http://tower.local").is_err());
+    assert!(manager_client(
+        "http://tower.local",
+        Some("certificate"),
+        Some("fingerprint")
+    )
+    .is_err());
+}
+
+#[test]
+fn manager_http_login_and_browser_calls_use_an_explicit_session_header() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for step in 0..3 {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let length = socket.read(&mut request).unwrap();
+            assert!(length > 0);
+            if step == 1 {
+                let headers = String::from_utf8_lossy(&request[..length]).to_lowercase();
+                assert!(headers.contains(&format!(
+                    "\r\nx-frameleaf-manager-session: {}\r\n",
+                    "a".repeat(64)
+                )));
+                assert!(!headers.contains("\r\ncookie:"));
+            }
+            let body = json!({"csrf":"c".repeat(64)}).to_string();
+            let credential = if step == 2 {
+                format!(
+                    "Set-Cookie: frameleaf-manager={}; Path=/; HttpOnly; SameSite=Strict",
+                    "a".repeat(64)
+                )
+            } else {
+                format!("X-Frameleaf-Manager-Session: {}", "a".repeat(64))
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", credential, body.len(), body).unwrap();
+        }
+    });
+    tauri::async_runtime::block_on(async {
+        let client = manager_client(&origin, None, None).unwrap();
+        let session = login(&client, &origin, "synthetic password").await.unwrap();
+        assert_eq!(session.credential, "a".repeat(64));
+        browser::<Value>(&client, &origin, &session, "logout", json!({}))
+            .await
+            .unwrap();
+        assert!(login(&client, &origin, "synthetic password").await.is_err());
+    });
+    server.join().unwrap();
 }
