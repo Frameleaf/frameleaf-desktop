@@ -607,10 +607,11 @@ binds a qualified Windows x64 server to its complete `exiftool-vendored.exe`
 13.59.3 package, including its executable and Perl tree. It verifies the input inventory, pinned vendor module,
 versions and required runtime/license files before removing global fallback.
 `Windows server candidate` runs on relevant packaging pull requests or manual
-dispatch from `main`, using reviewed application source `8e85ffa3b43d7158d7fffd0dda97a3b56ed9f6a0`,
+dispatch from `main`, using application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780,
 Node 26.11.1 and pnpm 12.11.2. Its single concurrency group serializes server builds,
 with a 45-minute limit per job. It retains one qualified component archive and
 bounded diagnostics for seven days; artifact access follows repository access.
+Promotion also requires that source candidate's current review and exact-head CI.
 This is component qualification, not a full host, installed app or release.
 
 `/absolute/path/to/private-node tools/qualify_host_exiftool.mjs /absolute/path/to/exiftool-build-output`
@@ -820,7 +821,7 @@ The development `frameleaf-native-host --owner-pipe` helper now provides bounded
 
 `tools/build_host_manager.py --source /absolute/repo --revision <commit> --node /absolute/private-node --output /absolute/new-output` builds Manager and its UI from an exact Git archive with the frozen npm lockfile. It ignores package lifecycle scripts, prunes development dependencies and checks deployed production imports, including the shared release verifier. Only runtime code, production dependencies, worker scripts, public release-verification resources, UI assets and licenses enter `output/manager`. `component.json` records the Manager revision independently of the photo server revision.
 
-The Windows Manager component workflow builds pinned Manager 1.2.2 source with Node 26.11.1 on Windows. Its artifact contains `manager-component.tar.gz`: the staged `manager` directory and successful `qualification.json`, checked against the exact source, toolchain metadata and complete file inventory before archiving. Build workspaces stay out of the component artifact. This qualifies production compilation and deployed imports; native bootstrap, complete-host startup, signing and installed acceptance remain separate gates.
+The Windows Manager component workflow builds application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780 with Node 26.11.1 on Windows. Promotion requires that source candidate’s current review and exact-head CI. Its artifact contains `manager-component.tar.gz`: the staged `manager` directory and successful `qualification.json`, checked against the exact source, toolchain metadata and complete file inventory before archiving. Build workspaces stay out of the component artifact. This qualifies production compilation and deployed imports; native bootstrap, complete-host startup, signing and installed acceptance remain separate gates.
 
 Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manager --backup /absolute/backup-output/backup` with the existing host/ML arguments. Manager code, UI, dependencies, release-verification resources and the backup engine are mandatory in the signed host inventory. An older pack that omits these components refuses admission. The previous factory-signed 24-role candidate and its component results remain historical evidence; a new complete candidate/signature and installed qualification are required. This package does not enable native hosting or supply the still-required protected installed supervisor and OS-keystore bootstrap.
 
