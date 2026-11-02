@@ -93,6 +93,12 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     work = output / "work"
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
+    # Studio's nested git apply must retain the canonical LF bytes too.
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="core.autocrlf", GIT_CONFIG_VALUE_0="false",
+        GIT_CONFIG_KEY_1="core.eol", GIT_CONFIG_VALUE_1="lf",
+    )
     env["PATH"] = os.pathsep.join(
         [
             str(node.parent),

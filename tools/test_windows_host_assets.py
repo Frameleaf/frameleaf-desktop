@@ -61,6 +61,15 @@ class WindowsHostAssetsTests(unittest.TestCase):
                     if arguments[1] == 'install':
                         self.assertEqual(Path(real_which('tar', path=kwargs['env']['PATH'])), tar)
                         self.assertEqual(Path(real_which('git', path=kwargs['env']['PATH'])), Path(real_which('git')))
+                        work = kwargs['cwd']
+                        git = real_which('git')
+                        run([git, 'init', '-q'], cwd=work, env=kwargs['env'])
+                        run([git, 'config', 'core.autocrlf', 'true'], cwd=work, env=kwargs['env'])
+                        patch = work / 'new-source.patch'
+                        patch.write_bytes(b'diff --git a/generated.txt b/generated.txt\nnew file mode 100644\n'
+                                          b'--- /dev/null\n+++ b/generated.txt\n@@ -0,0 +1 @@\n+canonical LF\n')
+                        run([git, 'apply', str(patch)], cwd=work, env=kwargs['env'])
+                        self.assertEqual((work / 'generated.txt').read_bytes(), b'canonical LF\n')
                         raise BuildError('test_dependency_install_boundary')
                     return run(arguments, **kwargs)
                 real_which = builder.shutil.which
