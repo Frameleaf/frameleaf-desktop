@@ -105,6 +105,8 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     run(
         [
             git,
+            "-c", "core.autocrlf=false",
+            "-c", "core.eol=lf",
             "archive",
             "--format=tar",
             "--output",
