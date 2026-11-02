@@ -39,6 +39,8 @@ class HostSourceArchiveTests(unittest.TestCase):
                 "server/src/utils/studio-fonts.generated.ts", "docker/scripts/verify-server-package.mjs",
                 "scripts/frameleaf-studio-contracts.mjs", "scripts/frameleaf-studio-rights.mjs",
             ]
+            for folder in ['server', 'manager', 'web', 'packages/plugin-core', 'studio']:
+                names.extend([folder + '/excluded.txt', folder + '/ignored/child.txt'])
             for name in names:
                 path = source / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,9 +65,11 @@ class HostSourceArchiveTests(unittest.TestCase):
                 run(arguments, cwd=cwd, env=env)
                 raise ArchiveReady()
 
-            for attribute in [None, 'crlf', 'lf']:
+            for attribute in [None, 'crlf', 'lf', 'export-ignore']:
                 info = source / '.git/info/attributes'
-                if attribute:
+                if attribute == 'export-ignore':
+                    info.write_text('**/excluded.txt text eol=crlf export-ignore\n**/ignored export-ignore\n**/ignored/*.txt text eol=crlf\n', encoding='utf-8')
+                elif attribute:
                     info.write_text('LICENSE text eol=' + attribute + '\n', encoding='utf-8')
                 elif info.exists():
                     info.unlink()
@@ -85,6 +89,8 @@ class HostSourceArchiveTests(unittest.TestCase):
                         else:
                             with tarfile.open(output / "work/source.tar") as archive:
                                 self.assertEqual(archive.extractfile("LICENSE").read(), canonical)
+                                if attribute == 'export-ignore':
+                                    self.assertFalse(any(name.endswith('/excluded.txt') or '/ignored/' in name for name in archive.getnames()))
 
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_committed_attributes_take_precedence_over_uncommitted_worktree_attributes(self):
