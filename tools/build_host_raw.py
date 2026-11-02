@@ -85,6 +85,7 @@ def use_windows_libraw_wide_input(source: Path) -> dict:
         raise BuildError("host_raw_libraw_entrypoint_changed")
     before = sha256(source)
     # Keep the original UTF-16 input; the CRT narrow argv has already lost Unicode characters.
+    # shortcut: Frameleaf qualifies stdout (-Z -) only; add wide output names if file output is exposed.
     adapted = original.replace(include, include + "#include <shellapi.h>\n#include <memory>\n")
     adapted = adapted.replace(opening, """#ifndef LIBRAW_WIN32_UNICODEPATHS
 #error Windows RAW input requires wide-path support
