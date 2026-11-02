@@ -52,6 +52,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
       - run: python -m unittest discover -s tools -p 'test_*.py'
+      - name: Test Windows signing trust checks without credentials
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/test_windows_sign.ps1
       - run: npm test
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
