@@ -141,6 +141,8 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
         let file = open(Path::new(part))?;
         let (owner, acl, _) = super::native::security(&file)?;
         if !super::safe_acl(&owner, &acl, &trusted, true) {
+            #[cfg(test)]
+            eprintln!("private directory refused unsafe ancestry: {part}");
             return Err(ERROR.into());
         }
         parents.push(file);
@@ -176,6 +178,12 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
         || control & 0x1000 == 0
         || !super::private_acl(&owner, &acl, &user, &private_trusted)
     {
+        #[cfg(test)]
+        eprintln!(
+            "private directory root policy refused: {path:?}, protected={}, user_owner={}",
+            control & 0x1000 != 0,
+            owner == user
+        );
         return Err(ERROR.into());
     }
     let mut pending = vec![path];
@@ -190,6 +198,8 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
             let file = open(&path)?;
             let (owner, acl, _) = super::native::security(&file)?;
             if !super::private_acl(&owner, &acl, &owner, &private_trusted) {
+                #[cfg(test)]
+                eprintln!("private directory descendant policy refused: {path:?}");
                 return Err(ERROR.into());
             }
             if file.metadata().map_err(|_| ERROR)?.is_dir() {
@@ -202,7 +212,12 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
 
 /// Admission may reuse an existing private directory; it never repairs permissions.
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
-    directory(path, false)
+    let result = directory(path, false);
+    #[cfg(test)]
+    if let Err(error) = &result {
+        eprintln!("private directory admission at {path:?}: {error}");
+    }
+    result
 }
 
 /// Return ownership only for a newly created protected directory, never an existing stage.
