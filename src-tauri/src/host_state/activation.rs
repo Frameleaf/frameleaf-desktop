@@ -271,6 +271,7 @@ impl Owner {
             .into_std();
         valid_file(&host_lease)?;
         host_lease.try_lock().map_err(|_| "host_already_owned")?;
+        let _host_lease = TransientHostLease(host_lease);
         let original = match &intent.previous.database_reference {
             Some(reference) => reference.resolve(&self.path)?,
             None => self.path.join("database"),
@@ -368,6 +369,7 @@ impl Owner {
             .into_std();
         valid_file(&host_lease)?;
         host_lease.try_lock().map_err(|_| "host_already_owned")?;
+        let _host_lease = TransientHostLease(host_lease);
         let original = match &intent.previous.database_reference {
             Some(reference) => reference.resolve(&self.path)?,
             None => self.path.join("database"),
@@ -473,6 +475,7 @@ impl Owner {
             .into_std();
         valid_file(&host_lease)?;
         host_lease.try_lock().map_err(|_| "host_already_owned")?;
+        let _host_lease = TransientHostLease(host_lease);
         let database = match &previous.database_reference {
             Some(reference) => reference.resolve(&self.path)?,
             None => self.path.join("database"),
