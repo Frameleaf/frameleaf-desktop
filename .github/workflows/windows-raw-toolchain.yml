@@ -1,0 +1,114 @@
+name: Windows RAW toolchain inventory
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-raw-toolchain
+  cancel-in-progress: false
+jobs:
+  inventory:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: false
+          path-type: strict
+          install: >-
+            git make autoconf automake-wrapper libtool intltool perl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-drmingw
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libxslt
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-exiv2
+            mingw-w64-ucrt-x86_64-gettext
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-iso-codes
+            mingw-w64-ucrt-x86_64-lcms2
+            mingw-w64-ucrt-x86_64-libarchive
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-potrace
+            mingw-w64-ucrt-x86_64-pugixml
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-zstd
+      - name: Record authoring toolchain versions
+        shell: msys2 {0}
+        run: LC_ALL=C pacman -Q | LC_ALL=C sort > "$(cygpath -u "$RUNNER_TEMP")/fl-raw-toolchain.txt"
+      - name: Verify the C and C++ OpenMP authoring runtime
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          probe="$(cygpath -u "$RUNNER_TEMP")/fl-raw-openmp"
+          mkdir -p "$probe"
+          cat > "$probe/probe.c" <<'C'
+          #include <omp.h>
+          #include <stdio.h>
+          #if !defined(_OPENMP) || _OPENMP < 201511
+          #error OpenMP 4.5 or newer is required
+          #endif
+          int main(void) {
+            int threads = 0;
+            #pragma omp parallel reduction(+:threads)
+            threads += 1;
+            printf("OpenMP=%d threads=%d\n", _OPENMP, threads);
+            return threads < 1;
+          }
+          C
+          for compiler in gcc g++; do
+            "$compiler" -fopenmp "$probe/probe.c" -o "$probe/probe.exe"
+            "$probe/probe.exe"
+          done
+      - name: Qualify the candidate toolchain PE inspector
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          python tools/qualify_windows_pe.py --dependencies "$env:MSYS2_LOCATION/ucrt64" --work "$env:RUNNER_TEMP/fl-raw-pe-probe" | Tee-Object -FilePath "$env:RUNNER_TEMP/fl-raw-pe-qualification.json"
+          if ($LASTEXITCODE) { throw 'RAW toolchain PE preflight failed' }
+      - name: Mark this receipt as inventory evidence only
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          (root / 'fl-raw-toolchain-scope.json').write_text(json.dumps({
+              'sourceRevision': os.environ['GITHUB_SHA'],
+              'scope': 'windows-raw-toolchain-inventory',
+              'engineBuildPerformed': False,
+              'fullRawConformance': False,
+              'installedPlatformQualified': False,
+          }, indent=2) + '\n')
+      - name: Retain the candidate package manifest and probe evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-raw-toolchain-inventory
+          path: |
+            ${{ runner.temp }}/fl-raw-toolchain.txt
+            ${{ runner.temp }}/fl-raw-toolchain-scope.json
+            ${{ runner.temp }}/fl-raw-pe-qualification.json
+          retention-days: 7
+          if-no-files-found: error

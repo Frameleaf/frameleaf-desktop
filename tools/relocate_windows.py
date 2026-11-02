@@ -30,7 +30,73 @@ def inspect_pe(tool: Path, source: Path, *, cwd: Path, env: dict[str, str]) -> s
         if error_log := env.get("FRAMELEAF_BUILD_ERROR_LOG"):
             Path(error_log).write_text((result.stderr or result.stdout)[-32768:], encoding="utf-8")
         raise BuildError("host_pe_inspection_failed")
+    listed = [line.split("DLL Name:", 1)[1].strip().casefold()
+              for line in result.stdout.splitlines() if "DLL Name:" in line]
+    if sorted(listed) != sorted(_import_names(source)):
+        raise BuildError("host_pe_imports_missing")
     return result.stdout.strip()
+
+
+def _import_names(source: Path) -> list[str]:
+    """Bound import descriptors to file-backed sections independently of objdump output."""
+    try:
+        with source.open("rb") as stream:
+            size = stream.seek(0, 2)
+            stream.seek(0)
+            header = stream.read(69656)
+            if not pe_imports(header):
+                return []
+            pe = int.from_bytes(header[60:64], "little")
+            count = int.from_bytes(header[pe + 6:pe + 8], "little")
+            optional = pe + 24
+            table = optional + int.from_bytes(header[pe + 20:pe + 22], "little")
+            if not 1 <= count <= 96 or table + count * 40 > size:
+                raise ValueError("invalid sections")
+            stream.seek(table)
+            sections = []
+            for _ in range(count):
+                entry = stream.read(40)
+                if len(entry) != 40:
+                    raise ValueError("truncated section")
+                address = int.from_bytes(entry[12:16], "little")
+                length = int.from_bytes(entry[16:20], "little")
+                offset = int.from_bytes(entry[20:24], "little")
+                if offset + length > size or address + length > 2**32:
+                    raise ValueError("section outside file")
+                sections.append((address, length, offset))
+            def location(address, length):
+                matches = [(offset + address - start, size - (address - start))
+                           for start, size, offset in sections
+                           if start <= address and address - start + length <= size]
+                if len(matches) != 1:
+                    raise ValueError("import outside a unique file-backed section")
+                return matches[0]
+            address = int.from_bytes(header[optional + 120:optional + 124], "little")
+            length = int.from_bytes(header[optional + 124:optional + 128], "little")
+            location(address, length)
+            names = []
+            for index in range(min(length // 20, 513)):
+                offset, _ = location(address + index * 20, 20)
+                stream.seek(offset)
+                descriptor = stream.read(20)
+                if len(descriptor) != 20:
+                    raise ValueError("truncated import descriptor")
+                if descriptor == b"\0" * 20:
+                    return names
+                name = int.from_bytes(descriptor[12:16], "little")
+                offset, available = location(name, 1)
+                stream.seek(offset)
+                encoded = stream.read(min(available, 260))
+                end = encoded.find(b"\0")
+                if end < 0:
+                    raise ValueError("unterminated import name")
+                reference = encoded[:end].decode("ascii")
+                if not re.fullmatch(r"[A-Za-z0-9_.+-]+\.(?:dll|drv)", reference, re.IGNORECASE):
+                    raise ValueError("invalid import name")
+                names.append(reference.casefold())
+            raise ValueError("unterminated import descriptors")
+    except (OSError, ValueError) as error:
+        raise BuildError("host_pe_dependency_invalid") from error
 
 
 def pe_imports(data: bytes) -> bool:
