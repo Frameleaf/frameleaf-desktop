@@ -18,7 +18,10 @@ class RuntimeBuilderTests(unittest.TestCase):
                          device + " .txt", "bin/" + device + "   .data"]:
                 with self.subTest(name=name), self.assertRaises(builder.BuildError):
                     builder.relative(name)
-        for name in ["bin/COM10.dll", "COMPOSITE.json", "company/normal"]:
+        for name in [" CON.txt", "bin/ NUL.data", " bin/tool", "bin/ ordinary.txt"]:
+            with self.subTest(name=name), self.assertRaises(builder.BuildError):
+                builder.relative(name)
+        for name in ["bin/COM10.dll", "COMPOSITE.json", "company/normal", "bin/normal name.txt"]:
             self.assertEqual(builder.relative(name), name)
 
     def test_source_build_exception_is_only_used_by_the_locked_legacy_dependency(self):

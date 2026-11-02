@@ -44,7 +44,8 @@ class FfmpegPackageTests(unittest.TestCase):
         cases = [
             [("good", "file"), (name, "file")]
             for name in ["../escape", "/absolute", "C:/drive", "file:stream", "CON.txt",
-                         "folder/../escape", "trailing.", "folder\\name"]
+                         "folder/../escape", "trailing.", "folder\\name", " CON.txt", "bin/ NUL.data",
+                         " bin/tool", "bin/ ordinary.txt"]
         ] + [
             [("bin/tool", "file"), ("BIN/tool", "file")],
             [("file", "file"), ("file/child", "file")],
@@ -105,6 +106,10 @@ class FfmpegPackageTests(unittest.TestCase):
                        *[f"{prefix}{digit}" for prefix in ["COM", "LPT"] for digit in "¹²³"]]],
                     ["bin/good", "bin/CON .txt"],
                     ["bin/good", "bin/LPT³   .data"],
+                    ["bin/good", " CON.txt"],
+                    ["bin/good", "bin/ NUL.data"],
+                    ["bin/good", " bin/tool"],
+                    ["bin/good", "bin/ ordinary.txt"],
                 ]
             ):
                 archive = root / f"{index}.zip"

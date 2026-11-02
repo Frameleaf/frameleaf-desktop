@@ -32,6 +32,7 @@ def relative(value: str) -> str:
         stem = part.split(".")[0].rstrip(" ").upper()
         if (
             part in {"", ".", ".."}
+            or part.startswith(" ")
             or part.endswith((".", " "))
             or any(ord(char) < 32 or ord(char) == 127 for char in part)
             or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
