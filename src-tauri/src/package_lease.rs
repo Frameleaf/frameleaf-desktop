@@ -128,13 +128,31 @@ fn open(candidate: &Path, name: &str, initialize: bool) -> Result<File, String> 
     }
     Ok(file)
 }
-pub(crate) struct CodeLease(File);
+pub(crate) struct CodeLease {
+    file: File,
+    #[cfg(unix)]
+    inherited: std::sync::atomic::AtomicBool,
+}
+impl Drop for CodeLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if !self.inherited.load(std::sync::atomic::Ordering::Relaxed) {
+            // Unrelated forks must not retain a reader that was never handed to a child.
+            let _ = self.file.unlock();
+        }
+    }
+}
 impl CodeLease {
     pub(crate) fn acquire(candidate: &Path) -> Result<Self, String> {
         let file = open(candidate, LEASE, true)?;
         file.try_lock_shared().map_err(|_| "host_package_busy")?;
+        let lease = Self {
+            file,
+            #[cfg(unix)]
+            inherited: std::sync::atomic::AtomicBool::new(false),
+        };
         match fs::symlink_metadata(candidate.join(FENCE)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(lease),
             _ => Err("host_package_maintenance".into()),
         }
     }
@@ -142,7 +160,9 @@ impl CodeLease {
         #[cfg(unix)]
         {
             use std::os::{fd::AsRawFd, unix::process::CommandExt};
-            let fd = self.0.as_raw_fd();
+            self.inherited
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let fd = self.file.as_raw_fd();
             command.env("FRAMELEAF_CODE_LEASE_FD", fd.to_string());
             // Preserve this already-open inode in Node, including after the desktop owner crashes.
             unsafe {
@@ -158,7 +178,7 @@ impl CodeLease {
             }
         }
         #[cfg(not(unix))]
-        let _ = (&self.0, command); // Windows process owners retain the lease through Job Object cleanup.
+        let _ = (&self.file, command); // Windows process owners retain the lease through Job Object cleanup.
     }
 }
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -243,6 +263,21 @@ mod tests {
         assert!(CodeLease::acquire(&f.0).is_err());
         Maintenance::acquire(&f.0).unwrap().finish().unwrap();
         CodeLease::acquire(&f.0).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unhanded_reader_releases_a_lock_even_with_a_fork_style_descriptor_copy() {
+        let f = Fixture::new();
+        let reader = CodeLease::acquire(&f.0).unwrap();
+        let inherited = reader.file.try_clone().unwrap();
+        let other_reader = CodeLease::acquire(&f.0).unwrap();
+        drop(reader);
+        assert!(Maintenance::acquire(&f.0).is_err());
+        drop(other_reader);
+        let writer = Maintenance::acquire(&f.0).unwrap();
+        writer.require_unfenced().unwrap();
+        drop(writer);
+        drop(inherited);
     }
     #[cfg(unix)]
     #[test]
