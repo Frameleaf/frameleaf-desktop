@@ -1,6 +1,10 @@
 //! OS process ownership; the Python gate opens only after this owner is installed.
 use std::process::{Child, Command};
 
+#[cfg(all(test, windows))]
+#[path = "process_tree_windows_tests.rs"]
+mod windows_tests;
+
 #[cfg(unix)]
 pub struct ProcessTree(i32);
 #[cfg(windows)]
