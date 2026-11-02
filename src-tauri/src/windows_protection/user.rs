@@ -110,19 +110,32 @@ fn descriptor(user: &[u8]) -> Result<Local, String> {
     }
     Ok(value)
 }
-/// Data/list access makes the no-delete share lock effective; metadata-only opens do not pin names.
+/// Only directories need data/list access for effective pins; files need metadata/security access.
 fn open(path: &Path) -> Result<File, String> {
-    let file = OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
-        .share_mode(3)
-        .custom_flags(
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
-        )
-        .open(path)
-        .map_err(|_| ERROR)?;
+    let metadata_access = READ_CONTROL | FILE_READ_ATTRIBUTES;
+    let acquire = |access| {
+        OpenOptions::new()
+            .access_mode(access)
+            .share_mode(3)
+            .custom_flags(
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | FILE_FLAG_OPEN_REPARSE_POINT
+                    | FILE_FLAG_OPEN_NO_RECALL,
+            )
+            .open(path)
+            .map_err(|_| ERROR)
+    };
+    let mut file = acquire(metadata_access)?;
     let info = file.metadata().map_err(|_| ERROR)?;
     if (!info.is_dir() && !info.is_file()) || info.file_attributes() & 0x400 != 0 {
         return Err(ERROR.into());
+    }
+    if info.is_dir() {
+        file = acquire(metadata_access | FILE_LIST_DIRECTORY)?;
+        let info = file.metadata().map_err(|_| ERROR)?;
+        if !info.is_dir() || info.file_attributes() & 0x400 != 0 {
+            return Err(ERROR.into());
+        }
     }
     Ok(file)
 }
