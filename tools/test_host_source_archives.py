@@ -94,7 +94,7 @@ class HostSourceArchiveTests(unittest.TestCase):
             env = build_environment(root, os.environ)
             source = root / 'source'
             source.mkdir()
-            name = 'source with spaces\nand newline.txt'
+            name = 'source with spaces.txt' if os.name == 'nt' else 'source with spaces\nand newline.txt'
             (source / name).write_bytes(b'committed bytes\n')
             (source / '.gitattributes').write_text('*.txt text eol=crlf\n', encoding='utf-8')
             for arguments in [
