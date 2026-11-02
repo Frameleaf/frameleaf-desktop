@@ -1063,7 +1063,25 @@ impl VerifiedHostRuntime {
         {
             return Err("host_config_invalid".into());
         }
-        if state.starts_with(&self.root) || self.root.starts_with(state) {
+        #[cfg(windows)]
+        let stable_state = {
+            // Compare the full candidate before private_directory can create it.
+            match std::fs::symlink_metadata(state) {
+                Ok(_) => crate::windows_protection::stable_path(state),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = state.parent().ok_or("host_state_overlaps_runtime")?;
+                    let name = state.file_name().ok_or("host_state_overlaps_runtime")?;
+                    crate::windows_protection::stable_path(parent).map(|parent| parent.join(name))
+                }
+                Err(_) => return Err("host_state_overlaps_runtime".into()),
+            }
+            .map_err(|_| "host_state_overlaps_runtime")?
+        };
+        #[cfg(windows)]
+        let overlap_state = stable_state.as_path();
+        #[cfg(not(windows))]
+        let overlap_state = state;
+        if overlap_state.starts_with(&self.root) || self.root.starts_with(overlap_state) {
             return Err("host_state_overlaps_runtime".into());
         }
         let code_lease = crate::package_lease::CodeLease::acquire(

@@ -111,6 +111,25 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn overlapping_host_state_is_rejected_before_any_directory_is_created() {
+    let fixture = Fixture::new();
+    let runtime = fixture.verify().unwrap();
+    let missing = fixture.0.join("state");
+    for state in [&fixture.0, &missing, &fixture.2] {
+        assert!(matches!(
+            runtime.start(
+                state,
+                &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()),
+                54321,
+                54322,
+            ),
+            Err(code) if code == "host_state_overlaps_runtime"
+        ));
+        assert!(!missing.exists());
+    }
+}
+
+#[test]
 fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
     let mut fixture = Fixture::new();
     let verified = fixture.verify().unwrap();
