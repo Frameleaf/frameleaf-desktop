@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime
+from http.client import HTTPException
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-from urllib.error import URLError
 from urllib.parse import urlsplit
 import zipfile
 
@@ -40,8 +40,8 @@ def build(source: Path, revision: str, output: Path) -> None:
     docker = git_blob(git, source, revision, 'server/Dockerfile', env)
     lock = git_blob(git, source, revision, 'server/base-image/geodata/geodata.lock', env)
     try:
-        snapshots = re.findall(r'^ARG GEODATA_SNAPSHOT=(\S+)$', docker.decode(), re.M)
-        dates = re.findall(r'^ARG GEODATA_DATE=(\S+)$', docker.decode(), re.M)
+        snapshots = re.findall(r'^ARG GEODATA_SNAPSHOT=(\S+)\r?$', docker.decode(), re.M)
+        dates = re.findall(r'^ARG GEODATA_DATE=(\S+)\r?$', docker.decode(), re.M)
         if (len(snapshots) != 1 or len(dates) != 1
                 or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', snapshots[0])
                 or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T00:00:00\+00:00', dates[0])
@@ -80,7 +80,7 @@ def build(source: Path, revision: str, output: Path) -> None:
             for url in [f'https://static.frameleaf.cloud/geodata/{snapshots[0]}/{name}', capture]:
                 try:
                     download(url, partial, digest)
-                except (URLError, TimeoutError, BuildError):
+                except (OSError, HTTPException, BuildError):
                     partial.unlink(missing_ok=True)
                     continue
                 partial.rename(data / name)
