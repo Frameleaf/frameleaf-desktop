@@ -121,9 +121,12 @@ class WindowsHostAssetsTests(unittest.TestCase):
             (payload / 'payload').chmod(0o755)
             (output / 'work').mkdir()
             (output / 'work/private-state').write_text('never archive')
+            source_archive = output / 'work/source.tar'
+            subprocess.run(['git', 'archive', '--format=tar', '--output', str(source_archive), revision],
+                           cwd=source, env=git_environment, check=True, capture_output=True)
             receipt = {
                 'schemaVersion': 1, 'sourceRevision': revision,
-                'sourceArchiveSha256': 'b' * 64,
+                'sourceArchiveSha256': hashlib.sha256(source_archive.read_bytes()).hexdigest(),
                 'nodeSha256': hashlib.sha256((node if name == 'plugin' else studio_node).read_bytes()).hexdigest(),
                 'qualification': 'passed', 'runtimeQualified': False, 'redistributable': False,
                 'files': {'payload': {'bytes': len(content), 'sha256': hashlib.sha256(content).hexdigest()}},
@@ -179,6 +182,7 @@ class WindowsHostAssetsTests(unittest.TestCase):
         script = self.archive_script()
         for name, directory in [('web', 'www'), ('plugin', 'plugin'), ('studio', 'studio-worker')]:
             failures = ['failed', 'source', 'node', 'node-swap', 'runtime', 'redistribution', 'archive',
+                        'archive-sha', 'archive-bytes', 'archive-missing',
                         'payload', 'extra', 'lock', 'schema', 'package-manager']
             if name == 'studio': failures.append('browser')
             for damage in failures:
@@ -196,6 +200,9 @@ class WindowsHostAssetsTests(unittest.TestCase):
                     elif damage == 'runtime': receipt['runtimeQualified'] = True
                     elif damage == 'redistribution': receipt['redistributable'] = True
                     elif damage == 'archive': receipt['sourceArchiveSha256'] = 'invalid'
+                    elif damage == 'archive-sha': receipt['sourceArchiveSha256'] = 'd' * 64
+                    elif damage == 'archive-bytes': (output / 'work/source.tar').write_bytes(b'changed')
+                    elif damage == 'archive-missing': (output / 'work/source.tar').unlink()
                     elif damage == 'payload': (output / directory / 'payload').write_bytes(b'changed')
                     elif damage == 'extra': (output / directory / 'extra').write_bytes(b'changed')
                     elif damage == 'lock': receipt['studioLockfileSha256' if name == 'studio' else 'lockfileSha256'] = 'd' * 64

@@ -13,6 +13,20 @@ from build_runtime import BuildError
 
 
 class PluginToolPinTests(unittest.TestCase):
+    def test_plugin_refuses_the_studio_node_before_archiving_or_compiling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            node = root / "studio-node.exe"
+            node.write_bytes(b"synthetic Node 22; never executed")
+            with patch.object(build_host_plugin.shutil, "which", return_value="fixture-tool"), \
+                 patch.object(build_host_plugin, "git_blob", return_value=b'{"packageManager":"pnpm@12.11.2"}'), \
+                 patch.object(build_host_plugin, "run", return_value="v22.23.4") as command, \
+                 self.assertRaisesRegex(BuildError, "^host_plugin_toolchain_unapproved$"):
+                build_host_plugin.build(root, "a" * 40, node, root / "output")
+            self.assertEqual(command.call_count, 1)
+            self.assertEqual(command.call_args.args[0], [node, "--version"])
+            self.assertFalse((root / "output/work/source.tar").exists())
+
     def test_known_folder_verification_refuses_runner_or_malformed_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary).resolve()

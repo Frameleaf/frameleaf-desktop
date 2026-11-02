@@ -128,6 +128,7 @@ jobs:
               component = root / name
               regular(component / directory)
               regular(component / 'qualification.json')
+              regular(component / 'work/source.tar')
               receipt = json.loads((component / 'qualification.json').read_text())
               if (type(receipt.get('schemaVersion')) is not int or receipt['schemaVersion'] != 1
                   or receipt.get('sourceRevision') != os.environ['HOST_SOURCE_REVISION']
@@ -137,6 +138,7 @@ jobs:
                   or receipt.get('runtimeQualified') is not False or receipt.get('redistributable') is not False
                   or not isinstance(receipt.get('sourceArchiveSha256'), str)
                   or not re.fullmatch('[a-f0-9]{64}', receipt['sourceArchiveSha256'])
+                  or receipt['sourceArchiveSha256'] != sha256(component / 'work/source.tar')
                   or receipt.get('files') != inventory(component / directory)):
                   raise SystemExit('Source-bound successful qualification and unchanged asset inventory are required')
               if name in {'web', 'plugin'} and (receipt.get('pnpmVersion') != '12.11.2'
