@@ -75,22 +75,40 @@ fn physical_id(path: &Path) -> Result<String, String> {
     crate::copy_source::root_identity(&directory)
         .map_err(|_| "host_profile_identity_unavailable".into())
 }
+fn storage_ancestors(path: &Path) -> Result<Vec<&Path>, String> {
+    #[cfg(any(windows, test))]
+    if let Some(value) = path.to_str().filter(|value| {
+        value.starts_with(r"\\?\GLOBALROOT") || value.starts_with(r"\\.\GLOBALROOT")
+    }) {
+        return Ok(crate::windows_protection::filesystem_components(value)
+            .ok_or("host_control_config_invalid")?
+            .into_iter()
+            .rev()
+            .map(Path::new)
+            .collect());
+    }
+    Ok(path.ancestors().collect())
+}
 pub(crate) fn separate_paths(candidate: &Path, state: &Path) -> Result<(), String> {
     // Compare physical directory identities too: case aliases cannot bypass payload/state separation.
     let candidate_id = physical_id(candidate)?;
+    let ancestors = storage_ancestors(state)?;
     let existing = if state.exists() {
-        state
+        ancestors.as_slice()
     } else {
-        state.parent().ok_or("host_control_config_invalid")?
+        ancestors
+            .get(1..)
+            .filter(|paths| !paths.is_empty())
+            .ok_or("host_control_config_invalid")?
     };
-    for ancestor in existing.ancestors() {
+    for ancestor in existing {
         if physical_id(ancestor)? == candidate_id {
             return Err("host_state_overlaps_runtime".into());
         }
     }
     if state.exists() {
         let state_id = physical_id(state)?;
-        for ancestor in candidate.ancestors() {
+        for ancestor in storage_ancestors(candidate)? {
             if physical_id(ancestor)? == state_id {
                 return Err("host_state_overlaps_runtime".into());
             }
@@ -655,6 +673,75 @@ mod tests {
         assert!(cancelled.load(Ordering::Acquire));
         assert!(invalid.load(Ordering::Acquire));
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn kernel_storage_ancestry_stops_at_the_filesystem_root() {
+        for prefix in [r"\\?\GLOBALROOT", r"\\.\GLOBALROOT"] {
+            let root = format!(r"{prefix}\Device\HarddiskVolume12\");
+            let parent = format!(r"{root}Frameleaf");
+            let child = format!(r"{parent}\state");
+            assert_eq!(
+                storage_ancestors(Path::new(&child)).unwrap(),
+                vec![Path::new(&child), Path::new(&parent), Path::new(&root)]
+            );
+            assert_eq!(
+                storage_ancestors(Path::new(&root)).unwrap(),
+                vec![Path::new(&root)]
+            );
+            let direct_state = format!(r"{root}state");
+            assert_eq!(
+                &storage_ancestors(Path::new(&direct_state)).unwrap()[1..],
+                &[Path::new(&root)]
+            );
+            for bad in [
+                format!(r"{prefix}\Device"),
+                format!(r"{prefix}\Device\HarddiskVolume0\state"),
+                format!(r"{prefix}\Device\HarddiskVolume12\..\state"),
+            ] {
+                assert!(storage_ancestors(Path::new(&bad)).is_err());
+            }
+        }
+        let ordinary = std::env::temp_dir().join("synthetic-state");
+        assert_eq!(
+            storage_ancestors(&ordinary).unwrap(),
+            ordinary.ancestors().collect::<Vec<_>>()
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn kernel_volume_separation_accepts_siblings_and_refuses_physical_overlap() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-kernel-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let stable = crate::windows_protection::stable_path(&root).unwrap();
+        let candidate = stable.join("Candidate");
+        std::fs::create_dir(&candidate).unwrap();
+        let volume_root =
+            crate::windows_protection::filesystem_components(stable.to_str().unwrap()).unwrap()[0];
+        let root_state = Path::new(volume_root)
+            .join(format!("frameleaf-missing-state-{}", uuid::Uuid::new_v4()));
+        assert!(!root_state.exists());
+        assert!(separate_paths(&candidate, &root_state).is_ok());
+        assert!(!root_state.exists());
+        let state = stable.join("state");
+        assert!(separate_paths(&candidate, &state).is_ok());
+        assert!(!state.exists());
+        std::fs::create_dir(&state).unwrap();
+        assert!(separate_paths(&candidate, &state).is_ok());
+        for overlap in [
+            candidate.clone(),
+            candidate.join("state"),
+            stable.clone(),
+            stable.join("candidate").join("state"),
+        ] {
+            assert_eq!(
+                separate_paths(&candidate, &overlap).unwrap_err(),
+                "host_state_overlaps_runtime"
+            );
+        }
+        assert!(!candidate.join("state").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
