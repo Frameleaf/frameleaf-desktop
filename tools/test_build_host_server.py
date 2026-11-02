@@ -29,6 +29,7 @@ class HostServerTests(unittest.TestCase):
                 ".pnpmfile.cjs": b"fixture\n", "LICENSE": b"fixture\n",
                 "packages/sdk/fixture": b"fixture", "packages/plugin-sdk/fixture": b"fixture",
                 "packages/sql-tools/fixture": b"fixture", "packages/patches/fixture": b"fixture",
+                "packages/locked-crypto/dist/index.js": b"export const fixture = true;\n",
                 "server/src/schema/catalog/fixture.json": canonical,
                 "studio/runtime/fixture": b"fixture", "studio/tools/fixture": b"fixture",
                 "docker/scripts/verify-server-package.mjs": b"fixture",
@@ -57,6 +58,10 @@ class HostServerTests(unittest.TestCase):
                     return checked_run(arguments, cwd=cwd, env=env)
                 self.assertEqual(
                     (output / "work/source/server/src/schema/catalog/fixture.json").read_bytes(), canonical
+                )
+                self.assertEqual(
+                    (output / "work/source/packages/locked-crypto/dist/index.js").read_bytes(),
+                    fixtures["packages/locked-crypto/dist/index.js"],
                 )
                 raise BuildError("canonical_archive_checked_before_build")
 
@@ -128,7 +133,7 @@ class HostServerTests(unittest.TestCase):
             with self.subTest(origin=origin, version=version), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 dependencies = {}
-                for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+                for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools", "@frameleaf/locked-crypto"]:
                     package = root / "node_modules" / name / "package.json"
                     package.parent.mkdir(parents=True)
                     package.write_text(json.dumps({"name": name, "version": version}))
@@ -160,7 +165,7 @@ class HostServerTests(unittest.TestCase):
             deployed = root / "deployment-fixture"
             deployed.mkdir()
             dependencies = {}
-            for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+            for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools", "@frameleaf/locked-crypto"]:
                 package = deployed / "node_modules" / name / "package.json"
                 package.parent.mkdir(parents=True)
                 package.write_text(json.dumps({"name": name, "version": "1.2.3"}))

@@ -74,7 +74,7 @@ def clean_runtime_metadata(runtime: Path) -> None:
     dependencies = metadata.get("dependencies") if isinstance(metadata, dict) else None
     if not isinstance(dependencies, dict):
         raise BuildError("host_server_package_metadata_invalid")
-    for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools"]:
+    for name in ["@frameleaf/plugin-sdk", "@frameleaf/sql-tools", "@frameleaf/locked-crypto"]:
         path = runtime / "node_modules" / name / "package.json"
         regular(path)
         workspace = json.loads(path.read_text())
@@ -143,6 +143,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             "packages/sdk",
             "packages/plugin-sdk",
             "packages/sql-tools",
+            "packages/locked-crypto",
             "packages/patches",
             "server",
             "studio/runtime",
