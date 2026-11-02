@@ -56,16 +56,23 @@ jobs:
           if [ -d "$RUNNER_TEMP/frameleaf-linux-database" ]; then
             dpkg-query -W build-essential bison flex pkg-config libicu-dev libssl-dev uuid-dev liblz4-dev libzstd-dev libxml2-dev zlib1g-dev > "$RUNNER_TEMP/frameleaf-linux-database/dependency-versions.txt"
           fi
+      - name: Archive the native component with its executable modes
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/frameleaf-linux-database/prefix" ]; then
+            tar -czf "$RUNNER_TEMP/frameleaf-linux-database/prefix.tar.gz" -C "$RUNNER_TEMP/frameleaf-linux-database" prefix
+          fi
       - name: Retain private component and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-linux-private-database-${{ matrix.architecture }}
           path: |
-            ${{ runner.temp }}/frameleaf-linux-database/prefix/
+            ${{ runner.temp }}/frameleaf-linux-database/prefix.tar.gz
             ${{ runner.temp }}/frameleaf-linux-database/qualification.json
             ${{ runner.temp }}/frameleaf-linux-database/build.log
             ${{ runner.temp }}/frameleaf-linux-database/command-error.log
+            ${{ runner.temp }}/frameleaf-linux-database/postgres.log
             ${{ runner.temp }}/frameleaf-linux-database/dependency-versions.txt
             ${{ runner.temp }}/frameleaf-linux-database/work/postgres/postgresql-19beta4/config.log
           retention-days: 7

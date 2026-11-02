@@ -440,8 +440,9 @@ required; receipts retain `redistributable: false`.
 
 The [private Linux database candidate workflow](.github/workflows/linux-host-database.yml)
 runs the existing source-pinned builder on Ubuntu 24 x64 and ARM64, one target at a
-time. Start it manually from `main`; it retains the component prefix, qualification
-receipt and dependency/build diagnostics for seven days. It does not install a
+time. Start it manually from `main`; it retains the component as `prefix.tar.gz`
+with executable modes preserved, plus qualification, server and dependency/build
+diagnostics for seven days. It does not install a
 system PostgreSQL server, publish a release or provide signing credentials.
 These development components still require portable dependency packaging and
 full-host/installed qualification; `redistributable` and database certification
