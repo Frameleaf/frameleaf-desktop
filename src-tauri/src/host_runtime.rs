@@ -1121,9 +1121,10 @@ impl VerifiedHostRuntime {
         if let Some(system_root) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", system_root);
         }
-        code_lease.inherit(&mut command);
         crate::process_tree::configure(&mut command);
-        let mut child = command.spawn().map_err(|_| "host_agent_start_failed")?;
+        let mut child = code_lease
+            .spawn(&mut command)
+            .map_err(|_| "host_agent_start_failed")?;
         let tree = match crate::process_tree::ProcessTree::attach(&child) {
             Ok(tree) => tree,
             Err(error) => {
