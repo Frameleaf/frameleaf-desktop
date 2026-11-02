@@ -59,8 +59,8 @@ class WindowsHostAssetsTests(unittest.TestCase):
                     if arguments == [node, '--version']: return 'v22.23.4'
                     if arguments[-1] == '--version': return '12.11.2'
                     if arguments[1] == 'install':
-                        self.assertEqual(real_which('tar', path=kwargs['env']['PATH']), str(tar))
-                        self.assertEqual(real_which('git', path=kwargs['env']['PATH']), real_which('git'))
+                        self.assertEqual(Path(real_which('tar', path=kwargs['env']['PATH'])), tar)
+                        self.assertEqual(Path(real_which('git', path=kwargs['env']['PATH'])), Path(real_which('git')))
                         raise BuildError('test_dependency_install_boundary')
                     return run(arguments, **kwargs)
                 real_which = builder.shutil.which

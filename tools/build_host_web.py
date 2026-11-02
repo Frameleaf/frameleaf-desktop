@@ -48,8 +48,8 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             str(node.parent),
             str(Path(pnpm).parent),
             str(Path(bootstrap).parent),
-            str(Path(git).parent),
             str(Path(tar).parent),
+            str(Path(git).parent),
             os.defpath,
         ]
     )
