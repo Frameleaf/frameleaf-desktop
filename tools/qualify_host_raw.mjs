@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -17,17 +17,19 @@ assert.equal(
 );
 assert.ok(isAbsolute(runtime) && isAbsolute(component));
 assert.equal(process.version, "v26.11.1");
+const extension = process.platform === "win32" ? ".exe" : "";
 assert.ok(
-  ["darwin", "linux"].includes(process.platform),
-  "This native RAW fixture supports macOS and Linux only",
+  ["darwin", "linux", "win32"].includes(process.platform),
+  "Unsupported native RAW fixture platform",
 );
 const receipt = JSON.parse(
   await readFile(join(component, "qualification.json"), "utf8"),
 );
-assert.equal(receipt.qualification, "passed");
+assert.equal(receipt.qualification, "passed", "RAW component is not qualified");
 const serverReceipt = JSON.parse(
   await readFile(join(runtime, "qualification.json"), "utf8"),
 );
+assert.equal(serverReceipt.qualification, "passed", "Server binding is not qualified");
 assert.ok(/^[a-f0-9]{40}$/.test(serverReceipt.sourceRevision));
 if (serverReceipt.sourceRevision !== receipt.sourceRevision) {
   assert.deepEqual(serverReceipt.rawSource, receipt.source);
@@ -35,34 +37,38 @@ if (serverReceipt.sourceRevision !== receipt.sourceRevision) {
 }
 const engine = join(runtime, "raw");
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
-const executable = join(engine, "bin/darktable-cli");
+const renderer = "bin/darktable-cli" + extension;
+const decoder = "bin/dcraw_emu" + extension;
+const executable = join(engine, renderer);
 assert.equal(
   hash(await readFile(executable)),
-  receipt.files["bin/darktable-cli"].sha256,
+  receipt.files[renderer].sha256,
 );
 const root = await mkdtemp(join(tmpdir(), "frameleaf-private-raw-"));
 assert.equal(
-  hash(await readFile(join(engine, "bin/dcraw_emu"))),
-  receipt.files["bin/dcraw_emu"].sha256,
+  hash(await readFile(join(engine, decoder))),
+  receipt.files[decoder].sha256,
 );
 const environment = {
   ...hostEnvironment({
     runtime,
     state: root,
     entryPoints: {
-      ffmpeg: "media-tools/ffmpeg",
-      ffprobe: "media-tools/ffprobe",
-      node: "node",
+      ffmpeg: "media-tools/ffmpeg" + extension,
+      ffprobe: "media-tools/ffprobe" + extension,
+      node: "node" + extension,
       // RAW component checks do not execute the browser role.
-      studioBrowser: "browser/chrome",
-      studioBrowserGuard: "studio/guard/studio-browser-guard",
+      studioBrowser: "browser/chrome" + extension,
+      studioBrowserGuard: "studio/guard/studio-browser-guard" + extension,
       studio: "studio/tools/bundled-worker.mjs",
-      postgres: "pg/bin/postgres",
-      rawRenderer: "raw/bin/darktable-cli",
-      rawDecoder: "raw/bin/dcraw_emu",
+      postgres: "pg/bin/postgres" + extension,
+      rawRenderer: "raw/" + renderer,
+      rawDecoder: "raw/" + decoder,
     },
   }),
   TMPDIR: root,
+  TMP: root,
+  TEMP: root,
   OMP_THREAD_LIMIT: "1",
   FRAMELEAF_HDR_BINDING: join(runtime, "media/image-hdr.node"),
 };
@@ -177,7 +183,10 @@ try {
   const { renderDarktable, encodeNativeDevelopOutput } = await import(
     pathToFileURL(join(runtime, "server/dist/utils/darktable-renderer.js"))
   );
-  const input = join(root, "synthetic-bayer.dng");
+  const originals = join(root, "originals");
+  await mkdir(originals);
+  const inputName = "café-写真-bayer.dng";
+  const input = join(originals, inputName);
   const original = syntheticDng();
   await writeFile(input, original);
   const { renderRawWithLibRaw } = await import(
@@ -227,6 +236,11 @@ try {
   assert.equal(Math.max(previewMetadata.width, previewMetadata.height), 64);
   assert.ok(previewMetadata.icc);
   assert.equal(hash(await readFile(input)), hash(original));
+  assert.deepEqual(
+    (await readdir(originals)).map((name) => name.normalize("NFC")),
+    [inputName.normalize("NFC")],
+    "RAW rendering must not create files beside the original",
+  );
   const loadedImages = [];
   if (process.platform === "darwin") {
     for (const name of ["audit-config", "audit-cache"])
