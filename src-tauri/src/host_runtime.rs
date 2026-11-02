@@ -1182,7 +1182,14 @@ impl VerifiedHostRuntime {
                     Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                     Err(_) => {
                         monitor_owner.terminate();
-                        reap::confirm(|| child.wait().map(|_| ()));
+                        if reap::confirm(|| child.wait().map(|_| ())).is_err() {
+                            let _ = exit_sender.send(Err("host_process_state_failed".into()));
+                            // Ownership loss cannot authorize PID reuse or release either lease.
+                            // shortcut: retain leases until process-level recovery; automatic recovery needs identity-bound exit proof.
+                            loop {
+                                std::thread::park();
+                            }
+                        }
                         break Err("host_process_state_failed".into());
                     }
                 }
