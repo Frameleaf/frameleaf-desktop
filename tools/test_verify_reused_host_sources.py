@@ -87,7 +87,22 @@ class ReusedHostSourceTests(unittest.TestCase):
         self.assertFalse(result['redistributable'])
 
     def test_source_and_receipt_contract_drift_is_refused(self):
-        for damage in ['database', 'raw-patch', 'raw-source', 'media', 'codec', 'native', 'fixture', 'missing', 'added', 'failed', 'revision', 'node', 'malformed-snapshot']:
+        expected = {
+            'database': 'host_reused_database_pin_changed',
+            'raw-patch': 'host_raw_source_contract_invalid',
+            'raw-source': 'host_reused_raw_source_changed',
+            'media': 'host_reused_media_pin_changed',
+            'codec': 'host_media_source_pin_invalid',
+            'native': 'host_reused_hdr_snapshot_changed:server/native/image-hdr.cc',
+            'fixture': 'host_reused_hdr_snapshot_changed:server/test/native/fixtures/image.bin',
+            'missing': 'host_reused_hdr_snapshot_paths_changed',
+            'added': 'host_reused_hdr_snapshot_paths_changed',
+            'failed': 'host_reused_receipt_invalid',
+            'revision': 'host_reused_receipt_invalid',
+            'node': 'host_reused_hdr_host_node_changed',
+            'malformed-snapshot': 'host_reused_hdr_snapshot_invalid',
+        }
+        for damage in expected:
             with self.subTest(damage=damage):
                 blobs, receipts = self.fixture()
                 if damage == 'database': receipts['database']['pins']['postgresSourceSha256'] = '0' * 64
@@ -103,7 +118,9 @@ class ReusedHostSourceTests(unittest.TestCase):
                 elif damage == 'revision': receipts['hdr']['sourceRevision'] = 'main'
                 elif damage == 'node': receipts['hdr']['nodeVersion'] = '22.23.4'
                 elif damage == 'malformed-snapshot': receipts['hdr']['sourceFiles']['server/test/native/image-hdr.test.mjs']['sha256'] = 'invalid'
-                with self.assertRaises(BuildError): self.check(blobs, receipts)
+                with self.assertRaises(BuildError) as refused:
+                    self.check(blobs, receipts)
+                self.assertEqual(str(refused.exception), expected[damage])
 
     def test_real_git_objects_are_used_despite_dirty_worktree(self):
         blobs, receipts = self.fixture()
