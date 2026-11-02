@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -183,7 +183,10 @@ try {
   const { renderDarktable, encodeNativeDevelopOutput } = await import(
     pathToFileURL(join(runtime, "server/dist/utils/darktable-renderer.js"))
   );
-  const input = join(root, "café-写真-bayer.dng");
+  const originals = join(root, "originals");
+  await mkdir(originals);
+  const inputName = "café-写真-bayer.dng";
+  const input = join(originals, inputName);
   const original = syntheticDng();
   await writeFile(input, original);
   const { renderRawWithLibRaw } = await import(
@@ -233,6 +236,7 @@ try {
   assert.equal(Math.max(previewMetadata.width, previewMetadata.height), 64);
   assert.ok(previewMetadata.icc);
   assert.equal(hash(await readFile(input)), hash(original));
+  assert.deepEqual(await readdir(originals), [inputName], "RAW rendering must not create files beside the original");
   const loadedImages = [];
   if (process.platform === "darwin") {
     for (const name of ["audit-config", "audit-cache"])
