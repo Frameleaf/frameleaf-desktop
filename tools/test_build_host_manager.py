@@ -1,14 +1,101 @@
 import json
 import os
 import tempfile
+import subprocess
+import sys
+import tarfile
+import textwrap
 import unittest
+import zipfile
 from pathlib import Path
 
 from build_host_manager import stage_manager
 from build_runtime import BuildError
+from build_runtime import inventory
 
 
 class HostManagerTests(unittest.TestCase):
+    def workflow_archive(self):
+        workflow = Path(__file__).resolve().parents[1] / '.github/workflows/windows-host-manager.yml'
+        self.assertTrue(workflow.is_file(), 'Windows Manager component workflow is missing')
+        return textwrap.dedent(workflow.read_text().split(
+            '      - name: Archive the qualified Manager component\n', 1
+        )[1].split('        run: |\n', 1)[1].split('      - name:', 1)[0])
+
+    def qualified_fixture(self, root):
+        source = self.fixture(root)
+        output = root / 'fl-windows-manager'
+        output.mkdir()
+        component = stage_manager(source, output / 'manager', 'a' * 40)
+        receipt = component | {
+            'sourceArchiveSha256': 'b' * 64,
+            'nodeSha256': 'c' * 64,
+            'npmVersion': '11.0.0',
+            'qualification': 'passed',
+            'files': inventory(output / 'manager'),
+        }
+        (output / 'qualification.json').write_text(json.dumps(receipt))
+        return output, receipt
+
+    def test_workflow_archive_transports_only_the_qualified_manager_and_receipt(self):
+        """Archive the real staged layout; build state must not enter the downloaded component."""
+        script = self.workflow_archive()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            output, receipt = self.qualified_fixture(root)
+            (output / 'work').mkdir()
+            (output / 'work/private-state').write_text('not distributable')
+            subprocess.run([sys.executable, '-c', script], check=True,
+                           cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                           env=os.environ | {'RUNNER_TEMP': str(root), 'MANAGER_REVISION': 'a' * 40})
+            archive = output / 'manager-component.tar.gz'
+            with zipfile.ZipFile(root / 'artifact.zip', 'w') as upload:
+                upload.write(archive, archive.name)
+            with zipfile.ZipFile(root / 'artifact.zip') as download:
+                download.extractall(root / 'download')
+            with tarfile.open(root / 'download' / archive.name) as restored:
+                self.assertTrue(all(member.name == 'qualification.json' or
+                                    member.name == 'manager' or member.name.startswith('manager/')
+                                    for member in restored.getmembers()))
+                restored.extractall(root / 'restored', filter='data')
+            self.assertEqual(inventory(root / 'restored/manager'), receipt['files'])
+            self.assertEqual(json.loads((root / 'restored/qualification.json').read_text()), receipt)
+            self.assertEqual((root / 'restored/manager/LICENSE').read_text(), 'fixture license')
+
+    def test_workflow_archive_refuses_unqualified_mismatched_or_changed_payload(self):
+        """Removing a source, result, toolchain or inventory guard must allow a failing case through."""
+        script = self.workflow_archive()
+        for damage in ['failed', 'source', 'node-version', 'runtime-claim', 'redistributable-claim',
+                       'lockfile', 'node', 'archive', 'changed', 'extra', 'missing']:
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                output, receipt = self.qualified_fixture(root)
+                if damage == 'failed': receipt['qualification'] = 'failed'
+                elif damage in ['source', 'node-version', 'runtime-claim', 'redistributable-claim']:
+                    key, value = {
+                        'source': ('sourceRevision', 'd' * 40),
+                        'node-version': ('nodeVersion', '0.0.0'),
+                        'runtime-claim': ('runtimeQualified', True),
+                        'redistributable-claim': ('redistributable', True),
+                    }[damage]
+                    component_file = output / 'manager/component.json'
+                    component = json.loads(component_file.read_text())
+                    component[key] = receipt[key] = value
+                    component_file.write_text(json.dumps(component))
+                    receipt['files'] = inventory(output / 'manager')
+                elif damage == 'lockfile': receipt['lockfileSha256'] = 'd' * 64
+                elif damage == 'node': receipt['nodeSha256'] = 'not a digest'
+                elif damage == 'archive': receipt['sourceArchiveSha256'] = 'not a digest'
+                elif damage == 'changed': (output / 'manager/app/build/main.js').write_text('changed')
+                elif damage == 'extra': (output / 'manager/unqualified').write_text('extra')
+                elif damage == 'missing': (output / 'manager/LICENSE').unlink()
+                (output / 'qualification.json').write_text(json.dumps(receipt))
+                result = subprocess.run([sys.executable, '-c', script],
+                                        cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                                        env=os.environ | {'RUNNER_TEMP': str(root), 'MANAGER_REVISION': 'a' * 40})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((output / 'manager-component.tar.gz').exists())
+
     def fixture(self, root):
         source = root / "source"
         (source / "build").mkdir(parents=True)

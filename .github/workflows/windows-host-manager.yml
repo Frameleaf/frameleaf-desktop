@@ -1,0 +1,99 @@
+name: Windows Manager component
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_manager.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_runtime.py'
+      - 'tools/test_build_host_manager.py'
+      - 'tools/source_archive.py'
+      - '.github/workflows/windows-host-manager.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-manager-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  manager:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      MANAGER_REVISION: 8e85ffa3b43d7158d7fffd0dda97a3b56ed9f6a0
+      UV_THREADPOOL_SIZE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ env.MANAGER_REVISION }}
+          path: manager-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Check Manager staging and archive guards
+        run: python -m unittest discover -s tools -p test_build_host_manager.py -v
+      - name: Build the actual native Manager production component
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          python tools/build_host_manager.py --source "$env:GITHUB_WORKSPACE/manager-source" --revision $env:MANAGER_REVISION --node $node --output "$env:RUNNER_TEMP/fl-windows-manager"
+          if ($LASTEXITCODE) { throw 'Windows Manager production build and import qualification failed' }
+      - name: Archive the qualified Manager component
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import tarfile
+          sys.path.insert(0, 'tools')
+          from build_runtime import inventory, regular
+          root = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-manager'
+          regular(root / 'manager')
+          regular(root / 'manager/component.json')
+          regular(root / 'qualification.json')
+          component = json.loads((root / 'manager/component.json').read_text())
+          receipt = json.loads((root / 'qualification.json').read_text())
+          expected = {'schemaVersion', 'sourceRevision', 'nodeVersion', 'lockfileSha256',
+                      'runtimeQualified', 'redistributable'}
+          if (set(component) != expected or component['schemaVersion'] != 1
+              or component['sourceRevision'] != os.environ['MANAGER_REVISION']
+              or not re.fullmatch('[a-f0-9]{40}', component['sourceRevision'])
+              or component['nodeVersion'] != '26.11.1'
+              or component['runtimeQualified'] is not False or component['redistributable'] is not False
+              or receipt.get('qualification') != 'passed'
+              or any(receipt.get(key) != value for key, value in component.items())
+              or any(not isinstance(receipt.get(key), str) or not re.fullmatch('[a-f0-9]{64}', receipt[key])
+                     for key in ['lockfileSha256', 'nodeSha256', 'sourceArchiveSha256'])
+              or receipt.get('files') != inventory(root / 'manager')):
+              raise SystemExit('A source-bound qualified Manager component and unchanged inventory are required')
+          with tarfile.open(root / 'manager-component.tar.gz', 'w:gz') as archive:
+              archive.add(root / 'manager', arcname='manager')
+              archive.add(root / 'qualification.json', arcname='qualification.json')
+      - name: Retain the qualified private Manager component
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-manager-component
+          path: ${{ runner.temp }}/fl-windows-manager/manager-component.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain bounded Manager diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-manager-diagnostics
+          path: |
+            ${{ runner.temp }}/fl-windows-manager/qualification.json
+            ${{ runner.temp }}/fl-windows-manager/build.log
+            ${{ runner.temp }}/fl-windows-manager/command-error.log
+          retention-days: 7
+          if-no-files-found: ignore
