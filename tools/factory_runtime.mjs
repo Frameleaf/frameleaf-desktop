@@ -15,6 +15,19 @@ if (
 )
   throw new Error("runtime_factory_source_invalid");
 
+export function factorySourceRevisionFor(target) {
+  if (!profile.targets.includes(target))
+    throw new Error("runtime_factory_source_invalid");
+  // The common lock lacks an ARM Linux psutil wheel; use its explicit target approval.
+  const source =
+    target === "linux-aarch64"
+      ? profile.additionalSources?.[target]?.[0]
+      : factorySourceRevision;
+  if (!/^[a-f0-9]{40}$/.test(source))
+    throw new Error("runtime_factory_source_invalid");
+  return source;
+}
+
 export async function signFactoryRuntime(
   candidate,
   target,
@@ -32,7 +45,7 @@ export async function signFactoryRuntime(
     manifest.epoch !== epoch ||
     !profile.targets.includes(target) ||
     `${manifest.platform}-${manifest.architecture}` !== target ||
-    manifest.sourceRevision !== factorySourceRevision ||
+    manifest.sourceRevision !== factorySourceRevisionFor(target) ||
     manifest.provider !== profile.provider
   )
     throw new Error("runtime_factory_candidate_unapproved");

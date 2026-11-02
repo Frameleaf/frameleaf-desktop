@@ -23,7 +23,6 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.inputs.outputs.matrix }}
-      source_revision: ${{ steps.inputs.outputs.source_revision }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -39,12 +38,14 @@ jobs:
           node --input-type=module <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           import { releaseMatrix } from './tools/release_inputs.mjs';
-          import { factorySourceRevision } from './tools/factory_runtime.mjs';
+          import { factorySourceRevisionFor } from './tools/factory_runtime.mjs';
           const trust = JSON.parse(readFileSync('runtime/release-trust.json'));
           const epoch = Number(process.env.RUNTIME_EPOCH);
           if (!/^[1-9][0-9]*$/.test(process.env.RUNTIME_EPOCH) || !Number.isSafeInteger(epoch) || epoch < trust.minimumRuntimeEpoch)
             throw new Error('runtime_factory_epoch_invalid');
-          appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS))}\nsource_revision=${factorySourceRevision}\n`);
+          const matrix = releaseMatrix(process.env.RELEASE_PLATFORMS);
+          for (const item of matrix.include) item.source_revision = factorySourceRevisionFor(item.target);
+          appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(matrix)}\n`);
           JS
   build:
     needs: prepare
@@ -61,7 +62,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: ${{ needs.prepare.outputs.source_revision }}
+          ref: ${{ matrix.source_revision }}
           path: source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -89,7 +90,7 @@ jobs:
           echo "$tool_dir/bin" >> "$GITHUB_PATH"
       - name: Build the approved unsigned runtime without signing credentials
         env:
-          SOURCE_REVISION: ${{ needs.prepare.outputs.source_revision }}
+          SOURCE_REVISION: ${{ matrix.source_revision }}
           RUNTIME_EPOCH: ${{ inputs.epoch }}
         shell: bash
         run: |
@@ -103,6 +104,15 @@ jobs:
           path: runtime-unsigned.tar
           retention-days: 7
           if-no-files-found: error
+      - name: Retain bounded private build failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: factory-runtime-failure-${{ matrix.target }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          retention-days: 3
+          if-no-files-found: warn
   sign:
     needs: [prepare, build]
     environment: desktop-release

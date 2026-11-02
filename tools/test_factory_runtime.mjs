@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   factorySourceRevision,
+  factorySourceRevisionFor,
   signFactoryRuntime,
 } from "./factory_runtime.mjs";
 
@@ -35,7 +36,7 @@ async function fixture(t, changes = {}) {
     architecture,
     provider: "CPUExecutionProvider",
     python: "python",
-    sourceRevision: factorySourceRevision,
+    sourceRevision: factorySourceRevisionFor(`${platform}-${architecture}`),
     ...changes,
   };
   const files = {
@@ -91,7 +92,7 @@ test("factory archives use an approved source and a signature accepted by packag
     f.privatePem,
     f.policy,
   );
-  assert.equal(receipt.sourceRevision, factorySourceRevision);
+  assert.equal(receipt.sourceRevision, factorySourceRevisionFor(f.target));
   assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
 });
 
@@ -145,4 +146,52 @@ test("factory CLI never prints private-key parser input", async (t) => {
   await assert.rejects(readFile(join(f.root, "manifest.sig")), {
     code: "ENOENT",
   });
+});
+
+test("factory accepts the existing target-scoped Linux ARM approval", async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const arch = Object.getOwnPropertyDescriptor(process, "arch");
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    Object.defineProperty(process, "arch", { ...arch, value: "arm64" });
+    const profiles = JSON.parse(
+      await readFile(new URL("../runtime/profiles.json", import.meta.url)),
+    );
+    const sourceRevision =
+      profiles.profiles["cpu-ort"].additionalSources["linux-aarch64"][0];
+    const f = await fixture(t, { sourceRevision });
+    const receipt = await signFactoryRuntime(
+      f.root,
+      f.target,
+      2,
+      f.privatePem,
+      f.policy,
+    );
+    assert.equal(receipt.sourceRevision, sourceRevision);
+    const old = await fixture(t, { sourceRevision: factorySourceRevision });
+    await assert.rejects(
+      signFactoryRuntime(old.root, old.target, 2, old.privatePem, old.policy),
+      /runtime_factory_candidate_unapproved/,
+    );
+    await assert.rejects(readFile(join(old.root, "manifest.sig")), {
+      code: "ENOENT",
+    });
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    Object.defineProperty(process, "arch", arch);
+  }
+});
+
+test("factory keeps the common source outside the explicit ARM recipe", () => {
+  for (const target of [
+    "macos-aarch64",
+    "macos-x86_64",
+    "linux-x86_64",
+    "windows-x86_64",
+  ])
+    assert.equal(factorySourceRevisionFor(target), factorySourceRevision);
+  assert.throws(
+    () => factorySourceRevisionFor("windows-aarch64"),
+    /runtime_factory_source_invalid/,
+  );
 });
