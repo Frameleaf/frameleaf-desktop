@@ -856,3 +856,5 @@ Manager pairing accepts explicit HTTP or HTTPS origins. HTTP home-lab management
 is unencrypted; use a trusted network. HTTPS continues to validate certificates,
 and private certificate approval applies only to HTTPS. The separate Library Server
 connection and desktop-owned native Manager retain their existing transport rules.
+
+Windows machine layout discovery resolves the OS-owned Program Files x64 folder, verifies its physical protected path, and uses the Windows controller filename. The lookup initializes COM on the calling thread and balances only its own initialization reference. This is read-only layout support; Windows installation and full-host startup remain gated.
