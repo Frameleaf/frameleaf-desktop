@@ -838,3 +838,5 @@ application acceptance, or GPU qualification.
 Windows CI checks that this ignored test is compiled. Actual Windows execution
 requires a complete Windows candidate with private database, Manager, backup and
 media dependencies; compilation alone does not qualify Windows restore.
+
+Windows kernel-volume storage separation stops physical-identity ancestry checks at the filesystem root for both supported GLOBALROOT path forms. Self, descendant, ancestor and case-alias overlap refusals remain in place. A Windows test checks separate storage without creating the state directory; installed-app acceptance remains unverified.
