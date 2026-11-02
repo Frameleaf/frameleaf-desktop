@@ -16,6 +16,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(any(windows, test))]
+mod windows_protection;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn no_acl(path: &Path) -> Result<(), String> {
     use std::os::fd::AsRawFd;
@@ -52,7 +55,11 @@ pub(crate) fn no_acl(path: &Path) -> Result<(), String> {
 }
 /// Root-owned physical ancestors and no write-granting ACLs keep verified code immutable through spawn.
 pub(crate) fn protect(path: &Path, checked: &mut BTreeSet<PathBuf>) -> Result<(), String> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        windows_protection::protect(path, checked)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (path, checked);
         Err("native_manager_protection_unavailable".into())
