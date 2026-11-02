@@ -99,6 +99,8 @@ class FfmpegPackageTests(unittest.TestCase):
                     ["C:/outside"],
                     ["ffmpeg.exe", "FFMPEG.exe"],
                     ["link"],
+                    *[[f"bin/ff{character}mpeg.exe", "bin/ff_mpeg.exe"]
+                      for character in '<>"|?*'],
                 ]
             ):
                 archive = root / f"{index}.zip"
