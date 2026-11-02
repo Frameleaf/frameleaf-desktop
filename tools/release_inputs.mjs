@@ -6,7 +6,8 @@ export function validateFactoryRun(run, repository) {
   if (
     !run || run.status !== "completed" || run.conclusion !== "success" ||
     run.head_branch !== "main" || run.event !== "workflow_dispatch" ||
-    run.path !== ".github/workflows/factory-runtime.yml" ||
+    typeof run.path !== "string" ||
+    run.path.split("@")[0] !== ".github/workflows/factory-runtime.yml" ||
     run.repository?.full_name !== repository ||
     typeof run.head_sha !== "string" || run.head_sha.length !== 40 ||
     !/^[a-f0-9]{40}$/.test(run.head_sha)

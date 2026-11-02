@@ -34,13 +34,17 @@ test("release selections cover the supported architectures without adding Window
 // Runtime consumers must reject artifacts from other workflows or untrusted refs.
 test("private installer inputs require a successful main factory dispatch", () => {
   const run = { status: "completed", conclusion: "success", head_branch: "main",
-    event: "workflow_dispatch", path: ".github/workflows/factory-runtime.yml",
+    event: "workflow_dispatch", path: ".github/workflows/factory-runtime.yml@main",
     head_sha: "a".repeat(40), repository: { full_name: "Frameleaf/frameleaf-desktop" } };
-  assert.equal(validateFactoryRun(run, "Frameleaf/frameleaf-desktop"), run.head_sha);
+  for (const path of [".github/workflows/factory-runtime.yml", ".github/workflows/factory-runtime.yml@main",
+    ".github/workflows/factory-runtime.yml@refs/heads/main"]) {
+    assert.equal(validateFactoryRun({ ...run, path }, "Frameleaf/frameleaf-desktop"), run.head_sha);
+  }
   for (const changed of [null, {}, { ...run, status: "in_progress" },
     { ...run, conclusion: "failure" }, { ...run, head_branch: "other" },
     { ...run, event: "pull_request_target" }, { ...run, event: "pull_request" },
     { ...run, path: ".github/workflows/desktop.yml" },
+    { ...run, path: ".github/workflows/desktop.yml@main" }, { ...run, path: null },
     { ...run, repository: { full_name: "attacker/fork" } },
     { ...run, repository: null }, { ...run, head_sha: "main" },
     { ...run, head_sha: "A".repeat(40) }, { ...run, head_sha: "a".repeat(40) + "\n" }]) {
