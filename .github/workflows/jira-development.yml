@@ -30,7 +30,13 @@ jobs:
               return;
             }
             const keys = Array.from(pr.title.matchAll(/(?:^|[^A-Za-z0-9])(FL-[1-9]\d*)(?=$|[^A-Za-z0-9])/g), match => match[1]);
-            const destinations = (pr.body ?? '').match(/https:\/\/[^\s<>()"'`]+/g) ?? [];
+            // Use GitHub's rendered links so code spans and sentence punctuation follow GFM.
+            const { data: html } = await github.rest.markdown.render({
+              text: pr.body ?? '',
+              mode: 'gfm',
+              context: `${context.repo.owner}/${context.repo.repo}`,
+            });
+            const destinations = Array.from(html.matchAll(/<a\b[^>]* href="([^"]*)"/g), match => match[1]);
             if (keys.length === 0) {
               core.setFailed('Include the assigned Jira issue in the PR title, for example: FL-118 Configure Frameleaf delivery.');
             } else if (!destinations.some(url => keys.some(key => url === `https://heroit.atlassian.net/browse/${key}`))) {
