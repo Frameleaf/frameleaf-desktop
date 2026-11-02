@@ -1188,6 +1188,11 @@ impl VerifiedHostRuntime {
             monitor_owner.terminate();
             // Retain both leases until termination has unblocked the pipe writer too.
             let _ = writer.join();
+            // Closing alone leaves the lock held by an unrelated fork's inherited descriptor.
+            let result = _lease
+                .unlock()
+                .map_err(|_| "host_process_state_failed".to_owned())
+                .and(result);
             drop(_lease);
             let _ = exit_sender.send(result);
         });
