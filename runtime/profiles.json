@@ -19,7 +19,10 @@
           "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4",
           "f93c34d196955da3e2760c095c08b27ccbf53315"
         ],
-        "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"]
+        "linux-aarch64": [
+          "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
+          "f93c34d196955da3e2760c095c08b27ccbf53315"
+        ]
       }
     },
     "coreml-ort": {
