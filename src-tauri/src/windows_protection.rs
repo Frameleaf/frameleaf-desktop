@@ -451,6 +451,34 @@ mod native {
             std::fs::remove_dir_all(scratch).unwrap();
         }
         #[test]
+        fn captured_state_is_accepted_by_the_actual_node_canonical_check() {
+            let scratch =
+                std::env::temp_dir().join(format!("frameleaf-node-state-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).unwrap();
+            let captured = stable_state_path(&scratch).unwrap();
+            let agent = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("runtime/host-agent.mjs");
+            let agent = url::Url::from_file_path(agent).unwrap();
+            let script = format!(
+                "import {{ canonicalHostPathMatches }} from {}; import fs from 'node:fs/promises'; const expected = process.argv[1]; const actual = await fs.realpath(expected); if (!canonicalHostPathMatches(actual, expected)) throw new Error(JSON.stringify({{actual,expected}}));",
+                serde_json::to_string(agent.as_str()).unwrap(),
+            );
+            let output = std::process::Command::new("node")
+                .args(["--input-type=module", "--eval", &script])
+                .arg(&captured)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&scratch).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[test]
         fn relative_code_path_never_uses_the_process_working_directory() {
             assert!(stable_path(Path::new("relative-code")).is_err());
         }
