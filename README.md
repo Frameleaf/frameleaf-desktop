@@ -779,6 +779,21 @@ with the current 30-second server heartbeat; responsiveness remains a limitation
 These results do not enable the shipping Studio gate or qualify installed platforms.
 
 
+### Windows host runtime and private browser inputs
+
+`python tools/build_host_windows_support.py --source <absolute-app-repo> --revision <full-commit> --studio <absolute-staged-studio> --output <new-absolute-output>`
+stages the official pinned Node 26.11.1 Windows x64 runtime and the private headless
+Chromium selected by the immutable Studio engine lock and staged Playwright browser
+manifest. It verifies archive hashes, the Node executable and browser notices, and
+reuses strict extraction and browser staging. `support/node/` retains `node.exe` and
+its `LICENSE`; `support/browser/` retains the complete browser tree and
+`LICENSE.headless_shell`. The separate receipt records source identity and every
+staged file. Existing output is refused; failed payloads and temporary downloads
+are removed. The caller must exclusively own the output throughout staging.
+A passed receipt proves byte staging only: actual Windows/Studio execution,
+sandboxing, complete-host assembly, signing, installed acceptance and redistribution
+qualification remain separate. No Windows executable is launched by this command.
+
 ### Complete host inventory authoring
 
 `tools/build_host_bundle.py` combines the staged private host components with an
