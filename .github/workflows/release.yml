@@ -1,0 +1,254 @@
+name: Signed desktop release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing main-branch tag matching all app versions (for example v0.1.0)'
+        required: true
+        type: string
+      runtime_run_id:
+        description: 'Successful main-branch run containing factory-runtime-<target> artifacts (each contains runtime.tar)'
+        required: true
+        type: string
+      platforms:
+        description: 'Release targets (Windows requires a signing certificate)'
+        type: choice
+        default: macos-linux
+        options: [macos-linux, all, linux]
+permissions:
+  contents: read
+concurrency:
+  group: signed-desktop-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+      matrix: ${{ steps.source.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Validate immutable release source and runtime run
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release_inputs.mjs "$RELEASE_TAG"
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            import { releaseMatrix } from "./tools/release_inputs.mjs";
+            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS)) + "\n");
+          '
+          [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          revision=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          test "$revision" = "$GITHUB_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const r = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json"));
+            if (r.conclusion !== "success" || r.head_branch !== "main" || r.event === "pull_request" || r.repository.full_name !== process.env.GITHUB_REPOSITORY)
+              throw new Error("release_runtime_run_untrusted");
+          '
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+  build:
+    needs: prepare
+    environment: desktop-release
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run_id }}
+          name: factory-runtime-${{ matrix.target }}
+          path: runtime-download
+      - name: Extract factory runtime without allowing archive path escapes
+        shell: python
+        run: |
+          import tarfile
+          with tarfile.open('runtime-download/runtime.tar') as archive:
+              archive.extractall('release-runtime', filter='data')
+      - name: Verify factory runtime and configure installer
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import { writeFileSync } from "node:fs";
+            import { packageConfiguration } from "./tools/package_desktop.mjs";
+            const config = await packageConfiguration("release-runtime");
+            config.bundle.targets = { darwin: ["app", "dmg"], win32: ["nsis", "msi"], linux: ["deb", "appimage"] }[process.platform];
+            if (process.platform === "darwin") config.bundle.macOS = { hardenedRuntime: true };
+            writeFileSync("release-config.json", JSON.stringify(config));
+          '
+      - name: Import Apple Developer ID certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${APPLE_CERTIFICATE:?Missing Apple certificate}" "${APPLE_CERTIFICATE_PASSWORD:?Missing certificate password}"
+          : "${APPLE_ID:?Missing Apple ID}" "${APPLE_PASSWORD:?Missing app-specific password}" "${APPLE_TEAM_ID:?Missing Apple team}"
+          [[ "$APPLE_SIGNING_IDENTITY" == 'Developer ID Application: '* ]]
+          keychain="$RUNNER_TEMP/desktop-release.keychain-db"
+          password=$(openssl rand -hex 32)
+          echo "::add-mask::$password"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm "$RUNNER_TEMP/developer-id.p12"
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          if (!$env:WINDOWS_CERTIFICATE -or !$env:WINDOWS_CERTIFICATE_PASSWORD) { throw 'Missing Windows signing certificate/password' }
+          $path = Join-Path $env:RUNNER_TEMP 'desktop-signing.pfx'
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $path -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $path
+          if (!$cert.HasPrivateKey -or $cert.NotAfter -le (Get-Date)) { throw 'Invalid Windows signing certificate' }
+          "WINDOWS_SIGNING_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+          $config = Get-Content release-config.json -Raw | ConvertFrom-Json
+          $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue @{certificateThumbprint=$cert.Thumbprint; digestAlgorithm='sha256'; timestampUrl='http://timestamp.digicert.com'; tsp=$true}
+          $config | ConvertTo-Json -Depth 20 | Set-Content release-config.json
+      - name: Build signed installer (macOS also notarizes)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
+      - name: Verify Apple signing, notarization, and embedded runtime integrity
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=src-tauri/target/release/bundle/macos/Frameleaf.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          node --input-type=module -e '
+            import { packageConfiguration } from "./tools/package_desktop.mjs";
+            await packageConfiguration("src-tauri/target/release/bundle/macos/Frameleaf.app/Contents/Resources/native-runtime");
+          '
+      - name: Verify Windows executable and installer signatures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $files = @(Get-Item src-tauri/target/release/frameleaf-desktop.exe)
+          $files += @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.exe', '.msi' })
+          if ($files.Count -lt 3) { throw 'Missing signed application/installers' }
+          foreach ($file in $files) {
+            $sig = Get-AuthenticodeSignature $file.FullName
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Thumbprint -ne $env:WINDOWS_SIGNING_THUMBPRINT) { throw "Invalid signature: $($file.Name)" }
+          }
+      - name: Collect installers
+        shell: python
+        run: |
+          from pathlib import Path
+          import shutil
+          import sys
+          extensions = {'darwin': {'.dmg'}, 'win32': {'.exe', '.msi'}, 'linux': {'.deb', '.AppImage'}}[sys.platform]
+          files = [p for p in Path('src-tauri/target/release/bundle').rglob('*') if p.is_file() and p.suffix in extensions]
+          if {p.suffix for p in files} != extensions or len({p.name for p in files}) != len(files):
+              raise SystemExit('Missing or ambiguous release installers')
+          Path('release-assets').mkdir()
+          for path in files:
+              shutil.copy2(path, Path('release-assets') / path.name)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: signed-installers-${{ matrix.target }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove Apple signing material
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
+      - name: Remove Windows signing material
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item "$env:RUNNER_TEMP/desktop-signing.pfx" -ErrorAction SilentlyContinue
+          if ($env:WINDOWS_SIGNING_THUMBPRINT) { Remove-Item "Cert:\CurrentUser\My\$env:WINDOWS_SIGNING_THUMBPRINT" -DeleteKey -ErrorAction Stop }
+  stage:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: signed-installers-*
+          merge-multiple: true
+          path: release-assets
+      - name: Create checksums and a draft release after every target succeeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum -- * > SHA256SUMS
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+            --title "Frameleaf $RELEASE_TAG candidate" \
+            --notes "Signed installer candidate from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -- ./*
