@@ -11,6 +11,15 @@ spec.loader.exec_module(builder)
 
 
 class RuntimeBuilderTests(unittest.TestCase):
+    def test_inventory_paths_reject_every_windows_dos_device_alias(self):
+        for device in ["CONIN$", "CONOUT$", *[f"{prefix}{digit}" for prefix in ["COM", "LPT"]
+                                                for digit in "¹²³"]]:
+            for name in [device, device.lower() + ".txt", "bin/" + device + ".json"]:
+                with self.subTest(name=name), self.assertRaises(builder.BuildError):
+                    builder.relative(name)
+        for name in ["bin/COM10.dll", "COMPOSITE.json", "company/normal"]:
+            self.assertEqual(builder.relative(name), name)
+
     def test_source_build_exception_is_only_used_by_the_locked_legacy_dependency(self):
         setuptools = "setuptools==80.9.0 --hash=sha256:" + "a" * 64 + "\n"
         antlr = "antlr4-python3-runtime==4.9.3 --hash=sha256:" + "b" * 64 + "\n"

@@ -101,6 +101,8 @@ class FfmpegPackageTests(unittest.TestCase):
                     ["link"],
                     *[[f"bin/ff{character}mpeg.exe", "bin/ff_mpeg.exe"]
                       for character in '<>"|?*'],
+                    *[["bin/good", f"bin/{device}.txt"] for device in ["CONIN$", "CONOUT$",
+                       *[f"{prefix}{digit}" for prefix in ["COM", "LPT"] for digit in "¹²³"]]],
                 ]
             ):
                 archive = root / f"{index}.zip"

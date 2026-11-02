@@ -34,8 +34,8 @@ def relative(value: str) -> str:
             part in {"", ".", ".."}
             or part.endswith((".", " "))
             or any(ord(char) < 32 or ord(char) == 127 for char in part)
-            or stem in {"CON", "PRN", "AUX", "NUL"}
-            or re.fullmatch(r"(?:COM|LPT)[1-9]", stem)
+            or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+            or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", stem)
         ):
             raise BuildError("runtime_path_invalid")
     return value
