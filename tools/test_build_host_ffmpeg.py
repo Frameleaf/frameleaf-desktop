@@ -103,6 +103,8 @@ class FfmpegPackageTests(unittest.TestCase):
                       for character in '<>"|?*'],
                     *[["bin/good", f"bin/{device}.txt"] for device in ["CONIN$", "CONOUT$",
                        *[f"{prefix}{digit}" for prefix in ["COM", "LPT"] for digit in "¹²³"]]],
+                    ["bin/good", "bin/CON .txt"],
+                    ["bin/good", "bin/LPT³   .data"],
                 ]
             ):
                 archive = root / f"{index}.zip"
