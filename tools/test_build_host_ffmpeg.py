@@ -1,4 +1,7 @@
+import io
+import os
 import stat
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -9,6 +12,67 @@ from build_runtime import BuildError
 
 
 class FfmpegPackageTests(unittest.TestCase):
+    def test_tar_preserves_nested_bytes_and_executable_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "safe.tar.gz"
+            with tarfile.open(archive, "w:gz") as contents:
+                entry = tarfile.TarInfo("bin/tool")
+                entry.size, entry.mode = 7, 0o755
+                contents.addfile(entry, io.BytesIO(b"payload"))
+            destination = root / "output"
+            destination.mkdir()
+            unpack(archive, destination)
+            self.assertEqual((destination / "bin/tool").read_bytes(), b"payload")
+            if os.name != "nt":
+                self.assertEqual((destination / "bin/tool").stat().st_mode & 0o777, 0o755)
+
+    def test_refuses_occupied_destination_without_overwriting_existing_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "safe.zip"
+            with zipfile.ZipFile(archive, "w") as contents:
+                contents.writestr("existing", b"replacement")
+            destination = root / "output"
+            destination.mkdir()
+            (destination / "existing").write_bytes(b"original")
+            with self.assertRaisesRegex(BuildError, "archive_paths_invalid"):
+                unpack(archive, destination)
+            self.assertEqual((destination / "existing").read_bytes(), b"original")
+
+    def test_tar_refuses_unsafe_entries_before_extracting_any_file(self):
+        cases = [
+            [("good", "file"), (name, "file")]
+            for name in ["../escape", "/absolute", "C:/drive", "file:stream", "CON.txt",
+                         "folder/../escape", "trailing.", "folder\\name"]
+        ] + [
+            [("bin/tool", "file"), ("BIN/tool", "file")],
+            [("file", "file"), ("file/child", "file")],
+            [("file/child", "file"), ("file", "file")],
+        ]
+        cases.extend([[("good", "file"), ("link", kind)] for kind in ["symlink", "hardlink", "fifo"]])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, entries in enumerate(cases):
+                with self.subTest(entries=entries):
+                    archive = root / f"{index}.tar.gz"
+                    with tarfile.open(archive, "w:gz") as contents:
+                        for name, kind in entries:
+                            entry = tarfile.TarInfo(name)
+                            if kind == "file":
+                                entry.size = 1
+                                contents.addfile(entry, io.BytesIO(b"x"))
+                            else:
+                                entry.type = {"symlink": tarfile.SYMTYPE, "hardlink": tarfile.LNKTYPE,
+                                              "fifo": tarfile.FIFOTYPE}[kind]
+                                entry.linkname = "good"
+                                contents.addfile(entry)
+                    destination = root / f"out-{index}"
+                    destination.mkdir()
+                    with self.assertRaises((BuildError, tarfile.FilterError)):
+                        unpack(archive, destination)
+                    self.assertEqual(list(destination.iterdir()), [])
+
     def test_portable_pin_must_match_the_selected_server_release(self):
         pin = {
             "url": "https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v8.1.3-1/media.zip",
