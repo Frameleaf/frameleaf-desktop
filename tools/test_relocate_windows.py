@@ -1,11 +1,13 @@
 import shutil
+import subprocess
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from build_runtime import BuildError
-from relocate_windows import closure, pe_imports
+from relocate_windows import closure, pe_imports, inspect_pe
 
 
 def pe(imports=True, machine=0x8664):
@@ -21,6 +23,30 @@ def pe(imports=True, machine=0x8664):
     data[208:212] = (4096 if imports else 0).to_bytes(4, 'little')
     data[212:216] = (100 if imports else 0).to_bytes(4, 'little')
     return bytes(data)
+
+
+class InspectorTests(unittest.TestCase):
+    def test_inspector_requires_clean_success_and_records_bounded_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            env = {"HOME": str(root / "home"), "FRAMELEAF_BUILD_ERROR_LOG": str(root / "error.log")}
+            args = [root / "objdump.exe", "-p", root / "probe.exe"]
+            with patch('relocate_windows.subprocess.run', return_value=subprocess.CompletedProcess(args, 0, 'DLL Name: KERNEL32.dll\n', '')) as call:
+                self.assertEqual(inspect_pe(args[0], args[-1], cwd=root, env=env), 'DLL Name: KERNEL32.dll')
+                self.assertEqual(call.call_args.args[0], args)
+                self.assertEqual(call.call_args.kwargs['env'], env)
+                self.assertEqual(call.call_args.kwargs['cwd'], root)
+                self.assertEqual(call.call_args.kwargs['timeout'], 60)
+            for result in [subprocess.CompletedProcess(args, 1, '', 'invalid PE'),
+                           subprocess.CompletedProcess(args, 0, 'DLL Name: KERNEL32.dll', 'partial decode ' + 'x' * 40000)]:
+                with self.subTest(code=result.returncode), patch('relocate_windows.subprocess.run', return_value=result):
+                    with self.assertRaisesRegex(BuildError, 'host_pe_inspection_failed'):
+                        inspect_pe(args[0], args[-1], cwd=root, env=env)
+                    self.assertLessEqual(len((root / 'error.log').read_text()), 32768)
+            for error in [OSError('missing tool'), subprocess.TimeoutExpired(args, 60)]:
+                with self.subTest(error=type(error).__name__), patch('relocate_windows.subprocess.run', side_effect=error):
+                    with self.assertRaisesRegex(BuildError, 'host_pe_inspection_failed'):
+                        inspect_pe(args[0], args[-1], cwd=root, env=env)
 
 
 class WindowsClosureTests(unittest.TestCase):
