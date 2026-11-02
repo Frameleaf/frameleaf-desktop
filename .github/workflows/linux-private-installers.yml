@@ -1,0 +1,149 @@
+name: Private Linux installer candidates
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_run_id:
+        description: 'Successful main factory-runtime run containing signed Linux runtimes'
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: private-linux-installers
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.source.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Validate factory source before allocating build runners
+        id: source
+        env:
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
+          revision=$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { validateFactoryRun } from "./tools/release_inputs.mjs";
+            console.log(validateFactoryRun(JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json")), process.env.GITHUB_REPOSITORY));
+          ')
+          git merge-base --is-ancestor "$revision" "$GITHUB_SHA"
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            import { releaseMatrix } from "./tools/release_inputs.mjs";
+            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix("linux")) + "\n");
+          '
+  build:
+    needs: prepare
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run_id }}
+          name: factory-runtime-${{ matrix.target }}
+          path: runtime-download
+      - name: Extract runtime without archive path escapes
+        shell: python
+        run: |
+          import tarfile
+          with tarfile.open('runtime-download/runtime.tar') as archive:
+              archive.extractall('release-runtime', filter='data')
+      - name: Verify signed runtime before native compilation
+        run: |
+          node --input-type=module -e '
+            import { writeFileSync } from "node:fs";
+            import { packageConfiguration } from "./tools/package_desktop.mjs";
+            const config = await packageConfiguration("release-runtime");
+            config.bundle.targets = ["deb", "appimage"];
+            writeFileSync("candidate-config.json", JSON.stringify(config));
+          '
+      - name: Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: false
+          save-if: false
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build private installer candidates
+        run: npm run tauri -- build --config "$GITHUB_WORKSPACE/candidate-config.json" -- --locked
+      - name: Collect installers and provenance preserving executable modes
+        env:
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib
+          import json
+          import os
+          import shutil
+          import tarfile
+          files = [p for p in Path('src-tauri/target/release/bundle').rglob('*') if p.is_file() and p.suffix in {'.deb', '.AppImage'}]
+          if len(files) != 2 or {p.suffix for p in files} != {'.deb', '.AppImage'}:
+              raise SystemExit('Missing or ambiguous private installers')
+          output = Path('candidate-installers')
+          output.mkdir()
+          hashes = {}
+          for source in files:
+              destination = output / source.name
+              shutil.copy2(source, destination)
+              if source.suffix == '.AppImage' and not os.access(destination, os.X_OK):
+                  raise SystemExit('AppImage executable permission is missing')
+              with destination.open('rb') as binary:
+                  hashes[source.name] = hashlib.file_digest(binary, 'sha256').hexdigest()
+          (output / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(hashes.items())))
+          (output / 'candidate.json').write_text(json.dumps({
+              'sourceRevision': os.environ['GITHUB_SHA'], 'target': os.environ['CANDIDATE_TARGET'],
+              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False,
+              'scope': 'Private GUI and existing-server helper candidate; full native host qualification remains separate',
+              'files': hashes,
+          }, indent=2) + '\n')
+          with tarfile.open('private-installers.tar.gz', 'w:gz') as archive:
+              archive.add(output, arcname='installers')
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-private-installers-${{ matrix.target }}
+          path: private-installers.tar.gz
+          if-no-files-found: error
+          retention-days: 7

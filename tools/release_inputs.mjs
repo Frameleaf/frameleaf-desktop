@@ -2,6 +2,18 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+export function validateFactoryRun(run, repository) {
+  if (
+    !run || run.status !== "completed" || run.conclusion !== "success" ||
+    run.head_branch !== "main" || run.event !== "workflow_dispatch" ||
+    run.path !== ".github/workflows/factory-runtime.yml" ||
+    run.repository?.full_name !== repository ||
+    typeof run.head_sha !== "string" || run.head_sha.length !== 40 ||
+    !/^[a-f0-9]{40}$/.test(run.head_sha)
+  ) throw new Error("runtime_run_untrusted");
+  return run.head_sha;
+}
+
 export function releaseMatrix(platforms) {
   if (!["macos-linux", "all", "linux"].includes(platforms))
     throw new Error("release_platforms_invalid");
