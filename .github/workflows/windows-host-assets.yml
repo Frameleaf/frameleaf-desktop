@@ -28,7 +28,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     env:
-      HOST_SOURCE_REVISION: 2f4959aed747ff33f07f2756c44b4692ef40565a
+      HOST_SOURCE_REVISION: 47d22320a994958659e18a865c76637e82fd0b4f
       UV_THREADPOOL_SIZE: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
