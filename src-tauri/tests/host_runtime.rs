@@ -110,6 +110,64 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn nonreading_bootstrap_does_not_block_startup_cancellation_or_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let mut fixture = Fixture::new();
+    // The finite child bounds the regression even before startup delivery is fixed.
+    let source = b"#!/bin/sh\nexec /bin/sleep 3\n";
+    fs::write(fixture.0.join("node"), source).unwrap();
+    fs::set_permissions(fixture.0.join("node"), fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.1["files"]["node"] =
+        json!({"bytes":source.len(),"sha256":format!("{:x}",Sha256::digest(source))});
+    let verified = fixture.verify().unwrap();
+    for cancel in [true, false] {
+        let state = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-no-read-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let _cleanup = Fixture(state.clone(), json!(null), state.clone());
+        let start = Instant::now();
+        let mut process = verified
+            .start(
+                &state,
+                &zeroize::Zeroizing::new("synthetic-host-password-long-enough".to_string()),
+                23451,
+                23452,
+            )
+            .expect("startup must return before the child reads its pipe");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        if cancel {
+            assert_eq!(
+                process.wait_ready_or_cancel(
+                    Duration::from_secs(1),
+                    &std::sync::atomic::AtomicBool::new(true)
+                ),
+                Ok(false)
+            );
+        } else {
+            assert_eq!(
+                process.wait_ready(Duration::from_millis(50)).unwrap_err(),
+                "host_readiness_timeout"
+            );
+        }
+        assert_ne!(process.is_running(), Ok(true));
+        drop(process);
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state.join("lease.lock"))
+            .unwrap();
+        lease
+            .try_lock()
+            .expect("the owned child must be gone before the profile lease is released");
+    }
+}
+
 #[test]
 fn backup_engine_descriptor_comes_from_the_signed_role_and_inventory() {
     let mut fixture = Fixture::new();
