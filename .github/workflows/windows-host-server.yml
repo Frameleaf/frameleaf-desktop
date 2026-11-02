@@ -1,5 +1,15 @@
 name: Windows server candidate
 on:
+  pull_request:
+    paths:
+      - 'tools/build_host_server.py'
+      - 'tools/test_build_host_server.py'
+      - 'tools/build_host_exiftool_windows.py'
+      - 'tools/test_build_host_exiftool_windows.py'
+      - 'tools/qualify_host_exiftool.mjs'
+      - 'tools/source_archive.py'
+      - 'tools/build_runtime.py'
+      - '.github/workflows/windows-host-server.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -8,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   server:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 45
     env:
@@ -22,7 +32,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: 3e5d58be808a8b48cf69f32e59d2f54c6ddf25c4
+          ref: 8e85ffa3b43d7158d7fffd0dda97a3b56ed9f6a0
           path: server-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -51,7 +61,7 @@ jobs:
         shell: pwsh
         run: |
           $node = (Get-Command node).Source
-          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 3e5d58be808a8b48cf69f32e59d2f54c6ddf25c4 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 8e85ffa3b43d7158d7fffd0dda97a3b56ed9f6a0 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
           if ($LASTEXITCODE) { throw 'Windows production server qualification failed' }
       - name: Bind and qualify private Windows metadata runtime
         shell: pwsh
