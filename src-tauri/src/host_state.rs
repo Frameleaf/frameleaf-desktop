@@ -48,6 +48,13 @@ pub(crate) struct Owner {
     active: Option<Marker>,
     writable: bool,
 }
+struct TransientHostLease(File);
+impl Drop for TransientHostLease {
+    fn drop(&mut self) {
+        // A concurrent fork may still hold a copy when this operation finishes.
+        let _ = self.0.unlock();
+    }
+}
 impl Drop for Owner {
     fn drop(&mut self) {
         // A concurrent fork can retain the file description until its CLOEXEC copies close.
@@ -412,7 +419,7 @@ impl Owner {
                 let file = file.into_std();
                 valid_file(&file)?;
                 file.try_lock_shared().map_err(|_| "host_already_owned")?;
-                Some(file)
+                Some(TransientHostLease(file))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err("host_process_state_requires_review".into()),
@@ -462,6 +469,42 @@ mod tests {
     const ID: &str = "aaaaaaaaaaaa";
     fn sha() -> String {
         "b".repeat(64)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_host_lease_releases_fork_style_descriptors_on_scope_exit() {
+        let fixture = Fixture::new();
+        let root = Dir::from_std_file(crate::host_storage::directory(&fixture.0).unwrap());
+        for shared in [false, true] {
+            let file = root
+                .open_with("lease.lock", &options(true))
+                .unwrap()
+                .into_std();
+            if shared {
+                file.try_lock_shared()
+            } else {
+                file.try_lock()
+            }
+            .unwrap();
+            let lease = TransientHostLease(file);
+            let inherited = lease.0.try_clone().unwrap();
+            let next = root
+                .open_with("lease.lock", &options(false))
+                .unwrap()
+                .into_std();
+            assert!(
+                next.try_lock().is_err(),
+                "live lease must still exclude writers"
+            );
+            drop(lease);
+            assert!(
+                next.try_lock().is_ok(),
+                "scope exit must release even while a fork-style descriptor exists"
+            );
+            drop(inherited);
+            next.unlock().unwrap();
+        }
     }
 
     #[cfg(unix)]
