@@ -396,15 +396,15 @@ impl NativeManager {
         client: reqwest::Client,
         code_lease: Option<crate::package_lease::CodeLease>,
     ) -> Result<Self, String> {
-        if let Some(lease) = &code_lease {
-            lease.inherit(command);
-        }
-        let child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "native_manager_launch_failed")?;
+            .stderr(Stdio::null());
+        let child = match &code_lease {
+            Some(lease) => lease.spawn(command),
+            None => command.spawn(),
+        }
+        .map_err(|_| "native_manager_launch_failed")?;
         let (receipt_tx, receipt) = mpsc::channel();
         let mut owner = Self {
             child,

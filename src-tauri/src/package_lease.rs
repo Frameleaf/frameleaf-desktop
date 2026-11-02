@@ -128,21 +128,39 @@ fn open(candidate: &Path, name: &str, initialize: bool) -> Result<File, String> 
     }
     Ok(file)
 }
-pub(crate) struct CodeLease(File);
+pub(crate) struct CodeLease {
+    file: File,
+    #[cfg(unix)]
+    inherited: std::sync::atomic::AtomicBool,
+}
+impl Drop for CodeLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if !self.inherited.load(std::sync::atomic::Ordering::Relaxed) {
+            // Unrelated forks must not retain a reader that was never handed to a child.
+            let _ = self.file.unlock();
+        }
+    }
+}
 impl CodeLease {
     pub(crate) fn acquire(candidate: &Path) -> Result<Self, String> {
         let file = open(candidate, LEASE, true)?;
         file.try_lock_shared().map_err(|_| "host_package_busy")?;
+        let lease = Self {
+            file,
+            #[cfg(unix)]
+            inherited: std::sync::atomic::AtomicBool::new(false),
+        };
         match fs::symlink_metadata(candidate.join(FENCE)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(lease),
             _ => Err("host_package_maintenance".into()),
         }
     }
-    pub(crate) fn inherit(&self, command: &mut Command) {
+    pub(crate) fn spawn(&self, command: &mut Command) -> std::io::Result<std::process::Child> {
         #[cfg(unix)]
         {
             use std::os::{fd::AsRawFd, unix::process::CommandExt};
-            let fd = self.0.as_raw_fd();
+            let fd = self.file.as_raw_fd();
             command.env("FRAMELEAF_CODE_LEASE_FD", fd.to_string());
             // Preserve this already-open inode in Node, including after the desktop owner crashes.
             unsafe {
@@ -158,7 +176,12 @@ impl CodeLease {
             }
         }
         #[cfg(not(unix))]
-        let _ = (&self.0, command); // Windows process owners retain the lease through Job Object cleanup.
+        let _ = &self.file; // Windows process owners retain the lease through Job Object cleanup.
+        let child = command.spawn()?;
+        #[cfg(unix)]
+        self.inherited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(child)
     }
 }
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -246,6 +269,36 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn unhanded_reader_releases_a_lock_even_with_a_fork_style_descriptor_copy() {
+        let f = Fixture::new();
+        let reader = CodeLease::acquire(&f.0).unwrap();
+        let inherited = reader.file.try_clone().unwrap();
+        let other_reader = CodeLease::acquire(&f.0).unwrap();
+        drop(reader);
+        assert!(Maintenance::acquire(&f.0).is_err());
+        drop(other_reader);
+        let writer = Maintenance::acquire(&f.0).unwrap();
+        writer.require_unfenced().unwrap();
+        drop(writer);
+        drop(inherited);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn failed_spawn_releases_the_reader_despite_a_fork_style_descriptor_copy() {
+        let f = Fixture::new();
+        let reader = CodeLease::acquire(&f.0).unwrap();
+        let inherited = reader.file.try_clone().unwrap();
+        let mut command = Command::new(f.0.join("missing-native-program"));
+        assert!(reader.spawn(&mut command).is_err());
+        drop(reader);
+        Maintenance::acquire(&f.0)
+            .unwrap()
+            .require_unfenced()
+            .unwrap();
+        drop(inherited);
+    }
+    #[cfg(unix)]
+    #[test]
     fn linked_or_write_shared_metadata_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
@@ -279,8 +332,7 @@ mod tests {
         let mut command = Command::new("node");
         command.args(["-e", "require('node:fs').fstatSync(Number(process.env.FRAMELEAF_CODE_LEASE_FD)); console.log('lease-ready'); process.stdin.resume();"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        lease.inherit(&mut command);
-        let mut child = Child(command.spawn().unwrap());
+        let mut child = Child(lease.spawn(&mut command).unwrap());
         let mut line = String::new();
         BufReader::new(child.0.stdout.take().unwrap())
             .read_line(&mut line)
