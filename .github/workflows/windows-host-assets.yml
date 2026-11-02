@@ -71,22 +71,29 @@ jobs:
       - name: Archive the qualified host assets
         shell: python
         run: |
+          import hashlib
           import json
           import os
           from pathlib import Path
           import re
+          import shutil
           import sys
           import tarfile
           sys.path.insert(0, 'tools')
-          from build_runtime import inventory, regular, sha256
+          from build_runtime import build_environment, git_blob, inventory, regular, sha256
           root = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-assets'
           source = Path(os.environ['GITHUB_WORKSPACE']) / 'application-source'
-          configuration = json.loads((source / 'studio/engine-build.json').read_text())
+          revision = os.environ['HOST_SOURCE_REVISION']
+          git = shutil.which('git')
+          if not git or not re.fullmatch('[a-f0-9]{40}', revision):
+              raise SystemExit('Git and the selected source commit are required')
+          environment = build_environment(root, os.environ)
+          configuration = json.loads(git_blob(git, source, revision, 'studio/engine-build.json', environment))
           if configuration.get('node') != '26.11.1':
               raise SystemExit('Pinned Studio Node version is required')
           node_sha = sha256(Path(os.environ['NODE_BINARY']))
-          workspace_lock = sha256(source / 'pnpm-lock.yaml')
-          studio_lock = sha256(source / 'studio/engine-package-lock.json')
+          workspace_lock = hashlib.sha256(git_blob(git, source, revision, 'pnpm-lock.yaml', environment)).hexdigest()
+          studio_lock = hashlib.sha256(git_blob(git, source, revision, 'studio/engine-package-lock.json', environment)).hexdigest()
           components = [('web', 'www'), ('plugin', 'plugin'), ('studio', 'studio-worker')]
           for name, directory in components:
               component = root / name

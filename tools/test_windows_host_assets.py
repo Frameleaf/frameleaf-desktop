@@ -23,9 +23,19 @@ class WindowsHostAssetsTests(unittest.TestCase):
     def fixture(self, root):
         source = root / 'application-source'
         (source / 'studio').mkdir(parents=True)
-        (source / 'pnpm-lock.yaml').write_bytes(b'workspace lock')
-        (source / 'studio/engine-package-lock.json').write_bytes(b'studio lock')
+        (source / 'pnpm-lock.yaml').write_bytes(b'workspace lock\n')
+        (source / 'studio/engine-package-lock.json').write_bytes(b'studio lock\n')
         (source / 'studio/engine-build.json').write_text(json.dumps({'node': '26.11.1', 'npm': '13.0.0'}))
+        git_environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+        git_environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+        subprocess.run(['git', 'init', '-q', str(source)], env=git_environment, check=True, capture_output=True)
+        subprocess.run(['git', '-c', 'core.autocrlf=false', 'add', '.'], cwd=source,
+                       env=git_environment, check=True, capture_output=True)
+        subprocess.run(['git', '-c', 'user.name=AJ Taylor', '-c', 'user.email=aj@ajtaylor.net',
+                        '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Synthetic source fixture'],
+                       cwd=source, env=git_environment, check=True, capture_output=True)
+        revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source,
+                                           env=git_environment, text=True).strip()
         node = root / 'node.exe'
         node.write_bytes(b'synthetic Node identity; never executed')
         receipts = {}
@@ -39,21 +49,33 @@ class WindowsHostAssetsTests(unittest.TestCase):
             (output / 'work').mkdir()
             (output / 'work/private-state').write_text('never archive')
             receipt = {
-                'schemaVersion': 1, 'sourceRevision': 'a' * 40,
+                'schemaVersion': 1, 'sourceRevision': revision,
                 'sourceArchiveSha256': 'b' * 64,
                 'nodeSha256': hashlib.sha256(node.read_bytes()).hexdigest(),
                 'qualification': 'passed', 'runtimeQualified': False, 'redistributable': False,
                 'files': {'payload': {'bytes': len(content), 'sha256': hashlib.sha256(content).hexdigest()}},
             }
             if name in ['web', 'plugin']:
-                receipt.update(pnpmVersion='12.11.2', lockfileSha256=hashlib.sha256(b'workspace lock').hexdigest())
+                receipt.update(pnpmVersion='12.11.2', lockfileSha256=hashlib.sha256(b'workspace lock\n').hexdigest())
             if name in ['web', 'studio']:
-                receipt.update(npmVersion='13.0.0', studioLockfileSha256=hashlib.sha256(b'studio lock').hexdigest())
+                receipt.update(npmVersion='13.0.0', studioLockfileSha256=hashlib.sha256(b'studio lock\n').hexdigest())
             if name == 'studio': receipt['browserIncluded'] = False
             (output / 'qualification.json').write_text(json.dumps(receipt))
             receipts[name] = receipt
         return receipts, os.environ | {'RUNNER_TEMP': str(root), 'GITHUB_WORKSPACE': str(root),
-                                      'HOST_SOURCE_REVISION': 'a' * 40, 'NODE_BINARY': str(node)}
+                                      'HOST_SOURCE_REVISION': revision, 'NODE_BINARY': str(node)}
+
+    def test_archive_uses_selected_git_lock_bytes_despite_crlf_checkout_conversion(self):
+        """A Windows checkout must not redefine the canonical lock hashes consumed by the builders."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, environment = self.fixture(root)
+            (root / 'application-source/pnpm-lock.yaml').write_bytes(b'workspace lock\r\n')
+            (root / 'application-source/studio/engine-package-lock.json').write_bytes(b'studio lock\r\n')
+            result = subprocess.run([sys.executable, '-c', self.archive_script()], env=environment,
+                                    cwd=Path(__file__).resolve().parents[1], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertTrue((root / 'fl-windows-assets/host-assets.tar.gz').is_file())
 
     def test_archive_transports_all_three_exact_payloads_without_build_state(self):
         """Losing a component, receipt, byte or executable mode during artifact transfer must fail."""
