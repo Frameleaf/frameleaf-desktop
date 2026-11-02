@@ -360,7 +360,10 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
   );
   assert.deepEqual(profiles["cpu-ort"].additionalSources, {
     "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
-    "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"],
+    "linux-aarch64": [
+      "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
+      "f93c34d196955da3e2760c095c08b27ccbf53315",
+    ],
   });
   assert.equal(
     profiles["coreml-ort"].sourceRevision,
@@ -400,51 +403,70 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
   );
 });
 
-test("current CPU source packages only on its qualified Linux and macOS ARM64 targets", async (t) => {
-  const { packageConfiguration } = await import("./package_desktop.mjs");
-  const profiles = JSON.parse(
-    await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
-  ).profiles;
-  const source = "f93c34d196955da3e2760c095c08b27ccbf53315";
-  assert.deepEqual(profiles["cpu-ort"].additionalSources["linux-aarch64"], [source]);
-  assert(profiles["cpu-ort"].additionalSources["macos-aarch64"].includes(source));
-  for (const [target, sources] of Object.entries(
-    profiles["cpu-ort"].additionalSources,
-  )) {
-    if (!["linux-aarch64", "macos-aarch64"].includes(target))
-      assert(!sources.includes(source));
-  }
-  assert.equal(profiles["coreml-ort"].additionalSources, undefined);
-  const f = await fixture(t);
-  const provenance = JSON.parse(
-    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
-  );
-  provenance.sourceRevision = source;
-  const bytes = Buffer.from(JSON.stringify(provenance));
-  f.manifest.sourceRevision = source;
-  f.manifest.moduleNamespace = "frameleaf_ml";
-  f.manifest.files["provenance.json"] = {
-    bytes: bytes.length,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-  };
-  await writeFile(join(f.root, "payload/provenance.json"), bytes);
-  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
-  await signCandidate(
-    f.root,
-    join(f.root, "manifest.sig"),
-    f.privatePem,
-    f.policy,
-  );
-  if (!["linux", "darwin"].includes(process.platform) || process.arch !== "arm64") {
-    await assert.rejects(
-      packageConfiguration(f.root, f.policy),
-      /runtime_bundle_source_unapproved/,
+for (const [source, platforms] of [
+  ["f93c34d196955da3e2760c095c08b27ccbf53315", ["linux", "darwin"]],
+  ["94d52a8244da0edfa9f680a3b357fdccbc0ad7e8", ["linux"]],
+]) {
+  test(`CPU source ${source.slice(0, 7)} packages only on its approved ARM64 targets`, async (t) => {
+    const { packageConfiguration } = await import("./package_desktop.mjs");
+    const profiles = JSON.parse(
+      await readFile(
+        new URL("../runtime/profiles.json", import.meta.url),
+        "utf8",
+      ),
+    ).profiles;
+    assert(
+      profiles["cpu-ort"].additionalSources["linux-aarch64"].includes(source),
     );
-    return;
-  }
-  const config = await packageConfiguration(f.root, f.policy);
-  assert.equal(
-    config.bundle.resources[join(f.root, "payload")],
-    "native-runtime/payload",
-  );
-});
+    assert.equal(
+      profiles["cpu-ort"].additionalSources["macos-aarch64"].includes(source),
+      platforms.includes("darwin"),
+    );
+    for (const [target, sources] of Object.entries(
+      profiles["cpu-ort"].additionalSources,
+    )) {
+      if (
+        !platforms
+          .map(
+            (platform) =>
+              `${platform === "darwin" ? "macos" : platform}-aarch64`,
+          )
+          .includes(target)
+      )
+        assert(!sources.includes(source));
+    }
+    assert.equal(profiles["coreml-ort"].additionalSources, undefined);
+    const f = await fixture(t);
+    const provenance = JSON.parse(
+      await readFile(join(f.root, "payload/provenance.json"), "utf8"),
+    );
+    provenance.sourceRevision = source;
+    const bytes = Buffer.from(JSON.stringify(provenance));
+    f.manifest.sourceRevision = source;
+    f.manifest.moduleNamespace = "frameleaf_ml";
+    f.manifest.files["provenance.json"] = {
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    await writeFile(join(f.root, "payload/provenance.json"), bytes);
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    await signCandidate(
+      f.root,
+      join(f.root, "manifest.sig"),
+      f.privatePem,
+      f.policy,
+    );
+    if (!platforms.includes(process.platform) || process.arch !== "arm64") {
+      await assert.rejects(
+        packageConfiguration(f.root, f.policy),
+        /runtime_bundle_source_unapproved/,
+      );
+      return;
+    }
+    const config = await packageConfiguration(f.root, f.policy);
+    assert.equal(
+      config.bundle.resources[join(f.root, "payload")],
+      "native-runtime/payload",
+    );
+  });
+}
