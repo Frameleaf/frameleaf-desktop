@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import build_host_server
 from build_host_server import build, stage_server
-from build_runtime import BuildError, run as checked_run
+from build_runtime import BuildError, build_environment, run as checked_run
 
 
 class HostServerTests(unittest.TestCase):
@@ -19,6 +19,7 @@ class HostServerTests(unittest.TestCase):
         git = shutil.which("git")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            fixture_env = build_environment(root, os.environ)
             source = root / "source"
             source.mkdir()
             canonical = b'{"canonical":true}\n'
@@ -43,8 +44,8 @@ class HostServerTests(unittest.TestCase):
                  "commit", "-q", "-m", "fixture"],
                 ["config", "core.autocrlf", "true"], ["config", "core.eol", "crlf"],
             ]:
-                subprocess.run([git, *arguments], cwd=source, check=True, capture_output=True)
-            revision = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=source, text=True).strip()
+                subprocess.run([git, *arguments], cwd=source, env=fixture_env, check=True, capture_output=True)
+            revision = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=source, env=fixture_env, text=True).strip()
             node = root / "node"
             node.write_bytes(b"fixture")
             output = root / "output"
@@ -65,6 +66,16 @@ class HostServerTests(unittest.TestCase):
                 self.assertRaisesRegex(BuildError, "canonical_archive_checked_before_build"),
             ):
                 build(source, revision, node, output)
+
+    def test_source_archive_fixture_ignores_inherited_git_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            decoy = Path(temporary).resolve()
+            sentinel = decoy / "sentinel"
+            sentinel.write_bytes(b"unrelated repository")
+            with patch.dict(os.environ, {"GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy)}):
+                self.test_source_archive_preserves_canonical_bytes_with_windows_git_settings()
+            self.assertFalse((decoy / ".git").exists())
+            self.assertEqual(sentinel.read_bytes(), b"unrelated repository")
 
     def test_runtime_metadata_keeps_versions_without_build_machine_paths(self):
         for origin, version in [("file:///developer/private-build", "0.0.0"), ("file:///C:/Users/builder/private-build", "1.2.3-beta.1"), ("file:///developer/private-build", "1.2.3-alpha-beta.1+build.001")]:
