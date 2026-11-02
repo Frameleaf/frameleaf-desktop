@@ -1,4 +1,5 @@
-//! Read-only machine installation anchor; no directory creation or caller-selected root.
+//! OS-owned machine anchor; installer-only directory writes live in the package submodule.
+pub(super) mod package;
 use std::{collections::BTreeSet, ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 use windows_sys::Win32::{
     Foundation::RPC_E_CHANGED_MODE,
