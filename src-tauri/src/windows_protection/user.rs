@@ -135,7 +135,16 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
     ];
     let mut trusted = super::native::trusted_sids()?.clone();
     trusted.push(user.clone());
-    let parent = super::stable_path(path.parent().ok_or(ERROR)?)?;
+    let physical = super::stable_path(path.parent().ok_or(ERROR)?)?;
+    // Native directory APIs need the extended spelling; process launches keep their captured spelling.
+    let parent = PathBuf::from(format!(
+        r"\\?\GLOBALROOT{}",
+        physical
+            .to_str()
+            .ok_or(ERROR)?
+            .strip_prefix(r"\\.\GLOBALROOT")
+            .ok_or(ERROR)?
+    ));
     let text = parent.to_str().ok_or(ERROR)?;
     // Hold the physical parent chain against deletion until creation and admission finish.
     let mut parents = Vec::new();
@@ -150,6 +159,7 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
         parents.push(file);
     }
     let path: PathBuf = parent.join(path.file_name().ok_or(ERROR)?);
+    super::filesystem_components(path.to_str().ok_or(ERROR)?).ok_or(ERROR)?;
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let security = descriptor(&user)?;
@@ -192,35 +202,44 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
         );
         return Err(ERROR.into());
     }
-    let mut pending = vec![path];
+    // Each frame pins its directory and ancestors until all children have been inspected.
+    let mut pending = vec![scan(&path, file)?];
     let mut visited = 0;
-    while let Some(directory) = pending.pop() {
-        #[cfg(test)]
-        BEFORE_SCAN.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook(&directory);
-            }
-        });
-        for entry in fs::read_dir(&directory).map_err(|_| ERROR)? {
-            visited += 1;
-            if visited > 100_000 {
-                return Err("runtime_store_privacy_inventory_limit".into());
-            }
-            let path = entry.map_err(|_| ERROR)?.path();
-            let file = open(&path)?;
-            let (owner, acl, _) = super::native::security(&file)?;
-            // Elevated writes may use a trusted SYSTEM/Administrators owner; foreign grants still fail.
-            if !super::private_acl(&owner, &acl, &owner, &private_trusted) {
-                #[cfg(test)]
-                eprintln!("private directory descendant policy refused: {path:?}");
-                return Err(ERROR.into());
-            }
-            if file.metadata().map_err(|_| ERROR)?.is_dir() {
-                pending.push(path);
-            }
+    while let Some((_, entries)) = pending.last_mut() {
+        let Some(entry) = entries.next() else {
+            pending.pop();
+            continue;
+        };
+        visited += 1;
+        if visited > 100_000 {
+            return Err("runtime_store_privacy_inventory_limit".into());
+        }
+        let path = entry.map_err(|_| ERROR)?.path();
+        let file = open(&path)?;
+        let (owner, acl, _) = super::native::security(&file)?;
+        // Elevated writes may use a trusted SYSTEM/Administrators owner; foreign grants still fail.
+        if !super::private_acl(&owner, &acl, &owner, &private_trusted) {
+            #[cfg(test)]
+            eprintln!("private directory descendant policy refused: {path:?}");
+            return Err(ERROR.into());
+        }
+        if file.metadata().map_err(|_| ERROR)?.is_dir() {
+            pending.push(scan(&path, file)?);
         }
     }
     Ok(())
+}
+
+/// Enumeration keeps the checked object open without delete sharing until its frame is exhausted.
+fn scan(path: &Path, pin: File) -> Result<(File, fs::ReadDir), String> {
+    #[cfg(test)]
+    BEFORE_SCAN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+    let entries = fs::read_dir(path).map_err(|_| ERROR)?;
+    Ok((pin, entries))
 }
 
 /// Admission may reuse an existing private directory; it never repairs permissions.
@@ -306,6 +325,59 @@ mod tests {
         );
         if !replaced.get() {
             result.unwrap();
+        }
+    }
+
+    #[test]
+    fn captured_parent_remains_pinned_until_child_admission_finishes() {
+        use std::{cell::Cell, rc::Rc};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_SCAN.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let root = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-parent-pin-{}", uuid::Uuid::new_v4())),
+        );
+        private_directory(&root.0).unwrap();
+        let parent = root.0.join("parent");
+        private_directory(&parent).unwrap();
+        let child = parent.join("new-child");
+        let parked = root.0.join("parked");
+        let attempted = Rc::new(Cell::new(false));
+        let replaced = Rc::new(Cell::new(false));
+        let flags = (attempted.clone(), replaced.clone());
+        let rename = (parent.clone(), parked.clone());
+        BEFORE_SCAN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path.file_name() == Some(std::ffi::OsStr::new("new-child")) {
+                    flags.0.set(true);
+                    flags.1.set(fs::rename(&rename.0, &rename.1).is_ok());
+                }
+            }))
+        });
+        let reset = Reset;
+        private_directory(&child).unwrap();
+        drop(reset);
+        assert!(attempted.get());
+        assert!(
+            !replaced.get(),
+            "the captured ancestor must stay pinned throughout admission"
+        );
+        fs::rename(parent, parked).unwrap();
+    }
+
+    #[test]
+    fn private_creation_refuses_alias_components_without_creating_a_normalized_sibling() {
+        let root = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-private-names-{}", uuid::Uuid::new_v4())),
+        );
+        private_directory(&root.0).unwrap();
+        for name in ["aliased.", "aliased ", "aliased:stream"] {
+            assert!(private_directory(&root.0.join(name)).is_err());
+            assert!(!root.0.join(name).exists());
+            assert!(!root.0.join("aliased").exists());
         }
     }
 

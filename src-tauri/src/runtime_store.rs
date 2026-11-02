@@ -38,7 +38,7 @@ impl RuntimeAttestation {
         &self.manifest_sha256
     }
 }
-pub(crate) struct Staging(pub(crate) PathBuf);
+pub(crate) struct Staging(PathBuf);
 impl Staging {
     /// Acquire cleanup ownership only after exclusive creation; admission failures clean up our root.
     pub(crate) fn create(path: PathBuf) -> Result<Self, String> {
@@ -46,6 +46,9 @@ impl Staging {
         let staging = Self(path);
         private_directory(&staging.0)?;
         Ok(staging)
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
 }
 impl Drop for Staging {

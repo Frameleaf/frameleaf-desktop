@@ -697,18 +697,18 @@ pub(crate) fn shared_cache(
     for (relative, (source, bytes, hash)) in &files {
         check_cancel(cancel)?;
         verify_file(source, *bytes, hash, cancel)?;
-        let mut parent = staging.0.clone();
+        let mut parent = staging.path().to_path_buf();
         for part in relative.parent().ok_or_else(invalid)?.components() {
             parent.push(part);
             private_directory(&parent)?;
         }
-        let target = staging.0.join(relative);
+        let target = staging.path().join(relative);
         // App-owned immutable weights share disk blocks; verify the published inode again before use.
         fs::hard_link(source, &target).map_err(|_| "worker_cache_publish_failed")?;
         verify_file(&target, *bytes, hash, cancel)?;
     }
     check_cancel(cancel)?;
-    fs::rename(&staging.0, &active).map_err(|_| "worker_cache_publish_failed")?;
+    fs::rename(staging.path(), &active).map_err(|_| "worker_cache_publish_failed")?;
     Ok(active)
 }
 
