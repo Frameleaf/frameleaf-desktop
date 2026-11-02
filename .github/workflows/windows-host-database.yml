@@ -166,7 +166,27 @@ jobs:
         run: |
           python -m unittest discover -s tools -p 'test_replay_host_database_windows.py'
           if ($LASTEXITCODE) { throw 'Replay guard tests failed' }
-          python tools/replay_host_database_windows.py --archive "$env:RUNNER_TEMP/frameleaf-database-replay.zip" --output "$env:RUNNER_TEMP/frameleaf-database-replay" --sha256 "$env:COMPONENT_ARCHIVE_SHA256" --source-revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
+          # initdb re-executes with the Administrators SID disabled. Test a root explicitly owned by this user.
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $probe = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('frameleaf-db-replay-' + [Guid]::NewGuid().ToString('N'))
+          if (Test-Path -LiteralPath $probe) { throw 'Probe directory already exists' }
+          $directory = New-Item -ItemType Directory -Path $probe -ErrorAction Stop
+          if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Probe root is redirected' }
+          $security = [System.Security.AccessControl.DirectorySecurity]::new()
+          $security.SetOwner($sid)
+          $security.SetAccessRuleProtection($true, $false)
+          foreach ($identity in @($sid.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($identity), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            $security.AddAccessRule($rule)
+          }
+          Set-Acl -LiteralPath $probe -AclObject $security -ErrorAction Stop
+          $actual = Get-Acl -LiteralPath $probe
+          if (!$actual.AreAccessRulesProtected -or $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'Probe ownership is not private' }
+          $rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+          if ($rules.Count -ne 3 -or @($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' -or $_.IdentityReference.Value -notin @($sid.Value, 'S-1-5-18', 'S-1-5-32-544') -or $_.FileSystemRights -ne 'FullControl' -or $_.InheritanceFlags -ne 'ContainerInherit,ObjectInherit' }).Count) { throw 'Probe ACL is not the explicit inheritable user policy' }
+          "FRAMELEAF_DATABASE_REPLAY_PROBE=$probe" >> $env:GITHUB_ENV
+          $actual.Sddl | Set-Content -LiteralPath (Join-Path $probe 'root-acl.txt')
+          python tools/replay_host_database_windows.py --archive "$env:RUNNER_TEMP/frameleaf-database-replay.zip" --output "$probe/candidate" --sha256 "$env:COMPONENT_ARCHIVE_SHA256" --source-revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
           if ($LASTEXITCODE) { throw 'Retained database qualification failed; inspect loader receipt' }
       - name: Retain bounded private replay diagnostics
         if: always()
@@ -174,9 +194,10 @@ jobs:
         with:
           name: frameleaf-windows-database-replay
           path: |
-            ${{ runner.temp }}/frameleaf-database-replay/loader-report.json
-            ${{ runner.temp }}/frameleaf-database-replay/command-error.log
-            ${{ runner.temp }}/frameleaf-database-replay/postgres.log
-            ${{ runner.temp }}/frameleaf-database-replay/pg-ctl-start.log
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/root-acl.txt
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/loader-report.json
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/command-error.log
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/postgres.log
+            ${{ env.FRAMELEAF_DATABASE_REPLAY_PROBE }}/candidate/pg-ctl-start.log
           retention-days: 7
           if-no-files-found: warn
