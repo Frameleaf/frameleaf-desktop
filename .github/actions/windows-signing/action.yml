@@ -1,0 +1,63 @@
+name: Configure Azure Artifact Signing
+description: Authenticate with GitHub OIDC and configure Tauri to sign before bundling
+inputs:
+  config:
+    description: Generated Tauri config file
+    required: true
+  client-id:
+    required: true
+    description: Azure application client ID
+  tenant-id:
+    required: true
+    description: Azure tenant ID
+  endpoint:
+    required: true
+    description: Regional Artifact Signing endpoint
+  account:
+    required: true
+    description: Artifact Signing account name
+  profile:
+    required: true
+    description: Public Trust certificate profile name
+  subject:
+    required: true
+    description: Exact verified certificate publisher subject
+runs:
+  using: composite
+  steps:
+    - name: Require signing configuration
+      shell: pwsh
+      env:
+        AZURE_CLIENT_ID: ${{ inputs.client-id }}
+        AZURE_TENANT_ID: ${{ inputs.tenant-id }}
+        AZURE_SIGNING_ENDPOINT: ${{ inputs.endpoint }}
+        AZURE_SIGNING_ACCOUNT: ${{ inputs.account }}
+        AZURE_SIGNING_PROFILE: ${{ inputs.profile }}
+        WINDOWS_SIGNING_SUBJECT: ${{ inputs.subject }}
+      run: |
+        if ($env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REF -ne 'refs/heads/main') { throw 'Signing requires Windows on main' }
+        foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_SIGNING_PROFILE', 'WINDOWS_SIGNING_SUBJECT') {
+          $value = [Environment]::GetEnvironmentVariable($name)
+          if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains("`n") -or $value.Contains("`r")) { throw "Missing or invalid $name" }
+          "$name=$value" >> $env:GITHUB_ENV
+        }
+    - name: Azure login with GitHub OIDC
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        allow-no-subscriptions: true
+    - name: Configure the Tauri signing command
+      shell: pwsh
+      env:
+        TAURI_CONFIG: ${{ inputs.config }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Install-Module -Name ArtifactSigning -RequiredVersion 0.1.20 -Scope CurrentUser -Force -Repository PSGallery
+        $config = Get-Content -LiteralPath $env:TAURI_CONFIG -Raw | ConvertFrom-Json
+        $windows = @{ signCommand = @{
+          cmd = 'pwsh'
+          args = @('-NoProfile', '-NonInteractive', '-File', (Join-Path $env:GITHUB_WORKSPACE 'tools/windows_sign.ps1'), '-Path', '%1')
+        } }
+        $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue $windows -Force
+        $config | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $env:TAURI_CONFIG

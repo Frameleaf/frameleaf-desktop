@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       platforms:
-        description: 'Candidate targets; Windows installers are unsigned for manual testing'
+        description: 'Candidate targets; Windows installers use Azure Artifact Signing'
         type: choice
         default: linux
         options: [linux, windows]
@@ -56,6 +56,11 @@ jobs:
           '
   build:
     needs: prepare
+    environment: ${{ matrix.target == 'windows-x86_64' && 'desktop-release' || '' }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -122,6 +127,17 @@ jobs:
         with:
           node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Configure Azure Artifact Signing
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/windows-signing
+        with:
+          config: candidate-config.json
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
+          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
       - name: Build installer candidates
         shell: bash
         run: |
@@ -140,6 +156,19 @@ jobs:
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
+      - name: Verify Windows executable and installer signatures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --input-type=module -e "import { packageConfiguration } from './tools/package_desktop.mjs'; await packageConfiguration('release-runtime');"
+          if ($LASTEXITCODE) { throw 'Factory runtime changed during bundling' }
+          $files = @(Get-Item src-tauri/target/release/frameleaf-desktop.exe)
+          $installers = @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.exe', '.msi' })
+          if ($installers.Count -ne 2 -or @($installers.Extension | Sort-Object -Unique).Count -ne 2) { throw 'Expected NSIS and MSI installers' }
+          foreach ($file in ($files + $installers)) {
+            & ./tools/windows_sign.ps1 -Path $file.FullName -VerifyOnly
+          }
       - name: Collect installers and provenance preserving executable modes
         env:
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
@@ -170,7 +199,7 @@ jobs:
           (output / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(hashes.items())))
           (output / 'candidate.json').write_text(json.dumps({
               'sourceRevision': os.environ['GITHUB_SHA'], 'target': os.environ['CANDIDATE_TARGET'],
-              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False, 'osSigned': False,
+              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False, 'osSigned': sys.platform == 'win32',
               'scope': 'GUI and existing-server helper candidate; full native host qualification remains separate',
               'files': hashes,
           }, indent=2) + '\n')
