@@ -36,6 +36,21 @@
     "allow-cancel-local-host-start",
     "allow-stop-local-host-manager",
     "allow-authorize-local-manager",
-    "allow-open-local-photos"
+    "allow-open-local-photos",
+    "allow-discover-servers",
+    "allow-server-summary",
+    "allow-cloud-status",
+    "allow-wallet-status",
+    "allow-update-wallet",
+    "allow-remote-status",
+    "allow-update-remote",
+    "allow-test-remote-access",
+    "allow-open-external",
+    "allow-tray-refresh",
+    "allow-cloud-sign-in",
+    "allow-cloud-account",
+    "allow-cloud-sign-out",
+    "allow-cloud-servers",
+    "allow-connect-cloud-server"
   ]
 }

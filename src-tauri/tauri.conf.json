@@ -16,8 +16,10 @@
         "title": "Frameleaf",
         "width": 1040,
         "height": 760,
-        "minWidth": 680,
-        "minHeight": 600
+        "minWidth": 900,
+        "minHeight": 640,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
