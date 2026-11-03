@@ -248,3 +248,14 @@ class WindowsComponentSetTests(unittest.TestCase):
                     obtain(root / 'source', approvals, root / 'result')
                 download.assert_not_called()
             self.assertFalse((root / 'result').exists())
+
+    def test_keyboard_interrupt_removes_owned_partial_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();fixture,approvals=self.prepare(root)
+            from obtain_windows_host_components import obtain as real_obtain
+            def interrupted(*args):
+                with patch('obtain_windows_host_components.verify_reused',side_effect=KeyboardInterrupt()):
+                    return real_obtain(*args)
+            with patch(__name__+'.obtain',side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+                self.run_set(root,fixture,approvals)
+            self.assertFalse((root/'result').exists())

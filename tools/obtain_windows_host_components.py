@@ -189,7 +189,7 @@ def obtain(source: Path, approvals: dict, output: Path) -> None:
         partial = output / 'qualification.json.part'
         partial.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8', newline='\n')
         partial.replace(output / 'qualification.json')
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         shutil.rmtree(output)
         raise
 
