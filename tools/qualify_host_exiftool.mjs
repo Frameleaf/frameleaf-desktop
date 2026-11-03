@@ -32,9 +32,8 @@ if (mode === missingMode) {
   console.log("private-runtime-missing-refused");
 } else {
   assert.equal(mode, undefined);
-  const receipt = JSON.parse(
-    await readFile(join(runtime, "qualification.json"), "utf8"),
-  );
+  const receiptBytes = await readFile(join(runtime, "qualification.json"));
+  const receipt = JSON.parse(receiptBytes.toString("utf8"));
   assert.equal(receipt.qualification, "passed");
   const hash = async (path) =>
     createHash("sha256")
@@ -135,6 +134,7 @@ if (mode === missingMode) {
     JSON.stringify(
       {
         qualification: "passed",
+        componentReceiptSha256: createHash("sha256").update(receiptBytes).digest("hex"),
         sourceRevision: receipt.sourceRevision,
         vendorVersion: receipt.vendorVersion,
         perlSource: receipt.perlSource,

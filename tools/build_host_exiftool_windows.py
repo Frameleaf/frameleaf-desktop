@@ -13,6 +13,8 @@ from build_host_server import stage_server
 from build_runtime import BuildError, inventory, regular, sha256
 
 VENDOR_MODULE_SHA256 = "98dd924f2661a18188aae477acb9f74e767a3c1a9ba12d159c8b1ba90361079a"
+# Deterministic adapter output for the fixed vendor blob; update both pins after source review.
+ADAPTED_MODULE_SHA256 = "d748df3883e322944ce52fd5c764692f8071cddb12740a02a0c3b1fef087c577"
 
 
 def adapt_exiftool_path(source: str, version: str) -> str:
