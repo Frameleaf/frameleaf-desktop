@@ -6,12 +6,39 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from build_host_ffmpeg import ffmpeg_contract, unpack
 from build_runtime import BuildError
 
 
 class FfmpegPackageTests(unittest.TestCase):
+    def test_explicit_complete_host_budget_does_not_change_default_archive_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "safe.tar"
+            with tarfile.open(archive, "w") as contents:
+                entry = tarfile.TarInfo("payload/file")
+                entry.size = 3 * 1024**3
+                # Only preflight metadata is needed to prove the default refuses before extraction.
+                contents.addfile(tarfile.TarInfo("placeholder"))
+            with patch("tarfile.TarFile.__iter__", return_value=iter([entry])), patch(
+                "tarfile.TarFile.extractall"
+            ) as extract:
+                destination = root / "out"
+                destination.mkdir()
+                with self.assertRaisesRegex(BuildError, "archive_limit"):
+                    unpack(archive, destination)
+                extract.assert_not_called()
+            with patch("tarfile.TarFile.__iter__", return_value=iter([entry])), patch(
+                "tarfile.TarFile.extractall"
+            ) as extract:
+                unpack(archive, destination, max_bytes=8 * 1024**3)
+                extract.assert_called_once()
+            for budget in (True, 0, -1, 8 * 1024**3 + 1):
+                with self.subTest(budget=budget), self.assertRaises(BuildError):
+                    unpack(archive, destination, max_bytes=budget)
+
     def test_tar_preserves_nested_bytes_and_executable_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

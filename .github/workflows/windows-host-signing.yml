@@ -1,0 +1,105 @@
+name: Sign verified Windows host candidate
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: 'Reviewed immutable approval for one successful complete-host assembly artifact'
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-complete-host-signing
+  cancel-in-progress: false
+jobs:
+  sign:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    environment: desktop-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Admit the immutable unsigned candidate without executing its payload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$HOST_APPROVAL" > "$RUNNER_TEMP/host-signing-approval.json"
+          python tools/obtain_windows_host_candidate.py --approval "$RUNNER_TEMP/host-signing-approval.json" --output "$RUNNER_TEMP/host-signing"
+      - name: Sign using the standard host and nested ML verifiers
+        shell: bash
+        env:
+          FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          : "${FACTORY_PRIVATE_KEY:?Missing factory signing key}"
+          printf '%s\n' "$FACTORY_PRIVATE_KEY" | node tools/sign_host_runtime.mjs --candidate "$RUNNER_TEMP/host-signing/candidate" --private-key-stdin > "$RUNNER_TEMP/host-signing/signature.json"
+      - name: Independently verify the signed candidate and retain separate acceptance flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import { readFile, writeFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import { verifySignedHostCandidate } from './tools/sign_host_runtime.mjs';
+          const root = join(process.env.RUNNER_TEMP, 'host-signing');
+          const verified = await verifySignedHostCandidate(join(root, 'candidate'));
+          const signed = JSON.parse(await readFile(join(root, 'signature.json'), 'utf8'));
+          const original = JSON.parse(await readFile(join(root, 'candidate/qualification.json'), 'utf8'));
+          const producer = JSON.parse(await readFile(join(root, 'producer.json'), 'utf8'));
+          if (verified.manifestSha256 !== original.manifestSha256 ||
+              ['keyId', 'manifestSha256', 'sourceRevision', 'epoch', 'certified'].some(key => verified[key] !== signed[key]))
+            throw new Error('host_signed_candidate_identity_changed');
+          await writeFile(join(root, 'signature-verification.json'), JSON.stringify({
+            schemaVersion: 1, ...verified, signatureSha256: signed.signatureSha256,
+            approvedProducer: producer.approved, signaturePresent: true,
+            runtimeQualified: false, redistributable: false, installedPlatformQualified: false,
+            fullMediaConformance: false,
+            scope: 'Data-only authoring signature; no installed host, release or deployment acceptance'
+          }, null, 2) + '\n');
+          JS
+      - name: Archive the exact signed resources without executing them
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import tarfile
+          root = Path(os.environ['RUNNER_TEMP']) / 'host-signing'
+          candidate = root / 'candidate'
+          expected = {'payload', 'manifest.json', 'manifest.sig', 'qualification.json'}
+          if {p.name for p in candidate.iterdir()} != expected:
+              raise SystemExit('Unexpected signed candidate files')
+          with tarfile.open(root / 'windows-complete-host-signed.tar.gz', 'w:gz', compresslevel=1) as archive:
+              for name in sorted(expected):
+                  archive.add(candidate / name, arcname=name)
+      - name: Retain private signed candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-complete-host-signed
+          path: ${{ runner.temp }}/host-signing/windows-complete-host-signed.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain bounded signature and original producer evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-complete-host-signature-evidence
+          path: |
+            ${{ runner.temp }}/host-signing/signature.json
+            ${{ runner.temp }}/host-signing/signature-verification.json
+            ${{ runner.temp }}/host-signing/producer.json
+            ${{ runner.temp }}/host-signing/candidate/manifest.json
+            ${{ runner.temp }}/host-signing/candidate/manifest.sig
+            ${{ runner.temp }}/host-signing/candidate/qualification.json
+          retention-days: 7
+          if-no-files-found: error

@@ -45,11 +45,13 @@ def ffmpeg_contract(lock: dict, descriptor: dict, target: str) -> dict:
     return pin
 
 
-def unpack(archive: Path, destination: Path) -> None:
+def unpack(archive: Path, destination: Path, *, max_bytes: int = 2 * 1024**3) -> None:
     """Preflight the bounded, link-free archive before extracting into an empty directory.
 
     The caller must exclusively own the archive and destination throughout this operation.
     """
+    if type(max_bytes) is not int or not 0 < max_bytes <= 8 * 1024**3:
+        raise BuildError("host_ffmpeg_archive_limit")
     if (not stat.S_ISREG(regular(archive).st_mode)
             or not stat.S_ISDIR(regular(destination).st_mode)
             or any(destination.iterdir())):
@@ -64,7 +66,7 @@ def unpack(archive: Path, destination: Path) -> None:
             name = relative(name[:-1] if name.endswith("/") else name)
             name = unicodedata.normalize("NFC", unicodedata.normalize("NFD", name).casefold())
             total += size
-            if count > 100_000 or size < 0 or total > 2 * 1024**3:
+            if count > 100_000 or size < 0 or total > max_bytes:
                 raise BuildError("host_ffmpeg_archive_limit")
             if name in names:
                 raise BuildError("host_ffmpeg_archive_entry_invalid")
