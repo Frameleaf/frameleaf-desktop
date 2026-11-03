@@ -23,7 +23,9 @@ class PrivateDirectoryTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), 'retained')
 
     def test_windows_uses_inheritable_explicit_user_ace_at_creation(self):
-        for sid in ['S-1-5-21-1-2-3-1001', 'S-1-12-1-1234567890-2345678901-3456789012-456789012']:
+        for sid in ['S-1-5-21-1-2-3-1001', 'S-1-12-1-1234567890-2345678901-3456789012-456789012',
+                    'S-1-12-3-1234567890-2345678901-3456789012-456789012',
+                    'S-1-12-8-1234567890-2345678901-3456789012-456789012']:
             with self.subTest(sid=sid):
                 security = SimpleNamespace(ConvertStringSecurityDescriptorToSecurityDescriptorW=Mock(return_value=True))
                 kernel = SimpleNamespace(CreateDirectoryW=Mock(return_value=True), LocalFree=Mock(return_value=None))
@@ -46,7 +48,8 @@ class PrivateDirectoryTests(unittest.TestCase):
         ) as api:
             for identity in ['', 'not,csv', '"runner","S-1-5-18"', '"runner","S-1-5-21-1-2-3-1001)(A;;FA;;;WD)"',
                              '"runner","S-1-12-1-1-2-3"', '"runner","S-1-12-2-1-2-3-4"',
-                             '"runner","S-1-12-1-1-2-3-4)(A;;FA;;;WD)"']:
+                             '"runner","S-1-12-1-1-2-3-4)(A;;FA;;;WD)"',
+                             '"runner","S-1-12-3-1-2-3"', '"runner","S-1-12-8-1-2-3-4)(A;;FA;;;WD)"']:
                 with self.subTest(identity=identity), patch('windows_private_directory.subprocess.check_output', return_value=identity):
                     with self.assertRaisesRegex(ValueError, 'identity_invalid'):
                         _windows_private_directory(Path(temporary) / 'private')
