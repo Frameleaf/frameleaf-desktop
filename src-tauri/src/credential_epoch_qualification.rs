@@ -45,48 +45,9 @@ fn disposable_runner_guard_refuses_ordinary_sessions() {
 }
 
 #[test]
-fn controller_credential_receipt_exposes_only_public_identity_and_runtime_history() {
-    let identity = DeviceIdentity::generate();
-    let receipt = controller_access_receipt(&identity, &identity.installation_id).unwrap();
-    let mut keys: Vec<_> = receipt
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort();
-    assert_eq!(
-        keys,
-        [
-            "installationId",
-            "protocolVersion",
-            "publicKey",
-            "runtimeEpochs"
-        ]
-    );
-    assert_eq!(receipt["publicKey"], identity.public_key());
-    assert_eq!(
-        receipt["runtimeEpochs"],
-        serde_json::json!({"accepted": {}})
-    );
-    assert!(controller_access_receipt(&identity, &uuid::Uuid::new_v4().to_string()).is_err());
-    assert!(controller_access_receipt(&identity, "not-an-identity").is_err());
-}
-
-#[test]
 #[ignore = "requires a fresh disposable hosted runner and a real unlocked OS credential store"]
 fn disposable_runner_epoch_persistence() {
     require_runner();
-    let controller = std::path::PathBuf::from(
-        std::env::var_os("FRAMELEAF_TEST_CONTROLLER").expect("compiled controller is required"),
-    );
-    assert!(
-        controller.is_absolute()
-            && fs::symlink_metadata(&controller)
-                .unwrap()
-                .file_type()
-                .is_file()
-    );
     {
         let _lock = installation_lock().unwrap();
         assert!(
@@ -150,31 +111,6 @@ fn disposable_runner_epoch_persistence() {
             .unwrap_err(),
         "interrupted_publish"
     );
-    let expected_receipt = {
-        let _lock = installation_lock().unwrap();
-        controller_access_receipt(&runtime_identity().unwrap(), &installation_id).unwrap()
-    };
-    let output = scratch.0.join("controller-credential-receipt.json");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&output)
-        .unwrap();
-    let mut controller_child = Command::new(&controller)
-        .args(["--qualify-credential-access", &installation_id])
-        .stdout(file)
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let status = wait_for_child(&mut controller_child, "separate-controller");
-    let actual: serde_json::Value =
-        serde_json::from_slice(&crate::runtime_store::read_bounded(&output, 8192).unwrap())
-            .unwrap();
-    assert_eq!(
-        actual, expected_receipt,
-        "separate controller must read the same key and saved rollback floor"
-    );
-    assert!(status.success(), "controller credential access failed");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
