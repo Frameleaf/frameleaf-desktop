@@ -287,10 +287,6 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
     directory(path, &current_user()?, DirectoryMode::CreateNew).map(|_| ())
 }
 
-pub(crate) fn new_private_directory(path: &Path) -> Result<(), String> {
-    create_private_directory(path)?;
-    require_private_directory(path)
-}
 pub(crate) fn require_private_directory(path: &Path) -> Result<(), String> {
     let user = current_user()?;
     directory(path, &user, DirectoryMode::ExistingOnly).map(|_| ())
@@ -641,10 +637,10 @@ mod tests {
     fn retained_private_admission_pins_the_leaf_and_its_ancestors() {
         let root =
             std::env::temp_dir().join(format!("frameleaf-ancestry-pin-{}", uuid::Uuid::new_v4()));
-        new_private_directory(&root).unwrap();
+        create_private_directory(&root).unwrap();
         let fixture = Fixture(root);
         let leaf = fixture.0.join("state");
-        new_private_directory(&leaf).unwrap();
+        create_private_directory(&leaf).unwrap();
         let pins = pin_private_directory(&leaf).unwrap();
         assert!(fs::rename(&fixture.0, fixture.0.with_extension("moved")).is_err());
         assert!(fs::rename(&leaf, leaf.with_extension("moved")).is_err());
@@ -665,7 +661,7 @@ mod tests {
             "frameleaf-existing-private-{}",
             uuid::Uuid::new_v4()
         ));
-        new_private_directory(&root).unwrap();
+        create_private_directory(&root).unwrap();
         crate::native_runtime::absolute_directory(&root).unwrap();
         fs::remove_dir(&root).unwrap();
         assert!(require_private_directory(&root).is_err());
@@ -675,12 +671,12 @@ mod tests {
     fn exclusive_private_creation_refuses_existing_state_without_repair_or_deletion() {
         let root =
             std::env::temp_dir().join(format!("frameleaf-new-private-{}", uuid::Uuid::new_v4()));
-        new_private_directory(&root).unwrap();
+        create_private_directory(&root).unwrap();
         let fixture = Fixture(root);
         let path = fixture.0.join("synthetic-state");
         fs::write(&path, b"retain").unwrap();
         let before = super::super::native::security(&open(&fixture.0).unwrap()).unwrap();
-        assert!(new_private_directory(&fixture.0).is_err());
+        assert!(create_private_directory(&fixture.0).is_err());
         assert_eq!(
             super::super::native::security(&open(&fixture.0).unwrap()).unwrap(),
             before

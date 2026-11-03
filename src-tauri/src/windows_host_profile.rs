@@ -88,7 +88,7 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join(format!("frameleaf-user-host-{}", uuid::Uuid::new_v4()));
-        crate::windows_protection::new_private_directory(&root).unwrap();
+        crate::windows_protection::create_private_directory(&root).unwrap();
         let profile = Profile {
             root: root.join("host"),
             legacy: root.join("legacy"),
@@ -156,7 +156,7 @@ mod tests {
             Ok("1")
         );
         let profile = discover().unwrap();
-        crate::windows_protection::new_private_directory(&profile.root).unwrap();
+        crate::windows_protection::create_private_directory(&profile.root).unwrap();
         struct EmptyProfile(PathBuf);
         impl Drop for EmptyProfile {
             fn drop(&mut self) {
