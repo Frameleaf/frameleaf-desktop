@@ -148,17 +148,23 @@ class WindowsDatabaseTests(unittest.TestCase):
             "extensions": ["cube", "earthdistance", "pg_trgm", "unaccent", "uuid-ossp", "vector"],
             "checksums": "on", "neighbor": 1,
         }
-        for failure in [None, "initdb", "start", "start-timeout", "facts"]:
+        for failure in [None, "initdb", "start", "start-timeout", "facts", "start-stop", "facts-stop", "stop", "start-diagnostic", "diagnostic"]:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
-                output = Path(temporary)
+                root = Path(temporary)
+                output = root / "work"
+                output.mkdir()
                 prefix = output / "postgres"
                 calls = []
+                startup = "discarded startup head\n" + "synthetic owned startup output\n" * 2000
+                postgres = b"discarded server head\n" + b"synthetic postgres output\n" * 2000
 
                 def command(arguments, *, cwd, env):
                     calls.append([str(arg) for arg in arguments])
                     if Path(arguments[0]).name == "pg_ctl.exe" and arguments[-1] == "start":
                         self.fail("pg_ctl start must not capture pipes inherited by the running server")
                     self.assertEqual(len(env["PGPASSWORD"]), 64)
+                    if Path(arguments[0]).name == "pg_ctl.exe" and arguments[-1] == "stop" and failure in {"start-stop", "facts-stop", "stop"}:
+                        raise BuildError("synthetic_stop_failure")
                     if Path(arguments[0]).name == "initdb.exe":
                         self.assertTrue((output / "fixture-password").exists())
                         if failure == "initdb":
@@ -172,7 +178,7 @@ class WindowsDatabaseTests(unittest.TestCase):
                         if "CREATE EXTENSION" in arguments[-1]:
                             self.assertIn("unaccent(U&'caf\\00e9')", arguments[-1])
                     if "-c" in arguments and str(arguments[-1]).startswith("SELECT json_build_object"):
-                        return json.dumps({**expected, "neighbor": 2} if failure == "facts" else expected)
+                        return json.dumps({**expected, "neighbor": 2} if failure in {"facts", "facts-stop"} else expected)
                     return ""
 
                 def start_command(arguments, *, cwd, env, stdin, stdout, stderr, timeout):
@@ -186,23 +192,43 @@ class WindowsDatabaseTests(unittest.TestCase):
                     self.assertEqual(len(env["PGPASSWORD"]), 64)
                     self.assertTrue(stdout.writable())
                     self.assertNotEqual(stdout, subprocess.PIPE)
-                    stdout.write("synthetic owned startup output\n")
+                    stdout.write(startup)
+                    (output / "postgres.log").write_bytes(postgres)
                     if failure == "start-timeout":
                         raise subprocess.TimeoutExpired(arguments, timeout)
-                    return subprocess.CompletedProcess(arguments, 1 if failure == "start" else 0)
+                    return subprocess.CompletedProcess(arguments, 1 if failure in {"start", "start-stop", "start-diagnostic"} else 0)
 
                 with (
                     patch("build_host_database_windows.run", side_effect=command),
                     patch("build_host_database_windows.subprocess.run", side_effect=start_command),
                 ):
+                    env = {"FRAMELEAF_BUILD_ERROR_LOG": str(root / "diagnostics.log")}
+                    if failure in {"start-diagnostic", "diagnostic"}:
+                        (root / "diagnostics.log").mkdir()
                     if failure:
-                        with self.assertRaisesRegex((BuildError, subprocess.TimeoutExpired), "synthetic_initdb_failure|host_database_start_failed|host_database_fixture_mismatch|timed out"):
-                            qualify(prefix, output, lock, {})
+                        message = "diagnostics.log" if failure == "diagnostic" else "synthetic_stop_failure" if failure == "stop" else "synthetic_initdb_failure|host_database_start_failed|host_database_fixture_mismatch|timed out"
+                        with self.assertRaisesRegex((BuildError, subprocess.TimeoutExpired, OSError), message) as caught:
+                            qualify(prefix, output, lock, env)
+                        if failure in {"start-stop", "facts-stop"}:
+                            self.assertIn("synthetic_stop_failure", " ".join(caught.exception.__notes__))
+                        if failure == "start-diagnostic":
+                            self.assertIn("Database diagnostics also failed", " ".join(caught.exception.__notes__))
                     else:
-                        result = qualify(prefix, output, lock, {})
+                        result = qualify(prefix, output, lock, env)
                         self.assertEqual(result["fresh"], result["restored"])
                         self.assertEqual(result["fresh"], result["restarted"])
                         self.assertTrue(result["physicalChecksumsVerified"])
                 self.assertFalse((output / "fixture-password").exists())
                 stops = [args for args in calls if args[-1] == "stop"]
-                self.assertEqual(len(stops), 0 if failure == "initdb" else 1 if failure else 2)
+                self.assertEqual(len(stops), 0 if failure == "initdb" else 2 if failure in {None, "stop", "diagnostic"} else 1)
+                if failure not in {"initdb", "start-diagnostic", "diagnostic"}:
+                    log = root / "diagnostics.log"
+                    self.assertTrue(log.is_file(), "Startup diagnostics must survive caller cleanup")
+                    retained = log.read_bytes()
+                    self.assertIn(startup.replace("\n", os.linesep).encode()[-32768:], retained)
+                    self.assertIn(postgres[-32768:], retained)
+                    self.assertNotIn(b"discarded startup head", retained)
+                    self.assertNotIn(b"discarded server head", retained)
+                    self.assertLessEqual(len(retained), 2 * 32768 + 128)
+                    if failure in {"start-stop", "facts-stop"}:
+                        self.assertTrue(b"synthetic_stop_failure" in retained, "Retain the secondary shutdown failure")

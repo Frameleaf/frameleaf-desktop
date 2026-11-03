@@ -147,6 +147,7 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
             raise BuildError("host_database_fixture_mismatch")
         return result
 
+    primary_error = None
     try:
         try:
             command([binary("initdb"), "-D", data, "--username=frameleaf", "--encoding=UTF8", "--locale=C", "--data-checksums", "--auth-local=scram-sha-256", "--auth-host=scram-sha-256", "--pwfile=" + str(password_file)])
@@ -168,8 +169,30 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
         command([binary("pg_checksums"), "--check", "-D", data])
         result.update(physicalChecksumsVerified=True, backupSha256=sha256(backup), fixtureAuthentication="scram-private-loopback-only")
         return result
+    except BaseException as error:
+        primary_error = error
+        try:
+            stop()
+        except Exception as stop_error:
+            error.add_note("Database shutdown also failed: " + str(stop_error))
+        raise
     finally:
-        stop()
+        if destination := env.get("FRAMELEAF_BUILD_ERROR_LOG"):
+            try:
+                with Path(destination).open("ab") as retained:
+                    for note in getattr(primary_error, "__notes__", [])[-4:]:
+                        retained.write(("\n" + note[-1024:] + "\n").encode("utf-8"))
+                    for name in ["pg-ctl-start.log", "postgres.log"]:
+                        path = output / name
+                        if path.is_file():
+                            with path.open("rb") as log:
+                                log.seek(0, os.SEEK_END)
+                                log.seek(max(0, log.tell() - 32768))
+                                retained.write(("\n[database " + name + "]\n").encode() + log.read(32768))
+            except OSError as log_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note("Database diagnostics also failed: " + str(log_error))
 
 
 def build(source: Path, revision: str, dependencies: Path, output: Path) -> None:

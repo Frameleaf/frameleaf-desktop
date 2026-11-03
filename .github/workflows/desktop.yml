@@ -65,6 +65,9 @@ jobs:
         with:
           node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Qualify Windows package directory authority in disposable runner
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_creates_protected_directories_and_refuses_existing_unsafe_objects -- --ignored --exact
       - name: Check Windows real restore test is compiled
         if: runner.os == 'Windows'
         shell: pwsh
@@ -73,6 +76,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Restore test discovery failed' }
           $restore = @($tests | Select-String '^host_state::activation::restore_qualification::actual_postgres_restore_selection_finalization_and_writer_admission: test$')
           if ($restore.Count -ne 1) { throw 'Windows real restore test is missing' }
+          $hostAuthority = @($tests | Select-String '^release_policy::tests::factory_signed_host_candidate_verifies_against_compiled_authority: test$')
+          if ($hostAuthority.Count -ne 1) { throw 'Windows compiled complete-host authority test is missing' }
       - name: Qualify privileged Linux package admission in disposable runner
         if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         run: |

@@ -1,0 +1,174 @@
+name: Windows host assets
+on:
+  pull_request:
+    paths:
+      - 'tools/build_host_web.py'
+      - 'tools/test_build_host_web.py'
+      - 'tools/build_host_plugin.py'
+      - 'tools/test_build_host_plugin.py'
+      - 'tools/build_host_studio.py'
+      - 'tools/test_build_host_studio.py'
+      - 'tools/build_host_server.py'
+      - 'tools/build_host_database.py'
+      - 'tools/build_runtime.py'
+      - 'tools/source_archive.py'
+      - 'tools/test_host_source_archives.py'
+      - 'tools/test_windows_host_assets.py'
+      - 'tools/diagnose_studio_resolution.mjs'
+      - 'runtime/studio-browser-guard*'
+      - '.github/workflows/windows-host-assets.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-host-assets
+  cancel-in-progress: false
+jobs:
+  assets:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      HOST_SOURCE_REVISION: 9118a01fdfb8a8cd20be24290660679b3a7c4de3
+      UV_THREADPOOL_SIZE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ env.HOST_SOURCE_REVISION }}
+          path: application-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Retain the plugin Node identity
+        shell: pwsh
+        run: '"NODE_BINARY=$((Get-Command node).Source)" >> $env:GITHUB_ENV'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '22.23.4'
+      - name: Prepare the source-matched package manager
+        shell: pwsh
+        run: |
+          $package = Get-Content application-source/package.json -Raw | ConvertFrom-Json
+          if ($package.packageManager -ne 'pnpm@12.11.2') { throw 'Source package manager mismatch' }
+          $studio = Get-Content application-source/studio/engine-build.json -Raw | ConvertFrom-Json
+          if ($studio.node -ne '22.23.4') { throw 'Source Studio build Node mismatch' }
+          npm install --global pnpm@12.11.2
+          if ($LASTEXITCODE) { throw 'Pinned package manager installation failed' }
+          "STUDIO_NODE_BINARY=$((Get-Command node).Source)" >> $env:GITHUB_ENV
+      - name: Check component staging and archive boundaries
+        shell: pwsh
+        run: |
+          foreach ($test in @('test_build_host_web.py', 'test_build_host_plugin.py', 'test_build_host_studio.py', 'test_host_source_archives.py', 'test_windows_host_assets.py')) {
+            python -m unittest discover -s tools -p $test -v
+            if ($LASTEXITCODE) { throw "Host asset packaging tests failed: $test" }
+          }
+      - name: Check the selected source's native Studio launchers
+        shell: pwsh
+        run: |
+          & $env:STUDIO_NODE_BINARY --test "$env:GITHUB_WORKSPACE/application-source/studio/tools/adapter-launch.test.mjs"
+          if ($LASTEXITCODE) { throw 'Selected source Studio launcher tests failed' }
+      - name: Build the current photo UI, plugin and Studio worker serially
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/fl-windows-assets" | Out-Null
+          foreach ($component in @('web', 'plugin', 'studio')) {
+            $node = if ($component -eq 'plugin') { $env:NODE_BINARY } else { $env:STUDIO_NODE_BINARY }
+            python "tools/build_host_$component.py" --source "$env:GITHUB_WORKSPACE/application-source" --revision $env:HOST_SOURCE_REVISION --node $node --output "$env:RUNNER_TEMP/fl-windows-assets/$component"
+            if ($LASTEXITCODE) {
+              "FAILED_ASSET_COMPONENT=$component" >> $env:GITHUB_ENV
+              throw "Genuine Windows asset build failed: $component"
+            }
+          }
+      - name: Capture bounded resolver evidence after a failed build
+        if: failure() && env.FAILED_ASSET_COMPONENT == 'web'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $source = "$env:RUNNER_TEMP/fl-windows-assets/web/work/source"
+          if (Test-Path "$source/studio/engine/node_modules/vite-plus/package.json") {
+            & $env:STUDIO_NODE_BINARY tools/diagnose_studio_resolution.mjs $source *> "$env:RUNNER_TEMP/fl-windows-assets/web/resolution-diagnostics.log"
+          }
+      - name: Archive the qualified host assets
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import sys
+          import tarfile
+          sys.path.insert(0, 'tools')
+          from build_runtime import build_environment, git_blob, inventory, regular, sha256
+          root = Path(os.environ['RUNNER_TEMP']) / 'fl-windows-assets'
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'application-source'
+          revision = os.environ['HOST_SOURCE_REVISION']
+          git = shutil.which('git')
+          if not git or not re.fullmatch('[a-f0-9]{40}', revision):
+              raise SystemExit('Git and the selected source commit are required')
+          environment = build_environment(root, os.environ)
+          configuration = json.loads(git_blob(git, source, revision, 'studio/engine-build.json', environment))
+          if configuration.get('node') != '22.23.4':
+              raise SystemExit('Pinned Studio Node version is required')
+          node_sha = sha256(Path(os.environ['NODE_BINARY']))
+          studio_node_sha = sha256(Path(os.environ['STUDIO_NODE_BINARY']))
+          workspace_lock = hashlib.sha256(git_blob(git, source, revision, 'pnpm-lock.yaml', environment)).hexdigest()
+          studio_lock = hashlib.sha256(git_blob(git, source, revision, 'studio/engine-package-lock.json', environment)).hexdigest()
+          components = [('web', 'www'), ('plugin', 'plugin'), ('studio', 'studio-worker')]
+          for name, directory in components:
+              component = root / name
+              regular(component / directory)
+              regular(component / 'qualification.json')
+              regular(component / 'work/source.tar')
+              receipt = json.loads((component / 'qualification.json').read_text())
+              if (type(receipt.get('schemaVersion')) is not int or receipt['schemaVersion'] != 1
+                  or receipt.get('sourceRevision') != os.environ['HOST_SOURCE_REVISION']
+                  or not re.fullmatch('[a-f0-9]{40}', receipt['sourceRevision'])
+                  or receipt.get('qualification') != 'passed'
+                  or receipt.get('nodeSha256') != (node_sha if name == 'plugin' else studio_node_sha)
+                  or receipt.get('runtimeQualified') is not False or receipt.get('redistributable') is not False
+                  or not isinstance(receipt.get('sourceArchiveSha256'), str)
+                  or not re.fullmatch('[a-f0-9]{64}', receipt['sourceArchiveSha256'])
+                  or receipt['sourceArchiveSha256'] != sha256(component / 'work/source.tar')
+                  or receipt.get('files') != inventory(component / directory)):
+                  raise SystemExit('Source-bound successful qualification and unchanged asset inventory are required')
+              if name in {'web', 'plugin'} and (receipt.get('pnpmVersion') != '12.11.2'
+                  or receipt.get('lockfileSha256') != workspace_lock):
+                  raise SystemExit('Source-matched workspace lock and pnpm version are required')
+              if name in {'web', 'studio'} and (receipt.get('npmVersion') != configuration['npm']
+                  or receipt.get('studioLockfileSha256') != studio_lock):
+                  raise SystemExit('Source-matched Studio lock and npm version are required')
+              if name == 'studio' and receipt.get('browserIncluded') is not False:
+                  raise SystemExit('Private browser qualification remains separate')
+          with tarfile.open(root / 'host-assets.tar.gz', 'w:gz') as archive:
+              for name, directory in components:
+                  archive.add(root / name / directory, arcname=name + '/' + directory)
+                  archive.add(root / name / 'qualification.json', arcname=name + '/qualification.json')
+      - name: Retain the qualified asset components
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-host-assets
+          path: ${{ runner.temp }}/fl-windows-assets/host-assets.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain bounded asset diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-host-assets-diagnostics
+          path: |
+            ${{ runner.temp }}/fl-windows-assets/*/qualification.json
+            ${{ runner.temp }}/fl-windows-assets/*/build.log
+            ${{ runner.temp }}/fl-windows-assets/*/command-error.log
+            ${{ runner.temp }}/fl-windows-assets/*/resolution-diagnostics.log
+          retention-days: 7
+          if-no-files-found: ignore

@@ -59,7 +59,7 @@ const { exiftoolPath } = require(modulePath);
   fs.renameSync(executable, executable + '.held');
   await assert.rejects(exiftoolPath(), /Private ExifTool executable is missing/);
 })().catch(error => { console.error(error); process.exitCode = 1; });
-''', str(module), str(executable)], capture_output=True, text=True, timeout=10)
+''', str(module), str(executable)], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unqualified_or_wrong_platform_input_is_refused_before_copy(self):

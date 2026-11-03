@@ -23,24 +23,33 @@ class PrivateDirectoryTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), 'retained')
 
     def test_windows_uses_inheritable_explicit_user_ace_at_creation(self):
-        sid = 'S-1-5-21-1-2-3-1001'
-        security = SimpleNamespace(ConvertStringSecurityDescriptorToSecurityDescriptorW=Mock(return_value=True))
-        kernel = SimpleNamespace(CreateDirectoryW=Mock(return_value=True), LocalFree=Mock(return_value=None))
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {'SystemRoot': temporary}), patch(
-            'windows_private_directory.subprocess.check_output', return_value=f'"runner","{sid}"\n'
-        ), patch('windows_private_directory.ctypes.WinDLL', side_effect=[security, kernel], create=True):
-            _windows_private_directory(Path(temporary) / 'private')
-        sddl = security.ConvertStringSecurityDescriptorToSecurityDescriptorW.call_args.args[0]
-        self.assertEqual(sddl, f'O:{sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})')
-        attributes = kernel.CreateDirectoryW.call_args.args[1]._obj
-        self.assertFalse(attributes.inherit)
-        kernel.LocalFree.assert_called_once()
+        for sid in ['S-1-5-21-1-2-3-1001', 'S-1-12-1-1234567890-2345678901-3456789012-456789012',
+                    'S-1-12-3-1234567890-2345678901-3456789012-456789012',
+                    'S-1-12-8-1234567890-2345678901-3456789012-456789012']:
+            with self.subTest(sid=sid):
+                security = SimpleNamespace(ConvertStringSecurityDescriptorToSecurityDescriptorW=Mock(return_value=True))
+                kernel = SimpleNamespace(CreateDirectoryW=Mock(return_value=True), LocalFree=Mock(return_value=None))
+                with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {'SystemRoot': temporary}), patch(
+                    'windows_private_directory.subprocess.check_output', return_value=f'"runner","{sid}"\n'
+                ), patch('windows_private_directory.ctypes.WinDLL', side_effect=[security, kernel], create=True):
+                    try:
+                        _windows_private_directory(Path(temporary) / 'private')
+                    except ValueError as error:
+                        self.fail(f'Valid local/domain or Entra user identity was rejected: {error}')
+                sddl = security.ConvertStringSecurityDescriptorToSecurityDescriptorW.call_args.args[0]
+                self.assertEqual(sddl, f'O:{sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})')
+                attributes = kernel.CreateDirectoryW.call_args.args[1]._obj
+                self.assertFalse(attributes.inherit)
+                kernel.LocalFree.assert_called_once()
 
     def test_invalid_identity_refuses_creation_before_loading_windows_apis(self):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {'SystemRoot': temporary}), patch(
             'windows_private_directory.ctypes.WinDLL', create=True
         ) as api:
-            for identity in ['', 'not,csv', '"runner","S-1-5-18"', '"runner","S-1-5-21-1-2-3-1001)(A;;FA;;;WD)"']:
+            for identity in ['', 'not,csv', '"runner","S-1-5-18"', '"runner","S-1-5-21-1-2-3-1001)(A;;FA;;;WD)"',
+                             '"runner","S-1-12-1-1-2-3"', '"runner","S-1-12-2-1-2-3-4"',
+                             '"runner","S-1-12-1-1-2-3-4)(A;;FA;;;WD)"',
+                             '"runner","S-1-12-3-1-2-3"', '"runner","S-1-12-8-1-2-3-4)(A;;FA;;;WD)"']:
                 with self.subTest(identity=identity), patch('windows_private_directory.subprocess.check_output', return_value=identity):
                     with self.assertRaisesRegex(ValueError, 'identity_invalid'):
                         _windows_private_directory(Path(temporary) / 'private')

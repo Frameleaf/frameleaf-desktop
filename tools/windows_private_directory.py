@@ -25,7 +25,7 @@ def _windows_private_directory(path):
         [str(Path(os.environ['SystemRoot']) / 'System32/whoami.exe'), '/user', '/fo', 'csv', '/nh'],
         text=True, timeout=10)
     rows = list(csv.reader(identity.splitlines()))
-    if len(rows) != 1 or len(rows[0]) != 2 or not re.fullmatch(r'S-1-5-21-(?:[0-9]+-){3}[0-9]+', rows[0][1]):
+    if len(rows) != 1 or len(rows[0]) != 2 or not re.fullmatch(r'S-1-(?:5-21|12-[138])-(?:[0-9]+-){3}[0-9]+', rows[0][1]):
         raise ValueError('private_user_identity_invalid')
     sid = rows[0][1]
 

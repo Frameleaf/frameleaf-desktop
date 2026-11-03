@@ -60,7 +60,7 @@ class HostSourceArchiveTests(unittest.TestCase):
 
             def command(arguments, *, cwd, env):
                 if arguments == [node, "--version"]:
-                    return "v26.11.1"
+                    return "v22.23.4" if name in {"web", "studio"} else "v26.11.1"
                 self.assertIn("archive", arguments)
                 return run(arguments, cwd=cwd, env=env)
 

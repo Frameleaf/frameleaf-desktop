@@ -1,4 +1,5 @@
-//! Read-only machine installation anchor; no directory creation or caller-selected root.
+//! OS-owned machine anchor; installer-only directory writes live in the package submodule.
+pub(super) mod package;
 use std::{collections::BTreeSet, ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 use windows_sys::Win32::{
     Foundation::RPC_E_CHANGED_MODE,
@@ -135,14 +136,18 @@ mod tests {
         );
     }
     #[test]
+    /// Invalid alternate inventory makes accidental environment-based redirection observable.
     fn caller_environment_and_working_directory_cannot_redirect_the_machine_anchor() {
         let root = base().unwrap();
+        let inventory = serde_json::to_string(&super::super::installed().unwrap()).unwrap();
         if std::env::var_os("FRAMELEAF_LAYOUT_CHILD").is_some() {
             println!("physical-installation={}", root.display());
+            println!("installed-versions={inventory}");
             return;
         }
         let temporary = std::env::temp_dir();
         let untrusted = temporary.join(format!("frameleaf-untrusted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(untrusted.join("Frameleaf/Runtimes/not-a-manifest")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "host_install::windows::tests::caller_environment_and_working_directory_cannot_redirect_the_machine_anchor", "--nocapture"])
             .env("FRAMELEAF_LAYOUT_CHILD", "1")
@@ -150,13 +155,18 @@ mod tests {
             .env("ProgramW6432", &untrusted)
             .env("ProgramFiles(x86)", &untrusted)
             .current_dir(temporary)
-            .output().unwrap();
+            .output();
+        std::fs::remove_dir_all(&untrusted).unwrap();
+        let output = output.unwrap();
         assert!(
             output.status.success(),
-            "{}",
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout)
             .contains(&format!("physical-installation={}", root.display())));
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("installed-versions={inventory}")));
     }
 }

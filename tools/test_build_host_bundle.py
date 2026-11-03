@@ -59,7 +59,7 @@ class HostBundleTests(unittest.TestCase):
             checked = {"platform": "fixture", "architecture": "fixture"}
             with (
                 patch("build_host_bundle.backup_component", return_value={}),
-                patch("build_host_bundle.run", side_effect=["v26.11.1", json.dumps(checked), json.dumps(checked)] * 2),
+                patch("build_host_bundle.run", side_effect=["v26.11.1", json.dumps(checked), json.dumps(checked)] * 3),
                 patch("build_host_bundle.host_manifest", side_effect=lambda payload, *_: {
                     **checked, "files": inventory(payload),
                 }),
@@ -68,6 +68,10 @@ class HostBundleTests(unittest.TestCase):
                 shutil.rmtree(host / "licenses")
                 assemble(host, ml, manager, backup, root / "without-licenses", "a" * 40, 2)
                 self.assertFalse((root / "without-licenses/payload/licenses").exists())
+                shutil.rmtree(host / "libraries")
+                with patch("build_host_bundle.platform.system", return_value="Windows"):
+                    assemble(host, ml, manager, backup, root / "windows-without-libraries", "a" * 40, 2)
+                self.assertFalse((root / "windows-without-libraries/payload/libraries").exists())
             manifest = json.loads((root / "output/manifest.json").read_text())
             for name, contents in notices.items():
                 self.assertEqual((root / "output/payload" / name).read_bytes(), contents)

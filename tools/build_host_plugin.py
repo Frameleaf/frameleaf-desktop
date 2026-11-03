@@ -9,6 +9,8 @@ import os
 import platform
 import re
 import shutil
+import stat
+import sys
 import tarfile
 import tomllib
 from pathlib import Path
@@ -18,6 +20,43 @@ from build_host_database import download
 from build_host_server import stage_server
 from build_runtime import BuildError, build_environment, git_blob, regular, run, sha256
 from source_archive import verify_source_archive
+
+
+def windows_compiler_cache(work: Path, env: dict) -> dict:
+    """Check the native Known Folder API in the compiler's isolated process environment."""
+    probe = """
+import ctypes as c, json, uuid
+lookup = c.WinDLL('shell32').SHGetKnownFolderPath
+lookup.argtypes = [c.c_void_p, c.c_uint32, c.c_void_p, c.POINTER(c.c_void_p)]
+lookup.restype = c.c_long
+free = c.WinDLL('ole32').CoTaskMemFree
+free.argtypes = [c.c_void_p]
+free.restype = None
+folders = {}
+for key, value in [('APPDATA', '3EB685DB-65F9-4CF6-A03A-E3EF65729F3D'),
+                   ('LOCALAPPDATA', 'F1B32785-6FBA-4FCF-9D55-7B8E7F157091')]:
+    guid = (c.c_ubyte * 16).from_buffer_copy(uuid.UUID(value).bytes_le)
+    result = c.c_void_p()
+    status = lookup(c.byref(guid), 0, None, c.byref(result))
+    if status != 0:
+        raise RuntimeError('Windows known folder unavailable: ' + key + ':' + str(status))
+    try:
+        folders[key] = c.wstring_at(result)
+    finally:
+        free(result)
+print(json.dumps(folders))
+"""
+    folders = json.loads(run([sys.executable, "-c", probe], cwd=work, env=env))
+    if not isinstance(folders, dict) or set(folders) != {"APPDATA", "LOCALAPPDATA"}:
+        raise BuildError("host_plugin_known_folders_invalid")
+    for key, directory in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+        if not isinstance(folders[key], str) or not Path(folders[key]).is_absolute():
+            raise BuildError("host_plugin_known_folders_invalid")
+        actual = Path(folders[key])
+        if (actual.resolve() != (work / "home/AppData" / directory).resolve()
+                or not stat.S_ISDIR(regular(actual).st_mode)):
+            raise BuildError("host_plugin_known_folders_not_private")
+    return folders
 
 
 def tool_pin(lock: dict, repository: str, target: str) -> dict:
@@ -63,6 +102,12 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
     work = output / "work"
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
+    if os.name == "nt":
+        # Wizer's Wasmtime cache needs existing Windows known folders under the private profile.
+        for key, directory in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")]:
+            location = work / "home/AppData" / directory
+            location.mkdir(parents=True, mode=0o700)
+            env[key] = str(location)
     env["PATH"] = os.pathsep.join(
         [str(node.parent), str(Path(pnpm).parent), os.defpath]
     )
@@ -127,6 +172,8 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
             log.flush()
 
         try:
+            if os.name == "nt":
+                report["compilerKnownFolders"] = windows_compiler_cache(work, env)
             compiler = work / ("extism-js.exe" if os.name == "nt" else "extism-js")
             pin = tool_pin(lock, "extism/js-pdk", target)
             compressed = work / "extism.gz"

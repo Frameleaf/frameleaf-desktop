@@ -1,0 +1,105 @@
+name: Windows complete host assembly
+on:
+  workflow_dispatch:
+    inputs:
+      approvals:
+        description: 'Reviewed JSON object with all nine immutable component approval records'
+        required: true
+        type: string
+      epoch:
+        description: 'Unsigned host candidate epoch (does not sign or publish)'
+        required: true
+        type: number
+        default: 18
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-complete-host-assembly
+  cancel-in-progress: false
+jobs:
+  assemble:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      HOST_SOURCE_REVISION: 9118a01fdfb8a8cd20be24290660679b3a7c4de3
+      UV_THREADPOOL_SIZE: '1'
+      OMP_THREAD_LIMIT: '1'
+      GOMAXPROCS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ env.HOST_SOURCE_REVISION }}
+          path: application-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Validate the bounded manual assembly request
+        shell: python
+        env:
+          COMPONENT_APPROVALS: ${{ inputs.approvals }}
+          CANDIDATE_EPOCH: ${{ inputs.epoch }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'tools')
+          from obtain_windows_host_components import validate_policy
+          approvals = json.loads(os.environ['COMPONENT_APPROVALS'])
+          validate_policy(approvals)
+          epoch = int(os.environ['CANDIDATE_EPOCH'])
+          trust = json.loads(Path('runtime/release-trust.json').read_text())
+          if not trust['minimumRuntimeEpoch'] <= epoch < 2**64:
+              raise SystemExit('Invalid unsigned host candidate epoch')
+          Path(os.environ['RUNNER_TEMP'], 'host-component-approvals.json').write_text(json.dumps(approvals), encoding='utf-8')
+      - name: Assemble and qualify current Windows consumers serially
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_EPOCH: ${{ inputs.epoch }}
+        run: |
+          python tools/build_windows_host.py --source "$env:GITHUB_WORKSPACE/application-source" --approvals "$env:RUNNER_TEMP/host-component-approvals.json" --output "$env:RUNNER_TEMP/windows-complete-host" --epoch $env:CANDIDATE_EPOCH
+          if ($LASTEXITCODE) { throw 'Windows complete-host assembly refused qualification' }
+      - name: Archive only the qualified unsigned candidate
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import tarfile
+          root = Path(os.environ['RUNNER_TEMP']) / 'windows-complete-host'
+          result = json.loads((root / 'qualification.json').read_text())
+          if (result.get('qualification') != 'passed' or result.get('runtimeQualified') is not False
+              or result.get('redistributable') is not False or result.get('signaturePresent') is not False
+              or set(result.get('consumers', {})) != {'database', 'media', 'raw', 'metadata', 'plugin', 'hdr', 'studio'}):
+              raise SystemExit('Current consumers and unsigned assembly proof are required')
+          candidate = root / 'candidate'
+          if {p.name for p in candidate.iterdir()} != {'payload', 'manifest.json', 'qualification.json'}:
+              raise SystemExit('Only candidate payload and control records may be archived')
+          with tarfile.open(root / 'windows-complete-host.tar.gz', 'w:gz', compresslevel=1) as archive:
+              for name in ['payload', 'manifest.json', 'qualification.json']:
+                  archive.add(candidate / name, arcname=name)
+      - name: Retain the unsigned complete-host candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-complete-host-unsigned
+          path: ${{ runner.temp }}/windows-complete-host/windows-complete-host.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain bounded qualification evidence separately
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-complete-host-evidence
+          path: |
+            ${{ runner.temp }}/windows-complete-host/qualification.json
+            ${{ runner.temp }}/windows-complete-host/evidence/
+          retention-days: 7
+          if-no-files-found: ignore

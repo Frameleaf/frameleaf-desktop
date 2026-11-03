@@ -4,7 +4,7 @@ use std::path::PathBuf;
 mod windows;
 #[cfg(target_os = "linux")]
 const BASE: &str = "/opt/frameleaf";
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 const BASE: &str = "/Library/Application Support/Frameleaf";
 pub struct Layout {
     pub runtime: PathBuf,
@@ -72,17 +72,34 @@ impl Installation {
         Ok(record)
     }
 }
+/// Read existing protected machine installations without creating or starting a runtime.
 pub(crate) fn installed() -> Result<Vec<Installation>, String> {
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+    if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
         return Err("host_install_platform_unsupported".into());
     }
+    #[cfg(windows)]
+    let root = windows::base()?.join("Runtimes");
+    #[cfg(not(windows))]
     let root = PathBuf::from(BASE).join("Runtimes");
-    match std::fs::symlink_metadata(&root) {
+    installed_records(
+        &root,
+        |path| crate::manager_host::protect(path, &mut std::collections::BTreeSet::new()),
+        Installation::read,
+    )
+}
+
+/// Protect each bounded inventory entry before reading its receipt; omit unfinished versions.
+fn installed_records(
+    root: &std::path::Path,
+    mut protect: impl FnMut(&std::path::Path) -> Result<(), String>,
+    mut read: impl FnMut(&str) -> Result<Installation, String>,
+) -> Result<Vec<Installation>, String> {
+    match std::fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err("host_install_record_invalid".into()),
         Ok(_) => {}
     }
-    crate::manager_host::protect(&root, &mut std::collections::BTreeSet::new())?;
+    protect(root)?;
     let mut records = Vec::new();
     for (index, entry) in std::fs::read_dir(root)
         .map_err(|_| "host_install_record_invalid")?
@@ -94,8 +111,11 @@ pub(crate) fn installed() -> Result<Vec<Installation>, String> {
         let entry = entry.map_err(|_| "host_install_record_invalid")?;
         let name = entry.file_name();
         let name = name.to_str().ok_or("host_install_record_invalid")?;
-        let candidate = Layout::new(name, &"0".repeat(64))?.runtime;
-        crate::manager_host::protect(&candidate, &mut std::collections::BTreeSet::new())?;
+        if !crate::native_runtime::digest_valid(name, 64) {
+            return Err("host_install_identity_invalid".into());
+        }
+        let candidate = root.join(name);
+        protect(&candidate)?;
         if !std::fs::symlink_metadata(&candidate)
             .map_err(|_| "host_install_record_invalid")?
             .is_dir()
@@ -103,7 +123,7 @@ pub(crate) fn installed() -> Result<Vec<Installation>, String> {
             return Err("host_install_record_invalid".into());
         }
         if receipt_present(&candidate.join("installation.json"))? {
-            records.push(Installation::read(name)?);
+            records.push(read(name)?);
         }
     }
     records.sort_by(|a, b| a.manifest_sha256.cmp(&b.manifest_sha256));
@@ -132,7 +152,6 @@ fn finalization_guard(
     Ok(guard)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn admit_versions(
     layout: &Layout,
     verify: impl FnOnce() -> Result<(), String>,
@@ -156,6 +175,22 @@ fn admit_versions(
         0 => Ok(()),
         2 => verify(),
         _ => Err("host_install_version_exists".into()),
+    }
+}
+
+/// Installer-only fresh Windows package preparation; never starts or replaces a runtime.
+pub fn prepare_windows_package(
+    manifest: &str,
+    controller: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        windows::package::prepare(manifest, controller)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller);
+        Err("host_install_platform_unsupported".into())
     }
 }
 
@@ -792,6 +827,134 @@ mod posix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct InventoryFixture(PathBuf);
+    impl InventoryFixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("frameleaf-inventory-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for InventoryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    /// Missing and unfinished versions stay untouched; receipt reads require protected ancestry.
+    fn inventory_is_read_only_bounded_and_reads_only_protected_complete_versions() {
+        use std::{cell::RefCell, collections::BTreeSet};
+        let fixture = InventoryFixture::new();
+        let root = fixture.0.join("Runtimes");
+        assert!(installed_records(
+            &root,
+            |_| panic!("absent root must not be inspected"),
+            |_| panic!("absent root has no receipts")
+        )
+        .unwrap()
+        .is_empty());
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        for name in ["c".repeat(64), "b".repeat(64), "a".repeat(64)] {
+            let directory = root.join(&name);
+            std::fs::create_dir(&directory).unwrap();
+            if !name.starts_with('b') {
+                std::fs::write(directory.join("installation.json"), serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"manifestSha256":name,"controllerSha256":"d".repeat(64)})).unwrap()).unwrap();
+            }
+        }
+        let visited = RefCell::new(BTreeSet::new());
+        let records = installed_records(
+            &root,
+            |path| {
+                visited.borrow_mut().insert(path.to_owned());
+                Ok(())
+            },
+            |name| {
+                assert!(visited.borrow().contains(&root));
+                assert!(visited.borrow().contains(&root.join(name)));
+                Installation::decode(
+                    &std::fs::read(root.join(name).join("installation.json")).unwrap(),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.manifest_sha256.as_str())
+                .collect::<Vec<_>>(),
+            [&"a".repeat(64), &"c".repeat(64)]
+        );
+        assert_eq!(visited.borrow().len(), 4);
+        assert_eq!(
+            installed_records(
+                &root,
+                |_| Err("trust_refused".into()),
+                |_| panic!("must protect before reading")
+            )
+            .unwrap_err(),
+            "trust_refused"
+        );
+        std::fs::write(
+            root.join("c".repeat(64)).join("installation.json"),
+            b"malformed",
+        )
+        .unwrap();
+        assert!(installed_records(
+            &root,
+            |_| Ok(()),
+            |name| Installation::decode(
+                &std::fs::read(root.join(name).join("installation.json")).unwrap()
+            )
+        )
+        .is_err());
+    }
+    #[test]
+    /// Malformed inventories must fail rather than return a partial installation list.
+    fn inventory_refuses_invalid_names_files_and_more_than_64_versions() {
+        let fixture = InventoryFixture::new();
+        let root = &fixture.0;
+        let forbidden = root.join("not-a-manifest");
+        std::fs::create_dir(&forbidden).unwrap();
+        assert!(installed_records(
+            root,
+            |_| Ok(()),
+            |_| panic!("invalid name has no authority")
+        )
+        .is_err());
+        std::fs::remove_dir(forbidden).unwrap();
+        let file = root.join("a".repeat(64));
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(installed_records(
+            root,
+            |_| Ok(()),
+            |_| panic!("file is not an installed version")
+        )
+        .is_err());
+        std::fs::remove_file(&file).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root, &file).unwrap();
+            assert!(
+                installed_records(root, |_| Ok(()), |_| panic!("linked version must refuse"))
+                    .is_err()
+            );
+            std::fs::remove_file(file).unwrap();
+        }
+        for index in 0..65 {
+            std::fs::create_dir(root.join(format!("{index:064x}"))).unwrap();
+        }
+        assert_eq!(
+            installed_records(
+                root,
+                |_| Ok(()),
+                |_| panic!("unfinished versions have no receipts")
+            )
+            .unwrap_err(),
+            "host_install_inventory_limit"
+        );
+    }
     #[cfg(unix)]
     struct RepairFixture(PathBuf);
     #[cfg(unix)]

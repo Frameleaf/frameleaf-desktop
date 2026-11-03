@@ -114,4 +114,116 @@ mod tests {
         assert!(verified.epoch() >= floor);
         eprintln!("PASS: factory-signed private runtime verified against the app's compiled release authority");
     }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an approved signed host/evidence pair on a disposable Windows runner"]
+    fn factory_signed_host_candidate_verifies_against_compiled_authority() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let root =
+            std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_HOST_TEST_PACK").unwrap());
+        assert_eq!(
+            root,
+            std::path::PathBuf::from(std::env::var("RUNNER_TEMP").unwrap())
+                .join("windows-compiled-host/candidate")
+        );
+        let expected = std::env::var("FRAMELEAF_FACTORY_HOST_EXPECTED_MANIFEST").unwrap();
+        assert!(crate::native_runtime::digest_valid(&expected, 64));
+        let raw = crate::runtime_store::read_bounded(&root.join("manifest.json"), 16 * 1024 * 1024)
+            .unwrap();
+        let signature: [u8; 64] =
+            crate::runtime_store::read_bounded(&root.join("manifest.sig"), 64)
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let host = verify_host_runtime(&root.join("payload"), &raw, &signature).unwrap();
+        assert_eq!(host.manifest_sha256(), expected);
+        assert_eq!(
+            host.source_revision(),
+            "9118a01fdfb8a8cd20be24290660679b3a7c4de3"
+        );
+        assert!(!host.certified());
+        let manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(manifest["entryPoints"]["mlManifest"], "ml/manifest.json");
+        let ml_root = root.join("payload/ml");
+        let ml_raw =
+            crate::runtime_store::read_bounded(&ml_root.join("manifest.json"), 8 * 1024 * 1024)
+                .unwrap();
+        let ml_signature: [u8; 64] =
+            crate::runtime_store::read_bounded(&ml_root.join("manifest.sig"), 64)
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let (floor, keys) = parse_policy(POLICY).unwrap();
+        let ml = crate::native_runtime::VerifiedRuntime::verify(
+            &ml_root.join("payload"),
+            &ml_raw,
+            &ml_signature,
+            &keys,
+            floor,
+        )
+        .unwrap();
+        let unsigned: serde_json::Value = serde_json::from_slice(
+            &crate::runtime_store::read_bounded(&root.join("qualification.json"), 16 * 1024 * 1024)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unsigned["ml"]["manifestSha256"], ml.manifest_sha256());
+        assert_eq!(unsigned["ml"]["sourceRevision"], ml.source_revision());
+        assert_eq!(unsigned["ml"]["epoch"], ml.epoch());
+        let mut altered = signature;
+        altered[0] ^= 1;
+        assert_eq!(
+            verify_host_runtime(&root.join("payload"), &raw, &altered)
+                .err()
+                .as_deref(),
+            Some("host_signature_invalid")
+        );
+        let mut altered_ml = ml_signature;
+        altered_ml[0] ^= 1;
+        assert_eq!(
+            crate::native_runtime::VerifiedRuntime::verify(
+                &ml_root.join("payload"),
+                &ml_raw,
+                &altered_ml,
+                &keys,
+                floor,
+            )
+            .err()
+            .as_deref(),
+            Some("runtime_signature_invalid")
+        );
+
+        let receipt = serde_json::json!({
+            "schemaVersion":1,"qualification":"passed","platform":"windows","architecture":"x86_64",
+            "manifestSha256":host.manifest_sha256(),"sourceRevision":host.source_revision(),
+            "epoch":manifest["epoch"],"certified":host.certified(),
+            "signatureSha256":format!("{:x}",Sha256::digest(signature)),
+            "files":manifest["files"].as_object().unwrap().len(),
+            "entryPoints":manifest["entryPoints"].as_object().unwrap().len(),
+            "hostSignatureVerified":true,"nestedMLSignatureVerified":true,
+            "changedHostSignatureRefused":true,"changedMLSignatureRefused":true,
+            "ml":{"manifestSha256":ml.manifest_sha256(),"sourceRevision":ml.source_revision(),"epoch":ml.epoch()},
+            "runtimeQualified":false,"redistributable":false,"installedPlatformQualified":false,
+            "fullMediaConformance":false,"serverStarted":false,
+            "scope":"Compiled host and nested ML signature/resource admission; protected installation remains separate"
+        });
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.parent().unwrap().join("compiled-authority.json"))
+            .unwrap();
+        output
+            .write_all(&serde_json::to_vec_pretty(&receipt).unwrap())
+            .unwrap();
+        output.sync_all().unwrap();
+        eprintln!("PASS: complete host and nested ML resources verified against compiled release authority");
+    }
 }

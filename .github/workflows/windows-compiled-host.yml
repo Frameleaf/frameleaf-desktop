@@ -1,0 +1,86 @@
+name: Windows compiled host authority qualification
+on:
+  workflow_dispatch:
+    inputs:
+      approvals:
+        description: 'Reviewed immutable candidate and evidence approvals from the same successful signing run'
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-compiled-host-authority
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RAYON_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Rust stable
+        shell: pwsh
+        run: |
+          rustup update stable
+          if ($LASTEXITCODE) { throw 'Rust toolchain update failed' }
+          rustup default stable
+          if ($LASTEXITCODE) { throw 'Rust toolchain selection failed' }
+      - name: Reuse successful main Rust dependencies without saving qualification payloads
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: false
+          save-if: false
+      - name: Compile the real release-authority test without release credentials
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --no-run
+          if ($LASTEXITCODE) { throw 'Compiled host qualification test build failed' }
+      - name: Admit the matched signed candidate and evidence without executing payloads
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_APPROVALS: ${{ inputs.approvals }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'tools')
+          from obtain_signed_windows_host import obtain
+          obtain(json.loads(os.environ['HOST_APPROVALS']), Path(os.environ['RUNNER_TEMP']) / 'windows-compiled-host')
+      - name: Verify complete host and nested ML with compiled production authority
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $staged = Get-Content (Join-Path $root 'qualification.json') -Raw | ConvertFrom-Json
+          $env:FRAMELEAF_FACTORY_HOST_TEST_PACK = Join-Path $root 'candidate'
+          $env:FRAMELEAF_FACTORY_HOST_EXPECTED_MANIFEST = $staged.manifestSha256
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib release_policy::tests::factory_signed_host_candidate_verifies_against_compiled_authority -- --ignored --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Compiled host authority refused the signed candidate' }
+          $result = Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json
+          if ($result.qualification -ne 'passed' -or $result.manifestSha256 -ne $staged.manifestSha256 -or $result.signatureSha256 -ne $staged.signatureSha256) {
+            throw 'Compiled host authority receipt does not match the admitted candidate'
+          }
+      - name: Retain bounded resource qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-compiled-host-authority
+          path: |
+            ${{ runner.temp }}/windows-compiled-host/qualification.json
+            ${{ runner.temp }}/windows-compiled-host/compiled-authority.json
+            ${{ runner.temp }}/windows-compiled-host/candidate-producer.json
+            ${{ runner.temp }}/windows-compiled-host/evidence-producer.json
+            ${{ runner.temp }}/windows-compiled-host/signature-evidence/
+          retention-days: 7
+          if-no-files-found: warn

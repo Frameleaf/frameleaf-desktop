@@ -86,21 +86,33 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         raise BuildError("host_studio_source_invalid")
     if output.exists() or output.is_symlink():
         raise BuildError("host_studio_output_invalid")
-    git, bootstrap = shutil.which("git"), shutil.which("npm")
-    if not git or not bootstrap or not node.is_file():
+    git, bootstrap, tar = (shutil.which(name) for name in ["git", "npm", "tar"])
+    if not git or not bootstrap or not tar or not node.is_file():
         raise BuildError("host_studio_build_tools_missing")
     output.mkdir(mode=0o700)
     work = output / "work"
     work.mkdir(mode=0o700)
     env = build_environment(work, os.environ)
+    # Studio's nested git apply must retain the canonical LF bytes too.
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="core.autocrlf", GIT_CONFIG_VALUE_0="false",
+        GIT_CONFIG_KEY_1="core.eol", GIT_CONFIG_VALUE_1="lf",
+    )
     env["PATH"] = os.pathsep.join(
-        [str(node.parent), str(Path(bootstrap).parent), os.defpath]
+        [
+            str(node.parent),
+            str(Path(bootstrap).parent),
+            str(Path(tar).parent),
+            str(Path(git).parent),
+            os.defpath,
+        ]
     )
     env["FRAMELEAF_BUILD_ERROR_LOG"] = str(output / "command-error.log")
     env["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
     env["RAYON_NUM_THREADS"] = "1"
     env["TOKIO_WORKER_THREADS"] = "1"
-    if run([node, "--version"], cwd=work, env=env) != "v26.11.1":
+    if run([node, "--version"], cwd=work, env=env) != "v22.23.4":
         raise BuildError("host_studio_node_unapproved")
     archive = work / "source.tar"
     archive_paths = [
@@ -133,7 +145,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         contents.extractall(snapshot, filter="data")
     configuration = json.loads((snapshot / "studio/engine-build.json").read_text())
     if (
-        configuration.get("node") != "26.11.1"
+        configuration.get("node") != "22.23.4"
         or not re.fullmatch(r"\d+\.\d+\.\d+", configuration.get("npm", ""))
         or not re.fullmatch(r"[a-f0-9]{40}", configuration.get("upstreamCommit", ""))
         or not re.fullmatch(r"[a-f0-9]{64}", configuration.get("sourceSha256", ""))

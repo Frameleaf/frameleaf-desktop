@@ -633,7 +633,7 @@ pub(crate) fn shared_cache(
 ) -> Result<std::path::PathBuf, String> {
     use crate::{
         model_cache::{check_cancel, verify_file},
-        runtime_store::private_directory,
+        runtime_store::{private_directory, Staging},
     };
     use std::{fs, path::PathBuf};
     if profiles.is_empty() || profiles.len() != caches.len() {
@@ -693,29 +693,22 @@ pub(crate) fn shared_cache(
         }
         return Ok(active);
     }
-    struct Staging(PathBuf);
-    impl Drop for Staging {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let staging = Staging(root.join(format!(".composition-{}", Uuid::new_v4())));
-    private_directory(&staging.0)?;
+    let staging = Staging::create(root.join(format!(".composition-{}", Uuid::new_v4())))?;
     for (relative, (source, bytes, hash)) in &files {
         check_cancel(cancel)?;
         verify_file(source, *bytes, hash, cancel)?;
-        let mut parent = staging.0.clone();
+        let mut parent = staging.path().to_path_buf();
         for part in relative.parent().ok_or_else(invalid)?.components() {
             parent.push(part);
             private_directory(&parent)?;
         }
-        let target = staging.0.join(relative);
+        let target = staging.path().join(relative);
         // App-owned immutable weights share disk blocks; verify the published inode again before use.
         fs::hard_link(source, &target).map_err(|_| "worker_cache_publish_failed")?;
         verify_file(&target, *bytes, hash, cancel)?;
     }
     check_cancel(cancel)?;
-    fs::rename(&staging.0, &active).map_err(|_| "worker_cache_publish_failed")?;
+    fs::rename(staging.path(), &active).map_err(|_| "worker_cache_publish_failed")?;
     Ok(active)
 }
 
@@ -791,11 +784,22 @@ mod tests {
             profile.validate().unwrap();
             let cache = root.join(format!("source-{index}"));
             let model = cache.join(family).join(name);
+            for path in [&cache, &cache.join(family), &model] {
+                crate::runtime_store::private_directory(path).unwrap();
+            }
             for role in ["detection", "recognition"] {
-                std::fs::create_dir_all(model.join(role)).unwrap();
+                crate::runtime_store::private_directory(&model.join(role)).unwrap();
                 std::fs::write(model.join(role).join("model.onnx"), &bytes).unwrap();
             }
-            std::fs::create_dir_all(model.join(&reference).parent().unwrap()).unwrap();
+            let mut parent = model.clone();
+            for part in std::path::Path::new(&reference)
+                .parent()
+                .unwrap()
+                .components()
+            {
+                parent.push(part);
+                crate::runtime_store::private_directory(&parent).unwrap();
+            }
             std::fs::write(model.join(&reference), revision).unwrap();
             std::fs::write(
                 model.join(".frameleaf-staged.json"),

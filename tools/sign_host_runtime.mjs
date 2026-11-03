@@ -224,6 +224,7 @@ export async function verifySignedHostCandidate(candidate, policy) {
   return {
     keyId: checked.keyId,
     manifestSha256: hash(checked.raw),
+    signatureSha256: hash(signature),
     sourceRevision: checked.manifest.sourceRevision,
     epoch: checked.manifest.epoch,
     certified: checked.manifest.certified,

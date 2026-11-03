@@ -29,13 +29,14 @@ def relative(value: str) -> str:
     if not value or len(value) > 4096 or "\\" in value or ":" in value:
         raise BuildError("runtime_path_invalid")
     for part in value.split("/"):
-        stem = part.split(".")[0].upper()
+        stem = part.split(".")[0].rstrip(" ").upper()
         if (
             part in {"", ".", ".."}
+            or part.startswith(" ")
             or part.endswith((".", " "))
             or any(ord(char) < 32 or ord(char) == 127 for char in part)
-            or stem in {"CON", "PRN", "AUX", "NUL"}
-            or re.fullmatch(r"(?:COM|LPT)[1-9]", stem)
+            or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+            or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", stem)
         ):
             raise BuildError("runtime_path_invalid")
     return value

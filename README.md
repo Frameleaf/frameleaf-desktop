@@ -492,6 +492,18 @@ space for relocation. This does not qualify the complete server, RAW/Studio,
 Windows/Linux dependency closure, release signing or installed-device acceptance.
 
 
+### Native geodata component
+
+`python tools/build_host_geodata.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --output /absolute/path/to/new-output`
+stages the selected server's pinned reverse-geocoding inputs for native hosts.
+It reads the snapshot date and attributed checksum lock from Git objects, checks
+the complete input contract before downloading, and verifies each file from the
+Frameleaf mirror or its pinned capture. It safely expands the single city-data
+file and preserves the original lock and data date. The receipt inventories the
+eight staged files; temporary and failed payloads are removed. This qualifies
+source-bound data staging, with `runtimeQualified` and `redistributable` false;
+server import and complete-host acceptance remain separate.
+
 ### Production server package
 
 `python3 tools/build_host_server.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
@@ -535,7 +547,8 @@ not complete workflow/server/UI, redistribution or installed-platform approval.
 
 `python3 tools/build_host_web.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
 builds the shared photo UI and Studio editor into `www/` from an exact Git
-archive. The selected source's Studio attestation config supplies npm's version;
+archive. Supply the pinned Studio build Node 22.23.4, matching the selected
+source's attestation configuration. That configuration supplies npm's version;
 bootstrap npm installs it only into the new private toolchain prefix, with
 lifecycle scripts disabled. Studio preparation verifies its pinned upstream
 archive, patches and adapted-source digest. The existing adapter build preserves
@@ -605,9 +618,12 @@ this Unix builder does not qualify it.
 binds a qualified Windows x64 server to its complete `exiftool-vendored.exe`
 13.59.3 package, including its executable and Perl tree. It verifies the input inventory, pinned vendor module,
 versions and required runtime/license files before removing global fallback.
-`Windows server candidate` is dispatched manually from `main`, using pinned shared
-application source, Node and pnpm. It retains one qualified component archive and
+`Windows server candidate` runs on relevant packaging pull requests or manual
+dispatch from `main`, using application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780,
+Node 26.11.1 and pnpm 12.11.2. Its single concurrency group serializes server builds,
+with a 45-minute limit per job. It retains one qualified component archive and
 bounded diagnostics for seven days; artifact access follows repository access.
+Promotion also requires that source candidate's current review and exact-head CI.
 This is component qualification, not a full host, installed app or release.
 
 `/absolute/path/to/private-node tools/qualify_host_exiftool.mjs /absolute/path/to/exiftool-build-output`
@@ -640,6 +656,15 @@ startup. These are macOS component checks. Full RAW format/recipe conformance,
 complete signed host assembly, installed Windows/Linux support, minimum OS and
 redistribution qualification remain pending.
 
+Windows RAW binding also accepts the qualified private-metadata server component.
+`tools/bind_host_raw.py` verifies the preserved original server receipt, the fixed
+original and adapted ExifTool module hashes, the sole module change, and all six
+metadata qualification checks bound to the exact adapted receipt before combining
+the server and RAW inventories.
+It preserves the original receipts and records their hashes in the new binding.
+This enables assembly; actual current-host RAW/metadata execution and installed
+acceptance remain separate checks.
+
 ### Native Studio worker draft
 
 `tools/build_host_studio.py` is a source-pinned authoring recipe. It snapshots a
@@ -648,6 +673,20 @@ its headless harness, then uses the existing bundled-worker packager. The staged
 worker includes its JavaScript runtime packages, subtitle sidecar, notices and
 server font resources. Required entries and font headers are checked before the
 package is accepted; Git LFS pointers are not usable font payloads.
+
+The `Windows host assets` workflow builds the current photo UI, core plugin and
+Studio worker serially from source `9118a01fdfb8a8cd20be24290660679b3a7c4de3`
+([shared tooling fix](https://github.com/Frameleaf/frameleaf-app/pull/780)).
+That source review must clear before promoting this producer.
+Its single 90-minute job retains `host-assets.tar.gz` with each qualified payload
+and receipt, after checking source, Node, package-manager locks and exact file
+inventories. Build workspaces stay outside the artifact. This qualifies asset
+builds and staging; private Chromium, real rendering and complete-host acceptance
+remain separate gates.
+
+Web and Studio use their source-pinned build Node 22.23.4; the plugin uses Node
+26.11.1. Receipts bind each component to its actual build binary. The assembled
+host's Node 26.11.1 runtime still needs separate Studio execution qualification.
 
 The host supplies profile-local Studio trust and scratch directories, applying
 the existing private-directory checks before launching processes. This lets the
@@ -761,6 +800,82 @@ with the current 30-second server heartbeat; responsiveness remains a limitation
 These results do not enable the shipping Studio gate or qualify installed platforms.
 
 
+### Windows host runtime and private browser inputs
+
+`python tools/build_host_windows_support.py --source <absolute-app-repo> --revision <full-commit> --studio <absolute-staged-studio> --output <new-absolute-output>`
+stages the official pinned Node 26.11.1 Windows x64 runtime and the private headless
+Chromium selected by the immutable Studio engine lock and staged Playwright browser
+manifest. It verifies archive hashes, the Node executable and browser notices, and
+reuses strict extraction and browser staging. `support/node/` retains `node.exe` and
+its `LICENSE`; `support/browser/` retains the complete browser tree and
+`LICENSE.headless_shell`. The separate receipt records source identity and every
+staged file. Existing output is refused; failed payloads and temporary downloads
+are removed. The caller must exclusively own the output throughout staging.
+A passed receipt proves byte staging only: actual Windows/Studio execution,
+sandboxing, complete-host assembly, signing, installed acceptance and redistribution
+qualification remain separate. No Windows executable is launched by this command.
+
+### Fixed Windows component staging
+
+On Windows x64, `python tools/obtain_windows_host_components.py --source <absolute-app-repo> --approvals <absolute-reviewed-policy.json> --output <new-absolute-output>`
+obtains the nine required producer artifacts serially: `assets`, `server`,
+`manager`, `database`, `raw`, `media`, `hdr`, `backup` and `ml`. Each policy value
+uses the exact `artifactId`, `runId`, `runAttempt`, `headSha`, `workflow` and
+`archiveSha256` record accepted by `obtain_host_component.py`; each role has a
+fixed workflow and duplicate artifact IDs are refused before downloading.
+The command requires GitHub CLI read access to this repository's Actions artifacts.
+The source checkout must contain application commit
+`9118a01fdfb8a8cd20be24290660679b3a7c4de3`. Canonical source archive and build-node
+hashes are pinned to that reviewed snapshot; another snapshot requires a reviewed
+recipe update.
+
+The command reuses authenticated acquisition and strict nested archive extraction,
+checks complete component inventories, current source/build locks, original native
+source contracts and the metadata/RAW binding. Restic retains its independent
+source and component contract. Original receipts remain unchanged under `inputs/`;
+`bound-server-raw/` contains the verified binding for later assembly. The separate
+staging receipt records producer and original receipt hashes. Existing output is
+refused; failures remove only the newly owned output. The caller must exclusively
+own both the source and output during the operation.
+
+No component executable is launched. The ML payload inventory and target are
+checked, but its signature must still pass the standard runtime verifier before
+use. The command does not create a complete host: pinned Node/browser/geodata
+staging, current Windows database, RAW, metadata, plugin, HDR and Studio consumers,
+`build_host_bundle.assemble`, signing and installed-platform acceptance remain
+required. Its receipt keeps `mlSignatureVerified`, `runtimeQualified` and
+`redistributable` false.
+
+### Windows complete host authoring
+
+`python tools/build_windows_host.py --source <absolute-app-repo> --approvals <absolute-reviewed-policy.json> --output <new-absolute-output> --epoch <candidate-epoch>`
+runs on Windows x64. It obtains the fixed component set, stages the pinned private
+Node/browser and geodata, preserves component licenses and original receipts, then
+runs the current database lifecycle/restore, FFmpeg, RAW, metadata, plugin, HDR and
+sandboxed Studio conformance consumers serially. Consumer processes receive the
+private host environment without the GitHub download token. A derived authoring
+receipt binds the staged inputs; original producer receipts are retained separately.
+The command refuses a changed payload after consumers, then calls the existing
+assembler, including its standard nested ML signature verification before and after
+copying. Windows may omit a separate `libraries/` directory because native libraries
+are retained in their component trees; a provided directory still passes normal
+inventory checks.
+
+Successful output contains `candidate/` and separate `evidence/` and qualification
+records. Private fixtures and acquired staging trees are removed before success.
+Failure removes the executable candidate and attempts private-work cleanup; a
+cleanup failure remains a refusal and may need manual recovery. The caller must
+exclusively own the new output and source throughout. The manual, main-only
+`Windows complete host assembly` workflow uses read-only GitHub permissions, a
+single bounded Windows job and explicitly supplied approval records. It archives
+only the unsigned candidate and retains evidence separately. It does not fan out
+component builds, sign, publish or deploy anything.
+
+These component consumers are synthetic authoring checks. A successful candidate
+still keeps runtime, installed-platform, full-media and redistribution qualification
+false. Database certification, installed lifecycle/retained-data tests, full ML and
+hardware/provider acceptance, signing and publication remain separate gates.
+
 ### Complete host inventory authoring
 
 `tools/build_host_bundle.py` combines the staged private host components with an
@@ -774,6 +889,17 @@ manifests are refused. The real payload passed the Rust verifier contract with
 an in-memory test authority. A factory host signature, complete controller/ML
 runtime qualification and installed three-OS acceptance remain required.
 
+
+`tools/verify_reused_host_sources.py --source <absolute-app-repo> --revision <full-commit> --database <receipt> --raw <receipt> --media <receipt> --hdr <receipt>`
+compares four reused Windows native components with immutable selected Git inputs.
+It reuses the database, RAW, FFmpeg and HDR source-contract validators, rejects
+changed production code, codec pins, patches or snapshot paths, and preserves
+original receipt identities. Only the HDR runtime test may differ; the report
+records that change and the original/current build Node versions, and requires
+current host runtime qualification. Receipt hashes use canonical JSON. This
+read-only check does not authenticate producers, verify payload files, bypass
+builder version guards or qualify runtime/redistribution; those remain separate
+assembly requirements.
 
 `tools/sign_host_runtime.mjs --candidate /absolute/candidate --private-key-stdin`
 checks the full host inventory and independently signed nested ML candidate before
@@ -803,9 +929,13 @@ The development `frameleaf-native-host --owner-pipe` helper now provides bounded
 
 `tools/build_host_manager.py --source /absolute/repo --revision <commit> --node /absolute/private-node --output /absolute/new-output` builds Manager and its UI from an exact Git archive with the frozen npm lockfile. It ignores package lifecycle scripts, prunes development dependencies and checks deployed production imports, including the shared release verifier. Only runtime code, production dependencies, worker scripts, public release-verification resources, UI assets and licenses enter `output/manager`. `component.json` records the Manager revision independently of the photo server revision.
 
+The Windows Manager component workflow builds application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780 with Node 26.11.1 on Windows. Promotion requires that source candidate’s current review and exact-head CI. Its artifact contains `manager-component.tar.gz`: the staged `manager` directory and successful `qualification.json`, checked against the exact source, toolchain metadata and complete file inventory before archiving. Build workspaces stay out of the component artifact. This qualifies production compilation and deployed imports; native bootstrap, complete-host startup, signing and installed acceptance remain separate gates.
+
 Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manager --backup /absolute/backup-output/backup` with the existing host/ML arguments. Manager code, UI, dependencies, release-verification resources and the backup engine are mandatory in the signed host inventory. An older pack that omits these components refuses admission. The previous factory-signed 24-role candidate and its component results remain historical evidence; a new complete candidate/signature and installed qualification are required. This package does not enable native hosting or supply the still-required protected installed supervisor and OS-keystore bootstrap.
 
 Build the private backup component with `python tools/build_host_backup.py --output /absolute/backup-output` using a new output directory. The builder verifies the pinned official restic archive and executable digests, retains its license, and exercises encrypted synthetic backup/check/restore before producing the component receipt. Assembly checks the approved target, executable and license hashes, and rechecks the staged component before constructing the host manifest. Manager backup integration and installed-host recovery qualification remain separate requirements; this component does not enable the native backup action.
+
+The backup workflow retains `backup-component.tar.gz` inside each component artifact. Extract that archive before assembly to preserve Unix executable permissions. Qualification receipts and license bytes travel with the component; failed-build diagnostics are retained separately.
 
 
 Native Manager accepts internal bootstrap protocol 2 through a single bounded private stdin record. The desktop TLS identity is generated in Rust and must be persisted through the OS keystore before use; native Manager validates its key, certificate, validity and exact origin. Native mode does not use OpenSSL or write TLS key files. The administration origin must be canonical HTTPS with a literal loopback address and an unprivileged port. Docker Manager retains its existing listener; the photo server has its separate listener.
@@ -814,6 +944,8 @@ After the native HTTPS listener binds, Manager writes one JSON line to its priva
 
 
 `VerifiedHostRuntime::manager_programs()` now prepares a native Manager launch authority. It checks every payload file and directory, including empty directories, under root-owned non-writable physical ancestors; macOS rejects extended ACLs through its native ACL API. The complete signed inventory is then revalidated. Windows now has a read-only handle-based package ACL validator for stable kernel-volume paths. Runtime verification resolves the opened code root before inventory/hash checks and retains the process-compatible `\\.\GLOBALROOT\Device\HarddiskVolumeN` spelling for derived executable paths. It requires a SYSTEM, Administrators or locally resolved TrustedInstaller owner and refuses untrusted mutation grants, unknown ACL forms and reparses. Drive-letter, network and DOS-device aliases remain refused for code access. State comparisons use DOS and physical spellings plus the volume identity captured from one native directory handle; all state I/O retains the physical spelling. Host and Manager Node launches preserve that namespace through module loading. Installed Windows setup and full-host qualification remain unfinished. There is no arbitrary executable-path launcher exposed to the webview.
+
+Windows directories admitted through `runtime_store::private_directory` require a process-user-owned root with a protected ACL for the process user, SYSTEM and Administrators. Descendants may also be owned by SYSTEM or Administrators, as with files created by an elevated process, but their ACLs must still exclude foreign access grants. At admission, this helper checks the existing root and descendants, refuses foreign access grants, unsafe ancestry, reparses and more than 100,000 entries, and preserves existing ACLs and contents on refusal. This scope does not include independent read-only host-state/store reuse paths or establish continuous ACL revalidation. Existing stores without the required protected-root ACL are refused; installed migration and recovery remain unqualified.
 
 The native `Programs::start` requires a separately protected controller and a previously persisted database password/TLS identity. It sends borrowed bootstrap fields through a bounded private stdin pipe, clears inherited environment and keeps secret bytes zeroized. `NativeManager` owns its child, validates bounded process-specific readiness and scoped HTTPS, and reaps the child after startup failure/cancellation. `shutdown` confirms Manager exit only; host/database quiescence still requires the controller journal/lease proof. The compiled Manager fixture passed this owner with empty PATH; setup, installed package authority, actual keychain persistence and background-role lifecycle remain unfinished.
 
@@ -858,3 +990,7 @@ and private certificate approval applies only to HTTPS. The separate Library Ser
 connection and desktop-owned native Manager retain their existing transport rules.
 
 Windows machine layout discovery resolves the OS-owned Program Files x64 folder, verifies its physical protected path, and uses the Windows controller filename. The lookup initializes COM on the calling thread and balances only its own initialization reference. This is read-only layout support; Windows installation and full-host startup remain gated.
+
+Windows package authoring has a dedicated `--prepare-windows-package <manifest-sha256> <controller-sha256>` phase. It requires an elevated process and effective Administrators membership before filesystem work, then prepares fixed machine containers with an explicit protected ACL. Existing objects are checked without changing their permissions, and existing versions are refused pending verified maintenance/recovery support. This phase publishes no runtime, receipt or user profile and starts no server. Its actual ACL fixture runs only on an elevated disposable GitHub-hosted Windows runner, using a unique test directory rather than the real Frameleaf installation.
+
+Windows installed-host discovery now reads installation receipts from the same protected OS-derived location. Missing and unfinished versions are omitted; malformed entries, unprotected paths and inventories above 64 versions are refused. The local IPC accepts no path and discovery creates no directories. Windows CI checks environment poisoning with a deliberately invalid alternate inventory; installed-device discovery and privileged installation remain separate acceptance gates.

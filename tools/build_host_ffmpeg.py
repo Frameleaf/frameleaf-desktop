@@ -14,13 +14,14 @@ import stat
 import struct
 import tarfile
 import tomllib
+import unicodedata
 import zipfile
 from pathlib import Path
 
 from build_host_database import download
 from build_host_plugin import tool_pin
 from build_host_server import stage_server
-from build_runtime import BuildError, build_environment, git_blob, relative, run, sha256
+from build_runtime import BuildError, build_environment, git_blob, regular, relative, run, sha256
 from relocate_macos import apple_library, load_commands
 
 
@@ -44,32 +45,57 @@ def ffmpeg_contract(lock: dict, descriptor: dict, target: str) -> dict:
     return pin
 
 
-def unpack(archive: Path, destination: Path) -> None:
+def unpack(archive: Path, destination: Path, *, max_bytes: int = 2 * 1024**3) -> None:
+    """Preflight the bounded, link-free archive before extracting into an empty directory.
+
+    The caller must exclusively own the archive and destination throughout this operation.
+    """
+    if type(max_bytes) is not int or not 0 < max_bytes <= 8 * 1024**3:
+        raise BuildError("host_ffmpeg_archive_limit")
+    if (not stat.S_ISREG(regular(archive).st_mode)
+            or not stat.S_ISDIR(regular(destination).st_mode)
+            or any(destination.iterdir())):
+        raise BuildError("host_ffmpeg_archive_paths_invalid")
+
+    def validate(entries):
+        names = {}
+        total = 0
+        for count, (name, directory, size) in enumerate(entries, 1):
+            if any(character in name for character in '<>:"|?*'):
+                raise BuildError("host_ffmpeg_archive_entry_invalid")
+            name = relative(name[:-1] if name.endswith("/") else name)
+            name = unicodedata.normalize("NFC", unicodedata.normalize("NFD", name).casefold())
+            total += size
+            if count > 100_000 or size < 0 or total > max_bytes:
+                raise BuildError("host_ffmpeg_archive_limit")
+            if name in names:
+                raise BuildError("host_ffmpeg_archive_entry_invalid")
+            names[name] = directory
+        for name in names:
+            parents = name.split("/")[:-1]
+            if any(names.get("/".join(parents[:index])) is False
+                   for index in range(1, len(parents) + 1)):
+                raise BuildError("host_ffmpeg_archive_entry_invalid")
+
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as contents:
             entries = contents.infolist()
-            if (
-                len(entries) > 100_000
-                or sum(entry.file_size for entry in entries) > 2 * 1024**3
-            ):
-                raise BuildError("host_ffmpeg_archive_limit")
-            names = set()
             for entry in entries:
-                name = relative(entry.filename.rstrip("/"))
-                folded = name.casefold()
                 mode = stat.S_IFMT(entry.external_attr >> 16)
-                if folded in names or mode not in (0, stat.S_IFREG, stat.S_IFDIR):
+                if (mode not in (0, stat.S_IFREG, stat.S_IFDIR)
+                        or mode == stat.S_IFDIR and not entry.is_dir()
+                        or mode == stat.S_IFREG and entry.is_dir()):
                     raise BuildError("host_ffmpeg_archive_entry_invalid")
-                names.add(folded)
+            validate((entry.filename, entry.is_dir(), entry.file_size) for entry in entries)
             contents.extractall(destination)
     else:
         with tarfile.open(archive) as contents:
-            entries = contents.getmembers()
-            if (
-                len(entries) > 100_000
-                or sum(entry.size for entry in entries) > 2 * 1024**3
-            ):
-                raise BuildError("host_ffmpeg_archive_limit")
+            def entries():
+                for entry in contents:
+                    if not (entry.isfile() or entry.isdir()):
+                        raise BuildError("host_ffmpeg_archive_entry_invalid")
+                    yield entry.name, entry.isdir(), entry.size
+            validate(entries())
             contents.extractall(destination, filter="data")
 
 
