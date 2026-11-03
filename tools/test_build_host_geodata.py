@@ -126,7 +126,7 @@ class HostGeodataTests(unittest.TestCase):
             self.assertEqual(report['sourceDockerfileSha256'], hashlib.sha256(original).hexdigest())
             self.assertEqual(report['date'], '2026-10-10T00:00:00+00:00')
 
-    def test_fixture_git_is_isolated_from_inherited_repository_controls(self):
+    def test_fixture_and_builder_git_are_isolated_from_inherited_repository_controls(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             outer = root / 'outer'
@@ -142,7 +142,11 @@ class HostGeodataTests(unittest.TestCase):
             with patch.dict(os.environ, {'GIT_DIR': str(outer / '.git'),
                                          'GIT_WORK_TREE': str(outer),
                                          'GIT_INDEX_FILE': str(outer / '.git/alternate-index')}):
-                source, revision, _, _ = self.fixture(root)
+                source, revision, lock, content = self.fixture(root)
+                with patch('build_host_geodata.download', side_effect=lambda url, path, digest:
+                           path.write_bytes(content[url.rsplit('/', 1)[1]])):
+                    build(source, revision, root / 'output')
+                self.assertEqual((root / 'output/geodata/geodata.lock').read_bytes(), lock)
             self.assertEqual(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=outer, env=env), before)
             self.assertEqual(subprocess.check_output(['git', 'status', '--porcelain'], cwd=outer, env=env), b'')
             self.assertFalse((outer / '.git/alternate-index').exists())
