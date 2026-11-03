@@ -234,6 +234,12 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       FRAMELEAF_TEST_DISPOSABLE_KEYSTORE: '1'
     steps:
+      - name: Reject conflicting qualification probes
+        if: ${{ inputs.directory_probe }}
+        shell: bash
+        run: |
+          echo 'Select either directory_probe or keystore_probe, not both.' >&2
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
