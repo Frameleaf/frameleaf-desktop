@@ -52,9 +52,9 @@ jobs:
               'archiveSha256': '1e735c375493250029932b779fd1f72f01851f81bbd57cb12beb84e600b8126e',
           }
           root = Path(os.environ['RUNNER_TEMP']) / 'database-relocation'
-          root.mkdir()
+          root.mkdir(mode=0o700)
           work = root / 'work'
-          work.mkdir()
+          work.mkdir(mode=0o700)
           report = {'qualification': 'failed', 'runtimeQualified': False,
                     'redistributable': False, 'approved': approved, 'phase': 'acquire'}
           try:
@@ -66,11 +66,18 @@ jobs:
                       or receipt.get('files') != inventory(original)):
                   raise RuntimeError('Approved database inventory or policy mismatch')
               host = work / 'host'
-              host.mkdir()
+              host.mkdir(mode=0o700)
               relocated = host / 'pg'
               stage_server(original, relocated)
               if inventory(relocated) != receipt['files']:
                   raise RuntimeError('Relocated database inventory mismatch')
+              acl_env = build_environment(work, os.environ)
+              acl_env['FRAMELEAF_DIAGNOSTIC_ROOT'] = str(relocated / 'bin/initdb.exe')
+              acl_script = ('$a=Get-Acl -LiteralPath $env:FRAMELEAF_DIAGNOSTIC_ROOT;'
+                            '@{owner=$a.Owner;sddl=$a.Sddl}|ConvertTo-Json -Compress')
+              report['databaseExecutableAccess'] = json.loads(run([
+                  Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe',
+                  '-NoProfile', '-NonInteractive', '-Command', acl_script], cwd=work, env=acl_env))
               for prefix in [original, relocated]:
                   report['phase'] = prefix.name + '-version'
                   print(report['phase'], flush=True)
