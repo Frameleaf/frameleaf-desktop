@@ -1,0 +1,105 @@
+name: Windows downloaded database qualification
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-database-relocation.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-database-relocation-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Verify the approved archive and qualify its relocated database
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          sys.path.insert(0, 'tools')
+          from bind_host_raw import read_receipt
+          from build_host_database_windows import qualify
+          from build_host_server import stage_server
+          from build_runtime import build_environment, inventory, run
+          from obtain_host_component import obtain
+          approved = {
+              'artifactId': 13117939175, 'runId': 41390851323, 'runAttempt': 1,
+              'headSha': '7338f418bb10f39aec33a6eabf968eb8ea47e2ee',
+              'workflow': '.github/workflows/windows-host-database.yml',
+              'archiveSha256': '1e735c375493250029932b779fd1f72f01851f81bbd57cb12beb84e600b8126e',
+          }
+          root = Path(os.environ['RUNNER_TEMP']) / 'database-relocation'
+          root.mkdir()
+          work = root / 'work'
+          work.mkdir()
+          report = {'qualification': 'failed', 'runtimeQualified': False,
+                    'redistributable': False, 'approved': approved, 'phase': 'acquire'}
+          try:
+              obtain(approved, work / 'input')
+              original = work / 'input/component/postgres'
+              receipt = read_receipt(work / 'input/component/qualification.json')
+              lock = read_receipt(Path('runtime/host-database.json'))
+              if (receipt.get('qualification') != 'passed' or receipt.get('pins') != lock
+                      or receipt.get('files') != inventory(original)):
+                  raise RuntimeError('Approved database inventory or policy mismatch')
+              relocated = work / 'pg'
+              stage_server(original, relocated)
+              if inventory(relocated) != receipt['files']:
+                  raise RuntimeError('Relocated database inventory mismatch')
+              for prefix in [original, relocated]:
+                  report['phase'] = prefix.name + '-version'
+                  print(report['phase'], flush=True)
+                  env = build_environment(work, os.environ)
+                  env['PATH'] = str(prefix / 'bin') + os.pathsep + env['PATH']
+                  env['FRAMELEAF_BUILD_ERROR_LOG'] = str(root / 'command-error.log')
+                  run([prefix / 'bin/initdb.exe', '--version'], cwd=work, env=env)
+              report['phase'] = 'relocated-restore-restart-checksums'
+              print(report['phase'], flush=True)
+              fixtures = work / 'fixtures'
+              fixtures.mkdir()
+              report['checks'] = qualify(relocated, fixtures, lock, env)
+              if inventory(relocated) != receipt['files']:
+                  raise RuntimeError('Database payload changed during qualification')
+              report['qualification'] = 'passed'
+          except Exception:
+              # A loader failure has no stderr; identify which bundled DLL cannot load.
+              if 'original' in locals() and original.is_dir():
+                  probe = 'import ctypes,sys; d=ctypes.WinDLL(sys.argv[1]); print("loaded",sys.argv[1])'
+                  env = build_environment(work, os.environ)
+                  env['PATH'] = str(original / 'bin') + os.pathsep + env['PATH']
+                  with (root / 'loader.log').open('w', encoding='utf-8') as log:
+                      for dll in sorted((original / 'bin').glob('*.dll')):
+                          print(dll.name, file=log, flush=True)
+                          subprocess.run([sys.executable, '-I', '-S', '-c', probe, dll],
+                                         cwd=work, env=env, stdout=log, stderr=log, timeout=15)
+              raise
+          finally:
+              shutil.rmtree(work)
+              (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
+      - name: Retain bounded evidence without database binaries or private fixtures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-database-relocation-evidence
+          path: |
+            ${{ runner.temp }}/database-relocation/qualification.json
+            ${{ runner.temp }}/database-relocation/command-error.log
+            ${{ runner.temp }}/database-relocation/loader.log
+          retention-days: 7
+          if-no-files-found: ignore
