@@ -25,7 +25,8 @@ test('local setup commands are registered and permitted only in the packaged mai
 test('every invoke() in the Svelte front end names a registered, permitted command', () => {
   const { readdirSync, statSync } = require('node:fs');
   const { join } = require('node:path');
-  const root = new URL('../src/', import.meta.url).pathname;
+  const { fileURLToPath } = require('node:url');
+  const root = fileURLToPath(new URL('../src/', import.meta.url));
   const files: string[] = [];
   const walk = (dir: string) => { for (const entry of readdirSync(dir)) { const path = join(dir, entry); if (statSync(path).isDirectory()) walk(path); else if (path.endsWith('.svelte')) files.push(path); } };
   walk(root);
