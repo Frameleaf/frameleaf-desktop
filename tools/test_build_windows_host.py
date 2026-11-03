@@ -147,7 +147,7 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             self.assertTrue((root/'output/evidence/source-components/server/server-qualification.json').exists())
             for name in ['qualify_host_raw.mjs','qualify_host_exiftool.mjs','qualify_host_plugin.mjs']:
                 self.assertTrue(any(name in ' '.join(c) for c in commands),name)
-            self.assertTrue(any('--test' in c and c[-1].endswith('server/test/native/image-hdr.test.mjs') for c in commands))
+            self.assertTrue(any('--test' in c and Path(c[-1]).as_posix().endswith('server/test/native/image-hdr.test.mjs') for c in commands))
 
     def test_consumer_and_signature_refusals_remove_all_executable_candidates_and_private_work(self):
         for failure in ['qualify_host_raw.mjs','qualify_host_exiftool.mjs','qualify_host_plugin.mjs','hdr','studio','assembly','payload-change']:

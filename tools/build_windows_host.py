@@ -139,6 +139,7 @@ console.log(JSON.stringify(hostEnvironment({{runtime:process.argv[1],state:proce
         consumers.mkdir()
         for name in ['database','media']:
             (consumers / name).mkdir()
+        # Native policy belongs to this desktop recipe; --source selects the application Dockerfile.
         database = read_receipt(ROOT/'runtime/host-database.json')
         report['databaseCertified'] = database['certified']
         report['consumers']['database'] = {'qualification':'passed','checks':qualify_database(host/'pg',consumers/'database',database,env)}
