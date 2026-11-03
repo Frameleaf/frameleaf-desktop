@@ -14,6 +14,7 @@ from pathlib import Path
 from build_host_exiftool_windows import ADAPTED_MODULE_SHA256, VENDOR_MODULE_SHA256
 from build_host_raw import raw_contract
 from build_host_server import stage_server
+from windows_private_directory import create_private_directory
 from build_runtime import BuildError, build_environment, git_blob, regular, sha256
 
 
@@ -78,9 +79,9 @@ def build(source: Path, server: Path, raw: Path, output: Path) -> None:
     git = shutil.which("git")
     if not git:
         raise BuildError("host_raw_binding_git_missing")
-    output.mkdir(mode=0o700)
+    create_private_directory(output)
     work = output / "work"
-    work.mkdir(mode=0o700)
+    create_private_directory(work)
     env = build_environment(work, os.environ)
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(Path("NUL") if platform.system() == "Windows" else Path("/dev/null")),
                GIT_TERMINAL_PROMPT="0")

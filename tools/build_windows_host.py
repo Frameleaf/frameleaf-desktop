@@ -23,6 +23,7 @@ from build_host_windows_support import build as build_support, NODE_EXE_SHA
 from build_runtime import BuildError, build_environment, git_blob, inventory, regular, run, sha256
 from obtain_windows_host_components import obtain as obtain_components, SOURCE_REVISION
 from source_archive import verify_source_archive
+from windows_private_directory import create_private_directory
 
 ROOT = Path(__file__).resolve().parent.parent
 STUDIO_CHECK = '''
@@ -55,10 +56,10 @@ def build(source: Path, approvals: dict, output: Path, epoch: int) -> None:
     git = shutil.which('git')
     if not git:
         raise BuildError('host_windows_assembly_git_missing')
-    output.mkdir(mode=0o700)
+    create_private_directory(output)
     work, evidence, candidate = output / 'work', output / 'evidence', output / 'candidate'
-    work.mkdir(mode=0o700)
-    evidence.mkdir(mode=0o700)
+    create_private_directory(work)
+    create_private_directory(evidence)
     report = {'schemaVersion':1, 'sourceRevision':SOURCE_REVISION, 'epoch':epoch,
               'qualification':'failed', 'runtimeQualified':False, 'redistributable':False,
               'installedPlatformQualified':False, 'fullMediaConformance':False,

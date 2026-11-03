@@ -45,6 +45,7 @@ jobs:
           from build_runtime import build_environment, inventory, run, sha256
           from obtain_host_component import obtain
           from obtain_windows_host_components import checked_receipt
+          from windows_private_directory import create_private_directory
           approved = {
               'artifactId': 13117939175, 'runId': 41390851323, 'runAttempt': 1,
               'headSha': '7338f418bb10f39aec33a6eabf968eb8ea47e2ee',
@@ -52,9 +53,9 @@ jobs:
               'archiveSha256': '1e735c375493250029932b779fd1f72f01851f81bbd57cb12beb84e600b8126e',
           }
           root = Path(os.environ['RUNNER_TEMP']) / 'database-relocation'
-          root.mkdir(mode=0o700)
+          create_private_directory(root)
           work = root / 'work'
-          work.mkdir(mode=0o700)
+          create_private_directory(work)
           report = {'qualification': 'failed', 'runtimeQualified': False,
                     'redistributable': False, 'approved': approved, 'phase': 'acquire'}
           try:
@@ -65,8 +66,11 @@ jobs:
               if (receipt.get('qualification') != 'passed' or receipt.get('pins') != lock
                       or receipt.get('files') != inventory(original)):
                   raise RuntimeError('Approved database inventory or policy mismatch')
-              host = work / 'host'
-              host.mkdir(mode=0o700)
+              components = work / 'components'
+              # Match acquisition's container; only the staged subtree needs restricted-user access.
+              components.mkdir(mode=0o700)
+              host = components / 'bound-server-raw'
+              create_private_directory(host)
               relocated = host / 'pg'
               stage_server(original, relocated)
               if inventory(relocated) != receipt['files']:
@@ -74,7 +78,8 @@ jobs:
               acl_env = build_environment(work, os.environ)
               acl_env['FRAMELEAF_DIAGNOSTIC_ROOT'] = str(relocated / 'bin/initdb.exe')
               acl_script = ('$a=Get-Acl -LiteralPath $env:FRAMELEAF_DIAGNOSTIC_ROOT;'
-                            '@{owner=$a.Owner;sddl=$a.Sddl}|ConvertTo-Json -Compress')
+                            '@{owner=$a.Owner;sddl=$a.Sddl;'
+                            'userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value}|ConvertTo-Json -Compress')
               report['databaseExecutableAccess'] = json.loads(run([
                   Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe',
                   '-NoProfile', '-NonInteractive', '-Command', acl_script], cwd=work, env=acl_env))
