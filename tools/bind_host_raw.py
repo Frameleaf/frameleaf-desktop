@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 from build_host_exiftool_windows import ADAPTED_MODULE_SHA256, VENDOR_MODULE_SHA256
@@ -122,5 +123,5 @@ if __name__ == "__main__":
     options = parser.parse_args()
     try:
         build(options.source, options.server, options.raw, options.output)
-    except (BuildError, OSError, ValueError, KeyError) as error:
+    except (BuildError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         parser.exit(1, str(error) if isinstance(error, BuildError) else "host_raw_binding_failed")

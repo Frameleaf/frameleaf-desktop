@@ -1,4 +1,9 @@
 import hashlib
+import io
+import runpy
+import subprocess
+import sys
+from contextlib import redirect_stderr
 import json
 import platform
 import tempfile
@@ -39,6 +44,24 @@ class RawBindingTests(unittest.TestCase):
                 report.update(source=pin, librawSource=libraw)
             (folder / 'qualification.json').write_text(json.dumps(report))
         return blobs
+
+    def test_cli_identity_process_failures_use_stable_diagnostic_without_creating_output(self):
+        for error in [subprocess.CalledProcessError(1, 'whoami.exe'),
+                      subprocess.TimeoutExpired('whoami.exe', 10)]:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                self.inputs(root)
+                script = Path(__file__).with_name('bind_host_raw.py')
+                arguments = [str(script), '--source', str(root), '--server', str(root / 'server'),
+                             '--raw', str(root / 'raw'), '--output', str(root / 'output')]
+                stderr = io.StringIO()
+                with patch.object(sys, 'argv', arguments), redirect_stderr(stderr), patch(
+                    'windows_private_directory.create_private_directory', side_effect=error
+                ), self.assertRaises(SystemExit) as exited:
+                    runpy.run_path(str(script), run_name='__main__')
+                self.assertEqual(exited.exception.code, 1)
+                self.assertEqual(stderr.getvalue(), 'host_raw_binding_failed')
+                self.assertFalse((root / 'output').exists())
 
     def test_different_server_revision_requires_exact_engine_and_patch_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
