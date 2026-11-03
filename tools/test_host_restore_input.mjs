@@ -14,7 +14,7 @@ import filesystem from 'node:fs/promises';
 import * as owner from '../runtime/host-agent.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 async function fixture(t,run){
- const state=await realpath(await mkdtemp(join(tmpdir(),'frameleaf-restore-input-')));t.after(()=>rm(state,{recursive:true,force:true}));
+ const state=await realpath(await mkdtemp(join(tmpdir(),'Frameleaf Desktop Host ü restore-')));t.after(()=>rm(state,{recursive:true,force:true}));
  const suffix=process.platform==='win32'?'.exe':'';
  const c={state,runtime:join(state,'signed-runtime'),manifestSha256:'a'.repeat(64),sourceRevision:'b'.repeat(40),postgresMajor:'19',databasePort:54329,apiPort:2283,password:'synthetic private database password',entryPoints:Object.fromEntries(['node','server','postgres','initdb','createdb','psql','pgIsready','pgCtl','pgDump','pgRestore','hdr','studioBrowserGuard','studio'].map(name=>[name,'bin/'+name+suffix]))};
  Object.assign(c.entryPoints,{ffmpeg:'media/ffmpeg'+suffix,ffprobe:'media/ffprobe'+suffix,rawRenderer:'raw/darktable-cli'+suffix,rawDecoder:'raw/dcraw_emu'+suffix,studioBrowser:'browser/chrome'+suffix});

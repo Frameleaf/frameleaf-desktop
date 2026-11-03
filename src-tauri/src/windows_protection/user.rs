@@ -78,8 +78,7 @@ fn current_user() -> Result<Vec<u8>, String> {
     }
     unsafe { super::native::sid_bytes(sid) }.map_err(|_| ERROR.into())
 }
-/// Pin ownership to the process SID and stop parent ACL changes from adding foreign grants.
-fn descriptor(user: &[u8]) -> Result<Local, String> {
+fn sid_name(user: &[u8]) -> Result<String, String> {
     let mut text = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(user.as_ptr().cast_mut().cast(), &mut text) } == 0
         || text.is_null()
@@ -90,8 +89,15 @@ fn descriptor(user: &[u8]) -> Result<Local, String> {
     let length = (0..256)
         .find(|i| unsafe { *text.add(*i) == 0 })
         .ok_or(ERROR)?;
-    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
-        .map_err(|_| ERROR)?;
+    String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+        .map_err(|_| ERROR.into())
+}
+pub(crate) fn process_user_sid() -> Result<String, String> {
+    sid_name(&current_user()?)
+}
+/// Pin ownership to the process SID and stop parent ACL changes from adding foreign grants.
+fn descriptor(user: &[u8]) -> Result<Local, String> {
+    let sid = sid_name(user)?;
     let sddl: Vec<u16> = format!("O:{sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})\0")
         .encode_utf16()
         .collect();
@@ -140,16 +146,19 @@ fn open(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 /// Hold protected ancestry during admission; inspect existing descendants without changing ACLs.
-fn directory(path: &Path, create_new: bool) -> Result<(), String> {
+fn directory(path: &Path, user: &[u8], mode: DirectoryMode) -> Result<Vec<File>, String> {
+    if !super::sid_valid(user) {
+        return Err(ERROR.into());
+    }
+    current_user()?;
     crate::native_runtime::absolute_directory(path.parent().ok_or(ERROR)?)?;
-    let user = current_user()?;
     let private_trusted = vec![
-        user.clone(),
+        user.to_vec(),
         vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
         vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0],
     ];
     let mut trusted = super::native::trusted_sids()?.clone();
-    trusted.push(user.clone());
+    trusted.push(user.to_vec());
     let physical = super::stable_path(path.parent().ok_or(ERROR)?)?;
     // Native directory APIs need the extended spelling; process launches keep their captured spelling.
     let parent = PathBuf::from(format!(
@@ -176,8 +185,11 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
     let path: PathBuf = parent.join(path.file_name().ok_or(ERROR)?);
     super::filesystem_components(path.to_str().ok_or(ERROR)?).ok_or(ERROR)?;
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let security = descriptor(&user)?;
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !matches!(mode, DirectoryMode::ExistingOnly) =>
+        {
+            let security = descriptor(user)?;
             let attributes = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: security.0,
@@ -194,11 +206,13 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
                 });
                 return Err(ERROR.into());
             }
-            if create_new {
-                return Ok(());
+            if matches!(mode, DirectoryMode::CreateNew) {
+                return Ok(parents);
             }
         }
-        Ok(_) if create_new => return Err("runtime_store_directory_exists".into()),
+        Ok(_) if matches!(mode, DirectoryMode::CreateNew) => {
+            return Err("runtime_store_directory_exists".into())
+        }
         Ok(_) => {}
         Err(_) => return Err(ERROR.into()),
     }
@@ -207,7 +221,7 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
     // Protected DACLs prevent later parent inheritance from widening this private boundary.
     if !file.metadata().map_err(|_| ERROR)?.is_dir()
         || control & 0x1000 == 0
-        || !super::private_acl(&owner, &acl, &user, &private_trusted)
+        || !super::private_acl(&owner, &acl, user, &private_trusted)
     {
         #[cfg(test)]
         eprintln!(
@@ -218,6 +232,7 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
         return Err(ERROR.into());
     }
     // Each frame pins its directory and ancestors until all children have been inspected.
+    parents.push(file.try_clone().map_err(|_| ERROR)?);
     let mut pending = vec![scan(&path, file)?];
     let mut visited = 0;
     while let Some((_, entries)) = pending.last_mut() {
@@ -242,7 +257,7 @@ fn directory(path: &Path, create_new: bool) -> Result<(), String> {
             pending.push(scan(&path, file)?);
         }
     }
-    Ok(())
+    Ok(parents)
 }
 
 /// Enumeration keeps the checked object open without delete sharing until its frame is exhausted.
@@ -259,7 +274,7 @@ fn scan(path: &Path, pin: File) -> Result<(File, fs::ReadDir), String> {
 
 /// Admission may reuse an existing private directory; it never repairs permissions.
 pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
-    let result = directory(path, false);
+    let result = directory(path, &current_user()?, DirectoryMode::CreateOrReuse).map(|_| ());
     #[cfg(test)]
     if let Err(error) = &result {
         eprintln!("private directory admission at {path:?}: {error}");
@@ -269,7 +284,25 @@ pub(crate) fn private_directory(path: &Path) -> Result<(), String> {
 
 /// Return ownership only for a newly created protected directory, never an existing stage.
 pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
-    directory(path, true)
+    directory(path, &current_user()?, DirectoryMode::CreateNew).map(|_| ())
+}
+
+pub(crate) fn new_private_directory(path: &Path) -> Result<(), String> {
+    create_private_directory(path)?;
+    require_private_directory(path)
+}
+pub(crate) fn require_private_directory(path: &Path) -> Result<(), String> {
+    let user = current_user()?;
+    directory(path, &user, DirectoryMode::ExistingOnly).map(|_| ())
+}
+pub(crate) fn pin_private_directory(path: &Path) -> Result<Vec<File>, String> {
+    let user = current_user()?;
+    directory(path, &user, DirectoryMode::ExistingOnly)
+}
+enum DirectoryMode {
+    CreateOrReuse,
+    CreateNew,
+    ExistingOnly,
 }
 
 #[cfg(test)]
@@ -603,5 +636,56 @@ mod tests {
         );
         drop(file);
         assert_eq!(fs::read(&path).unwrap(), b"synthetic only");
+    }
+    #[test]
+    fn retained_private_admission_pins_the_leaf_and_its_ancestors() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-ancestry-pin-{}", uuid::Uuid::new_v4()));
+        new_private_directory(&root).unwrap();
+        let fixture = Fixture(root);
+        let leaf = fixture.0.join("state");
+        new_private_directory(&leaf).unwrap();
+        let pins = pin_private_directory(&leaf).unwrap();
+        assert!(fs::rename(&fixture.0, fixture.0.with_extension("moved")).is_err());
+        assert!(fs::rename(&leaf, leaf.with_extension("moved")).is_err());
+        assert!(fs::remove_dir(&leaf).is_err());
+        fs::write(leaf.join("allowed"), b"synthetic state").unwrap();
+        fs::remove_file(leaf.join("allowed")).unwrap();
+        drop(pins);
+        let moved = fixture.0.join("moved");
+        fs::rename(&leaf, &moved).unwrap();
+        fs::rename(&moved, &leaf).unwrap();
+        let moved = fixture.0.with_extension("moved");
+        fs::rename(&fixture.0, &moved).unwrap();
+        fs::rename(&moved, &fixture.0).unwrap();
+    }
+    #[test]
+    fn existing_private_admission_never_recreates_a_directory_removed_after_inspection() {
+        let root = std::env::temp_dir().join(format!(
+            "frameleaf-existing-private-{}",
+            uuid::Uuid::new_v4()
+        ));
+        new_private_directory(&root).unwrap();
+        crate::native_runtime::absolute_directory(&root).unwrap();
+        fs::remove_dir(&root).unwrap();
+        assert!(require_private_directory(&root).is_err());
+        assert!(!root.exists());
+    }
+    #[test]
+    fn exclusive_private_creation_refuses_existing_state_without_repair_or_deletion() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-new-private-{}", uuid::Uuid::new_v4()));
+        new_private_directory(&root).unwrap();
+        let fixture = Fixture(root);
+        let path = fixture.0.join("synthetic-state");
+        fs::write(&path, b"retain").unwrap();
+        let before = super::super::native::security(&open(&fixture.0).unwrap()).unwrap();
+        assert!(new_private_directory(&fixture.0).is_err());
+        assert_eq!(
+            super::super::native::security(&open(&fixture.0).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"retain");
+        private_directory(&fixture.0).unwrap();
     }
 }

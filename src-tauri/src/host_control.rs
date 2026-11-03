@@ -552,6 +552,11 @@ pub fn run() -> Result<(), String> {
     stopped(&invalid)
 }
 
+#[cfg(debug_assertions)]
+pub fn qualify_credential_access(expected: &str) -> Result<serde_json::Value, String> {
+    crate::credentials::qualify_controller_access(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, ffi::OsString, os::windows::ffi::OsStringExt, p
 use windows_sys::Win32::{
     Foundation::RPC_E_CHANGED_MODE,
     System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
-    UI::Shell::{FOLDERID_ProgramFilesX64, SHGetKnownFolderPath},
+    UI::Shell::{FOLDERID_LocalAppData, FOLDERID_ProgramFilesX64, SHGetKnownFolderPath},
 };
 const ERROR: &str = "host_install_location_unavailable";
 struct Com(bool);
@@ -31,17 +31,13 @@ impl Drop for Folder {
         unsafe { CoTaskMemFree(self.0.cast()) };
     }
 }
-pub(super) fn base() -> Result<PathBuf, String> {
+pub(super) fn local_app_data() -> Result<PathBuf, String> {
+    known_folder(&FOLDERID_LocalAppData)
+}
+fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf, String> {
     let _initialization = Com::initialize()?;
     let mut folder = Folder(std::ptr::null_mut());
-    let result = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_ProgramFilesX64,
-            0,
-            std::ptr::null_mut(),
-            &mut folder.0,
-        )
-    };
+    let result = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut folder.0) };
     if result != 0 || folder.0.is_null() {
         return Err(ERROR.into());
     }
@@ -56,7 +52,10 @@ pub(super) fn base() -> Result<PathBuf, String> {
     let path = PathBuf::from(OsString::from_wide(unsafe {
         std::slice::from_raw_parts(folder.0, length)
     }));
-    let physical = crate::windows_protection::stable_path(&path).map_err(|_| ERROR)?;
+    crate::windows_protection::stable_path(&path).map_err(|_| ERROR.into())
+}
+pub(super) fn base() -> Result<PathBuf, String> {
+    let physical = known_folder(&FOLDERID_ProgramFilesX64)?;
     crate::windows_protection::protect(&physical, &mut BTreeSet::new()).map_err(|_| ERROR)?;
     Ok(physical.join("Frameleaf"))
 }
@@ -102,6 +101,7 @@ mod tests {
                     let _initialization = Com::initialize().unwrap();
                     assert_eq!(CoGetContextToken(&mut context), S_OK);
                     base().unwrap();
+                    local_app_data().unwrap();
                 }
                 if existing.is_some() {
                     assert_eq!(CoGetContextToken(&mut context), S_OK);

@@ -56,10 +56,14 @@ fn parse_policy(raw: &str) -> Result<(u64, Vec<VerifyingKey>), String> {
     }
     Ok((policy.minimum_runtime_epoch, keys))
 }
-// shortcut: the initial floor is compiled; add a monotonic OS-keystore floor before enabling runtime updates.
 pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
     let (floor, keys) = parse_policy(POLICY)?;
-    RuntimeStore::new(root, keys, floor)
+    RuntimeStore::new(
+        root,
+        keys,
+        floor,
+        std::sync::Arc::new(crate::credentials::CredentialEpochAuthority),
+    )
 }
 
 pub fn verify_host_runtime(

@@ -25,7 +25,7 @@ test("checkpoint owner requests accept only one bounded operation identity", () 
 });
 
 async function fixture(t) {
-  const state = await realpath(await mkdtemp(join(tmpdir(), "frameleaf-checkpoint-")));
+  const state = await realpath(await mkdtemp(join(tmpdir(), "Frameleaf Desktop Host ü checkpoint-")));
   t.after(() => rm(state, { recursive: true, force: true }));
   const suffix = process.platform === "win32" ? ".exe" : "";
   const c = {

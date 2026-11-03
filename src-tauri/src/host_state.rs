@@ -41,6 +41,8 @@ pub(crate) struct Marker {
     database_reference: Option<crate::host_database::Reference>,
 }
 pub(crate) struct Owner {
+    #[cfg(windows)]
+    _profile_pins: Vec<File>,
     path: PathBuf,
     root: Dir,
     file: File,
@@ -128,6 +130,8 @@ impl Owner {
         if writable {
             crate::runtime_store::private_directory(path)?;
         }
+        #[cfg(windows)]
+        let profile_pins = crate::windows_protection::pin_private_directory(path)?;
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         #[cfg(unix)]
         {
@@ -155,6 +159,8 @@ impl Owner {
         .map_err(|_| "host_controller_already_owned")?;
         let profile_identity = identity(&root)?;
         let owner = Self {
+            #[cfg(windows)]
+            _profile_pins: profile_pins,
             path: path.into(),
             root,
             file,
@@ -669,6 +675,19 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn controller_owner_pins_its_profile_until_the_journal_lease_is_released() {
+        let fixture = Fixture::new();
+        let owner = Owner::acquire(&fixture.0, true).unwrap();
+        let moved = fixture.0.with_extension("moved");
+        assert!(fs::rename(&fixture.0, &moved).is_err());
+        fs::write(fixture.0.join("sentinel"), b"retained").unwrap();
+        drop(owner);
+        fs::rename(&fixture.0, &moved).unwrap();
+        fs::rename(&moved, &fixture.0).unwrap();
+        assert_eq!(fs::read(fixture.0.join("sentinel")).unwrap(), b"retained");
+    }
     #[cfg(unix)]
     #[test]
     fn journal_refuses_symlinks_and_hardlinks_and_a_replaced_root() {

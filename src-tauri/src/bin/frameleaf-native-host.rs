@@ -1,6 +1,12 @@
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
+        #[cfg(debug_assertions)]
+        [mode, identity] if mode == "--qualify-credential-access" => match identity.to_str() {
+            Some(identity) => frameleaf_desktop::host_control::qualify_credential_access(identity)
+                .map(|receipt| println!("{receipt}")),
+            None => Err("host_control_arguments_invalid".into()),
+        },
         [mode] if mode == "--owner-pipe" => frameleaf_desktop::host_control::run(),
         [mode] if mode == "--inspect-owner" => frameleaf_desktop::host_control::inspect_owner(),
         [mode, manifest, controller]
@@ -9,6 +15,7 @@ fn main() {
                 || mode == "--prepare-maintenance"
                 || mode == "--prepare-repair"
                 || mode == "--prepare-windows-package"
+                || mode == "--finalize-windows-package"
                 || mode == "--prepare-linux-package" =>
         {
             match (manifest.to_str(), controller.to_str()) {
@@ -21,6 +28,10 @@ fn main() {
                         frameleaf_desktop::host_install::prepare_repair(manifest, controller)
                     } else if mode == "--prepare-windows-package" {
                         frameleaf_desktop::host_install::prepare_windows_package(
+                            manifest, controller,
+                        )
+                    } else if mode == "--finalize-windows-package" {
+                        frameleaf_desktop::host_install::finalize_windows_package(
                             manifest, controller,
                         )
                     } else if mode == "--prepare-linux-package" {

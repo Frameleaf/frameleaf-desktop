@@ -1,5 +1,5 @@
 //! Package changes require exclusive ownership; a fence survives interrupted maintenance.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use std::path::PathBuf;
 use std::{
     fs::{self, File, OpenOptions},
@@ -184,19 +184,19 @@ impl CodeLease {
         Ok(child)
     }
 }
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 pub(crate) struct Maintenance {
     candidate: PathBuf,
     _lease: File,
 }
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 impl Drop for Maintenance {
     fn drop(&mut self) {
         // A concurrent fork may retain this open file description until exec closes CLOEXEC copies.
         let _ = self._lease.unlock();
     }
 }
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 impl Maintenance {
     pub(crate) fn acquire(candidate: &Path) -> Result<Self, String> {
         let file = open(candidate, LEASE, true)?;

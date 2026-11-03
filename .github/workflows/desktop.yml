@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      directory_probe:
+        description: Run only Windows directory and shared-cache qualification
+        type: boolean
+        default: false
+      keystore_probe:
+        description: Qualify real OS credential persistence on disposable hosted runners
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -11,6 +20,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   check:
+    if: ${{ !inputs.directory_probe && !inputs.keystore_probe }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,9 +71,26 @@ jobs:
         with:
           node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - name: Qualify Windows package directory authority in disposable runner
+      - name: Qualify Windows controller dependencies without ambient runtime paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $inspectors = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe')
+          if ($LASTEXITCODE -or $inspectors.Count -lt 1) { throw 'Controller dependency inspector is missing' }
+          $controller = (Resolve-Path 'src-tauri/target/debug/frameleaf-native-host.exe').Path
+          python tools/qualify_windows_controller.py $controller $inspectors[0]
+          if ($LASTEXITCODE) { throw 'Windows controller dependency qualification failed' }
+      - name: Qualify Windows package directory and receipt authority in disposable runner
         if: runner.os == 'Windows' && runner.environment == 'github-hosted'
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_creates_protected_directories_and_refuses_existing_unsafe_objects -- --ignored --exact
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE) { throw 'Windows package test discovery failed' }
+          $fixtures = @($tests | Select-String '^host_install::windows::package::tests::disposable_runner_.*: test$')
+          if ($fixtures.Count -ne 2) { throw 'Windows package qualification fixtures are missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
+          if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
       - name: Check Windows real restore test is compiled
         if: runner.os == 'Windows'
         shell: pwsh
@@ -96,3 +123,112 @@ jobs:
           path: src-tauri/target/debug/bundle/
           retention-days: 7
           if-no-files-found: error
+
+  directory-probe:
+    if: ${{ inputs.directory_probe && !inputs.keystore_probe }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Qualify host state, checkpoint and restore paths with spaces and Unicode
+        run: node --test tools/test_host_agent.mjs tools/test_host_database.mjs tools/test_host_checkpoint.mjs tools/test_host_restore_input.mjs tools/test_host_server_owner.mjs
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - name: Qualify private directory admission and long physical paths
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_protection::user::tests:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Private Windows directory admission failed' }
+      - name: Diagnose real shared model-cache composition
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib model_catalogue::tests::composes_distinct_revision_caches_without_replacing_weights_and_detects_tampering -- --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Private shared model-cache composition failed' }
+      - name: Qualify Windows Manager descendant ownership
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib manager_host::windows_tests:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Windows Manager descendant ownership failed' }
+      - name: Qualify per-user host profile boundaries and controller pins
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Per-user Windows host profile qualification failed' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_state:: -- --nocapture
+          if ($LASTEXITCODE) { throw 'Windows controller profile lifetime qualification failed' }
+      - name: Qualify explicit per-user profile preparation on a disposable Windows runner
+        if: ${{ !cancelled() && runner.environment == 'github-hosted' }}
+        env:
+          FRAMELEAF_TEST_DISPOSABLE_HOST_PROFILE: '1'
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --list
+          if ($LASTEXITCODE) { throw 'Per-user profile test discovery failed' }
+          $fixture = @($tests | Select-String '^windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile: test$')
+          if ($fixture.Count -ne 1) { throw 'Disposable per-user profile fixture is missing' }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --exact --ignored --nocapture
+          if ($LASTEXITCODE) { throw 'Disposable per-user profile preparation failed' }
+      - name: Check Windows production and test code with strict Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  keystore-probe:
+    if: ${{ inputs.keystore_probe }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      FRAMELEAF_TEST_DISPOSABLE_KEYSTORE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Linux native dependencies and Secret Service
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev dbus-x11 gnome-keyring
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Build the separate controller for real credential access qualification
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          subprocess.run(["cargo", "build", "--locked", "--manifest-path", "src-tauri/Cargo.toml", "--bin", "frameleaf-native-host"], check=True)
+          binary = "frameleaf-native-host.exe" if os.name == "nt" else "frameleaf-native-host"
+          controller = pathlib.Path("src-tauri/target/debug", binary).resolve(strict=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"FRAMELEAF_TEST_CONTROLLER={controller}\n")
+      - name: Verify the real credential fixture is compiled
+        shell: python
+        run: |
+          import subprocess
+          tests = subprocess.check_output(["cargo", "test", "--locked", "--manifest-path", "src-tauri/Cargo.toml", "--lib", "--", "--list"], text=True)
+          if tests.splitlines().count("credentials::qualification::disposable_runner_epoch_persistence: test") != 1:
+              raise SystemExit("Real credential qualification fixture is missing")
+      - name: Qualify actual macOS and Windows credential persistence
+        if: runner.os != 'Linux'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib credentials::qualification::disposable_runner_epoch_persistence -- --exact --ignored
+      - name: Qualify actual Linux Secret Service persistence
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            python3 -c "import secrets, sys; sys.stdout.write(secrets.token_hex(32))" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            cargo test --locked --manifest-path src-tauri/Cargo.toml --lib credentials::qualification::disposable_runner_epoch_persistence -- --exact --ignored
+          '

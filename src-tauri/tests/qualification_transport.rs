@@ -1,3 +1,4 @@
+mod common;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::{
@@ -56,7 +57,13 @@ fn fixture() -> Fixture {
         "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider",
         "python":"python","sourceRevision":p.runtime_source_revision(),
         "files":{"python":{"sha256":format!("{:x}",Sha256::digest(b"fixture")),"bytes":7}}})).unwrap();
-    let store = RuntimeStore::new(&root.join("store"), vec![key.verifying_key()], 1).unwrap();
+    let store = RuntimeStore::new(
+        &root.join("store"),
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
     store
         .install_and_activate(&payload, &raw, &key.sign(&raw).to_bytes())
         .unwrap();

@@ -3,7 +3,14 @@ import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import * as managerState from '../src/manager-state.ts';
-import { controlIntent, restoreIntent, intentKey, managerError, localProfilePending, type ManagerView } from '../src/manager-state.ts';
+import { controlIntent, restoreIntent, intentKey, managerError, localProfilePending, profileSetupCopy, type ManagerView } from '../src/manager-state.ts';
+test('profile setup copy distinguishes local preparation from system authorization', () => {
+ const local=profileSetupCopy(false), authorized=profileSetupCopy(true);
+ assert.doesNotMatch(JSON.stringify(local), /administrator|authorization request/i);
+ assert.match(local.pending, /preparing/i);
+ assert.match(authorized.preparation, /administrator/i);
+ assert.match(authorized.quit, /authorization request/i);
+});
 test('local profile authorization survives reload and ends only after backend and request complete',()=>{
  assert.equal(localProfilePending('provisioning',false),true);
  assert.equal(localProfilePending('provisioning',true),true);

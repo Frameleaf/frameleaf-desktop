@@ -4,7 +4,7 @@ use crate::{
     manager_host::{Configuration, NativeManager},
 };
 use serde::Serialize;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
@@ -22,6 +22,8 @@ pub(crate) struct View {
     installation: Option<Installation>,
     origin: Option<String>,
     pub background_active: bool,
+    profile_setup_available: bool,
+    profile_requires_authorization: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -31,6 +33,8 @@ impl Default for View {
             installation: None,
             origin: None,
             background_active: false,
+            profile_setup_available: cfg!(any(target_os = "linux", windows)),
+            profile_requires_authorization: cfg!(target_os = "linux"),
         }
     }
 }
@@ -59,6 +63,8 @@ impl HostSetup {
                 .map(|_| "https://127.0.0.1:9443".into()),
             installation,
             background_active: false,
+            profile_setup_available: cfg!(any(target_os = "linux", windows)),
+            profile_requires_authorization: cfg!(target_os = "linux"),
         };
     }
     fn snapshot(&self) -> View {
@@ -107,13 +113,19 @@ impl HostSetup {
             self.provision_record(record, crate::profile_elevation::provision)
                 .await
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let record = Installation::read(&manifest)?;
+            self.provision_record(record, crate::windows_host_profile::prepare)
+                .await
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = manifest;
             Err("host_install_platform_unsupported".into())
         }
     }
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", windows, test))]
     async fn provision_record<F>(
         &self,
         installation: Installation,
@@ -153,7 +165,7 @@ impl HostSetup {
                 return Err("native_manager_already_running".into());
             }
         }
-        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             return Err("host_install_platform_unsupported".into());
         }
         // Validate the fixed identity before changing lifecycle state.
@@ -389,7 +401,7 @@ pub(crate) async fn authorize_owner(
     .await
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, all(test, unix)))]
 pub(crate) fn require_leaf(path: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -410,13 +422,18 @@ pub(crate) fn require_leaf(path: &std::path::Path) -> Result<(), String> {
         crate::manager_host::no_acl(path)?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::windows_protection::require_private_directory(path)
+            .map_err(|_| "host_install_windows_profile_required".into())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Err("host_install_platform_unsupported".into())
     }
 }
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn native_release(version: &str, revision: &str) -> Result<String, String> {
     if version.split('.').count() != 3
         || !version.split('.').all(|part| {
@@ -428,13 +445,19 @@ fn native_release(version: &str, revision: &str) -> Result<String, String> {
     }
     Ok(format!("frameleaf-v{version}-native.{}-1", &revision[..12]))
 }
+#[cfg(windows)]
+fn pin_profile_leaf(path: &std::path::Path) -> Result<Vec<std::fs::File>, String> {
+    crate::windows_protection::pin_private_directory(path)
+        .map_err(|_| "host_install_windows_profile_required".into())
+}
+
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (record, cancel);
         Err("host_install_platform_unsupported".into())
     }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
         let current = Installation::read(&record.manifest_sha256)?;
         if &current != record {
@@ -461,14 +484,28 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         if runtime.manifest_sha256() != record.manifest_sha256 {
             return Err("host_install_runtime_changed".into());
         }
-        let uid = unsafe { libc::geteuid() };
-        let minimum_uid = if cfg!(target_os = "linux") { 1 } else { 501 };
-        if uid < minimum_uid || unsafe { libc::getuid() } != uid {
-            return Err("host_install_profile_required".into());
-        }
+        #[cfg(unix)]
+        let uid = {
+            let uid = unsafe { libc::geteuid() };
+            let minimum_uid = if cfg!(target_os = "linux") { 1 } else { 501 };
+            if uid < minimum_uid || unsafe { libc::getuid() } != uid {
+                return Err("host_install_profile_required".into());
+            }
+            uid
+        };
+        #[cfg(windows)]
+        let uid = crate::windows_protection::process_user_sid()?;
+        #[cfg(unix)]
         let profile = layout.profiles.join(uid.to_string());
+        #[cfg(unix)]
         let state = profile.join("state");
+        #[cfg(unix)]
         let data = profile.join("manager");
+        #[cfg(windows)]
+        let (state, data) = crate::windows_host_profile::paths()?;
+        // Downstream shared setup helpers may create missing leaves; keep both existing objects pinned.
+        #[cfg(windows)]
+        let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];
         require_leaf(&state)?;
         require_leaf(&data)?;
         let package: serde_json::Value =
@@ -515,6 +552,65 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn pinned_profile_leaf_cannot_disappear_during_shared_startup_helpers() {
+        let root =
+            std::env::temp_dir().join(format!("frameleaf-setup-pin-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let pin = pin_profile_leaf(&root).unwrap();
+        assert!(std::fs::remove_dir(&root).is_err());
+        assert!(std::fs::rename(&root, root.with_extension("moved")).is_err());
+        require_leaf(&root).unwrap();
+        crate::runtime_store::private_directory(&root).unwrap();
+        drop(pin);
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[tokio::test]
+    async fn uninstalled_identity_never_starts_a_manager_or_reads_credentials() {
+        let setup = HostSetup::default();
+        assert_eq!(
+            setup.start("../escape".into()).await.err().unwrap(),
+            "host_install_identity_invalid"
+        );
+        assert!(setup.owner.lock().await.is_none());
+        assert!(!setup.background_active());
+        assert_eq!(setup.snapshot().state, "idle");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_setup_never_creates_missing_or_adopts_inherited_profile_leaves() {
+        let root = std::env::temp_dir().join(format!("frameleaf-setup-{}", uuid::Uuid::new_v4()));
+        assert_eq!(
+            require_leaf(&root).unwrap_err(),
+            "host_install_windows_profile_required"
+        );
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("retained"), b"synthetic only").unwrap();
+        assert!(require_leaf(&root).is_err());
+        assert_eq!(
+            std::fs::read(root.join("retained")).unwrap(),
+            b"synthetic only"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        crate::runtime_store::private_directory(&root).unwrap();
+        require_leaf(&root).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn profile_setup_capability_survives_lifecycle_transitions() {
+        let setup = HostSetup::default();
+        for state in ["idle", "provisioning", "profile-ready", "needs-attention"] {
+            setup.set(state, None, None);
+            let view = serde_json::to_value(setup.snapshot()).unwrap();
+            assert_eq!(
+                view["profileSetupAvailable"],
+                cfg!(any(target_os = "linux", windows))
+            );
+            assert_eq!(view["state"], state);
+        }
+    }
     #[tokio::test]
     async fn local_photos_requires_an_owned_manager_before_reading_credentials() {
         assert_eq!(

@@ -1,6 +1,32 @@
 use std::process::Command;
 
 #[test]
+fn windows_package_finalization_is_a_bounded_platform_scoped_command() {
+    for args in [vec![], vec!["invalid", "invalid"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"))
+            .arg("--finalize-windows-package")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if args.is_empty() {
+            assert_eq!(receipt["code"], "host_control_arguments_invalid");
+        } else if cfg!(windows) {
+            assert!([
+                "host_install_administrator_required",
+                "host_install_identity_invalid"
+            ]
+            .iter()
+            .any(|code| receipt["code"] == *code));
+        } else {
+            assert_eq!(receipt["code"], "host_install_platform_unsupported");
+        }
+    }
+}
+
+#[test]
 fn windows_package_preparation_requires_its_bounded_dedicated_command() {
     for ids in [vec![], vec!["invalid"], vec!["invalid", "invalid"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_frameleaf-native-host"))
