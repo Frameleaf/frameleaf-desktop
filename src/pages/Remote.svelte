@@ -117,7 +117,7 @@
                 {@const status = statusFor(entry)}
                 <tr>
                   <td><b>{entry.label}</b><small>{detailFor(entry)}</small></td>
-                  <td><span class="mono">{entry.uri}</span></td>
+                  <td><span class="url">{entry.uri}</span></td>
                   <td><span class="pill {status.tone}"><i aria-hidden="true"></i>{status.label}</span></td>
                   <td class="right">
                     {#if entry.kind === 'custom' && remote?.customHostnameStatus !== 'verified' && remote?.customHostnameRecords?.length}
@@ -185,7 +185,7 @@
     <p>Add these records at your DNS provider. Frameleaf Cloud checks them every few minutes.{remote.customHostnameProblem ? ` ${remote.customHostnameProblem}` : ''}</p>
     <div class="list">
       {#each remote.customHostnameRecords as record (record.name)}
-        <div class="row"><span class="l"><b>{record.type} <span class="mono">{record.name}</span></b><small><span class="mono">{record.value}</span> · {record.purpose}</small></span><button class="btn quiet" type="button" onclick={() => copy(record.value)}><Icon name="copy" />Copy</button></div>
+        <div class="row"><span class="l"><b>{record.type} <span class="url">{record.name}</span></b><small><span class="url">{record.value}</span> · {record.purpose}</small></span><button class="btn quiet" type="button" onclick={() => copy(record.value)}><Icon name="copy" />Copy</button></div>
       {/each}
     </div>
     {#snippet actions()}<button class="btn" type="button" onclick={() => { dnsOpen = false; }}>Done</button>{/snippet}
