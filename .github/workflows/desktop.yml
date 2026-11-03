@@ -95,6 +95,11 @@ jobs:
           if ($fixtures.Count -ne 2) { throw 'Windows package qualification fixtures are missing' }
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
           if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
+      - name: Qualify per-user Windows profile preparation in disposable runner
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        env:
+          FRAMELEAF_TEST_DISPOSABLE_HOST_PROFILE: '1'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --exact --ignored
       - name: Check Windows real restore test is compiled
         if: runner.os == 'Windows'
         shell: pwsh
