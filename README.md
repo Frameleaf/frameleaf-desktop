@@ -492,6 +492,18 @@ space for relocation. This does not qualify the complete server, RAW/Studio,
 Windows/Linux dependency closure, release signing or installed-device acceptance.
 
 
+### Native geodata component
+
+`python tools/build_host_geodata.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --output /absolute/path/to/new-output`
+stages the selected server's pinned reverse-geocoding inputs for native hosts.
+It reads the snapshot date and attributed checksum lock from Git objects, checks
+the complete input contract before downloading, and verifies each file from the
+Frameleaf mirror or its pinned capture. It safely expands the single city-data
+file and preserves the original lock and data date. The receipt inventories the
+eight staged files; temporary and failed payloads are removed. This qualifies
+source-bound data staging, with `runtimeQualified` and `redistributable` false;
+server import and complete-host acceptance remain separate.
+
 ### Production server package
 
 `python3 tools/build_host_server.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --node /absolute/path/to/private-node --output /absolute/path/to/new-output`
