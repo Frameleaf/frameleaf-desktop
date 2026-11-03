@@ -704,20 +704,25 @@ impl NativeManager {
     fn cleanup_windows(&mut self, timeout: Duration) -> Result<(), String> {
         #[cfg(test)]
         windows_tests::cleanup_barrier();
-        self.tree.terminate_confirmed(timeout).map_err(|error| {
-            #[cfg(test)]
-            eprintln!("manager_cleanup_stage=job error={error}");
-            let _ = error;
-            "native_manager_shutdown_unconfirmed"
-        })?;
-        match self.child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            state => {
-                #[cfg(test)]
-                eprintln!("manager_cleanup_stage=leader_after_empty_job state={state:?}");
-                let _ = state;
-                Err("native_manager_shutdown_unconfirmed".into())
+        let deadline = Instant::now() + timeout;
+        self.tree
+            .terminate_confirmed(timeout)
+            .map_err(|_| "native_manager_shutdown_unconfirmed")?;
+        // An empty job can precede its leader's process handle becoming signaled.
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|_| "native_manager_shutdown_unconfirmed")?
+                .is_some()
+            {
+                return Ok(());
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("native_manager_shutdown_unconfirmed".into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
         }
     }
 }

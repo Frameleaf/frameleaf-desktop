@@ -74,6 +74,19 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: '26.11.1'
+      - name: Initialize hosted Windows cloud-files inspection
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        shell: pwsh
+        run: |
+          sc.exe query CldFlt
+          fltmc.exe filters
+          fltmc.exe instances
+          Start-Service CldFlt -ErrorAction Continue
+          $volumes = @($env:SystemDrive, (Split-Path -Qualifier $env:RUNNER_TEMP)) | Sort-Object -Unique
+          foreach ($volume in $volumes) { fltmc.exe attach CldFlt $volume }
+          fltmc.exe instances
+          # Diagnostics cannot grant storage admission; the real profile tests below still enforce it.
+          $global:LASTEXITCODE = 0
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Qualify Windows controller dependencies without ambient runtime paths
         if: runner.os == 'Windows'
