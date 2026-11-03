@@ -644,6 +644,14 @@ startup. These are macOS component checks. Full RAW format/recipe conformance,
 complete signed host assembly, installed Windows/Linux support, minimum OS and
 redistribution qualification remain pending.
 
+Windows RAW binding also accepts the qualified private-metadata server component.
+`tools/bind_host_raw.py` verifies the preserved original server receipt, the fixed
+original and adapted ExifTool module hashes, the sole module change, and all six
+metadata qualification checks before combining the server and RAW inventories.
+It preserves the original receipts and records their hashes in the new binding.
+This enables assembly; actual current-host RAW/metadata execution and installed
+acceptance remain separate checks.
+
 ### Native Studio worker draft
 
 `tools/build_host_studio.py` is a source-pinned authoring recipe. It snapshots a
