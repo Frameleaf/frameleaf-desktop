@@ -10,9 +10,6 @@ inputs:
   tenant-id:
     required: true
     description: Azure tenant ID
-  subscription-id:
-    required: true
-    description: Azure subscription ID
   endpoint:
     required: true
     description: Regional Artifact Signing endpoint
@@ -33,14 +30,13 @@ runs:
       env:
         AZURE_CLIENT_ID: ${{ inputs.client-id }}
         AZURE_TENANT_ID: ${{ inputs.tenant-id }}
-        AZURE_SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
         AZURE_SIGNING_ENDPOINT: ${{ inputs.endpoint }}
         AZURE_SIGNING_ACCOUNT: ${{ inputs.account }}
         AZURE_SIGNING_PROFILE: ${{ inputs.profile }}
         WINDOWS_SIGNING_SUBJECT: ${{ inputs.subject }}
       run: |
         if ($env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REF -ne 'refs/heads/main') { throw 'Signing requires Windows on main' }
-        foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID', 'AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_SIGNING_PROFILE', 'WINDOWS_SIGNING_SUBJECT') {
+        foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_SIGNING_PROFILE', 'WINDOWS_SIGNING_SUBJECT') {
           $value = [Environment]::GetEnvironmentVariable($name)
           if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains("`n") -or $value.Contains("`r")) { throw "Missing or invalid $name" }
           "$name=$value" >> $env:GITHUB_ENV
@@ -50,7 +46,7 @@ runs:
       with:
         client-id: ${{ inputs.client-id }}
         tenant-id: ${{ inputs.tenant-id }}
-        subscription-id: ${{ inputs.subscription-id }}
+        allow-no-subscriptions: true
     - name: Configure the Tauri signing command
       shell: pwsh
       env:

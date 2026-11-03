@@ -134,7 +134,6 @@ jobs:
           config: candidate-config.json
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           profile: ${{ vars.AZURE_SIGNING_PROFILE }}

@@ -151,7 +151,6 @@ environment after provisioning and validation:
 | --- | --- |
 | `AZURE_CLIENT_ID` | Dedicated Entra application's client ID |
 | `AZURE_TENANT_ID` | Directory ID (`e15b1052-f1b2-4c39-a3bb-f892f80d25c7`) |
-| `AZURE_SUBSCRIPTION_ID` | Signing subscription (`01c08b4d-6e09-4799-a468-bdfe59280ff2`) |
 | `AZURE_SIGNING_ENDPOINT` | Account's regional endpoint; East US: `https://eus.codesigning.azure.net/` |
 | `AZURE_SIGNING_ACCOUNT` | Provisioned signing account name |
 | `AZURE_SIGNING_PROFILE` | Validated Public Trust certificate profile name |
