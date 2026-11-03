@@ -113,7 +113,7 @@ class WindowsComponentSetTests(unittest.TestCase):
     def test_fixed_set_is_staged_with_original_receipts_and_explicit_unsigned_limits(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve(); fixture, approvals = self.prepare(root)
-            originals = {str(f.relative_to(fixture)): f.read_bytes() for f in fixture.rglob('*.json')}
+            originals = {f.relative_to(fixture).as_posix(): f.read_bytes() for f in fixture.rglob('*.json')}
             self.run_set(root, fixture, approvals)
             result = json.loads((root / 'result/qualification.json').read_text())
             self.assertEqual(result['qualification'], 'passed')
@@ -124,7 +124,7 @@ class WindowsComponentSetTests(unittest.TestCase):
             self.assertTrue(result['requiresCurrentWindowsConsumers'])
             self.assertEqual((root / 'result/inputs/assets/expanded/web/www/café-原本').read_bytes(), b'web')
             self.assertTrue((root / 'result/bound-server-raw/qualification.json').is_file())
-            self.assertEqual({str(f.relative_to(fixture)): f.read_bytes() for f in fixture.rglob('*.json')}, originals)
+            self.assertEqual({f.relative_to(fixture).as_posix(): f.read_bytes() for f in fixture.rglob('*.json')}, originals)
             for name, original in originals.items():
                 role, path = name.split('/', 1)
                 component = 'assets' if role in {'web', 'plugin', 'studio'} else role
