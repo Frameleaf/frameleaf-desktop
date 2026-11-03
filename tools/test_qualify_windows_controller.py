@@ -14,12 +14,16 @@ class ControllerQualificationTests(unittest.TestCase):
     def test_system_only_controller_reaches_its_bounded_entrypoint_without_ambient_paths(self):
         self.exercise('KERNEL32.dll\n api-ms-win-core-synch-l1-2-0.dll')
 
-    def exercise(self, imports='kernel32.dll', probe=None, failure=None):
+    def test_windows_runtime_and_cloud_api_dependencies_use_regular_system_files(self):
+        self.exercise('COMBASE.dll\nCldApi.dll', system_dlls=('combase.dll', 'cldapi.dll'))
+
+    def exercise(self, imports='kernel32.dll', probe=None, failure=None, system_dlls=('kernel32.dll',)):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             system = root / 'Windows/System32'
             system.mkdir(parents=True)
-            (system / 'kernel32.dll').write_bytes(b'OS fixture')
+            for name in system_dlls:
+                (system / name).write_bytes(b'OS fixture')
             binary = root / 'frameleaf-native-host.exe'
             image = bytearray(pe())
             image[86:88] = (0x22).to_bytes(2, 'little')
@@ -49,7 +53,7 @@ class ControllerQualificationTests(unittest.TestCase):
                 self.assertEqual(command.kwargs['timeout'], 30)
 
     def test_private_unknown_and_missing_os_dlls_refuse_even_when_adjacent(self):
-        for name in ['vcruntime140.dll', 'msvcp140.dll', 'unknown.dll', 'user32.dll']:
+        for name in ['vcruntime140.dll', 'msvcp140.dll', 'unknown.dll', 'user32.dll', 'combase.dll', 'cldapi.dll']:
             self.exercise(name, failure='controller_dependency_')
         self.exercise('', failure='controller_imports_missing')
 
