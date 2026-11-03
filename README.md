@@ -815,6 +815,37 @@ A passed receipt proves byte staging only: actual Windows/Studio execution,
 sandboxing, complete-host assembly, signing, installed acceptance and redistribution
 qualification remain separate. No Windows executable is launched by this command.
 
+### Fixed Windows component staging
+
+On Windows x64, `python tools/obtain_windows_host_components.py --source <absolute-app-repo> --approvals <absolute-reviewed-policy.json> --output <new-absolute-output>`
+obtains the nine required producer artifacts serially: `assets`, `server`,
+`manager`, `database`, `raw`, `media`, `hdr`, `backup` and `ml`. Each policy value
+uses the exact `artifactId`, `runId`, `runAttempt`, `headSha`, `workflow` and
+`archiveSha256` record accepted by `obtain_host_component.py`; each role has a
+fixed workflow and duplicate artifact IDs are refused before downloading.
+The command requires GitHub CLI read access to this repository's Actions artifacts.
+The source checkout must contain application commit
+`9118a01fdfb8a8cd20be24290660679b3a7c4de3`. Canonical source archive and build-node
+hashes are pinned to that reviewed snapshot; another snapshot requires a reviewed
+recipe update.
+
+The command reuses authenticated acquisition and strict nested archive extraction,
+checks complete component inventories, current source/build locks, original native
+source contracts and the metadata/RAW binding. Restic retains its independent
+source and component contract. Original receipts remain unchanged under `inputs/`;
+`bound-server-raw/` contains the verified binding for later assembly. The separate
+staging receipt records producer and original receipt hashes. Existing output is
+refused; failures remove only the newly owned output. The caller must exclusively
+own both the source and output during the operation.
+
+No component executable is launched. The ML payload inventory and target are
+checked, but its signature must still pass the standard runtime verifier before
+use. The command does not create a complete host: pinned Node/browser/geodata
+staging, current Windows database, RAW, metadata, plugin, HDR and Studio consumers,
+`build_host_bundle.assemble`, signing and installed-platform acceptance remain
+required. Its receipt keeps `mlSignatureVerified`, `runtimeQualified` and
+`redistributable` false.
+
 ### Complete host inventory authoring
 
 `tools/build_host_bundle.py` combines the staged private host components with an
