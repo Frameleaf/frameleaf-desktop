@@ -91,6 +91,8 @@ class WindowsHostAssemblyTests(unittest.TestCase):
                 return json.dumps({'qualification':'passed','formats':['mp4-h264'],'softwareRenderer':True})
             name = Path(args[1]).name
             if failure == name: raise BuildError('synthetic consumer refusal')
+            if failure == 'payload-change' and name == 'qualify_host_raw.mjs':
+                (Path(args[2])/'server/dist/main.js').write_bytes(b'unexpected mutation')
             result = {'qualification':'passed','sourceRevision':'9118a01fdfb8a8cd20be24290660679b3a7c4de3'}
             if name == 'qualify_host_exiftool.mjs':
                 result['componentReceiptSha256'] = sha256(Path(args[2])/'qualification.json')
@@ -145,7 +147,7 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             self.assertTrue(any('--test' in c and c[-1].endswith('server/test/native/image-hdr.test.mjs') for c in commands))
 
     def test_consumer_and_signature_refusals_remove_all_executable_candidates_and_private_work(self):
-        for failure in ['qualify_host_raw.mjs','qualify_host_exiftool.mjs','qualify_host_plugin.mjs','hdr','studio','assembly']:
+        for failure in ['qualify_host_raw.mjs','qualify_host_exiftool.mjs','qualify_host_plugin.mjs','hdr','studio','assembly','payload-change']:
             with self.subTest(failure=failure),tempfile.TemporaryDirectory() as td:
                 root=Path(td).resolve();self.source(root)
                 with self.assertRaises(BuildError): self.run_fixture(root,failure)
@@ -162,3 +164,43 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             shutil.rmtree(root/'output')
             with self.assertRaises(BuildError): build(root/'source',{},root/'output',True)
             self.assertFalse((root/'output').exists())
+
+    def test_failed_receipt_publication_removes_candidate_and_partial_receipt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();self.source(root)
+            real_replace=Path.replace
+            def replace(path,destination):
+                if path == root/'output/qualification.json.part': raise OSError('synthetic receipt publication failure')
+                return real_replace(path,destination)
+            with patch('pathlib.Path.replace',replace), self.assertRaisesRegex(OSError,'synthetic receipt publication failure'):
+                self.run_fixture(root)
+            self.assertFalse((root/'output/candidate').exists())
+            self.assertFalse((root/'output/work').exists())
+            self.assertFalse((root/'output/qualification.json.part').exists())
+            self.assertEqual(json.loads((root/'output/qualification.json').read_text())['qualification'],'failed')
+
+    def test_private_work_cleanup_failure_still_removes_candidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();self.source(root)
+            real_rmtree=shutil.rmtree
+            def remove(path,*args,**kwargs):
+                if Path(path) == root/'output/work': raise OSError('synthetic scratch removal failure')
+                return real_rmtree(path,*args,**kwargs)
+            with patch('shutil.rmtree',side_effect=remove), self.assertRaisesRegex(OSError,'synthetic scratch removal failure'):
+                self.run_fixture(root)
+            self.assertFalse((root/'output/candidate').exists())
+            self.assertEqual(json.loads((root/'output/qualification.json').read_text())['qualification'],'failed')
+
+    def test_workflow_is_manual_serial_and_cannot_publish(self):
+        workflow=(Path(__file__).parents[1]/'.github/workflows/windows-host-assembly.yml').read_text()
+        self.assertIn('  workflow_dispatch:',workflow)
+        self.assertNotIn('pull_request:',workflow)
+        self.assertNotIn('  push:',workflow)
+        self.assertIn("github.ref == 'refs/heads/main'",workflow)
+        self.assertIn('  actions: read',workflow)
+        self.assertIn('  contents: read',workflow)
+        self.assertIn('    timeout-minutes: 90',workflow)
+        self.assertNotIn('matrix:',workflow)
+        self.assertNotIn('id-token:',workflow)
+        self.assertNotIn('contents: write',workflow)
+        self.assertEqual(workflow.count('python tools/build_windows_host.py'),1)

@@ -846,6 +846,36 @@ staging, current Windows database, RAW, metadata, plugin, HDR and Studio consume
 required. Its receipt keeps `mlSignatureVerified`, `runtimeQualified` and
 `redistributable` false.
 
+### Windows complete host authoring
+
+`python tools/build_windows_host.py --source <absolute-app-repo> --approvals <absolute-reviewed-policy.json> --output <new-absolute-output> --epoch <candidate-epoch>`
+runs on Windows x64. It obtains the fixed component set, stages the pinned private
+Node/browser and geodata, preserves component licenses and original receipts, then
+runs the current database lifecycle/restore, FFmpeg, RAW, metadata, plugin, HDR and
+sandboxed Studio conformance consumers serially. Consumer processes receive the
+private host environment without the GitHub download token. A derived authoring
+receipt binds the staged inputs; original producer receipts are retained separately.
+The command refuses a changed payload after consumers, then calls the existing
+assembler, including its standard nested ML signature verification before and after
+copying. Windows may omit a separate `libraries/` directory because native libraries
+are retained in their component trees; a provided directory still passes normal
+inventory checks.
+
+Successful output contains `candidate/` and separate `evidence/` and qualification
+records. Private fixtures and acquired staging trees are removed before success.
+Failure removes the executable candidate and attempts private-work cleanup; a
+cleanup failure remains a refusal and may need manual recovery. The caller must
+exclusively own the new output and source throughout. The manual, main-only
+`Windows complete host assembly` workflow uses read-only GitHub permissions, a
+single bounded Windows job and explicitly supplied approval records. It archives
+only the unsigned candidate and retains evidence separately. It does not fan out
+component builds, sign, publish or deploy anything.
+
+These component consumers are synthetic authoring checks. A successful candidate
+still keeps runtime, installed-platform, full-media and redistribution qualification
+false. Database certification, installed lifecycle/retained-data tests, full ML and
+hardware/provider acceptance, signing and publication remain separate gates.
+
 ### Complete host inventory authoring
 
 `tools/build_host_bundle.py` combines the staged private host components with an
