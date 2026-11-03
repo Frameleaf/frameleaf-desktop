@@ -143,6 +143,9 @@ class RawBindingTests(unittest.TestCase):
             receipt['sourceRevision'] = 'f' * 40
             (server / 'server-qualification.json').write_text(json.dumps(receipt))
         (server / 'qualification.json').write_text(json.dumps(adapted))
+        metadata['componentReceiptSha256'] = hashlib.sha256((server / 'qualification.json').read_bytes()).hexdigest()
+        if problem == 'missing-binding':
+            del metadata['componentReceiptSha256']
         (server / 'metadata-qualification.json').write_bytes(b'\xef\xbb\xbf' + json.dumps(metadata).encode())
         raw = root / 'raw/qualification.json'
         record = json.loads(raw.read_text()); record['platform'] = 'Windows-AMD64'; raw.write_text(json.dumps(record))
@@ -169,7 +172,7 @@ class RawBindingTests(unittest.TestCase):
             self.assertEqual({p: p.read_bytes() for p in originals}, originals)
 
     def test_windows_metadata_binding_refuses_changed_chain_or_payload(self):
-        for problem in ['extra-change', 'original-hash', 'adapted-hash', 'source', 'flag', 'vendor', 'payload', 'original-source', 'forged-adaptation']:
+        for problem in ['extra-change', 'original-hash', 'adapted-hash', 'source', 'flag', 'vendor', 'payload', 'original-source', 'forged-adaptation', 'missing-binding']:
             with self.subTest(problem=problem), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 blobs, original_sha = self.metadata_inputs(root, problem)
@@ -181,3 +184,24 @@ class RawBindingTests(unittest.TestCase):
                     expected = 'inventory_mismatch' if problem == 'payload' else 'metadata_invalid'
                     with self.assertRaisesRegex(BuildError, expected):
                         build(root, root / 'server', root / 'raw', root / 'output')
+
+    def test_metadata_result_from_different_same_source_component_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            blobs, original_sha = self.metadata_inputs(root)
+            server = root / 'server'
+            (server / 'server/fixture').write_text('different same-source server inventory')
+            original = json.loads((server / 'server-qualification.json').read_text())
+            original['files']['fixture'] = inventory(server / 'server')['fixture']
+            (server / 'server-qualification.json').write_text(json.dumps(original))
+            adapted = json.loads((server / 'qualification.json').read_text())
+            adapted['files']['server'] = inventory(server / 'server')
+            (server / 'qualification.json').write_text(json.dumps(adapted))
+            with patch('bind_host_raw.platform.system', return_value='Windows'), \
+                    patch('bind_host_raw.platform.machine', return_value='AMD64'), \
+                    patch('bind_host_raw.git_blob', side_effect=lambda git, source, revision, name, env: blobs[name]), \
+                    patch('bind_host_raw.VENDOR_MODULE_SHA256', original_sha), \
+                    patch('bind_host_raw.ADAPTED_MODULE_SHA256', hashlib.sha256(b'private runtime adaptation').hexdigest()):
+                with self.assertRaisesRegex(BuildError, 'metadata_invalid'):
+                    build(root, server, root / 'raw', root / 'output')
+            self.assertFalse((root / 'output').exists())

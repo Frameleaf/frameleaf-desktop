@@ -57,6 +57,7 @@ def build(source: Path, server: Path, raw: Path, output: Path) -> None:
                         or adapted[module]["sha256"] != ADAPTED_MODULE_SHA256
                         or receipt.get("adaptedModuleSha256") != ADAPTED_MODULE_SHA256
                         or metadata.get("qualification") != "passed"
+                        or metadata.get("componentReceiptSha256") != sha256(root / "qualification.json")
                         or metadata.get("sourceRevision") != receipt["sourceRevision"]
                         or any(record.get("vendorVersion") != "39.0.1"
                                or record.get("executableVendorVersion") != "13.59.3"

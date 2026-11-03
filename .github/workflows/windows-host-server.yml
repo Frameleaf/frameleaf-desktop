@@ -74,6 +74,7 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import hashlib
           import json
           import os
           import shutil
@@ -81,8 +82,9 @@ jobs:
           temporary = Path(os.environ['RUNNER_TEMP'])
           metadata = temporary / 'fl-windows-metadata'
           receipt = json.loads((metadata / 'metadata-qualification.json').read_text(encoding='utf-8-sig'))
-          if receipt.get('qualification') != 'passed':
-              raise SystemExit('Metadata qualification is missing')
+          if (receipt.get('qualification') != 'passed'
+              or receipt.get('componentReceiptSha256') != hashlib.sha256((metadata / 'qualification.json').read_bytes()).hexdigest()):
+              raise SystemExit('Metadata qualification must bind the selected component')
           shutil.copy2(temporary / 'fl-windows-server/qualification.json', metadata / 'server-qualification.json')
           with tarfile.open(temporary / 'windows-server-candidate.tar.gz', 'w:gz') as archive:
               archive.add(metadata, arcname='server-candidate')
