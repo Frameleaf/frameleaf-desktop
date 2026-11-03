@@ -154,6 +154,18 @@ jobs:
           node-version: 22
       - name: Qualify host state, checkpoint and restore paths with spaces and Unicode
         run: node --test tools/test_host_agent.mjs tools/test_host_database.mjs tools/test_host_checkpoint.mjs tools/test_host_restore_input.mjs tools/test_host_server_owner.mjs
+      - name: Inspect and initialize the hosted Windows cloud-files filter
+        shell: pwsh
+        run: |
+          sc.exe query CldFlt
+          fltmc.exe filters
+          fltmc.exe instances
+          Start-Service CldFlt -ErrorAction Continue
+          $volumes = @($env:SystemDrive, (Split-Path -Qualifier $env:RUNNER_TEMP)) | Sort-Object -Unique
+          foreach ($volume in $volumes) { fltmc.exe attach CldFlt $volume }
+          fltmc.exe instances
+          # Diagnostics cannot grant storage admission; the real profile tests below still enforce it.
+          $global:LASTEXITCODE = 0
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - name: Qualify private directory admission and long physical paths

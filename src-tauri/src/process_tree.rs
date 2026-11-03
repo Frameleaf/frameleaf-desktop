@@ -57,6 +57,11 @@ impl ProcessTree {
                 )
             } == 0
             {
+                #[cfg(test)]
+                eprintln!(
+                    "job_cleanup_stage=query error={}",
+                    std::io::Error::last_os_error()
+                );
                 return Err("runtime_process_shutdown_unconfirmed".to_string());
             }
             Ok(info.ActiveProcesses == 0)
@@ -65,6 +70,11 @@ impl ProcessTree {
             return Ok(());
         }
         if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
+            #[cfg(test)]
+            eprintln!(
+                "job_cleanup_stage=terminate error={}",
+                std::io::Error::last_os_error()
+            );
             return Err("runtime_process_shutdown_unconfirmed".into());
         }
         loop {
@@ -72,6 +82,8 @@ impl ProcessTree {
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                #[cfg(test)]
+                eprintln!("job_cleanup_stage=nonempty_timeout");
                 return Err("runtime_process_shutdown_unconfirmed".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));

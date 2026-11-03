@@ -139,7 +139,19 @@ mod tests {
             .env("APPDATA", r"Z:\untrusted")
             .env("USERPROFILE", r"Z:\untrusted")
             .current_dir(std::env::temp_dir()).output().unwrap();
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "locator child status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(8192)
+                .collect::<String>(),
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(8192)
+                .collect::<String>()
+        );
         assert!(String::from_utf8_lossy(&output.stdout)
             .contains(&format!("profile-location={}", base.display())));
     }
