@@ -36,9 +36,11 @@ jobs:
           from bind_host_raw import read_receipt
           from build_host_bundle import host_entries
           from build_host_database_windows import qualify
+          from build_host_ffmpeg import unpack
           from build_host_server import stage_server
           from build_runtime import build_environment, inventory, run
           from obtain_host_component import obtain
+          from obtain_windows_host_components import checked_receipt
           approved = {
               'artifactId': 13117939175, 'runId': 41390851323, 'runAttempt': 1,
               'headSha': '7338f418bb10f39aec33a6eabf968eb8ea47e2ee',
@@ -77,7 +79,7 @@ jobs:
               fixtures = work / 'fixtures'
               fixtures.mkdir()
               report['checks'] = qualify(relocated, fixtures, lock, env)
-              # Compare the successful minimal environment with the production host environment.
+              # Match build_windows_host's merged environment, not installed-host acceptance.
               report['phase'] = 'host-environment-restore-restart-checksums'
               print(report['phase'], flush=True)
               module = (Path.cwd() / 'runtime/host-agent.mjs').as_uri()
@@ -89,6 +91,27 @@ jobs:
               host_fixtures = work / 'host-fixtures'
               host_fixtures.mkdir()
               report['hostEnvironmentChecks'] = qualify(relocated, host_fixtures, lock, env)
+              report['phase'] = 'database-with-raw-path'
+              print(report['phase'], flush=True)
+              raw_approved = {
+                  'artifactId': 13162233776, 'runId': 41481808035, 'runAttempt': 2,
+                  'headSha': 'f779bb454777231b2be371d13841571bbca30e00',
+                  'workflow': '.github/workflows/windows-host-raw.yml',
+                  'archiveSha256': '68bfae045c6be99739da82a53ce76d13db8ae855cb9c47c53e4503d7324255a9',
+              }
+              obtain(raw_approved, work / 'raw-input')
+              expanded = work / 'raw-expanded'
+              expanded.mkdir()
+              unpack(work / 'raw-input/component/windows-raw-component.tar.gz', expanded)
+              raw = expanded / 'raw-candidate'
+              raw_receipt = checked_receipt(raw, 'raw', 'Windows-AMD64')
+              stage_server(raw / 'raw', host / 'raw')
+              if inventory(host / 'raw') != raw_receipt['files']:
+                  raise RuntimeError('Relocated RAW inventory mismatch')
+              raw_fixtures = work / 'raw-path-fixtures'
+              raw_fixtures.mkdir()
+              report['rawPathChecks'] = qualify(relocated, raw_fixtures, lock, env)
+              report['rawApproved'] = raw_approved
               if inventory(relocated) != receipt['files']:
                   raise RuntimeError('Database payload changed during qualification')
               report['qualification'] = 'passed'
