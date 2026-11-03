@@ -252,7 +252,7 @@ def assemble(
         directories.append("perl")
     for name in directories:
         source = host / name
-        if name == "licenses":
+        if name == "licenses" or (name == "libraries" and platform.system() == "Windows"):
             try:
                 source.lstat()
             except FileNotFoundError:
