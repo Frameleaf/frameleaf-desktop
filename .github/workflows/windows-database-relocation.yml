@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
       - name: Verify the approved archive and qualify its relocated database
         shell: python
         env:
@@ -38,7 +41,8 @@ jobs:
           from build_host_database_windows import qualify
           from build_host_ffmpeg import unpack
           from build_host_server import stage_server
-          from build_runtime import build_environment, inventory, run
+          from build_host_windows_support import NODE_EXE_SHA
+          from build_runtime import build_environment, inventory, run, sha256
           from obtain_host_component import obtain
           from obtain_windows_host_components import checked_receipt
           approved = {
@@ -83,11 +87,16 @@ jobs:
               report['phase'] = 'host-environment-restore-restart-checksums'
               print(report['phase'], flush=True)
               module = (Path.cwd() / 'runtime/host-agent.mjs').as_uri()
+              node = Path(shutil.which('node'))
+              if sha256(node) != NODE_EXE_SHA:
+                  raise RuntimeError('Host Node executable digest mismatch')
               script = ('import {hostEnvironment} from ' + json.dumps(module) + ';'
                         'console.log(JSON.stringify(hostEnvironment({runtime:process.argv[1],'
                         'state:process.argv[2],entryPoints:JSON.parse(process.argv[3])})));')
-              env.update(json.loads(run([shutil.which('node'), '--input-type=module', '--eval',
+              env.update(json.loads(run([node, '--input-type=module', '--eval',
                                          script, host, work, json.dumps(host_entries())], cwd=work, env=env)))
+              env['FRAMELEAF_HDR_BINDING'] = str(host / 'media/image-hdr.node')
+              env['OMP_THREAD_LIMIT'] = '1'
               host_fixtures = work / 'host-fixtures'
               host_fixtures.mkdir()
               report['hostEnvironmentChecks'] = qualify(relocated, host_fixtures, lock, env)
@@ -129,12 +138,25 @@ jobs:
               raise
           finally:
               try:
-                  shutil.rmtree(work)
+                  for folder in ['fixtures', 'host-fixtures', 'raw-path-fixtures']:
+                      for name in ['pg-ctl-start.log', 'postgres.log']:
+                          path = work / folder / name
+                          if path.is_file():
+                              with path.open('rb') as log:
+                                  log.seek(0, os.SEEK_END)
+                                  log.seek(max(0, log.tell() - 32768))
+                                  (root / (folder + '-' + name)).write_bytes(log.read(32768))
               except BaseException:
                   report['qualification'] = 'failed'
                   raise
               finally:
-                  (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
+                  try:
+                      shutil.rmtree(work)
+                  except BaseException:
+                      report['qualification'] = 'failed'
+                      raise
+                  finally:
+                      (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
       - name: Retain bounded evidence without database binaries or private fixtures
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -144,5 +166,7 @@ jobs:
             ${{ runner.temp }}/database-relocation/qualification.json
             ${{ runner.temp }}/database-relocation/command-error.log
             ${{ runner.temp }}/database-relocation/loader.log
+            ${{ runner.temp }}/database-relocation/*-pg-ctl-start.log
+            ${{ runner.temp }}/database-relocation/*-postgres.log
           retention-days: 7
           if-no-files-found: ignore

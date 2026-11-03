@@ -142,8 +142,8 @@ console.log(JSON.stringify(hostEnvironment({{runtime:process.argv[1],state:proce
         # Native policy belongs to this desktop recipe; --source selects the application Dockerfile.
         database = read_receipt(ROOT/'runtime/host-database.json')
         report['databaseCertified'] = database['certified']
-        report['consumers']['database'] = {'qualification':'passed','checks':qualify_database(host/'pg',consumers/'database',database,env)}
         env['FRAMELEAF_BUILD_ERROR_LOG'] = str(evidence/'native-consumer-error.log')
+        report['consumers']['database'] = {'qualification':'passed','checks':qualify_database(host/'pg',consumers/'database',database,env)}
         report['consumers']['media'] = qualify_media(host/'media-tools/ffmpeg.exe',host/'media-tools/ffprobe.exe',consumers/'media',env)
         for role, script, extra in [('raw','qualify_host_raw.mjs',[roots['raw']]),
                                     ('metadata','qualify_host_exiftool.mjs',[]),

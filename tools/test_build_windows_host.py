@@ -70,6 +70,12 @@ class WindowsHostAssemblyTests(unittest.TestCase):
 
     def run_fixture(self, root, failure=None):
         commands = []
+        def database(prefix, output, lock, env):
+            if failure == 'database':
+                log = Path(env.get('FRAMELEAF_BUILD_ERROR_LOG', str(Path(env['HOME']).parent / 'command-error.log')))
+                log.write_text('synthetic database loader failure', encoding='utf-8')
+                raise BuildError('synthetic database refusal')
+            return {'physicalChecksumsVerified':True}
         def command(args, *, cwd, env):
             commands.append([str(x) for x in args])
             self.assertNotIn('GH_TOKEN', env)
@@ -120,7 +126,7 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             stack.enter_context(patch('build_windows_host.obtain_components', side_effect=self.stage))
             stack.enter_context(patch('build_windows_host.build_support', side_effect=self.support))
             stack.enter_context(patch('build_windows_host.build_geodata', side_effect=self.geodata))
-            stack.enter_context(patch('build_windows_host.qualify_database', return_value={'physicalChecksumsVerified':True}))
+            stack.enter_context(patch('build_windows_host.qualify_database', side_effect=database))
             stack.enter_context(patch('build_windows_host.qualify_media', return_value={'qualification':'passed'}))
             stack.enter_context(patch('build_windows_host.verify_source_archive'))
             stack.enter_context(patch('build_windows_host.run', side_effect=command))
@@ -167,6 +173,19 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             shutil.rmtree(root/'output')
             with self.assertRaises(BuildError): build(root/'source',{},root/'output',True)
             self.assertFalse((root/'output').exists())
+
+    def test_database_failure_keeps_diagnostics_after_private_work_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();self.source(root)
+            with self.assertRaisesRegex(BuildError, 'synthetic database refusal'):
+                self.run_fixture(root,'database')
+            log=root/'output/evidence/native-consumer-error.log'
+            self.assertTrue(log.is_file(), 'Database diagnostics must survive private-work cleanup')
+            self.assertEqual(log.read_text(),
+                             'synthetic database loader failure')
+            self.assertFalse((root/'output/work').exists())
+            self.assertFalse((root/'output/candidate').exists())
+            self.assertEqual(json.loads((root/'output/qualification.json').read_text())['qualification'],'failed')
 
     def test_failed_receipt_publication_removes_candidate_and_partial_receipt(self):
         with tempfile.TemporaryDirectory() as td:
