@@ -32,7 +32,7 @@ class WindowsComponentSetTests(unittest.TestCase):
             if target: records[name]['platform'] = target
             if name in SOURCE_ARCHIVES:
                 records[name].update(sourceArchiveSha256=SOURCE_ARCHIVES[name],
-                                     nodeSha256='c' * 64, lockfileSha256='d' * 64,
+                                     nodeSha256=('b' if name in {'web', 'studio'} else 'c') * 64, lockfileSha256='d' * 64,
                                      studioLockfileSha256='e' * 64, pnpmVersion='12.11.2',
                                      npmVersion='12.2.0', runtimeQualified=False)
             if name in ['server', 'manager']: records[name]['nodeVersion'] = '26.11.1'
@@ -95,7 +95,7 @@ class WindowsComponentSetTests(unittest.TestCase):
                     'studio/engine-build.json': b'{"npm":"12.2.0"}',
                 }[name]), \
                 patch('obtain_windows_host_components.NODE_EXE_SHA', 'c' * 64), \
-                patch('obtain_windows_host_components.BUILD_NODE_SHA', 'c' * 64):
+                patch('obtain_windows_host_components.BUILD_NODE_SHA', 'b' * 64):
             return obtain(root / 'source', approvals, root / 'result')
 
     def prepare(self, root):
@@ -171,7 +171,7 @@ class WindowsComponentSetTests(unittest.TestCase):
                 elif damage == 'platform': record['platform'] = 'linux-x64'
                 elif damage == 'archive': record['sourceArchiveSha256'] = 'f' * 64
                 elif damage == 'lock': record['lockfileSha256'] = 'f' * 64
-                elif damage == 'node': record['nodeSha256'] = 'f' * 64
+                elif damage == 'node': record['nodeSha256'] = 'b' * 64
                 elif damage == 'failed': record['qualification'] = 'failed'
                 elif damage == 'release': record['redistributable'] = True
                 elif damage == 'ml-target':
@@ -211,8 +211,9 @@ class WindowsComponentSetTests(unittest.TestCase):
                         with patch('obtain_windows_host_components.' + target, side_effect=fail_at_call):
                             return real_obtain(*args)
                     error_patch = patch(__name__ + '.obtain', side_effect=refused_obtain)
-                with error_patch, self.assertRaises((BuildError, OSError)):
+                with error_patch, self.assertRaises((BuildError, OSError)) as refused:
                     self.run_set(root, fixture, approvals)
+                self.assertEqual(str(refused.exception), 'synthetic publication failure' if target == 'publication' else 'synthetic dependency refusal')
                 self.assertFalse((root / 'result').exists())
 
     def test_nested_links_and_unexpected_outer_layout_are_refused_by_real_unpack(self):
