@@ -138,25 +138,12 @@ jobs:
               raise
           finally:
               try:
-                  for folder in ['fixtures', 'host-fixtures', 'raw-path-fixtures']:
-                      for name in ['pg-ctl-start.log', 'postgres.log']:
-                          path = work / folder / name
-                          if path.is_file():
-                              with path.open('rb') as log:
-                                  log.seek(0, os.SEEK_END)
-                                  log.seek(max(0, log.tell() - 32768))
-                                  (root / (folder + '-' + name)).write_bytes(log.read(32768))
+                  shutil.rmtree(work)
               except BaseException:
                   report['qualification'] = 'failed'
                   raise
               finally:
-                  try:
-                      shutil.rmtree(work)
-                  except BaseException:
-                      report['qualification'] = 'failed'
-                      raise
-                  finally:
-                      (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
+                  (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
       - name: Retain bounded evidence without database binaries or private fixtures
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -166,7 +153,5 @@ jobs:
             ${{ runner.temp }}/database-relocation/qualification.json
             ${{ runner.temp }}/database-relocation/command-error.log
             ${{ runner.temp }}/database-relocation/loader.log
-            ${{ runner.temp }}/database-relocation/*-pg-ctl-start.log
-            ${{ runner.temp }}/database-relocation/*-postgres.log
           retention-days: 7
           if-no-files-found: ignore
