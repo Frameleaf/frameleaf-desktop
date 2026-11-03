@@ -105,6 +105,9 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             self.assertFalse((host/'libraries').exists())
             self.assertTrue((ml/'payload/model').is_file())
             if failure == 'assembly': raise BuildError('synthetic signed ML refusal')
+            if failure == 'assembly-interrupt':
+                self.file(output,'payload/partial',b'partial executable candidate')
+                raise KeyboardInterrupt()
             self.file(output, 'payload/fixture', b'complete unsigned inventory fixture')
             self.file(output, 'work/home/private', b'must not retain')
             self.file(output, 'manifest.json', b'{"synthetic":true}')
@@ -204,3 +207,11 @@ class WindowsHostAssemblyTests(unittest.TestCase):
         self.assertNotIn('id-token:',workflow)
         self.assertNotIn('contents: write',workflow)
         self.assertEqual(workflow.count('python tools/build_windows_host.py'),1)
+
+    def test_keyboard_interrupt_removes_private_work_and_partial_candidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();self.source(root)
+            with self.assertRaises(KeyboardInterrupt): self.run_fixture(root,'assembly-interrupt')
+            self.assertFalse((root/'output/work').exists())
+            self.assertFalse((root/'output/candidate').exists())
+            self.assertEqual(json.loads((root/'output/qualification.json').read_text())['qualification'],'failed')

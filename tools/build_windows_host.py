@@ -183,7 +183,7 @@ console.log(JSON.stringify(hostEnvironment({{runtime:process.argv[1],state:proce
         report['scope'] = 'Current component consumers and complete unsigned host inventory; no installed-host, signing or release acceptance'
         partial.write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8',newline='\n')
         partial.replace(receipt)
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         # Both contain executable or private fixture data; attempt both removals even if one fails.
         try:
             if work.exists(): shutil.rmtree(work)
