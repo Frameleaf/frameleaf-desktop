@@ -808,6 +808,17 @@ an in-memory test authority. A factory host signature, complete controller/ML
 runtime qualification and installed three-OS acceptance remain required.
 
 
+`tools/verify_reused_host_sources.py --source <absolute-app-repo> --revision <full-commit> --database <receipt> --raw <receipt> --media <receipt> --hdr <receipt>`
+compares four reused Windows native components with immutable selected Git inputs.
+It reuses the database, RAW, FFmpeg and HDR source-contract validators, rejects
+changed production code, codec pins, patches or snapshot paths, and preserves
+original receipt identities. Only the HDR runtime test may differ; the report
+records that change and the original/current build Node versions, and requires
+current host runtime qualification. Receipt hashes use canonical JSON. This
+read-only check does not authenticate producers, verify payload files, bypass
+builder version guards or qualify runtime/redistribution; those remain separate
+assembly requirements.
+
 `tools/sign_host_runtime.mjs --candidate /absolute/candidate --private-key-stdin`
 checks the full host inventory and independently signed nested ML candidate before
 writing a new `manifest.sig`. The existing Infisical-owned release key is supplied
