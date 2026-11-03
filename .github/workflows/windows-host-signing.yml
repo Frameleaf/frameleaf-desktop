@@ -83,7 +83,7 @@ jobs:
           with tarfile.open(root / 'windows-complete-host-signed.tar.gz', 'w:gz', compresslevel=1) as archive:
               for name in sorted(expected):
                   archive.add(candidate / name, arcname=name)
-      - name: Retain private signed candidate
+      - name: Retain signed CI test candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-windows-complete-host-signed
