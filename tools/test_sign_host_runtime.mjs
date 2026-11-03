@@ -130,6 +130,12 @@ test("signs the complete host and verifies the nested ML authority without overw
   assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
   const checked = await verifySignedHostCandidate(f.root, f.policy);
   assert.equal(checked.manifestSha256, signed.manifestSha256);
+  assert.equal(
+    checked.signatureSha256,
+    createHash("sha256")
+      .update(await readFile(join(f.root, "manifest.sig")))
+      .digest("hex"),
+  );
   await assert.rejects(
     signHostCandidate(f.root, f.pem, f.policy),
     /signature_exists/,

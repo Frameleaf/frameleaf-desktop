@@ -59,10 +59,10 @@ jobs:
           const original = JSON.parse(await readFile(join(root, 'candidate/qualification.json'), 'utf8'));
           const producer = JSON.parse(await readFile(join(root, 'producer.json'), 'utf8'));
           if (verified.manifestSha256 !== original.manifestSha256 ||
-              ['keyId', 'manifestSha256', 'sourceRevision', 'epoch', 'certified'].some(key => verified[key] !== signed[key]))
+              ['keyId', 'manifestSha256', 'signatureSha256', 'sourceRevision', 'epoch', 'certified'].some(key => verified[key] !== signed[key]))
             throw new Error('host_signed_candidate_identity_changed');
           await writeFile(join(root, 'signature-verification.json'), JSON.stringify({
-            schemaVersion: 1, ...verified, signatureSha256: signed.signatureSha256,
+            schemaVersion: 1, ...verified,
             approvedProducer: producer.approved, signaturePresent: true,
             runtimeQualified: false, redistributable: false, installedPlatformQualified: false,
             fullMediaConformance: false,
