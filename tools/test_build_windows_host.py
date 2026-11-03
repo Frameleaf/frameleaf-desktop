@@ -2,15 +2,45 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from build_runtime import BuildError, inventory, sha256
 from build_windows_host import build
+from windows_private_directory import create_private_directory
 
 
 class WindowsHostAssemblyTests(unittest.TestCase):
+    def test_directory_setup_failures_remove_only_newly_owned_output(self):
+        for failed_directory in ['work', 'evidence']:
+            for cleanup_fails in [False, True]:
+                with self.subTest(directory=failed_directory, cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    (root / 'source').mkdir()
+                    error = subprocess.TimeoutExpired('whoami.exe', 10)
+                    def create(path):
+                        if path.name == failed_directory:
+                            raise error
+                        create_private_directory(path)
+                    remove = shutil.rmtree
+                    def cleanup(path):
+                        if cleanup_fails:
+                            raise OSError('synthetic setup cleanup failure')
+                        remove(path)
+                    with patch('build_windows_host.platform.system', return_value='Windows'), patch(
+                        'build_windows_host.platform.machine', return_value='AMD64'
+                    ), patch('build_windows_host.create_private_directory', side_effect=create), patch(
+                        'build_windows_host.shutil.rmtree', side_effect=cleanup
+                    ), self.assertRaises(subprocess.TimeoutExpired) as caught:
+                        build(root / 'source', {}, root / 'output', 18)
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual((root / 'output').exists(), cleanup_fails)
+                    self.assertTrue((root / 'source').is_dir())
+                    if cleanup_fails:
+                        self.assertIn('synthetic setup cleanup failure', '\n'.join(error.__notes__))
+
     def file(self, root, name, data=b'fixture'):
         p = root / name; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(data)
 

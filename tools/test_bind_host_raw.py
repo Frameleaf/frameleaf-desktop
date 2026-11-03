@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from bind_host_raw import build
 from build_runtime import BuildError, inventory
+from windows_private_directory import create_private_directory
 
 
 class RawBindingTests(unittest.TestCase):
@@ -48,20 +49,54 @@ class RawBindingTests(unittest.TestCase):
     def test_cli_identity_process_failures_use_stable_diagnostic_without_creating_output(self):
         for error in [subprocess.CalledProcessError(1, 'whoami.exe'),
                       subprocess.TimeoutExpired('whoami.exe', 10)]:
-            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary).resolve()
-                self.inputs(root)
-                script = Path(__file__).with_name('bind_host_raw.py')
-                arguments = [str(script), '--source', str(root), '--server', str(root / 'server'),
-                             '--raw', str(root / 'raw'), '--output', str(root / 'output')]
-                stderr = io.StringIO()
-                with patch.object(sys, 'argv', arguments), redirect_stderr(stderr), patch(
-                    'windows_private_directory.create_private_directory', side_effect=error
-                ), self.assertRaises(SystemExit) as exited:
-                    runpy.run_path(str(script), run_name='__main__')
-                self.assertEqual(exited.exception.code, 1)
-                self.assertEqual(stderr.getvalue(), 'host_raw_binding_failed')
-                self.assertFalse((root / 'output').exists())
+            for failed_call in [1, 2]:
+                with self.subTest(error=type(error).__name__, failed_call=failed_call), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    self.inputs(root)
+                    script = Path(__file__).with_name('bind_host_raw.py')
+                    arguments = [str(script), '--source', str(root), '--server', str(root / 'server'),
+                                 '--raw', str(root / 'raw'), '--output', str(root / 'output')]
+                    stderr = io.StringIO()
+                    calls = []
+                    def create(path):
+                        calls.append(path)
+                        if len(calls) == failed_call:
+                            raise error
+                        create_private_directory(path)
+                    with patch.object(sys, 'argv', arguments), redirect_stderr(stderr), patch(
+                        'windows_private_directory.create_private_directory', side_effect=create
+                    ), self.assertRaises(SystemExit) as exited:
+                        runpy.run_path(str(script), run_name='__main__')
+                    self.assertEqual(exited.exception.code, 1)
+                    self.assertEqual(stderr.getvalue(), 'host_raw_binding_failed')
+                    self.assertFalse((root / 'output').exists())
+
+    def test_setup_cleanup_failure_does_not_replace_identity_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self.inputs(root)
+            error = subprocess.TimeoutExpired('whoami.exe', 10)
+            def create(path):
+                if path.name == 'work':
+                    raise error
+                create_private_directory(path)
+            with patch('bind_host_raw.create_private_directory', side_effect=create), patch(
+                'bind_host_raw.shutil.rmtree', side_effect=OSError('synthetic cleanup failure')
+            ), self.assertRaises(subprocess.TimeoutExpired) as caught:
+                build(root, root / 'server', root / 'raw', root / 'output')
+            self.assertIs(caught.exception, error)
+            self.assertIn('synthetic cleanup failure', '\n'.join(error.__notes__))
+
+    def test_existing_output_is_refused_without_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            output = root / 'output'
+            output.mkdir()
+            (output / 'sentinel').write_text('retained')
+            with patch('bind_host_raw.shutil.rmtree') as cleanup, self.assertRaisesRegex(BuildError, 'output_invalid'):
+                build(root, root / 'server', root / 'raw', output)
+            cleanup.assert_not_called()
+            self.assertEqual((output / 'sentinel').read_text(), 'retained')
 
     def test_different_server_revision_requires_exact_engine_and_patch_contract(self):
         with tempfile.TemporaryDirectory() as temporary:

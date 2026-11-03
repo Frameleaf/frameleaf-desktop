@@ -82,7 +82,14 @@ def build(source: Path, server: Path, raw: Path, output: Path) -> None:
         raise BuildError("host_raw_binding_git_missing")
     create_private_directory(output)
     work = output / "work"
-    create_private_directory(work)
+    try:
+        create_private_directory(work)
+    except (Exception, KeyboardInterrupt) as error:
+        try:
+            shutil.rmtree(output)
+        except OSError as cleanup_error:
+            error.add_note("Partial output cleanup also failed: " + str(cleanup_error))
+        raise
     env = build_environment(work, os.environ)
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(Path("NUL") if platform.system() == "Windows" else Path("/dev/null")),
                GIT_TERMINAL_PROMPT="0")

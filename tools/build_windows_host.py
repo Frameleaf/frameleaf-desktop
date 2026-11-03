@@ -58,8 +58,15 @@ def build(source: Path, approvals: dict, output: Path, epoch: int) -> None:
         raise BuildError('host_windows_assembly_git_missing')
     create_private_directory(output)
     work, evidence, candidate = output / 'work', output / 'evidence', output / 'candidate'
-    create_private_directory(work)
-    create_private_directory(evidence)
+    try:
+        create_private_directory(work)
+        create_private_directory(evidence)
+    except (Exception, KeyboardInterrupt) as error:
+        try:
+            shutil.rmtree(output)
+        except OSError as cleanup_error:
+            error.add_note('Partial output cleanup also failed: ' + str(cleanup_error))
+        raise
     report = {'schemaVersion':1, 'sourceRevision':SOURCE_REVISION, 'epoch':epoch,
               'qualification':'failed', 'runtimeQualified':False, 'redistributable':False,
               'installedPlatformQualified':False, 'fullMediaConformance':False,
