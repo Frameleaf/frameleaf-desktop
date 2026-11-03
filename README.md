@@ -413,6 +413,11 @@ python3 tools/build_host_media.py \
 
 The receipt records source fixture hashes, Node and binding hashes, codec pins, platform and qualification scope, and always declares `redistributable: false`. The pinned macOS candidate passed 38/38 HDR tests; a stock-library control passed 27 and failed 11. The JPEG include path must come from package metadata to avoid stock HEIF headers shadowing the patched headers. This closes one native-host feasibility gap; it does not establish RAW/Studio parity, a portable dependency bundle, private PostgreSQL, Manager hosting, signing or installed three-platform acceptance.
 
+The [Windows HDR candidate workflow](.github/workflows/windows-host-hdr.yml) uses
+the same source-pinned codecs and HDR fixtures with an MSVC binding, matching Node
+import library, and audited private DLL closure. Its component checks remain
+separate from a complete host pack, Windows 11 installation, and release signing.
+
 ### Native host database feasibility
 
 `tools/build_host_database.py` builds PostgreSQL and pgvector under a fresh private macOS output directory. The lock in `runtime/host-database.json` must match the selected Frameleaf revision's database image, extension version and source digest. Downloaded source archives must match their SHA-256 pins before extraction.
@@ -634,6 +639,15 @@ and refusal when private Perl or the Windows executable is missing. This passed 
 complete signed-host assembly and installed three-platform acceptance are pending.
 
 ### Private native RAW engine
+
+The Windows authoring path uses MSYS2 UCRT64 GCC/Ninja to build the same pinned
+LibRaw, Lensfun and patched darktable sources. `windows-host-raw.yml` builds in
+private CI and records the installed toolchain package versions. Staging follows
+the transitive x64 PE imports, retains private DLLs, data and notices, rejects
+ambiguous or missing libraries and MSYS/Cygwin runtime dependencies, and tests
+startup after moving the original installation away. The toolchain is used only
+for authoring. Windows production RAW rendering and installed acceptance still
+require qualification; a successful component build is insufficient.
 
 `python3 tools/build_host_raw.py --source /absolute/path/to/frameleaf-app --revision <full-commit-sha> --dependency-prefix /opt/homebrew --output /absolute/path/to/new-raw-output`
 
@@ -989,8 +1003,27 @@ is unencrypted; use a trusted network. HTTPS continues to validate certificates,
 and private certificate approval applies only to HTTPS. The separate Library Server
 connection and desktop-owned native Manager retain their existing transport rules.
 
-Windows machine layout discovery resolves the OS-owned Program Files x64 folder, verifies its physical protected path, and uses the Windows controller filename. The lookup initializes COM on the calling thread and balances only its own initialization reference. This is read-only layout support; Windows installation and full-host startup remain gated.
+Windows machine layout discovery resolves the OS-owned Program Files x64 folder, verifies its physical protected path, and uses the Windows controller filename. The lookup initializes COM on the calling thread and balances only its own initialization reference. This is layout discovery support; installed Windows acceptance remains separate from source support.
 
 Windows package authoring has a dedicated `--prepare-windows-package <manifest-sha256> <controller-sha256>` phase. It requires an elevated process and effective Administrators membership before filesystem work, then prepares fixed machine containers with an explicit protected ACL. Existing objects are checked without changing their permissions, and existing versions are refused pending verified maintenance/recovery support. This phase publishes no runtime, receipt or user profile and starts no server. Its actual ACL fixture runs only on an elevated disposable GitHub-hosted Windows runner, using a unique test directory rather than the real Frameleaf installation.
 
 Windows installed-host discovery now reads installation receipts from the same protected OS-derived location. Missing and unfinished versions are omitted; malformed entries, unprotected paths and inventories above 64 versions are refused. The local IPC accepts no path and discovery creates no directories. Windows CI checks environment poisoning with a deliberately invalid alternate inventory; installed-device discovery and privileged installation remain separate acceptance gates.
+
+The opt-in `native_photo` integration test uses a measured test candidate and a new
+synthetic profile to check the native web entry, admin signup, generated PNG upload,
+thumbnail processing, clean controller stop/restart, and persisted metadata plus
+byte-exact original and thumbnail retrieval. Set `FRAMELEAF_TEST_HOST_PACK` as above
+and `FRAMELEAF_TEST_PHOTO_STATE` to a new absolute profile path, then run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --test native_photo -- \
+  --ignored --exact actual_native_photo_upload_thumbnail_and_restart
+```
+
+It retains only generated fixture data for inspection and uses in-memory test
+signing authority. This does not qualify the Owner journal, OS keystore, installed
+desktop UI, release signing, or NAS/GPU work.
+
+Windows package finalization uses `--finalize-windows-package <manifest-sha256> <controller-sha256>` to verify the protected controller and factory-signed runtime under an exclusive unfenced lease, then publish a protected receipt without replacing existing authority. Matching retries preserve existing state; conflicting receipts or existing profiles refuse finalization. This command starts no server.
+
+Desktop setup prepares private folders in the current Windows user’s Local AppData without elevation. Local Manager startup admits existing private folders and retains their ancestry pins through startup and ownership. Installed Windows acceptance remains separate from source and hosted qualification.

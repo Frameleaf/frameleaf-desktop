@@ -11,7 +11,7 @@ from build_host_database_windows import SYSTEM_DLLS
 from build_runtime import BuildError, regular, relative, sha256
 
 PLATFORM_DLLS = SYSTEM_DLLS | {
-    "comctl32.dll",
+    "cldapi.dll", "combase.dll", "comctl32.dll",
     "credui.dll", "dwmapi.dll", "dwrite.dll", "gdiplus.dll", "glu32.dll", "hid.dll", "imm32.dll",
     "msimg32.dll", "opengl32.dll", "propsys.dll", "shcore.dll", "urlmon.dll",
     "usp10.dll", "uxtheme.dll", "winhttp.dll", "wininet.dll", "winspool.drv",

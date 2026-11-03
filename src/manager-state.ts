@@ -2,6 +2,17 @@ export type Control = 'start' | 'stop' | 'restart' | 'backup';
 export function localProfilePending(state: string | undefined, requesting: boolean): boolean {
   return requesting || state === 'provisioning';
 }
+export function profileSetupCopy(authorization: boolean) {
+  return authorization ? {
+    pending: 'Finish or dismiss the system authorization request, then check installation to continue.',
+    quit: 'Finish or dismiss the system authorization request before quitting.',
+    preparation: 'Your system may ask for administrator authorization to create private server folders for your account. Frameleaf does not receive your administrator password. This step does not start the photo server.',
+  } : {
+    pending: 'Frameleaf is preparing your private server profile. Wait for setup to finish.',
+    quit: 'Wait for server profile preparation to finish before quitting.',
+    preparation: 'Prepare private server folders for your Windows account. This step does not start the photo server.',
+  };
+}
 export type ManagerView = {
   origin: string; managerId: string; deviceId: string; installationId: string;
   expiresAt: number; scopes: string[]; certificateSha256: string | null;

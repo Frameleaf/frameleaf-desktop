@@ -37,6 +37,47 @@ pub fn configure(command: &mut Command) {
     }
 }
 impl ProcessTree {
+    #[cfg(windows)]
+    pub(crate) fn terminate_confirmed(&self, timeout: std::time::Duration) -> Result<(), String> {
+        use std::{os::windows::io::AsRawHandle, time::Instant};
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let deadline = Instant::now() + timeout;
+        let empty = || {
+            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            if unsafe {
+                QueryInformationJobObject(
+                    self.0.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err("runtime_process_shutdown_unconfirmed".to_string());
+            }
+            Ok(info.ActiveProcesses == 0)
+        };
+        if empty()? {
+            return Ok(());
+        }
+        if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
+            return Err("runtime_process_shutdown_unconfirmed".into());
+        }
+        loop {
+            if empty()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("runtime_process_shutdown_unconfirmed".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     pub fn attach(child: &Child) -> Result<Self, String> {
         #[cfg(unix)]
         {

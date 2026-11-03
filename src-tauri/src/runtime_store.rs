@@ -20,10 +20,14 @@ pub struct RuntimeStore {
     root: PathBuf,
     keys: Vec<VerifyingKey>,
     minimum_epoch: u64,
+    epochs: Arc<dyn crate::runtime_epochs::EpochAuthority>,
+    installation_id: String,
 }
 pub struct InstalledRuntime {
     runtime: VerifiedRuntime,
     lease: Arc<File>,
+    epochs: Arc<dyn crate::runtime_epochs::EpochAuthority>,
+    installation_id: String,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,16 +160,54 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<(), String> {
 }
 impl RuntimeStore {
     /// App-owned trust keys and minimum epoch must never come from a server response or runtime pack.
-    pub fn new(root: &Path, keys: Vec<VerifyingKey>, minimum_epoch: u64) -> Result<Self, String> {
+    pub fn new(
+        root: &Path,
+        keys: Vec<VerifyingKey>,
+        minimum_epoch: u64,
+        epochs: Arc<dyn crate::runtime_epochs::EpochAuthority>,
+    ) -> Result<Self, String> {
         if minimum_epoch == 0 {
             return Err("runtime_epoch_invalid".into());
         }
+        let identity = epochs.installation_id()?;
+        if uuid::Uuid::parse_str(&identity).is_err()
+            || uuid::Uuid::parse_str(&identity).is_ok_and(|id| id.is_nil())
+        {
+            return Err("runtime_epoch_identity_invalid".into());
+        }
         private_directory(root)?;
         private_directory(&root.join("releases"))?;
+        let binding = root.join("epoch-authority.json");
+        match fs::symlink_metadata(&binding) {
+            Ok(_) => {
+                let saved: String = serde_json::from_slice(&read_bounded(&binding, 128)?)
+                    .map_err(|_| "runtime_epoch_binding_invalid")?;
+                if saved != identity {
+                    return Err("runtime_epoch_identity_changed".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(root.join("active.json")).is_ok()
+                    || fs::read_dir(root.join("releases"))
+                        .map_err(|_| "runtime_store_read_failed")?
+                        .next()
+                        .is_some()
+                {
+                    return Err("runtime_epoch_recovery_required".into());
+                }
+                write_new(
+                    &binding,
+                    &serde_json::to_vec(&identity).map_err(|_| "runtime_epoch_binding_invalid")?,
+                )?;
+            }
+            Err(_) => return Err("runtime_store_read_failed".into()),
+        }
         Ok(Self {
             root: root.into(),
             keys,
             minimum_epoch,
+            epochs,
+            installation_id: identity,
         })
     }
     fn lock(&self, shared: bool) -> Result<Arc<File>, String> {
@@ -257,6 +299,8 @@ impl RuntimeStore {
         use flate2::{write::GzEncoder, Compression};
         let id = installed.manifest_sha256();
         self.read_release(id, installed.runtime.epoch())?;
+        self.epochs
+            .check(&self.installation_id, &installed.runtime)?;
         let release = self.root.join("releases").join(id);
         let raw = read_bounded(&release.join("manifest.json"), 8 * 1024 * 1024)?;
         let signature = read_bounded(&release.join("manifest.sig"), 64)?;
@@ -303,7 +347,13 @@ impl RuntimeStore {
         if runtime.epoch() != active.epoch {
             return Err("runtime_active_epoch_changed".into());
         }
-        Ok(Some(InstalledRuntime { runtime, lease }))
+        self.epochs.check(&self.installation_id, &runtime)?;
+        Ok(Some(InstalledRuntime {
+            runtime,
+            lease,
+            epochs: self.epochs.clone(),
+            installation_id: self.installation_id.clone(),
+        }))
     }
     pub fn install_and_activate(
         &self,
@@ -319,6 +369,7 @@ impl RuntimeStore {
             .map(|value| value.epoch)
             .unwrap_or(self.minimum_epoch);
         let verified = VerifiedRuntime::verify(candidate, raw, signature, &self.keys, minimum)?;
+        self.epochs.check(&self.installation_id, &verified)?;
         let id = verified.manifest_sha256();
         if active
             .as_ref()
@@ -344,27 +395,39 @@ impl RuntimeStore {
             write_new(&staging.0.join("manifest.sig"), signature)?;
             fs::rename(&staging.0, &release).map_err(|_| "runtime_store_activation_failed")?;
         }
-        let pointer = Active {
-            manifest_sha256: id.into(),
-            epoch: verified.epoch(),
-        };
-        let temporary = self.root.join(format!(".active-{}.json", Uuid::new_v4()));
-        write_new(
-            &temporary,
-            &serde_json::to_vec(&pointer).map_err(|_| "runtime_active_invalid")?,
-        )?;
-        if fs::rename(&temporary, self.root.join("active.json")).is_err() {
-            let _ = fs::remove_file(temporary);
-            return Err("runtime_store_activation_failed".into());
-        }
-        #[cfg(unix)]
-        File::open(&self.root)
-            .and_then(|root| root.sync_all())
-            .map_err(|_| "runtime_store_activation_sync_failed")?;
-        Ok(())
+        self.epochs
+            .activate(&self.installation_id, &verified, &mut || {
+                let pointer = Active {
+                    manifest_sha256: id.into(),
+                    epoch: verified.epoch(),
+                };
+                let temporary = self.root.join(format!(".active-{}.json", Uuid::new_v4()));
+                write_new(
+                    &temporary,
+                    &serde_json::to_vec(&pointer).map_err(|_| "runtime_active_invalid")?,
+                )?;
+                if fs::rename(&temporary, self.root.join("active.json")).is_err() {
+                    let _ = fs::remove_file(temporary);
+                    return Err("runtime_store_activation_failed".into());
+                }
+                #[cfg(unix)]
+                File::open(&self.root)
+                    .and_then(|root| root.sync_all())
+                    .map_err(|_| "runtime_store_activation_sync_failed")?;
+                Ok(())
+            })
     }
 }
 impl InstalledRuntime {
+    fn checked<T>(&self, mut operation: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        let mut result = None;
+        self.epochs
+            .with_current(&self.installation_id, &self.runtime, &mut || {
+                result = Some(operation()?);
+                Ok(())
+            })?;
+        result.ok_or_else(|| "runtime_epoch_operation_missing".into())
+    }
     pub fn source_revision(&self) -> &str {
         self.runtime.source_revision()
     }
@@ -380,7 +443,7 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        let mut child = self.runtime.start_sidecar(cache, private_root, port)?;
+        let mut child = self.checked(|| self.runtime.start_sidecar(cache, private_root, port))?;
         child.hold_lease(self.lease.clone());
         Ok(child)
     }
@@ -391,9 +454,10 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        let mut child =
+        let mut child = self.checked(|| {
             self.runtime
-                .start_qualified_sidecar(qualified, cache, private_root, port)?;
+                .start_qualified_sidecar(qualified, cache, private_root, port)
+        })?;
         child.hold_lease(self.lease.clone());
         Ok(child)
     }
@@ -404,9 +468,10 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
-        let mut child = self
-            .runtime
-            .start_bound_sidecar(qualified, cache, private_root, port)?;
+        let mut child = self.checked(|| {
+            self.runtime
+                .start_bound_sidecar(qualified, cache, private_root, port)
+        })?;
         child.hold_lease(self.lease.clone());
         Ok(child)
     }
@@ -418,8 +483,10 @@ impl InstalledRuntime {
         fixture: &[u8],
         cancel: &AtomicBool,
     ) -> Result<QualifiedRuntime, String> {
-        self.runtime
-            .qualify(cache, private_root, spec, fixture, cancel)
+        self.checked(|| {
+            self.runtime
+                .qualify(cache, private_root, spec, fixture, cancel)
+        })
     }
 }
 

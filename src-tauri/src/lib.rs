@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod copy_source;
 pub mod copy_upload;
+mod credential_lock;
 mod credentials;
 mod host_commands;
 pub mod host_control;
@@ -10,6 +11,7 @@ pub mod host_runtime;
 mod host_setup;
 mod host_state;
 mod host_storage;
+mod identity_anchor;
 pub mod lifecycle;
 pub mod manager;
 mod manager_commands;
@@ -28,12 +30,15 @@ mod process_tree;
 mod profile_elevation;
 pub mod release_policy;
 mod resource_policy;
+pub mod runtime_epochs;
 pub mod runtime_store;
 mod source_consent;
 mod source_import;
 mod source_metadata;
 mod transport;
 mod upload_budget;
+#[cfg(windows)]
+mod windows_host_profile;
 #[cfg(any(windows, test))]
 mod windows_protection;
 pub mod worker;

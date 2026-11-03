@@ -61,6 +61,9 @@ pub fn enrollment_message(server: &str, account: &str, dto: &EnrollmentRequest) 
 pub struct DeviceIdentity {
     pub installation_id: String,
     secret: [u8; 32],
+    #[serde(default, rename = "runtimeEpochs")]
+    #[zeroize(skip)]
+    pub(crate) runtime_epochs: Option<crate::runtime_epochs::RuntimeEpochs>,
 }
 impl DeviceIdentity {
     pub fn public_key(&self) -> String {
@@ -83,6 +86,7 @@ impl DeviceIdentity {
         Self {
             installation_id: Uuid::new_v4().to_string(),
             secret,
+            runtime_epochs: Some(crate::runtime_epochs::RuntimeEpochs::default()),
         }
     }
     pub fn enrollment(

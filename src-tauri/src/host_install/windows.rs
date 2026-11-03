@@ -1,10 +1,22 @@
 //! OS-owned machine anchor; installer-only directory writes live in the package submodule.
 pub(super) mod package;
-use std::{collections::BTreeSet, ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    ffi::OsString,
+    os::windows::{
+        ffi::OsStringExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
+    path::PathBuf,
+};
 use windows_sys::Win32::{
-    Foundation::RPC_E_CHANGED_MODE,
-    System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
-    UI::Shell::{FOLDERID_ProgramFilesX64, SHGetKnownFolderPath},
+    Foundation::{HANDLE, RPC_E_CHANGED_MODE},
+    Security::{TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY},
+    System::{
+        Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
+        Threading::{GetCurrentProcess, OpenProcessToken},
+    },
+    UI::Shell::{FOLDERID_LocalAppData, FOLDERID_ProgramFilesX64, SHGetKnownFolderPath},
 };
 const ERROR: &str = "host_install_location_unavailable";
 struct Com(bool);
@@ -31,18 +43,33 @@ impl Drop for Folder {
         unsafe { CoTaskMemFree(self.0.cast()) };
     }
 }
-pub(super) fn base() -> Result<PathBuf, String> {
+pub(super) fn local_app_data() -> Result<PathBuf, String> {
+    let mut raw = std::ptr::null_mut();
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE,
+            &mut raw,
+        )
+    } == 0
+        || raw.is_null()
+    {
+        return Err(ERROR.into());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // An explicit process token expands the user's registered folder independently of inherited variables.
+    known_folder(&FOLDERID_LocalAppData, token.as_raw_handle())
+}
+fn known_folder(id: &windows_sys::core::GUID, token: HANDLE) -> Result<PathBuf, String> {
     let _initialization = Com::initialize()?;
     let mut folder = Folder(std::ptr::null_mut());
-    let result = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_ProgramFilesX64,
-            0,
-            std::ptr::null_mut(),
-            &mut folder.0,
-        )
-    };
+    let result = unsafe { SHGetKnownFolderPath(id, 0, token, &mut folder.0) };
     if result != 0 || folder.0.is_null() {
+        #[cfg(test)]
+        eprintln!(
+            "native known-folder probe HRESULT: {result:#010x} explicit_user={}",
+            !token.is_null()
+        );
         return Err(ERROR.into());
     }
     let mut length = 0;
@@ -56,7 +83,10 @@ pub(super) fn base() -> Result<PathBuf, String> {
     let path = PathBuf::from(OsString::from_wide(unsafe {
         std::slice::from_raw_parts(folder.0, length)
     }));
-    let physical = crate::windows_protection::stable_path(&path).map_err(|_| ERROR)?;
+    crate::windows_protection::stable_path(&path).map_err(|_| ERROR.into())
+}
+pub(super) fn base() -> Result<PathBuf, String> {
+    let physical = known_folder(&FOLDERID_ProgramFilesX64, std::ptr::null_mut())?;
     crate::windows_protection::protect(&physical, &mut BTreeSet::new()).map_err(|_| ERROR)?;
     Ok(physical.join("Frameleaf"))
 }
@@ -102,6 +132,7 @@ mod tests {
                     let _initialization = Com::initialize().unwrap();
                     assert_eq!(CoGetContextToken(&mut context), S_OK);
                     base().unwrap();
+                    local_app_data().unwrap();
                 }
                 if existing.is_some() {
                     assert_eq!(CoGetContextToken(&mut context), S_OK);
