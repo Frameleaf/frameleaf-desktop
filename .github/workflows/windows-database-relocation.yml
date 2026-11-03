@@ -34,6 +34,7 @@ jobs:
           import sys
           sys.path.insert(0, 'tools')
           from bind_host_raw import read_receipt
+          from build_host_bundle import host_entries
           from build_host_database_windows import qualify
           from build_host_server import stage_server
           from build_runtime import build_environment, inventory, run
@@ -58,7 +59,9 @@ jobs:
               if (receipt.get('qualification') != 'passed' or receipt.get('pins') != lock
                       or receipt.get('files') != inventory(original)):
                   raise RuntimeError('Approved database inventory or policy mismatch')
-              relocated = work / 'pg'
+              host = work / 'host'
+              host.mkdir()
+              relocated = host / 'pg'
               stage_server(original, relocated)
               if inventory(relocated) != receipt['files']:
                   raise RuntimeError('Relocated database inventory mismatch')
@@ -74,6 +77,18 @@ jobs:
               fixtures = work / 'fixtures'
               fixtures.mkdir()
               report['checks'] = qualify(relocated, fixtures, lock, env)
+              # Compare the successful minimal environment with the production host environment.
+              report['phase'] = 'host-environment-restore-restart-checksums'
+              print(report['phase'], flush=True)
+              module = (Path.cwd() / 'runtime/host-agent.mjs').as_uri()
+              script = ('import {hostEnvironment} from ' + json.dumps(module) + ';'
+                        'console.log(JSON.stringify(hostEnvironment({runtime:process.argv[1],'
+                        'state:process.argv[2],entryPoints:JSON.parse(process.argv[3])})));')
+              env.update(json.loads(run([shutil.which('node'), '--input-type=module', '--eval',
+                                         script, host, work, json.dumps(host_entries())], cwd=work, env=env)))
+              host_fixtures = work / 'host-fixtures'
+              host_fixtures.mkdir()
+              report['hostEnvironmentChecks'] = qualify(relocated, host_fixtures, lock, env)
               if inventory(relocated) != receipt['files']:
                   raise RuntimeError('Database payload changed during qualification')
               report['qualification'] = 'passed'
@@ -90,8 +105,13 @@ jobs:
                                          cwd=work, env=env, stdout=log, stderr=log, timeout=15)
               raise
           finally:
-              shutil.rmtree(work)
-              (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
+              try:
+                  shutil.rmtree(work)
+              except BaseException:
+                  report['qualification'] = 'failed'
+                  raise
+              finally:
+                  (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
       - name: Retain bounded evidence without database binaries or private fixtures
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
