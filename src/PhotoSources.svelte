@@ -2,6 +2,9 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import Icon from './Icon.svelte';
+  import Sheet from './Sheet.svelte';
+  import { formatBytes, percent } from './ui-state';
   type Hint = { label: string; path: string };
   type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
@@ -16,6 +19,8 @@
   let alive = true;
   let busy = $state(false);
   let message = $state('');
+  let revokeSheet = $state(false);
+  let detailsOpen = $state(false);
   const native = isTauri();
   const errors: Record<string, string> = {
     source_metadata_unavailable: 'File metadata could not be checked safely. Check folder access before resuming; staged data is kept.',
@@ -93,12 +98,7 @@
     })();
     return () => { alive = false; unlisten?.(); };
   });
-  function size(bytes: number) {
-    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-    if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} kB`;
-    return `${bytes} bytes`;
-  }
+  const size = formatBytes;
   function availabilityText(value: Availability) {
     return `${value.available.toLocaleString()} OS-reported available; ${value.needsDownload.toLocaleString()} need downloading (${size(value.downloadBytes)} in originals); ${value.notReady.toLocaleString()} provider not ready; ${value.unknown.toLocaleString()} unknown. ${value.pinned.toLocaleString()} request pinning. These are metadata snapshots; pinning does not prove a complete local original. Unknown files may also need downloading.`;
   }
@@ -124,7 +124,7 @@
     finally { busy = false; }
   }
   async function revoke() {
-    busy = true; message = '';
+    busy = true; message = ''; revokeSheet = false;
     try {
       const confirmed = await invoke<boolean>('revoke_photo_source');
       consent = null; job = null; blockedConsent = false; folder = null; allowReads = false;
@@ -148,80 +148,99 @@
     } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
     finally { busy = false; }
   }
+  const jobLabel = $derived(!job ? '' : job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention');
+  const jobTone = $derived(!job ? 'off' : job.state === 'complete' ? 'ok' : job.state === 'copying' ? 'wait' : job.state === 'needs-attention' ? 'bad' : 'off');
+  const canResume = $derived(!!job && ['ready', 'paused', 'needs-attention'].includes(job.state));
+  const needsAllowance = $derived(!!job && !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
 </script>
 
-<section class="sources" aria-labelledby="photo-sources-heading" aria-busy={busy}>
-  <h2 id="photo-sources-heading">Photo sources</h2>
-  <p>Choose where to bring photos from. Local folders are separate from this computer’s AI processing permission.</p>
-  <div class="actions">
-    <button class="secondary" disabled={busy || !native || !!consent || blockedConsent} onclick={() => choose()}>Choose a photo folder</button>
-    <button class="text-button" disabled={busy || !native || !!consent || blockedConsent} onclick={discover}>Find OneDrive folders</button>
-  </div>
-  {#if hints.length}
-    <ul aria-label="Known OneDrive folders">
-      {#each hints as hint, index (hint.path)}
-        <li><strong>{hint.label}</strong><small>{hint.path}</small><button class="text-button" disabled={busy} onclick={() => choose(index)}>Choose folders</button></li>
-      {/each}
-    </ul>
-  {/if}
-  {#if busy}<p role="status">Waiting for the folder or server operation to finish…</p>{/if}
-  {#if message}<p role="status">{message}</p>{/if}
-  {#if consent}
-    <div class="folder-preview" aria-label="Approved photo folder">
-      <strong>{consent.name}</strong><p>{consent.path}</p>
-      <p>{consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</p>
-      {#if !consent.registered}<button class="secondary" disabled={busy} onclick={() => approve(true)}>Retry server registration</button>{/if}
-      {#if consent.registered && !job}
-        <p>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</p>
-        <button class="secondary" disabled={busy} onclick={prepareCopy}>Prepare copy</button>
-      {/if}
-      {#if job}
-        <div class="copy-job" aria-label="Photo copy progress">
-          <p role="status">{job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'}: {job.completed.toLocaleString()} of {job.total.toLocaleString()} copies confirmed.</p>
-          <progress max={Math.max(1, job.total)} value={job.completed} aria-label="Copies verified on your server"></progress>
-          <p class="footnote">Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
-          <p class="footnote">{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
-          {#if !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted')}
-            <button class="secondary" disabled={busy} onclick={() => controlCopy('approve-upload')}>Approve {size(job.additionalUploadAllowance)} more upload data</button>
-          {/if}
-          {#if job.availability}<p class="footnote" aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
-          {#if job.code}<p role="status">{explain(job.code)}</p>{/if}
-          {#if ['ready', 'paused', 'needs-attention'].includes(job.state)}
-            <button class="secondary" disabled={busy || job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job.state === 'ready' ? `Copy ${job.total.toLocaleString()} files` : 'Resume copy'}</button>
-          {/if}
-          {#if job.state === 'copying'}<button class="secondary" disabled={busy} onclick={() => controlCopy('pause')}>Pause copy</button>{/if}
-          {#if !['complete', 'cancelled'].includes(job.state)}<button class="text-button" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel copy</button>{/if}
-          {#if job.state === 'cancelled'}<p class="footnote">Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</p>{/if}
+<section class="page" aria-labelledby="photo-sources-heading" aria-busy={busy}>
+  <header class="toolbar">
+    <h1 id="photo-sources-heading">Photo sources</h1>
+    {#if consent}<span class="pill {job ? jobTone : consent.registered ? 'ok' : 'wait'}"><i aria-hidden="true"></i>{job ? jobLabel : consent.registered ? 'Folder registered' : 'Registration pending'}</span>{/if}
+    <span class="sp"></span>
+    <button class="btn quiet" disabled={busy || !native || !!consent || blockedConsent} onclick={discover}>Find OneDrive Folders</button>
+    <button class="btn" disabled={busy || !native || !!consent || blockedConsent} onclick={() => choose()}><Icon name="plus" />Add Folder…</button>
+  </header>
+  <div class="body">
+    {#if busy}<div class="inline-msg" role="status"><span class="spin" aria-hidden="true"></span><p>Waiting for the folder or server operation to finish…</p></div>{/if}
+    {#if message}<div class="inline-msg" role="status"><p>{message}</p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
+    {#if hints.length}
+      <div>
+        <div class="group-head"><h2 class="group-title">Known OneDrive folders</h2></div>
+        <div class="group">
+          {#each hints as hint, index (hint.path)}
+            <div class="row"><span class="ic" aria-hidden="true"><Icon name="cloud" /></span><span class="l"><b>{hint.label}</b><small>{hint.path}</small></span><button class="btn" disabled={busy || !!consent || blockedConsent} onclick={() => choose(index)}>Choose Folders…</button></div>
+          {/each}
         </div>
-      {/if}
-      <button class="text-button" disabled={busy} onclick={revoke}>Remove folder permission</button>
+      </div>
+    {/if}
+    <div>
+      <div class="group-head">
+        <h2 class="group-title">Approved folder</h2>
+        {#if consent && job}<button class="btn quiet" onclick={() => { detailsOpen = true; }}>Details</button>{/if}
+      </div>
+      <div class="group">
+        {#if consent}
+          <div class="row" class:top={!!job && !['complete', 'cancelled'].includes(job.state)} aria-label="Approved photo folder">
+            <span class="ic" aria-hidden="true"><Icon name="folder" /></span>
+            <span class="l">
+              <b>{consent.name}</b>
+              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {job ? `${jobLabel} · ${job.completed.toLocaleString()} of ${job.total.toLocaleString()} copies confirmed${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
+              {#if job && !['complete', 'cancelled'].includes(job.state)}<span class="progress" role="progressbar" aria-valuenow={percent(job.completed, job.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(job.completed, job.total)}%"></span></span>{/if}
+            </span>
+            {#if job}<span class="pill {jobTone}" role="status"><i aria-hidden="true"></i>{job.state === 'complete' ? 'Up to date' : jobLabel.replace('Copy ', '')}</span>{/if}
+            {#if !consent.registered}<button class="btn" disabled={busy} onclick={() => approve(true)}>Retry Registration</button>{/if}
+            {#if consent.registered && !job}<button class="btn primary" disabled={busy} onclick={prepareCopy}>Prepare Copy</button>{/if}
+            {#if needsAllowance}<button class="btn" disabled={busy} onclick={() => controlCopy('approve-upload')}>Approve {size(job!.additionalUploadAllowance)} more</button>{/if}
+            {#if canResume}<button class="btn primary" disabled={busy || job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : 'Resume'}</button>{/if}
+            {#if job?.state === 'copying'}<button class="btn" disabled={busy} onclick={() => controlCopy('pause')}><Icon name="pause" />Pause</button>{/if}
+            {#if job && !['complete', 'cancelled'].includes(job.state)}<button class="btn quiet" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel</button>{/if}
+            <button class="btn quiet" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove…</button>
+          </div>
+          {#if consent.registered && !job}
+            <div class="row"><span class="l"><small>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</small></span></div>
+          {/if}
+          {#if job?.code}<div class="row"><span class="l"><small role="status" class="danger-text">{explain(job.code)}</small></span></div>{/if}
+          {#if job?.state === 'cancelled'}<div class="row"><span class="l"><small>Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</small></span></div>{/if}
+        {:else if blockedConsent}
+          <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><span class="l"><b>A previous folder permission needs removing</b><small>It belongs to an earlier sign-in or no longer matches this connection.</small></span><button class="btn" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove Previous Permission…</button></div>
+        {:else if !folder}
+          <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="folder" /></span><span class="l"><b>No folder approved</b><small>Choose where to bring photos from. Local folders are separate from this computer’s AI processing permission.</small></span></div>
+        {/if}
+        {#if folder && !consent && !blockedConsent}
+          <div class="row top" aria-label="Selected folder preview">
+            <span class="ic" aria-hidden="true"><Icon name="folder" /></span>
+            <span class="l">
+              <b>{folder.path}</b>
+              <small>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}. {folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</small>
+              {#if folder.availability}<small aria-label="Preview file availability">{availabilityText(folder.availability)}</small>{/if}
+              <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={allowReads} disabled={busy} /> Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.</label>
+            </span>
+            <button class="btn quiet" disabled={busy} onclick={() => { folder = null; allowReads = false; }}>Clear</button>
+            <button class="btn primary" disabled={busy || !allowReads} onclick={() => approve()}>Approve Folder</button>
+          </div>
+        {/if}
+      </div>
+      <p class="foot">Originals stay in their folders. A copy counts only after your server verifies its stored bytes. Copy jobs require explicit folder approval and an unmetered connection. Cloud-only files may download while staging an approved original. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
     </div>
-  {:else if blockedConsent}
-    <button class="text-button" disabled={busy} onclick={revoke}>Remove previous folder permission</button>
-  {/if}
-  {#if folder && !consent && !blockedConsent}
-    <div class="folder-preview" aria-label="Selected folder preview">
-      <strong>{folder.path}</strong>
-      <p>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}.</p>
-      <p class="footnote">{folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</p>
-      {#if folder.availability}<p class="footnote" aria-label="Preview file availability">{availabilityText(folder.availability)}</p>{/if}
-      <label class="source-consent"><input type="checkbox" bind:checked={allowReads} disabled={busy}> Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.</label>
-      <button class="secondary" disabled={busy || !allowReads} onclick={() => approve()}>Approve this folder</button>
-      <button class="text-button" disabled={busy} onclick={() => { folder = null; allowReads = false; }}>Clear preview</button>
-    </div>
-  {/if}
-  <p class="footnote">Copy jobs require explicit folder approval and an unmetered connection. Cloud-only files may download while staging an approved original. External-library connections are still being implemented. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
+  </div>
 </section>
 
-<style>
-  .sources { margin-top: 36px; padding-top: 28px; border-top: 1px solid var(--border); }
-  p { color: var(--muted); line-height: 1.6; }
-  .actions { flex-wrap: wrap; margin-top: 16px; }
-  ul { padding: 0; list-style: none; }
-  li, .folder-preview { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); overflow-wrap: anywhere; }
-  .copy-job { margin: 16px 0; border-top: 1px solid var(--border); padding-top: 12px; }
-  progress { width: 100%; accent-color: var(--accent); }
-  .source-consent { display: flex; align-items: start; gap: 10px; margin: 16px 0; color: var(--muted); line-height: 1.6; }
-  .source-consent input { margin-top: 5px; flex-shrink: 0; }
-  small { display: block; color: var(--muted); margin: 6px 0; }
-</style>
+{#if revokeSheet}
+  <Sheet title={consent ? `Remove the permission for “${consent.name}”?` : 'Remove the previous folder permission?'} kind="warning" {busy} onclose={() => { revokeSheet = false; }} onsubmit={revoke}>
+    <p>Existing server copies are kept. Any copy in progress stops, and the folder has to be approved again before another copy.</p>
+    {#snippet actions()}
+      <button class="btn" type="button" disabled={busy} onclick={() => { revokeSheet = false; }}>Cancel</button>
+      <button class="btn danger" type="submit" disabled={busy}>Remove Permission</button>
+    {/snippet}
+  </Sheet>
+{/if}
+{#if detailsOpen && job}
+  <Sheet title="Copy details" wide onclose={() => { detailsOpen = false; }}>
+    <p>Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
+    <p>{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
+    {#if job.availability}<p aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
+    {#snippet actions()}<button class="btn" type="button" onclick={() => { detailsOpen = false; }}>Done</button>{/snippet}
+  </Sheet>
+{/if}

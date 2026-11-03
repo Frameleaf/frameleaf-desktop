@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 import { workerStatus, safeMode } from '../src/mode-state.ts';
 
 test('local setup commands are registered and permitted only in the packaged main window', () => {
@@ -18,6 +20,26 @@ test('local setup commands are registered and permitted only in the packaged mai
   assert.equal(capability.local, true);
   assert.deepEqual(capability.windows, ['main']);
   assert.equal(capability.remote, undefined);
+});
+
+test('every invoke() in the Svelte front end names a registered, permitted command', () => {
+  const { readdirSync, statSync } = require('node:fs');
+  const { join } = require('node:path');
+  const root = new URL('../src/', import.meta.url).pathname;
+  const files: string[] = [];
+  const walk = (dir: string) => { for (const entry of readdirSync(dir)) { const path = join(dir, entry); if (statSync(path).isDirectory()) walk(path); else if (path.endsWith('.svelte')) files.push(path); } };
+  walk(root);
+  const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
+  const handler = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8').match(/tauri::generate_handler!\[([\s\S]*?)\]/)?.[1] ?? '';
+  const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
+  const commands = new Set<string>();
+  for (const file of files) for (const match of readFileSync(file, 'utf8').matchAll(/\binvoke(?:<[^>]+>)?\(\s*['"]([a-z_]+)['"]/g)) commands.add(match[1]!);
+  for (const expected of ['discover_servers', 'server_summary', 'cloud_status', 'wallet_status', 'update_wallet', 'remote_status', 'update_remote', 'test_remote_access', 'open_external', 'tray_refresh', 'cloud_sign_in', 'cloud_account', 'cloud_sign_out', 'cloud_servers', 'connect_cloud_server']) assert.ok(commands.has(expected), `front end never calls ${expected}`);
+  for (const command of commands) {
+    assert.match(handler, new RegExp(`\\b${command}\\b`), `missing invoke handler: ${command}`);
+    assert.ok(manifest.includes(JSON.stringify(command)), `missing app command: ${command}`);
+    assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`), `missing permission: ${command}`);
+  }
 });
 
 test('persisted modes reject unknown values without treating them as hosting', () => {
