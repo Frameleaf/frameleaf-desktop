@@ -43,15 +43,17 @@ gh workflow run installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
   --ref main -f platforms=linux -f runtime_run_id=<successful-factory-run-id>
 ```
 
-`Signed desktop release` is manually dispatched from `main`. Its tag must already
+`Signed desktop release` is manually dispatched from `main`. A supplied tag must
 point to that exact workflow commit and match `package.json`, `Cargo.toml` and
-`tauri.conf.json`. It builds macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage by default.
+`tauri.conf.json`. An empty tag retains installer artifacts and skips draft staging.
+The default selection requests macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage.
+Intel macOS runtime dependencies are tracked in [FD-6](https://heroit.atlassian.net/browse/FD-6).
 Choose `all` to include Windows x86-64 NSIS/MSI after Azure Artifact Signing is configured,
 or `linux` to build both Linux architectures independently.
 
 The installer pipeline consumes factory-signed ML runtimes rather than exposing
 the Infisical Ed25519 release key to app-build jobs. Specify a successful
-non-pull-request `main` run in this repository containing these Actions artifacts:
+`factory-runtime.yml` dispatch from `main` in this repository containing these Actions artifacts:
 
 | Artifact | Required for |
 | --- | --- |
