@@ -11,5 +11,7 @@ security set-keychain-settings -lut 7200 "$keychain"
 security unlock-keychain -p "$password" "$keychain"
 security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
-security list-keychains -d user -s "$keychain" login.keychain-db
+security find-identity -v -p codesigning "$keychain" |
+  awk -F'"' -v identity="$APPLE_SIGNING_IDENTITY" '$2 == identity { matches++ } END { exit matches != 1 }'
+security list-keychains -d user -s "$keychain"
 rm "$RUNNER_TEMP/developer-id.p12"
