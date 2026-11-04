@@ -6,6 +6,10 @@ on:
         description: 'Reviewed immutable candidate and evidence approvals from the same successful signing run'
         required: true
         type: string
+      desktop_sha256:
+        description: 'Reviewed SHA-256 of the published Windows Desktop 0.1.1 EXE'
+        required: true
+        type: string
 permissions:
   contents: read
   actions: read
@@ -127,16 +131,18 @@ jobs:
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
-      - name: Exercise the companion with the published 0.1.0 Windows desktop
+      - name: Exercise the companion with the published 0.1.1 Windows desktop
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          DESKTOP_SHA256: ${{ inputs.desktop_sha256 }}
         run: |
-          $name = 'Frameleaf_0.1.0_x64-setup-unsigned.exe'
-          gh release download v0.1.0 --repo Frameleaf/frameleaf-desktop --pattern $name --dir $env:RUNNER_TEMP
+          if ($env:DESKTOP_SHA256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'Expected a reviewed desktop SHA-256' }
+          $name = 'Frameleaf_0.1.1_x64-setup-unsigned.exe'
+          gh release download v0.1.1 --repo Frameleaf/frameleaf-desktop --pattern $name --dir $env:RUNNER_TEMP
           if ($LASTEXITCODE) { throw 'Published desktop download failed' }
           $setup = Join-Path $env:RUNNER_TEMP $name
-          if ((Get-FileHash $setup).Hash.ToLowerInvariant() -cne 'b7b8c2f12ea85a0a135e51d9568b41dbc9b115b988c6c4cefcedd02aa04bd50a') { throw 'Published desktop identity changed' }
+          if ((Get-FileHash $setup).Hash.ToLowerInvariant() -cne $env:DESKTOP_SHA256) { throw 'Published desktop identity changed' }
           $destination = Join-Path $env:RUNNER_TEMP 'FrameleafWelcome'
           $install = Start-Process $setup -ArgumentList '/S', "/D=$destination" -PassThru -Wait
           if ($install.ExitCode) { throw 'Desktop installation failed' }
