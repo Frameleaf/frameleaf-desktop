@@ -91,7 +91,7 @@ export function managerError(error: unknown): string {
     server_address_invalid: 'Enter a valid Manager HTTPS address.',
     manager_rate_limited: 'Manager has temporarily limited requests. Wait before trying again.',
     credential_unlock_required: 'Unlock your saved sign-in with Touch ID or your Mac password.',
-  credential_store_locked_or_unavailable: 'Unlock your computer’s secure credential store, then try again.',
+    credential_store_locked_or_unavailable: 'Unlock your computer’s secure credential store, then try again.',
     credential_store_unavailable: 'Your computer’s secure credential store is unavailable. Manager access was not saved.',
     credential_record_invalid: 'The saved Manager record could not be read. Check your computer’s secure credential store.',
     native_runtime_busy: 'The server is starting or stopping. Let it finish before retrying the backup.',

@@ -185,7 +185,8 @@ async fn connect_server(
         return Err("sign_out_before_switching_servers".into());
     }
     let client = transport::client()?;
-    let (saved, mut view) = sign_in(&client, &server, &email, password, &device_name).await?;
+    let (saved, mut view) =
+        sign_in(&window, &client, &server, &email, password, &device_name).await?;
     if view.state == "preparing"
         && view.features.worker_session
         && start_worker_setup(&app, &saved, false).await.is_err()
@@ -199,6 +200,7 @@ async fn connect_server(
 }
 
 async fn sign_in(
+    window: &WebviewWindow,
     client: &reqwest::Client,
     server: &str,
     email: &str,
@@ -235,6 +237,7 @@ async fn sign_in(
             .await;
         return Err(error);
     }
+    credentials::confirm_new_sign_in("connection", &saved, window)?;
     let view = prepare_with_client(client, &mut saved).await;
     Ok((saved, view))
 }
@@ -304,9 +307,10 @@ async fn sign_out(
     app.state::<source_import::SourceJobs>().stop().await;
     app.state::<source_consent::SourceConsent>().clear()?;
     app.state::<worker_setup::WorkerSetup>().stop().await;
-    let saved = current
-        .clone()
-        .or(credentials::load::<SavedConnection>("connection")?);
+    let saved = match current.as_ref() {
+        Some(saved) => Some(saved.clone()),
+        None => credentials::load_interactive::<SavedConnection>("connection", &window, true)?,
+    };
     *current = None;
     drop(current);
     tray::refresh(&app).await;

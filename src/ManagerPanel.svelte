@@ -156,7 +156,7 @@
       manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: !http && pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery });
       pem = ''; fingerprint = ''; fingerprintPem = ''; certificateApproved = false;
       pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager);
-      await restore();
+      await restore(true);
       notice = 'This computer is paired with Manager. Its access works independently of photo sign-in.';
     });
   }

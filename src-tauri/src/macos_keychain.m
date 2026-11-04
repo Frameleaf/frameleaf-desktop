@@ -38,7 +38,7 @@ static OSStatus readModern(NSString *account, CFDataRef *output) {
 // Limit legacy lookup to exactly the user-domain default Keychain used by keyring 3.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-static OSStatus legacy(NSString *account, bool remove, bool interactive, NSData **value) {
+static OSStatus legacy(NSString *account, bool remove, bool interactive, NSData **value, NSData *expected) {
     Boolean previous;
     OSStatus status = SecKeychainGetUserInteractionAllowed(&previous);
     if (status) return status;
@@ -52,10 +52,15 @@ static OSStatus legacy(NSString *account, bool remove, bool interactive, NSData 
     if (!status) {
         status = SecKeychainFindGenericPassword(keychain, (UInt32)[service lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
             service.UTF8String, (UInt32)[account lengthOfBytesUsingEncoding:NSUTF8StringEncoding], account.UTF8String,
-            remove ? NULL : &size, remove ? NULL : &bytes, &item);
+            remove && !expected ? NULL : &size, remove && !expected ? NULL : &bytes, &item);
     }
     if (!status) {
-        if (remove) status = SecKeychainItemDelete(item);
+        if (remove) {
+            // An older installed version might have updated the classic record since migration.
+            if (!expected || (expected.length == size && !memcmp(bytes, expected.bytes, size)))
+                status = SecKeychainItemDelete(item);
+            else status = errSecDataNotAvailable;
+        }
         else *value = [NSData dataWithBytes:bytes length:size];
     }
     if (bytes) SecKeychainItemFreeContent(NULL, bytes);
@@ -72,9 +77,9 @@ static OSStatus readAccount(NSString *account, bool presence, bool interactive, 
     if (status != errSecItemNotFound && status != errSecSuccess) return status;
     if (status == errSecItemNotFound) {
         NSData *old = nil;
-        status = legacy(account, false, false, &old);
+        status = legacy(account, false, false, &old, nil);
         bool approvedLegacy = status == errSecInteractionNotAllowed && interactive;
-        if (approvedLegacy) status = legacy(account, false, true, &old);
+        if (approvedLegacy) status = legacy(account, false, true, &old, nil);
         if (status) return status;
         status = add(account, old, presence);
         if (status && status != errSecDuplicateItem) return status;
@@ -94,15 +99,10 @@ static OSStatus readAccount(NSString *account, bool presence, bool interactive, 
         }
     }
     // Resume an interrupted migration only after the new protected item is readable.
-    status = legacy(account, true, false, NULL);
-    if (status && status != errSecItemNotFound) {
-        CFRelease(*output);
-        *output = NULL;
-    } else {
-        [legacyCleared addObject:account];
-        status = errSecSuccess;
-    }
-    return status;
+    status = legacy(account, true, false, NULL, (__bridge NSData *)*output);
+    if (!status || status == errSecItemNotFound) [legacyCleared addObject:account];
+    // A locked legacy ACL delays cleanup, not a separately authorized modern read.
+    return errSecSuccess;
 }
 
 OSStatus frameleaf_keychain(unsigned operation, const char *name, bool presence, unsigned prompt,
@@ -121,6 +121,9 @@ OSStatus frameleaf_keychain(unsigned operation, const char *name, bool presence,
             OSStatus status;
             if (operation == 0) {
                 status = readAccount(account, presence, interactive, output);
+            } else if (operation == 3) {
+                // Verify the item just written; never consult a legacy item in its place.
+                status = readModern(account, output);
             } else if (operation == 1) {
                 NSData *value = [NSData dataWithBytesNoCopy:(void *)bytes length:size freeWhenDone:NO];
                 status = add(account, value, presence);
@@ -130,7 +133,7 @@ OSStatus frameleaf_keychain(unsigned operation, const char *name, bool presence,
                 }
             } else if (operation == 2) {
                 // Delete legacy first so an interrupted sign-out can never resurrect an old grant.
-                status = legacy(account, true, false, NULL);
+                status = legacy(account, true, false, NULL, nil);
                 if (!status || status == errSecItemNotFound)
                     status = SecItemDelete((__bridge CFDictionaryRef)query(account));
             } else {

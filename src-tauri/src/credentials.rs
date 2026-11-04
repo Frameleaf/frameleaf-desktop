@@ -50,14 +50,33 @@ pub fn load_interactive<T: DeserializeOwned>(
     retry: bool,
 ) -> Result<Option<T>, String> {
     let _lock = worker_lock(account)?;
-    let prompt = if !window.is_focused().unwrap_or(false) {
+    read_record(account, foreground_prompt(window, retry))
+}
+
+fn foreground_prompt(window: &tauri::WebviewWindow, retry: bool) -> Prompt {
+    if !window.is_focused().unwrap_or(false) {
         Prompt::Silent
     } else if retry {
         Prompt::Retry
     } else {
         Prompt::Foreground
-    };
-    read_record(account, prompt)
+    }
+}
+
+/// New user-presence items are added without a grant. Read the actual item once before
+/// using the sign-in so subsequent noninteractive refreshes inherit the authorized context.
+pub fn confirm_new_sign_in<T: Serialize>(
+    _account: &str,
+    _value: &T,
+    _window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        let bytes =
+            Zeroizing::new(serde_json::to_vec(_value).map_err(|_| "credential_record_invalid")?);
+        macos::confirm(_account, &bytes, foreground_prompt(_window, true))?;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", not(test)))]

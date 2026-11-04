@@ -55,6 +55,13 @@ pub(super) fn read<T: DeserializeOwned>(
         })
         .transpose()
 }
+pub(super) fn confirm(account: &str, expected: &[u8], prompt: Prompt) -> Result<(), String> {
+    let data = operation(3, account, prompt as u32, &[])?.ok_or("credential_record_invalid")?;
+    if data.bytes() != expected {
+        return Err("credential_record_invalid".into());
+    }
+    Ok(())
+}
 pub(super) fn write(account: &str, bytes: &[u8]) -> Result<(), String> {
     operation(1, account, 0, bytes).map(|_| ())
 }
@@ -69,6 +76,7 @@ mod tests {
     fn malformed_accounts_cannot_reach_any_native_keychain_operation() {
         let name = "bad\0account";
         assert!(read::<String>(name, Prompt::Silent).is_err());
+        assert!(confirm(name, b"fixture", Prompt::Silent).is_err());
         assert!(write(name, b"fixture").is_err());
         assert!(delete(name).is_err());
     }

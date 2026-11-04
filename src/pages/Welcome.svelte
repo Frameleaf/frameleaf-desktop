@@ -10,9 +10,9 @@
   import { mergeServers, initials, computerWord, platformFromUserAgent, type ServerEntry } from '../ui-state';
   import type { Connection, CloudAccount, CloudServer, DiscoveredServer } from '../server-types';
 
-  let { native, hostActive, cloudAccount, managerRevision, onconnected, oncloudaccount, onhostactive, onmanagerchange, onmanagerstate }: {
+  let { native, hostActive, cloudAccount, managerRevision, onlocked, onconnected, oncloudaccount, onhostactive, onmanagerchange, onmanagerstate }: {
     native: boolean; hostActive: boolean; cloudAccount: CloudAccount | null; managerRevision: number;
-    onconnected: (connection: Connection) => void; oncloudaccount: (account: CloudAccount | null) => void;
+    onlocked: () => void; onconnected: (connection: Connection) => void; oncloudaccount: (account: CloudAccount | null) => void;
     onhostactive: (active: boolean) => void; onmanagerchange: () => void; onmanagerstate: (paired: boolean) => void;
   } = $props();
   const platform = platformFromUserAgent(navigator.userAgent);
@@ -42,6 +42,7 @@
 
   let cloudLocked = $state(false);
   async function restoreCloud(retry = false) {
+    if (retry) failure = '';
     cloudBusy = true;
     try {
       const account = await invoke<CloudAccount | null>('cloud_account', { retry });
@@ -69,7 +70,7 @@
       const account = await invoke<CloudAccount>('cloud_sign_in');
       oncloudaccount(account); addressMode = false; notice = '';
       await loadServers();
-    } catch (error) { notice = ''; failure = explain(error); }
+    } catch (error) { cloudLocked = String(error) === 'credential_unlock_required'; notice = ''; failure = explain(error); }
     finally { cloudBusy = false; }
   }
   async function cloudSignOut() {
@@ -85,14 +86,14 @@
     busy = true; failure = ''; notice = '';
     const secret = password; password = '';
     try { onconnected(await invoke<Connection>('connect_server', { server, email, password: secret, deviceName })); }
-    catch (error) { failure = explain(error); }
+    catch (error) { if (String(error) === 'credential_unlock_required') onlocked(); failure = explain(error); }
     finally { busy = false; }
   }
   async function connectCloud(entry: ServerEntry) {
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
     try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName })); }
-    catch (error) { failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
+    catch (error) { if (String(error) === 'credential_unlock_required') onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {

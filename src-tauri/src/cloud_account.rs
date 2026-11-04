@@ -628,6 +628,7 @@ pub(crate) async fn cloud_sign_in(
         expires_at: now() + token.expires_in.unwrap_or(600),
     };
     store(&credential)?;
+    credentials::confirm_new_sign_in(CREDENTIAL, &credential, &window)?;
     match profile(&client, &credential, &token.access_token).await {
         Ok(account) => Ok(account),
         Err(error) => {
@@ -685,7 +686,7 @@ pub(crate) async fn cloud_sign_out(window: WebviewWindow) -> Result<(), String> 
     crate::require_local(&window)?;
     let credential = {
         let _held = LIFECYCLE.lock().await;
-        let Some(credential) = load()? else {
+        let Some(credential) = credentials::load_interactive(CREDENTIAL, &window, true)? else {
             return Ok(());
         };
         // Local authority ends first; the cloud is told best-effort.
@@ -971,6 +972,7 @@ pub(crate) async fn connect_cloud_server(
             .await;
         return Err(error);
     }
+    credentials::confirm_new_sign_in("connection", &saved, &window)?;
     let mut view = crate::prepare_with_client(&client, &mut saved).await;
     if view.state == "preparing"
         && view.features.worker_session
