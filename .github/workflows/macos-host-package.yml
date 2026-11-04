@@ -74,6 +74,9 @@ jobs:
           receipt="$base/Runtimes/$manifest/installation.json"
           helper="$base/Controllers/$manifest/$controller/frameleaf-native-host"
           test ! -e "$base"
+          uid=$(id -u)
+          test "$uid" -ge 501
+          test "$(stat -f %u /dev/console)" = "$uid"
           sudo installer -pkg "$PACKAGE" -target /
           jq -e --arg manifest "$manifest" --arg controller "$controller" '
             .schemaVersion==1 and .manifestSha256==$manifest and .controllerSha256==$controller
@@ -84,8 +87,6 @@ jobs:
           printf '%s  %s\n' "$controller" "$helper" | shasum -a 256 -c
           codesign --verify --strict "$helper"
           test "$(stat -f '%u:%Lp' "$receipt")" = 0:644
-          uid=$(id -u)
-          sudo "$helper" --provision-profile "$manifest" "$controller" "$uid"
           for leaf in state manager; do
             test "$(stat -f '%u:%Lp' "$base/Profiles/$uid/$leaf")" = "$uid:700"
           done
