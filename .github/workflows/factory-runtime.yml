@@ -6,7 +6,7 @@ on:
         description: 'Runtime targets (Windows can be built independently)'
         type: choice
         default: macos-linux
-        options: [macos-linux, all, linux, windows]
+        options: [macos-linux, all, linux, windows, macos-aarch64]
       epoch:
         description: 'Runtime epoch admitted by the release policy'
         type: string

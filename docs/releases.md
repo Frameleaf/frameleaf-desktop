@@ -174,6 +174,12 @@ and Tauri's [Windows signing guide](https://v2.tauri.app/distribute/sign/windows
 
 ## Dispatch
 
+For an Apple Silicon installer artifact, run the factory and signed desktop
+workflows on `main` with `platforms=macos-aarch64`. Pass the successful factory
+run ID to the signed workflow and leave the tag empty. After signing, notarization
+and embedded runtime verification, the DMG is available in the workflow artifact
+`signed-installers-macos-aarch64`. Draft release staging requires a tag.
+
 After the workflow is merged, factory packs and credentials are available, and
 the chosen version is ready for a candidate:
 

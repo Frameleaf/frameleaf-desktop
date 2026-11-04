@@ -16,11 +16,13 @@ export function validateFactoryRun(run, repository) {
 }
 
 export function releaseMatrix(platforms) {
+  const appleSilicon = { os: "macos-15", target: "macos-aarch64" };
+  if (platforms === "macos-aarch64") return { include: [appleSilicon] };
   if (!["macos-linux", "all", "linux", "windows"].includes(platforms))
     throw new Error("release_platforms_invalid");
   return { include: [
     ...(platforms !== "linux" && platforms !== "windows" ? [
-      { os: "macos-15", target: "macos-aarch64" },
+      appleSilicon,
       { os: "macos-15-intel", target: "macos-x86_64" },
     ] : []),
     ...(platforms === "all" || platforms === "windows" ? [{ os: "windows-2022", target: "windows-x86_64" }] : []),

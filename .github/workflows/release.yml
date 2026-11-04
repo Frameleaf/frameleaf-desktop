@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing main-branch tag matching all app versions (for example v0.1.0)'
-        required: true
+        description: 'Existing main-branch version tag for draft staging; leave empty for installer artifacts only'
+        required: false
         type: string
       runtime_run_id:
         description: 'Successful main-branch run containing factory-runtime-<target> artifacts (each contains runtime.tar)'
@@ -14,7 +14,7 @@ on:
         description: 'Release targets (Windows uses Azure Artifact Signing)'
         type: choice
         default: macos-linux
-        options: [macos-linux, all, linux]
+        options: [macos-linux, all, linux, macos-aarch64]
 permissions:
   contents: read
 concurrency:
@@ -48,22 +48,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node tools/release_inputs.mjs "$RELEASE_TAG"
+          revision="$GITHUB_SHA"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            node tools/release_inputs.mjs "$RELEASE_TAG"
+            test "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")" = "$revision"
+          fi
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
             appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS)) + "\n");
           '
           [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-          revision=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
-          test "$revision" = "$GITHUB_SHA"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
-          node --input-type=module -e '
+          factory_revision=$(node --input-type=module -e '
             import { readFileSync } from "node:fs";
-            const r = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json"));
-            if (r.conclusion !== "success" || r.head_branch !== "main" || r.event === "pull_request" || r.repository.full_name !== process.env.GITHUB_REPOSITORY)
-              throw new Error("release_runtime_run_untrusted");
-          '
+            import { validateFactoryRun } from "./tools/release_inputs.mjs";
+            console.log(validateFactoryRun(JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json")), process.env.GITHUB_REPOSITORY));
+          ')
+          git merge-base --is-ancestor "$factory_revision" "$revision"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
   build:
     needs: prepare
@@ -224,6 +226,7 @@ jobs:
           rm -f "$RUNNER_TEMP/developer-id.p12"
           if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
   stage:
+    if: inputs.tag != ''
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     permissions:
