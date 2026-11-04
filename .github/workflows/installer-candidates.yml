@@ -177,7 +177,25 @@ jobs:
             $exe = Join-Path $dest 'frameleaf-desktop.exe'
             if (!(Test-Path $exe)) { throw "Missing installed desktop in $dest" }
             if ((Get-AuthenticodeSignature -LiteralPath $exe).Status -ne 'NotSigned') { throw 'Expected unsigned desktop executable' }
-            if ((Get-FileHash $exe).Hash -ne (Get-FileHash 'src-tauri/target/release/frameleaf-desktop.exe').Hash) { throw 'Installed desktop bytes changed' }
+            @'
+          from pathlib import Path
+          import sys
+          actual = Path(sys.argv[1]).read_bytes()
+          built = Path('src-tauri/target/release/frameleaf-desktop.exe').read_bytes()
+          marker = b'__TAURI_BUNDLE_TYPE_VAR_'
+          installed_marker = marker + (b'MSI' if sys.argv[2] == '.msi' else b'NSS')
+          if actual != built:
+              for offset in range(len(actual)):
+                  if offset >= len(built) or actual[offset] != built[offset]:
+                      break
+              start = actual.rfind(marker, max(0, offset - len(marker) - 2), offset + 1)
+              if start < 0 or actual[start:start+len(installed_marker)] != installed_marker:
+                  raise SystemExit('Unexpected difference outside installer marker')
+              end = start + len(installed_marker)
+              if built[start:end] not in [marker + t for t in (b'MSI', b'NSS', b'UNK')] or actual[:start] != built[:start] or actual[end:] != built[end:]:
+                  raise SystemExit('Installed executable differs beyond Tauri bundle type')
+          '@ | python - "$exe" "$($package.Extension)"
+            if ($LASTEXITCODE) { throw 'Installed executable check failed' }
             $env:QA_RUNTIME = Join-Path $dest 'native-runtime'
             node --input-type=module -e "import {packageConfiguration} from './tools/package_desktop.mjs'; await packageConfiguration(process.env.QA_RUNTIME)"
             if ($LASTEXITCODE) { throw 'Installed runtime validation failed' }
