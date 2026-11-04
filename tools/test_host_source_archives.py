@@ -35,6 +35,7 @@ class HostSourceArchiveTests(unittest.TestCase):
                 "packages/locked-crypto/dist/fixture.js",
                 "packages/patches/fixture", "packages/plugin-core/fixture", "packages/ui/fixture",
                 "packages/justified-layout-wasm/fixture", "web/fixture", "i18n/fixture", "licenses/fixture",
+                "manager/src/fixture.ts", "manager/import-rename.c",
                 "studio/runtime/fixture", "studio/tools/fixture", "server/resources/studio-fonts/fixture",
                 "server/src/utils/studio-fonts.generated.ts", "docker/scripts/verify-server-package.mjs",
                 "scripts/frameleaf-studio-contracts.mjs", "scripts/frameleaf-studio-rights.mjs",

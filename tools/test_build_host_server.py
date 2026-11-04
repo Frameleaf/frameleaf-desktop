@@ -31,6 +31,8 @@ class HostServerTests(unittest.TestCase):
                 "packages/sql-tools/fixture": b"fixture", "packages/patches/fixture": b"fixture",
                 "packages/locked-crypto/dist/index.js": b"export const fixture = true;\n",
                 "server/src/schema/catalog/fixture.json": canonical,
+                "manager/src/fixture.ts": canonical,
+                "manager/import-rename.c": canonical,
                 "studio/runtime/fixture": b"fixture", "studio/tools/fixture": b"fixture",
                 "docker/scripts/verify-server-package.mjs": b"fixture",
             }
