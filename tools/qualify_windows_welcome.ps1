@@ -9,6 +9,7 @@ $all = [System.Windows.Automation.Condition]::TrueCondition
 
 function Wait-Control([string]$Name, [switch]$Radio, [string]$Type, [int]$Seconds = 45, [switch]$PollOperation) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
+    $nextOperationCheck = 0
     do {
         $app.Refresh()
         if ($app.HasExited) { throw "Installed app exited with code $($app.ExitCode)" }
@@ -23,10 +24,13 @@ function Wait-Control([string]$Name, [switch]$Radio, [string]$Type, [int]$Second
                 } elseif ($label -ceq $Name -and (!$Type -or ($control.Current.ControlType.ProgrammaticName -eq "ControlType.$Type" -and $control.Current.IsEnabled))) { return $control }
             }
         }
-        if ($PollOperation) {
+        if ($PollOperation -and $timer.Elapsed.TotalSeconds -ge $nextOperationCheck) {
             $check = $controls | Where-Object { $_.Current.Name -ceq 'Check' -and $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.IsEnabled } | Select-Object -First 1
-            if ($check) { $check.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
-            Start-Sleep -Seconds 2
+            if ($check) {
+                $check.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                # Leave room for all lifecycle requests in Manager's ten-minute rate limit.
+                $nextOperationCheck = $timer.Elapsed.TotalSeconds + 15
+            }
         }
         Start-Sleep -Milliseconds 350
     } while ($timer.Elapsed.TotalSeconds -lt $Seconds)
