@@ -223,6 +223,26 @@ class LinuxHostDebTests(unittest.TestCase):
             with self.assertRaises(BuildError):
                 stage_packages(candidate, controller, root / 'invalid', 'a' * 64, digest, 'amd64\nDepends: bad')
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX permissions')
+    def test_debian_studio_browser_gets_a_manifest_bound_apparmor_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            candidate, controller, digest = self.fixture(root)
+            browser = candidate / 'payload/browser/chromium-headless-shell'
+            browser.parent.mkdir()
+            browser.write_bytes(b'fixture browser')
+            browser.chmod(0o700)
+            manifest = 'a' * 64
+            bootstrap, runtime = stage_packages(candidate, controller, root / 'out', manifest, digest, 'amd64')
+            policy = Path('etc/apparmor.d') / ('frameleaf-studio-' + manifest)
+            self.assertFalse((bootstrap / policy).exists())
+            self.assertIn(f'/opt/frameleaf/Runtimes/{manifest}/payload/browser/chromium-headless-shell flags=(unconfined)', (runtime / policy).read_text())
+            self.assertIn('userns,', (runtime / policy).read_text())
+            self.assertEqual((runtime / 'DEBIAN/conffiles').read_text(), '/' + policy.as_posix() + '\n')
+            hook = (runtime / 'DEBIAN/postinst').read_text()
+            self.assertLess(hook.index('/usr/sbin/apparmor_parser'), hook.index(' --finalize-install'))
+            subprocess.run(['/bin/sh', '-n', runtime / 'DEBIAN/postinst'], check=True)
+
     @unittest.skipUnless(os.name == 'posix', 'requires POSIX shell')
     def test_hooks_fence_before_replacement_and_preserve_refusals_and_data(self):
         with tempfile.TemporaryDirectory() as temp:

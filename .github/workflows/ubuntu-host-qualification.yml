@@ -1,0 +1,81 @@
+name: Qualify the installed Ubuntu companion browser
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Approved draft release asset ID, release ID, archive SHA-256, manifest SHA-256 and controller SHA-256 as JSON
+        required: true
+        type: string
+permissions: {}
+jobs:
+  installed-browser:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    environment: desktop-release
+    permissions:
+      # GitHub requires write access to retrieve unpublished release assets.
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify and install the approved companion packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            keys == ["archiveSha256","assetId","controllerSha256","manifestSha256","releaseId"] and
+            ([.assetId,.releaseId] | all(type=="number" and .>0 and .==floor)) and
+            ([.archiveSha256,.controllerSha256,.manifestSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
+          ' <<< "$APPROVAL" >/dev/null
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          asset=$(jq -r .assetId <<< "$APPROVAL")
+          digest=$(jq -r .archiveSha256 <<< "$APPROVAL")
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+            .draft == true and any(.assets[]; .id == $asset and .digest == $digest and .size > 0 and .size < 2147483648)
+          ' >/dev/null
+          archive="$RUNNER_TEMP/ubuntu-host-packages.tar.gz"
+          packages="$RUNNER_TEMP/ubuntu-host-packages"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
+          mkdir -m 700 "$packages"
+          PYTHONPATH=tools python3 -c 'from pathlib import Path; from build_host_ffmpeg import unpack; import sys; unpack(Path(sys.argv[1]),Path(sys.argv[2]))' "$archive" "$packages"
+          test "$(find "$packages" -mindepth 1 -printf '%P\n' | sort)" = "$(printf 'bootstrap.deb\nruntime.deb')"
+          test "$(dpkg-deb -f "$packages/bootstrap.deb" Package)" = "frameleaf-host-bootstrap-$controller"
+          test "$(dpkg-deb -f "$packages/runtime.deb" Package)" = "frameleaf-host-runtime-$manifest"
+          sudo apt-get update -qq
+          sudo apt-get install -y apparmor "$packages/bootstrap.deb" "$packages/runtime.deb"
+          runtime="/opt/frameleaf/Runtimes/$manifest"
+          jq -e --arg manifest "$manifest" --arg controller "$controller"             '.manifestSha256 == $manifest and .controllerSha256 == $controller' "$runtime/installation.json" >/dev/null
+          echo "FRAMELEAF_TEST_RUNTIME=$runtime" >> "$GITHUB_ENV"
+      - name: Render with the installed Chromium sandbox under AppArmor
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          manifest=${FRAMELEAF_TEST_RUNTIME##*/}
+          payload="$FRAMELEAF_TEST_RUNTIME/payload"
+          sudo aa-enabled --quiet
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo aa-status --json | jq -e --arg name "frameleaf-studio-$manifest" '.profiles | has($name)' >/dev/null
+          test "$(id -u)" -ne 0
+          env -i HOME="$HOME" PATH=/usr/bin:/bin             FRAMELEAF_STUDIO_NODE="$payload/node"             FRAMELEAF_STUDIO_CHROMIUM="$payload/browser/chrome-headless-shell"             FRAMELEAF_STUDIO_BROWSER_GUARD="$payload/studio/guard/studio-browser-guard"             timeout 10m "$payload/node" --input-type=module - "$payload" <<'JS'
+          import assert from 'node:assert/strict';
+          import { join } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const root = process.argv[2];
+          const { createEngineRenderer } = await import(pathToFileURL(join(root, 'studio/tools/bundled-worker-renderer.mjs')));
+          const signal = AbortSignal.timeout(540_000);
+          const renderer = await createEngineRenderer({
+            ffmpeg: join(root, 'media-tools/ffmpeg'),
+            ffprobe: join(root, 'media-tools/ffprobe'),
+            signal,
+          });
+          const result = await renderer.conformance({ signal });
+          assert.ok(result.formats.includes('mp4-h264'));
+          console.log(JSON.stringify(result));
+          JS

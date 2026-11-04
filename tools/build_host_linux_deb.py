@@ -18,6 +18,7 @@ from relocate_linux import search_directories
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE = Path('opt/frameleaf')
+STUDIO_BROWSER = Path('browser/chromium-headless-shell')
 
 
 def package_names(manifest: str, controller: str) -> tuple[str, str]:
@@ -25,7 +26,7 @@ def package_names(manifest: str, controller: str) -> tuple[str, str]:
     return 'frameleaf-host-bootstrap-' + controller, 'frameleaf-host-runtime-' + manifest
 
 
-def installer_scripts(manifest: str, controller: str) -> dict[str, dict[str, str]]:
+def installer_scripts(manifest: str, controller: str, studio_apparmor: bool = False) -> dict[str, dict[str, str]]:
     package_names(manifest, controller)
     bootstrap = '/opt/frameleaf/Bootstrap/' + controller
     runtime = '/opt/frameleaf/Runtimes/' + manifest
@@ -61,9 +62,17 @@ file() { [ -f "$1" ] || exit 65; protected "$1"; [ "$(/usr/bin/stat -c %h -- "$1
     retained = 'if [ -e ' + receipt + ' ] || [ -L ' + receipt + ' ]; then\n'
     retained += 'for path in / /opt /opt/frameleaf /opt/frameleaf/Runtimes ' + runtime + '; do directory "$path"; done\n'
     retained += 'file ' + receipt + '\nfile ' + fence + '\n[ "$(/usr/bin/stat -c %s -- ' + fence + ')" = 0 ] || exit 65\n/bin/rm -- ' + receipt + '\nfi\n'
+    load_policy = ''
+    if studio_apparmor:
+        policy = '/etc/apparmor.d/frameleaf-studio-' + manifest
+        load_policy = (
+            'if /usr/bin/aa-enabled --quiet 2>/dev/null; then\n'
+            'directory /etc\ndirectory /etc/apparmor.d\nfile ' + policy + '\n'
+            '/usr/sbin/apparmor_parser --replace --skip-cache ' + policy + '\nfi\n'
+        )
     runtime_hooks = {
         'preinst': header + 'case "${1:-}" in install|upgrade) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --prepare-linux-package' + ids,
-        'postinst': header + 'case "${1:-}" in configure|abort-upgrade|abort-remove|abort-deconfigure) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --finalize-install' + ids,
+        'postinst': header + 'case "${1:-}" in configure|abort-upgrade|abort-remove|abort-deconfigure) ;; *) exit 64 ;; esac\n' + verify + load_policy + invoke + ' --finalize-install' + ids,
         # A failed old prerm must never become permission to unpack over live code.
         'prerm': header + 'case "${1:-}" in remove|upgrade|deconfigure) ;; *) exit 64 ;; esac\n' + verify + invoke + ' --prepare-linux-package' + ids,
         'postrm': header + 'case "${1:-}" in remove|purge|upgrade) ;; failed-upgrade|abort-install|abort-upgrade) exit 0 ;; *) exit 64 ;; esac\n' + retained,
@@ -95,14 +104,28 @@ def stage_packages(candidate: Path, controller: Path, output: Path, manifest_has
         path.chmod(0o755)
         if sha256(path) != controller_hash:
             raise BuildError('host_install_controller_changed')
+    browser = resource / 'payload' / STUDIO_BROWSER
+    studio_apparmor = browser.is_file()
+    if studio_apparmor:
+        policy = Path('etc/apparmor.d') / ('frameleaf-studio-' + manifest_hash)
+        (runtime / policy).parent.mkdir(parents=True)
+        (runtime / policy).write_text(
+            'abi <abi/4.0>,\ninclude <tunables/global>\n'
+            f'profile {policy.name} /{browser.relative_to(runtime)} flags=(unconfined) {{\n'
+            '    userns,\n}\n'
+        )
+    scripts = installer_scripts(manifest_hash, controller_hash, studio_apparmor)
     for role, tree, name in zip(['bootstrap', 'runtime'], [bootstrap, runtime], names):
         metadata = tree / 'DEBIAN'
         metadata.mkdir()
         control = f'Package: {name}\nVersion: 1\nArchitecture: {architecture}\nMaintainer: Frameleaf <support@frameleaf.app>\nSection: graphics\nPriority: optional\nDescription: Frameleaf private native host {role} candidate\n'
         if role == 'runtime':
             control += 'Pre-Depends: ' + names[0] + ' (= 1)\n'
+            if studio_apparmor:
+                control += 'Recommends: apparmor (>= 4.0)\n'
+                (metadata / 'conffiles').write_text('/' + policy.as_posix() + '\n')
         (metadata / 'control').write_text(control)
-        for hook, text in installer_scripts(manifest_hash, controller_hash)[role].items():
+        for hook, text in scripts[role].items():
             (metadata / hook).write_text(text)
             (metadata / hook).chmod(0o755)
         for path in tree.rglob('*'):
