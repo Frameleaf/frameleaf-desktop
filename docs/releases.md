@@ -125,21 +125,24 @@ then create a **Public Trust** certificate profile. The provisioned account is
 `frameleaf`, resource group `frameleaf-signing`, East US, Basic tier
 (US$9.99/month, 5,000 signatures included; US$0.005 per additional signature).
 The subscription was upgraded to pay-as-you-go and the signing account deployed
-successfully on November 2, 2026. Its tenant, subscription, endpoint and account
-values are provisioned in GitHub's `desktop-release` environment. Identity
-validation, acceptance of the Artifact Signing service terms, the Identity
-Verifier role, a Public Trust profile and the GitHub signing identity remain
-outstanding; live signing is not yet qualified.
+successfully on November 2, 2026. GitHub's `desktop-release` environment has the
+tenant, subscription, endpoint, signing account and client ID.
 
-Create a dedicated Entra application/service principal for this repository with
-one federated credential:
+Microsoft lists the public identity validation for Frameleaf Inc. as **Action
+Required**. The named representative must complete Microsoft's verification.
+Once approved, create the Public Trust profile, set `AZURE_SIGNING_PROFILE` and
+`WINDOWS_SIGNING_SUBJECT`, and qualify a signed Windows installer candidate.
+
+The dedicated single-tenant Entra application `frameleaf-desktop-windows-signing`
+has one federated credential, `github-desktop-release`. GitHub uses immutable
+organization and repository IDs in this repository's subject.
 
 - Issuer: `https://token.actions.githubusercontent.com`
 - Audience: `api://AzureADTokenExchange`
-- Subject: `repo:Frameleaf/frameleaf-desktop:environment:desktop-release`
+- Subject: `repo:Frameleaf@331460878/frameleaf-desktop@1421136454:environment:desktop-release`
 
 Assign only **Artifact Signing Certificate Profile Signer** at the certificate
-profile scope. Keep the existing GitHub environment's deployment policy restricted
+profile scope once the profile exists. Keep the existing GitHub environment's deployment policy restricted
 to the `main` branch. Do not add pull-request or wildcard federated subjects.
 The manual Windows candidate and release jobs use that environment. The ordinary
 pull-request smoke build stays unsigned and receives no Azure identity.
