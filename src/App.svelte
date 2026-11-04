@@ -2,203 +2,167 @@
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { workerStatus, runtimeRecoveryMessage } from './mode-state';
   import mark from './mark.svg';
-  import PhotoSources from './PhotoSources.svelte';
-  import ManagerPanel from './ManagerPanel.svelte';
-  import LocalHost from './LocalHost.svelte';
+  import Icon from './Icon.svelte';
+  import Sheet from './Sheet.svelte';
+  import Welcome from './pages/Welcome.svelte';
+  import Overview from './pages/Overview.svelte';
+  import PhotoSourcesPage from './pages/PhotoSources.svelte';
+  import Manager from './pages/Manager.svelte';
+  import Backups from './pages/Backups.svelte';
+  import Cloud from './pages/Cloud.svelte';
+  import Wallet from './pages/Wallet.svelte';
+  import Remote from './pages/Remote.svelte';
+  import { initials, hostOf } from './ui-state';
+  import { connectionError } from './errors';
+  import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
 
-  type Connection = { server: string; name: string; mode: string; state: string; features: { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean } };
-  let mode = $state<'client-worker' | 'local-server'>('client-worker');
+  type Page = 'overview' | 'sources' | 'ai' | 'manager' | 'backups' | 'cloud' | 'wallet' | 'remote';
+  const native = isTauri();
   let connection = $state<Connection | null>(null);
-  let server = $state('');
-  let email = $state('');
-  let password = $state('');
-  let deviceName = $state('My computer');
-  let busy = $state(false);
+  let setup = $state<SetupStatus | null>(null);
+  let summary = $state<ServerSummary | null>(null);
+  let cloudAccount = $state<CloudAccount | null>(null);
   let hostActive = $state(false);
   let managerRevision = $state(0);
-  let notice = $state('');
+  let managerPaired = $state(false);
+  let page = $state<Page>('overview');
+  let busy = $state(false);
   let failure = $state('');
-  type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: { workload: string; state: string; modelNames: string[]; code: string | null }[] };
-  let setup = $state<SetupStatus | null>(null);
-  const setupState = $derived(setup?.state || connection?.state || '');
-  const setupDetail = $derived(runtimeRecoveryMessage(setup?.code ?? null) ?? (setup?.code === 'runtime_pack_unavailable'
-    ? 'This build does not include a signed AI runtime yet. Photos remain available.'
-    : setup?.state === 'model-download-required'
-    ? 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks.'
-    : setup?.state === 'reconnecting'
-    ? 'Waiting for a secure connection to your server. This computer will recheck its session, models and resources before processing again.'
-    : setup?.state === 'pausing'
-    ? 'The current bounded task will finish, then this computer will stop requesting work.'
-    : setup?.state === 'stopped'
-    ? 'AI processing is stopped on this computer. Resume whenever you are ready. Photos remain available.'
-    : setup?.state === 'paused'
-    ? ({ system_resumed: 'This computer resumed or its clock changed. Rechecking the selected models before more work.', user_paused: 'Paused by you. This computer will stay paused after reopening the app.', on_battery: 'Plug in this computer to continue AI processing.', power_unknown: 'Power status could not be read. AI processing is paused.', metered_network: 'AI processing pauses on metered networks. Photos remain available.', network_unknown: 'Network cost could not be determined. AI processing is paused.', memory_low: 'Waiting for enough memory for the selected model.', memory_unknown: 'Memory status could not be read. AI processing is paused.' } as Record<string, string>)[setup.code ?? ''] ?? 'AI processing is paused.'
-    : setup?.state === 'qualified'
-    ? 'The selected models passed this computer’s checks.'
-    : setup?.state === 'starting-worker'
-    ? 'Starting the checked models locally before requesting work from your server.'
-    : setup?.state === 'working'
-    ? 'This computer can process one selected AI task at a time while power, network and memory allow.'
-    : setup?.state === 'waiting-for-work'
-    ? 'Connected and waiting for your server to send AI work.'
-    : setup?.state === 'qualifying'
-    ? 'Running the selected models locally and checking the results with your server.'
-    : setup?.state === 'preparing-models'
-    ? 'Verifying the selected model files. You can keep using Photos while this runs.'
-    : setup?.state === 'preparing-runtime'
-    ? 'Checking the signed runtime included with this app.'
-    : setup?.state === 'setup-needs-attention'
-    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : ''));
-  const native = isTauri();
-  const errors: Record<string, string> = {
-    local_host_active: 'Stop local management before connecting to another server.',
-    worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
-    server_requires_https_origin: 'Enter your server’s HTTPS address without a path or sign-in details.',
-    server_address_invalid: 'Enter a valid HTTPS server address.',
-    server_identity_not_confirmed: 'Sign in again to confirm this server’s identity. Clear the saved sign-in first.',
-    server_unreachable_or_certificate_invalid: 'Could not securely connect. Check the server address, network and certificate.',
-    server_http_401: 'Sign-in expired or the email and password are incorrect. Sign out and try again.',
-    server_http_403: 'Your server did not permit this sign-in.',
-    credential_store_locked_or_unavailable: 'Unlock your computer’s credential store, then try again.',
-    credential_store_unavailable: 'The secure credential store is unavailable on this computer.',
-    sign_out_before_switching_servers: 'Sign out before connecting to another server.',
-    account_identity_changed: 'This session no longer matches the saved account. Sign out before continuing.',
-    device_details_invalid: 'Enter a computer name between 1 and 128 characters.',
-  };
-  function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check your connection and try again.'; }
+  let notice = $state('');
+  let accountMenu = $state(false);
+  let signOutSheet = $state(false);
+  // A sign-in left in the credential store with no connection shown (restore failed, or sign-out could not delete it):
+  // native connect refuses until it is cleared, so the clear action stays reachable.
+  let staleSignIn = $state(false);
+  const isAdmin = $derived(summary?.me?.isAdmin === true);
+  const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
+  const explain = connectionError;
+  let summaryRequest = 0; // bumped per request and on every sign-in and sign-out: only the latest reply applies
+  async function loadSummary() {
+    if (!native || !connection) { summary = null; return; }
+    // A superseded reply (a newer refresh, or a sign-in or sign-out since) is dropped.
+    const asked = ++summaryRequest;
+    const result = await invoke<ServerSummary>('server_summary').catch(() => null);
+    if (summaryRequest === asked) summary = result;
+    void invoke('tray_refresh').catch(() => {});
+  }
   onMount(() => {
     if (!native) return;
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
+    const unlisten: UnlistenFn[] = [];
     void (async () => {
       busy = true;
       try {
-        unlisten = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
-        if (disposed) { unlisten(); return; }
+        unlisten.push(await listen<SetupStatus>('worker-setup', event => { setup = event.payload; }));
+        unlisten.push(await listen<string>('tray-action-failed', event => {
+          failure = explain(event.payload);
+          void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
+        }));
+        if (disposed) { unlisten.forEach(stop => stop()); return; }
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
         hostActive = host.backgroundActive;
-        if (hostActive) mode = 'local-server';
-        connection = await invoke<Connection | null>('restore_connection');
+        connection = await invoke<Connection | null>('restore_connection').catch(error => { staleSignIn = true; throw error; });
         setup = await invoke<SetupStatus>('worker_setup_status');
+        await loadSummary();
       } catch (error) { failure = explain(error); }
       finally { busy = false; }
     })();
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
-  async function connect(event: SubmitEvent) {
-    event.preventDefault(); busy = true; failure = ''; notice = '';
-    const secret = password; password = ''; setup = null;
-    try { connection = await invoke<Connection>('connect_server', { server, email, password: secret, deviceName }); }
-    catch (error) { failure = explain(error); }
+  function connected(view: Connection) {
+    summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false;
+    void loadSummary();
+    void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
+  }
+  async function signOut() {
+    busy = true; failure = '';
+    try {
+      const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
+      summaryRequest += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
+      notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
+      void invoke('tray_refresh').catch(() => {});
+    } catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
   async function photos() {
     failure = '';
     try { await invoke('open_photos'); } catch (error) { failure = explain(error); }
   }
-  async function signOut() {
-    busy = true; failure = '';
-    try {
-      const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out'); connection = null; setup = null;
-      notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
-    } catch (error) { failure = explain(error); }
-    finally { busy = false; }
-  }
-  async function controlWorker(control: 'running' | 'paused' | 'stopped') {
-    busy = true; failure = '';
-    try { setup = await invoke<SetupStatus>('control_worker', { control }); }
-    catch (error) {
-      failure = explain(error);
-      setup = await invoke<SetupStatus>('worker_setup_status').catch(() => setup);
-    }
-    finally { busy = false; }
-  }
-  async function prepareModels(allowDownload: boolean) {
-    busy = true; failure = '';
-    try { await invoke('prepare_models', { allowDownload }); }
-    catch (error) { failure = explain(error); }
-    finally { busy = false; }
-  }
-  async function checkApproval() {
-    busy = true; failure = '';
-    try {
-      connection = await invoke<Connection | null>('restore_connection');
-      setup = await invoke<SetupStatus>('worker_setup_status');
-    } catch (error) { failure = explain(error); }
-    finally { busy = false; }
-  }
+  function go(target: Page) { page = target; accountMenu = false; }
+  const nav: { section: string; items: { id: Page; label: string; icon: string }[]; admin?: boolean }[] = [
+    { section: 'My computer', items: [{ id: 'overview', label: 'Overview', icon: 'overview' }, { id: 'sources', label: 'Photo sources', icon: 'sources' }, { id: 'ai', label: 'AI processing', icon: 'ai' }] },
+    { section: 'Server', items: [{ id: 'manager', label: 'Manager', icon: 'server' }, { id: 'backups', label: 'Backups', icon: 'backup' }] },
+    { section: 'Frameleaf Cloud', admin: true, items: [{ id: 'cloud', label: 'Account & plan', icon: 'cloud' }, { id: 'wallet', label: 'AI credit', icon: 'wallet' }, { id: 'remote', label: 'Remote access', icon: 'globe' }] },
+  ];
 </script>
 
 <svelte:head><title>Frameleaf</title></svelte:head>
+<svelte:window onpointerdown={event => { if (accountMenu && !(event.target as Element | null)?.closest?.('.acct-wrap')) accountMenu = false; }} />
 <div class="app">
-  <aside>
-    <div class="brand"><img src={mark} alt="" /><span>Frameleaf</span></div>
-    <div class="rail-label">On your computer</div>
-    <div class="rail-item active">{connection ? 'My computer' : 'Get started'}</div>
-    <div class="rail-footer">Your photos.<br />Your server.<br />A little more power.</div>
-  </aside>
-  <main>
-    {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
-    {#if failure}<div class="message error" role="alert">{failure}<button class="text-button" disabled={busy || !native} onclick={signOut}>Clear saved sign-in</button></div>{/if}
-    {#if notice}<p class="message" role="status">{notice}</p>{/if}
-    {#if connection}
-      <p class="eyebrow">Connected to {connection.server}</p>
-      <h1>Welcome back,<br />{connection.name}.</h1>
-      <p class="intro">Your photos and server are right here. This computer’s processing status stays visible below.</p>
-      <section class="status-panel" aria-label="Computer processing status">
-        <div class="status-heading"><span class="status-dot"></span><h2>{connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : workerStatus({ state: setupState, workerSupported: connection.features.worker })}</h2></div>
-        <p>{setupDetail || (connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : 'AI processing starts only after the server supports desktop workers and the selected models pass qualification.')}</p>
-        {#if setup?.workloads?.length}
-          <ul aria-label="AI processing by task">
-            {#each setup.workloads as workload (workload.workload)}
-              <li><strong>{{ clip: 'Smart search', ocr: 'Text recognition', face: 'Face recognition', enrichment: 'Photo descriptions and safety' }[workload.workload] || workload.workload}:</strong>
-                {{ eligible: 'Waiting for qualification', qualifying: 'Checking this computer', ready: 'Ready to help', disabled: 'Disabled on your server', pinned: 'Uses your chosen server destination', legacy: 'Uses your existing server destination', unavailable: 'Unavailable on this computer; other tasks can continue', unsupported: 'Selected model is not supported on this computer yet' }[workload.state] || workload.state}
-              </li>
+  {#if connection}
+    <nav class="sidebar" aria-label="Sidebar">
+      <div class="drag" data-tauri-drag-region></div>
+      <div class="brand" data-tauri-drag-region><img src={mark} alt="" />Frameleaf</div>
+      <div class="nav-list">
+        {#each nav as group (group.section)}
+          {#if !group.admin || isAdmin}
+            <div class="sec">{group.section}</div>
+            {#each group.items as item (item.id)}
+              <button class="nav-item" class:on={page === item.id} aria-current={page === item.id ? 'page' : undefined} onclick={() => go(item.id)}>
+                <Icon name={item.icon} />{item.label}
+                {#if item.id === 'manager' && managerPaired}<span class="dot" aria-label="Paired"></span>{/if}
+                {#if item.id === 'overview' && attentionCount}<span class="badge" aria-label="{attentionCount} items need attention">{attentionCount}</span>{/if}
+              </button>
             {/each}
-          </ul>
-        {/if}
-        {#if setup?.state === 'model-download-required'}<button class="secondary" disabled={busy} onclick={() => prepareModels(true)}>Download selected AI models</button>{/if}
-        {#if connection.state === 'awaiting-approval'}<button class="secondary" disabled={busy || !native} onclick={checkApproval}>Check approval</button>{/if}
-        {#if setup?.state === 'setup-needs-attention'}<button class="text-button" disabled={busy} onclick={() => prepareModels(false)}>Retry AI setup</button>{/if}
-        {#if connection.mode === 'client-worker' && connection.features.workerSession}
-          <div class="actions" aria-label="AI worker controls">
-            {#if setup?.control === 'paused' || setup?.control === 'stopped'}
-              <button class="secondary" disabled={busy} onclick={() => controlWorker('running')}>Resume AI processing</button>
-            {:else}
-              <button class="secondary" disabled={busy} onclick={() => controlWorker('paused')}>Pause after current task</button>
-            {/if}
-            <button class="text-button" disabled={busy || setup?.control === 'stopped'} onclick={() => controlWorker('stopped')}>Stop now</button>
-          </div>
-        {/if}
-        <div class="facts"><div><span>Connection</span><strong>Encrypted</strong></div><div><span>AI processing</span><strong>{setupState === 'working' ? 'Available' : setupState === 'pausing' ? 'Finishing current task' : 'Not running'}</strong></div></div>
-      </section>
-      <div class="actions"><button class="primary" onclick={photos} disabled={busy || connection.state === 'identity-changed'}>Open Frameleaf Photos</button><button class="secondary" onclick={signOut} disabled={busy}>Sign out</button></div>
-      <p class="footnote">Server administration uses your existing Frameleaf permissions inside Photos. Host controls require a separately paired Manager.</p>
-      <PhotoSources />
-    {:else}
-      <p class="eyebrow">Frameleaf Desktop</p>
-      <h1>Make yourself<br />at home.</h1>
-      <p class="intro">Keep everything on this computer, or connect to your server and put your computer to work.</p>
-      <fieldset class="modes" disabled={busy || hostActive}>
-        <legend>How would you like to use Frameleaf?</legend>
-        <label class:selected={mode === 'client-worker'}><input type="radio" bind:group={mode} value="client-worker" /><span><strong>Connect to my server</strong><small>Photos, server management and help with AI processing.</small></span></label>
-        <label class:selected={mode === 'local-server'}><input type="radio" bind:group={mode} value="local-server" /><span><strong>Run Frameleaf here</strong><small>Host your photo library on this computer.</small></span></label>
-      </fieldset>
-      {#if mode === 'local-server'}
-        <LocalHost onactive={(active) => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} />
-      {:else}
-        <form onsubmit={connect}>
-          <label for="server">Server address</label><input id="server" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={busy} autocomplete="url" />
-          <div class="form-row"><div><label for="email">Email</label><input id="email" type="email" bind:value={email} required disabled={busy} autocomplete="username" /></div><div><label for="password">Password</label><input id="password" type="password" bind:value={password} required disabled={busy} autocomplete="current-password" /></div></div>
-          <label for="computer">Computer name</label><input id="computer" bind:value={deviceName} required maxlength="128" disabled={busy} autocomplete="off" />
-          <p class="consent">Signing in sets up this computer to help your server process photos when compatible workers are available. Local photo folders are connected separately.</p>
-          <button class="primary" type="submit" disabled={busy || !native}>{busy ? 'Connecting…' : 'Connect to Frameleaf'}</button>
-          <p class="footnote">Your password is used to sign in and is never saved. The session and device key stay in your computer’s secure credential store.</p>
-        </form>
-      {/if}
+          {/if}
+        {/each}
+        <div class="acct-wrap" style="margin-top:auto;position:relative">
+          {#if accountMenu}
+            <div class="acct-menu" role="menu">
+              <div class="acct-info">{connection.name}{summary?.me?.email ? ` · ${summary.me.email}` : ''}<br />{connection.server}{isAdmin ? ' · Administrator' : ''}</div>
+              <button role="menuitem" onclick={() => { accountMenu = false; void photos(); }} disabled={busy || connection.state === 'identity-changed'}>Open Photos</button>
+              <button role="menuitem" onclick={() => { accountMenu = false; signOutSheet = true; }} disabled={busy}>Sign out…</button>
+            </div>
+          {/if}
+          <button class="acct" aria-haspopup="menu" aria-expanded={accountMenu} onclick={() => { accountMenu = !accountMenu; }}>
+            <span class="av" aria-hidden="true">{initials(connection.name)}</span>
+            <span class="who"><b>{connection.name}</b><small>{hostOf(connection.server)}</small></span>
+          </button>
+        </div>
+      </div>
+    </nav>
+  {/if}
+  <main class="content">
+    {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
+    {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
+    {#if staleSignIn && !connection && !failure && !notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>A saved sign-in is still on this computer. Clear it before connecting to a server.</p><button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button></div>{/if}
+    {#if !connection}
+      <Welcome {native} {hostActive} {cloudAccount} onconnected={connected} oncloudaccount={account => { cloudAccount = account; }} onhostactive={active => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} {managerRevision} onmanagerstate={paired => { managerPaired = paired; }} />
+    {:else if page === 'overview' || page === 'ai'}
+      <Overview {connection} {setup} {summary} {native} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target as Page)} />
+    {:else if page === 'sources'}
+      <PhotoSourcesPage />
+    {:else if page === 'manager'}
+      {#key managerRevision}<Manager onstate={paired => { managerPaired = paired; }} />{/key}
+    {:else if page === 'backups'}
+      {#key managerRevision}<Backups onstate={paired => { managerPaired = paired; }} />{/key}
+    {:else if page === 'cloud'}
+      <Cloud {native} {summary} />
+    {:else if page === 'wallet'}
+      <Wallet {native} />
+    {:else if page === 'remote'}
+      <Remote {native} {summary} {connection} onrefresh={loadSummary} />
     {/if}
-    {#key managerRevision}<ManagerPanel />{/key}
   </main>
 </div>
+{#if signOutSheet}
+  <Sheet title={connection ? `Sign out of “${hostOf(connection.server)}”?` : 'Clear the saved sign-in?'} kind="warning" {busy} onclose={() => { signOutSheet = false; }} onsubmit={signOut}>
+    <p>This computer’s session and device key are removed from the secure credential store, and the server is asked to revoke them. Photo folder permissions and AI processing on this computer stop.</p>
+    {#snippet actions()}
+      <button class="btn" type="button" disabled={busy} onclick={() => { signOutSheet = false; }}>Cancel</button>
+      <button class="btn danger" type="submit" disabled={busy || !native}>{busy ? 'Signing out…' : 'Sign Out'}</button>
+    {/snippet}
+  </Sheet>
+{/if}

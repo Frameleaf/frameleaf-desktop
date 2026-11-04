@@ -1,8 +1,10 @@
+pub mod cloud_account;
 pub mod connection;
 pub mod copy_source;
 pub mod copy_upload;
 mod credential_lock;
 mod credentials;
+mod discovery;
 mod host_commands;
 pub mod host_control;
 mod host_database;
@@ -32,10 +34,12 @@ pub mod release_policy;
 mod resource_policy;
 pub mod runtime_epochs;
 pub mod runtime_store;
+mod server_admin;
 mod source_consent;
 mod source_import;
 mod source_metadata;
 mod transport;
+mod tray;
 mod upload_budget;
 #[cfg(windows)]
 mod windows_host_profile;
@@ -47,14 +51,14 @@ mod worker_setup;
 
 use connection::{normalize_server, ConnectionView, Features, SavedConnection};
 use serde::Deserialize;
-use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 #[derive(Default)]
-struct DesktopState(Mutex<Option<SavedConnection>>);
+pub(crate) struct DesktopState(pub(crate) Mutex<Option<SavedConnection>>);
 
-fn require_local(window: &WebviewWindow) -> Result<(), String> {
+pub(crate) fn require_local(window: &WebviewWindow) -> Result<(), String> {
     let url = window.url().map_err(|_| "window_origin_invalid")?;
     if !connection::native_origin_allowed(window.label(), &url, cfg!(debug_assertions)) {
         return Err("native_access_denied".into());
@@ -85,7 +89,7 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
     prepare_with_client(&client, saved).await
 }
 
-async fn prepare_with_client(
+pub(crate) async fn prepare_with_client(
     client: &reqwest::Client,
     saved: &mut SavedConnection,
 ) -> ConnectionView {
@@ -189,6 +193,8 @@ async fn connect_server(
         view.state = "worker-setup-failed".into();
     }
     *current = Some(saved);
+    drop(current);
+    tray::refresh(&app).await;
     Ok(view)
 }
 
@@ -276,6 +282,8 @@ async fn restore_connection(
         view.state = "worker-setup-failed".into();
     }
     *current = Some(saved);
+    drop(current);
+    tray::refresh(&app).await;
     Ok(Some(view))
 }
 
@@ -294,6 +302,8 @@ async fn sign_out(
         .clone()
         .or(credentials::load::<SavedConnection>("connection")?);
     *current = None;
+    drop(current);
+    tray::refresh(&app).await;
     Ok(lifecycle::finish_sign_out(
         async {
             let worker = credentials::delete("worker-session").is_ok();
@@ -355,6 +365,11 @@ async fn open_photos(
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
+    open_photos_window(&app, saved)
+}
+
+/// Shows the photo window for the signed-in connection, from the window or the tray alike.
+pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
     if let Some(photos) = app.get_webview_window("photos") {
         photos.show().map_err(|_| "photo_window_unavailable")?;
@@ -363,17 +378,18 @@ async fn open_photos(
     }
     let origin = base.origin();
     let photos =
-        tauri::WebviewWindowBuilder::new(&app, "photos", WebviewUrl::External(base.clone()))
+        tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(base.clone()))
             .title("Frameleaf Photos")
             .inner_size(1280.0, 850.0)
             .on_navigation(move |url| url.origin() == origin)
             .build()
             .map_err(|_| "photo_window_unavailable")?;
     let domain = base.host_str().ok_or("server_address_invalid")?;
+    let secure = base.scheme() == "https";
     let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
         .domain(domain)
         .path("/")
-        .secure(true)
+        .secure(secure)
         .http_only(true)
         .build();
     photos
@@ -388,7 +404,7 @@ async fn open_photos(
                 tauri::webview::Cookie::build((key, value))
                     .domain(domain)
                     .path("/")
-                    .secure(true)
+                    .secure(secure)
                     .build(),
             )
             .map_err(|_| "photo_session_unavailable")?;
@@ -402,6 +418,7 @@ async fn open_photos(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -413,6 +430,14 @@ pub fn run() {
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
+        .manage(tray::TrayState::default())
+        .setup(|app| {
+            // A desktop without a tray (some Linux sessions) still gets the window.
+            if let Err(error) = tray::build(app.handle()) {
+                eprintln!("tray unavailable: {error}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             host_commands::open_local_photos,
             host_commands::authorize_local_manager,
@@ -442,7 +467,22 @@ pub fn run() {
             manager_commands::pair_manager,
             manager_commands::manager_request,
             manager_commands::reauthenticate_manager,
-            manager_commands::disconnect_manager
+            manager_commands::disconnect_manager,
+            discovery::discover_servers,
+            server_admin::server_summary,
+            server_admin::cloud_status,
+            server_admin::wallet_status,
+            server_admin::update_wallet,
+            server_admin::remote_status,
+            server_admin::update_remote,
+            server_admin::test_remote_access,
+            server_admin::open_external,
+            tray::tray_refresh,
+            cloud_account::cloud_sign_in,
+            cloud_account::cloud_account,
+            cloud_account::cloud_sign_out,
+            cloud_account::cloud_servers,
+            cloud_account::connect_cloud_server
         ])
         .on_window_event(|window, event| {
             if window.label() == "main"
@@ -477,7 +517,7 @@ pub fn run() {
         });
 }
 
-async fn start_worker_setup(
+pub(crate) async fn start_worker_setup(
     app: &tauri::AppHandle,
     saved: &SavedConnection,
     allow_download: bool,
@@ -485,7 +525,7 @@ async fn start_worker_setup(
     let control = worker_control::load(saved)?;
     if control != worker_control::WorkerControl::Running {
         let status = app.state::<worker_setup::WorkerSetup>().hold(control).await;
-        let _ = app.emit_to("main", "worker-setup", status);
+        publish_worker_status(app, status);
         return Ok(());
     }
     let paths = worker_setup::SetupPaths {
@@ -506,12 +546,16 @@ async fn start_worker_setup(
             saved.clone(),
             paths,
             allow_download,
-            std::sync::Arc::new(move |status| {
-                let _ = handle.emit_to("main", "worker-setup", status);
-            }),
+            std::sync::Arc::new(move |status| publish_worker_status(&handle, status)),
         )
         .await;
     Ok(())
+}
+
+/// Every worker status the window hears about, the tray hears about too.
+pub(crate) fn publish_worker_status(app: &AppHandle, status: worker_setup::SetupStatus) {
+    tray::set_worker_status(app, &status);
+    let _ = app.emit_to("main", "worker-setup", status);
 }
 
 #[tauri::command]
@@ -543,10 +587,20 @@ async fn prepare_models(
 async fn control_worker(
     window: WebviewWindow,
     app: tauri::AppHandle,
-    state: State<'_, DesktopState>,
     control: worker_control::WorkerControl,
 ) -> Result<worker_setup::SetupStatus, String> {
     require_local(&window)?;
+    let status = apply_worker_control(&app, control).await?;
+    tray::refresh(&app).await;
+    Ok(status)
+}
+
+/// Pause, stop or resume the worker for the signed-in connection, from the window or the tray.
+pub(crate) async fn apply_worker_control(
+    app: &AppHandle,
+    control: worker_control::WorkerControl,
+) -> Result<worker_setup::SetupStatus, String> {
+    let state = app.state::<DesktopState>();
     let mut current = state.0.lock().await;
     let saved = current.as_mut().ok_or("sign_in_required")?;
     let setup = app.state::<worker_setup::WorkerSetup>();
@@ -554,11 +608,13 @@ async fn control_worker(
         worker_control::WorkerControl::Paused => {
             let status = setup.pause();
             worker_control::save(saved, control)?;
+            tray::set_worker_status(app, &status);
             Ok(status)
         }
         worker_control::WorkerControl::Stopped => {
             let status = setup.hold(control).await;
             worker_control::save(saved, control)?;
+            tray::set_worker_status(app, &status);
             Ok(status)
         }
         worker_control::WorkerControl::Running => {
@@ -573,7 +629,7 @@ async fn control_worker(
                 setup.hold(previous).await;
                 return Err(error);
             }
-            start_worker_setup(&app, saved, false).await?;
+            start_worker_setup(app, saved, false).await?;
             Ok(setup.status())
         }
     }

@@ -1,15 +1,18 @@
 use frameleaf_desktop::connection::{enrollment_message, normalize_server, EnrollmentRequest};
 
 #[test]
-fn server_selection_requires_tls_and_refuses_credentials_paths_and_fragments() {
+fn server_selection_requires_tls_off_the_local_network_and_refuses_credentials_paths_and_fragments()
+{
     assert_eq!(
         normalize_server("https://nas.example:2283/")
             .unwrap()
             .as_str(),
         "https://nas.example:2283/"
     );
+    assert!(normalize_server("http://nas.local").is_ok());
     for value in [
-        "http://nas.local",
+        "http://nas.example",
+        "http://user:pass@nas.local",
         "https://user:pass@nas.local",
         "https://nas.local/api",
         "https://nas.local/?token=secret",

@@ -29,7 +29,7 @@ jobs:
               core.notice('Automated Dependabot update; no manually assigned issue required.');
               return;
             }
-            const keys = Array.from(pr.title.matchAll(/(?:^|[^A-Za-z0-9])(FL-[1-9]\d*)(?=$|[^A-Za-z0-9])/g), match => match[1]);
+            const keys = Array.from(pr.title.matchAll(/(?:^|[^A-Za-z0-9])((?:FL|FD)-[1-9]\d*)(?=$|[^A-Za-z0-9])/g), match => match[1]);
             // Use GitHub's rendered links so code spans and sentence punctuation follow GFM.
             const { data: html } = await github.rest.markdown.render({
               text: pr.body ?? '',
@@ -38,7 +38,7 @@ jobs:
             });
             const destinations = Array.from(html.matchAll(/<a\b[^>]* href="([^"]*)"/g), match => match[1]);
             if (keys.length === 0) {
-              core.setFailed('Include the assigned Jira issue in the PR title, for example: FL-118 Configure Frameleaf delivery.');
+              core.setFailed('Include the assigned Jira issue in the PR title, for example: FL-118 Configure Frameleaf delivery or FD-5 UI update.');
             } else if (!destinations.some(url => keys.some(key => url === `https://heroit.atlassian.net/browse/${key}`))) {
               core.setFailed('Link an assigned title issue using its complete canonical Jira URL in the PR body.');
             }

@@ -3,6 +3,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
+  import Icon from './Icon.svelte';
   type Installation = { manifestSha256: string; controllerSha256: string };
   type View = { state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
@@ -22,6 +23,8 @@
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
   let authorized = $state(false);
+  const headline = $derived(profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer');
+  const pill = $derived(view?.state === 'manager-ready' ? { label: authorized ? 'Authorized' : 'Ready', tone: 'ok' } : profilePending || starting || busy ? { label: 'Working', tone: 'wait' } : view?.state === 'needs-attention' ? { label: 'Needs attention', tone: 'bad' } : view?.backgroundActive ? { label: 'Active', tone: 'wait' } : { label: 'Not started', tone: 'off' });
   function explain(code: unknown): string {
     const value = String(code);
     if (value.startsWith('manager_') || value === 'native_manager_not_ready' || value === 'native_host_busy') return managerError(value);
@@ -114,54 +117,57 @@
   }
 </script>
 
-<section class="status-panel" aria-label="Local library setup" aria-busy={busy}>
-  <h2>{profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer'}</h2>
-  <p>Keep your photo library here and manage it from Frameleaf. Server management and photo-server startup are separate steps.</p>
-  {#if failure}<p class="message error" role="alert">{failure}</p>{/if}
-  {#if notice}<p class="message" role="status">{notice}</p>{/if}
-  {#if profilePending}<p role="status">{profileCopy.pending}</p>{/if}
-  {#if view?.profileSetupAvailable && installations.length > 0 && !view.code?.startsWith('host_profile_legacy_') && (view.state === 'idle' || view.state === 'needs-attention')}
-    <p>{profileCopy.preparation}</p>
-    <button class="primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare my server profile</button>
-  {/if}
-  {#if native && !busy && !failure && installations.length === 0}
-    <p>Install the Frameleaf server component, then check again. Your existing photo folders are kept separate.</p>
-  {/if}
-  {#if installations.length > 1 && !view?.backgroundActive}
-    <label for="local-package">Installed server package</label>
-    <select id="local-package" bind:value={selected} disabled={busy}>
-      <option value="">Choose an installed package</option>
-      {#each installations as installation}<option value={installation.manifestSha256}>Package {installation.manifestSha256.slice(0, 12)}</option>{/each}
-    </select>
-  {/if}
-  {#if view?.state === 'manager-ready'}
-    <p role="status">Management is listening at {view.origin}. The photo server has not been started by this setup step.</p>
-    {#if authorized}
-      <p>Start your server using the controls below, then open Photos. For a new library, Photos guides you through creating your first administrator. Your Photos account is separate from your Manager password.</p>
-      <button class="primary" disabled={busy || !native} onclick={photos}>Open local Photos</button>
-    {/if}
-    {#if !authorized}
-      <form aria-label="Local Manager authorization" onsubmit={authorize}>
-        <p>For a new library, choose a Manager password. If you have already set one, use that password.</p>
-        <label for="local-manager-password">Local Manager password</label>
-        <input id="local-manager-password" type="password" bind:value={managerPassword} required minlength="14" maxlength="256" disabled={busy || !native} autocomplete="current-password" />
-        <label class="check"><input type="checkbox" bind:checked={allowManagement} required disabled={busy || !native} />Allow this computer to manage this local server.</label>
-        <label class="check"><input type="checkbox" bind:checked={allowRecovery} disabled={busy || !native} />Also allow backup recovery reviews and restore operations.</label>
-        <button class="primary" disabled={busy || !native || !allowManagement || managerPassword.length < 14}>Authorize local management</button>
-        <p class="footnote">Keep this password for recovery. The app saves a separate management grant in your secure credential store.</p>
-      </form>
-    {/if}
-  {/if}
-  <div class="actions">
-    {#if !view?.backgroundActive || view?.state === 'needs-attention'}<button class="primary" disabled={busy || !native || !selected} onclick={prepare}>Prepare local Manager</button>{/if}
-    {#if starting}<button class="secondary" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
-    {#if view?.backgroundActive && !profilePending}<button class="secondary" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
-    <button class="text-button" disabled={busy || !native} onclick={refresh}>Check installation</button>
+<div aria-label="Local library setup" aria-busy={busy}>
+  <div class="group-head">
+    <h2 class="group-title">Run Frameleaf here</h2>
+    {#if starting}<button class="btn quiet" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
+    <button class="btn quiet" disabled={busy || !native} onclick={refresh}>Check installation</button>
   </div>
-  <p class="footnote">{profilePending ? profileCopy.quit : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}</p>
-</section>
-
-<style>
-  .check { display: flex; align-items: flex-start; gap: 10px; line-height: 1.55; margin: 18px 0; }
-  .check input { flex: 0 0 16px; width: 16px; height: 16px; padding: 0; margin: 3px 0 0; accent-color: var(--accent); }
-</style>
+  <div class="group">
+    <div class="row">
+      <span class="ic" aria-hidden="true"><Icon name="computer" /></span>
+      <span class="l"><b>{headline}</b><small>Keep your photo library here and manage it from Frameleaf. Server management and photo-server startup are separate steps.</small></span>
+      <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
+      {#if !view?.backgroundActive || view?.state === 'needs-attention'}<button class="btn primary" disabled={busy || !native || !selected} onclick={prepare}>Prepare local Manager</button>{/if}
+      {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
+    </div>
+    {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
+    {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
+    {#if profilePending}<div class="row"><span class="spin" aria-hidden="true"></span><p role="status" style="flex:1">{profileCopy.pending}</p></div>{/if}
+    {#if view?.profileSetupAvailable && installations.length > 0 && !view.code?.startsWith('host_profile_legacy_') && (view.state === 'idle' || view.state === 'needs-attention')}
+      <div class="row"><span class="l"><b>Prepare my server profile</b><small>{profileCopy.preparation}</small></span><button class="btn primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare Profile</button></div>
+    {/if}
+    {#if native && !busy && !failure && installations.length === 0}
+      <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><span class="l"><b>Server component not installed</b><small>Install the Frameleaf server component, then check again. Your existing photo folders are kept separate.</small></span></div>
+    {/if}
+    {#if installations.length > 1 && !view?.backgroundActive}
+      <div class="form-row"><label for="local-package">Installed server package</label>
+        <select id="local-package" bind:value={selected} disabled={busy}>
+          <option value="">Choose an installed package</option>
+          {#each installations as installation (installation.manifestSha256)}<option value={installation.manifestSha256}>Package {installation.manifestSha256.slice(0, 12)}</option>{/each}
+        </select>
+      </div>
+    {/if}
+    {#if view?.state === 'manager-ready'}
+      <div class="row">
+        <span class="ic" aria-hidden="true"><Icon name="server" /></span>
+        <span class="l"><b>Management is listening at {view.origin}</b><small role="status">{authorized ? 'Start your server using the controls below, then open Photos. For a new library, Photos guides you through creating your first administrator. Your Photos account is separate from your Manager password.' : 'The photo server has not been started by this setup step.'}</small></span>
+        {#if authorized}<button class="btn primary" disabled={busy || !native} onclick={photos}><Icon name="open" />Open local Photos</button>{/if}
+      </div>
+      {#if !authorized}
+        <form aria-label="Local Manager authorization" onsubmit={authorize}>
+          <div class="form-row"><label for="local-manager-password">Local Manager password</label><span>
+            <input id="local-manager-password" type="password" bind:value={managerPassword} required minlength="14" maxlength="256" disabled={busy || !native} autocomplete="current-password" />
+            <p class="hint">For a new library, choose a Manager password of at least 14 characters. If you have already set one, use that password.</p>
+          </span></div>
+          <div class="form-row top"><label for="local-allow">Permissions</label><span>
+            <label class="check"><input id="local-allow" type="checkbox" bind:checked={allowManagement} required disabled={busy || !native} />Allow this computer to manage this local server.</label>
+            <label class="check" style="margin-top:8px"><input type="checkbox" bind:checked={allowRecovery} disabled={busy || !native} />Also allow backup recovery reviews and restore operations.</label>
+          </span></div>
+          <div class="form-row"><span></span><span class="actions"><button class="btn primary" disabled={busy || !native || !allowManagement || managerPassword.length < 14}>Authorize local management</button></span></div>
+        </form>
+      {/if}
+    {/if}
+  </div>
+  <p class="foot">{profilePending ? profileCopy.quit : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}{view?.state === 'manager-ready' && !authorized ? ' Keep this password for recovery. The app saves a separate management grant in your secure credential store.' : ''}</p>
+</div>
