@@ -140,6 +140,8 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
         "packages/locked-crypto",
         "packages/patches",
         "server",
+        "manager/src",
+        "manager/import-rename.c",
         "studio/runtime",
         "studio/tools",
         "docker/scripts/verify-server-package.mjs",
@@ -212,6 +214,7 @@ def build(source: Path, revision: str, node: Path, output: Path) -> None:
                     deployed,
                 ]
             )
+            command([node, snapshot / "server/scripts/prepare-import-transfer-runtime.mjs", "--package", deployed])
             runtime = output / "server"
             report["files"] = stage_server(deployed, runtime, clean_metadata=True)
             command(
