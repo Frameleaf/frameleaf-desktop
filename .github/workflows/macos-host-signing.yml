@@ -88,7 +88,7 @@ jobs:
           assert.ok(result.formats.includes('mp4-h264'));
           console.log(JSON.stringify(result));
           JS
-      - name: Notarize the signed Chromium bundle
+      - name: Submit the signed Chromium bundle to Apple
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -98,8 +98,31 @@ jobs:
           work="$RUNNER_TEMP/macos-host-browser"
           ditto -c -k --keepParent "$work/Chromium.app" "$work/submission.zip"
           xcrun notarytool submit "$work/submission.zip" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --output-format json > "$work/submission.json"
+          jq -er '.id' "$work/submission.json"
+      - name: Keep the exact Apple submission on the approved draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -er 'select(.draft == true) | .tag_name')
+          work="$RUNNER_TEMP/macos-host-browser"
+          name="FrameleafChromium-macOS-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mv "$work/submission.zip" "$work/$name.zip"
+          digest=$(shasum -a 256 "$work/$name.zip" | cut -d ' ' -f1)
+          jq --arg digest "$digest" --argjson approval "$APPROVAL" \
+            '{id, browserSha256: $digest, input: $approval}' "$work/submission.json" > "$work/$name.json"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$work/$name.zip" "$work/$name.json"
+      - name: Verify notarization and staple the submitted Chromium bundle
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/macos-host-browser"
           id=$(jq -er '.id' "$work/submission.json")
-          printf 'Chromium notarization submission %s\n' "$id"
           xcrun notarytool wait "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --timeout 45m --output-format json > "$work/notary-result.json"
           jq -e '.status=="Accepted"' "$work/notary-result.json" >/dev/null
           xcrun stapler staple "$work/Chromium.app"
