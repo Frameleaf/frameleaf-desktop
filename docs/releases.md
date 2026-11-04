@@ -43,23 +43,25 @@ gh workflow run installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
   --ref main -f platforms=linux -f runtime_run_id=<successful-factory-run-id>
 ```
 
-`Signed desktop release` is manually dispatched from `main`. Its tag must already
+`Signed desktop release` is manually dispatched from `main`. A supplied tag must
 point to that exact workflow commit and match `package.json`, `Cargo.toml` and
-`tauri.conf.json`. It builds macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage by default.
+`tauri.conf.json`. An empty tag retains installer artifacts and skips draft staging.
+The default selection requests macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage.
+Intel macOS runtime dependencies are tracked in [FD-6](https://heroit.atlassian.net/browse/FD-6).
 Choose `all` to include Windows x86-64 NSIS/MSI after Azure Artifact Signing is configured,
 or `linux` to build both Linux architectures independently.
 
 The installer pipeline consumes factory-signed ML runtimes rather than exposing
 the Infisical Ed25519 release key to app-build jobs. Specify a successful
-non-pull-request `main` run in this repository containing these Actions artifacts:
+`factory-runtime.yml` dispatch from `main` in this repository containing these Actions artifacts:
 
 | Artifact | Required for |
 | --- | --- |
-| `factory-runtime-macos-aarch64` | `macos-linux`, `all` |
+| `factory-runtime-macos-aarch64` | `macos-aarch64`, `macos-linux`, `all` |
 | `factory-runtime-macos-x86_64` | `macos-linux`, `all` |
-| `factory-runtime-linux-x86_64` | Every selection |
-| `factory-runtime-linux-aarch64` | Every selection |
-| `factory-runtime-windows-x86_64` | `all` |
+| `factory-runtime-linux-x86_64` | `linux`, `macos-linux`, `all` |
+| `factory-runtime-linux-aarch64` | `linux`, `macos-linux`, `all` |
+| `factory-runtime-windows-x86_64` | `windows`, `all` |
 
 Each artifact contains `runtime.tar`, with `manifest.json`, `manifest.sig` and
 `payload/` at its root. Create the tar on the factory OS to retain executable
@@ -175,7 +177,17 @@ cleans up the Azure session. Use Microsoft's [OIDC setup guide](https://github.c
 [signing integrations](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-signing-integrations),
 and Tauri's [Windows signing guide](https://v2.tauri.app/distribute/sign/windows/).
 
+The macOS factory signer verifies the unsigned inventory, signs the interpreter and
+embedded Mach-O libraries with Developer ID and secure timestamps, then seals the
+final bytes with the factory key. The installer verifies that inventory again.
+
 ## Dispatch
+
+For an Apple Silicon installer artifact, run the factory and signed desktop
+workflows on `main` with `platforms=macos-aarch64`. Pass the successful factory
+run ID to the signed workflow and leave the tag empty. After signing, notarization
+and embedded runtime verification, the DMG is available in the workflow artifact
+`signed-installers-macos-aarch64`. Draft release staging requires a tag.
 
 After the workflow is merged, factory packs and credentials are available, and
 the chosen version is ready for a candidate:

@@ -27,6 +27,7 @@ test("release selections cover the supported architectures without adding Window
     { os: "windows-2022", target: "windows-x86_64" },
     ...linux,
   ]);
+  assert.deepEqual(releaseMatrix("macos-aarch64").include, [macos[0]]);
   assert.deepEqual(releaseMatrix("linux").include, linux);
   assert.throws(() => releaseMatrix("anything"), /release_platforms_invalid/);
 });
