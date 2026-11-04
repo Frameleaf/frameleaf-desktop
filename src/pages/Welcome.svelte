@@ -51,9 +51,9 @@
       oncloudaccount(account);
       if (account) await loadServers();
     } catch (error) {
-      cloudLocked = savedSignInNeedsRecovery(error);
       cloudDamaged = String(error) === 'credential_record_invalid';
-      if (cloudLocked || cloudDamaged) failure = explain(error);
+      cloudLocked = !cloudDamaged;
+      failure = explain(error);
     } finally { cloudBusy = false; }
   }
   onMount(() => { if (native) void restoreCloud(); });
@@ -197,7 +197,7 @@
     {/if}
     <span class="sp"></span>
     {#if cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignOut}>Clear unreadable Cloud sign-in</button>{/if}
-    {#if mode === 'client-worker' && !cloudAccount && !cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Unlock Frameleaf Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
+    {#if mode === 'client-worker' && !cloudAccount && !cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Restore saved Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
     Version {version}
   </footer>
 </div>

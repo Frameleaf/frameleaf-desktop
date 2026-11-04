@@ -147,7 +147,7 @@
     </nav>
   {/if}
   <main class="content">
-    {#if connectionLocked && !connection}<button class="btn" disabled={busy} onclick={() => restoreSaved(true)}>Unlock saved server sign-in</button>{/if}
+    {#if (connectionLocked || staleSignIn) && !connection}<button class="btn" disabled={busy} onclick={() => restoreSaved(true)}>Restore saved server sign-in</button>{/if}
     {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}

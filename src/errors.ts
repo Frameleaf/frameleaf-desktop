@@ -12,6 +12,7 @@ const messages: Record<string, string> = {
   credential_confirmation_unavailable: 'Your Mac could not confirm the saved sign-in. Restore it when the credential store is available.',
   credential_confirmation_changed: 'The stored sign-in changed. Restore the sign-in currently saved on this Mac.',
   credential_record_invalid: 'The saved sign-in could not be read. Clear it and sign in again.',
+  credential_device_unlock_required: 'Your existing Frameleaf device key is locked. Retry this action and approve access on your Mac.',
   credential_unlock_required: 'Unlock your saved sign-in with Touch ID or your Mac password.',
   credential_store_locked_or_unavailable: 'Unlock your computer’s credential store, then try again.',
   credential_store_unavailable: 'The secure credential store is unavailable on this computer.',

@@ -130,7 +130,13 @@ pub fn identity() -> Result<DeviceIdentity, String> {
 // An explicitly requested sign-in can authorize the old installation key during migration.
 // The migrated operational item needs no user-presence prompt for subsequent worker reads.
 pub fn foreground_identity(window: &tauri::WebviewWindow) -> Result<DeviceIdentity, String> {
-    identity_with_prompt(foreground_prompt(window, true))
+    identity_with_prompt(foreground_prompt(window, true)).map_err(|code| {
+        if code == "credential_unlock_required" {
+            "credential_device_unlock_required".into()
+        } else {
+            code
+        }
+    })
 }
 pub fn unlock_existing_identity(window: &tauri::WebviewWindow) -> Result<(), String> {
     let _lock = installation_lock()?;
