@@ -68,6 +68,22 @@ fn identity(root: &Dir) -> Result<String, String> {
         crate::copy_source::root_identity(root).map_err(|_| "host_profile_identity_unavailable")?;
     Ok(format!("{:x}", Sha256::digest(value.as_bytes())))
 }
+// Use the same physical profile identity as the controller journal, independent of runtime upgrades.
+fn installation_uuid(profile_identity: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"frameleaf-native-installation:");
+    digest.update(profile_identity.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+pub(crate) fn secure_installation_id(path: &Path) -> Result<Uuid, String> {
+    let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+    Ok(installation_uuid(&identity(&root)?))
+}
+
 pub(crate) fn options(write: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
     options
@@ -126,6 +142,10 @@ fn valid_sized_file(file: &File, maximum: u64) -> Result<(), String> {
     Ok(())
 }
 impl Owner {
+    pub fn secure_installation_id(&self) -> Uuid {
+        installation_uuid(&self.profile_identity)
+    }
+
     pub fn acquire(path: &Path, writable: bool) -> Result<Self, String> {
         if writable {
             crate::runtime_store::private_directory(path)?;

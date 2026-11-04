@@ -21,6 +21,7 @@ struct Config {
     #[serde(default)]
     mode: crate::host_runtime::HostMode,
     installation_id: String,
+    secure_installation_id: Option<uuid::Uuid>,
     candidate: PathBuf,
     state: PathBuf,
     manifest_sha256: String,
@@ -66,10 +67,21 @@ fn config(raw: &[u8]) -> Result<Config, String> {
 struct Inspection {
     protocol_version: u32,
     installation_id: String,
+    secure_installation_id: Option<uuid::Uuid>,
     candidate: PathBuf,
     state: PathBuf,
     manifest_sha256: String,
 }
+fn check_secure_installation(
+    requested: Option<uuid::Uuid>,
+    owner: &crate::host_state::Owner,
+) -> Result<(), String> {
+    if requested.is_some_and(|value| value != owner.secure_installation_id()) {
+        return Err("host_profile_identity_changed".into());
+    }
+    Ok(())
+}
+
 fn physical_id(path: &Path) -> Result<String, String> {
     let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(path)?);
     crate::copy_source::root_identity(&directory)
@@ -158,13 +170,16 @@ pub fn inspect_owner() -> Result<(), String> {
     }
     separate_paths(&request.candidate, &request.state)?;
     let mut owner = crate::host_state::Owner::acquire(&request.state, false)?;
+    check_secure_installation(request.secure_installation_id, &owner)?;
     let runtime = verify_candidate(&request.candidate, &request.manifest_sha256)?;
     let marker = owner.inspect(&request.installation_id, &request.manifest_sha256)?;
-    emit(
-        json!({"protocolVersion":1,"state":"quiescent","installationId":marker.installation_id,
+    let mut receipt = json!({"protocolVersion":1,"state":"quiescent","installationId":marker.installation_id,
         "manifestSha256":runtime.manifest_sha256(),"sourceRevision":runtime.source_revision(),
-        "certified":runtime.certified(),"profileIdentity":marker.profile_identity,"generation":marker.generation}),
-    )
+        "certified":runtime.certified(),"profileIdentity":marker.profile_identity,"generation":marker.generation});
+    if let Some(id) = request.secure_installation_id {
+        receipt["secureInstallationId"] = json!(id);
+    }
+    emit(receipt)
 }
 
 fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -409,6 +424,7 @@ pub fn run() -> Result<(), String> {
         candidate_file(&config.state.join("host-state.json"), 4096)?;
     }
     let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
+    check_secure_installation(config.secure_installation_id, &owner)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
@@ -434,12 +450,12 @@ pub fn run() -> Result<(), String> {
         owner.clean_stop()?;
         return stopped(&invalid);
     }
-    if emit(
-        json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
-        "sourceRevision":runtime.source_revision(),"certified":runtime.certified()}),
-    )
-    .is_err()
-    {
+    let mut receipt = json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
+        "sourceRevision":runtime.source_revision(),"certified":runtime.certified()});
+    if let Some(id) = config.secure_installation_id {
+        receipt["secureInstallationId"] = json!(id);
+    }
+    if emit(receipt).is_err() {
         process.stop()?;
         owner.clean_stop()?;
         return Err("host_control_output_unavailable".into());
@@ -837,6 +853,30 @@ mod tests {
                 "host_control_config_invalid"
             );
         }
+    }
+
+    #[test]
+    fn manager_identity_is_bound_to_the_controller_profile() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-manager-id-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let state = root.join("state");
+        let other = root.join("other");
+        crate::runtime_store::private_directory(&state).unwrap();
+        crate::runtime_store::private_directory(&other).unwrap();
+        let owner = crate::host_state::Owner::acquire(&state, true).unwrap();
+        let id = crate::host_state::secure_installation_id(&state).unwrap();
+        let wrong = crate::host_state::secure_installation_id(&other).unwrap();
+        assert!(!id.is_nil());
+        assert!(check_secure_installation(Some(id), &owner).is_ok());
+        assert_eq!(
+            check_secure_installation(Some(wrong), &owner),
+            Err("host_profile_identity_changed".into())
+        );
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
