@@ -48,8 +48,18 @@ jobs:
           test "$(find "$packages" -mindepth 1 -printf '%P\n' | sort)" = "$(printf 'bootstrap.deb\nruntime.deb')"
           test "$(dpkg-deb -f "$packages/bootstrap.deb" Package)" = "frameleaf-host-bootstrap-$controller"
           test "$(dpkg-deb -f "$packages/runtime.deb" Package)" = "frameleaf-host-runtime-$manifest"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test ! -e /opt/frameleaf && test ! -L /opt/frameleaf
           sudo apt-get update -qq
-          sudo apt-get install -y apparmor "$packages/bootstrap.deb" "$packages/runtime.deb"
+          sudo apt-get install -y apparmor
+          # Match stock Ubuntu parent-directory ownership on the disposable runner.
+          for directory in / /opt /etc /etc/apparmor.d; do
+            test -d "$directory" && test ! -L "$directory"
+            stat -c '%U:%G %a %n' "$directory"
+            sudo chown root:root -- "$directory"
+            sudo chmod go-w -- "$directory"
+          done
+          sudo apt-get install -y "$packages/bootstrap.deb" "$packages/runtime.deb"
           runtime="/opt/frameleaf/Runtimes/$manifest"
           jq -e --arg manifest "$manifest" --arg controller "$controller"             '.manifestSha256 == $manifest and .controllerSha256 == $controller' "$runtime/installation.json" >/dev/null
           echo "FRAMELEAF_TEST_RUNTIME=$runtime" >> "$GITHUB_ENV"
