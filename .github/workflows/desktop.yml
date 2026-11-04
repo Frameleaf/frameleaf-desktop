@@ -108,6 +108,28 @@ jobs:
           if ($fixtures.Count -ne 2) { throw 'Windows package qualification fixtures are missing' }
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
           if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
+      - name: Check Windows native installer rejects and rolls back a corrupt payload
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        shell: pwsh
+        run: |
+          $env:HOST_CONTROLLER = (Resolve-Path 'src-tauri/target/debug/frameleaf-native-host.exe').Path
+          $env:HOST_CONTROLLER_SHA256 = (Get-FileHash $env:HOST_CONTROLLER).Hash.ToLowerInvariant()
+          $env:HOST_MANIFEST = 'f' * 64
+          $env:HOST_OUTPUT = Join-Path $env:RUNNER_TEMP 'installer-refusal'
+          $env:HOST_ARCHIVE = Join-Path $env:RUNNER_TEMP 'windows-host.7z'
+          $base = Join-Path $env:ProgramFiles 'Frameleaf'
+          if (Test-Path -LiteralPath $base) { throw 'Expected a fresh disposable machine' }
+          Set-Content $env:HOST_ARCHIVE 'corrupt archive'
+          & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /Q tools/windows/native-host.iss
+          if ($LASTEXITCODE) { throw 'Native installer compilation failed' }
+          $log = Join-Path $env:HOST_OUTPUT 'refusal.log'
+          $setup = Start-Process "$env:HOST_OUTPUT/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -Wait -PassThru
+          if (!$setup.ExitCode -or !(Test-Path "$base/Runtimes") -or (Test-Path "$base/Runtimes/$env:HOST_MANIFEST") -or
+              (Test-Path "$base/Controllers/$env:HOST_MANIFEST/$env:HOST_CONTROLLER_SHA256")) {
+            Get-Content $log -Tail 35
+            throw 'Corrupt payload did not fail with a clean rollback'
+          }
+          $global:LASTEXITCODE = 0
       - name: Qualify per-user Windows profile preparation in disposable runner
         if: runner.os == 'Windows' && runner.environment == 'github-hosted'
         env:

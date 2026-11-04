@@ -16,7 +16,7 @@ jobs:
   qualify:
     if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: '2'
       RAYON_NUM_THREADS: '1'
@@ -27,6 +27,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - run: npm ci
+      - run: npm run build
       - name: Rust stable
         shell: pwsh
         run: |
@@ -43,7 +48,7 @@ jobs:
       - name: Compile the real release-authority test without release credentials
         shell: pwsh
         run: |
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --no-run
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --no-run
           if ($LASTEXITCODE) { throw 'Compiled host qualification test build failed' }
       - name: Admit the matched signed candidate and evidence without executing payloads
         shell: python
@@ -65,54 +70,78 @@ jobs:
           $staged = Get-Content (Join-Path $root 'qualification.json') -Raw | ConvertFrom-Json
           $env:FRAMELEAF_FACTORY_HOST_TEST_PACK = Join-Path $root 'candidate'
           $env:FRAMELEAF_FACTORY_HOST_EXPECTED_MANIFEST = $staged.manifestSha256
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib release_policy::tests::factory_signed_host_candidate_verifies_against_compiled_authority -- --ignored --exact --nocapture
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib release_policy::tests::factory_signed_host_candidate_verifies_against_compiled_authority -- --ignored --exact --nocapture
           if ($LASTEXITCODE) { throw 'Compiled host authority refused the signed candidate' }
           $result = Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json
           if ($result.qualification -ne 'passed' -or $result.manifestSha256 -ne $staged.manifestSha256 -or $result.signatureSha256 -ne $staged.signatureSha256) {
             throw 'Compiled host authority receipt does not match the admitted candidate'
           }
-      - name: Qualify protected machine installation on this disposable runner
+      - name: Build the native server installer from the verified host
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          cargo build --locked --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host
+          cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host
           if ($LASTEXITCODE) { throw 'Controller build failed' }
-          $controller = (Resolve-Path 'src-tauri/target/debug/frameleaf-native-host.exe').Path
-          $digest = (Get-FileHash $controller).Hash.ToLowerInvariant()
+          $env:HOST_CONTROLLER = (Resolve-Path 'src-tauri/target/release/frameleaf-native-host.exe').Path
+          $env:HOST_CONTROLLER_SHA256 = (Get-FileHash $env:HOST_CONTROLLER).Hash.ToLowerInvariant()
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $env:HOST_MANIFEST = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
+          if ($env:HOST_MANIFEST -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid manifest identity' }
+          $env:HOST_ARCHIVE = Join-Path $root 'windows-host.7z'
+          Push-Location (Join-Path $root 'candidate')
+          try {
+            & "${env:ProgramFiles}/7-Zip/7z.exe" a -t7z -mx=1 -mmt=2 $env:HOST_ARCHIVE manifest.json manifest.sig payload
+            if ($LASTEXITCODE) { throw 'Verified payload archive creation failed' }
+          } finally { Pop-Location }
+          $env:HOST_OUTPUT = Join-Path $root 'installer'
+          & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /Q tools/windows/native-host.iss
+          if ($LASTEXITCODE) { throw 'Installer build failed' }
+      - name: Install the actual package twice and verify its protected receipt
+        shell: pwsh
+        run: |
           $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
           $manifest = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
-          if ($manifest -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid qualified manifest identity' }
+          $digest = (Get-FileHash 'src-tauri/target/release/frameleaf-native-host.exe').Hash.ToLowerInvariant()
+          $setup = (Get-Item "$root/installer/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe").FullName
           $base = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Frameleaf'
           if (Test-Path -LiteralPath $base) { throw 'Expected a fresh machine location' }
-          $prepared = & $controller --prepare-windows-package $manifest $digest
-          if ($LASTEXITCODE -or ($prepared | ConvertFrom-Json).state -ne 'install-prepared') { throw "Preparation failed: $prepared" }
-          $runtime = Join-Path $base "Runtimes/$manifest"
-          $binaryDir = Join-Path $base "Controllers/$manifest/$digest"
-          New-Item -ItemType Directory -Path $runtime, $binaryDir | Out-Null
-          $installed = Join-Path $binaryDir 'frameleaf-native-host.exe'
-          Copy-Item -LiteralPath $controller -Destination $installed
-          $candidate = Join-Path $root 'candidate'
-          Copy-Item -LiteralPath (Join-Path $candidate 'manifest.json'), (Join-Path $candidate 'manifest.sig') -Destination $runtime
-          # Copy bytes into fresh objects so the payload inherits its machine ACL.
-          robocopy (Join-Path $candidate 'payload') (Join-Path $runtime 'payload') /E /COPY:DAT /R:0 /W:0 /NFL /NDL /NJH /NJS /NP
-          if ($LASTEXITCODE -ge 8) { throw 'Protected payload copy failed' }
-          foreach ($path in $runtime, $binaryDir) {
-            icacls ("\\?\" + $path) /setowner '*S-1-5-32-544' /T /Q
-            if ($LASTEXITCODE) { throw 'Could not assign the Administrators owner' }
-          }
-          if ((Get-FileHash $installed).Hash.ToLowerInvariant() -cne $digest) { throw 'Installed controller changed' }
-          $receipt = Join-Path $runtime 'installation.json'
+          $receipt = Join-Path $base "Runtimes/$manifest/installation.json"
           foreach ($attempt in 1..2) {
-            $result = & $installed --finalize-windows-package $manifest $digest
-            if ($LASTEXITCODE) { throw "Finalization failed: $result" }
-            $result = $result | ConvertFrom-Json
+            $log = Join-Path $root "setup-$attempt.log"
+            $install = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -PassThru -Wait
+            if ($install.ExitCode) {
+              Get-Content $log -Tail 35
+              throw "Server installation failed with code $($install.ExitCode)"
+            }
             $record = Get-Content $receipt -Raw | ConvertFrom-Json
-            if ($result.state -ne 'resources-installed' -or $result.manifestSha256 -cne $manifest -or $result.controllerSha256 -cne $digest -or
-                $record.schemaVersion -ne 1 -or $record.manifestSha256 -cne $manifest -or $record.controllerSha256 -cne $digest) { throw 'Installed receipt mismatch' }
+            if ($record.schemaVersion -ne 1 -or $record.manifestSha256 -cne $manifest -or $record.controllerSha256 -cne $digest) { throw 'Installed receipt mismatch' }
             $hash = (Get-FileHash $receipt).Hash
             if ($attempt -eq 1) { $first = $hash } elseif ($first -ne $hash) { throw 'Retry changed the receipt' }
           }
-          $result | ConvertTo-Json | Set-Content (Join-Path $root 'protected-install.json')
+          @{ state = 'resources-installed'; manifestSha256 = $manifest; controllerSha256 = $digest; installerSha256 = (Get-FileHash $setup).Hash.ToLowerInvariant()
+             receiptSha256 = $hash.ToLowerInvariant(); installAttempts = 2 } | ConvertTo-Json | Set-Content (Join-Path $root 'protected-install.json')
+      - name: Retain private Windows installer candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-native-server-installer
+          path: ${{ runner.temp }}/windows-compiled-host/installer/*.exe
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: Exercise the companion with the published 0.1.0 Windows desktop
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = 'Frameleaf_0.1.0_x64-setup-unsigned.exe'
+          gh release download v0.1.0 --repo Frameleaf/frameleaf-desktop --pattern $name --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE) { throw 'Published desktop download failed' }
+          $setup = Join-Path $env:RUNNER_TEMP $name
+          if ((Get-FileHash $setup).Hash.ToLowerInvariant() -cne 'b7b8c2f12ea85a0a135e51d9568b41dbc9b115b988c6c4cefcedd02aa04bd50a') { throw 'Published desktop identity changed' }
+          $destination = Join-Path $env:RUNNER_TEMP 'FrameleafWelcome'
+          $install = Start-Process $setup -ArgumentList '/S', "/D=$destination" -PassThru -Wait
+          if ($install.ExitCode) { throw 'Desktop installation failed' }
+          powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe') -InstalledHost
+          if ($LASTEXITCODE) { throw 'Installed native host acceptance failed' }
       - name: Retain bounded resource qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
