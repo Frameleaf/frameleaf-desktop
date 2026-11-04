@@ -114,7 +114,7 @@ OSStatus frameleaf_keychain(FrameleafKeychainOperation operation, const char *na
             // Concurrent startup reads share both a successful context and a cancellation until an explicit retry.
             if (prompt == 2) cancelled = false; // An explicit user retry re-arms the sheet.
             bool interactive = prompt != 0 && !cancelled;
-            session.interactionNotAllowed = !interactive;
+            session.interactionNotAllowed = !interactive || !presence;
             session.localizedReason = @"Unlock your saved Frameleaf sign-in";
             NSString *account = [NSString stringWithUTF8String:name];
             if (!account.length) return errSecParam;

@@ -851,7 +851,7 @@ pub(crate) async fn connect_cloud_server(
         return Err("sign_out_before_switching_servers".into());
     }
     // Check secure persistence and the device identity before any token is minted.
-    let identity = credentials::identity()?;
+    let identity = credentials::foreground_identity(&window)?;
     identity.enrollment("validation", "validation", &device_name, "client-worker")?;
     let client = transport::client()?;
     let (credential, app_token) = signed_in(&client).await?;

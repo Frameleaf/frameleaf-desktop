@@ -18,6 +18,9 @@ pub(crate) async fn manager_view(
     else {
         return Ok(None);
     };
+    if retry.unwrap_or(false) {
+        credentials::unlock_existing_identity(&window)?;
+    }
     // Public pairing metadata remains visible when a device key needs recovery.
     Ok(Some(saved.view()))
 }
@@ -51,7 +54,7 @@ pub(crate) async fn pair_manager(
     let origin = manager::normalize_manager(&origin)?
         .origin()
         .ascii_serialization();
-    let identity = credentials::identity()?;
+    let identity = credentials::foreground_identity(&window)?;
     // Confirm secure writes before sending a Manager password; no plaintext fallback.
     credentials::save("manager-pairing-check", &true)?;
     credentials::delete("manager-pairing-check")?;

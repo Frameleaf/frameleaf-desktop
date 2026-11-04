@@ -124,9 +124,22 @@ pub fn delete(account: &str) -> Result<(), String> {
     }
 }
 pub fn identity() -> Result<DeviceIdentity, String> {
+    identity_with_prompt(Prompt::Silent)
+}
+
+// An explicitly requested sign-in can authorize the old installation key during migration.
+// The migrated operational item needs no user-presence prompt for subsequent worker reads.
+pub fn foreground_identity(window: &tauri::WebviewWindow) -> Result<DeviceIdentity, String> {
+    identity_with_prompt(foreground_prompt(window, true))
+}
+pub fn unlock_existing_identity(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let _lock = installation_lock()?;
+    read_record::<DeviceIdentity>("installation", foreground_prompt(window, true)).map(|_| ())
+}
+fn identity_with_prompt(prompt: Prompt) -> Result<DeviceIdentity, String> {
     let _lock = installation_lock()?;
     identity_with(
-        || load_record("installation"),
+        || read_record("installation", prompt),
         |identity| save_record("installation", identity),
         crate::identity_anchor::read,
         crate::identity_anchor::write,

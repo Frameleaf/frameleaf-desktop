@@ -194,9 +194,15 @@ async fn connect_server(
         return Err("sign_out_before_switching_servers".into());
     }
     let client = transport::client()?;
-    let (saved, mut view) = sign_in(&client, &server, &email, password, &device_name, |saved| {
-        credentials::confirm_new_sign_in("connection", saved, &window)
-    })
+    let (saved, mut view) = sign_in(
+        &client,
+        &server,
+        &email,
+        password,
+        &device_name,
+        || credentials::foreground_identity(&window),
+        |saved| credentials::confirm_new_sign_in("connection", saved, &window),
+    )
     .await?;
     if view.state == "preparing"
         && view.features.worker_session
@@ -216,6 +222,7 @@ async fn sign_in(
     email: &str,
     password: String,
     device_name: &str,
+    identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
     confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
 ) -> Result<(SavedConnection, ConnectionView), String> {
     let base = normalize_server(server)?;
@@ -224,7 +231,7 @@ async fn sign_in(
         return Err("login_details_invalid".into());
     }
     // Check secure persistence and the device identity before sending a password.
-    let identity = credentials::identity()?;
+    let identity = identity()?;
     identity.enrollment("validation", "validation", device_name, "client-worker")?;
     let response = client.post(base.join("api/auth/login").unwrap())
         .json(&serde_json::json!({ "email": email.trim(), "password": password.as_str(), "rememberMe": true }))
@@ -313,6 +320,9 @@ async fn restore_connection(
     let user: User = transport::json(response).await?;
     if user.id != saved.account_id {
         return Err("account_identity_changed".into());
+    }
+    if retry.unwrap_or(false) {
+        credentials::unlock_existing_identity(&window)?;
     }
     let mut view = prepare(&mut saved).await;
     if view.state == "preparing"
