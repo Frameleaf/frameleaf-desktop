@@ -54,6 +54,13 @@ impl HostSetup {
     pub(crate) fn background_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
+    pub(crate) fn lock_for_update(&self) -> Result<impl Drop + '_, String> {
+        let owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
+        if owner.is_some() || self.background_active() {
+            return Err("update_host_active".into());
+        }
+        Ok(owner)
+    }
     fn set(&self, state: &str, code: Option<String>, installation: Option<Installation>) {
         *self.view.lock().unwrap_or_else(|error| error.into_inner()) = View {
             state: state.into(),
@@ -552,6 +559,20 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_excludes_local_host_operations() {
+        let setup = HostSetup::default();
+        let update = setup.lock_for_update().unwrap();
+        assert!(setup.owner.try_lock().is_err());
+        assert!(setup.lock_for_update().is_err());
+        drop(update);
+        setup.active.store(true, Ordering::Release);
+        assert!(setup.lock_for_update().is_err());
+        setup.active.store(false, Ordering::Release);
+        assert!(setup.lock_for_update().is_ok());
+    }
+
     #[cfg(windows)]
     #[test]
     fn pinned_profile_leaf_cannot_disappear_during_shared_startup_helpers() {

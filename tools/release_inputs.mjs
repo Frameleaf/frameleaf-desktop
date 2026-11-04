@@ -43,6 +43,37 @@ export function validateReleaseTag(tag, versions) {
   return tag;
 }
 
+export function updateManifest(tag, repository, signatures) {
+  const version = tag.slice(1);
+  validateReleaseTag(tag, [version]);
+  const formats = {
+    "app.tar.gz": ["darwin", "app"],
+    AppImage: ["linux", "appimage"],
+    deb: ["linux", "deb"],
+    exe: ["windows", "nsis"],
+    msi: ["windows", "msi"],
+  };
+  const platforms = {};
+  for (const [name, value] of Object.entries(signatures)) {
+    const filename = name.startsWith(`Frameleaf_${version}_`) && name.slice(`Frameleaf_${version}_`.length);
+    const match = filename && /^(aarch64|arm64|amd64|x64)(?:-setup|_en-US)?\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.exec(filename);
+    if (!match) throw new Error(`update_asset_invalid: ${name}`);
+    const [, architecture, extension] = match;
+    const [os, installer] = formats[extension];
+    const arch = architecture === "aarch64" || architecture === "arm64" ? "aarch64" : "x86_64";
+    const target = `${os}-${arch}-${installer}`;
+    if (platforms[target]) throw new Error(`update_asset_duplicate: ${target}`);
+    const signature = value.trim();
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(signature)) throw new Error(`update_signature_invalid: ${name}`);
+    platforms[target] = {
+      url: `https://github.com/${repository}/releases/download/${tag}/${name}`,
+      signature,
+    };
+  }
+  if (!Object.keys(platforms).length) throw new Error("update_assets_missing");
+  return { version, platforms };
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const root = new URL("../", import.meta.url);
   const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8"));

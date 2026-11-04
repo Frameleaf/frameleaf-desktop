@@ -40,6 +40,7 @@ mod source_import;
 mod source_metadata;
 mod transport;
 mod tray;
+mod updates;
 mod upload_budget;
 #[cfg(windows)]
 mod windows_host_profile;
@@ -485,6 +486,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -505,6 +507,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::check_desktop_update,
+            updates::install_desktop_update,
             host_commands::open_local_photos,
             host_commands::authorize_local_manager,
             host_commands::installed_local_hosts,
