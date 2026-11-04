@@ -108,7 +108,7 @@ jobs:
           if ($fixtures.Count -ne 2) { throw 'Windows package qualification fixtures are missing' }
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib host_install::windows::package::tests::disposable_runner_ -- --ignored
           if ($LASTEXITCODE) { throw 'Windows package qualification failed' }
-      - name: Check Windows native installer rejects and rolls back a corrupt payload
+      - name: Check Windows native installer rolls back corrupt and long-path fixtures
         if: runner.os == 'Windows' && runner.environment == 'github-hosted'
         shell: pwsh
         run: |
@@ -119,15 +119,38 @@ jobs:
           $env:HOST_ARCHIVE = Join-Path $env:RUNNER_TEMP 'windows-host.7z'
           $base = Join-Path $env:ProgramFiles 'Frameleaf'
           if (Test-Path -LiteralPath $base) { throw 'Expected a fresh disposable machine' }
+          $compiler = "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe"
+          $installer = "$env:HOST_OUTPUT/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe"
+          $runtime = "$base/Runtimes/$env:HOST_MANIFEST"
+          $controller = "$base/Controllers/$env:HOST_MANIFEST/$env:HOST_CONTROLLER_SHA256"
           Set-Content $env:HOST_ARCHIVE 'corrupt archive'
-          & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /Q tools/windows/native-host.iss
-          if ($LASTEXITCODE) { throw 'Native installer compilation failed' }
-          $log = Join-Path $env:HOST_OUTPUT 'refusal.log'
-          $setup = Start-Process "$env:HOST_OUTPUT/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -Wait -PassThru
-          if (!$setup.ExitCode -or !(Test-Path "$base/Runtimes") -or (Test-Path "$base/Runtimes/$env:HOST_MANIFEST") -or
-              (Test-Path "$base/Controllers/$env:HOST_MANIFEST/$env:HOST_CONTROLLER_SHA256")) {
-            Get-Content $log -Tail 35
-            throw 'Corrupt payload did not fail with a clean rollback'
+          foreach ($fixture in @('corrupt', 'long-path')) {
+            if ($fixture -eq 'long-path') {
+              Remove-Item -LiteralPath $env:HOST_ARCHIVE
+              $folder = 'payload/' + ('a' * 70) + '/' + ('b' * 70)
+              $entry = "$folder/" + ('c' * 70) + '.txt'
+              if (("$runtime/$entry").Length -le 260) { throw 'The fixture path is too short' }
+              $input = Join-Path $env:RUNNER_TEMP 'installer-long-path'
+              New-Item -ItemType Directory -Path "$input/$folder" -Force | Out-Null
+              Set-Content "$input/$entry" 'fixture'
+              Push-Location $input
+              try {
+                & "$env:ProgramFiles/7-Zip/7z.exe" a -t7z $env:HOST_ARCHIVE payload
+                if ($LASTEXITCODE) { throw 'Long-path fixture creation failed' }
+              } finally { Pop-Location }
+            }
+            & $compiler /Q tools/windows/native-host.iss
+            if ($LASTEXITCODE) { throw 'Native installer compilation failed' }
+            $log = Join-Path $env:HOST_OUTPUT "$fixture.log"
+            $setup = Start-Process $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -Wait -PassThru
+            if (!$setup.ExitCode -or !(Test-Path "$base/Runtimes") -or (Test-Path $runtime) -or (Test-Path $controller)) {
+              Get-Content $log -Tail 35
+              throw "$fixture payload did not fail with a clean rollback"
+            }
+            if ($fixture -eq 'long-path' -and !(Select-String -Quiet -SimpleMatch 'frameleaf-native-host.exe failed (exit' -Path $log)) {
+              Get-Content $log -Tail 35
+              throw 'Long-path extraction did not reach signed payload verification'
+            }
           }
           $global:LASTEXITCODE = 0
       - name: Qualify per-user Windows profile preparation in disposable runner

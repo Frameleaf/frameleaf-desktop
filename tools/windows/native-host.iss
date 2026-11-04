@@ -78,7 +78,7 @@ begin
     WizardForm.StatusLabel.Caption := 'Verifying the installed server...';
     RunChecked(Controller, '--finalize-windows-package {#Manifest} {#Digest}');
   except
-    if MadeRuntime then DelTree(RuntimeDir, True, True, True);
+    if MadeRuntime then DelTree('\\?\' + RuntimeDir, True, True, True);
     if MadeController then DelTree(ControllerDir, True, True, True);
     RaiseException(GetExceptionMessage);
   end;
