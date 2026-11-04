@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/aj/fd3-unsigned-windows-010' && inputs.platforms == 'windows' && inputs.runtime_run_id == '41406368520'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -27,6 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: 974b18f3b6e67701ef71feb61ce71e5df9d8d3d7
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
@@ -47,7 +48,8 @@ jobs:
             import { validateFactoryRun } from "./tools/release_inputs.mjs";
             console.log(validateFactoryRun(JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json")), process.env.GITHUB_REPOSITORY));
           ')
-          git merge-base --is-ancestor "$revision" "$GITHUB_SHA"
+          test "$(git rev-parse refs/tags/v0.1.0^{commit})" = "974b18f3b6e67701ef71feb61ce71e5df9d8d3d7"
+          git merge-base --is-ancestor "$revision" "974b18f3b6e67701ef71feb61ce71e5df9d8d3d7"
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
@@ -56,11 +58,9 @@ jobs:
           '
   build:
     needs: prepare
-    environment: ${{ matrix.target == 'windows-x86_64' && 'desktop-release' || '' }}
     permissions:
       contents: read
       actions: read
-      id-token: write
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -74,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.sha }}
+          ref: 974b18f3b6e67701ef71feb61ce71e5df9d8d3d7
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
@@ -127,17 +127,6 @@ jobs:
         with:
           node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - name: Configure Azure Artifact Signing
-        if: runner.os == 'Windows'
-        uses: ./.github/actions/windows-signing
-        with:
-          config: candidate-config.json
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
-          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
       - name: Build installer candidates
         shell: bash
         run: |
@@ -156,18 +145,39 @@ jobs:
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
-      - name: Verify Windows executable and installer signatures
-        if: runner.os == 'Windows'
+      - name: Install each unsigned Windows package and verify its bundled runtime and Welcome screen
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          node --input-type=module -e "import { packageConfiguration } from './tools/package_desktop.mjs'; await packageConfiguration('release-runtime');"
-          if ($LASTEXITCODE) { throw 'Factory runtime changed during bundling' }
-          $files = @(Get-Item src-tauri/target/release/frameleaf-desktop.exe)
           $installers = @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.exe', '.msi' })
           if ($installers.Count -ne 2 -or @($installers.Extension | Sort-Object -Unique).Count -ne 2) { throw 'Expected NSIS and MSI installers' }
-          foreach ($file in ($files + $installers)) {
-            & ./tools/windows_sign.ps1 -Path $file.FullName -VerifyOnly
+          foreach ($package in $installers) {
+            if ((Get-AuthenticodeSignature -LiteralPath $package.FullName).Status -ne 'NotSigned') { throw 'Expected unsigned installer' }
+            $dest = Join-Path $env:RUNNER_TEMP ("FrameleafQA" + $package.Extension.Substring(1))
+            if (Test-Path $dest) { throw 'Expected a clean destination' }
+            if ($package.Extension -eq '.exe') {
+              $process = Start-Process -FilePath $package.FullName -ArgumentList '/S', "/D=$dest" -Wait -PassThru
+            } else {
+              $process = Start-Process msiexec.exe -ArgumentList '/i', ('"' + $package.FullName + '"'), '/qn', '/norestart', "INSTALLDIR=$dest", "APPLICATIONFOLDER=$dest", '/l*v', "$env:RUNNER_TEMP/frameleaf-msi.log" -Wait -PassThru
+            }
+            if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+            $exe = Join-Path $dest 'frameleaf-desktop.exe'
+            if (!(Test-Path $exe)) { throw "Missing installed desktop in $dest" }
+            if ((Get-AuthenticodeSignature -LiteralPath $exe).Status -ne 'NotSigned') { throw 'Expected unsigned desktop executable' }
+            if ((Get-FileHash $exe).Hash -ne (Get-FileHash 'src-tauri/target/release/frameleaf-desktop.exe').Hash) { throw 'Installed desktop bytes changed' }
+            $env:QA_RUNTIME = Join-Path $dest 'native-runtime'
+            node --input-type=module -e "import {packageConfiguration} from './tools/package_desktop.mjs'; await packageConfiguration(process.env.QA_RUNTIME)"
+            if ($LASTEXITCODE) { throw 'Installed runtime validation failed' }
+            powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable $exe
+            if ($LASTEXITCODE) { throw 'Installed Welcome failed' }
+            if ($package.Extension -eq '.msi') {
+              $remove = Start-Process msiexec.exe -ArgumentList '/x', ('"' + $package.FullName + '"'), '/qn', '/norestart' -Wait -PassThru
+            } else {
+              $uninstaller = Get-Item (Join-Path $dest 'uninstall.exe')
+              $remove = Start-Process $uninstaller.FullName -ArgumentList '/S', "_?=$dest" -Wait -PassThru
+            }
+            if ($remove.ExitCode -ne 0) { throw 'Uninstall failed' }
+            Write-Output "Verified unsigned $($package.Extension) installation and signed runtime"
           }
       - name: Collect installers and provenance preserving executable modes
         env:
@@ -198,8 +208,8 @@ jobs:
                   hashes[source.name] = hashlib.file_digest(binary, 'sha256').hexdigest()
           (output / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(hashes.items())))
           (output / 'candidate.json').write_text(json.dumps({
-              'sourceRevision': os.environ['GITHUB_SHA'], 'target': os.environ['CANDIDATE_TARGET'],
-              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False, 'osSigned': sys.platform == 'win32',
+              'sourceRevision': '974b18f3b6e67701ef71feb61ce71e5df9d8d3d7', 'target': os.environ['CANDIDATE_TARGET'],
+              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': True, 'osSigned': False,
               'scope': 'GUI and existing-server helper candidate; full native host qualification remains separate',
               'files': hashes,
           }, indent=2) + '\n')
