@@ -560,6 +560,29 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires an installed companion on a disposable hosted runner"]
+    async fn disposable_runner_diagnoses_installed_manager_start() {
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST")
+            .expect("expected the reviewed installed companion identity");
+        let setup = HostSetup::default();
+        let view = setup
+            .start(manifest)
+            .await
+            .expect("installed Manager startup refused");
+        assert_eq!(view.state, "manager-ready");
+        setup
+            .stop()
+            .await
+            .expect("installed Manager shutdown failed");
+    }
+
     #[test]
     fn update_excludes_local_host_operations() {
         let setup = HostSetup::default();

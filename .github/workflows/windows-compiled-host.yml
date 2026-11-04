@@ -151,6 +151,7 @@ jobs:
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --ignored --exact --nocapture
           if ($LASTEXITCODE) { throw 'Windows private profile admission failed' }
       - name: Exercise the companion with the published 0.1.1 Windows desktop
+        id: installed-desktop
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -167,6 +168,14 @@ jobs:
           if ($install.ExitCode) { throw 'Desktop installation failed' }
           powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe') -InstalledHost
           if ($LASTEXITCODE) { throw 'Installed native host acceptance failed' }
+      - name: Report the installed Manager startup error if Desktop setup fails
+        if: failure() && steps.installed-desktop.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $env:FRAMELEAF_INSTALLED_HOST_MANIFEST = (Get-Content (Join-Path $root 'protected-install.json') -Raw | ConvertFrom-Json).manifestSha256
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_setup::tests::disposable_runner_diagnoses_installed_manager_start -- --ignored --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Installed Manager diagnostic failed' }
       - name: Retain bounded resource qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
