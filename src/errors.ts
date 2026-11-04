@@ -4,10 +4,16 @@ const messages: Record<string, string> = {
   worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
   server_requires_https_origin: 'Enter your server’s address without a path or sign-in details. Use HTTPS unless the server is on your local network.',
   server_address_invalid: 'Enter a valid server address.',
+  server_sign_in_retry_required: 'Your server’s identity could not be confirmed. Sign in again to continue.',
   server_identity_not_confirmed: 'Sign in again to confirm this server’s identity. Clear the saved sign-in first.',
   server_unreachable_or_certificate_invalid: 'Could not securely connect. Check the server address, network and certificate.',
   server_http_401: 'Sign-in expired or the email and password are incorrect. Sign out and try again.',
   server_http_403: 'Your server did not permit this sign-in.',
+  credential_confirmation_unavailable: 'Your Mac could not confirm the saved sign-in. Restore it when the credential store is available.',
+  credential_confirmation_changed: 'The stored sign-in changed. Restore the sign-in currently saved on this Mac.',
+  credential_record_invalid: 'The saved sign-in could not be read. Clear it and sign in again.',
+  credential_device_unlock_required: 'Your existing Frameleaf device key is locked. Retry this action and approve access on your Mac.',
+  credential_unlock_required: 'Unlock your saved sign-in with Touch ID or your Mac password.',
   credential_store_locked_or_unavailable: 'Unlock your computer’s credential store, then try again.',
   credential_store_unavailable: 'The secure credential store is unavailable on this computer.',
   sign_out_before_switching_servers: 'Sign out before connecting to another server.',
@@ -29,4 +35,8 @@ const messages: Record<string, string> = {
 export function connectionError(error: unknown): string {
   const code = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
   return Object.hasOwn(messages, code) ? messages[code]! : 'This operation could not finish. Check your connection and try again.';
+}
+
+export function savedSignInNeedsRecovery(error: unknown): boolean {
+  return ['credential_unlock_required', 'credential_confirmation_unavailable', 'credential_confirmation_changed'].includes(String(error));
 }

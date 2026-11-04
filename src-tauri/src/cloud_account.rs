@@ -550,9 +550,17 @@ async fn profile(
 static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The stored credential with a usable access token, or `None` when signed out.
-async fn current(client: &Client) -> Result<Option<(CloudCredential, String)>, String> {
+async fn current(
+    client: &Client,
+    prompt: Option<(&WebviewWindow, bool)>,
+) -> Result<Option<(CloudCredential, String)>, String> {
     let _held = LIFECYCLE.lock().await;
-    let Some(mut credential) = load()? else {
+    let credential = if let Some((window, retry)) = prompt {
+        credentials::load_interactive(CREDENTIAL, window, retry)?
+    } else {
+        load()?
+    };
+    let Some(mut credential) = credential else {
         return Ok(None);
     };
     let token = access_token(client, &mut credential).await?;
@@ -620,6 +628,12 @@ pub(crate) async fn cloud_sign_in(
         expires_at: now() + token.expires_in.unwrap_or(600),
     };
     store(&credential)?;
+    if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, &window) {
+        if error == "credential_confirmation_changed" {
+            let _ = revoke(&client, &credential).await;
+        }
+        return Err(error);
+    }
     match profile(&client, &credential, &token.access_token).await {
         Ok(account) => Ok(account),
         Err(error) => {
@@ -631,10 +645,14 @@ pub(crate) async fn cloud_sign_in(
 }
 
 #[tauri::command]
-pub(crate) async fn cloud_account(window: WebviewWindow) -> Result<Option<CloudAccount>, String> {
+pub(crate) async fn cloud_account(
+    window: WebviewWindow,
+    retry: Option<bool>,
+) -> Result<Option<CloudAccount>, String> {
     crate::require_local(&window)?;
     let client = transport::client()?;
-    let (credential, token) = match current(&client).await {
+    let (credential, token) = match current(&client, Some((&window, retry.unwrap_or(false)))).await
+    {
         Ok(Some(found)) => found,
         Ok(None) => return Ok(None),
         Err(code) if code == "cloud_sign_in_required" => return Ok(None),
@@ -673,8 +691,13 @@ pub(crate) async fn cloud_sign_out(window: WebviewWindow) -> Result<(), String> 
     crate::require_local(&window)?;
     let credential = {
         let _held = LIFECYCLE.lock().await;
-        let Some(credential) = load()? else {
-            return Ok(());
+        let credential = match credentials::load_interactive(CREDENTIAL, &window, true) {
+            Ok(Some(credential)) => credential,
+            Ok(None) => return Ok(()),
+            Err(code) if code == "credential_record_invalid" => {
+                return credentials::delete(CREDENTIAL)
+            }
+            Err(code) => return Err(code),
         };
         // Local authority ends first; the cloud is told best-effort.
         credentials::delete(CREDENTIAL)?;
@@ -726,7 +749,7 @@ pub(crate) fn parse_instances(value: Value) -> Result<Vec<CloudServer>, String> 
 }
 
 async fn signed_in(client: &Client) -> Result<(CloudCredential, String), String> {
-    current(client)
+    current(client, None)
         .await?
         .ok_or_else(|| "cloud_sign_in_required".into())
 }
@@ -838,7 +861,7 @@ pub(crate) async fn connect_cloud_server(
         return Err("sign_out_before_switching_servers".into());
     }
     // Check secure persistence and the device identity before any token is minted.
-    let identity = credentials::identity()?;
+    let identity = credentials::foreground_identity(&window)?;
     identity.enrollment("validation", "validation", &device_name, "client-worker")?;
     let client = transport::client()?;
     let (credential, app_token) = signed_in(&client).await?;
@@ -951,15 +974,10 @@ pub(crate) async fn connect_cloud_server(
         mode: "client-worker".into(),
         device_id: None,
     };
-    if let Err(error) = credentials::save("connection", &saved) {
-        let _ = client
-            .post(base.join("api/auth/logout").unwrap())
-            .bearer_auth(&saved.token)
-            .send()
-            .await;
-        return Err(error);
-    }
-    let mut view = crate::prepare_with_client(&client, &mut saved).await;
+    let mut view = crate::finish_new_connection(&client, &mut saved, |saved| {
+        credentials::confirm_new_sign_in("connection", saved, &window)
+    })
+    .await?;
     if view.state == "preparing"
         && view.features.worker_session
         && crate::start_worker_setup(&app, &saved, false)

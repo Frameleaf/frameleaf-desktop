@@ -6,13 +6,13 @@
   import Sheet from '../Sheet.svelte';
   import LocalHost from '../LocalHost.svelte';
   import ManagerPanel from '../ManagerPanel.svelte';
-  import { connectionError } from '../errors';
+  import { connectionError, savedSignInNeedsRecovery } from '../errors';
   import { mergeServers, initials, computerWord, platformFromUserAgent, type ServerEntry } from '../ui-state';
   import type { Connection, CloudAccount, CloudServer, DiscoveredServer } from '../server-types';
 
-  let { native, hostActive, cloudAccount, managerRevision, onconnected, oncloudaccount, onhostactive, onmanagerchange, onmanagerstate }: {
+  let { native, hostActive, cloudAccount, managerRevision, onlocked, onconnected, oncloudaccount, onhostactive, onmanagerchange, onmanagerstate }: {
     native: boolean; hostActive: boolean; cloudAccount: CloudAccount | null; managerRevision: number;
-    onconnected: (connection: Connection) => void; oncloudaccount: (account: CloudAccount | null) => void;
+    onlocked: () => void; onconnected: (connection: Connection) => void; oncloudaccount: (account: CloudAccount | null) => void;
     onhostactive: (active: boolean) => void; onmanagerchange: () => void; onmanagerstate: (paired: boolean) => void;
   } = $props();
   const platform = platformFromUserAgent(navigator.userAgent);
@@ -40,16 +40,23 @@
   const showServers = $derived(mode === 'client-worker' && !!cloudAccount && !addressMode);
   const explain = connectionError;
 
-  onMount(() => {
-    if (!native) return;
-    void (async () => {
-      try {
-        const account = await invoke<CloudAccount | null>('cloud_account');
-        oncloudaccount(account);
-        if (account) await loadServers();
-      } catch { /* no cloud account: the address form is shown */ }
-    })();
-  });
+  let cloudLocked = $state(false);
+  let cloudDamaged = $state(false);
+  async function restoreCloud(retry = false) {
+    if (retry) failure = '';
+    cloudBusy = true;
+    try {
+      const account = await invoke<CloudAccount | null>('cloud_account', { retry });
+      cloudLocked = false; cloudDamaged = false;
+      oncloudaccount(account);
+      if (account) await loadServers();
+    } catch (error) {
+      cloudDamaged = String(error) === 'credential_record_invalid';
+      cloudLocked = !cloudDamaged;
+      failure = explain(error);
+    } finally { cloudBusy = false; }
+  }
+  onMount(() => { if (native) void restoreCloud(); });
   async function loadServers() {
     loadingServers = true; failure = '';
     const [cloud, lan] = await Promise.allSettled([invoke<CloudServer[]>('cloud_servers'), invoke<DiscoveredServer[]>('discover_servers')]);
@@ -65,13 +72,13 @@
       const account = await invoke<CloudAccount>('cloud_sign_in');
       oncloudaccount(account); addressMode = false; notice = '';
       await loadServers();
-    } catch (error) { notice = ''; failure = explain(error); }
+    } catch (error) { cloudLocked = savedSignInNeedsRecovery(error); notice = ''; failure = explain(error); }
     finally { cloudBusy = false; }
   }
   async function cloudSignOut() {
     if (!native || cloudBusy) return;
     cloudBusy = true; failure = '';
-    try { await invoke('cloud_sign_out'); oncloudaccount(null); cloudServers = []; }
+    try { await invoke('cloud_sign_out'); oncloudaccount(null); cloudServers = []; cloudDamaged = false; cloudLocked = false; failure = ''; }
     catch (error) { failure = explain(error); }
     finally { cloudBusy = false; }
   }
@@ -81,14 +88,14 @@
     busy = true; failure = ''; notice = '';
     const secret = password; password = '';
     try { onconnected(await invoke<Connection>('connect_server', { server, email, password: secret, deviceName })); }
-    catch (error) { failure = explain(error); }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); }
     finally { busy = false; }
   }
   async function connectCloud(entry: ServerEntry) {
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
     try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName })); }
-    catch (error) { failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {
@@ -189,7 +196,8 @@
       Your sign-in is saved securely on this {computer}.
     {/if}
     <span class="sp"></span>
-    {#if mode === 'client-worker' && !cloudAccount}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignIn}><Icon name="cloud" />{cloudBusy ? 'Waiting for your browser…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
+    {#if cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignOut}>Clear unreadable Cloud sign-in</button>{/if}
+    {#if mode === 'client-worker' && !cloudAccount && !cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Restore saved Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
     Version {version}
   </footer>
 </div>

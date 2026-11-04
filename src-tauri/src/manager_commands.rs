@@ -3,15 +3,24 @@ use tauri::{Manager, WebviewWindow};
 
 #[tauri::command]
 pub(crate) async fn manager_view(
+    retry: Option<bool>,
     window: WebviewWindow,
     app: tauri::AppHandle,
 ) -> Result<Option<manager::View>, String> {
     require_local(&window)?;
     let state = app.state::<DesktopState>();
     let _lock = state.0.lock().await;
-    let Some(saved) = credentials::load::<manager::SavedManager>(manager::CREDENTIAL)? else {
+    let Some(saved) = credentials::load_interactive::<manager::SavedManager>(
+        manager::CREDENTIAL,
+        &window,
+        retry.unwrap_or(false),
+    )?
+    else {
         return Ok(None);
     };
+    if retry.unwrap_or(false) {
+        credentials::unlock_existing_identity(&window)?;
+    }
     // Public pairing metadata remains visible when a device key needs recovery.
     Ok(Some(saved.view()))
 }
@@ -45,7 +54,7 @@ pub(crate) async fn pair_manager(
     let origin = manager::normalize_manager(&origin)?
         .origin()
         .ascii_serialization();
-    let identity = credentials::identity()?;
+    let identity = credentials::foreground_identity(&window)?;
     // Confirm secure writes before sending a Manager password; no plaintext fallback.
     credentials::save("manager-pairing-check", &true)?;
     credentials::delete("manager-pairing-check")?;

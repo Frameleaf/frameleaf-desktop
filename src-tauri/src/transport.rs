@@ -141,6 +141,73 @@ mod tests {
         });
         (url, handle)
     }
+    #[tokio::test]
+    #[ignore = "uses a process-local synthetic Keychain; run alone"]
+    async fn cancelled_first_unlock_preserves_only_a_verified_restartable_sign_in() {
+        crate::ml_transport::native_nas_tests::install_test_keyring();
+        let caps = serde_json::json!({"protocolVersion":1,"serverId":"known-server","features":{
+            "enrollment":false,"worker":false,"sources":false,"nativeHost":false
+        }});
+        for (status, failure, expected_error, expected_token) in [
+            (
+                200,
+                "credential_unlock_required",
+                "credential_unlock_required",
+                Some("fixture"),
+            ),
+            (
+                200,
+                "credential_confirmation_unavailable",
+                "credential_confirmation_unavailable",
+                Some("fixture"),
+            ),
+            (
+                200,
+                "credential_confirmation_changed",
+                "credential_confirmation_changed",
+                Some("replacement"),
+            ),
+            (
+                404,
+                "credential_unlock_required",
+                "server_sign_in_retry_required",
+                None,
+            ),
+        ] {
+            let (url, server) = reply(caps.to_string(), status);
+            let mut saved = SavedConnection {
+                server: url,
+                server_id: String::new(),
+                account_id: "account".into(),
+                name: "Test".into(),
+                token: "fixture".into(),
+                device_name: "Fixture".into(),
+                mode: "client-worker".into(),
+                device_id: None,
+            };
+            let result = crate::finish_new_connection(&client().unwrap(), &mut saved, |expected| {
+                if failure == "credential_confirmation_changed" {
+                    let mut replacement = expected.clone();
+                    replacement.token = "replacement".into();
+                    crate::credentials::save("connection", &replacement)?;
+                }
+                Err(failure.into())
+            })
+            .await;
+            assert_eq!(result.err().as_deref(), Some(expected_error));
+            let stored: Option<SavedConnection> = crate::credentials::load("connection").unwrap();
+            if let Some(expected_token) = expected_token {
+                let stored = stored.unwrap();
+                assert_eq!(stored.server_id, "known-server");
+                assert_eq!(stored.account_id, saved.account_id);
+                assert_eq!(stored.token, expected_token);
+                crate::credentials::delete("connection").unwrap();
+            } else {
+                assert!(stored.is_none());
+            }
+            server.join().unwrap();
+        }
+    }
     #[test]
     fn keeps_photo_json_small_and_accepts_only_explicit_bounded_worker_replies() {
         tauri::async_runtime::block_on(async {

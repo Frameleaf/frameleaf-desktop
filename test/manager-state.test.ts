@@ -29,7 +29,7 @@ test('startup restores durable recovery requests before an unreachable Manager s
   [managerState.backupRestoreKey(owner),JSON.stringify(restore)],
  ]);
  const source=readFileSync(new URL('../src/ManagerPanel.svelte',import.meta.url),'utf8');
- const startup=source.match(/async function restore\(\) \{[\s\S]*?\n  \}\n  onMount/)?.[0].replace(/\n  onMount$/,'');
+ const startup=source.match(/async function restore\([^)]*\) \{[\s\S]*?\n  \}\n  onMount/)?.[0].replace(/\n  onMount$/,'');
  assert.ok(startup);
  const run=new Function('invoke','localStorage','checkStatus','helpers',`
   const {restoreIntent,intentKey,restoreBackupReview,backupReviewKey,parseBackupRestoreIntent,backupRestoreKey}=helpers;

@@ -127,8 +127,8 @@
       }
     }
   }
-  async function restore() {
-    manager = await invoke<ManagerView | null>('manager_view');
+  async function restore(retry = false) {
+    manager = await invoke<ManagerView | null>('manager_view', { retry });
     if (!manager) return;
     origin = manager.origin;
     try { pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager); }
@@ -156,7 +156,7 @@
       manager = await invoke<ManagerView>('pair_manager', { origin, password: secret, certificate: !http && pem.trim() ? { pem, sha256: fingerprint } : null, allowManagement, allowRecovery });
       pem = ''; fingerprint = ''; fingerprintPem = ''; certificateApproved = false;
       pending = restoreIntent(localStorage.getItem(intentKey(manager)), manager);
-      await restore();
+      await restore(true);
       notice = 'This computer is paired with Manager. Its access works independently of photo sign-in.';
     });
   }
@@ -472,7 +472,7 @@
             </span></div>
             <div class="form-row"><span></span><span class="actions">
               <button class="btn primary" disabled={!allowManagement || (!http && !!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
-              <button class="btn quiet" type="button" disabled={busy || !native} onclick={() => perform(restore)}>Restore saved Manager access</button>
+              <button class="btn quiet" type="button" disabled={busy || !native} onclick={() => perform(() => restore(true))}>Restore saved Manager access</button>
             </span></div>
           </fieldset>
         </form>

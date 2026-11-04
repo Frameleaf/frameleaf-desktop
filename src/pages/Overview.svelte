@@ -96,7 +96,7 @@
     if (!native || busy) return;
     busy = true; failure = '';
     try {
-      const restored = await invoke<Connection | null>('restore_connection');
+      const restored = await invoke<Connection | null>('restore_connection', { retry: true });
       if (restored) onconnection(restored);
       onsetup(await invoke<SetupStatus>('worker_setup_status'));
       await onrefresh();
