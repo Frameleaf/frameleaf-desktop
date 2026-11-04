@@ -88,7 +88,7 @@ class WindowsHostAssemblyTests(unittest.TestCase):
         self.assertTrue((studio / 'tools/bundled-worker-renderer.mjs').is_file())
         self.file(output, 'support/node/node.exe', b'private-node')
         self.file(output, 'support/node/LICENSE', b'node-license')
-        self.file(output, 'support/browser/chrome-headless-shell.exe', b'private-browser')
+        self.file(output, 'support/browser/chrome.exe', b'private-browser')
         self.file(output, 'support/browser/LICENSE.headless_shell', b'browser-license')
         self.file(output, 'qualification.json', json.dumps({'qualification':'passed','sourceRevision':revision,
                   'files':inventory(output/'support')}).encode())

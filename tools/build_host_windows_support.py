@@ -20,10 +20,12 @@ from stage_host_browser import stage_browser
 NODE_URL = 'https://nodejs.org/dist/v26.11.1/node-v26.11.1-win-x64.zip'
 NODE_ARCHIVE_SHA = '97f36a8a9684ff0d3e35758b4610fef5b628a5880e96f2ccc11240e5daf9934e'
 NODE_EXE_SHA = 'a619e2e09eb0d50ef4c733d678b4d22689d2afef138cd67fd3fa107b535f8819'
-BROWSER_URL = 'https://cdn.playwright.dev/builds/cft/156.0.8078.4/win64/chrome-headless-shell-win64.zip'
-BROWSER_ARCHIVE_SHA = '5af4c82cf4b351ec4bad4c71dcf938af14fccea8a0eb0d5c2a7b49ccc922698c'
+BROWSER_URL = 'https://storage.googleapis.com/chromium-browser-snapshots/Win_x64/1735040/chrome-win.zip'
+BROWSER_ARCHIVE_SHA = 'c6f856b110dba84f88c060f30ad9e84f11d4ca8f426eeab024e67b661a6624db'
 BROWSER_MANIFEST_SHA = '2cfd419f71ac6475d81e1301fa86c34cf2a2a6bae2a0da4b5a2b18310216b6bf'
-BROWSER_LICENSE_SHA = '1b6e83846a68f8f0a383057c78d180d58ec11a0abfcba380f11d5c2f4b45b273'
+BROWSER_SOURCE = 'https://github.com/chromium/chromium/tree/437d8b7085ee32ec76c1145fd502169f2ad8be50'
+BROWSER_LICENSE_URL = 'https://raw.githubusercontent.com/chromium/chromium/437d8b7085ee32ec76c1145fd502169f2ad8be50/LICENSE'
+BROWSER_LICENSE_SHA = '368cca1106be99d39ecd32a38d8305585d802a475effb66380b91ffc9bcf709b'
 PLAYWRIGHT = {
     'version': '1.64.0',
     'resolved': 'https://registry.npmjs.org/playwright-core/-/playwright-core-1.64.0.tgz',
@@ -68,6 +70,7 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
         'nodeVersion': '26.11.1', 'browserVersion': '156.0.8078.4',
         'nodeArchive': {'url': NODE_URL, 'sha256': NODE_ARCHIVE_SHA},
         'browserArchive': {'url': BROWSER_URL, 'sha256': BROWSER_ARCHIVE_SHA},
+        'browserSource': BROWSER_SOURCE,
         'qualification': 'failed', 'runtimeQualified': False, 'redistributable': False,
     }
     try:
@@ -80,16 +83,19 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
             expanded.mkdir(mode=0o700)
             unpack(archive, expanded)
         node = work / 'node/node-v26.11.1-win-x64'
-        browser = work / 'browser/chrome-headless-shell-win64'
-        if (sha256(node / 'node.exe') != NODE_EXE_SHA or not (node / 'LICENSE').stat().st_size
-                or sha256(browser / 'LICENSE.headless_shell') != BROWSER_LICENSE_SHA):
+        browser = work / 'browser/chrome-win'
+        if sha256(node / 'node.exe') != NODE_EXE_SHA or not (node / 'LICENSE').stat().st_size:
             raise BuildError('host_windows_support_payload_changed')
         (payload / 'node').mkdir(mode=0o700)
         for name in ['node.exe', 'LICENSE']:
             shutil.copy2(node / name, payload / 'node' / name)
         # Cross-staging Windows bytes on POSIX needs executable metadata, without executing them.
-        (browser / 'chrome-headless-shell.exe').chmod(0o755)
-        stage_browser(browser, payload / 'browser', 'chrome-headless-shell.exe')
+        (browser / 'chrome.exe').chmod(0o755)
+        for name in ['interactive_ui_tests.exe', 'setup.exe']:
+            (browser / name).unlink(missing_ok=True)
+        stage_browser(browser, payload / 'browser', 'chrome.exe')
+        download(BROWSER_LICENSE_URL, payload / 'browser/LICENSE', BROWSER_LICENSE_SHA)
+        (payload / 'browser/SOURCE.txt').write_text(BROWSER_SOURCE + '\n', encoding='utf-8')
         report['files'] = inventory(payload)
         report['qualification'] = 'passed'
     finally:

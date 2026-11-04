@@ -86,7 +86,7 @@ def host_entries() -> dict[str, str]:
         "rawDecoder": "raw/bin/dcraw_emu" + suffix,
         "webIndex": "build/www/index.html",
         "studio": "studio/tools/bundled-worker.mjs",
-        "studioBrowser": "browser/chrome-headless-shell" + suffix,
+        "studioBrowser": "browser/chrome.exe" if os.name == "nt" else "browser/chrome-headless-shell",
         "studioBrowserGuard": "studio/guard/studio-browser-guard",
         "corePlugin": "build/plugins/immich-plugin-core/manifest.json",
         "mlManifest": "ml/manifest.json",

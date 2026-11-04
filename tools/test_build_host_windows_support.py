@@ -29,15 +29,12 @@ class WindowsSupportTests(unittest.TestCase):
             return stream.getvalue()
         node_files = {'node-v26.11.1-win-x64/node.exe': b'private node fixture',
                       'node-v26.11.1-win-x64/LICENSE': b'node licence fixture'}
-        browser_files = {'chrome-headless-shell-win64/chrome-headless-shell.exe': b'browser fixture',
-                         'chrome-headless-shell-win64/LICENSE.headless_shell': b'complete browser notices',
-                         'chrome-headless-shell-win64/locales/en-US.pak': b'locale fixture'}
+        browser_files = {'chrome-win/chrome.exe': b'browser fixture',
+                         'chrome-win/locales/en-US.pak': b'locale fixture'}
         if damage == 'node-missing':
             del node_files['node-v26.11.1-win-x64/node.exe']
         if damage == 'node-digest':
             node_files['node-v26.11.1-win-x64/node.exe'] = b'wrong executable'
-        if damage == 'browser-notice':
-            del browser_files['chrome-headless-shell-win64/LICENSE.headless_shell']
         if damage == 'traversal':
             browser_files['../escape'] = b'forbidden'
         node, browser = archive(node_files), archive(browser_files)
@@ -50,7 +47,8 @@ class WindowsSupportTests(unittest.TestCase):
             manifest.write_bytes(b'changed installed browser manifest')
         if damage == 'digest':
             browser += b'changed download'
-        downloads = {support.NODE_URL: node, support.BROWSER_URL: browser}
+        downloads = {support.NODE_URL: node, support.BROWSER_URL: browser,
+                     support.BROWSER_LICENSE_URL: b'wrong notice' if damage == 'browser-notice' else b'complete browser notices'}
         calls = []
         def blob(git, path, revision, name, env):
             self.assertEqual((path, revision, name), (source, 'a' * 40, 'studio/engine-package-lock.json'))
@@ -73,9 +71,9 @@ class WindowsSupportTests(unittest.TestCase):
             report = json.loads((output / 'qualification.json').read_text())
             self.assertEqual(report['qualification'], 'passed')
             self.assertEqual(report['files'], inventory(output / 'support'))
-            self.assertEqual(len(report['files']), 5)
-            self.assertEqual((output / 'support/browser/LICENSE.headless_shell').read_bytes(), b'complete browser notices')
-            self.assertEqual(calls, [support.NODE_URL, support.BROWSER_URL])
+            self.assertEqual(len(report['files']), 6)
+            self.assertEqual((output / 'support/browser/LICENSE').read_bytes(), b'complete browser notices')
+            self.assertEqual(calls, [support.NODE_URL, support.BROWSER_URL, support.BROWSER_LICENSE_URL])
             self.assertFalse(report['runtimeQualified'])
             self.assertFalse(report['redistributable'])
             self.assertFalse((output / 'work').exists())
