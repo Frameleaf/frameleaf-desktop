@@ -144,6 +144,18 @@ jobs:
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build unsigned shell smoke-test candidate
         run: npm run desktop:build:shell -- --debug
+      - name: Install the unsigned Windows shell and exercise Welcome
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem src-tauri/target/debug/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) { throw 'Expected one NSIS installer' }
+          $destination = Join-Path $env:RUNNER_TEMP 'FrameleafWelcome'
+          if (Test-Path $destination) { throw 'Expected a fresh install destination' }
+          $install = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S', "/D=$destination" -PassThru -Wait
+          if ($install.ExitCode) { throw "NSIS failed: $($install.ExitCode)" }
+          powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe')
+          if ($LASTEXITCODE) { throw 'Installed Welcome check failed' }
       - name: Retain private candidate artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
