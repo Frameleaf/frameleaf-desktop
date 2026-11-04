@@ -65,7 +65,8 @@ def main(bundle, profile_path, keychain):
         image.parent.mkdir(exist_ok=True)
         # The temporary image is on the output volume so a failed build cannot replace a candidate.
         pending = temp / image.name
-        subprocess.run(["hdiutil", "create", "-volname", "Frameleaf", "-format", "UDZO", "-srcfolder", root, pending], check=True)
+        subprocess.run(["hdiutil", "create", "-volname", "Frameleaf", "-fs", "HFS+", "-format", "UDZO",
+                        "-imagekey", "zlib-level=9", "-srcfolder", root, pending], check=True)
         subprocess.run([*sign, pending], check=True)
         subprocess.run([*verify, pending], check=True)
         pending.replace(image)
