@@ -112,6 +112,22 @@ def stage_packages(candidate: Path, controller: Path, output: Path, manifest_has
     return bootstrap, runtime
 
 
+def foreign_node_prebuild(path: Path, machine: str) -> bool:
+    if len(path.parts) < 6:
+        return False
+    server, modules, package, prebuilds, target, filename = path.parts[-6:]
+    if (server, modules, prebuilds) != ('server', 'node_modules', 'prebuilds'):
+        return False
+    if target not in {'linux-arm', 'linux-arm64', 'linux-x64'}:
+        return False
+    native = {'x86_64': 'linux-x64', 'aarch64': 'linux-arm64'}.get(machine)
+    if native is None:
+        return False
+    if package == 'bcrypt' and filename in {'bcrypt.glibc.node', 'bcrypt.musl.node'}:
+        return target != native or filename == 'bcrypt.musl.node'
+    return package in {'bare-fs', 'bare-path', 'bare-url'} and filename == package + '.bare' and target != native
+
+
 def dependencies(tree: Path, package: str, work: Path) -> str:
     work.mkdir(mode=0o700)
     (work / 'debian').mkdir()
@@ -125,6 +141,9 @@ def dependencies(tree: Path, package: str, work: Path) -> str:
         with path.open('rb') as stream:
             if stream.read(4) != b'\x7fELF':
                 continue
+        # These npm packages ship alternative prebuilds that their loaders do not select on Ubuntu.
+        if foreign_node_prebuild(path.relative_to(tree), platform.machine()):
+            continue
         directories.add(path.parent)
         dynamic = run(['readelf', '-d', path], cwd=work, env=env)
         analyzed = path
