@@ -1,6 +1,10 @@
 use crate::connection::DeviceIdentity;
 use crate::worker::{persist_checkpoint, SavedWorker};
+#[cfg(any(not(target_os = "macos"), test))]
 use keyring::{Entry, Error};
+#[cfg(target_os = "macos")]
+#[path = "macos_keychain.rs"]
+mod macos;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
@@ -21,12 +25,48 @@ fn worker_lock(account: &str) -> Result<Option<MutexGuard<'static, ()>>, String>
     Ok(None)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 const SERVICE: &str = "app.frameleaf.desktop";
 pub fn load<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
     let _lock = worker_lock(account)?;
     load_record(account)
 }
 fn load_record<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
+    read_record(account, Prompt::Silent)
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy)]
+pub(super) enum Prompt {
+    Silent,
+    Foreground,
+    Retry,
+}
+
+/// Interactive access is requested only by local foreground credential commands.
+pub fn load_interactive<T: DeserializeOwned>(
+    account: &str,
+    window: &tauri::WebviewWindow,
+    retry: bool,
+) -> Result<Option<T>, String> {
+    let _lock = worker_lock(account)?;
+    let prompt = if !window.is_focused().unwrap_or(false) {
+        Prompt::Silent
+    } else if retry {
+        Prompt::Retry
+    } else {
+        Prompt::Foreground
+    };
+    read_record(account, prompt)
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn read_record<T: DeserializeOwned>(account: &str, prompt: Prompt) -> Result<Option<T>, String> {
+    macos::read(account, prompt)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn read_record<T: DeserializeOwned>(account: &str, _prompt: Prompt) -> Result<Option<T>, String> {
     let entry = Entry::new(SERVICE, account).map_err(|_| "credential_store_unavailable")?;
     match entry.get_password() {
         Ok(value) => serde_json::from_str(&Zeroizing::new(value))
@@ -43,6 +83,9 @@ pub fn save<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
 fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     let data =
         Zeroizing::new(serde_json::to_string(value).map_err(|_| "credential_record_invalid")?);
+    #[cfg(all(target_os = "macos", not(test)))]
+    return macos::write(account, data.as_bytes());
+    #[cfg(any(not(target_os = "macos"), test))]
     Entry::new(SERVICE, account)
         .map_err(|_| "credential_store_unavailable")?
         .set_password(&data)
@@ -50,6 +93,9 @@ fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
 }
 pub fn delete(account: &str) -> Result<(), String> {
     let _lock = worker_lock(account)?;
+    #[cfg(all(target_os = "macos", not(test)))]
+    return macos::delete(account);
+    #[cfg(any(not(target_os = "macos"), test))]
     match Entry::new(SERVICE, account)
         .map_err(|_| "credential_store_unavailable")?
         .delete_credential()

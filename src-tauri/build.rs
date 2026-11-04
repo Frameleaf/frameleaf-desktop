@@ -1,4 +1,15 @@
 fn main() {
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rerun-if-changed=src/macos_keychain.m");
+        cc::Build::new()
+            .file("src/macos_keychain.m")
+            .flag("-fobjc-arc")
+            .compile("frameleaf_keychain");
+        println!("cargo:rustc-link-lib=framework=LocalAuthentication");
+        println!("cargo:rustc-link-lib=framework=Security");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "open_local_photos",

@@ -40,16 +40,20 @@
   const showServers = $derived(mode === 'client-worker' && !!cloudAccount && !addressMode);
   const explain = connectionError;
 
-  onMount(() => {
-    if (!native) return;
-    void (async () => {
-      try {
-        const account = await invoke<CloudAccount | null>('cloud_account');
-        oncloudaccount(account);
-        if (account) await loadServers();
-      } catch { /* no cloud account: the address form is shown */ }
-    })();
-  });
+  let cloudLocked = $state(false);
+  async function restoreCloud(retry = false) {
+    cloudBusy = true;
+    try {
+      const account = await invoke<CloudAccount | null>('cloud_account', { retry });
+      cloudLocked = false;
+      oncloudaccount(account);
+      if (account) await loadServers();
+    } catch (error) {
+      cloudLocked = String(error) === 'credential_unlock_required';
+      if (cloudLocked) failure = explain(error);
+    } finally { cloudBusy = false; }
+  }
+  onMount(() => { if (native) void restoreCloud(); });
   async function loadServers() {
     loadingServers = true; failure = '';
     const [cloud, lan] = await Promise.allSettled([invoke<CloudServer[]>('cloud_servers'), invoke<DiscoveredServer[]>('discover_servers')]);
@@ -189,7 +193,7 @@
       Your sign-in is saved securely on this {computer}.
     {/if}
     <span class="sp"></span>
-    {#if mode === 'client-worker' && !cloudAccount}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignIn}><Icon name="cloud" />{cloudBusy ? 'Waiting for your browser…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
+    {#if mode === 'client-worker' && !cloudAccount}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Unlock Frameleaf Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
     Version {version}
   </footer>
 </div>

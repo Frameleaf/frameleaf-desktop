@@ -1326,6 +1326,7 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "cap-std",
+ "cc",
  "core-foundation 0.10.1",
  "dbus",
  "dispatch2",

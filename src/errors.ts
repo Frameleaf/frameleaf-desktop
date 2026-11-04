@@ -8,6 +8,7 @@ const messages: Record<string, string> = {
   server_unreachable_or_certificate_invalid: 'Could not securely connect. Check the server address, network and certificate.',
   server_http_401: 'Sign-in expired or the email and password are incorrect. Sign out and try again.',
   server_http_403: 'Your server did not permit this sign-in.',
+  credential_unlock_required: 'Unlock your saved sign-in with Touch ID or your Mac password.',
   credential_store_locked_or_unavailable: 'Unlock your computer’s credential store, then try again.',
   credential_store_unavailable: 'The secure credential store is unavailable on this computer.',
   sign_out_before_switching_servers: 'Sign out before connecting to another server.',

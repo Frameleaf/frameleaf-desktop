@@ -241,6 +241,7 @@ async fn sign_in(
 
 #[tauri::command]
 async fn restore_connection(
+    retry: Option<bool>,
     window: WebviewWindow,
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
@@ -252,7 +253,12 @@ async fn restore_connection(
     }
     app.state::<source_import::SourceJobs>().stop().await;
     app.state::<worker_setup::WorkerSetup>().stop().await;
-    let Some(mut saved) = credentials::load::<SavedConnection>("connection")? else {
+    let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
+        "connection",
+        &window,
+        retry.unwrap_or(false),
+    )?
+    else {
         return Ok(None);
     };
     if saved.server_id.is_empty() {

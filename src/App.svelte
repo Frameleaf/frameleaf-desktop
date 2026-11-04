@@ -35,6 +35,7 @@
   // A sign-in left in the credential store with no connection shown (restore failed, or sign-out could not delete it):
   // native connect refuses until it is cleared, so the clear action stays reachable.
   let staleSignIn = $state(false);
+  let connectionLocked = $state(false);
   const isAdmin = $derived(summary?.me?.isAdmin === true);
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
@@ -46,6 +47,20 @@
     const result = await invoke<ServerSummary>('server_summary').catch(() => null);
     if (summaryRequest === asked) summary = result;
     void invoke('tray_refresh').catch(() => {});
+  }
+  async function restoreSaved(retry = false) {
+    busy = true;
+    try {
+      failure = '';
+      connection = await invoke<Connection | null>('restore_connection', { retry });
+      connectionLocked = false; staleSignIn = false;
+      setup = await invoke<SetupStatus>('worker_setup_status');
+      await loadSummary();
+    } catch (error) {
+      connectionLocked = String(error) === 'credential_unlock_required';
+      staleSignIn = !connectionLocked;
+      failure = explain(error);
+    } finally { busy = false; }
   }
   onMount(() => {
     if (!native) return;
@@ -62,16 +77,14 @@
         if (disposed) { unlisten.forEach(stop => stop()); return; }
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
         hostActive = host.backgroundActive;
-        connection = await invoke<Connection | null>('restore_connection').catch(error => { staleSignIn = true; throw error; });
-        setup = await invoke<SetupStatus>('worker_setup_status');
-        await loadSummary();
+        await restoreSaved();
       } catch (error) { failure = explain(error); }
       finally { busy = false; }
     })();
     return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
   function connected(view: Connection) {
-    summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false;
+    summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
   }
@@ -134,6 +147,7 @@
     </nav>
   {/if}
   <main class="content">
+    {#if connectionLocked && !connection}<button class="btn" disabled={busy} onclick={() => restoreSaved(true)}>Unlock saved server sign-in</button>{/if}
     {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
