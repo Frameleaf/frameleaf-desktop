@@ -15,7 +15,8 @@ jobs:
     if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
     environment: desktop-release
     permissions:
-      contents: read
+      # GitHub draft assets require write access even for download.
+      contents: write
     runs-on: macos-15
     timeout-minutes: 100
     defaults:
