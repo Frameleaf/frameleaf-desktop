@@ -123,6 +123,12 @@ test("host media commands use private binaries without inheriting the caller env
   const cfg = config("/private/state");
   const env = hostEnvironment(cfg);
   assert.equal(
+    env.SystemDrive,
+    process.platform === "win32"
+      ? (process.env.SystemRoot ?? "C:\\Windows").slice(0, 2)
+      : undefined,
+  );
+  assert.equal(
     env.FRAMELEAF_STUDIO_CHROMIUM,
     join(cfg.runtime, cfg.entryPoints.studioBrowser),
   );

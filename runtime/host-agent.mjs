@@ -543,6 +543,9 @@ async function exited(child, ms) {
   return !child.pid || child.exitCode !== null || child.signalCode !== null;
 }
 export function hostEnvironment(c) {
+  const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+  // Windows shell paths expand SystemDrive even when the child has a private working directory.
+  const systemDrive = /^([A-Za-z]:)[\\/]/.exec(systemRoot)?.[1];
   return {
     FRAMELEAF_STUDIO_WORKER_TRUST_DIR: join(c.state, "studio-trust"),
     FRAMELEAF_STUDIO_WORKER_WORK_DIR: join(c.state, "studio-work"),
@@ -565,7 +568,7 @@ export function hostEnvironment(c) {
       dirname(join(c.runtime, c.entryPoints.node)),
       dirname(join(c.runtime, c.entryPoints.postgres)),
       process.platform === "win32"
-        ? join(process.env.SystemRoot ?? "C:\\Windows", "System32")
+        ? join(systemRoot, "System32")
         : "/usr/bin",
       ...(process.platform === "win32" ? [] : ["/bin"]),
     ].join(delimiter),
@@ -573,7 +576,11 @@ export function hostEnvironment(c) {
     USERPROFILE: join(c.state, "home"),
     LANG: "C",
     ...(process.platform === "win32"
-      ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows", NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" }
+      ? {
+          SystemRoot: systemRoot,
+          ...(systemDrive ? { SystemDrive: systemDrive } : {}),
+          NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main",
+        }
       : {}),
   };
 }
