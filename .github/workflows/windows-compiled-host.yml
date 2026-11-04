@@ -97,7 +97,7 @@ jobs:
           robocopy (Join-Path $candidate 'payload') (Join-Path $runtime 'payload') /E /COPY:DAT /R:0 /W:0 /NFL /NDL /NJH /NJS /NP
           if ($LASTEXITCODE -ge 8) { throw 'Protected payload copy failed' }
           foreach ($path in $runtime, $binaryDir) {
-            icacls $path /setowner '*S-1-5-32-544' /T /Q
+            icacls ("\\?\" + $path) /setowner '*S-1-5-32-544' /T /Q
             if ($LASTEXITCODE) { throw 'Could not assign the Administrators owner' }
           }
           if ((Get-FileHash $installed).Hash.ToLowerInvariant() -cne $digest) { throw 'Installed controller changed' }
