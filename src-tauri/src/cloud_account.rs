@@ -549,6 +549,21 @@ async fn profile(
     })
 }
 
+/// Held from loading the credential through its refresh and save, and through sign-out's delete,
+/// so a refresh in flight can never write back a credential sign-out removed (nor two refreshes
+/// spend the same rotating refresh token).
+static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The stored credential with a usable access token, or `None` when signed out.
+async fn current(client: &Client) -> Result<Option<(CloudCredential, String)>, String> {
+    let _held = LIFECYCLE.lock().await;
+    let Some(mut credential) = load()? else {
+        return Ok(None);
+    };
+    let token = access_token(client, &mut credential).await?;
+    Ok(Some((credential, token)))
+}
+
 fn load() -> Result<Option<CloudCredential>, String> {
     credentials::load::<CloudCredential>(CREDENTIAL)
 }
@@ -624,12 +639,10 @@ pub(crate) async fn cloud_sign_in(
 #[tauri::command]
 pub(crate) async fn cloud_account(window: WebviewWindow) -> Result<Option<CloudAccount>, String> {
     crate::require_local(&window)?;
-    let Some(mut credential) = load()? else {
-        return Ok(None);
-    };
     let client = transport::client()?;
-    let token = match access_token(&client, &mut credential).await {
-        Ok(token) => token,
+    let (credential, token) = match current(&client).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(None),
         Err(code) if code == "cloud_sign_in_required" => return Ok(None),
         Err(code) => return Err(code),
     };
@@ -664,11 +677,15 @@ async fn revoke(client: &Client, credential: &CloudCredential) -> Result<(), Str
 #[tauri::command]
 pub(crate) async fn cloud_sign_out(window: WebviewWindow) -> Result<(), String> {
     crate::require_local(&window)?;
-    let Some(credential) = load()? else {
-        return Ok(());
+    let credential = {
+        let _held = LIFECYCLE.lock().await;
+        let Some(credential) = load()? else {
+            return Ok(());
+        };
+        // Local authority ends first; the cloud is told best-effort.
+        credentials::delete(CREDENTIAL)?;
+        credential
     };
-    // Local authority ends first; the cloud is told best-effort.
-    credentials::delete(CREDENTIAL)?;
     if let Ok(client) = transport::client() {
         let _ = revoke(&client, &credential).await;
     }
@@ -715,9 +732,9 @@ pub(crate) fn parse_instances(value: Value) -> Result<Vec<CloudServer>, String> 
 }
 
 async fn signed_in(client: &Client) -> Result<(CloudCredential, String), String> {
-    let mut credential = load()?.ok_or("cloud_sign_in_required")?;
-    let token = access_token(client, &mut credential).await?;
-    Ok((credential, token))
+    current(client)
+        .await?
+        .ok_or_else(|| "cloud_sign_in_required".into())
 }
 
 #[tauri::command]
