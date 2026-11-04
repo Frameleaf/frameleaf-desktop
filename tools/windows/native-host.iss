@@ -70,7 +70,8 @@ begin
     if not CopyFile(Controller, ControllerDir + '\frameleaf-native-host.exe', True) then
       RaiseException('Cannot install the server controller.');
     WizardForm.StatusLabel.Caption := 'Installing verified server resources...';
-    ExtractArchive(ExpandConstant('{tmp}\windows-host.7z'), RuntimeDir, '', True, nil);
+    { ONNX test fixtures exceed MAX_PATH under the manifest-addressed directory. }
+    ExtractArchive(ExpandConstant('{tmp}\windows-host.7z'), '\\?\' + RuntimeDir, '', True, nil);
     OwnerArgs := '" /setowner *S-1-5-32-544 /T /Q';
     RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + RuntimeDir + OwnerArgs);
     RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + ControllerDir + OwnerArgs);
