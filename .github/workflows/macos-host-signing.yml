@@ -6,6 +6,10 @@ on:
         description: Approved draft asset ID, release ID, archive SHA-256, manifest SHA-256 and controller SHA-256 as JSON
         required: true
         type: string
+      resume_submission:
+        description: 'Saved Chromium submission run and attempt (for example, 41912175001-1)'
+        required: false
+        type: string
 permissions: {}
 concurrency:
   group: macos-arm64-host-signing
@@ -55,11 +59,38 @@ jobs:
           printf '%s  %s\n' "$(jq -r .manifestSha256 <<< "$APPROVAL")" "$root/candidate/manifest.json" | shasum -a 256 -c
           printf '%s  %s\n' "$(jq -r .controllerSha256 <<< "$APPROVAL")" "$root/frameleaf-native-host" | shasum -a 256 -c
           jq -e '.platform=="macos" and .architecture=="aarch64" and .epoch==22 and .sourceRevision=="c64039743af7bb0d68b602ff842683906019de52"' "$root/candidate/manifest.json" >/dev/null
+      - name: Retrieve the retained submission for the same approved input
+        if: inputs.resume_submission != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+          SUBMISSION: ${{ inputs.resume_submission }}
+        run: |
+          set -euo pipefail
+          [[ "$SUBMISSION" =~ ^[1-9][0-9]*-[1-9][0-9]*$ ]]
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release")
+          tag=$(jq -er 'select(.draft == true) | .tag_name' <<< "$draft")
+          name="FrameleafChromium-macOS-arm64-$SUBMISSION"
+          resume="$RUNNER_TEMP/macos-host-resume"
+          mkdir -m 700 "$resume"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$resume" --pattern "$name.zip" --pattern "$name.json"
+          jq -e --argjson approval "$APPROVAL" '
+            .input==$approval and (.id|test("^[a-f0-9-]{36}$")) and (.browserSha256|test("^[a-f0-9]{64}$"))
+          ' "$resume/$name.json" >/dev/null
+          digest=$(jq -r .browserSha256 "$resume/$name.json")
+          jq -e --arg name "$name.zip" --arg digest "sha256:$digest" '
+            any(.assets[]; .name==$name and .state=="uploaded" and .digest==$digest)
+          ' <<< "$draft" >/dev/null
+          printf '%s  %s\n' "$digest" "$resume/$name.zip" | shasum -a 256 -c
+          mv "$resume/$name.zip" "$resume/submission.zip"
+          mv "$resume/$name.json" "$resume/submission.json"
       - name: Sign native code and test the signed Studio browser
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/macos-host-input"
@@ -68,6 +99,15 @@ jobs:
           unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
           python3 tools/sign_macos_host_runtime.py prepare --candidate "$root/candidate" --controller "$root/frameleaf-native-host" --work "$work"
           security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"
+          resume="$RUNNER_TEMP/macos-host-resume"
+          if test -f "$resume/submission.zip"; then
+            PYTHONPATH=tools python3 -c 'from pathlib import Path; from sign_macos_host_runtime import browser_archive; import sys; browser_archive(Path(sys.argv[1]))' "$resume/submission.zip"
+            mv "$work/Chromium.app" "$resume/newly-signed-Chromium.app"
+            ditto -x -k "$resume/submission.zip" "$work"
+            [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+            codesign --verify --strict --deep -R="anchor apple generic and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\"" "$work/Chromium.app"
+            cp "$resume/submission.json" "$work/submission.json"
+          fi
           payload="$root/candidate/payload"
           FRAMELEAF_STUDIO_NODE="$payload/node" \
           FRAMELEAF_STUDIO_CHROMIUM="$work/Chromium.app/Contents/MacOS/Chromium" \
@@ -89,6 +129,7 @@ jobs:
           console.log(JSON.stringify(result));
           JS
       - name: Submit the signed Chromium bundle to Apple
+        if: inputs.resume_submission == ''
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -100,6 +141,7 @@ jobs:
           xcrun notarytool submit "$work/submission.zip" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --output-format json > "$work/submission.json"
           jq -er '.id' "$work/submission.json"
       - name: Keep the exact Apple submission on the approved draft
+        if: inputs.resume_submission == ''
         env:
           GH_TOKEN: ${{ github.token }}
           APPROVAL: ${{ inputs.approval }}
