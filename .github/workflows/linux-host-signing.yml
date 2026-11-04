@@ -50,7 +50,7 @@ jobs:
           mkdir -m 700 "$candidate"
           PYTHONPATH=tools python -c 'from pathlib import Path; from build_host_ffmpeg import unpack; import sys; unpack(Path(sys.argv[1]),Path(sys.argv[2]),max_bytes=8*1024**3)' "$archive" "$candidate"
           printf '%s  %s\n' "$(jq -r .manifestSha256 <<< "$APPROVAL")" "$candidate/manifest.json" | sha256sum --check --status
-          jq -e '.platform=="linux" and .architecture=="x86_64" and .epoch==23 and .sourceRevision=="c64039743af7bb0d68b602ff842683906019de52"' "$candidate/manifest.json" >/dev/null
+          jq -e '.platform=="linux" and .architecture=="x86_64" and .epoch==24 and .sourceRevision=="c64039743af7bb0d68b602ff842683906019de52"' "$candidate/manifest.json" >/dev/null
       - name: Seal and independently verify the host
         env:
           FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}
