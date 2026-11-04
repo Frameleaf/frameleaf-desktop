@@ -1,0 +1,139 @@
+name: Sign the Apple Silicon companion payload
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Approved draft asset ID, release ID, archive SHA-256, manifest SHA-256 and controller SHA-256 as JSON
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: macos-arm64-host-signing
+  cancel-in-progress: false
+jobs:
+  sign:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    environment: desktop-release
+    permissions:
+      # Only the draft release is used for unpublished installer bytes.
+      contents: write
+    runs-on: macos-15
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Verify the approved draft input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            keys == ["archiveSha256","assetId","controllerSha256","manifestSha256","releaseId"] and
+            ([.assetId,.releaseId] | all(type=="number" and .>0 and .==floor)) and
+            ([.archiveSha256,.controllerSha256,.manifestSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
+          ' <<< "$APPROVAL" >/dev/null
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          asset=$(jq -r .assetId <<< "$APPROVAL")
+          digest=$(jq -r .archiveSha256 <<< "$APPROVAL")
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+            .draft == true and any(.assets[]; .id == $asset and .digest == $digest and .size > 0 and .size < 2147483648)
+          ' >/dev/null
+          archive="$RUNNER_TEMP/macos-host.tar.gz"
+          root="$RUNNER_TEMP/macos-host-input"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | shasum -a 256 -c
+          mkdir -m 700 "$root"
+          PYTHONPATH=tools python3 -c 'from pathlib import Path; from build_host_ffmpeg import unpack; import sys; unpack(Path(sys.argv[1]),Path(sys.argv[2]),max_bytes=8*1024**3)' "$archive" "$root"
+          printf '%s  %s\n' "$(jq -r .manifestSha256 <<< "$APPROVAL")" "$root/candidate/manifest.json" | shasum -a 256 -c
+          printf '%s  %s\n' "$(jq -r .controllerSha256 <<< "$APPROVAL")" "$root/frameleaf-native-host" | shasum -a 256 -c
+          jq -e '.platform=="macos" and .architecture=="aarch64" and .epoch==22 and .sourceRevision=="c64039743af7bb0d68b602ff842683906019de52"' "$root/candidate/manifest.json" >/dev/null
+      - name: Sign native code and test the signed Studio browser
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/macos-host-input"
+          work="$RUNNER_TEMP/macos-host-browser"
+          bash tools/import_apple_certificate.sh
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+          python3 tools/sign_macos_host_runtime.py prepare --candidate "$root/candidate" --controller "$root/frameleaf-native-host" --work "$work"
+          security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"
+          payload="$root/candidate/payload"
+          FRAMELEAF_STUDIO_NODE="$payload/node" \
+          FRAMELEAF_STUDIO_CHROMIUM="$work/Chromium.app/Contents/MacOS/Chromium" \
+          FRAMELEAF_STUDIO_BROWSER_GUARD="$payload/studio/guard/studio-browser-guard" \
+            "$payload/node" --input-type=module - "$payload" <<'JS'
+          import assert from 'node:assert/strict';
+          import { join } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const payload = process.argv[2];
+          const { createEngineRenderer } = await import(pathToFileURL(join(payload, 'studio/tools/bundled-worker-renderer.mjs')));
+          const signal = AbortSignal.timeout(540_000);
+          const renderer = await createEngineRenderer({
+            ffmpeg: join(payload, 'media-tools/ffmpeg'),
+            ffprobe: join(payload, 'media-tools/ffprobe'),
+            signal,
+          });
+          const result = await renderer.conformance({ signal });
+          assert.ok(result.formats.includes('mp4-h264'));
+          console.log(JSON.stringify(result));
+          JS
+      - name: Notarize the signed Chromium bundle
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/macos-host-browser"
+          ditto -c -k --keepParent "$work/Chromium.app" "$work/submission.zip"
+          xcrun notarytool submit "$work/submission.zip" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --output-format json > "$work/submission.json"
+          id=$(jq -er '.id' "$work/submission.json")
+          printf 'Chromium notarization submission %s\n' "$id"
+          xcrun notarytool wait "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --timeout 45m --output-format json > "$work/notary-result.json"
+          jq -e '.status=="Accepted"' "$work/notary-result.json" >/dev/null
+          xcrun stapler staple "$work/Chromium.app"
+      - name: Seal the notarized payload and build an unsigned installer wrapper
+        env:
+          FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/macos-host-input"
+          work="$RUNNER_TEMP/macos-host-browser"
+          candidate="$root/candidate"
+          python3 tools/sign_macos_host_runtime.py finish --candidate "$candidate" --work "$work"
+          printf '%s\n' "${FACTORY_PRIVATE_KEY:?Missing host signing key}" | node tools/sign_host_runtime.mjs --candidate "$candidate" --private-key-stdin
+          unset FACTORY_PRIVATE_KEY
+          python3 tools/build_host_macos_pkg.py --candidate "$candidate" --controller "$root/frameleaf-native-host" --output "$RUNNER_TEMP/macos-host-pkg"
+      - name: Keep the unsigned installer on the approved draft only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -er 'select(.draft == true) | .tag_name')
+          pkg="$RUNNER_TEMP/macos-host-pkg"
+          name="FrameleafCompanion-1.2.3-macOS-arm64-unsigned-$GITHUB_RUN_ID.pkg"
+          mv "$pkg/FrameleafNativeHost-internal.pkg" "$pkg/$name"
+          mv "$pkg/qualification.json" "$pkg/FrameleafCompanion-macOS-$GITHUB_RUN_ID.json"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$pkg/$name" "$pkg/FrameleafCompanion-macOS-$GITHUB_RUN_ID.json"
+      - name: Remove the temporary Apple signing keychain
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/desktop-release.keychain-db"; then
+            security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"
+          fi
+          if test -f "$RUNNER_TEMP/developer-id.p12"; then
+            /bin/rm "$RUNNER_TEMP/developer-id.p12"
+          fi
