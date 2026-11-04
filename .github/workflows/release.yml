@@ -261,6 +261,32 @@ jobs:
           Path('release-assets').mkdir()
           for path in files:
               shutil.copy2(path, Path('release-assets') / path.name)
+      - name: Sign verified updater packages
+        if: inputs.tag != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${TAURI_SIGNING_PRIVATE_KEY:?Missing updater signing key}"
+          version="${RELEASE_TAG#v}"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            bundle=src-tauri/target/release/bundle/macos
+            xcrun stapler staple "$bundle/Frameleaf.app"
+            xcrun stapler validate "$bundle/Frameleaf.app"
+            arch="${RELEASE_TARGET#macos-}"
+            [[ "$arch" != x86_64 ]] || arch=x64
+            COPYFILE_DISABLE=1 tar -C "$bundle" -czf "release-assets/Frameleaf_${version}_${arch}.app.tar.gz" Frameleaf.app
+          fi
+          for file in release-assets/*; do
+            case "$file" in
+              *.app.tar.gz|*.AppImage|*.deb|*.msi|*.exe)
+                npm run tauri -- signer sign --app-version "$version" "$file"
+                ;;
+            esac
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: signed-installers-${{ matrix.target }}
@@ -280,6 +306,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: signed-installers-*
@@ -293,6 +326,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          node --input-type=module <<'JS'
+          import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+          import { updateManifest } from "./tools/release_inputs.mjs";
+          const dir = "release-assets";
+          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
+          const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
+          const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
+          writeFileSync(`${dir}/latest.json`, JSON.stringify(manifest, null, 2) + "\n");
+          JS
           cd release-assets
           sha256sum -- * > SHA256SUMS
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \

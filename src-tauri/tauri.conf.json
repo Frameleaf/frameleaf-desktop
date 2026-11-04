@@ -38,5 +38,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGQzkwODhDOUU3NDQ0QTQKUldTa1JIU2VqQWpKYjN6WVYrWTdNSzFta1VZanAxcDFOTG91YmZuSmIvK2s0czJzajNiWG9QdWoK",
+      "requireSignedVersion": true,
+      "endpoints": [
+        "https://github.com/Frameleaf/frameleaf-desktop/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

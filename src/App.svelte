@@ -30,6 +30,9 @@
   let busy = $state(false);
   let failure = $state('');
   let notice = $state('');
+  let updateVersion = $state<string | null>(null);
+  let installingUpdate = $state(false);
+  let updateError = $state('');
   let accountMenu = $state(false);
   let signOutSheet = $state(false);
   // A sign-in left in the credential store with no connection shown (restore failed, or sign-out could not delete it):
@@ -65,6 +68,9 @@
   onMount(() => {
     if (!native) return;
     let disposed = false;
+    void invoke<string | null>('check_desktop_update')
+      .then(version => { if (!disposed) updateVersion = version; })
+      .catch(() => {});
     const unlisten: UnlistenFn[] = [];
     void (async () => {
       busy = true;
@@ -83,6 +89,26 @@
     })();
     return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
+  async function installUpdate() {
+    if (!updateVersion || installingUpdate) return;
+    installingUpdate = true;
+    updateError = '';
+    try {
+      await invoke('install_desktop_update', { version: updateVersion });
+    } catch (error) {
+      if (error === 'update_changed') {
+        updateVersion = await invoke<string | null>('check_desktop_update').catch(() => null);
+      }
+      updateError = error === 'update_host_active'
+        ? 'Stop the local server before installing the update.'
+        : error === 'update_changed'
+          ? updateVersion
+            ? `The latest release changed to Frameleaf ${updateVersion}.`
+            : 'That update is no longer available.'
+          : 'Frameleaf couldn’t install the update. Try again.';
+      installingUpdate = false;
+    }
+  }
   function connected(view: Connection) {
     summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
@@ -147,6 +173,13 @@
     </nav>
   {/if}
   <main class="content">
+    {#if updateVersion || updateError}
+      <div class="inline-msg" style="margin:12px 24px 0">
+        <p role="status">{updateError || (installingUpdate ? 'Installing the update…' : `Frameleaf ${updateVersion} is available.`)}</p>
+        {#if updateVersion}<button class="btn small" disabled={installingUpdate} onclick={installUpdate}>Install and restart</button>{/if}
+        <button class="btn small quiet" disabled={installingUpdate} onclick={() => { updateVersion = null; updateError = ''; }}>Dismiss</button>
+      </div>
+    {/if}
     {#if (connectionLocked || staleSignIn) && !connection}<button class="btn" disabled={busy} onclick={() => restoreSaved(true)}>Restore saved server sign-in</button>{/if}
     {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}

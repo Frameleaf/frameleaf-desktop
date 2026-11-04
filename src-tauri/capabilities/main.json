@@ -8,6 +8,8 @@
   ],
   "permissions": [
     "core:default",
+    "allow-check-desktop-update",
+    "allow-install-desktop-update",
     "allow-connect-server",
     "allow-restore-connection",
     "allow-sign-out",

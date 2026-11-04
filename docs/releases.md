@@ -82,13 +82,21 @@ Gatekeeper and stapled notarization checks. Windows verifies Authenticode on the
 app and both installers for a trusted, timestamped signature with the exact
 configured publisher subject. Azure rotates leaf certificates, so verification
 does not pin a leaf thumbprint. Linux packages include
-the same verified runtime; the final draft includes SHA-256 checksums for all
-selected installers. Linux package/repository GPG signatures and automatic app
-updates are outside this initial pipeline.
+the same verified runtime. Linux package repositories use their own signing policy.
+
+For a tagged build, the workflow signs the verified NSIS, MSI, DEB and AppImage
+packages and archives the signed, stapled macOS app for in-app upgrades. Desktop
+checks GitHub's Latest release for `latest.json` at launch and offers to install a
+newer version when the manifest includes its architecture and installer format.
+Users on builds that predate the updater need one manual install. Publish a release
+covering all supported formats when promoting it to Latest so each can receive
+the update.
 
 Only after every selected target passes does a separate job receive repository
-write permission and create a **draft prerelease** with installers and
-`SHA256SUMS`. It never publishes automatically or replaces an existing release.
+write permission and create a **draft prerelease** with installers, signed updater
+packages, `latest.json` and `SHA256SUMS`. The updater sees the manifest after the
+release is published as Latest. The workflow never publishes automatically or
+replaces an existing release.
 If a draft already exists for the tag, the create step fails; inspect/remove the
 draft deliberately before retrying. Successful CI or code signing does not prove
 installed-device, NAS-job, GPU or native-host acceptance.
@@ -108,6 +116,7 @@ required values into that environment, never into pull-request jobs:
 | `APPLE_PASSWORD` | App-specific notarization password |
 | `APPLE_DEVELOPER_ID_PROVISION_PROFILE` | Base64 Developer ID provisioning profile for the desktop GUI’s private Keychain identity |
 | `APPLE_TEAM_ID` | Developer team ID |
+| `TAURI_SIGNING_PRIVATE_KEY` | Signs update packages with the version bound to the signature. The matching public key is embedded in Desktop. |
 
 Apple App Store Distribution and Apple Development certificates do not replace
 Developer ID Application for direct downloads. Developer ID Application

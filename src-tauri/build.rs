@@ -14,6 +14,8 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "open_local_photos",
+            "check_desktop_update",
+            "install_desktop_update",
             "authorize_local_manager",
             "installed_local_hosts",
             "local_host_status",

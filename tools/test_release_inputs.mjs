@@ -58,3 +58,28 @@ test("factory Windows selection builds one native target without changing the fu
     { os: "windows-2022", target: "windows-x86_64" },
   ] });
 });
+
+test("update manifests match each installed package format to its signed asset", async () => {
+  const { updateManifest } = await import("./release_inputs.mjs");
+  const signature = "c2lnbmF0dXJl";
+  const files = {
+    "Frameleaf_1.2.3_aarch64.app.tar.gz": signature,
+    "Frameleaf_1.2.3_amd64.AppImage": signature,
+    "Frameleaf_1.2.3_amd64.deb": signature,
+    "Frameleaf_1.2.3_x64-setup.exe": signature,
+    "Frameleaf_1.2.3_x64_en-US.msi": signature,
+  };
+  const manifest = updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", files);
+  assert.equal(manifest.version, "1.2.3");
+  assert.deepEqual(Object.keys(manifest.platforms).sort(), [
+    "darwin-aarch64-app", "linux-x86_64-appimage", "linux-x86_64-deb", "windows-x86_64-msi", "windows-x86_64-nsis",
+  ]);
+  assert.deepEqual(manifest.platforms["windows-x86_64-msi"], {
+    url: "https://github.com/Frameleaf/frameleaf-desktop/releases/download/v1.2.3/Frameleaf_1.2.3_x64_en-US.msi",
+    signature,
+  });
+  assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {}), /update_assets_missing/);
+  assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {
+    "Frameleaf_1.2.3_amd64.deb": "",
+  }), /update_signature_invalid/);
+});
