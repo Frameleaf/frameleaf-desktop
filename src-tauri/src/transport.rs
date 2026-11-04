@@ -148,9 +148,31 @@ mod tests {
         let caps = serde_json::json!({"protocolVersion":1,"serverId":"known-server","features":{
             "enrollment":false,"worker":false,"sources":false,"nativeHost":false
         }});
-        for (status, expected_error) in [
-            (200, "credential_unlock_required"),
-            (404, "server_sign_in_retry_required"),
+        for (status, failure, expected_error, expected_token) in [
+            (
+                200,
+                "credential_unlock_required",
+                "credential_unlock_required",
+                Some("fixture"),
+            ),
+            (
+                200,
+                "credential_confirmation_unavailable",
+                "credential_confirmation_unavailable",
+                Some("fixture"),
+            ),
+            (
+                200,
+                "credential_confirmation_changed",
+                "credential_confirmation_changed",
+                Some("replacement"),
+            ),
+            (
+                404,
+                "credential_unlock_required",
+                "server_sign_in_retry_required",
+                None,
+            ),
         ] {
             let (url, server) = reply(caps.to_string(), status);
             let mut saved = SavedConnection {
@@ -163,17 +185,22 @@ mod tests {
                 mode: "client-worker".into(),
                 device_id: None,
             };
-            let result = crate::finish_new_connection(&client().unwrap(), &mut saved, |_| {
-                Err("credential_unlock_required".into())
+            let result = crate::finish_new_connection(&client().unwrap(), &mut saved, |expected| {
+                if failure == "credential_confirmation_changed" {
+                    let mut replacement = expected.clone();
+                    replacement.token = "replacement".into();
+                    crate::credentials::save("connection", &replacement)?;
+                }
+                Err(failure.into())
             })
             .await;
             assert_eq!(result.err().as_deref(), Some(expected_error));
             let stored: Option<SavedConnection> = crate::credentials::load("connection").unwrap();
-            if status == 200 {
+            if let Some(expected_token) = expected_token {
                 let stored = stored.unwrap();
                 assert_eq!(stored.server_id, "known-server");
                 assert_eq!(stored.account_id, saved.account_id);
-                assert_eq!(stored.token, saved.token);
+                assert_eq!(stored.token, expected_token);
                 crate::credentials::delete("connection").unwrap();
             } else {
                 assert!(stored.is_none());

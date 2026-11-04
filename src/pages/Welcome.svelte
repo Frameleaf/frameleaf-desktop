@@ -6,7 +6,7 @@
   import Sheet from '../Sheet.svelte';
   import LocalHost from '../LocalHost.svelte';
   import ManagerPanel from '../ManagerPanel.svelte';
-  import { connectionError } from '../errors';
+  import { connectionError, savedSignInNeedsRecovery } from '../errors';
   import { mergeServers, initials, computerWord, platformFromUserAgent, type ServerEntry } from '../ui-state';
   import type { Connection, CloudAccount, CloudServer, DiscoveredServer } from '../server-types';
 
@@ -41,17 +41,19 @@
   const explain = connectionError;
 
   let cloudLocked = $state(false);
+  let cloudDamaged = $state(false);
   async function restoreCloud(retry = false) {
     if (retry) failure = '';
     cloudBusy = true;
     try {
       const account = await invoke<CloudAccount | null>('cloud_account', { retry });
-      cloudLocked = false;
+      cloudLocked = false; cloudDamaged = false;
       oncloudaccount(account);
       if (account) await loadServers();
     } catch (error) {
-      cloudLocked = String(error) === 'credential_unlock_required';
-      if (cloudLocked) failure = explain(error);
+      cloudLocked = savedSignInNeedsRecovery(error);
+      cloudDamaged = String(error) === 'credential_record_invalid';
+      if (cloudLocked || cloudDamaged) failure = explain(error);
     } finally { cloudBusy = false; }
   }
   onMount(() => { if (native) void restoreCloud(); });
@@ -70,13 +72,13 @@
       const account = await invoke<CloudAccount>('cloud_sign_in');
       oncloudaccount(account); addressMode = false; notice = '';
       await loadServers();
-    } catch (error) { cloudLocked = String(error) === 'credential_unlock_required'; notice = ''; failure = explain(error); }
+    } catch (error) { cloudLocked = savedSignInNeedsRecovery(error); notice = ''; failure = explain(error); }
     finally { cloudBusy = false; }
   }
   async function cloudSignOut() {
     if (!native || cloudBusy) return;
     cloudBusy = true; failure = '';
-    try { await invoke('cloud_sign_out'); oncloudaccount(null); cloudServers = []; }
+    try { await invoke('cloud_sign_out'); oncloudaccount(null); cloudServers = []; cloudDamaged = false; cloudLocked = false; failure = ''; }
     catch (error) { failure = explain(error); }
     finally { cloudBusy = false; }
   }
@@ -86,14 +88,14 @@
     busy = true; failure = ''; notice = '';
     const secret = password; password = '';
     try { onconnected(await invoke<Connection>('connect_server', { server, email, password: secret, deviceName })); }
-    catch (error) { if (String(error) === 'credential_unlock_required') onlocked(); failure = explain(error); }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); }
     finally { busy = false; }
   }
   async function connectCloud(entry: ServerEntry) {
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
     try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName })); }
-    catch (error) { if (String(error) === 'credential_unlock_required') onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {
@@ -194,7 +196,8 @@
       Your sign-in is saved securely on this {computer}.
     {/if}
     <span class="sp"></span>
-    {#if mode === 'client-worker' && !cloudAccount}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Unlock Frameleaf Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
+    {#if cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignOut}>Clear unreadable Cloud sign-in</button>{/if}
+    {#if mode === 'client-worker' && !cloudAccount && !cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Unlock Frameleaf Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
     Version {version}
   </footer>
 </div>

@@ -265,7 +265,17 @@ async fn finish_new_connection(
         Err(error) => Err(error),
         Ok(()) => match confirm(saved) {
             Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
-            Err(error) if !saved.server_id.is_empty() => return Err(error),
+            // A changed item may belong to another writer. Revoke our minted token only.
+            Err(error) if error == "credential_confirmation_changed" => Err(error),
+            Err(error)
+                if !saved.server_id.is_empty()
+                    && matches!(
+                        error.as_str(),
+                        "credential_unlock_required" | "credential_confirmation_unavailable"
+                    ) =>
+            {
+                return Err(error)
+            }
             Err(_) => {
                 credentials::delete("connection").and(Err("server_sign_in_retry_required".into()))
             }
@@ -350,7 +360,12 @@ async fn sign_out(
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let saved = match current.as_ref() {
         Some(saved) => Some(saved.clone()),
-        None => credentials::load_interactive::<SavedConnection>("connection", &window, true)?,
+        None => match credentials::load_interactive::<SavedConnection>("connection", &window, true)
+        {
+            // The explicit clear action already authorized access; malformed bytes cannot revoke remotely.
+            Err(code) if code == "credential_record_invalid" => None,
+            result => result?,
+        },
     };
     *current = None;
     drop(current);

@@ -628,7 +628,12 @@ pub(crate) async fn cloud_sign_in(
         expires_at: now() + token.expires_in.unwrap_or(600),
     };
     store(&credential)?;
-    credentials::confirm_new_sign_in(CREDENTIAL, &credential, &window)?;
+    if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, &window) {
+        if error == "credential_confirmation_changed" {
+            let _ = revoke(&client, &credential).await;
+        }
+        return Err(error);
+    }
     match profile(&client, &credential, &token.access_token).await {
         Ok(account) => Ok(account),
         Err(error) => {
@@ -686,8 +691,13 @@ pub(crate) async fn cloud_sign_out(window: WebviewWindow) -> Result<(), String> 
     crate::require_local(&window)?;
     let credential = {
         let _held = LIFECYCLE.lock().await;
-        let Some(credential) = credentials::load_interactive(CREDENTIAL, &window, true)? else {
-            return Ok(());
+        let credential = match credentials::load_interactive(CREDENTIAL, &window, true) {
+            Ok(Some(credential)) => credential,
+            Ok(None) => return Ok(()),
+            Err(code) if code == "credential_record_invalid" => {
+                return credentials::delete(CREDENTIAL)
+            }
+            Err(code) => return Err(code),
         };
         // Local authority ends first; the cloud is told best-effort.
         credentials::delete(CREDENTIAL)?;

@@ -70,10 +70,17 @@ pub(super) fn read<T: DeserializeOwned>(
         .transpose()
 }
 pub(super) fn confirm(account: &str, expected: &[u8], prompt: Prompt) -> Result<(), String> {
-    let data = operation(Operation::Confirm, account, prompt as u32, &[])?
-        .ok_or("credential_record_invalid")?;
+    let data = operation(Operation::Confirm, account, prompt as u32, &[])
+        .map_err(|error| {
+            if error == "credential_unlock_required" {
+                error
+            } else {
+                "credential_confirmation_unavailable".into()
+            }
+        })?
+        .ok_or("credential_confirmation_changed")?;
     if data.bytes() != expected {
-        return Err("credential_record_invalid".into());
+        return Err("credential_confirmation_changed".into());
     }
     Ok(())
 }

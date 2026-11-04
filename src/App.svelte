@@ -14,7 +14,7 @@
   import Wallet from './pages/Wallet.svelte';
   import Remote from './pages/Remote.svelte';
   import { initials, hostOf } from './ui-state';
-  import { connectionError } from './errors';
+  import { connectionError, savedSignInNeedsRecovery } from './errors';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
 
   type Page = 'overview' | 'sources' | 'ai' | 'manager' | 'backups' | 'cloud' | 'wallet' | 'remote';
@@ -57,7 +57,7 @@
       setup = await invoke<SetupStatus>('worker_setup_status');
       await loadSummary();
     } catch (error) {
-      connectionLocked = String(error) === 'credential_unlock_required';
+      connectionLocked = savedSignInNeedsRecovery(error);
       staleSignIn = !connection && !connectionLocked;
       failure = explain(error);
     } finally { busy = false; }
