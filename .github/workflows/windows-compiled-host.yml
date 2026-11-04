@@ -16,7 +16,7 @@ jobs:
   qualify:
     if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: '2'
       RAYON_NUM_THREADS: '1'
@@ -71,6 +71,48 @@ jobs:
           if ($result.qualification -ne 'passed' -or $result.manifestSha256 -ne $staged.manifestSha256 -or $result.signatureSha256 -ne $staged.signatureSha256) {
             throw 'Compiled host authority receipt does not match the admitted candidate'
           }
+      - name: Qualify protected machine installation on this disposable runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host
+          if ($LASTEXITCODE) { throw 'Controller build failed' }
+          $controller = (Resolve-Path 'src-tauri/target/debug/frameleaf-native-host.exe').Path
+          $digest = (Get-FileHash $controller).Hash.ToLowerInvariant()
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $manifest = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
+          if ($manifest -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid qualified manifest identity' }
+          $base = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Frameleaf'
+          if (Test-Path -LiteralPath $base) { throw 'Expected a fresh machine location' }
+          $prepared = & $controller --prepare-windows-package $manifest $digest
+          if ($LASTEXITCODE -or ($prepared | ConvertFrom-Json).state -ne 'install-prepared') { throw "Preparation failed: $prepared" }
+          $runtime = Join-Path $base "Runtimes/$manifest"
+          $binaryDir = Join-Path $base "Controllers/$manifest/$digest"
+          New-Item -ItemType Directory -Path $runtime, $binaryDir | Out-Null
+          $installed = Join-Path $binaryDir 'frameleaf-native-host.exe'
+          Copy-Item -LiteralPath $controller -Destination $installed
+          $candidate = Join-Path $root 'candidate'
+          Copy-Item -LiteralPath (Join-Path $candidate 'manifest.json'), (Join-Path $candidate 'manifest.sig') -Destination $runtime
+          # Copy bytes into fresh objects so the payload inherits its machine ACL.
+          robocopy (Join-Path $candidate 'payload') (Join-Path $runtime 'payload') /E /COPY:DAT /R:0 /W:0 /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) { throw 'Protected payload copy failed' }
+          foreach ($path in $runtime, $binaryDir) {
+            icacls $path /setowner '*S-1-5-32-544' /T /Q
+            if ($LASTEXITCODE) { throw 'Could not assign the Administrators owner' }
+          }
+          if ((Get-FileHash $installed).Hash.ToLowerInvariant() -cne $digest) { throw 'Installed controller changed' }
+          $receipt = Join-Path $runtime 'installation.json'
+          foreach ($attempt in 1..2) {
+            $result = & $installed --finalize-windows-package $manifest $digest
+            if ($LASTEXITCODE) { throw "Finalization failed: $result" }
+            $result = $result | ConvertFrom-Json
+            $record = Get-Content $receipt -Raw | ConvertFrom-Json
+            if ($result.state -ne 'resources-installed' -or $result.manifestSha256 -cne $manifest -or $result.controllerSha256 -cne $digest -or
+                $record.schemaVersion -ne 1 -or $record.manifestSha256 -cne $manifest -or $record.controllerSha256 -cne $digest) { throw 'Installed receipt mismatch' }
+            $hash = (Get-FileHash $receipt).Hash
+            if ($attempt -eq 1) { $first = $hash } elseif ($first -ne $hash) { throw 'Retry changed the receipt' }
+          }
+          $result | ConvertTo-Json | Set-Content (Join-Path $root 'protected-install.json')
       - name: Retain bounded resource qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -78,6 +120,7 @@ jobs:
           name: frameleaf-windows-compiled-host-authority
           path: |
             ${{ runner.temp }}/windows-compiled-host/qualification.json
+            ${{ runner.temp }}/windows-compiled-host/protected-install.json
             ${{ runner.temp }}/windows-compiled-host/compiled-authority.json
             ${{ runner.temp }}/windows-compiled-host/candidate-producer.json
             ${{ runner.temp }}/windows-compiled-host/evidence-producer.json
