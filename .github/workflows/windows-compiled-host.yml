@@ -131,6 +131,25 @@ jobs:
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
+      - name: Inspect and initialize the hosted Windows cloud-files filter
+        shell: pwsh
+        run: |
+          sc.exe query CldFlt
+          fltmc.exe filters
+          fltmc.exe instances
+          Start-Service CldFlt -ErrorAction Continue
+          $volumes = @($env:SystemDrive, (Split-Path -Qualifier $env:RUNNER_TEMP)) | Sort-Object -Unique
+          foreach ($volume in $volumes) { fltmc.exe attach CldFlt $volume }
+          fltmc.exe instances
+          # Diagnostics cannot grant storage admission; the real profile tests below still enforce it.
+          $global:LASTEXITCODE = 0
+      - name: Verify private profile admission on the disposable runner
+        shell: pwsh
+        env:
+          FRAMELEAF_TEST_DISPOSABLE_HOST_PROFILE: '1'
+        run: |
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --ignored --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Windows private profile admission failed' }
       - name: Exercise the companion with the published 0.1.1 Windows desktop
         shell: pwsh
         env:
