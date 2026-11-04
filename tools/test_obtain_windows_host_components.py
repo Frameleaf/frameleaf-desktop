@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from build_runtime import BuildError, inventory
-from obtain_windows_host_components import obtain, WORKFLOWS, SOURCE_REVISION, SOURCE_ARCHIVES
+from obtain_windows_host_components import obtain, WORKFLOWS, SOURCE_REVISION, MANAGER_REVISION, SOURCE_ARCHIVES
 
 
 class WindowsComponentSetTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class WindowsComponentSetTests(unittest.TestCase):
             path = root / name
             (path / directory).mkdir(parents=True)
             (path / directory / 'café-原本').write_bytes(name.encode())
-            records[name] = {'schemaVersion': 1, 'qualification': 'passed', 'sourceRevision': SOURCE_REVISION,
+            records[name] = {'schemaVersion': 1, 'qualification': 'passed', 'sourceRevision': MANAGER_REVISION if name == 'manager' else SOURCE_REVISION,
                             'files': inventory(path / directory), 'redistributable': False}
             if target: records[name]['platform'] = target
             if name in SOURCE_ARCHIVES:
@@ -152,6 +152,7 @@ class WindowsComponentSetTests(unittest.TestCase):
         expected = {
             'bytes': 'host_windows_component_inventory_mismatch:plugin',
             'source': 'host_windows_component_source_mismatch:plugin',
+            'old-manager': 'host_windows_component_source_mismatch:manager',
             'platform': 'host_windows_component_receipt_invalid',
             'archive': 'host_windows_component_source_mismatch:plugin',
             'lock': 'host_windows_component_source_mismatch:plugin',
@@ -164,10 +165,12 @@ class WindowsComponentSetTests(unittest.TestCase):
         for damage in expected:
             with self.subTest(damage=damage), tempfile.TemporaryDirectory() as td:
                 root = Path(td).resolve(); fixture, approvals = self.prepare(root)
-                p = fixture / 'plugin/qualification.json'
+                role = 'manager' if damage == 'old-manager' else 'plugin'
+                p = fixture / role / 'qualification.json'
                 record = json.loads(p.read_text())
                 if damage == 'bytes': (fixture / 'plugin/plugin/café-原本').write_bytes(b'tampered')
                 elif damage == 'source': record['sourceRevision'] = 'f' * 40
+                elif damage == 'old-manager': record['sourceRevision'] = SOURCE_REVISION
                 elif damage == 'platform': record['platform'] = 'linux-x64'
                 elif damage == 'archive': record['sourceArchiveSha256'] = 'f' * 64
                 elif damage == 'lock': record['lockfileSha256'] = 'f' * 64
