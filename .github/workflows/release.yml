@@ -172,6 +172,27 @@ jobs:
             import { packageConfiguration } from "./tools/package_desktop.mjs";
             await packageConfiguration("src-tauri/target/release/bundle/macos/Frameleaf.app/Contents/Resources/native-runtime");
           '
+      - name: Notarize and verify the signed distribution disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/dmg/*.dmg)
+          [[ ${#images[@]} == 1 ]]
+          image=${images[0]}
+          codesign --verify --strict "$image"
+          xcrun notarytool submit "$image" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --output-format json > "$RUNNER_TEMP/dmg-notarization.json"
+          jq '{id, status}' "$RUNNER_TEMP/dmg-notarization.json"
+          jq -e '.status == "Accepted"' "$RUNNER_TEMP/dmg-notarization.json" > /dev/null
+          xcrun stapler staple "$image"
+          xcrun stapler validate "$image"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$image"
       - name: Verify Windows executable and installer signatures
         if: runner.os == 'Windows'
         shell: pwsh
