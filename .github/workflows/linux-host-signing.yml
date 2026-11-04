@@ -6,8 +6,7 @@ on:
         description: Reviewed draft release asset ID, release ID, archive SHA-256 and manifest SHA-256 as JSON
         required: true
         type: string
-permissions:
-  contents: read
+permissions: {}
 concurrency:
   group: linux-x64-host-signing
   cancel-in-progress: false
@@ -15,6 +14,9 @@ jobs:
   sign:
     if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
     environment: desktop-release
+    permissions:
+      # GitHub requires repository write access to read unpublished release assets.
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
