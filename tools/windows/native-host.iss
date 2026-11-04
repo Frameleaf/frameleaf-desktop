@@ -72,6 +72,7 @@ begin
     WizardForm.StatusLabel.Caption := 'Installing verified server resources...';
     { ONNX test fixtures exceed MAX_PATH under the manifest-addressed directory. }
     ExtractArchive(ExpandConstant('{tmp}\windows-host.7z'), '\\?\' + RuntimeDir, '', True, nil);
+    Log('Server archive extraction completed.');
     OwnerArgs := '" /setowner *S-1-5-32-544 /T /Q';
     RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + RuntimeDir + OwnerArgs);
     RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + ControllerDir + OwnerArgs);

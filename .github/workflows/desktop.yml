@@ -147,7 +147,9 @@ jobs:
               Get-Content $log -Tail 35
               throw "$fixture payload did not fail with a clean rollback"
             }
-            if ($fixture -eq 'long-path' -and !(Select-String -Quiet -SimpleMatch 'frameleaf-native-host.exe failed (exit' -Path $log)) {
+            if ($fixture -eq 'long-path' -and (
+                !(Select-String -Quiet -SimpleMatch 'Server archive extraction completed.' -Path $log) -or
+                !(Select-String -Quiet -SimpleMatch 'frameleaf-native-host.exe failed (exit' -Path $log))) {
               Get-Content $log -Tail 35
               throw 'Long-path extraction did not reach signed payload verification'
             }
