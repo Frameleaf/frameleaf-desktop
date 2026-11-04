@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+test "${FRAMELEAF_STUDIO_GUARD_ACTIVE:-}" = 1
+profile=''
+for arg do
+    case "$arg" in
+        --user-data-dir=*) profile=${arg#--user-data-dir=} ;;
+    esac
+done
+case "$profile" in /*) ;; *) exit 1 ;; esac
+test -d "$profile" && test ! -L "$profile" && test -O "$profile"
+bundle=$(/usr/bin/mktemp -d "$profile/frameleaf-browser.XXXXXXXX")
+/usr/bin/ditto -x -k "${0%/*}/Chromium.zip" "$bundle"
+exec "$bundle/Chromium.app/Contents/MacOS/Chromium" "$@"
