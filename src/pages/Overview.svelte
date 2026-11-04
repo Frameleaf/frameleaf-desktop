@@ -5,7 +5,7 @@
   import Icon from '../Icon.svelte';
   import { workerStatus, runtimeRecoveryMessage } from '../mode-state';
   import { connectionError } from '../errors';
-  import { workloadName, workloadPill, workerTone, hostOf, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
+  import { workloadName, workloadPill, workerTone, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
 
   let { connection, setup, summary, native, section = 'all', onsetup, onconnection, onrefresh, onsignout, onopen }: {
@@ -23,7 +23,7 @@
     : setup?.state === 'model-download-required'
     ? 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks.'
     : setup?.state === 'reconnecting'
-    ? 'Waiting for a secure connection to your server. This computer will recheck its session, models and resources before processing again.'
+    ? 'Waiting to reconnect to your server. This computer will recheck its session, models and resources before processing again.'
     : setup?.state === 'pausing'
     ? 'The current bounded task will finish, then this computer will stop requesting work.'
     : setup?.state === 'stopped'
@@ -156,7 +156,7 @@
         <div class="group">
           <div class="row">
             <span class="ic" aria-hidden="true"><Icon name="server" /></span>
-            <span class="l"><b>{hostOf(connection.server)}</b><small>Signed in as {connection.name} · Encrypted connection · This {computer} is enrolled{summary?.me?.isAdmin ? ' · Administrator' : ''}</small></span>
+            <span class="l"><b>{hostOf(connection.server)}</b><small>Signed in as {connection.name} · {connectionTransport(connection.server)}{summary?.me?.isAdmin ? ' · Administrator' : ''}</small></span>
             <button class="btn" disabled={busy} onclick={onsignout}>Sign Out…</button>
           </div>
           {#if summary?.storage || summary?.version}

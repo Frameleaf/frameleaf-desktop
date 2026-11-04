@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort } from '../src/ui-state.ts';
+import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort } from '../src/ui-state.ts';
 import type { CloudServer, DiscoveredServer } from '../src/server-types.ts';
 
 test('money renders USD doubles and micro-USD integers without ever printing NaN', () => {
@@ -130,4 +130,11 @@ test('platform classes and worker pills are derived from strings only', () => {
   assert.equal(workerTone('working'), 'ok');
   assert.equal(workerTone('paused'), 'off');
   assert.equal(workerTone('qualifying'), 'wait');
+});
+
+test('connection transport reflects the server URL', () => {
+  assert.equal(connectionTransport('http://127.0.0.1:2283'), 'Unencrypted connection');
+  assert.equal(connectionTransport('https://photos.example.com'), 'Encrypted connection');
+  assert.equal(connectionTransport(''), 'Connection type unknown');
+  assert.equal(connectionTransport('ftp://photos.example.com'), 'Connection type unknown');
 });

@@ -10,7 +10,7 @@ export type DiscoveredServer = {
   name: string; id: string; url: string; host: string; port: number; addresses: string[];
   setup: 'needed' | 'complete' | string; linked: boolean; cloud: 'available' | 'unavailable' | string;
 };
-export type CloudAccount = { email: string; name: string; cloud_url: string };
+export type CloudAccount = { email: string; name: string };
 export type CloudServerConnection = { kind: 'local' | 'wan' | 'relay' | 'ipv6' | string; uri: string; verified: boolean };
 export type CloudServer = {
   instance_id: string; name: string; version?: string | null; status?: 'linked' | 'suspended' | 'revoked' | string;
@@ -49,7 +49,7 @@ export type ServerSummary = {
 
 // ---- cloud_status -----------------------------------------------------------------------------------
 export type CloudLinkStatus = {
-  state?: 'not-configured' | 'unlinked' | 'pending' | 'linked' | 'revoked' | string; configured?: boolean; cloudHost?: string | null; instanceId?: string | null;
+  state?: 'not-configured' | 'unlinked' | 'pending' | 'linked' | 'revoked' | string; configured?: boolean; instanceId?: string | null;
   account?: { id: string | null; label: string | null } | null; dataRegion?: string | null; linkedAt?: string | null; lastContactAt?: string | null;
   permissions?: { allowRemoteEnable?: boolean; allowBackupTrigger?: boolean; allowEntitlementRefresh?: boolean };
   revoked?: { at: string; reason: string } | null; lastError?: string | null; heartbeatFailures?: number; remoteAccessEnabled?: boolean;

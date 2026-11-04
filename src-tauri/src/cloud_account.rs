@@ -22,6 +22,7 @@ use zeroize::ZeroizeOnDrop;
 
 pub(crate) const CLIENT_ID: &str = "frameleaf-desktop";
 pub(crate) const SCOPE: &str = "openid email profile offline_access account";
+const CLOUD_ORIGIN: &str = "https://api.frameleaf.cloud";
 const CREDENTIAL: &str = "cloud-account";
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -50,7 +51,6 @@ pub(crate) struct CloudCredential {
 pub(crate) struct CloudAccount {
     pub email: String,
     pub name: String,
-    pub cloud_url: String,
 }
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
@@ -125,8 +125,7 @@ fn origin(url: &Url) -> Url {
     origin
 }
 
-/// The address an administrator types, as the server reads `FRAMELEAF_CLOUD_URL`: an https origin
-/// (plain http only on this computer, for a development cloud), nothing else in it.
+/// Cloud discovery requires a bare HTTPS origin, except for local development servers.
 pub(crate) fn parse_cloud_url(value: &str) -> Result<Url, String> {
     let url = Url::parse(value.trim()).map_err(|_| "cloud_address_invalid")?;
     let host = url.host_str().ok_or("cloud_address_invalid")?;
@@ -542,11 +541,7 @@ async fn profile(
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| email.clone());
-    Ok(CloudAccount {
-        email,
-        name,
-        cloud_url: credential.cloud_url.clone(),
-    })
+    Ok(CloudAccount { email, name })
 }
 
 /// Held from loading the credential through its refresh and save, and through sign-out's delete,
@@ -572,11 +567,10 @@ fn load() -> Result<Option<CloudCredential>, String> {
 pub(crate) async fn cloud_sign_in(
     window: WebviewWindow,
     app: tauri::AppHandle,
-    cloud_url: String,
 ) -> Result<CloudAccount, String> {
     use tauri_plugin_opener::OpenerExt;
     crate::require_local(&window)?;
-    let cloud = parse_cloud_url(&cloud_url)?;
+    let cloud = parse_cloud_url(CLOUD_ORIGIN)?;
     // The credential store must work before the browser opens; nothing to keep is worth a round trip.
     if load()?.is_some() {
         return Err("cloud_sign_out_before_switching_accounts".into());
