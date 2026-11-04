@@ -154,7 +154,7 @@ jobs:
           if (Test-Path $destination) { throw 'Expected a fresh install destination' }
           $install = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S', "/D=$destination" -PassThru -Wait
           if ($install.ExitCode) { throw "NSIS failed: $($install.ExitCode)" }
-          node tools/qualify_windows_welcome.mjs (Join-Path $destination 'frameleaf-desktop.exe')
+          powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe')
           if ($LASTEXITCODE) { throw 'Installed Welcome check failed' }
       - name: Retain private candidate artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
