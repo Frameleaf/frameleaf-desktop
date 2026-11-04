@@ -20,11 +20,11 @@ from stage_host_browser import stage_browser
 NODE_URL = 'https://nodejs.org/dist/v26.11.1/node-v26.11.1-win-x64.zip'
 NODE_ARCHIVE_SHA = '97f36a8a9684ff0d3e35758b4610fef5b628a5880e96f2ccc11240e5daf9934e'
 NODE_EXE_SHA = 'a619e2e09eb0d50ef4c733d678b4d22689d2afef138cd67fd3fa107b535f8819'
-BROWSER_URL = 'https://storage.googleapis.com/chromium-browser-snapshots/Win_x64/1735040/chrome-win.zip'
-BROWSER_ARCHIVE_SHA = 'c6f856b110dba84f88c060f30ad9e84f11d4ca8f426eeab024e67b661a6624db'
+BROWSER_URL = 'https://github.com/ungoogled-software/ungoogled-chromium-windows/releases/download/156.0.8078.79-1.1/ungoogled-chromium_156.0.8078.79-1.1_windows_x64.zip'
+BROWSER_ARCHIVE_SHA = 'a97c5378e16075967660f85cc34150444a9cfbc79733f048b9c6b42a851e4eb9'
 BROWSER_MANIFEST_SHA = '2cfd419f71ac6475d81e1301fa86c34cf2a2a6bae2a0da4b5a2b18310216b6bf'
-BROWSER_SOURCE = 'https://github.com/chromium/chromium/tree/437d8b7085ee32ec76c1145fd502169f2ad8be50'
-BROWSER_LICENSE_URL = 'https://raw.githubusercontent.com/chromium/chromium/437d8b7085ee32ec76c1145fd502169f2ad8be50/LICENSE'
+BROWSER_SOURCE = 'https://github.com/ungoogled-software/ungoogled-chromium-windows/tree/8492884eb30fdd9417ea7816aa92def805c97c74'
+BROWSER_LICENSE_URL = 'https://raw.githubusercontent.com/chromium/chromium/156.0.8078.79/LICENSE'
 BROWSER_LICENSE_SHA = '368cca1106be99d39ecd32a38d8305585d802a475effb66380b91ffc9bcf709b'
 PLAYWRIGHT = {
     'version': '1.64.0',
@@ -67,7 +67,7 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
         'schemaVersion': 1, 'sourceRevision': revision,
         'sourceLockSha256': hashlib.sha256(lock).hexdigest(),
         'browserManifestSha256': BROWSER_MANIFEST_SHA,
-        'nodeVersion': '26.11.1', 'browserVersion': '159.0.8143.0',
+        'nodeVersion': '26.11.1', 'browserVersion': '156.0.8078.79',
         'nodeArchive': {'url': NODE_URL, 'sha256': NODE_ARCHIVE_SHA},
         'browserArchive': {'url': BROWSER_URL, 'sha256': BROWSER_ARCHIVE_SHA},
         'browserSource': BROWSER_SOURCE,
@@ -83,7 +83,7 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
             expanded.mkdir(mode=0o700)
             unpack(archive, expanded)
         node = work / 'node/node-v26.11.1-win-x64'
-        browser = work / 'browser/chrome-win'
+        browser = work / 'browser/ungoogled-chromium_156.0.8078.79-1.1_windows_x64'
         if sha256(node / 'node.exe') != NODE_EXE_SHA or not (node / 'LICENSE').stat().st_size:
             raise BuildError('host_windows_support_payload_changed')
         (payload / 'node').mkdir(mode=0o700)
