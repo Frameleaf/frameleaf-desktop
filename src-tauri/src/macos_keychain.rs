@@ -6,9 +6,18 @@ use core_foundation::{
 use serde::de::DeserializeOwned;
 use std::{ffi::CString, ptr};
 
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    Read,
+    Write,
+    Delete,
+    Confirm,
+}
+
 extern "C" {
     fn frameleaf_keychain(
-        operation: u32,
+        operation: Operation,
         name: *const std::ffi::c_char,
         presence: bool,
         prompt: u32,
@@ -22,7 +31,12 @@ fn user_presence(account: &str) -> bool {
     matches!(account, "connection" | "cloud-account" | "manager-grant")
 }
 
-fn operation(op: u32, account: &str, prompt: u32, bytes: &[u8]) -> Result<Option<CFData>, String> {
+fn operation(
+    op: Operation,
+    account: &str,
+    prompt: u32,
+    bytes: &[u8],
+) -> Result<Option<CFData>, String> {
     let name = CString::new(account).map_err(|_| "credential_record_invalid")?;
     let mut output = ptr::null();
     // The synchronous native call borrows its input and returns only a create-rule CFData.
@@ -39,7 +53,7 @@ fn operation(op: u32, account: &str, prompt: u32, bytes: &[u8]) -> Result<Option
     };
     match status {
         0 => Ok((!output.is_null()).then(|| unsafe { CFData::wrap_under_create_rule(output) })),
-        -25300 if op != 1 => Ok(None), // errSecItemNotFound
+        -25300 if op != Operation::Write => Ok(None), // errSecItemNotFound
         -128 | -25293 | -25308 => Err("credential_unlock_required".into()),
         _ => Err("credential_store_locked_or_unavailable".into()),
     }
@@ -49,24 +63,25 @@ pub(super) fn read<T: DeserializeOwned>(
     account: &str,
     prompt: Prompt,
 ) -> Result<Option<T>, String> {
-    operation(0, account, prompt as u32, &[])?
+    operation(Operation::Read, account, prompt as u32, &[])?
         .map(|data| {
             serde_json::from_slice(data.bytes()).map_err(|_| "credential_record_invalid".into())
         })
         .transpose()
 }
 pub(super) fn confirm(account: &str, expected: &[u8], prompt: Prompt) -> Result<(), String> {
-    let data = operation(3, account, prompt as u32, &[])?.ok_or("credential_record_invalid")?;
+    let data = operation(Operation::Confirm, account, prompt as u32, &[])?
+        .ok_or("credential_record_invalid")?;
     if data.bytes() != expected {
         return Err("credential_record_invalid".into());
     }
     Ok(())
 }
 pub(super) fn write(account: &str, bytes: &[u8]) -> Result<(), String> {
-    operation(1, account, 0, bytes).map(|_| ())
+    operation(Operation::Write, account, 0, bytes).map(|_| ())
 }
 pub(super) fn delete(account: &str) -> Result<(), String> {
-    operation(2, account, 0, &[]).map(|_| ())
+    operation(Operation::Delete, account, 0, &[]).map(|_| ())
 }
 
 #[cfg(test)]

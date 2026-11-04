@@ -4,6 +4,7 @@ const messages: Record<string, string> = {
   worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
   server_requires_https_origin: 'Enter your server’s address without a path or sign-in details. Use HTTPS unless the server is on your local network.',
   server_address_invalid: 'Enter a valid server address.',
+  server_sign_in_retry_required: 'Your server’s identity could not be confirmed. Sign in again to continue.',
   server_identity_not_confirmed: 'Sign in again to confirm this server’s identity. Clear the saved sign-in first.',
   server_unreachable_or_certificate_invalid: 'Could not securely connect. Check the server address, network and certificate.',
   server_http_401: 'Sign-in expired or the email and password are incorrect. Sign out and try again.',

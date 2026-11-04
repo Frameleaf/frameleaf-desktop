@@ -168,6 +168,16 @@ fn actual_native_nas_library_jobs() {
             &configuration.email,
             configuration.password,
             "Native sign-in fixture",
+            |saved| {
+                assert!(!saved.server_id.is_empty());
+                assert_eq!(
+                    credentials::load::<SavedConnection>("connection")?
+                        .unwrap()
+                        .server_id,
+                    saved.server_id
+                );
+                Ok(())
+            },
         )
         .await
         .unwrap();
@@ -362,6 +372,7 @@ async fn fresh_sign_in_rejects_invalid_details_before_credentials_or_network() {
             email,
             password.into(),
             "Fixture",
+            |_| panic!("invalid login must not request credential access"),
         )
         .await;
         assert_eq!(result.err().as_deref(), Some("login_details_invalid"));

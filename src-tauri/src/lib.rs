@@ -93,6 +93,15 @@ pub(crate) async fn prepare_with_client(
     client: &reqwest::Client,
     saved: &mut SavedConnection,
 ) -> ConnectionView {
+    let capabilities = transport::capabilities(client, saved).await;
+    prepare_with_capabilities(client, saved, capabilities).await
+}
+
+async fn prepare_with_capabilities(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+    capabilities: Result<Option<connection::Capabilities>, String>,
+) -> ConnectionView {
     let unavailable = Features {
         enrollment: false,
         worker: false,
@@ -100,7 +109,7 @@ pub(crate) async fn prepare_with_client(
         sources: false,
         native_host: false,
     };
-    match transport::capabilities(client, saved).await {
+    match capabilities {
         Ok(Some(caps)) => {
             if connection::persist_server_identity(saved, &caps.server_id, |value| {
                 credentials::save("connection", value)
@@ -185,8 +194,10 @@ async fn connect_server(
         return Err("sign_out_before_switching_servers".into());
     }
     let client = transport::client()?;
-    let (saved, mut view) =
-        sign_in(&window, &client, &server, &email, password, &device_name).await?;
+    let (saved, mut view) = sign_in(&client, &server, &email, password, &device_name, |saved| {
+        credentials::confirm_new_sign_in("connection", saved, &window)
+    })
+    .await?;
     if view.state == "preparing"
         && view.features.worker_session
         && start_worker_setup(&app, &saved, false).await.is_err()
@@ -200,12 +211,12 @@ async fn connect_server(
 }
 
 async fn sign_in(
-    window: &WebviewWindow,
     client: &reqwest::Client,
     server: &str,
     email: &str,
     password: String,
     device_name: &str,
+    confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
 ) -> Result<(SavedConnection, ConnectionView), String> {
     let base = normalize_server(server)?;
     let password = Zeroizing::new(password);
@@ -229,17 +240,37 @@ async fn sign_in(
         mode: "client-worker".into(),
         device_id: None,
     };
-    if let Err(error) = credentials::save("connection", &saved) {
-        let _ = client
-            .post(base.join("api/auth/logout").unwrap())
-            .bearer_auth(&saved.token)
-            .send()
-            .await;
-        return Err(error);
-    }
-    credentials::confirm_new_sign_in("connection", &saved, window)?;
-    let view = prepare_with_client(client, &mut saved).await;
+    let view = finish_new_connection(client, &mut saved, confirm).await?;
     Ok((saved, view))
+}
+
+// Persist the verified identity with the very first credential so cancellation is restart-safe.
+async fn finish_new_connection(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+    confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
+) -> Result<ConnectionView, String> {
+    let capabilities = transport::capabilities(client, saved).await;
+    if let Ok(Some(caps)) = &capabilities {
+        saved.server_id.clone_from(&caps.server_id);
+    }
+    let result = match credentials::save("connection", saved) {
+        Err(error) => Err(error),
+        Ok(()) => match confirm(saved) {
+            Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
+            Err(error) if !saved.server_id.is_empty() => return Err(error),
+            Err(_) => {
+                credentials::delete("connection").and(Err("server_sign_in_retry_required".into()))
+            }
+        },
+    };
+    let base = normalize_server(&saved.server)?;
+    let _ = client
+        .post(base.join("api/auth/logout").unwrap())
+        .bearer_auth(&saved.token)
+        .send()
+        .await;
+    result
 }
 
 #[tauri::command]

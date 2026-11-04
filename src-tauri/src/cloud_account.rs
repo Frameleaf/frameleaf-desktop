@@ -964,16 +964,10 @@ pub(crate) async fn connect_cloud_server(
         mode: "client-worker".into(),
         device_id: None,
     };
-    if let Err(error) = credentials::save("connection", &saved) {
-        let _ = client
-            .post(base.join("api/auth/logout").unwrap())
-            .bearer_auth(&saved.token)
-            .send()
-            .await;
-        return Err(error);
-    }
-    credentials::confirm_new_sign_in("connection", &saved, &window)?;
-    let mut view = crate::prepare_with_client(&client, &mut saved).await;
+    let mut view = crate::finish_new_connection(&client, &mut saved, |saved| {
+        credentials::confirm_new_sign_in("connection", saved, &window)
+    })
+    .await?;
     if view.state == "preparing"
         && view.features.worker_session
         && crate::start_worker_setup(&app, &saved, false)

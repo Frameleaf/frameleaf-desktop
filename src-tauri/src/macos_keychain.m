@@ -1,7 +1,7 @@
 // Security.framework evaluates user presence on the read itself, using Touch ID or the Mac password.
 #import <Foundation/Foundation.h>
 #import <LocalAuthentication/LocalAuthentication.h>
-#import <Security/Security.h>
+#import "macos_keychain.h"
 
 #define KEY(x) ((__bridge id)(x))
 static NSString *const service = @"app.frameleaf.desktop";
@@ -105,7 +105,7 @@ static OSStatus readAccount(NSString *account, bool presence, bool interactive, 
     return errSecSuccess;
 }
 
-OSStatus frameleaf_keychain(unsigned operation, const char *name, bool presence, unsigned prompt,
+OSStatus frameleaf_keychain(FrameleafKeychainOperation operation, const char *name, bool presence, unsigned prompt,
                             const void *bytes, size_t size, CFDataRef *output) {
     @autoreleasepool {
         @synchronized ([LAContext class]) {
@@ -119,19 +119,19 @@ OSStatus frameleaf_keychain(unsigned operation, const char *name, bool presence,
             NSString *account = [NSString stringWithUTF8String:name];
             if (!account.length) return errSecParam;
             OSStatus status;
-            if (operation == 0) {
+            if (operation == FrameleafKeychainRead) {
                 status = readAccount(account, presence, interactive, output);
-            } else if (operation == 3) {
+            } else if (operation == FrameleafKeychainConfirm) {
                 // Verify the item just written; never consult a legacy item in its place.
                 status = readModern(account, output);
-            } else if (operation == 1) {
+            } else if (operation == FrameleafKeychainWrite) {
                 NSData *value = [NSData dataWithBytesNoCopy:(void *)bytes length:size freeWhenDone:NO];
                 status = add(account, value, presence);
                 if (status == errSecDuplicateItem) {
                     status = SecItemUpdate((__bridge CFDictionaryRef)query(account),
                         (__bridge CFDictionaryRef)@{KEY(kSecValueData): value});
                 }
-            } else if (operation == 2) {
+            } else if (operation == FrameleafKeychainDelete) {
                 // Delete legacy first so an interrupted sign-out can never resurrect an old grant.
                 status = legacy(account, true, false, NULL, nil);
                 if (!status || status == errSecItemNotFound)

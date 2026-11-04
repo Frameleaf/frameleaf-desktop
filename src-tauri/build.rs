@@ -2,6 +2,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         println!("cargo:rerun-if-changed=src/macos_keychain.m");
+        println!("cargo:rerun-if-changed=src/macos_keychain.h");
         cc::Build::new()
             .file("src/macos_keychain.m")
             .flag("-fobjc-arc")

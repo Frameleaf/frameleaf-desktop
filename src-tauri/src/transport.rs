@@ -141,6 +141,46 @@ mod tests {
         });
         (url, handle)
     }
+    #[tokio::test]
+    #[ignore = "uses a process-local synthetic Keychain; run alone"]
+    async fn cancelled_first_unlock_preserves_only_a_verified_restartable_sign_in() {
+        crate::ml_transport::native_nas_tests::install_test_keyring();
+        let caps = serde_json::json!({"protocolVersion":1,"serverId":"known-server","features":{
+            "enrollment":false,"worker":false,"sources":false,"nativeHost":false
+        }});
+        for (status, expected_error) in [
+            (200, "credential_unlock_required"),
+            (404, "server_sign_in_retry_required"),
+        ] {
+            let (url, server) = reply(caps.to_string(), status);
+            let mut saved = SavedConnection {
+                server: url,
+                server_id: String::new(),
+                account_id: "account".into(),
+                name: "Test".into(),
+                token: "fixture".into(),
+                device_name: "Fixture".into(),
+                mode: "client-worker".into(),
+                device_id: None,
+            };
+            let result = crate::finish_new_connection(&client().unwrap(), &mut saved, |_| {
+                Err("credential_unlock_required".into())
+            })
+            .await;
+            assert_eq!(result.err().as_deref(), Some(expected_error));
+            let stored: Option<SavedConnection> = crate::credentials::load("connection").unwrap();
+            if status == 200 {
+                let stored = stored.unwrap();
+                assert_eq!(stored.server_id, "known-server");
+                assert_eq!(stored.account_id, saved.account_id);
+                assert_eq!(stored.token, saved.token);
+                crate::credentials::delete("connection").unwrap();
+            } else {
+                assert!(stored.is_none());
+            }
+            server.join().unwrap();
+        }
+    }
     #[test]
     fn keeps_photo_json_small_and_accepts_only_explicit_bounded_worker_replies() {
         tauri::async_runtime::block_on(async {
