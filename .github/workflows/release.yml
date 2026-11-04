@@ -119,7 +119,7 @@ jobs:
             import { writeFileSync } from "node:fs";
             import { packageConfiguration } from "./tools/package_desktop.mjs";
             const config = await packageConfiguration("release-runtime");
-            config.bundle.targets = { darwin: ["app", "dmg"], win32: ["nsis", "msi"], linux: ["deb", "appimage"] }[process.platform];
+            config.bundle.targets = { darwin: ["app"], win32: ["nsis", "msi"], linux: ["deb", "appimage"] }[process.platform];
             if (process.platform === "darwin") config.bundle.macOS = { hardenedRuntime: true };
             writeFileSync("release-config.json", JSON.stringify(config));
           '
@@ -151,28 +151,45 @@ jobs:
           account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           profile: ${{ vars.AZURE_SIGNING_PROFILE }}
           subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
-      - name: Build signed installer (macOS also notarizes)
+      - name: Build signed installers (macOS app bundle)
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
         run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
-      - name: Verify Apple signing, notarization, and embedded runtime integrity
+      - name: Sign the macOS GUI with its provisioned Keychain identity and package the DMG
         if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROFILE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_PROVISION_PROFILE }}
         shell: bash
         run: |
           set -euo pipefail
-          app=src-tauri/target/release/bundle/macos/Frameleaf.app
-          codesign --verify --deep --strict --verbose=2 "$app"
-          spctl --assess --type execute --verbose=2 "$app"
-          xcrun stapler validate "$app"
+          : "${PROFILE_BASE64:?Missing macOS Developer ID profile}"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/desktop.provisionprofile"
+          python tools/package_macos_dmg.py src-tauri/target/release/bundle "$RUNNER_TEMP/desktop.provisionprofile" "$RUNNER_TEMP/desktop-release.keychain-db"
+          images=(src-tauri/target/release/bundle/dmg/*.dmg)
+          [[ ${#images[@]} == 1 ]]
+          mount=$(mktemp -d "$RUNNER_TEMP/verify-dmg.XXXXXX")
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "${images[0]}"
+          trap 'hdiutil detach "$mount"' EXIT
+          codesign --verify --deep --strict "$mount/Frameleaf.app"
           node --input-type=module -e '
             import { packageConfiguration } from "./tools/package_desktop.mjs";
-            await packageConfiguration("src-tauri/target/release/bundle/macos/Frameleaf.app/Contents/Resources/native-runtime");
-          '
-      - name: Notarize and verify the signed distribution disk image
+            await packageConfiguration(process.argv[1]);
+          ' "$mount/Frameleaf.app/Contents/Resources/native-runtime"
+          install=$(mktemp -d "$RUNNER_TEMP/installed-desktop.XXXXXX")
+          ditto "$mount/Frameleaf.app" "$install/Frameleaf.app"
+          codesign --verify --deep --strict "$install/Frameleaf.app"
+          open -n -g -a "$install/Frameleaf.app"
+          xcrun swift tools/qualify_macos_app_launch.swift "$install/Frameleaf.app"
+      - name: Exercise the production Keychain entitlements on a disposable macOS user
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: bash tools/qualify_signed_macos_keychain.sh
+      - name: Submit the distribution disk image to Apple
         if: runner.os == 'macOS'
         shell: bash
         env:
@@ -184,15 +201,37 @@ jobs:
           shopt -s nullglob
           images=(src-tauri/target/release/bundle/dmg/*.dmg)
           [[ ${#images[@]} == 1 ]]
-          image=${images[0]}
-          codesign --verify --strict "$image"
-          xcrun notarytool submit "$image" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
-            --wait --output-format json > "$RUNNER_TEMP/dmg-notarization.json"
+          xcrun notarytool submit "${images[0]}" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --no-wait --output-format json > src-tauri/target/release/bundle/dmg/dmg-submission.json
+          jq -er '.id' src-tauri/target/release/bundle/dmg/dmg-submission.json
+      - name: Retain the exact submitted image and request ID before waiting for Apple
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: notarization-pending-${{ matrix.target }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/dmg/dmg-submission.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Verify notarization and staple the submitted disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          id=$(jq -er '.id' src-tauri/target/release/bundle/dmg/dmg-submission.json)
+          xcrun notarytool wait "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --output-format json > "$RUNNER_TEMP/dmg-notarization.json"
           jq '{id, status}' "$RUNNER_TEMP/dmg-notarization.json"
           jq -e '.status == "Accepted"' "$RUNNER_TEMP/dmg-notarization.json" > /dev/null
-          xcrun stapler staple "$image"
-          xcrun stapler validate "$image"
-          spctl --assess --type open --context context:primary-signature --verbose=2 "$image"
+          images=(src-tauri/target/release/bundle/dmg/*.dmg)
+          xcrun stapler staple "${images[0]}"
+          xcrun stapler validate "${images[0]}"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "${images[0]}"
       - name: Verify Windows executable and installer signatures
         if: runner.os == 'Windows'
         shell: pwsh
