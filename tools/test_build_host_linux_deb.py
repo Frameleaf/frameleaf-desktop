@@ -42,6 +42,32 @@ class LinuxHostDebTests(unittest.TestCase):
                 self.assertIn('-xframeleaf-fixture', args)
                 self.assertNotIn('--ignore-missing-info', args)
 
+    def test_only_unused_known_node_prebuilds_are_excluded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'tree'
+            selected = [
+                'payload/server/node_modules/bcrypt/prebuilds/linux-x64/bcrypt.glibc.node',
+                'payload/server/node_modules/bare-fs/prebuilds/linux-x64/bare-fs.bare',
+                'payload/server/node_modules/other/prebuilds/linux-arm64/other.node',
+            ]
+            ignored = [
+                'payload/server/node_modules/bcrypt/prebuilds/linux-arm64/bcrypt.glibc.node',
+                'payload/server/node_modules/bcrypt/prebuilds/linux-x64/bcrypt.musl.node',
+                'payload/server/node_modules/bare-fs/prebuilds/linux-arm64/bare-fs.bare',
+            ]
+            for name in selected + ignored:
+                path = tree / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'\x7fELFfixture')
+            with patch('build_host_linux_deb.platform.machine', return_value='x86_64'), patch(
+                'build_host_linux_deb.run',
+                side_effect=lambda args, **kwargs: 'shlibs:Depends=libc6' if args[0] == 'dpkg-shlibdeps' else '',
+            ) as call:
+                self.assertEqual(dependencies(tree, 'frameleaf-fixture', root / 'work'), 'libc6')
+            args = call.call_args.args[0]
+            self.assertEqual({arg[2:] for arg in args if arg.startswith('-e')}, {str(tree / name) for name in selected})
+
     def test_native_addon_sonames_keep_dependency_analysis_without_library_version_mapping(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
