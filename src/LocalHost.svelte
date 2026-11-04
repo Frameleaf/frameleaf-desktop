@@ -137,7 +137,7 @@
     {#if view?.profileSetupAvailable && installations.length > 0 && !view.code?.startsWith('host_profile_legacy_') && (view.state === 'idle' || view.state === 'needs-attention')}
       <div class="row"><span class="l"><b>Prepare my server profile</b><small>{profileCopy.preparation}</small></span><button class="btn primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare Profile</button></div>
     {/if}
-    {#if native && !busy && !failure && installations.length === 0}
+    {#if native && view && !busy && !failure && installations.length === 0}
       <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><span class="l"><b>Server component not installed</b><small>Install the Frameleaf server component, then check again. Your existing photo folders are kept separate.</small></span></div>
     {/if}
     {#if installations.length > 1 && !view?.backgroundActive}
