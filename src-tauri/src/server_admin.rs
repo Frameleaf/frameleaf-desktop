@@ -351,19 +351,19 @@ pub(crate) async fn test_remote_access(
         .await
 }
 
-/// Only https, and only the signed-in server or Frameleaf's own domains: the browser never opens an
-/// address a server reply could choose freely.
-pub(crate) fn external_url_allowed(url: &Url, server_host: Option<&str>) -> bool {
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+/// Only the signed-in server's own origin (http on the local network) or https Frameleaf domains:
+/// the browser never opens an address a server reply could choose freely.
+pub(crate) fn external_url_allowed(url: &Url, server: Option<&Url>) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
         return false;
     }
-    let Some(host) = url.host_str() else {
+    if server.is_some_and(|server| server.origin() == url.origin()) {
+        return true;
+    }
+    let Some(host) = url.host_str().filter(|_| url.scheme() == "https") else {
         return false;
     };
     let host = host.to_ascii_lowercase();
-    if server_host.is_some_and(|server| server.eq_ignore_ascii_case(&host)) {
-        return true;
-    }
     host == "frameleaf.cloud"
         || host.ends_with(".frameleaf.cloud")
         || host == "frameleaf.net"
@@ -383,14 +383,13 @@ pub(crate) async fn open_external(
         return Err("external_url_not_allowed".into());
     }
     let parsed = Url::parse(&url).map_err(|_| "external_url_not_allowed")?;
-    let server_host = {
+    let server = {
         let current = state.0.lock().await;
         current
             .as_ref()
             .and_then(|saved| normalize_server(&saved.server).ok())
-            .and_then(|base| base.host_str().map(str::to_owned))
     };
-    if !external_url_allowed(&parsed, server_host.as_deref()) {
+    if !external_url_allowed(&parsed, server.as_ref()) {
         return Err("external_url_not_allowed".into());
     }
     app.opener()
@@ -405,10 +404,16 @@ mod tests {
 
     #[test]
     fn external_urls_are_limited_to_the_server_and_frameleaf_domains() {
-        let allowed =
-            |url: &str| external_url_allowed(&Url::parse(url).unwrap(), Some("nas.home.arpa"));
+        let server = Url::parse("https://nas.home.arpa").unwrap();
+        let allowed = |url: &str| external_url_allowed(&Url::parse(url).unwrap(), Some(&server));
         assert!(allowed("https://nas.home.arpa/admin"));
         assert!(allowed("https://NAS.home.arpa/"));
+        assert!(!allowed("http://nas.home.arpa/"));
+        let local = Url::parse("http://192.168.1.20:2283").unwrap();
+        let on_local = |url: &str| external_url_allowed(&Url::parse(url).unwrap(), Some(&local));
+        assert!(on_local("http://192.168.1.20:2283/admin"));
+        assert!(!on_local("http://192.168.1.20/"));
+        assert!(!on_local("http://192.168.1.21:2283/"));
         assert!(!allowed("https://frameleaf.example/servers/1"));
         assert!(allowed("https://frameleaf.cloud/store"));
         assert!(allowed("https://id.frameleaf.cloud/session/end"));

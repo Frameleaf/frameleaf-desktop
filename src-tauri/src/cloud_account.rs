@@ -740,7 +740,7 @@ fn rank(candidate: &Candidate) -> u8 {
     }
 }
 
-/// The candidates this app can use (an https origin), in the order to prefer them: local, wan,
+/// The candidates this app can use (https, or http on the local network), in the order to prefer them: local, wan,
 /// ipv6, custom hostname, relay; the cloud's own order within a kind.
 pub(crate) fn order_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut usable: Vec<Candidate> = Vec::new();
@@ -756,7 +756,7 @@ pub(crate) fn order_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
             usable.push(candidate);
         }
     }
-    usable.sort_by_key(rank);
+    usable.sort_by_key(|candidate| (rank(candidate), !candidate.uri.starts_with("https://")));
     usable
 }
 
@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_ordered_local_wan_ipv6_custom_relay_and_https_only() {
+    fn candidates_are_ordered_local_wan_ipv6_custom_relay_https_first() {
         let ordered = order_candidates(vec![
             candidate("relay", "https://r.abc.frameleaf.net/", false),
             candidate("wan", "https://photos.example.com/", true),
@@ -1203,6 +1203,7 @@ mod tests {
             uris,
             [
                 "https://192-168-1-20.abc.frameleaf.net:2283/",
+                "http://192.168.1.20:2283/",
                 "https://abc.frameleaf.net:44443/",
                 "https://[2001:db8::1]:2283/",
                 "https://photos.example.com/",

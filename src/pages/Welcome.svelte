@@ -93,11 +93,8 @@
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {
-    const nearby = entry.nearby?.url.startsWith('https://') ? entry.nearby.url : undefined;
-    server = nearby ?? entry.cloud?.connections?.[0]?.uri ?? '';
-    addressMode = true; failure = '';
-    notice = entry.action === 'setup' ? `“${entry.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.`
-      : !server && entry.nearby ? plainHttp(entry.nearby) : '';
+    server = entry.nearby?.url ?? entry.cloud?.connections?.[0]?.uri ?? '';
+    addressMode = true; failure = ''; notice = entry.action === 'setup' ? `“${entry.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.` : '';
   }
   async function findServer() {
     if (!native || discovering) return;
@@ -105,18 +102,12 @@
     try {
       found = await invoke<DiscoveredServer[]>('discover_servers');
       if (found.length === 0) notice = 'No Frameleaf server answered on this network. Enter its address instead.';
-      else if (found.length === 1) useFound(found[0]!, 'Found');
+      else if (found.length === 1) { server = found[0]!.url; notice = `Found “${found[0]!.name}” at ${found[0]!.url}.`; }
       else picker = true;
     } catch (error) { failure = explain(error); }
     finally { discovering = false; }
   }
-  // Sign-in only accepts HTTPS; a server discovered on plain HTTP is named, not put in the address field.
-  const plainHttp = (entry: DiscoveredServer) => `“${entry.name}” answers only over plain HTTP at ${entry.url}. Set up HTTPS for it, then enter its https:// address.`;
-  function useFound(entry: DiscoveredServer, verb: string) {
-    if (entry.url.startsWith('https://')) { server = entry.url; notice = `${verb} “${entry.name}” at ${entry.url}.`; }
-    else { server = ''; notice = plainHttp(entry); }
-  }
-  function pick(entry: DiscoveredServer) { picker = false; useFound(entry, 'Using'); }
+  function pick(entry: DiscoveredServer) { server = entry.url; picker = false; notice = `Using “${entry.name}” at ${entry.url}.`; }
 </script>
 
 {#if managerOnly}

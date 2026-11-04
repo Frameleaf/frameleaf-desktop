@@ -12,7 +12,8 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
         return Err("server_address_invalid".into());
     }
     let url = Url::parse(value.trim()).map_err(|_| "server_address_invalid")?;
-    if url.scheme() != "https"
+    let local_http = url.scheme() == "http" && url.host().is_some_and(is_local_network);
+    if !(url.scheme() == "https" || local_http)
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -23,6 +24,26 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
         return Err("server_requires_https_origin".into());
     }
     Ok(url)
+}
+
+/// A host on this computer or the local network, where servers answer over plain HTTP: loopback,
+/// private and link-local addresses, single-label names and the local-only DNS suffixes.
+pub fn is_local_network(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        url::Host::Ipv6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+        url::Host::Domain(name) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            !name.is_empty()
+                && (!name.contains('.')
+                    || [".local", ".lan", ".home.arpa", ".internal", ".localdomain"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix)))
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -224,4 +245,40 @@ pub fn native_origin_allowed(label: &str, url: &Url, development_build: bool) ->
         && url.host_str() == Some("localhost")
         && url.port() == Some(1420);
     label == "main" && (packaged || development)
+}
+
+#[cfg(test)]
+mod local_http_tests {
+    use super::*;
+
+    #[test]
+    fn plain_http_is_accepted_only_on_the_local_network() {
+        for local in [
+            "http://192.168.1.20:2283",
+            "http://10.0.0.5",
+            "http://172.16.4.2:2283/",
+            "http://127.0.0.1:2283",
+            "http://169.254.1.1",
+            "http://[fd00::7]:2283",
+            "http://[fe80::1]",
+            "http://[::1]",
+            "http://tower",
+            "http://localhost:2283",
+            "http://tower.local:2283",
+            "http://nas.home.arpa",
+            "http://nas.lan",
+        ] {
+            assert!(normalize_server(local).is_ok(), "{local}");
+        }
+        for remote in [
+            "http://photos.example.com",
+            "http://8.8.8.8",
+            "http://100.64.0.1",
+            "http://[2001:db8::1]",
+            "http://192.168.1.20/photos",
+        ] {
+            assert!(normalize_server(remote).is_err(), "{remote}");
+        }
+        assert!(normalize_server("https://photos.example.com").is_ok());
+    }
 }

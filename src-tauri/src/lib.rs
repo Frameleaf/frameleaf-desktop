@@ -385,10 +385,11 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
             .build()
             .map_err(|_| "photo_window_unavailable")?;
     let domain = base.host_str().ok_or("server_address_invalid")?;
+    let secure = base.scheme() == "https";
     let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
         .domain(domain)
         .path("/")
-        .secure(true)
+        .secure(secure)
         .http_only(true)
         .build();
     photos
@@ -403,7 +404,7 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
                 tauri::webview::Cookie::build((key, value))
                     .domain(domain)
                     .path("/")
-                    .secure(true)
+                    .secure(secure)
                     .build(),
             )
             .map_err(|_| "photo_session_unavailable")?;
