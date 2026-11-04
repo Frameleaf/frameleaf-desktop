@@ -1,15 +1,21 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 
 assert.equal(process.platform, 'win32');
 assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 const profile = await mkdtemp(join(process.env.RUNNER_TEMP, 'frameleaf-webview-'));
+const listener = createServer();
+await new Promise((resolve, reject) => listener.once('error', reject).listen(0, '127.0.0.1', resolve));
+const port = listener.address().port;
+await new Promise(resolve => listener.close(resolve));
 const app = spawn(process.argv[2], [], {
+  stdio: 'inherit',
   env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: profile,
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-address=127.0.0.1 --remote-debugging-port=0' }
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-address=127.0.0.1 --remote-debugging-port=' + port }
 });
 
 async function welcomeInteraction() {
@@ -23,8 +29,10 @@ async function welcomeInteraction() {
   }
   const radio = label => [...document.querySelectorAll('[role="radio"]')].find(el => el.textContent.includes(label));
   await waitFor(() => document.querySelector('h2')?.textContent === 'Welcome' && document.querySelector('#srv'), 'Welcome server address form');
-  const local = radio('Run Frameleaf here');
-  if (!local || local.disabled) throw new Error('Local setup choice unavailable');
+  const local = await waitFor(() => {
+    const choice = radio('Run Frameleaf here');
+    return choice && !choice.disabled && choice;
+  }, 'enabled local setup choice');
   local.click();
   await waitFor(() => document.querySelector('[aria-label="Local library setup"]')?.innerText.includes('Server component not installed'), 'native host discovery result');
   radio('Connect to my server').click();
@@ -34,20 +42,19 @@ async function welcomeInteraction() {
 
 try {
   let page;
+  let observed = [];
   for (let i = 0; i < 120 && !page; i++) {
     assert.equal(app.exitCode, null, 'Installed executable exited before Welcome');
     try {
-      const port = (await readFile(join(profile, 'EBWebView', 'DevToolsActivePort'), 'utf8')).split(/\r?\n/)[0];
-      if (/^\d+$/.test(port)) {
-        const targets = await (await fetch('http://127.0.0.1:' + port + '/json/list')).json();
-        page = targets.find(t => t.type === 'page' && /^https?:\/\/tauri\.localhost\//.test(t.url));
-      }
+      const targets = await (await fetch('http://127.0.0.1:' + port + '/json/list')).json();
+      observed = targets.map(t => [t.type, t.url.split(/[?#]/)[0]]);
+      page = targets.find(t => ['page', 'webview'].includes(t.type) && /^https?:\/\/tauri\.localhost(?:\/|$)/.test(t.url));
     } catch (error) {
-      if (error.code !== 'ENOENT' && error.cause?.code !== 'ECONNREFUSED') throw error;
+      if (error.cause?.code !== 'ECONNREFUSED') throw error;
     }
     if (!page) await pause(500);
   }
-  assert.ok(page, 'Installed Frameleaf WebView2 target did not appear');
+  assert.ok(page, 'Installed Frameleaf WebView2 target did not appear: ' + JSON.stringify(observed));
   const socket = new WebSocket(page.webSocketDebuggerUrl);
   try {
     const response = await new Promise((resolve, reject) => {
