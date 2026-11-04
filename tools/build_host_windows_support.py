@@ -67,7 +67,7 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
         'schemaVersion': 1, 'sourceRevision': revision,
         'sourceLockSha256': hashlib.sha256(lock).hexdigest(),
         'browserManifestSha256': BROWSER_MANIFEST_SHA,
-        'nodeVersion': '26.11.1', 'browserVersion': '156.0.8078.4',
+        'nodeVersion': '26.11.1', 'browserVersion': '159.0.8143.0',
         'nodeArchive': {'url': NODE_URL, 'sha256': NODE_ARCHIVE_SHA},
         'browserArchive': {'url': BROWSER_URL, 'sha256': BROWSER_ARCHIVE_SHA},
         'browserSource': BROWSER_SOURCE,
@@ -79,7 +79,7 @@ def build(source: Path, revision: str, studio: Path, output: Path) -> None:
         for name, url, digest in [('node', NODE_URL, NODE_ARCHIVE_SHA),
                                   ('browser', BROWSER_URL, BROWSER_ARCHIVE_SHA)]:
             archive, expanded = work / (name + '.zip'), work / name
-            download(url, archive, digest)
+            download(url, archive, digest, max_bytes=(384 if name == 'browser' else 128) * 1024**2)
             expanded.mkdir(mode=0o700)
             unpack(archive, expanded)
         node = work / 'node/node-v26.11.1-win-x64'
