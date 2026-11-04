@@ -178,6 +178,11 @@ jobs:
             import { packageConfiguration } from "./tools/package_desktop.mjs";
             await packageConfiguration(process.argv[1]);
           ' "$mount/Frameleaf.app/Contents/Resources/native-runtime"
+          install=$(mktemp -d "$RUNNER_TEMP/installed-desktop.XXXXXX")
+          ditto "$mount/Frameleaf.app" "$install/Frameleaf.app"
+          codesign --verify --deep --strict "$install/Frameleaf.app"
+          open -n -g -a "$install/Frameleaf.app"
+          xcrun swift tools/qualify_macos_app_launch.swift "$install/Frameleaf.app"
       - name: Exercise the production Keychain entitlements on a disposable macOS user
         if: runner.os == 'macOS'
         env:
