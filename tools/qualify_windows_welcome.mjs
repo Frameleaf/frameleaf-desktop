@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
@@ -43,10 +43,12 @@ async function welcomeInteraction() {
 try {
   let page;
   let observed = [];
+  let connected = false;
   for (let i = 0; i < 120 && !page; i++) {
     assert.equal(app.exitCode, null, 'Installed executable exited before Welcome');
     try {
       const targets = await (await fetch('http://127.0.0.1:' + port + '/json/list')).json();
+      connected = true;
       observed = targets.map(t => [t.type, t.url.split(/[?#]/)[0]]);
       page = targets.find(t => ['page', 'webview'].includes(t.type) && /^https?:\/\/tauri\.localhost(?:\/|$)/.test(t.url));
     } catch (error) {
@@ -54,7 +56,21 @@ try {
     }
     if (!page) await pause(500);
   }
-  assert.ok(page, 'Installed Frameleaf WebView2 target did not appear: ' + JSON.stringify(observed));
+  if (!page) {
+    // Startup and missing-DLL dialogs can keep the executable alive without creating a WebView.
+    spawnSync('powershell.exe', ['-NoProfile', '-Command', `
+      $app = Get-Process -Id ${app.pid}
+      $app | Select-Object ProcessName, SessionId, MainWindowTitle, Responding | Format-List
+      Get-CimInstance Win32_Process -Filter "ParentProcessId=${app.pid}" | Select-Object Name, ProcessId | Format-Table
+      Add-Type -AssemblyName UIAutomationClient
+      $window = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
+      if ($window) {
+        $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+          Select-Object -First 30 | ForEach-Object { $_.Current.Name }
+      }
+    `], { stdio: 'inherit', timeout: 15000 });
+    throw new Error('Installed WebView2 absent; debugger connected=' + connected + '; targets=' + JSON.stringify(observed));
+  }
   const socket = new WebSocket(page.webSocketDebuggerUrl);
   try {
     const response = await new Promise((resolve, reject) => {
