@@ -106,6 +106,7 @@ required values into that environment, never into pull-request jobs:
 | `APPLE_SIGNING_IDENTITY` | Full `Developer ID Application: …` identity |
 | `APPLE_ID` | Apple account used for notarization |
 | `APPLE_PASSWORD` | App-specific notarization password |
+| `APPLE_DEVELOPER_ID_PROVISION_PROFILE` | Base64 Developer ID provisioning profile for the desktop GUI’s private Keychain identity |
 | `APPLE_TEAM_ID` | Developer team ID |
 
 Apple App Store Distribution and Apple Development certificates do not replace
@@ -187,7 +188,10 @@ For an Apple Silicon installer artifact, run the factory and signed desktop
 workflows on `main` with `platforms=macos-aarch64`. Pass the successful factory
 run ID to the signed workflow and leave the tag empty. After signing, notarization
 and embedded runtime verification, the workflow submits the signed DMG to Apple,
-staples the accepted ticket, and checks Gatekeeper. The verified DMG is available in the workflow artifact
+retains the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`,
+staples the accepted ticket, and checks Gatekeeper. If Apple outlasts the
+runner, use the recorded request ID with `notarytool info` and staple the retained
+DMG after acceptance. The verified DMG is available in the workflow artifact
 `signed-installers-macos-aarch64`. Draft release staging requires a tag.
 
 After the workflow is merged, factory packs and credentials are available, and
