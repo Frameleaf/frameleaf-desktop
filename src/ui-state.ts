@@ -107,6 +107,14 @@ export function initials(name: unknown): string {
   const letters = parts.length >= 2 ? parts[0]![0]! + parts[1]![0]! : text.slice(0, 2);
   return letters.toUpperCase();
 }
+export function connectionTransport(server: string): string {
+  try {
+    const { protocol } = new URL(server);
+    if (protocol === 'https:') return 'Encrypted HTTPS';
+    if (protocol === 'http:') return 'Unencrypted HTTP';
+  } catch { /* Saved addresses may be invalid. */ }
+  return 'Unknown transport';
+}
 export function hostOf(url: unknown): string {
   if (typeof url !== 'string') return '';
   try { return new URL(url).host; } catch { return url.replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, ''); }
