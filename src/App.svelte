@@ -38,10 +38,13 @@
   const isAdmin = $derived(summary?.me?.isAdmin === true);
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
+  let session = 0; // bumped on every sign-in and sign-out
   async function loadSummary() {
     if (!native || !connection) { summary = null; return; }
-    try { summary = await invoke<ServerSummary>('server_summary'); }
-    catch { summary = null; }
+    // A reply that arrives after sign-out or a switch belongs to the old account: drop it.
+    const asked = session;
+    const result = await invoke<ServerSummary>('server_summary').catch(() => null);
+    if (session === asked) summary = result;
     void invoke('tray_refresh').catch(() => {});
   }
   onMount(() => {
@@ -68,7 +71,7 @@
     return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
   function connected(view: Connection) {
-    connection = view; setup = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false;
+    session += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
   }
@@ -76,7 +79,7 @@
     busy = true; failure = '';
     try {
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
-      connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
+      session += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
     } catch (error) { failure = explain(error); }
