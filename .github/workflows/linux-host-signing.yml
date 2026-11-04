@@ -1,0 +1,71 @@
+name: Sign verified Linux x64 host candidate
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Reviewed draft release asset ID, release ID, archive SHA-256 and manifest SHA-256 as JSON
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: linux-x64-host-signing
+  cancel-in-progress: false
+jobs:
+  sign:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    environment: desktop-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Verify draft asset and unpack without executing it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            keys == ["archiveSha256","assetId","manifestSha256","releaseId"] and
+            ([.assetId,.releaseId] | all(type=="number" and .>0 and .==floor)) and
+            ([.archiveSha256,.manifestSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
+          ' <<< "$APPROVAL" >/dev/null
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          asset=$(jq -r .assetId <<< "$APPROVAL")
+          digest=$(jq -r .archiveSha256 <<< "$APPROVAL")
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+            .draft == true and any(.assets[]; .id == $asset and .digest == $digest and .size > 0 and .size < 2147483648)
+          ' >/dev/null
+          archive="$RUNNER_TEMP/linux-host.tar.gz"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
+          candidate="$RUNNER_TEMP/linux-host"
+          mkdir -m 700 "$candidate"
+          PYTHONPATH=tools python -c 'from pathlib import Path; from build_host_ffmpeg import unpack; import sys; unpack(Path(sys.argv[1]),Path(sys.argv[2]),max_bytes=8*1024**3)' "$archive" "$candidate"
+          printf '%s  %s\n' "$(jq -r .manifestSha256 <<< "$APPROVAL")" "$candidate/manifest.json" | sha256sum --check --status
+          jq -e '.platform=="linux" and .architecture=="x86_64" and .epoch==23 and .sourceRevision=="c64039743af7bb0d68b602ff842683906019de52"' "$candidate/manifest.json" >/dev/null
+      - name: Seal and independently verify the host
+        env:
+          FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          : "${FACTORY_PRIVATE_KEY:?Missing host signing key}"
+          candidate="$RUNNER_TEMP/linux-host"
+          evidence="$RUNNER_TEMP/linux-host-evidence"
+          mkdir -m 700 "$evidence"
+          printf '%s\n' "$FACTORY_PRIVATE_KEY" | node tools/sign_host_runtime.mjs --candidate "$candidate" --private-key-stdin > "$evidence/signature.json"
+          node --input-type=module -e 'import {verifySignedHostCandidate} from "./tools/sign_host_runtime.mjs"; console.log(JSON.stringify(await verifySignedHostCandidate(process.argv[1])));' "$candidate" > "$evidence/verification.json"
+          diff <(jq -S . "$evidence/signature.json") <(jq -S . "$evidence/verification.json")
+          cp "$candidate/manifest.sig" "$evidence/"
+      - name: Retain only the detached signature and verification
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-linux-x64-host-signature
+          path: ${{ runner.temp }}/linux-host-evidence/
+          retention-days: 7
+          if-no-files-found: error
