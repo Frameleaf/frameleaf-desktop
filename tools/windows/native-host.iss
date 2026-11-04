@@ -2,7 +2,7 @@
 #define Manifest GetEnv("HOST_MANIFEST")
 #define Controller GetEnv("HOST_CONTROLLER")
 #define Digest GetEnv("HOST_CONTROLLER_SHA256")
-#define Candidate GetEnv("HOST_CANDIDATE")
+#define Archive GetEnv("HOST_ARCHIVE")
 #define RuntimeDir "{commonpf64}\Frameleaf\Runtimes\" + Manifest
 #define ControllerDir "{commonpf64}\Frameleaf\Controllers\" + Manifest + "\" + Digest
 
@@ -20,66 +20,70 @@ ArchitecturesInstallIn64BitMode=x64os
 SetupMutex=Global\FrameleafNativeHostSetup
 Uninstallable=no
 CloseApplications=no
-Compression=zip/fast
+Compression=none
+ArchiveExtraction=basic
+ExtraDiskSpaceRequired=4294967296
 OutputDir={#GetEnv("HOST_OUTPUT")}
 OutputBaseFilename=FrameleafNativeServer_0.1.0_x64-setup-unsigned
 SetupLogging=yes
 
 [Files]
-Source: "{#Controller}"; DestName: "installer-controller.exe"; Flags: dontcopy
-Source: "{#Controller}"; DestDir: "{#ControllerDir}"; Flags: ignoreversion; Check: FreshInstall
-Source: "{#Candidate}\manifest.json"; DestDir: "{#RuntimeDir}"; Flags: ignoreversion; Check: FreshInstall
-Source: "{#Candidate}\payload\*"; DestDir: "{#RuntimeDir}\payload"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: FreshInstall
-Source: "{#Candidate}\manifest.sig"; DestDir: "{#RuntimeDir}"; Flags: ignoreversion; Check: FreshInstall; AfterInstall: FinalizeFreshInstall
+Source: "{#Controller}"; Flags: dontcopy
+Source: "{#Archive}"; Flags: dontcopy
 
 [Code]
-var
-  ExistingVerified: Boolean;
-
-function FreshInstall: Boolean;
-begin
-  Result := not ExistingVerified;
-end;
-
 procedure RunChecked(const ProgramPath, Arguments: String);
 var
   ExitCode: Integer;
 begin
-  if not Exec(ProgramPath, Arguments, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+  if not Exec(ProgramPath, Arguments, ExpandConstant('{sys}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
     RaiseException(SysErrorMessage(ExitCode));
   if ExitCode <> 0 then
     RaiseException(Format('%s failed (exit %d). See the setup log.', [ExtractFileName(ProgramPath), ExitCode]));
 end;
 
-procedure ControllerCommand(const Mode: String);
+procedure InstallHost;
+var
+  RuntimeDir, ControllerDir, Controller, OwnerArgs: String;
+  MadeRuntime, MadeController: Boolean;
 begin
-  RunChecked(ExpandConstant('{tmp}\installer-controller.exe'),
-    Mode + ' {#Manifest} {#Digest}');
-end;
+  RuntimeDir := ExpandConstant('{#RuntimeDir}');
+  ControllerDir := ExpandConstant('{#ControllerDir}');
+  ExtractTemporaryFile('frameleaf-native-host.exe');
+  Controller := ExpandConstant('{tmp}\frameleaf-native-host.exe');
+  if CompareText(GetSHA256OfFile(Controller), '{#Digest}') <> 0 then
+    RaiseException('The installer controller failed verification.');
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  Result := '';
+  if FileExists(RuntimeDir + '\installation.json') then begin
+    RunChecked(Controller, '--finalize-windows-package {#Manifest} {#Digest}');
+    Exit;
+  end;
+  ExtractTemporaryFile('windows-host.7z');
+  RunChecked(Controller, '--prepare-windows-package {#Manifest} {#Digest}');
+  MadeRuntime := False;
+  MadeController := False;
   try
-    ExtractTemporaryFile('installer-controller.exe');
-    if CompareText(GetSHA256OfFile(ExpandConstant('{tmp}\installer-controller.exe')), '{#Digest}') <> 0 then
-      RaiseException('The installer controller failed verification.');
-    if FileExists(ExpandConstant('{#RuntimeDir}\installation.json')) then begin
-      ControllerCommand('--finalize-windows-package');
-      ExistingVerified := True;
-    end else
-      ControllerCommand('--prepare-windows-package');
+    MadeRuntime := CreateDir(RuntimeDir);
+    if not MadeRuntime then RaiseException('Cannot create the new runtime directory.');
+    MadeController := CreateDir(ControllerDir);
+    if not MadeController then RaiseException('Cannot create the new controller directory.');
+    if not CopyFile(Controller, ControllerDir + '\frameleaf-native-host.exe', True) then
+      RaiseException('Cannot install the server controller.');
+    WizardForm.StatusLabel.Caption := 'Installing verified server resources...';
+    ExtractArchive(ExpandConstant('{tmp}\windows-host.7z'), RuntimeDir, '', True, nil);
+    OwnerArgs := '" /setowner *S-1-5-32-544 /T /Q';
+    RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + RuntimeDir + OwnerArgs);
+    RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + ControllerDir + OwnerArgs);
+    WizardForm.StatusLabel.Caption := 'Verifying the installed server...';
+    RunChecked(Controller, '--finalize-windows-package {#Manifest} {#Digest}');
   except
-    Result := GetExceptionMessage;
+    if MadeRuntime then DelTree(RuntimeDir, True, True, True);
+    if MadeController then DelTree(ControllerDir, True, True, True);
+    RaiseException(GetExceptionMessage);
   end;
 end;
 
-procedure FinalizeFreshInstall;
-var
-  OwnerArgs: String;
+procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  OwnerArgs := '" /setowner *S-1-5-32-544 /T /Q';
-  RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + ExpandConstant('{#RuntimeDir}') + OwnerArgs);
-  RunChecked(ExpandConstant('{sys}\icacls.exe'), '"\\?\' + ExpandConstant('{#ControllerDir}') + OwnerArgs);
-  ControllerCommand('--finalize-windows-package');
+  if CurStep = ssInstall then InstallHost;
 end;

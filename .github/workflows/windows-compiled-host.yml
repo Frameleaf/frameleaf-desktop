@@ -86,7 +86,12 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
           $env:HOST_MANIFEST = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
           if ($env:HOST_MANIFEST -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid manifest identity' }
-          $env:HOST_CANDIDATE = Join-Path $root 'candidate'
+          $env:HOST_ARCHIVE = Join-Path $root 'windows-host.7z'
+          Push-Location (Join-Path $root 'candidate')
+          try {
+            & "${env:ProgramFiles}/7-Zip/7z.exe" a -t7z -mx=1 -mmt=2 $env:HOST_ARCHIVE manifest.json manifest.sig payload
+            if ($LASTEXITCODE) { throw 'Verified payload archive creation failed' }
+          } finally { Pop-Location }
           $env:HOST_OUTPUT = Join-Path $root 'installer'
           & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /Q tools/windows/native-host.iss
           if ($LASTEXITCODE) { throw 'Installer build failed' }
