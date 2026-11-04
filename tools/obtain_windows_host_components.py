@@ -24,13 +24,14 @@ from obtain_host_component import obtain as obtain_component, validate_approval
 from verify_reused_host_sources import verify as verify_reused
 
 SOURCE_REVISION = 'c64039743af7bb0d68b602ff842683906019de52'
+MANAGER_REVISION = '6fa662533ec547ce0dd6e15e2d711cdf8d6c10df'
 # Canonical Git archives independently verified for this immutable application snapshot.
 SOURCE_ARCHIVES = {
     'web': 'a2cace3f8eddb83ec5f5c4a90f00916e8fdeed92a0d5a510fabf31cb2f86c99a',
     'plugin': '41aad26098c4db5807e37518a0e4868bc657cc02c778e59c08383a0381b5c6a2',
     'studio': '4d6cb68c2eac8f59cf335111c260b44a43f1c93b49dd9ae39f49491ee02451b0',
     'server': '1a542a8ceedb577eef058d9dca39f5558b1927d8d8ead6c9c36d9a6b1ce89a42',
-    'manager': '036fd3fd298e14af9edd8513f9281c829479fdd95a6380869419823b6bb118a3',
+    'manager': 'e1a26fdcc859aabadbedcc3b60b447873ff9da060fff9dde333edc250c182dff',
 }
 BUILD_NODE_SHA = 'dccc52de28d8df2ee22d2062424f8c563070d95d8ad70c54c4bf01d590dec14f'
 WORKFLOWS = {role: '.github/workflows/' + name + '.yml' for role, name in {
@@ -90,7 +91,7 @@ def check_source(role: str, receipt: dict, blobs: dict[str, bytes]) -> None:
     """Keep original builder identities and the pinned current application inputs explicit."""
     lock = 'manager/package-lock.json' if role == 'manager' else 'pnpm-lock.yaml'
     if (receipt.get('qualification') != 'passed'
-            or receipt.get('sourceRevision') != SOURCE_REVISION
+            or receipt.get('sourceRevision') != (MANAGER_REVISION if role == 'manager' else SOURCE_REVISION)
             or receipt.get('sourceArchiveSha256') != SOURCE_ARCHIVES[role]
             or receipt.get('nodeSha256') != (BUILD_NODE_SHA if role in {'web', 'studio'} else NODE_EXE_SHA)
             or receipt.get('redistributable') is not False
@@ -163,7 +164,7 @@ def obtain(source: Path, approvals: dict, output: Path) -> None:
             if role in SOURCE_ARCHIVES:
                 current = read_receipt(root / 'server-qualification.json') if role == 'server' else receipts[role]
                 check_source(role, current, blobs)
-                if receipts[role]['sourceRevision'] != SOURCE_REVISION:
+                if role == 'server' and receipts[role]['sourceRevision'] != SOURCE_REVISION:
                     raise BuildError('host_windows_component_source_mismatch:' + role)
         reused = verify_reused(source, SOURCE_REVISION, {role: receipts[role] for role in ['database', 'raw', 'media', 'hdr']})
         # This existing binder checks the original/adapted module pins and component-bound metadata proof.
