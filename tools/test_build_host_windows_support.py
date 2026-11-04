@@ -29,8 +29,8 @@ class WindowsSupportTests(unittest.TestCase):
             return stream.getvalue()
         node_files = {'node-v26.11.1-win-x64/node.exe': b'private node fixture',
                       'node-v26.11.1-win-x64/LICENSE': b'node licence fixture'}
-        browser_files = {'chrome-win/chrome.exe': b'browser fixture',
-                         'chrome-win/locales/en-US.pak': b'locale fixture'}
+        browser_files = {'ungoogled-chromium_156.0.8078.79-1.1_windows_x64/chrome.exe': b'browser fixture',
+                         'ungoogled-chromium_156.0.8078.79-1.1_windows_x64/locales/en-US.pak': b'locale fixture'}
         if damage == 'node-missing':
             del node_files['node-v26.11.1-win-x64/node.exe']
         if damage == 'node-digest':
