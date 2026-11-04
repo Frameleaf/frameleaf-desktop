@@ -27,10 +27,17 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
 }
 
 /// A host on this computer or the local network, where servers answer over plain HTTP: loopback,
-/// private and link-local addresses, single-label names and the local-only DNS suffixes.
+/// private and link-local addresses, single-label names and the local-only DNS suffixes. Tailscale
+/// counts as local: its 100.64.0.0/10 addresses, its fd7a:115c:a1e0::/48 ULAs and `*.ts.net` names.
 pub fn is_local_network(host: url::Host<&str>) -> bool {
     match host {
-        url::Host::Ipv4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        url::Host::Ipv4(ip) => {
+            let [a, b, ..] = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || (a == 100 && (b & 0xc0) == 64)
+        }
         url::Host::Ipv6(ip) => {
             let first = ip.segments()[0];
             ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
@@ -39,9 +46,16 @@ pub fn is_local_network(host: url::Host<&str>) -> bool {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
             !name.is_empty()
                 && (!name.contains('.')
-                    || [".local", ".lan", ".home.arpa", ".internal", ".localdomain"]
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix)))
+                    || [
+                        ".local",
+                        ".lan",
+                        ".home.arpa",
+                        ".internal",
+                        ".localdomain",
+                        ".ts.net",
+                    ]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix)))
         }
     }
 }
@@ -267,13 +281,19 @@ mod local_http_tests {
             "http://tower.local:2283",
             "http://nas.home.arpa",
             "http://nas.lan",
+            "http://100.64.0.1:2283",
+            "http://100.127.255.254",
+            "http://[fd7a:115c:a1e0::1]",
+            "http://nas.tail1234.ts.net",
         ] {
             assert!(normalize_server(local).is_ok(), "{local}");
         }
         for remote in [
             "http://photos.example.com",
             "http://8.8.8.8",
-            "http://100.64.0.1",
+            "http://100.63.255.255",
+            "http://100.128.0.1",
+            "http://ts.net.example.com",
             "http://[2001:db8::1]",
             "http://192.168.1.20/photos",
         ] {

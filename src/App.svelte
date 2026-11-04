@@ -32,6 +32,9 @@
   let notice = $state('');
   let accountMenu = $state(false);
   let signOutSheet = $state(false);
+  // A sign-in left in the credential store with no connection shown (restore failed, or sign-out could not delete it):
+  // native connect refuses until it is cleared, so the clear action stays reachable.
+  let staleSignIn = $state(false);
   const isAdmin = $derived(summary?.me?.isAdmin === true);
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
@@ -56,7 +59,7 @@
         if (disposed) { unlisten.forEach(stop => stop()); return; }
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
         hostActive = host.backgroundActive;
-        connection = await invoke<Connection | null>('restore_connection');
+        connection = await invoke<Connection | null>('restore_connection').catch(error => { staleSignIn = true; throw error; });
         setup = await invoke<SetupStatus>('worker_setup_status');
         await loadSummary();
       } catch (error) { failure = explain(error); }
@@ -65,7 +68,7 @@
     return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
   function connected(view: Connection) {
-    connection = view; setup = null; failure = ''; notice = ''; page = 'overview';
+    connection = view; setup = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
   }
@@ -73,7 +76,7 @@
     busy = true; failure = '';
     try {
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
-      connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview';
+      connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
     } catch (error) { failure = explain(error); }
@@ -129,8 +132,9 @@
   {/if}
   <main class="content">
     {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
-    {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p><button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
+    {#if staleSignIn && !connection && !failure && !notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>A saved sign-in is still on this computer. Clear it before connecting to a server.</p><button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button></div>{/if}
     {#if !connection}
       <Welcome {native} {hostActive} {cloudAccount} onconnected={connected} oncloudaccount={account => { cloudAccount = account; }} onhostactive={active => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} {managerRevision} onmanagerstate={paired => { managerPaired = paired; }} />
     {:else if page === 'overview' || page === 'ai'}
@@ -150,8 +154,8 @@
     {/if}
   </main>
 </div>
-{#if signOutSheet && connection}
-  <Sheet title="Sign out of “{hostOf(connection.server)}”?" kind="warning" {busy} onclose={() => { signOutSheet = false; }} onsubmit={signOut}>
+{#if signOutSheet}
+  <Sheet title={connection ? `Sign out of “${hostOf(connection.server)}”?` : 'Clear the saved sign-in?'} kind="warning" {busy} onclose={() => { signOutSheet = false; }} onsubmit={signOut}>
     <p>This computer’s session and device key are removed from the secure credential store, and the server is asked to revoke them. Photo folder permissions and AI processing on this computer stop.</p>
     {#snippet actions()}
       <button class="btn" type="button" disabled={busy} onclick={() => { signOutSheet = false; }}>Cancel</button>
