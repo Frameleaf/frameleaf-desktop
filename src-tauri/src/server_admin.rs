@@ -7,7 +7,6 @@ use crate::{transport, DesktopState};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::sync::Mutex;
 use tauri::{State, WebviewWindow};
 use url::Url;
 
@@ -56,11 +55,6 @@ pub(crate) struct RemoteStatus {
     pub remote: Value,
     pub usage: Option<Value>,
 }
-
-/// Hosts the last cloud status named (the account site and the sign-in issuer), which the browser
-/// may be sent to beside the server and the Frameleaf domains.
-#[derive(Default)]
-pub(crate) struct ExternalHosts(pub(crate) Mutex<Vec<String>>);
 
 struct Session {
     client: Client,
@@ -178,31 +172,10 @@ pub(crate) async fn server_summary(
     })
 }
 
-/// Every https host a cloud status names, lowercase: `manageUrl` and `signInIssuer` today.
-pub(crate) fn cloud_hosts(status: &Value) -> Vec<String> {
-    let mut hosts = Vec::new();
-    for key in ["manageUrl", "signInIssuer"] {
-        if let Some(url) = status.get(key).and_then(Value::as_str) {
-            if let Ok(url) = Url::parse(url) {
-                if url.scheme() == "https" {
-                    if let Some(host) = url.host_str() {
-                        let host = host.to_ascii_lowercase();
-                        if !hosts.contains(&host) {
-                            hosts.push(host);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    hosts
-}
-
 #[tauri::command]
 pub(crate) async fn cloud_status(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-    hosts: State<'_, ExternalHosts>,
 ) -> Result<CloudStatus, String> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
@@ -212,10 +185,8 @@ pub(crate) async fn cloud_status(
         session.get("api/admin/license"),
         session.get("api/admin/cloud/backup"),
     );
-    let cloud = cloud?;
-    *hosts.0.lock().map_err(|_| "state_unavailable")? = cloud_hosts(&cloud);
     Ok(CloudStatus {
-        cloud,
+        cloud: cloud?,
         license: license.ok(),
         backup: backup.ok(),
     })
@@ -380,13 +351,9 @@ pub(crate) async fn test_remote_access(
         .await
 }
 
-/// Only https, and only the signed-in server, a host the last cloud status named, or Frameleaf's
-/// own domains: the browser never opens an address a server reply could choose freely.
-pub(crate) fn external_url_allowed(
-    url: &Url,
-    server_host: Option<&str>,
-    cloud_hosts: &[String],
-) -> bool {
+/// Only https, and only the signed-in server or Frameleaf's own domains: the browser never opens an
+/// address a server reply could choose freely.
+pub(crate) fn external_url_allowed(url: &Url, server_host: Option<&str>) -> bool {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return false;
     }
@@ -395,12 +362,6 @@ pub(crate) fn external_url_allowed(
     };
     let host = host.to_ascii_lowercase();
     if server_host.is_some_and(|server| server.eq_ignore_ascii_case(&host)) {
-        return true;
-    }
-    if cloud_hosts
-        .iter()
-        .any(|cloud| cloud.eq_ignore_ascii_case(&host))
-    {
         return true;
     }
     host == "frameleaf.cloud"
@@ -414,7 +375,6 @@ pub(crate) async fn open_external(
     window: WebviewWindow,
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
-    hosts: State<'_, ExternalHosts>,
     url: String,
 ) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -430,8 +390,7 @@ pub(crate) async fn open_external(
             .and_then(|saved| normalize_server(&saved.server).ok())
             .and_then(|base| base.host_str().map(str::to_owned))
     };
-    let cloud = hosts.0.lock().map_err(|_| "state_unavailable")?.clone();
-    if !external_url_allowed(&parsed, server_host.as_deref(), &cloud) {
+    if !external_url_allowed(&parsed, server_host.as_deref()) {
         return Err("external_url_not_allowed".into());
     }
     app.opener()
@@ -445,14 +404,12 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn external_urls_are_limited_to_the_server_the_cloud_and_frameleaf_domains() {
-        let cloud = vec!["frameleaf.example".to_string()];
-        let allowed = |url: &str| {
-            external_url_allowed(&Url::parse(url).unwrap(), Some("nas.home.arpa"), &cloud)
-        };
+    fn external_urls_are_limited_to_the_server_and_frameleaf_domains() {
+        let allowed =
+            |url: &str| external_url_allowed(&Url::parse(url).unwrap(), Some("nas.home.arpa"));
         assert!(allowed("https://nas.home.arpa/admin"));
         assert!(allowed("https://NAS.home.arpa/"));
-        assert!(allowed("https://frameleaf.example/servers/1"));
+        assert!(!allowed("https://frameleaf.example/servers/1"));
         assert!(allowed("https://frameleaf.cloud/store"));
         assert!(allowed("https://id.frameleaf.cloud/session/end"));
         assert!(allowed("https://frameleaf.net/"));
@@ -466,24 +423,8 @@ mod tests {
         assert!(!allowed("file:///etc/passwd"));
         assert!(!external_url_allowed(
             &Url::parse("https://nas.home.arpa/").unwrap(),
-            None,
-            &[]
+            None
         ));
-    }
-
-    #[test]
-    fn cloud_status_hosts_come_from_its_https_links_only() {
-        let hosts = cloud_hosts(&json!({
-            "manageUrl": "https://Frameleaf.Example/servers/abc",
-            "signInIssuer": "https://id.frameleaf.example",
-            "other": "https://ignored.example"
-        }));
-        assert_eq!(hosts, ["frameleaf.example", "id.frameleaf.example"]);
-        assert!(
-            cloud_hosts(&json!({"manageUrl": "http://plain.example", "signInIssuer": null}))
-                .is_empty()
-        );
-        assert!(cloud_hosts(&json!(null)).is_empty());
     }
 
     #[test]

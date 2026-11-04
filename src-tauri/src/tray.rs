@@ -58,7 +58,7 @@ pub(crate) fn labels(status: &SetupStatus, connected: bool) -> Labels {
         };
         format!("AI processing: {word}")
     };
-    let paused = status.control == WorkerControl::Paused;
+    let paused = status.control != WorkerControl::Running;
     Labels {
         worker: state,
         toggle: if paused {
@@ -156,8 +156,12 @@ fn on_menu(app: &AppHandle, id: &str) {
             tauri::async_runtime::spawn(async move {
                 let state = app.state::<crate::DesktopState>();
                 let current = state.0.lock().await;
-                if let Some(saved) = current.as_ref() {
-                    let _ = crate::open_photos_window(&app, saved);
+                if let Some(Err(code)) = current
+                    .as_ref()
+                    .map(|saved| crate::open_photos_window(&app, saved))
+                {
+                    let _ = app.emit_to("main", "tray-action-failed", code);
+                    show_main(&app);
                 }
             });
         }
@@ -169,7 +173,7 @@ fn on_menu(app: &AppHandle, id: &str) {
                 .state::<crate::worker_setup::WorkerSetup>()
                 .status()
                 .control
-                == WorkerControl::Paused
+                != WorkerControl::Running
             {
                 WorkerControl::Running
             } else {
@@ -181,7 +185,8 @@ fn on_menu(app: &AppHandle, id: &str) {
                         let _ = app.emit_to("main", "worker-setup", status);
                     }
                     Err(code) => {
-                        let _ = app.emit_to("main", "worker-control-failed", code);
+                        let _ = app.emit_to("main", "tray-action-failed", code);
+                        show_main(&app);
                     }
                 }
                 refresh(&app).await;
@@ -291,6 +296,7 @@ mod tests {
 
         let stopped = labels(&status("stopped", WorkerControl::Stopped, None), true);
         assert_eq!(stopped.worker, "AI processing: stopped");
+        assert_eq!(stopped.toggle, "Resume AI processing");
         assert!(stopped.can_toggle && !stopped.can_stop);
 
         let failed = labels(

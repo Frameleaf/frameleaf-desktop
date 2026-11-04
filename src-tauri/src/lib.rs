@@ -429,7 +429,6 @@ pub fn run() {
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
-        .manage(server_admin::ExternalHosts::default())
         .manage(tray::TrayState::default())
         .setup(|app| {
             // A desktop without a tray (some Linux sessions) still gets the window.

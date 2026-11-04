@@ -44,12 +44,16 @@
   onMount(() => {
     if (!native) return;
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
+    const unlisten: UnlistenFn[] = [];
     void (async () => {
       busy = true;
       try {
-        unlisten = await listen<SetupStatus>('worker-setup', event => { setup = event.payload; });
-        if (disposed) { unlisten(); return; }
+        unlisten.push(await listen<SetupStatus>('worker-setup', event => { setup = event.payload; }));
+        unlisten.push(await listen<string>('tray-action-failed', event => {
+          failure = explain(event.payload);
+          void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
+        }));
+        if (disposed) { unlisten.forEach(stop => stop()); return; }
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
         hostActive = host.backgroundActive;
         connection = await invoke<Connection | null>('restore_connection');
@@ -58,7 +62,7 @@
       } catch (error) { failure = explain(error); }
       finally { busy = false; }
     })();
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
   function connected(view: Connection) {
     connection = view; setup = null; failure = ''; notice = ''; page = 'overview';

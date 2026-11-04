@@ -15,7 +15,7 @@
     onconnected: (connection: Connection) => void; oncloudaccount: (account: CloudAccount | null) => void;
     onhostactive: (active: boolean) => void; onmanagerchange: () => void; onmanagerstate: (paired: boolean) => void;
   } = $props();
-  const CLOUD_URL = 'https://frameleaf.cloud';
+  const CLOUD_URL = 'https://api.frameleaf.cloud';
   const platform = platformFromUserAgent(navigator.userAgent);
   const computer = computerWord(platform);
   const version = (import.meta.env?.VITE_APP_VERSION as string | undefined) || '0.1.0';
@@ -55,7 +55,7 @@
     loadingServers = true; failure = '';
     const [cloud, lan] = await Promise.allSettled([invoke<CloudServer[]>('cloud_servers'), invoke<DiscoveredServer[]>('discover_servers')]);
     if (cloud.status === 'fulfilled') cloudServers = cloud.value ?? [];
-    else { failure = explain(cloud.reason); if (String(cloud.reason) === 'cloud_account_signed_out') { oncloudaccount(null); } }
+    else { failure = explain(cloud.reason); if (String(cloud.reason) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     nearby = lan.status === 'fulfilled' ? lan.value ?? [] : [];
     loadingServers = false;
   }
@@ -89,12 +89,15 @@
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
     try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName })); }
-    catch (error) { failure = explain(error); }
+    catch (error) { failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {
-    server = entry.nearby?.url ?? entry.cloud?.connections?.[0]?.uri ?? '';
-    addressMode = true; failure = ''; notice = entry.action === 'setup' ? `“${entry.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.` : '';
+    const nearby = entry.nearby?.url.startsWith('https://') ? entry.nearby.url : undefined;
+    server = nearby ?? entry.cloud?.connections?.[0]?.uri ?? '';
+    addressMode = true; failure = '';
+    notice = entry.action === 'setup' ? `“${entry.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.`
+      : !server && entry.nearby ? plainHttp(entry.nearby) : '';
   }
   async function findServer() {
     if (!native || discovering) return;
@@ -102,12 +105,18 @@
     try {
       found = await invoke<DiscoveredServer[]>('discover_servers');
       if (found.length === 0) notice = 'No Frameleaf server answered on this network. Enter its address instead.';
-      else if (found.length === 1) { server = found[0]!.url; notice = `Found “${found[0]!.name}” at ${found[0]!.url}.`; }
+      else if (found.length === 1) useFound(found[0]!, 'Found');
       else picker = true;
     } catch (error) { failure = explain(error); }
     finally { discovering = false; }
   }
-  function pick(entry: DiscoveredServer) { server = entry.url; picker = false; notice = `Using “${entry.name}” at ${entry.url}.`; }
+  // Sign-in only accepts HTTPS; a server discovered on plain HTTP is named, not put in the address field.
+  const plainHttp = (entry: DiscoveredServer) => `“${entry.name}” answers only over plain HTTP at ${entry.url}. Set up HTTPS for it, then enter its https:// address.`;
+  function useFound(entry: DiscoveredServer, verb: string) {
+    if (entry.url.startsWith('https://')) { server = entry.url; notice = `${verb} “${entry.name}” at ${entry.url}.`; }
+    else { server = ''; notice = plainHttp(entry); }
+  }
+  function pick(entry: DiscoveredServer) { picker = false; useFound(entry, 'Using'); }
 </script>
 
 {#if managerOnly}

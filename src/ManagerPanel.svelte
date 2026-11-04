@@ -79,7 +79,6 @@
   });
   $effect(() => { onstate?.(!!manager); });
   $effect(() => {
-    if (authorizedUntil === null) return;
     const timer = setInterval(() => { now = Date.now(); if (authorizedUntil !== null && authorizedUntil <= now) authorizedUntil = null; }, 1000);
     return () => clearInterval(timer);
   });

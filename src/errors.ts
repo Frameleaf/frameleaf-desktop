@@ -20,7 +20,7 @@ const messages: Record<string, string> = {
   cloud_sign_in_timeout: 'Frameleaf Cloud sign-in timed out. Try again.',
   cloud_sign_in_failed: 'Frameleaf Cloud did not complete the sign-in. Try again.',
   cloud_account_unavailable: 'Frameleaf Cloud could not be reached. Check your connection and try again.',
-  cloud_account_signed_out: 'Your Frameleaf Cloud session ended. Sign in again.',
+  cloud_sign_in_required: 'Your Frameleaf Cloud session ended. Sign in again.',
   cloud_exchange_unsupported: 'This server does not accept Frameleaf Cloud sign-in yet. Sign in with its address, email and password.',
   cloud_server_unreachable: 'None of this server’s addresses answered. Check that it is online, or try again on its home network.',
   cloud_server_offline: 'This server is offline. Try again when it is back.',

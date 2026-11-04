@@ -36,7 +36,7 @@ test('bytes use decimal units like the server storage report', () => {
 });
 
 test('relative and absolute times read naturally and never throw on bad input', () => {
-  const now = Date.UTC(2026, 10, 3, 10, 44);
+  const now = new Date(2026, 10, 3, 10, 44).getTime();
   assert.equal(relativeTime(now - 10_000, now), 'just now');
   assert.equal(relativeTime(now - 2 * 60_000, now), '2 minutes ago');
   assert.equal(relativeTime(new Date(now - 3 * 86_400_000).toISOString(), now), '3 days ago');
@@ -45,7 +45,7 @@ test('relative and absolute times read naturally and never throw on bad input', 
   assert.equal(relativeTime('not a date', now), 'never');
   assert.match(formatWhen(now - 60_000, now), /^Today, /);
   assert.match(formatWhen(now - 86_400_000, now), /^Yesterday, /);
-  assert.match(formatWhen(Date.UTC(2026, 10, 1, 2, 0), now), /^Nov 1, /);
+  assert.match(formatWhen(new Date(2026, 10, 1, 2, 0).getTime(), now), /^Nov 1, /);
   assert.equal(formatWhen(undefined, now), '—');
   assert.equal(countdown(now + 272_000, now), '4:32');
   assert.equal(countdown(now - 1, now), '0:00');

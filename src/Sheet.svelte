@@ -9,19 +9,35 @@
   } = $props();
   const id = `sheet-${Math.random().toString(36).slice(2, 8)}`;
   let panel = $state<HTMLElement | null>(null);
+  const tabbable = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
   $effect(() => {
     if (!open || !panel) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const focusable = panel.querySelector<HTMLElement>('input:not([type="checkbox"]), select, textarea, button.primary, button.danger, button');
     focusable?.focus();
+    return () => { if (opener?.isConnected) opener.focus(); };
   });
+  // On the window, so Escape and Tab still work when focus has dropped to the body (a control went disabled).
   function keydown(event: KeyboardEvent) {
-    if (event.key === 'Escape' && !busy) { event.preventDefault(); onclose?.(); }
+    if (!open || !panel) return;
+    if (event.key === 'Escape' && !busy) { event.preventDefault(); onclose?.(); return; }
+    if (event.key !== 'Tab') return;
+    const items = [...panel.querySelectorAll<HTMLElement>(tabbable)];
+    if (items.length === 0) { event.preventDefault(); return; }
+    const first = items[0]!, last = items[items.length - 1]!;
+    const inside = panel.contains(document.activeElement);
+    if (!inside || (event.shiftKey ? document.activeElement === first : document.activeElement === last)) {
+      event.preventDefault();
+      (event.shiftKey && inside ? last : first).focus();
+    }
   }
   function submit(event: SubmitEvent) { event.preventDefault(); if (!busy) onsubmit?.(); }
 </script>
 
+<svelte:window onkeydown={keydown} />
+
 {#if open}
-  <div class="sheet-backdrop" role="presentation" onkeydown={keydown} onpointerdown={event => { if (event.target === event.currentTarget && !busy) onclose?.(); }}>
+  <div class="sheet-backdrop" role="presentation" onpointerdown={event => { if (event.target === event.currentTarget && !busy) onclose?.(); }}>
     <div class="sheet" class:wide role="dialog" aria-modal="true" aria-labelledby={labelledby ?? id} aria-busy={busy} bind:this={panel}>
     <form class="sheet-form" onsubmit={submit}>
       {#if kind !== 'plain'}
