@@ -133,8 +133,8 @@ test('platform classes and worker pills are derived from strings only', () => {
 });
 
 test('connection transport reflects the server URL', () => {
-  assert.equal(connectionTransport('http://127.0.0.1:2283'), 'Unencrypted HTTP');
-  assert.equal(connectionTransport('https://photos.example.com'), 'Encrypted HTTPS');
-  assert.equal(connectionTransport(''), 'Unknown transport');
-  assert.equal(connectionTransport('ftp://photos.example.com'), 'Unknown transport');
+  assert.equal(connectionTransport('http://127.0.0.1:2283'), 'Unencrypted connection');
+  assert.equal(connectionTransport('https://photos.example.com'), 'Encrypted connection');
+  assert.equal(connectionTransport(''), 'Connection type unknown');
+  assert.equal(connectionTransport('ftp://photos.example.com'), 'Connection type unknown');
 });

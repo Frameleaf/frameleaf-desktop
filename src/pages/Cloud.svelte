@@ -62,17 +62,17 @@
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s Frameleaf Cloud account and plan.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
-    {#if cloud?.lastError}<div class="inline-msg" role="status"><p>{cloud.lastError}</p></div>{/if}
+    {#if cloud?.lastError}<div class="inline-msg" role="status"><p>There was a problem checking this server’s Cloud connection. Try refreshing.</p></div>{/if}
     <div>
       <div class="group-head"><h2 class="group-title">Account</h2></div>
       <div class="group">
         <div class="row">
           <span class="ic" aria-hidden="true"><Icon name="cloud" /></span>
-          <span class="l"><b>{cloud?.account?.label || (cloud?.state === 'linked' ? 'Linked Frameleaf account' : 'No Frameleaf account linked')}</b><small>{[cloud?.state === 'linked' ? 'Owner' : null, regionName ? `Data region ${regionName}` : null, cloud?.cloudHost ? cloud.cloudHost : null].filter(Boolean).join(' · ') || 'Link this server from Settings › Frameleaf Cloud inside Photos.'}</small></span>
+          <span class="l"><b>{cloud?.account?.label || (cloud?.state === 'linked' ? 'Linked Frameleaf account' : 'No Frameleaf account linked')}</b><small>{[cloud?.state === 'linked' ? 'Owner' : null, regionName ? `Data region ${regionName}` : null].filter(Boolean).join(' · ') || 'Link this server from Settings › Frameleaf Cloud inside Photos.'}</small></span>
           <button class="btn" disabled={!cloud?.manageUrl || !native} onclick={() => open(cloud?.manageUrl)}>Account Settings…</button>
         </div>
         <div class="row">
-          <span class="l"><b>{cloud?.state === 'linked' ? 'This server is linked to this account' : cloud?.state === 'pending' ? 'Waiting for the link to be approved' : cloud?.state === 'revoked' ? 'Frameleaf Cloud ended this link' : 'This server is not linked'}</b><small>{cloud?.instanceId ? `Instance ` : ''}{#if cloud?.instanceId}<span class="mono">{cloud.instanceId}</span>{/if}{cloud?.linkedAt ? ` · linked ${formatDate(cloud.linkedAt)}` : ''}{cloud?.lastContactAt ? ` · last contact ${relativeTime(cloud.lastContactAt)}` : ''}{cloud?.revoked ? ` · ${cloud.revoked.reason}` : ''}{cloud?.heartbeatFailures ? ` · ${cloud.heartbeatFailures} check-ins failed in a row` : ''}</small></span>
+          <span class="l"><b>{cloud?.state === 'linked' ? 'This server is linked to this account' : cloud?.state === 'pending' ? 'Waiting for the link to be approved' : cloud?.state === 'revoked' ? 'Frameleaf Cloud ended this link' : 'This server is not linked'}</b><small>{[cloud?.linkedAt ? `Linked ${formatDate(cloud.linkedAt)}` : null, cloud?.lastContactAt ? `Last connected ${relativeTime(cloud.lastContactAt)}` : null].filter(Boolean).join(' · ')}</small></span>
           {#if cloud?.state === 'linked'}<span class="pill {cloud.heartbeatFailures ? 'wait' : 'ok'}"><i aria-hidden="true"></i>{cloud.heartbeatFailures ? 'Check-in failing' : 'Healthy'}</span>{/if}
         </div>
         {#if cloud?.permissions}

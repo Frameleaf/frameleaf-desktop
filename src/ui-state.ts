@@ -110,10 +110,10 @@ export function initials(name: unknown): string {
 export function connectionTransport(server: string): string {
   try {
     const { protocol } = new URL(server);
-    if (protocol === 'https:') return 'Encrypted HTTPS';
-    if (protocol === 'http:') return 'Unencrypted HTTP';
+    if (protocol === 'https:') return 'Encrypted connection';
+    if (protocol === 'http:') return 'Unencrypted connection';
   } catch { /* Saved addresses may be invalid. */ }
-  return 'Unknown transport';
+  return 'Connection type unknown';
 }
 export function hostOf(url: unknown): string {
   if (typeof url !== 'string') return '';

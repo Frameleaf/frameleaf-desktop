@@ -15,7 +15,6 @@
     onconnected: (connection: Connection) => void; oncloudaccount: (account: CloudAccount | null) => void;
     onhostactive: (active: boolean) => void; onmanagerchange: () => void; onmanagerstate: (paired: boolean) => void;
   } = $props();
-  const CLOUD_URL = 'https://api.frameleaf.cloud';
   const platform = platformFromUserAgent(navigator.userAgent);
   const computer = computerWord(platform);
   const version = (import.meta.env?.VITE_APP_VERSION as string | undefined) || '0.1.0';
@@ -63,7 +62,7 @@
     if (!native || cloudBusy) return;
     cloudBusy = true; failure = ''; notice = 'Finish signing in to Frameleaf Cloud in your browser…';
     try {
-      const account = await invoke<CloudAccount>('cloud_sign_in', { cloudUrl: CLOUD_URL });
+      const account = await invoke<CloudAccount>('cloud_sign_in');
       oncloudaccount(account); addressMode = false; notice = '';
       await loadServers();
     } catch (error) { notice = ''; failure = explain(error); }
@@ -163,7 +162,7 @@
         {/each}
       </div>
       <div class="wfoot wide">
-        <p>Servers come from your Frameleaf Cloud account and from Bonjour on this network. Connecting picks the fastest path automatically: home network, then direct, then relay.</p>
+        <p>Choose a server from your account or your local network.</p>
         <button class="btn quiet" type="button" disabled={loadingServers} onclick={loadServers}>Refresh</button>
         <button class="btn quiet" type="button" onclick={() => { addressMode = true; }}>Enter an address…</button>
         <button class="btn" type="button" disabled={busy} onclick={() => { mode = 'local-server'; }}>Run Frameleaf on this {computer}</button>
@@ -184,10 +183,10 @@
   </div>
   <footer class="bar">
     {#if showServers}
-      No Frameleaf Cloud account? You can still sign in to a server by address.
+      Can’t find your server? Enter its address to connect.
     {:else}
       <Icon name="lock" />
-      Session and device key stay in {platform === 'mac' ? 'the macOS Keychain' : platform === 'windows' ? 'Windows Credential Manager' : 'your secure credential store'}.
+      Your sign-in is saved securely on this {computer}.
     {/if}
     <span class="sp"></span>
     {#if mode === 'client-worker' && !cloudAccount}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignIn}><Icon name="cloud" />{cloudBusy ? 'Waiting for your browser…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
