@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(host.manifest_sha256(), expected);
         assert_eq!(
             host.source_revision(),
-            "9118a01fdfb8a8cd20be24290660679b3a7c4de3"
+            "c64039743af7bb0d68b602ff842683906019de52"
         );
         assert!(!host.certified());
         let manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();

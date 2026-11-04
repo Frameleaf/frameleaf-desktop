@@ -624,7 +624,7 @@ binds a qualified Windows x64 server to its complete `exiftool-vendored.exe`
 13.59.3 package, including its executable and Perl tree. It verifies the input inventory, pinned vendor module,
 versions and required runtime/license files before removing global fallback.
 `Windows server candidate` runs on relevant packaging pull requests or manual
-dispatch from `main`, using application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780,
+dispatch from `main`, using application source candidate `c64039743af7bb0d68b602ff842683906019de52` from Frameleaf/frameleaf-app PR #855,
 Node 26.11.1 and pnpm 12.11.2. Its single concurrency group serializes server builds,
 with a 45-minute limit per job. It retains one qualified component archive and
 bounded diagnostics for seven days; artifact access follows repository access.
@@ -689,8 +689,8 @@ server font resources. Required entries and font headers are checked before the
 package is accepted; Git LFS pointers are not usable font payloads.
 
 The `Windows host assets` workflow builds the current photo UI, core plugin and
-Studio worker serially from source `9118a01fdfb8a8cd20be24290660679b3a7c4de3`
-([shared tooling fix](https://github.com/Frameleaf/frameleaf-app/pull/780)).
+Studio worker serially from source `c64039743af7bb0d68b602ff842683906019de52`
+([Windows import worker build fix](https://github.com/Frameleaf/frameleaf-app/pull/855)).
 That source review must clear before promoting this producer.
 Its single 90-minute job retains `host-assets.tar.gz` with each qualified payload
 and receipt, after checking source, Node, package-manager locks and exact file
@@ -839,7 +839,7 @@ uses the exact `artifactId`, `runId`, `runAttempt`, `headSha`, `workflow` and
 fixed workflow and duplicate artifact IDs are refused before downloading.
 The command requires GitHub CLI read access to this repository's Actions artifacts.
 The source checkout must contain application commit
-`9118a01fdfb8a8cd20be24290660679b3a7c4de3`. Canonical source archive and build-node
+`c64039743af7bb0d68b602ff842683906019de52`. Canonical source archive and build-node
 hashes are pinned to that reviewed snapshot; another snapshot requires a reviewed
 recipe update.
 
@@ -943,7 +943,7 @@ The development `frameleaf-native-host --owner-pipe` helper now provides bounded
 
 `tools/build_host_manager.py --source /absolute/repo --revision <commit> --node /absolute/private-node --output /absolute/new-output` builds Manager and its UI from an exact Git archive with the frozen npm lockfile. It ignores package lifecycle scripts, prunes development dependencies and checks deployed production imports, including the shared release verifier. Only runtime code, production dependencies, worker scripts, public release-verification resources, UI assets and licenses enter `output/manager`. `component.json` records the Manager revision independently of the photo server revision.
 
-The Windows Manager component workflow builds application source candidate `9118a01fdfb8a8cd20be24290660679b3a7c4de3` from Frameleaf/frameleaf-app PR #780 with Node 26.11.1 on Windows. Promotion requires that source candidate’s current review and exact-head CI. Its artifact contains `manager-component.tar.gz`: the staged `manager` directory and successful `qualification.json`, checked against the exact source, toolchain metadata and complete file inventory before archiving. Build workspaces stay out of the component artifact. This qualifies production compilation and deployed imports; native bootstrap, complete-host startup, signing and installed acceptance remain separate gates.
+The Windows Manager component workflow builds application source candidate `c64039743af7bb0d68b602ff842683906019de52` from Frameleaf/frameleaf-app PR #855 with Node 26.11.1 on Windows. Promotion requires that source candidate’s current review and exact-head CI. Its artifact contains `manager-component.tar.gz`: the staged `manager` directory and successful `qualification.json`, checked against the exact source, toolchain metadata and complete file inventory before archiving. Build workspaces stay out of the component artifact. This qualifies production compilation and deployed imports; native bootstrap, complete-host startup, signing and installed acceptance remain separate gates.
 
 Pass that folder to `tools/build_host_bundle.py --manager /absolute/output/manager --backup /absolute/backup-output/backup` with the existing host/ML arguments. Manager code, UI, dependencies, release-verification resources and the backup engine are mandatory in the signed host inventory. An older pack that omits these components refuses admission. The previous factory-signed 24-role candidate and its component results remain historical evidence; a new complete candidate/signature and installed qualification are required. This package does not enable native hosting or supply the still-required protected installed supervisor and OS-keystore bootstrap.
 

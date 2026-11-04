@@ -59,7 +59,7 @@ def database_contract(dockerfile: str, lock: dict) -> dict:
     return lock
 
 
-def download(url: str, destination: Path, expected: str) -> None:
+def download(url: str, destination: Path, expected: str, *, max_bytes: int = 128 * 1024**2) -> None:
     with (
         urllib.request.urlopen(url, timeout=60) as response,
         destination.open("xb") as output,
@@ -67,7 +67,7 @@ def download(url: str, destination: Path, expected: str) -> None:
         size = 0
         while chunk := response.read(1024 * 1024):
             size += len(chunk)
-            if size > 128 * 1024 * 1024:
+            if size > max_bytes:
                 raise BuildError("host_database_download_too_large")
             output.write(chunk)
     if sha256(destination) != expected:
