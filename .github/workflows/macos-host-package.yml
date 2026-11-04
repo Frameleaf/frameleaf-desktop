@@ -1,0 +1,109 @@
+name: Notarize and qualify the Apple Silicon companion installer
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: 'Approved draft asset ID, package SHA-256, manifest SHA-256, and controller SHA-256'
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: macos-arm64-host-package
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    environment: desktop-release
+    permissions:
+      contents: read
+    runs-on: macos-15
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    env:
+      APPROVAL: ${{ inputs.approval }}
+    steps:
+      - name: Verify the exact signed package on the private draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            keys == ["assetId","controllerSha256","manifestSha256","packageSha256"] and
+            (.assetId|type=="number" and .>0 and .==floor) and
+            ([.controllerSha256,.manifestSha256,.packageSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
+          ' <<< "$APPROVAL" >/dev/null
+          PACKAGE="$RUNNER_TEMP/FrameleafCompanion_1.2.3_arm64.pkg"
+          printf 'PACKAGE=%s\n' "$PACKAGE" >> "$GITHUB_ENV"
+          asset=$(jq -r .assetId <<< "$APPROVAL")
+          digest=$(jq -r .packageSha256 <<< "$APPROVAL")
+          gh api "repos/$GITHUB_REPOSITORY/releases/419477762" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+            .draft==true and any(.assets[]; .id==$asset and .digest==$digest and .state=="uploaded" and .size>0 and .size<2147483648)
+          ' >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$PACKAGE"
+          printf '%s  %s\n' "$digest" "$PACKAGE" | shasum -a 256 -c
+          pkgutil --check-signature "$PACKAGE" > "$RUNNER_TEMP/installer-signature.txt"
+          grep -F 'signed by a developer certificate issued by Apple for distribution' "$RUNNER_TEMP/installer-signature.txt"
+          grep -E "^[[:space:]]*1\\. Developer ID Installer:.* \\($APPLE_TEAM_ID\\)$" "$RUNNER_TEMP/installer-signature.txt"
+      - name: Obtain and verify Apple's notarization ticket
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if ! xcrun stapler staple "$PACKAGE"; then
+            xcrun notarytool submit "$PACKAGE" --no-wait --output-format json --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > "$RUNNER_TEMP/installer-submission.json"
+            id=$(jq -er '.id' "$RUNNER_TEMP/installer-submission.json")
+            printf 'Apple submission %s\n' "$id"
+            xcrun notarytool wait "$id" --timeout 65m --output-format json --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > "$RUNNER_TEMP/installer-notary.json"
+            jq -e '.status=="Accepted"' "$RUNNER_TEMP/installer-notary.json" >/dev/null
+            xcrun stapler staple "$PACKAGE"
+          fi
+          xcrun stapler validate "$PACKAGE"
+          spctl --assess --type install --verbose=2 "$PACKAGE"
+      - name: Install twice and provision the private profile on a fresh Mac
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          base='/Library/Application Support/Frameleaf'
+          receipt="$base/Runtimes/$manifest/installation.json"
+          helper="$base/Controllers/$manifest/$controller/frameleaf-native-host"
+          test ! -e "$base"
+          sudo installer -pkg "$PACKAGE" -target /
+          jq -e --arg manifest "$manifest" --arg controller "$controller" '
+            .schemaVersion==1 and .manifestSha256==$manifest and .controllerSha256==$controller
+          ' "$receipt" >/dev/null
+          cp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          sudo installer -pkg "$PACKAGE" -target /
+          cmp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          printf '%s  %s\n' "$controller" "$helper" | shasum -a 256 -c
+          codesign --verify --strict "$helper"
+          test "$(stat -f '%u:%Lp' "$receipt")" = 0:644
+          uid=$(id -u)
+          sudo "$helper" --provision-profile "$manifest" "$controller" "$uid"
+          for leaf in state manager; do
+            test "$(stat -f '%u:%Lp' "$base/Profiles/$uid/$leaf")" = "$uid:700"
+          done
+          shasum -a 256 "$PACKAGE" | sed "s|  .*/|  |" > "$RUNNER_TEMP/SHA256SUMS"
+      - name: Retain the exact notarized installer and verification receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-macos-arm64-companion-installed
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/FrameleafCompanion_1.2.3_arm64.pkg
+            ${{ runner.temp }}/SHA256SUMS
+            ${{ runner.temp }}/installed-receipt.json
+          if-no-files-found: error
+      - name: Retain Apple's request on a failed wait
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-macos-arm64-companion-notary-request
+          path: ${{ runner.temp }}/installer-submission.json
+          if-no-files-found: ignore
