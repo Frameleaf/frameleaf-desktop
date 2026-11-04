@@ -231,6 +231,9 @@ async function checkedCandidate(candidate, trust, signature) {
     fail("runtime_provenance_invalid");
   return { raw, manifest, keyId: authority?.id };
 }
+export async function verifyUnsignedCandidate(candidate, policy) {
+  return checkedCandidate(candidate, await releasePolicy(policy));
+}
 export async function verifySignedCandidate(candidate, policy) {
   const trust = await releasePolicy(policy);
   const signature = await boundedFile(join(candidate, "manifest.sig"), 64);

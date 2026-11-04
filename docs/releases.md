@@ -55,11 +55,11 @@ non-pull-request `main` run in this repository containing these Actions artifact
 
 | Artifact | Required for |
 | --- | --- |
-| `factory-runtime-macos-aarch64` | `macos-linux`, `all` |
+| `factory-runtime-macos-aarch64` | `macos-aarch64`, `macos-linux`, `all` |
 | `factory-runtime-macos-x86_64` | `macos-linux`, `all` |
-| `factory-runtime-linux-x86_64` | Every selection |
-| `factory-runtime-linux-aarch64` | Every selection |
-| `factory-runtime-windows-x86_64` | `all` |
+| `factory-runtime-linux-x86_64` | `linux`, `macos-linux`, `all` |
+| `factory-runtime-linux-aarch64` | `linux`, `macos-linux`, `all` |
+| `factory-runtime-windows-x86_64` | `windows`, `all` |
 
 Each artifact contains `runtime.tar`, with `manifest.json`, `manifest.sig` and
 `payload/` at its root. Create the tar on the factory OS to retain executable
@@ -171,6 +171,10 @@ Temporary Apple keychains are removed on success or failure; `azure/login`
 cleans up the Azure session. Use Microsoft's [OIDC setup guide](https://github.com/Azure/artifact-signing-action/blob/main/docs/OIDC.md),
 [signing integrations](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-signing-integrations),
 and Tauri's [Windows signing guide](https://v2.tauri.app/distribute/sign/windows/).
+
+The macOS factory signer verifies the unsigned inventory, signs the interpreter and
+embedded Mach-O libraries with Developer ID and secure timestamps, then seals the
+final bytes with the factory key. The installer verifies that inventory again.
 
 ## Dispatch
 

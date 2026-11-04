@@ -120,7 +120,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -141,6 +141,32 @@ jobs:
           import tarfile
           with tarfile.open('unsigned-download/runtime-unsigned.tar') as archive:
               archive.extractall('candidate', filter='data')
+      - name: Verify Apple runtime and sign its embedded code before sealing the inventory
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+          RUNTIME_EPOCH: ${{ inputs.epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import { checkFactoryInputs } from './tools/factory_runtime.mjs';
+          import { verifyUnsignedCandidate } from './tools/sign_runtime.mjs';
+          await checkFactoryInputs('candidate', process.env.RUNTIME_TARGET, Number(process.env.RUNTIME_EPOCH));
+          await verifyUnsignedCandidate('candidate');
+          JS
+          bash tools/import_apple_certificate.sh
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+          python tools/sign_macos_runtime.py candidate
+      - name: Remove Apple signing material
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
       - name: Sign and verify the exact archive accepted by installer packaging
         env:
           FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}

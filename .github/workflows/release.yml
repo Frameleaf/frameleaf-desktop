@@ -138,20 +138,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : "${APPLE_CERTIFICATE:?Missing Apple certificate}" "${APPLE_CERTIFICATE_PASSWORD:?Missing certificate password}"
           : "${APPLE_ID:?Missing Apple ID}" "${APPLE_PASSWORD:?Missing app-specific password}" "${APPLE_TEAM_ID:?Missing Apple team}"
-          [[ "$APPLE_SIGNING_IDENTITY" == 'Developer ID Application: '* ]]
-          keychain="$RUNNER_TEMP/desktop-release.keychain-db"
-          password=$(openssl rand -hex 32)
-          echo "::add-mask::$password"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 7200 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-          rm "$RUNNER_TEMP/developer-id.p12"
+          bash tools/import_apple_certificate.sh
       - name: Configure Azure Artifact Signing
         if: runner.os == 'Windows'
         uses: ./.github/actions/windows-signing

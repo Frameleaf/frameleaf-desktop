@@ -28,13 +28,7 @@ export function factorySourceRevisionFor(target) {
   return source;
 }
 
-export async function signFactoryRuntime(
-  candidate,
-  target,
-  epoch,
-  privatePem,
-  policy,
-) {
+export async function checkFactoryInputs(candidate, target, epoch) {
   candidate = resolve(candidate);
   const manifest = JSON.parse(
     await boundedFile(join(candidate, "manifest.json"), 8 * 1024 * 1024),
@@ -49,6 +43,11 @@ export async function signFactoryRuntime(
     manifest.provider !== profile.provider
   )
     throw new Error("runtime_factory_candidate_unapproved");
+}
+
+export async function signFactoryRuntime(candidate, target, epoch, privatePem, policy) {
+  candidate = resolve(candidate);
+  await checkFactoryInputs(candidate, target, epoch);
   const receipt = await signCandidate(
     candidate,
     join(candidate, "manifest.sig"),
