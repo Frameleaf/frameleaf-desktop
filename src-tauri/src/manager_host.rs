@@ -345,6 +345,7 @@ impl Programs<'_> {
         struct Binding<'a> {
             runtime: &'a str,
             id: &'a str,
+            secure_installation_id: uuid::Uuid,
             controller: &'a Path,
             candidate: &'a Path,
             state: &'a Path,
@@ -372,6 +373,7 @@ impl Programs<'_> {
             installation: Binding {
                 runtime: "native",
                 id: &config.installation_id,
+                secure_installation_id: crate::host_state::secure_installation_id(&config.state)?,
                 controller: &config.controller,
                 candidate,
                 state: &config.state,
