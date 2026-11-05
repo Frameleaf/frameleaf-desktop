@@ -493,7 +493,7 @@ fn rust_owner_drains_agent_output_and_restarts_without_reinitializing_database()
             }
         }
     }
-    put("pg/initdb",b"#!/bin/sh\nmkdir \"$2\" || exit 1\nprintf 19 >\"$2/PG_VERSION\"\necho init >>init-count\n",true);
+    put("pg/initdb",b"#!/bin/sh\ntest -d \"$2\" || exit 1\nprintf 19 >\"$2/PG_VERSION\"\necho init >>init-count\n",true);
     put("pg/postgres",b"#!/bin/sh\necho $$ >\"$2/postmaster.pid\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",true);
     put("pg/pg_isready", b"#!/bin/sh\nexit 0\n", true);
     put("pg/createdb", b"#!/bin/sh\ntouch db-created\n", true);
