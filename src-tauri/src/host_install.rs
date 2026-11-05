@@ -234,10 +234,8 @@ pub fn verify_installed_program(
             return Err("host_install_controller_changed".into());
         }
         let layout = record.layout()?;
-        let executable = std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .map_err(|_| "host_install_controller_changed")?;
-        if std::fs::canonicalize(&layout.controller).ok().as_ref() != Some(&executable) {
+        let executable = std::env::current_exe().map_err(|_| "host_install_controller_changed")?;
+        if crate::windows_protection::stable_path(&executable)? != layout.controller {
             return Err("host_install_controller_changed".into());
         }
         match program {
