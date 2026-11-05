@@ -127,7 +127,7 @@ jobs:
               kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
               kernel.CloseHandle.argtypes = [wintypes.HANDLE]
               kernel.CloseHandle.restype = wintypes.BOOL
-              def physical(path):
+              def physical(path, extended=False):
                   """Keep device-path tests bound to the original directory's OS identity."""
                   handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
                   if handle == ctypes.c_void_p(-1).value:
@@ -137,7 +137,8 @@ jobs:
                       count = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 2)
                       if not 0 < count < len(buffer) or not buffer.value.startswith('\\Device\\'):
                           raise RuntimeError('Expected an OS-resolved physical device path')
-                      result = Path('\\\\.\\GLOBALROOT' + buffer.value)
+                      prefix = '\\\\?\\GLOBALROOT' if extended else '\\\\.\\GLOBALROOT'
+                      result = Path(prefix + buffer.value)
                       if not os.path.samefile(path, result):
                           raise RuntimeError('Physical directory identity mismatch')
                       return result
@@ -155,24 +156,24 @@ jobs:
                   'FRAMELEAF_BUILD_ERROR_LOG': str(root / 'command-error.log'),
               }
               clean_env = json.loads(run([node, '--input-type=module', '--eval', installed_script,
-                                          physical(host), physical(installed_fixtures),
+                                          physical(host), physical(installed_fixtures, extended=True),
                                           json.dumps(host_entries())], cwd=work, env=clean_parent))
               clean_env['FRAMELEAF_BUILD_ERROR_LOG'] = str(root / 'command-error.log')
               report['installedEnvironmentKeys'] = sorted(clean_env)
               report['installedSystemDrivePresent'] = 'SystemDrive' in clean_env
               report['installedEnvironmentChecks'] = qualify(
-                  physical(relocated), physical(installed_fixtures), lock, clean_env)
+                  physical(relocated), physical(installed_fixtures, extended=True), lock, clean_env)
               report['phase'] = 'installed-direct-postgres-start'
               print(report['phase'], flush=True)
               with socket.socket() as listener:
                   listener.bind(('127.0.0.1', 0))
                   port = listener.getsockname()[1]
-              data = physical(installed_fixtures / 'fixture-data')
+              data = physical(installed_fixtures / 'fixture-data', extended=True)
               binary = lambda name: physical(relocated / 'bin' / (name + '.exe'))
               direct_log = root / 'direct-postgres.log'
               with direct_log.open('wb') as log:
                   pg = subprocess.Popen([binary('postgres'), '-D', data, '-h', '127.0.0.1', '-p', str(port)],
-                                        cwd=physical(installed_fixtures), env=clean_env,
+                                        cwd=physical(installed_fixtures, extended=True), env=clean_env,
                                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
                   try:
                       deadline = time.monotonic() + 30
@@ -185,7 +186,7 @@ jobs:
                               report['installedDirectPostgres'] = 'administrator-token-refused'
                               break
                           result = subprocess.run([binary('pg_isready'), '-h', '127.0.0.1', '-p', str(port)],
-                                                  cwd=physical(installed_fixtures), env=clean_env,
+                                                  cwd=physical(installed_fixtures, extended=True), env=clean_env,
                                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=10)
                           if result.returncode == 0:
                               ready = True
@@ -199,7 +200,7 @@ jobs:
                       try:
                           if pg.poll() is None:
                               subprocess.run([binary('pg_ctl'), '-D', data, '-m', 'fast', '-w', '-t', '20', 'stop'],
-                                             cwd=physical(installed_fixtures), env=clean_env,
+                                             cwd=physical(installed_fixtures, extended=True), env=clean_env,
                                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
                           elif ready:
                               raise RuntimeError('Direct PostgreSQL exited before cleanup: ' + str(pg.returncode))
