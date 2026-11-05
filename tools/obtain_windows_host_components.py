@@ -24,14 +24,14 @@ from obtain_host_component import obtain as obtain_component, validate_approval
 from verify_reused_host_sources import verify as verify_reused
 
 SOURCE_REVISION = 'c64039743af7bb0d68b602ff842683906019de52'
-MANAGER_REVISION = '7d5da3e61f5de54bf362bb13bbdab8474b436fc5'
+MANAGER_REVISION = '9ad60f5fb5885e7c4d24ef86a5f0859415e41f7b'
 # Canonical Git archives independently verified for this immutable application snapshot.
 SOURCE_ARCHIVES = {
     'web': 'a2cace3f8eddb83ec5f5c4a90f00916e8fdeed92a0d5a510fabf31cb2f86c99a',
     'plugin': '41aad26098c4db5807e37518a0e4868bc657cc02c778e59c08383a0381b5c6a2',
     'studio': '4d6cb68c2eac8f59cf335111c260b44a43f1c93b49dd9ae39f49491ee02451b0',
     'server': '1a542a8ceedb577eef058d9dca39f5558b1927d8d8ead6c9c36d9a6b1ce89a42',
-    'manager': '90d984309a895cffb1a29218600d827d34d19a94378781225d84fb8c8bd43d49',
+    'manager': 'e5e8b4b0b49f48b32182ba2b56c4176dd475f278ecb074078b24402be049470f',
 }
 BUILD_NODE_SHA = 'dccc52de28d8df2ee22d2062424f8c563070d95d8ad70c54c4bf01d590dec14f'
 WORKFLOWS = {role: '.github/workflows/' + name + '.yml' for role, name in {
