@@ -247,6 +247,8 @@ pub struct NativeManager {
     #[cfg(windows)]
     tree: crate::process_tree::ProcessTree,
     receipt: mpsc::Receiver<Result<Vec<u8>, String>>,
+    #[cfg(all(test, windows))]
+    stderr_diagnostic: Option<mpsc::Receiver<()>>,
     installation_id: String,
     manifest_sha256: String,
     origin: String,
@@ -475,6 +477,8 @@ impl NativeManager {
             #[cfg(windows)]
             tree,
             receipt,
+            #[cfg(all(test, windows))]
+            stderr_diagnostic: None,
             installation_id: id.into(),
             manifest_sha256: hash.into(),
             origin: origin.into(),
@@ -487,6 +491,8 @@ impl NativeManager {
         };
         #[cfg(all(test, windows))]
         if let Some(mut stderr) = owner.child.stderr.take() {
+            let (complete, diagnostic) = mpsc::channel();
+            owner.stderr_diagnostic = Some(diagnostic);
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
                 let _ = stderr.by_ref().take(8192).read_to_end(&mut bytes);
@@ -503,11 +509,17 @@ impl NativeManager {
                     "native_installation_changed",
                     "ERR_MODULE_NOT_FOUND",
                     "ERR_INVALID_ARG_VALUE",
+                    "ERR_INVALID_FILE_URL_HOST",
+                    "ERR_INVALID_FILE_URL_PATH",
+                    "native_library_identity_invalid",
+                    "manager_runtime_changed",
+                    "Frameleaf Manager could not start; check its mounted configuration.",
                 ] {
                     if output.contains(code) {
                         eprintln!("Installed Manager diagnostic: {code}");
                     }
                 }
+                let _ = complete.send(());
                 let _ = std::io::copy(&mut stderr, &mut std::io::sink());
             });
         }
@@ -594,8 +606,24 @@ impl NativeManager {
             }
             match self.receipt.try_recv() {
                 Ok(bytes) => {
+                    let bytes = bytes?;
+                    #[cfg(all(test, windows))]
+                    if self.stderr_diagnostic.is_some() {
+                        let value = serde_json::from_slice::<Ready>(&bytes);
+                        eprintln!(
+                            "Installed Manager receipt: bytes={}, newline={}, decoded={}, binding_matches={}",
+                            bytes.len(),
+                            bytes.ends_with(b"\n"),
+                            value.is_ok(),
+                            value.is_ok_and(|value| value.protocol_version == 2
+                                && value.state == "ready"
+                                && value.installation_id == self.installation_id
+                                && value.manifest_sha256 == self.manifest_sha256
+                                && value.origin == self.origin)
+                        );
+                    }
                     ready(
-                        &bytes?,
+                        &bytes,
                         &self.installation_id,
                         &self.manifest_sha256,
                         &self.origin,
@@ -773,6 +801,10 @@ impl Drop for NativeManager {
                 std::mem::forget(std::mem::take(&mut self._profile_pins));
                 let _ = self.child.kill();
             }
+        }
+        #[cfg(all(test, windows))]
+        if let Some(diagnostic) = self.stderr_diagnostic.take() {
+            let _ = diagnostic.recv_timeout(Duration::from_secs(1));
         }
         #[cfg(not(windows))]
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
