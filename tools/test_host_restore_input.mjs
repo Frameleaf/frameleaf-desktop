@@ -50,6 +50,7 @@ test('owner refuses malformed bindings, changed bytes, links and unknown restore
 });
 
 
+/** Simulate restore commands and failures while retaining the original database as a sentinel. */
 async function restoreFixture(t, run) {
  await fixture(t,async f=>{
   f.recovery.checkpoint.sourceRevision=f.c.sourceRevision;
