@@ -1028,12 +1028,14 @@ fn direct_profile(state: &Path) -> Result<(), String> {
 }
 impl VerifiedHostRuntime {
     /// Credentials are native-only; callers persist them in the OS credential store before first start.
+    /// Windows callers also supply the separately measured, protected native controller executable.
     pub fn start(
         &self,
         state: &Path,
         password: &Zeroizing<String>,
         database_port: u16,
         api_port: u16,
+        #[cfg(windows)] supervisor: &Path,
     ) -> Result<HostProcess, String> {
         self.start_mode(
             state,
@@ -1042,8 +1044,12 @@ impl VerifiedHostRuntime {
             api_port,
             HostMode::Server,
             None,
+            #[cfg(windows)]
+            supervisor,
         )
     }
+    /// Keep payload and supervisor authority explicit for production and qualification callers.
+    #[cfg_attr(windows, allow(clippy::too_many_arguments))]
     pub(crate) fn start_mode(
         &self,
         state: &Path,
@@ -1052,6 +1058,7 @@ impl VerifiedHostRuntime {
         api_port: u16,
         mode: HostMode,
         mut owner: Option<&mut crate::host_state::Owner>,
+        #[cfg(windows)] supervisor: &Path,
     ) -> Result<HostProcess, String> {
         let requested_state = state;
         #[cfg(windows)]
@@ -1144,8 +1151,21 @@ impl VerifiedHostRuntime {
         #[cfg(not(windows))]
         command.args(["--input-type=module", "--eval", AGENT_BOOTSTRAP]);
         #[cfg(windows)]
-        let mut command =
-            Command::new(std::env::current_exe().map_err(|_| "host_agent_start_failed")?);
+        let supervisor = crate::windows_protection::stable_path(supervisor)
+            .map_err(|_| "host_agent_start_failed")?;
+        #[cfg(windows)]
+        if !supervisor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("frameleaf-native-host.exe"))
+        {
+            return Err("host_agent_start_failed".into());
+        }
+        #[cfg(windows)]
+        crate::windows_protection::protect(&supervisor, &mut std::collections::BTreeSet::new())
+            .map_err(|_| "host_agent_start_failed")?;
+        #[cfg(windows)]
+        let mut command = Command::new(&supervisor);
         #[cfg(windows)]
         command.arg("--run-windows-host-agent").arg(&node);
         command

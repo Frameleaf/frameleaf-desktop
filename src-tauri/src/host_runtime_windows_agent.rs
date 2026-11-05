@@ -19,13 +19,16 @@ use windows_sys::Win32::{
         },
         CreateRestrictedToken, CreateWellKnownSid, WinBuiltinAdministratorsSid,
         WinBuiltinPowerUsersSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, NO_INHERITANCE,
-        SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
+        SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
     },
+    Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
     System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-        ResumeThread, TerminateProcess, WaitForSingleObject, BELOW_NORMAL_PRIORITY_CLASS,
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-        STARTUPINFOW,
+        CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject, BELOW_NORMAL_PRIORITY_CLASS,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW,
     },
 };
 
@@ -36,6 +39,50 @@ impl Drop for Local {
         unsafe {
             LocalFree(self.0);
         }
+    }
+}
+
+struct Attributes(Vec<usize>);
+impl Drop for Attributes {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast());
+        }
+    }
+}
+impl Attributes {
+    /// Restrict inheritance to these pipes even if another thread opens an inheritable handle.
+    fn pipes(handles: &[windows_sys::Win32::Foundation::HANDLE]) -> Result<Self, String> {
+        let mut bytes = 0;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes);
+        }
+        if bytes == 0 || bytes > 1_048_576 {
+            return Err(ERROR.into());
+        }
+        let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 1, 0, &mut bytes)
+        } == 0
+        {
+            return Err(ERROR.into());
+        }
+        let mut list = Self(storage);
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list.0.as_mut_ptr().cast(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                std::mem::size_of_val(handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(ERROR.into());
+        }
+        Ok(list)
     }
 }
 
@@ -147,16 +194,16 @@ fn command_line(arguments: &[&OsStr]) -> Result<Vec<u16>, String> {
     Ok(line)
 }
 
-/// Retain pipes and a kill-on-close job while supervising a restricted foreground child.
-fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
-    let program_name = program.as_os_str();
-    let mut all = vec![program_name];
-    all.extend_from_slice(arguments);
-    let mut line = command_line(&all)?;
-    let executable: Vec<u16> = program_name.encode_wide().chain(Some(0)).collect();
+/// Remove privileged groups and privileges without changing the profile user.
+fn restricted_token() -> Result<OwnedHandle, String> {
     unsafe {
         let mut raw = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut raw) == 0 {
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | READ_CONTROL | WRITE_DAC,
+            &mut raw,
+        ) == 0
+        {
             return Err(ERROR.into());
         }
         let original = OwnedHandle::from_raw_handle(raw);
@@ -204,6 +251,19 @@ fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
         }
         let token = OwnedHandle::from_raw_handle(raw);
         grant_token_user(&token)?;
+        Ok(token)
+    }
+}
+
+/// Retain pipes and a kill-on-close job while supervising a restricted foreground child.
+fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
+    let program_name = program.as_os_str();
+    let mut all = vec![program_name];
+    all.extend_from_slice(arguments);
+    let mut line = command_line(&all)?;
+    let executable: Vec<u16> = program_name.encode_wide().chain(Some(0)).collect();
+    let token = restricted_token()?;
+    unsafe {
         let mut pipes = Vec::new();
         for handle in [
             std::io::stdin().as_raw_handle(),
@@ -225,13 +285,18 @@ fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
             }
             pipes.push(OwnedHandle::from_raw_handle(duplicate));
         }
-        let startup = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: pipes[0].as_raw_handle(),
-            hStdOutput: pipes[1].as_raw_handle(),
-            hStdError: pipes[2].as_raw_handle(),
-            ..Default::default()
+        let inherited: Vec<_> = pipes.iter().map(AsRawHandle::as_raw_handle).collect();
+        let mut attributes = Attributes::pipes(&inherited)?;
+        let startup = STARTUPINFOEXW {
+            StartupInfo: STARTUPINFOW {
+                cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+                dwFlags: STARTF_USESTDHANDLES,
+                hStdInput: pipes[0].as_raw_handle(),
+                hStdOutput: pipes[1].as_raw_handle(),
+                hStdError: pipes[2].as_raw_handle(),
+                ..Default::default()
+            },
+            lpAttributeList: attributes.0.as_mut_ptr().cast(),
         };
         let mut process = PROCESS_INFORMATION::default();
         if CreateProcessAsUserW(
@@ -241,10 +306,13 @@ fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+            CREATE_SUSPENDED
+                | CREATE_NO_WINDOW
+                | BELOW_NORMAL_PRIORITY_CLASS
+                | EXTENDED_STARTUPINFO_PRESENT,
             std::ptr::null(),
             std::ptr::null(),
-            &startup,
+            &startup.StartupInfo,
             &mut process,
         ) == 0
         {
@@ -279,6 +347,115 @@ fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inspect native privilege entries so flag wording cannot substitute for token-state proof.
+    fn privileges(token: &OwnedHandle) -> Vec<windows_sys::Win32::Security::LUID_AND_ATTRIBUTES> {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenPrivileges, TOKEN_PRIVILEGES,
+        };
+        let mut buffer = [0usize; 128];
+        let mut bytes = 0;
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenPrivileges,
+                    buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buffer) as u32,
+                    &mut bytes,
+                )
+            },
+            0
+        );
+        assert!(bytes as usize <= std::mem::size_of_val(&buffer));
+        let value = unsafe { &*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+        let count = value.PrivilegeCount as usize;
+        assert!(
+            std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges)
+                + count * std::mem::size_of::<windows_sys::Win32::Security::LUID_AND_ATTRIBUTES>()
+                <= bytes as usize
+        );
+        unsafe { std::slice::from_raw_parts(value.Privileges.as_ptr(), count) }.to_vec()
+    }
+
+    #[test]
+    /// Prove filtering removes privileges, including when the child can adjust its own token.
+    fn administrative_privileges_are_removed_and_cannot_be_enabled_again() {
+        use windows_sys::Win32::{
+            Foundation::{GetLastError, ERROR_NOT_ALL_ASSIGNED, LUID},
+            Security::{
+                AdjustTokenPrivileges, DuplicateTokenEx, LookupPrivilegeValueW,
+                SecurityImpersonation, TokenPrimary, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+                TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+            },
+        };
+        let lookup = |name: &str| {
+            let text: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let mut value = LUID::default();
+            assert_ne!(
+                unsafe { LookupPrivilegeValueW(std::ptr::null(), text.as_ptr(), &mut value) },
+                0
+            );
+            value
+        };
+        let shutdown = lookup("SeShutdownPrivilege");
+        let notify = lookup("SeChangeNotifyPrivilege");
+        let key = |luid: LUID| (luid.HighPart, luid.LowPart);
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) },
+            0
+        );
+        let original = unsafe { OwnedHandle::from_raw_handle(raw) };
+        if std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted") {
+            assert!(
+                privileges(&original)
+                    .iter()
+                    .any(|entry| key(entry.Luid) == key(shutdown)),
+                "the elevated CI token must hold the tested privilege"
+            );
+        }
+        let restricted = restricted_token().unwrap();
+        assert!(privileges(&restricted)
+            .iter()
+            .all(|entry| key(entry.Luid) == key(notify)));
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                DuplicateTokenEx(
+                    restricted.as_raw_handle(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut raw,
+                )
+            },
+            0
+        );
+        let adjustable = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let desired = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: shutdown,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        assert_ne!(
+            unsafe {
+                AdjustTokenPrivileges(
+                    adjustable.as_raw_handle(),
+                    0,
+                    &desired,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { GetLastError() }, ERROR_NOT_ALL_ASSIGNED);
+    }
 
     #[test]
     /// Calibrate quoting against the OS parser, including the complete embedded bootstrap.

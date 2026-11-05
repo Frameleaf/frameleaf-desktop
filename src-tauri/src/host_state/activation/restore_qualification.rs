@@ -79,6 +79,11 @@ fn verified(
             ports.1,
             HostMode::RestorePrepare,
             Some(owner),
+            #[cfg(windows)]
+            &PathBuf::from(
+                std::env::var_os("FRAMELEAF_TEST_HOST_CONTROLLER")
+                    .expect("measured Windows native controller"),
+            ),
         )
         .unwrap();
     process.wait_ready(Duration::from_secs(30)).unwrap();
@@ -154,6 +159,11 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
             ports.1,
             HostMode::RestorePrepare,
             Some(&mut owner),
+            #[cfg(windows)]
+            &PathBuf::from(
+                std::env::var_os("FRAMELEAF_TEST_HOST_CONTROLLER")
+                    .expect("measured Windows native controller"),
+            ),
         )
         .unwrap();
     process.wait_ready(Duration::from_secs(30)).unwrap();
@@ -233,6 +243,11 @@ fn actual_postgres_restore_selection_finalization_and_writer_admission() {
             ports.1,
             HostMode::Server,
             Some(&mut owner),
+            #[cfg(windows)]
+            &PathBuf::from(
+                std::env::var_os("FRAMELEAF_TEST_HOST_CONTROLLER")
+                    .expect("measured Windows native controller"),
+            ),
         )
         .unwrap();
     process.wait_ready(Duration::from_secs(240)).unwrap();

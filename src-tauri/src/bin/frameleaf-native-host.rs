@@ -1,3 +1,4 @@
+/// Keep internal agent failures off the controller's owner-protocol stdout pipe.
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
