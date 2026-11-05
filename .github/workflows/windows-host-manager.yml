@@ -38,6 +38,25 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: '26.11.1'
+      - name: Verify crypto in an isolated Windows Manager environment
+        shell: python
+        run: |
+          import json
+          import os
+          import shutil
+          import subprocess
+          node = shutil.which('node')
+          script = "require('node:crypto').randomBytes(32); console.log('entropy-ready')"
+          results = {}
+          for name, env in [
+              ('empty', {'PATH': ''}),
+              ('systemRoot', {'PATH': '', 'SystemRoot': os.environ['SystemRoot']}),
+          ]:
+              result = subprocess.run([node, '-e', script], env=env, capture_output=True, text=True, timeout=15)
+              results[name] = {'status': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr[:2048]}
+          print(json.dumps(results))
+          if results['systemRoot']['status'] != 0 or results['systemRoot']['stdout'].strip() != 'entropy-ready':
+              raise SystemExit('Windows native crypto failed with the isolated OS environment')
       - name: Check Manager staging and archive guards
         run: python -m unittest discover -s tools -p test_build_host_manager.py -v
       - name: Build the actual native Manager production component
