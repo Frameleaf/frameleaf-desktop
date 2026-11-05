@@ -123,6 +123,20 @@ jobs:
           }
           @{ state = 'resources-installed'; manifestSha256 = $manifest; controllerSha256 = $digest; installerSha256 = (Get-FileHash $setup).Hash.ToLowerInvariant()
              receiptSha256 = $hash.ToLowerInvariant(); installAttempts = 2 } | ConvertTo-Json | Set-Content (Join-Path $root 'protected-install.json')
+      - name: Check the installed Manager program protection contract
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $receipt = Get-Content (Join-Path $root 'protected-install.json') -Raw | ConvertFrom-Json
+          $base = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Frameleaf'
+          $helper = Join-Path $base "Controllers/$($receipt.manifestSha256)/$($receipt.controllerSha256)/frameleaf-native-host.exe"
+          foreach ($program in 'controller', 'restic') {
+            $result = & $helper --verify-installed-program $receipt.manifestSha256 $receipt.controllerSha256 $program
+            if ($LASTEXITCODE -or ($result | ConvertFrom-Json).state -cne 'protected') { throw 'Protected program check failed' }
+          }
+          & $helper --verify-installed-program $receipt.manifestSha256 $receipt.controllerSha256 invalid
+          if ($LASTEXITCODE -ne 1) { throw 'Unknown program was not refused' }
+          $global:LASTEXITCODE = 0
       - name: Retain private Windows installer candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

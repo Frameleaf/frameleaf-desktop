@@ -38,6 +38,17 @@ fn main() {
                 _ => Err("host_install_identity_invalid".into()),
             }
         }
+        [mode, manifest, controller, program] if mode == "--verify-installed-program" => {
+            match (manifest.to_str(), controller.to_str(), program.to_str()) {
+                (Some(manifest), Some(controller), Some(program)) => {
+                    frameleaf_desktop::host_install::verify_installed_program(
+                        manifest, controller, program,
+                    )
+                    .map(|receipt| println!("{}", receipt))
+                }
+                _ => Err("host_install_identity_invalid".into()),
+            }
+        }
         [mode, manifest, controller, uid]
             if mode == "--provision-install" || mode == "--provision-profile" =>
         {
