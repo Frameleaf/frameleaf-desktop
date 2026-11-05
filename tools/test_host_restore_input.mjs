@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import subprocess from 'node:child_process';
-import { writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { writeFileSync, rmSync, lstatSync, readdirSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { basename } from 'node:path';
 import filesystem from 'node:fs/promises';
@@ -62,11 +62,16 @@ async function restoreFixture(t, run) {
   subprocess.spawn=(file,args,options)=>{
    const name=basename(file).replace(/\.exe$/,'');calls.push({name,args,options});
    assert.ok(['initdb','postgres','pgIsready','psql','createdb','pgRestore','node','pgCtl','pg_checksums'].includes(name),'unexpected process '+name);
+   if(name==='initdb'){
+    const data=args[args.indexOf('-D')+1],meta=lstatSync(data);
+    assert.ok(meta.isDirectory()&&!meta.isSymbolicLink());assert.deepEqual(readdirSync(data),[]);
+    if(process.platform!=='win32')assert.equal(meta.mode&0o077,0);
+   }
    const child=new EventEmitter();Object.assign(child,{pid:7000+calls.length,exitCode:null,signalCode:null,stdout:new PassThrough(),stderr:new PassThrough()});
    const exit=(code=0)=>{if(child.exitCode!==null)return;child.exitCode=code;child.stdout.end();child.stderr.end();child.emit('exit',code,null);child.emit('close',code,null);};child.kill=()=>exit();
    if(name==='postgres'){pg=child;pgData=args[args.indexOf('-D')+1];pgReadonly=args.includes('default_transaction_read_only=on');exists=pgReadonly;writeFileSync(join(pgData,'postmaster.pid'),String(child.pid)+'\n');}
    else queueMicrotask(()=>{
-    if(name==='initdb'){mkdirSync(args[args.indexOf('-D')+1],{mode:0o700});writeFileSync(join(args[args.indexOf('-D')+1],'PG_VERSION'),'19');}
+    if(name==='initdb')writeFileSync(join(args[args.indexOf('-D')+1],'PG_VERSION'),'19');
     if(name==='psql')child.stdout.write(args.at(-1).includes('pg_database')?(exists?'1\n':'\n'):JSON.stringify({postgresMajor,vectorVersion,canonical,...(args.at(-1).includes('transaction_read_only')?{readOnly:pgReadonly&&readOnlyProof}:{})})+'\n');
     if(name==='createdb')exists=true;
     if(name==='pgRestore'&&!args.includes('--list')&&failRestore){failRestore=false;exit(1);return;}

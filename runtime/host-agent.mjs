@@ -929,6 +929,8 @@ export async function runHost(c, stopping, ready, restoreSession) {
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
       }
+      // initdb cannot recursively create physical Windows device-path ancestors.
+      await fs.mkdir(data, { mode: 0o700 });
       const passwordFile = join(c.state, "database-password.tmp");
       await fs.writeFile(passwordFile, c.password, { flag: "wx", mode: 0o600 });
       try {

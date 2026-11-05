@@ -143,18 +143,20 @@ jobs:
               installed_fixtures = work / 'installed-fixtures'
               create_private_directory(installed_fixtures)
               create_private_directory(installed_fixtures / 'home')
-              create_private_directory(installed_fixtures / 'fixture-data')
+              installed_script = ("import fs from 'node:fs/promises'; import {join} from 'node:path';"
+                                  "await fs.mkdir(join(process.argv[2],'fixture-data'),{mode:0o700});" + script)
               clean_parent = {
                   'SystemRoot': str(physical(Path(os.environ['SystemRoot']))),
                   'PATH': '',
                   'HOME': str(installed_fixtures / 'home'),
                   'FRAMELEAF_BUILD_ERROR_LOG': str(root / 'command-error.log'),
               }
-              clean_env = json.loads(run([node, '--input-type=module', '--eval', script,
+              clean_env = json.loads(run([node, '--input-type=module', '--eval', installed_script,
                                           physical(host), physical(installed_fixtures),
                                           json.dumps(host_entries())], cwd=work, env=clean_parent))
               clean_env['FRAMELEAF_BUILD_ERROR_LOG'] = str(root / 'command-error.log')
               report['installedEnvironmentKeys'] = sorted(clean_env)
+              report['installedSystemDrivePresent'] = 'SystemDrive' in clean_env
               report['installedEnvironmentChecks'] = qualify(
                   physical(relocated), physical(installed_fixtures), lock, clean_env)
               report['phase'] = 'database-with-raw-path'
