@@ -296,6 +296,23 @@ mod native {
         stable_volume_root(&value).ok_or(ERROR)?;
         Ok(PathBuf::from(value))
     }
+    /// Discover the protected OS directory without trusting the parent environment or DOS aliases.
+    pub(crate) fn system_root() -> Result<PathBuf, String> {
+        let mut buffer = vec![0u16; 32768];
+        let size = unsafe {
+            windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW(
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        } as usize;
+        if size == 0 || size >= buffer.len() {
+            return Err(ERROR.into());
+        }
+        let directory = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
+        let directory = stable_path(Path::new(&directory))?;
+        protect(&directory, &mut BTreeSet::new())?;
+        Ok(directory)
+    }
     fn opened_path(file: &File, flags: u32) -> Result<String, String> {
         let mut buffer = vec![0u16; 32768];
         let size = unsafe {
@@ -583,6 +600,35 @@ mod native {
             std::fs::remove_dir_all(scratch).unwrap();
         }
         #[test]
+        fn isolated_node_crypto_uses_the_os_discovered_system_root() {
+            let node = std::process::Command::new("node")
+                .args(["-p", "process.execPath"])
+                .output()
+                .unwrap();
+            assert!(node.status.success());
+            let node =
+                stable_path(Path::new(String::from_utf8(node.stdout).unwrap().trim())).unwrap();
+            let output = std::process::Command::new(node)
+                .args([
+                    "-e",
+                    "require('node:crypto').randomBytes(32); console.log('entropy-ready')",
+                ])
+                .env_clear()
+                .env("PATH", "")
+                .env("SystemRoot", system_root().unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                "entropy-ready"
+            );
+        }
+        #[test]
         fn actual_node_keeps_physical_main_and_dependency_paths() {
             let scratch = std::env::temp_dir()
                 .join(format!("frameleaf-node-modules-{}", uuid::Uuid::new_v4()));
@@ -682,7 +728,7 @@ mod native {
 }
 #[cfg(windows)]
 pub(crate) use native::{
-    durable_name, protect, stable_path, stable_state_path, state_path_binding,
+    durable_name, protect, stable_path, stable_state_path, state_path_binding, system_root,
 };
 
 #[cfg(test)]

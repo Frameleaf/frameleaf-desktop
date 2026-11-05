@@ -248,7 +248,10 @@ pub fn verify_installed_program(
             _ => return Err("host_install_program_invalid".into()),
         };
         crate::manager_host::protect(&target, &mut BTreeSet::new())?;
-        Ok(serde_json::json!({"protocolVersion": 1, "state": "protected"}))
+        let system_root = crate::windows_protection::system_root()?;
+        Ok(
+            serde_json::json!({"protocolVersion": 1, "state": "protected", "systemRoot": system_root}),
+        )
     }
     #[cfg(not(windows))]
     {
