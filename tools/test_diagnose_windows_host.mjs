@@ -30,6 +30,11 @@ test('host diagnostics read only bounded categories and redact journal inputs an
     assert.deepEqual(readFileSync(database), before);
     writeFileSync(join(root, 'state', 'agent.log'), 'x'.repeat(8192) + '\nhost_config_invalid\n');
     assert.deepEqual(diagnose(root).agentCodes, []);
+    const code = 'host_config_invalid';
+    writeFileSync(join(root, 'state', 'agent.log'), 'x'.repeat(8192 - code.length - 1) + '\n' + code + '-private-suffix');
+    assert.deepEqual(diagnose(root).agentCodes, []);
+    writeFileSync(join(root, 'state', 'agent.log'), code);
+    assert.deepEqual(diagnose(root).agentCodes, [code]);
     rmSync(database);
     assert.equal(diagnose(root).journalReadable, false);
   } finally { rmSync(root, { recursive: true, force: true }); }

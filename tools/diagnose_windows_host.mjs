@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { closeSync, openSync, readFileSync, readSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -26,7 +26,9 @@ export function diagnose(root) {
     fd = openSync(join(root, 'state', 'agent.log'), 'r');
     const bytes = Buffer.alloc(8192);
     const count = readSync(fd, bytes, 0, bytes.length, 0);
-    result.agentCodes = [...new Set(bytes.subarray(0, count).toString('utf8').split(/\r?\n/).filter(line => agentCodes.has(line)))];
+    const lines = bytes.subarray(0, count).toString('utf8').split(/\r?\n/);
+    if (fstatSync(fd).size > count) lines.pop();
+    result.agentCodes = [...new Set(lines.filter(line => agentCodes.has(line)))];
     result.agentLogReadable = true;
   } catch {} finally { if (fd !== undefined) closeSync(fd); }
   return result;
