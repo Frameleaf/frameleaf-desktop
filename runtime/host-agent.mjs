@@ -1583,9 +1583,10 @@ export async function verifyHostRestoreTarget(
     check();
     child = spawn(
       join(c.runtime, tool),
-      ["--check", "--pgdata", checked.database],
+      ["--check", "--pgdata", "."],
       {
-        cwd: checked.target,
+        // pg_checksums appends forward slashes, which Windows extended paths cannot contain.
+        cwd: checked.database,
         env: hostEnvironment(c),
         stdio: "ignore",
         windowsHide: true,
