@@ -182,6 +182,9 @@ jobs:
           if ($install.ExitCode) { throw 'Desktop installation failed' }
           powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe') -InstalledHost
           if ($LASTEXITCODE) { throw 'Installed native host acceptance failed' }
+      - name: Report bounded installed host operation categories
+        if: failure() && steps.installed-desktop.outcome == 'failure'
+        run: node tools/diagnose_windows_host.mjs
       - name: Report the installed Manager startup error if Desktop setup fails
         if: failure() && steps.installed-desktop.outcome == 'failure'
         shell: pwsh
