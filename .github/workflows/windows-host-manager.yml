@@ -20,7 +20,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 20
     env:
-      MANAGER_REVISION: 1fcdbca6e6ae9265fb89c906f70a21216ef89e00
+      MANAGER_REVISION: 7d5da3e61f5de54bf362bb13bbdab8474b436fc5
       UV_THREADPOOL_SIZE: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
