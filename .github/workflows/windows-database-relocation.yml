@@ -143,6 +143,7 @@ jobs:
               installed_fixtures = work / 'installed-fixtures'
               create_private_directory(installed_fixtures)
               create_private_directory(installed_fixtures / 'home')
+              create_private_directory(installed_fixtures / 'fixture-data')
               clean_parent = {
                   'SystemRoot': str(physical(Path(os.environ['SystemRoot']))),
                   'PATH': '',
