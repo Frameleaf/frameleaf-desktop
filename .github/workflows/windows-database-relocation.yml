@@ -179,7 +179,11 @@ jobs:
                       ready = False
                       while time.monotonic() < deadline:
                           if pg.poll() is not None:
-                              raise RuntimeError('Direct PostgreSQL exited: ' + str(pg.returncode))
+                              log.flush()
+                              if pg.returncode != 1 or 'administrative permissions' not in direct_log.read_text():
+                                  raise RuntimeError('Unexpected direct PostgreSQL exit: ' + str(pg.returncode))
+                              report['installedDirectPostgres'] = 'administrator-token-refused'
+                              break
                           result = subprocess.run([binary('pg_isready'), '-h', '127.0.0.1', '-p', str(port)],
                                                   cwd=physical(installed_fixtures), env=clean_env,
                                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=10)
@@ -187,9 +191,10 @@ jobs:
                               ready = True
                               break
                           time.sleep(0.1)
-                      if not ready:
+                      if not ready and report.get('installedDirectPostgres') != 'administrator-token-refused':
                           raise RuntimeError('Direct PostgreSQL readiness timed out')
-                      report['installedDirectPostgres'] = 'ready'
+                      if ready:
+                          report['installedDirectPostgres'] = 'ready'
                   finally:
                       try:
                           if pg.poll() is None:

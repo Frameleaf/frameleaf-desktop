@@ -90,33 +90,42 @@ impl ProcessTree {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            };
-            // An unnamed non-inherited job terminates every child when this process loses ownership.
-            unsafe {
-                let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if raw.is_null() {
-                    return Err("runtime_process_owner_failed".into());
-                }
-                let handle = OwnedHandle::from_raw_handle(raw);
-                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if SetInformationJobObject(
-                    raw,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const _,
-                    std::mem::size_of_val(&info) as u32,
-                ) == 0
-                    || AssignProcessToJobObject(raw, child.as_raw_handle()) == 0
-                {
-                    return Err("runtime_process_owner_failed".into());
-                }
-                Ok(Self(handle))
+            use std::os::windows::io::AsHandle;
+            Self::attach_handle(child.as_handle())
+        }
+    }
+
+    #[cfg(windows)]
+    /// Apply the existing job ownership contract to native suspended-process handles too.
+    pub(crate) fn attach_handle(
+        child: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> Result<Self, String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // An unnamed non-inherited job terminates every child when this process loses ownership.
+        unsafe {
+            let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if raw.is_null() {
+                return Err("runtime_process_owner_failed".into());
             }
+            let handle = OwnedHandle::from_raw_handle(raw);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                raw,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            ) == 0
+                || AssignProcessToJobObject(raw, child.as_raw_handle()) == 0
+            {
+                return Err("runtime_process_owner_failed".into());
+            }
+            Ok(Self(handle))
         }
     }
     pub fn terminate(&self) {

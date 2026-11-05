@@ -1,6 +1,16 @@
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
+        #[cfg(windows)]
+        [mode, node] if mode == "--run-windows-host-agent" => {
+            match frameleaf_desktop::host_runtime::run_windows_host_agent(node) {
+                Ok(code) => std::process::exit(code as i32),
+                Err(code) => {
+                    eprintln!("{code}");
+                    std::process::exit(1);
+                }
+            }
+        }
         [mode] if mode == "--owner-pipe" => frameleaf_desktop::host_control::run(),
         [mode] if mode == "--inspect-owner" => frameleaf_desktop::host_control::inspect_owner(),
         [mode, manifest, controller]

@@ -1,5 +1,10 @@
 //! Host packs have separate authority and component requirements from ML packs.
 mod reap;
+#[cfg(windows)]
+#[path = "host_runtime_windows_agent.rs"]
+mod windows_agent;
+#[cfg(windows)]
+pub use windows_agent::run as run_windows_host_agent;
 
 use crate::native_runtime::{digest_valid, relative, verify_files, Artifact};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -1133,9 +1138,17 @@ impl VerifiedHostRuntime {
         } else {
             direct_profile(state)?;
         }
-        let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
+        let node = self.root.join(relative(&self.manifest.entry_points.node)?);
+        #[cfg(not(windows))]
+        let mut command = Command::new(&node);
+        #[cfg(not(windows))]
+        command.args(["--input-type=module", "--eval", AGENT_BOOTSTRAP]);
+        #[cfg(windows)]
+        let mut command =
+            Command::new(std::env::current_exe().map_err(|_| "host_agent_start_failed")?);
+        #[cfg(windows)]
+        command.arg("--run-windows-host-agent").arg(&node);
         command
-            .args(["--input-type=module", "--eval", AGENT_BOOTSTRAP])
             .env_clear()
             .env("FRAMELEAF_HOST_AGENT", "1")
             .current_dir(state)
