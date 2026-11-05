@@ -26,6 +26,10 @@ async function request(path, options, statuses) {
 function postJson(path, data) {
   return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }, [201]);
 }
+async function verifyOriginal(id) {
+  assert.deepEqual(Buffer.from(await (await request('/api/assets/' + id + '/original', {}, [200])).arrayBuffer()), original);
+  console.log('Installed Library synthetic original readback passed');
+}
 /** Require a processed image; report redacted queue diagnostics if it never appears. */
 async function thumbnail(id) {
   for (let i = 0; i < 90; i++) {
@@ -55,17 +59,17 @@ if (phase === 'upload') {
   const asset = await (await request('/api/assets', { method: 'POST', body: form }, [201])).json();
   assert.equal(asset.status, 'created');
   assert.match(asset.id, /^[0-9a-f-]{36}$/);
-  const thumbnailHash = await thumbnail(asset.id);
-  assert.deepEqual(Buffer.from(await (await request('/api/assets/' + asset.id + '/original', {}, [200])).arrayBuffer()), original);
-  console.log('Installed Library synthetic original readback passed');
-  await writeFile(receipt, JSON.stringify({ id: asset.id, thumbnail: thumbnailHash }), { flag: 'wx' });
+  const checks = await Promise.allSettled([verifyOriginal(asset.id), thumbnail(asset.id)]);
+  const failure = checks.find(result => result.status === 'rejected');
+  if (failure) throw failure.reason;
+  await writeFile(receipt, JSON.stringify({ id: asset.id, thumbnail: checks[1].value }), { flag: 'wx' });
 } else {
   const asset = JSON.parse(await readFile(receipt, 'utf8'));
   const path = '/api/assets/' + asset.id;
   const info = await (await request(path, {}, [200])).json();
   assert.equal(info.id, asset.id);
   assert.equal(info.originalFileName, filename);
-  assert.deepEqual(Buffer.from(await (await request(path + '/original', {}, [200])).arrayBuffer()), original);
+  await verifyOriginal(asset.id);
   assert.equal(await thumbnail(asset.id), asset.thumbnail);
 }
 console.log('Installed Library synthetic photo ' + phase + ' passed');
