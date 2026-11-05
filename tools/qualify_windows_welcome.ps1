@@ -82,7 +82,7 @@ try {
         Press 'Prepare local Manager'
         $null = Wait-Control 'Local Manager is ready' -Seconds 360
         Fill 'Local Manager password' $managerPassword
-        $permissions = Wait-Control 'Allow this computer to manage this local server.' -Type CheckBox
+        $permissions = Wait-Control 'Permissions Allow this computer to manage this local server.' -Type CheckBox
         $permissions.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
         Press 'Authorize local management'
         $null = Wait-Control 'Open local Photos' -Type Button -Seconds 120
