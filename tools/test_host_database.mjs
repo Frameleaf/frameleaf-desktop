@@ -255,6 +255,20 @@ test('physical Windows state comparisons require a captured root and volume iden
   assert.equal(canonicalHostPathMatches(canonicalRoot, physicalRoot, 'linux', binding, 42n), false);
 });
 
+test('extended physical Windows state retains the captured root and volume checks', () => {
+  const physicalRoot = String.raw`\\?\GLOBALROOT\Device\HarddiskVolume3\private\profile`;
+  const canonicalRoot = String.raw`C:\private\profile`;
+  const binding = { physicalRoot, canonicalRoot, volumeSerial: 42 };
+  assert.equal(canonicalHostPathMatches(`${canonicalRoot}\\media`, `${physicalRoot}\\media`, 'win32', binding, 42n), true);
+  for (const [actual, expected, captured, device] of [
+    [canonicalRoot, physicalRoot, undefined, 42n],
+    [canonicalRoot, physicalRoot, binding, 43n],
+    [canonicalRoot, physicalRoot + '\\..\\profile', binding, 42n],
+    [canonicalRoot, physicalRoot.replace('Volume3', 'Volume4'), binding, 42n],
+    [canonicalRoot.replace('C:', 'D:'), physicalRoot, binding, 42n],
+  ]) assert.equal(canonicalHostPathMatches(actual, expected, 'win32', captured, device), false);
+});
+
 
 test('all startup modes reject a noncanonical profile before any state writes', async t => {
   for (const mode of [undefined, 'server', 'database', 'checkpoint-cleanup', 'restore-prepare']) {

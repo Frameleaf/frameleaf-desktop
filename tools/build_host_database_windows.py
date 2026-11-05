@@ -166,7 +166,8 @@ def qualify(prefix: Path, output: Path, lock: dict, env: dict) -> dict:
         start()
         result["restarted"] = facts("restored_fixture")
         stop()
-        command([binary("pg_checksums"), "--check", "-D", data])
+        # Relative input keeps pg_checksums' internal slash joins off the extended Windows path.
+        run([binary("pg_checksums"), "--check", "-D", "."], cwd=data, env=client_env)
         result.update(physicalChecksumsVerified=True, backupSha256=sha256(backup), fixtureAuthentication="scram-private-loopback-only")
         return result
     except BaseException as error:

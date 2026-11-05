@@ -1092,7 +1092,14 @@ impl VerifiedHostRuntime {
         {
             return Err("host_config_invalid".into());
         }
-        if state.starts_with(&self.root) || self.root.starts_with(state) {
+        #[cfg(windows)]
+        let overlap_root = crate::windows_protection::stable_state_path(&self.root)
+            .map_err(|_| "host_runtime_path_unavailable")?;
+        #[cfg(windows)]
+        let overlap_root = overlap_root.as_path();
+        #[cfg(not(windows))]
+        let overlap_root = self.root.as_path();
+        if state.starts_with(overlap_root) || overlap_root.starts_with(state) {
             return Err("host_state_overlaps_runtime".into());
         }
         let code_lease = crate::package_lease::CodeLease::acquire(

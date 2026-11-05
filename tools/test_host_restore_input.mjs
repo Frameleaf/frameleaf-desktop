@@ -585,7 +585,8 @@ test('offline restore verification checks only the prepared cluster with the sig
             seen[0].file,
             join(c.runtime, c.entryPoints.pgChecksums),
           );
-          assert.deepEqual(seen[0].args, ['--check', '--pgdata', database]);
+          assert.deepEqual(seen[0].args, ['--check', '--pgdata', '.']);
+          assert.equal(seen[0].options.cwd, database);
           assert.equal(seen[0].options.stdio, 'ignore');
           assert.ok(!JSON.stringify(seen[0].args).includes(c.password));
           assert.equal(calls.length, priorCalls);

@@ -36,3 +36,13 @@ test('photo diagnostic classifies the pinned media idle timeout', async () => {
     : { statistics: {} } }));
   assert.deepEqual(result[0].failures, [{ categories: ['process_timeout'], sharpExitCode: null }]);
 });
+
+test('photo diagnostic distinguishes decoder input from filesystem lookup without printing paths', async () => {
+  const result = await diagnosePhoto(async (path) => ({ json: async () => path.includes('/jobs?')
+    ? [{ failedReason: 'Input file is missing: private-path' }, { failedReason: "ENOENT: no such file or directory, lstat 'private-path'" }]
+    : { statistics: {} } }));
+  assert.deepEqual(result[0].failures.map(item => item.categories), [
+    ['input_missing', 'sharp_input_missing'], ['input_missing', 'file_stat_missing'],
+  ]);
+  assert.ok(!JSON.stringify(result).includes('private-path'));
+});

@@ -160,6 +160,9 @@ class WindowsDatabaseTests(unittest.TestCase):
 
                 def command(arguments, *, cwd, env):
                     calls.append([str(arg) for arg in arguments])
+                    if Path(arguments[0]).name == "pg_checksums.exe":
+                        self.assertEqual(arguments[-2:], ["-D", "."])
+                        self.assertEqual(cwd, output / "fixture-data")
                     if Path(arguments[0]).name == "pg_ctl.exe" and arguments[-1] == "start":
                         self.fail("pg_ctl start must not capture pipes inherited by the running server")
                     self.assertEqual(len(env["PGPASSWORD"]), 64)

@@ -1,5 +1,11 @@
 const reasons = [
   ['input_missing', /Input file is missing|ENOENT|no such file or directory/i],
+  ['sharp_input_missing', /Input file is missing/],
+  ['file_open_missing', /ENOENT: no such file or directory, open\b/],
+  ['file_stat_missing', /ENOENT: no such file or directory, (?:lstat|stat)\b/],
+  ['file_rename_missing', /ENOENT: no such file or directory, rename\b/],
+  ['file_link_missing', /ENOENT: no such file or directory, link\b/],
+  ['file_mkdir_missing', /ENOENT: no such file or directory, mkdir\b/],
   ['permission_denied', /EACCES|EPERM|permission denied|access is denied/i],
   ['invalid_path', /EINVAL|ENAMETOOLONG|invalid (?:file|path|argument)/i],
   ['unsupported_image', /unsupported image|unsupported file format|corrupt|pngload|libpng/i],
