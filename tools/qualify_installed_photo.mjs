@@ -55,9 +55,10 @@ if (phase === 'upload') {
   const asset = await (await request('/api/assets', { method: 'POST', body: form }, [201])).json();
   assert.equal(asset.status, 'created');
   assert.match(asset.id, /^[0-9a-f-]{36}$/);
+  const thumbnailHash = await thumbnail(asset.id);
   assert.deepEqual(Buffer.from(await (await request('/api/assets/' + asset.id + '/original', {}, [200])).arrayBuffer()), original);
   console.log('Installed Library synthetic original readback passed');
-  await writeFile(receipt, JSON.stringify({ id: asset.id, thumbnail: await thumbnail(asset.id) }), { flag: 'wx' });
+  await writeFile(receipt, JSON.stringify({ id: asset.id, thumbnail: thumbnailHash }), { flag: 'wx' });
 } else {
   const asset = JSON.parse(await readFile(receipt, 'utf8'));
   const path = '/api/assets/' + asset.id;

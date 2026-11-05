@@ -281,11 +281,12 @@ export async function cleanupHostCheckpoint(c, supplied) {
   return { ...expected, state: "checkpoint-cleaned" };
 }
 
+/** Physical Windows paths require the native captured root, DOS mapping and volume serial. */
 export function canonicalHostPathMatches(actual, expected, platform = process.platform, binding, device) {
   // Node resolves physical Windows paths back to DOS paths; compare only the native captured mapping.
-  if (platform === "win32" && expected.startsWith("\\\\.\\GLOBALROOT\\")) {
+  if (platform === "win32" && /^\\\\[.?]\\GLOBALROOT\\/.test(expected)) {
     if (!binding || typeof binding.physicalRoot !== "string" || typeof binding.canonicalRoot !== "string" ||
-      !/^\\\\\.\\GLOBALROOT\\Device\\HarddiskVolume[1-9][0-9]*\\/.test(binding.physicalRoot) ||
+      !/^\\\\[.?]\\GLOBALROOT\\Device\\HarddiskVolume[1-9][0-9]*\\/.test(binding.physicalRoot) ||
       !/^[A-Za-z]:\\/.test(binding.canonicalRoot) || !Number.isInteger(binding.volumeSerial) ||
       binding.volumeSerial < 0 || binding.volumeSerial > 0xffffffff || device !== BigInt(binding.volumeSerial)) return false;
     const prefix = binding.physicalRoot.endsWith("\\") ? binding.physicalRoot : `${binding.physicalRoot}\\`;

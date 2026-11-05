@@ -328,6 +328,7 @@ mod native {
         }
         String::from_utf16(&buffer[..size]).map_err(|_| ERROR.into())
     }
+    /// Bind the extended state spelling to its opened DOS mapping and volume serial.
     pub(crate) fn state_path_binding(path: &Path) -> Result<super::StatePathBinding, String> {
         let file = OpenOptions::new()
             .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
@@ -339,7 +340,7 @@ mod native {
         if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
             return Err(ERROR.into());
         }
-        let physical_root = format!(r"\\.\GLOBALROOT{}", opened_path(&file, VOLUME_NAME_NT)?);
+        let physical_root = format!(r"\\?\GLOBALROOT{}", opened_path(&file, VOLUME_NAME_NT)?);
         stable_volume_root(&physical_root).ok_or(ERROR)?;
         if Path::new(&physical_root) != path {
             return Err(ERROR.into());
@@ -362,6 +363,7 @@ mod native {
         })
     }
 
+    /// Preserve the opened NT volume while allowing long descendant paths in Node and native tools.
     pub(crate) fn stable_state_path(path: &Path) -> Result<PathBuf, String> {
         let captured = match std::fs::symlink_metadata(path) {
             Ok(_) => stable_path(path),
@@ -372,8 +374,10 @@ mod native {
             }
             Err(_) => Err(ERROR.into()),
         }?;
-        stable_volume_root(captured.to_str().ok_or(ERROR)?).ok_or(ERROR)?;
-        Ok(captured)
+        let captured = captured.to_str().ok_or(ERROR)?;
+        stable_volume_root(captured).ok_or(ERROR)?;
+        let physical = captured.strip_prefix(r"\\.\").ok_or(ERROR)?;
+        Ok(PathBuf::from(format!(r"\\?\{physical}")))
     }
     /// Capture identity metadata from an already-open object, never resolve a GUID alias for execution.
     pub(crate) fn durable_name(handle: &impl AsRawHandle) -> Result<String, String> {
@@ -676,6 +680,7 @@ mod native {
                 std::env::temp_dir().join(format!("frameleaf-node-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&scratch).unwrap();
             let captured = stable_state_path(&scratch).unwrap();
+            assert!(captured.to_str().unwrap().starts_with(r"\\?\GLOBALROOT\"));
             let binding = state_path_binding(&captured).unwrap();
             let agent = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -683,7 +688,7 @@ mod native {
                 .join("runtime/host-agent.mjs");
             let agent = url::Url::from_file_path(agent).unwrap();
             let script = format!(
-                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; import {{join}} from 'node:path'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); const child=join(expected,'database'); await fs.mkdir(child,{{mode:0o700}}); for(const path of [expected,child]) if (!await isCanonicalHostPath(path, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(path),expected:path,binding}}));",
+                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; import {{spawnSync}} from 'node:child_process'; import {{join}} from 'node:path'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); const spawned=spawnSync(process.execPath,['--eval','process.exit(0)'],{{cwd:expected}}); if(spawned.status!==0) throw new Error('physical state cwd failed'); const child=join(expected,'database',...Array.from({{length:8}},(_,i)=>'attempt-'+i+'-'+'x'.repeat(32))); if(child.length<=260) throw new Error('long-path calibration failed'); await fs.mkdir(child,{{recursive:true,mode:0o700}}); for(const path of [expected,child]) if (!await isCanonicalHostPath(path, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(path),expected:path,binding}}));",
                 serde_json::to_string(agent.as_str()).unwrap(),
             );
             let output = std::process::Command::new("node")
