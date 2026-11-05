@@ -444,6 +444,13 @@ impl NativeManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(all(test, windows))]
+        if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
+            && std::env::var_os("FRAMELEAF_INSTALLED_HOST_MANIFEST").is_some()
+        {
+            command.stderr(Stdio::piped());
+        }
         let child = match &leases.code {
             Some(lease) => lease.spawn(command),
             None => command.spawn(),
@@ -477,6 +484,31 @@ impl NativeManager {
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
         };
+        #[cfg(all(test, windows))]
+        if let Some(stderr) = owner.child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stderr.take(8192).read_to_end(&mut bytes);
+                let output = String::from_utf8_lossy(&bytes);
+                // Print only known refusal codes, never child stderr or its paths.
+                for code in [
+                    "native_bootstrap_unavailable",
+                    "native_bootstrap_invalid",
+                    "native_controller_changed",
+                    "native_controller_unprotected",
+                    "native_backup_engine_changed",
+                    "native_backup_destination_invalid",
+                    "native_tls_invalid",
+                    "native_installation_changed",
+                    "ERR_MODULE_NOT_FOUND",
+                    "ERR_INVALID_ARG_VALUE",
+                ] {
+                    if output.contains(code) {
+                        eprintln!("Installed Manager diagnostic: {code}");
+                    }
+                }
+            });
+        }
         let stdout = owner
             .child
             .stdout
