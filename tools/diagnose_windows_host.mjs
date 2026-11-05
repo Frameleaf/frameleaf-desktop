@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const errors = new Set(['operation_failed', 'native_controller_changed', 'native_controller_unavailable', 'native_controller_unprotected', 'native_credentials_unavailable', 'native_start_cancelled', 'native_startup_timeout', 'native_host_pipe_failed', 'native_host_protocol_invalid', 'native_host_identity_changed', 'native_host_failed', 'native_shutdown_unconfirmed', 'native_installation_invalid']);
-const agentCodes = new Set([...readFileSync(new URL('../runtime/host-agent.mjs', import.meta.url), 'utf8').matchAll(/"((?:host|native)_[a-z_]+)"/g)].map(match => match[1]));
+const agentCodes = new Set(['host_agent_source_invalid', ...[...readFileSync(new URL('../runtime/host-agent.mjs', import.meta.url), 'utf8').matchAll(/"((?:host|native)_[a-z_]+)"/g)].map(match => match[1])]);
 const member = (value, known) => known.has(value) ? value : 'unreported';
 
 /** Report only fixed categories from the disposable runner, never journal inputs or raw stderr. */
