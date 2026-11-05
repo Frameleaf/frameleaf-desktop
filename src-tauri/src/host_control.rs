@@ -636,7 +636,9 @@ mod tests {
                 .as_str()
                 .filter(|code| {
                     code.len() <= 80
-                        && code.starts_with("host_")
+                        && ["host_", "runtime_store_", "native_"]
+                            .iter()
+                            .any(|prefix| code.starts_with(prefix))
                         && code.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
                 })
                 .unwrap_or("unreported");
