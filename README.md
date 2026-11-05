@@ -30,7 +30,7 @@ Original planning baseline: PR #140 head `a85264d9e0973cce209d7539fb9fd5045488e7
 GitHub candidate builds and the signed installer pipeline are described in
 [Desktop releases](docs/releases.md).
 
-Requires Node 22.12 or later, Rust stable and the Tauri platform prerequisites.
+Requires Node 22.18 or later, Rust stable and the Tauri platform prerequisites.
 Linux runtime builders also require patchelf 0.19.0 or later; older versions can
 corrupt initialization code when relocating shared libraries. CI pins 0.19.1.
 
