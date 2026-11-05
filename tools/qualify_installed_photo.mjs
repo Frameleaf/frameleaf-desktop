@@ -60,8 +60,8 @@ if (phase === 'upload') {
   assert.equal(asset.status, 'created');
   assert.match(asset.id, /^[0-9a-f-]{36}$/);
   const checks = await Promise.allSettled([verifyOriginal(asset.id), thumbnail(asset.id)]);
-  const failure = checks.find(result => result.status === 'rejected');
-  if (failure) throw failure.reason;
+  const failures = checks.filter(result => result.status === 'rejected');
+  if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'Installed photo qualification failed');
   await writeFile(receipt, JSON.stringify({ id: asset.id, thumbnail: checks[1].value }), { flag: 'wx' });
 } else {
   const asset = JSON.parse(await readFile(receipt, 'utf8'));
