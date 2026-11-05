@@ -112,6 +112,50 @@ jobs:
               host_fixtures = work / 'host-fixtures'
               host_fixtures.mkdir()
               report['hostEnvironmentChecks'] = qualify(relocated, host_fixtures, lock, env)
+              report['phase'] = 'installed-physical-path-environment'
+              print(report['phase'], flush=True)
+              import ctypes
+              from ctypes import wintypes
+              kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+              kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+              kernel.CreateFileW.restype = wintypes.HANDLE
+              kernel.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR,
+                                                          wintypes.DWORD, wintypes.DWORD]
+              kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+              kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+              kernel.CloseHandle.restype = wintypes.BOOL
+              def physical(path):
+                  handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
+                  if handle == ctypes.c_void_p(-1).value:
+                      raise ctypes.WinError(ctypes.get_last_error())
+                  try:
+                      buffer = ctypes.create_unicode_buffer(32768)
+                      count = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 2)
+                      if not 0 < count < len(buffer) or not buffer.value.startswith('\\Device\\'):
+                          raise RuntimeError('Expected an OS-resolved physical device path')
+                      result = Path('\\\\.\\GLOBALROOT' + buffer.value)
+                      if not os.path.samefile(path, result):
+                          raise RuntimeError('Physical directory identity mismatch')
+                      return result
+                  finally:
+                      kernel.CloseHandle(handle)
+              installed_fixtures = work / 'installed-fixtures'
+              create_private_directory(installed_fixtures)
+              create_private_directory(installed_fixtures / 'home')
+              clean_parent = {
+                  'SystemRoot': str(physical(Path(os.environ['SystemRoot']))),
+                  'PATH': '',
+                  'HOME': str(installed_fixtures / 'home'),
+                  'FRAMELEAF_BUILD_ERROR_LOG': str(root / 'command-error.log'),
+              }
+              clean_env = json.loads(run([node, '--input-type=module', '--eval', script,
+                                          physical(host), physical(installed_fixtures),
+                                          json.dumps(host_entries())], cwd=work, env=clean_parent))
+              clean_env['FRAMELEAF_BUILD_ERROR_LOG'] = str(root / 'command-error.log')
+              report['installedEnvironmentKeys'] = sorted(clean_env)
+              report['installedEnvironmentChecks'] = qualify(
+                  physical(relocated), physical(installed_fixtures), lock, clean_env)
               report['phase'] = 'database-with-raw-path'
               print(report['phase'], flush=True)
               raw_approved = {
