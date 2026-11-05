@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
@@ -25,24 +25,30 @@ const physicalRoot = physical + root.slice(temporary.length);
 const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGNQaEigKWIYtWDUglELRi0YtWDUglELRi0YtWDUglELhooFAHfgAD2FaRhWAAAAAElFTkSuQmCC', 'base64');
 const results = [];
 try {
-  await writeFile(join(root, 'source.png'), original, { flag: 'wx' });
-  assert.deepEqual(await readFile(join(physicalRoot, 'source.png')), original);
-  for (const [inputName, inputRoot] of [['ordinary', root], ['physical', physicalRoot]]) {
-    for (const [outputName, outputRoot] of [['ordinary', root], ['physical', physicalRoot]]) {
-      const result = { input: inputName, output: outputName, passed: false };
-      try {
-        const output = join(outputRoot, inputName + '-' + outputName + '.jpg');
-        await sharp(join(inputRoot, 'source.png')).resize(16, 16).jpeg().toFile(output);
-        const info = await sharp(await readFile(output)).metadata();
-        assert.equal(info.width, 16); assert.equal(info.height, 16);
-        result.passed = true;
-      } catch (error) {
-        const message = String(error?.message ?? '');
-        result.failure = message.includes('Input file is missing') ? 'sharp_input_missing'
-          : message.includes('unable to open for write') ? 'image_output_open_failed' : 'unreported';
-        result.code = ['ENOENT', 'EINVAL', 'EACCES', 'EPERM'].includes(error?.code) ? error.code : null;
+  const attempt = join('media', 'thumbs', 'a'.repeat(36), 'aa', 'bb', '.attempts', 'b'.repeat(36), 'c'.repeat(36), 'd'.repeat(36), 'e'.repeat(36));
+  const layouts = [['short', root, physicalRoot], ['attempt', join(root, attempt), join(physicalRoot, attempt)]];
+  assert.ok(layouts[1][2].length > 260);
+  for (const [layout, ordinaryRoot, deviceRoot] of layouts) {
+    await mkdir(deviceRoot, { recursive: true });
+    await writeFile(join(ordinaryRoot, 'source.png'), original, { flag: 'wx' });
+    assert.deepEqual(await readFile(join(deviceRoot, 'source.png')), original);
+    for (const [inputName, inputRoot] of [['ordinary', ordinaryRoot], ['physical', deviceRoot]]) {
+      for (const [outputName, outputRoot] of [['ordinary', ordinaryRoot], ['physical', deviceRoot]]) {
+        const result = { layout, input: inputName, output: outputName, passed: false };
+        try {
+          const output = join(outputRoot, inputName + '-' + outputName + '.jpg');
+          await sharp(join(inputRoot, 'source.png')).resize(16, 16).jpeg().toFile(output);
+          const info = await sharp(await readFile(output)).metadata();
+          assert.equal(info.width, 16); assert.equal(info.height, 16);
+          result.passed = true;
+        } catch (error) {
+          const message = String(error?.message ?? '');
+          result.failure = message.includes('Input file is missing') ? 'sharp_input_missing'
+            : message.includes('unable to open for write') ? 'image_output_open_failed' : 'unreported';
+          result.code = ['ENOENT', 'EINVAL', 'EACCES', 'EPERM'].includes(error?.code) ? error.code : null;
+        }
+        results.push(result);
       }
-      results.push(result);
     }
   }
   console.log(JSON.stringify({ diagnosticOnly: true, node: process.version, sharp: sharp.versions.sharp, nodePhysicalRead: true, results }));
