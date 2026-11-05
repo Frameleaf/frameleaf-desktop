@@ -1,0 +1,45 @@
+name: Windows image physical path qualification
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-image-paths.yml'
+      - 'tools/qualify_windows_image_paths.mjs'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  image-paths:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Obtain the production-pinned Sharp without package scripts
+        shell: pwsh
+        run: |
+          $env:FRAMELEAF_TEST_SHARP_ROOT = Join-Path $env:RUNNER_TEMP 'frameleaf-sharp-probe'
+          npm install --prefix $env:FRAMELEAF_TEST_SHARP_ROOT --ignore-scripts --no-audit --no-fund --save-exact sharp@0.35.5
+          if ($LASTEXITCODE) { throw 'Sharp fixture installation failed' }
+          "FRAMELEAF_TEST_SHARP_ROOT=$env:FRAMELEAF_TEST_SHARP_ROOT" >> $env:GITHUB_ENV
+      - name: Compare ordinary and physical image paths on the same volume
+        shell: pwsh
+        run: |
+          Add-Type @'
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public static class ImageVolume {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern uint QueryDosDevice(string name, StringBuilder target, int length);
+          }
+          '@
+          $drive = Split-Path -Qualifier $env:RUNNER_TEMP
+          $device = New-Object Text.StringBuilder 32768
+          if (![ImageVolume]::QueryDosDevice($drive, $device, $device.Capacity)) { throw 'Volume lookup failed' }
+          $env:FRAMELEAF_TEST_PHYSICAL_TEMP = '\\.\GLOBALROOT' + $device.ToString() + $env:RUNNER_TEMP.Substring(2)
+          node tools/qualify_windows_image_paths.mjs
+          if ($LASTEXITCODE) { throw 'Windows image physical path qualification failed' }
