@@ -1,0 +1,91 @@
+name: Private Windows installed controller restart diagnostic
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-installed-restart-diagnostic.yml'
+      - 'src-tauri/src/host_control.rs'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      RAYON_NUM_THREADS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Obtain the exact failed installer for diagnosis only
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib, os, shutil, sys, zipfile
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from obtain_host_component import api, download, REPOSITORY_ID
+          approved = {'artifactId': 13448000522, 'archiveSha256': '7258c94b5e3de70031f86d06bd033e8247118cf6874419b7db16c02e29395735'}
+          artifact = api('actions/artifacts/13448000522')
+          run = api('actions/runs/42092166742')
+          head = '25fd779f716974b9b348526e20c91bb1577dd949'
+          assert run['status'] == 'completed' and run['conclusion'] == 'failure'
+          assert run['head_sha'] == head and run['run_attempt'] == 1
+          assert run['path'] == '.github/workflows/windows-compiled-host.yml'
+          assert run['event'] == 'workflow_dispatch' and run['head_branch'] == 'main'
+          assert all(run[key]['id'] == REPOSITORY_ID for key in ['repository', 'head_repository'])
+          assert artifact['workflow_run']['id'] == run['id'] and artifact['workflow_run']['head_sha'] == head
+          assert artifact['expired'] is False and artifact['digest'] == 'sha256:' + approved['archiveSha256']
+          assert 0 < artifact['size_in_bytes'] < 2 * 1024**3
+          root = Path(os.environ['RUNNER_TEMP']) / 'failed-restart-diagnostic'
+          root.mkdir()
+          archive = root / 'installer.zip'
+          download(approved, archive, artifact['size_in_bytes'])
+          name = 'FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe'
+          with zipfile.ZipFile(archive) as package:
+              assert package.namelist() == [name]
+              assert 0 < package.getinfo(name).file_size < 2 * 1024**3
+              with package.open(name) as source, (root / 'setup.exe').open('xb') as target:
+                  shutil.copyfileobj(source, target)
+          assert hashlib.file_digest((root / 'setup.exe').open('rb'), 'sha256').hexdigest() == '0a5848ae169f2b44b6fb339ccd017ebb923e8b5ba01fcc295094adb2dd8a8513'
+          print('Exact failed installer staged for private diagnosis; not release-qualified')
+      - name: Install the diagnostic candidate and initialize the hosted filter
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'failed-restart-diagnostic/setup.exe'
+          if (Test-Path (Join-Path $env:ProgramFiles 'Frameleaf')) { throw 'Expected a fresh package location' }
+          $install = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru -Wait
+          if ($install.ExitCode) { throw 'Diagnostic installer failed' }
+          Start-Service CldFlt -ErrorAction Continue
+          $volumes = @($env:SystemDrive, (Split-Path -Qualifier $env:RUNNER_TEMP)) | Sort-Object -Unique
+          foreach ($volume in $volumes) { fltmc.exe attach CldFlt $volume }
+          $global:LASTEXITCODE = 0
+      - run: npm ci
+      - run: npm run build
+      - name: Rust stable
+        shell: pwsh
+        run: |
+          rustup update stable
+          if ($LASTEXITCODE) { throw 'Rust toolchain update failed' }
+          rustup default stable
+          if ($LASTEXITCODE) { throw 'Rust toolchain selection failed' }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: false
+          save-if: false
+      - name: Observe the actual installed controller protocol through restart
+        shell: pwsh
+        env:
+          FRAMELEAF_INSTALLED_HOST_MANIFEST: bbc2ac89c9cf5861107e48c8e705f9f087d8e4dad9ecd177b1a3c5089583052c
+        run: |
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_control::tests::disposable_installed_controller_starts_stops_and_restarts -- --ignored --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Private installed controller restart reproduction failed' }

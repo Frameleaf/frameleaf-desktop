@@ -574,6 +574,92 @@ pub fn run() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a fresh disposable hosted Windows profile and installed companion"]
+    fn disposable_installed_controller_starts_stops_and_restarts() {
+        use std::process::{Command, Stdio};
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST").unwrap();
+        let record = crate::host_install::Installation::read(&manifest).unwrap();
+        let layout = record.layout().unwrap();
+        let (state, _) = crate::windows_host_profile::paths().unwrap();
+        assert!(!state.exists(), "never adopt an existing profile");
+        crate::windows_host_profile::prepare(&record).unwrap();
+        let state = crate::windows_protection::stable_state_path(&state).unwrap();
+        let candidate = crate::windows_protection::stable_path(&layout.runtime).unwrap();
+        let ports = [
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+        ];
+        let config = json!({"protocolVersion":1,"installationId":"a".repeat(12),
+            "candidate":candidate,"state":state,"manifestSha256":manifest,
+            "password":"synthetic-controller-restart-password-only",
+            "databasePort":ports[0].local_addr().unwrap().port(),"apiPort":ports[1].local_addr().unwrap().port()});
+        drop(ports);
+        for cycle in 1..=2 {
+            let mut command = Command::new(&layout.controller);
+            command.arg("--owner-pipe").env_clear();
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                command.env("SystemRoot", root);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            let output = child.stdout.take().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                for message in BufReader::new(output).lines() {
+                    if sender.send(message).is_err() {
+                        break;
+                    }
+                }
+            });
+            writeln!(input, "{config}").unwrap();
+            let ready: serde_json::Value = serde_json::from_str(
+                &receiver
+                    .recv_timeout(Duration::from_secs(300))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            // The controller's fixed code is safe; never print configuration or arbitrary stderr.
+            let code = ready["code"]
+                .as_str()
+                .filter(|code| {
+                    code.len() <= 80
+                        && code.starts_with("host_")
+                        && code.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+                })
+                .unwrap_or("unreported");
+            assert_eq!(
+                ready["state"], "running",
+                "Installed controller cycle {cycle}: {code}"
+            );
+            assert_eq!(ready["manifestSha256"], manifest);
+            writeln!(input, "stop").unwrap();
+            drop(input);
+            let stopped: serde_json::Value = serde_json::from_str(
+                &receiver
+                    .recv_timeout(Duration::from_secs(170))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stopped, json!({"protocolVersion":1,"state":"stopped"}));
+            assert!(child.wait().unwrap().success());
+            println!("Installed controller cycle {cycle} start and clean stop passed");
+        }
+    }
+
     #[test]
     fn checkpoint_input_is_identity_only_and_stop_or_eof_remain_immediate() {
         let operation = "11111111-1111-4111-8111-111111111111";
