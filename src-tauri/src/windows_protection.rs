@@ -669,6 +669,7 @@ mod native {
                 ]
             );
         }
+        /// Check that Node-created database state retains the native physical-path binding.
         #[test]
         fn captured_state_is_accepted_by_the_actual_node_canonical_check() {
             let scratch =

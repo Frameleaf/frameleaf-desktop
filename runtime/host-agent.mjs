@@ -936,7 +936,9 @@ export async function runHost(c, stopping, ready, restoreSession) {
       try {
         // initdb cannot recursively create physical Windows device-path ancestors.
         await fs.mkdir(data, { mode: 0o700 });
-        created = await checkpointIdentity(data, true, c.statePathBinding);
+        // Capture cleanup authority before canonical-path validation can fail.
+        created = await fs.lstat(data, { bigint: true });
+        await checkpointIdentity(data, true, c.statePathBinding);
         await command([
           executable("initdb"),
           "-D",
@@ -951,8 +953,12 @@ export async function runHost(c, stopping, ready, restoreSession) {
         ]);
       } catch (error) {
         try {
-          if (created && await checkpointIdentity(data, true, c.statePathBinding) === created)
-            await fs.rmdir(data);
+          if (created?.isDirectory() && !created.isSymbolicLink() && created.ino > 0n) {
+            const current = await fs.lstat(data, { bigint: true });
+            if (current.isDirectory() && !current.isSymbolicLink() &&
+                current.dev === created.dev && current.ino === created.ino)
+              await fs.rmdir(data);
+          }
         } catch {}
         throw error;
       } finally {
@@ -1213,7 +1219,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
         await exited(child, 5000);
       }
     await log.close();
-    if ((restoreOnly || validateOnly) && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
+    if ((restoreOnly || validateOnly) && pg && (!restoreStopped || pg.exitCode !== 0 || pg.signalCode !== null))
       stopError ??= new Error("host_restore_shutdown_unconfirmed");
     if (stopError) throw stopError;
   }

@@ -102,13 +102,42 @@ async function restoreFixture(t, run) {
 test('failed initialization removes only its own empty directory and retains partial or replaced state',async t=>{
  for(const mode of ['empty','partial','replaced'])await restoreFixture(t,async({c,binding,calls,failInitdb})=>{
   failInitdb(mode);
-  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})));
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),/host_command_failed/);
   const call=calls.find(value=>value.name==='initdb'),data=call.args[call.args.indexOf('-D')+1];
   if(mode==='empty')await assert.rejects(filesystem.lstat(data),{code:'ENOENT'});
   if(mode==='partial')assert.equal(await readFile(join(data,'partial'),'utf8'),'retain partial database');
   if(mode==='replaced')assert.ok((await filesystem.lstat(data)).isDirectory());
   await assert.rejects(readFile(join(data,'..','database-password.tmp')),{code:'ENOENT'});
   assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+test('initialization validation cleanup requires a captured native directory identity',async t=>{
+ for(const failure of ['canonical','identity'])await restoreFixture(t,async({c,binding,calls})=>{
+  const original=filesystem.realpath,originalStat=filesystem.lstat;
+  let data;
+  filesystem.realpath=async path=>{
+   if(failure==='canonical'&&!data&&String(path).startsWith(join(c.state,'restore-targets'))&&basename(String(path))==='database'){
+    data=String(path);throw Object.assign(new Error('synthetic lookup failure'),{code:'EIO'});
+   }
+   return original(path);
+  };
+  filesystem.lstat=async(path,options)=>{
+   const meta=await originalStat(path,options);
+   if(failure==='identity'&&!data&&String(path).startsWith(join(c.state,'restore-targets'))&&basename(String(path))==='database'){
+    data=String(path);throw Object.assign(new Error('synthetic identity failure'),{code:'EIO'});
+   }
+   return meta;
+  };
+  syncBuiltinESMExports();
+  try{
+   await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),{code:'EIO'});
+   assert.ok(data);assert.deepEqual(calls,[]);
+   if(failure==='canonical')await assert.rejects(filesystem.lstat(data),{code:'ENOENT'});
+   else assert.ok((await filesystem.lstat(data)).isDirectory());
+   await assert.rejects(readFile(join(data,'..','database-password.tmp')),{code:'ENOENT'});
+   assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+  }finally{filesystem.realpath=original;filesystem.lstat=originalStat;syncBuiltinESMExports();}
  });
 });
 
