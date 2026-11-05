@@ -577,6 +577,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "requires a fresh disposable hosted Windows profile and installed companion"]
+    /// Observe the native failure without Manager's error generalization, using only a fresh profile.
     fn disposable_installed_controller_starts_stops_and_restarts() {
         use std::process::{Command, Stdio};
         assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
@@ -593,14 +594,16 @@ mod tests {
         let state = crate::windows_protection::stable_state_path(&state).unwrap();
         let candidate = crate::windows_protection::stable_path(&layout.runtime).unwrap();
         let ports = [
-            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
-            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:54329").unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:2283").unwrap(),
         ];
         let config = json!({"protocolVersion":1,"installationId":"a".repeat(12),
             "candidate":candidate,"state":state,"manifestSha256":manifest,
             "password":"synthetic-controller-restart-password-only",
             "databasePort":ports[0].local_addr().unwrap().port(),"apiPort":ports[1].local_addr().unwrap().port()});
         drop(ports);
+        let receipt =
+            std::env::temp_dir().join(format!("synthetic-photo-{}.json", uuid::Uuid::new_v4()));
         for cycle in 1..=2 {
             let mut command = Command::new(&layout.controller);
             command.arg("--owner-pipe").env_clear();
@@ -636,17 +639,37 @@ mod tests {
                 .as_str()
                 .filter(|code| {
                     code.len() <= 80
-                        && ["host_", "runtime_store_", "native_"]
+                        && ["host_", "runtime_", "native_"]
                             .iter()
                             .any(|prefix| code.starts_with(prefix))
                         && code.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
                 })
                 .unwrap_or("unreported");
+            if ready["state"] != "running" {
+                eprintln!(
+                    "Synthetic state privacy admission: {:?}",
+                    crate::windows_protection::require_private_directory(&state)
+                );
+            }
             assert_eq!(
                 ready["state"], "running",
                 "Installed controller cycle {cycle}: {code}"
             );
             assert_eq!(ready["manifestSha256"], manifest);
+            let photo = Command::new("node")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../tools/qualify_installed_photo.mjs"),
+                )
+                .arg(if cycle == 1 { "upload" } else { "verify" })
+                .arg(&receipt)
+                .env(
+                    "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
+                    "Synthetic-photo-controller-restart-only",
+                )
+                .status()
+                .unwrap();
+            assert!(photo.success(), "Installed synthetic photo cycle {cycle}");
             writeln!(input, "stop").unwrap();
             drop(input);
             let stopped: serde_json::Value = serde_json::from_str(
