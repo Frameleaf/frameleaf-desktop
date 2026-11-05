@@ -497,8 +497,22 @@ impl NativeManager {
                 let mut bytes = Vec::new();
                 let _ = stderr.by_ref().take(8192).read_to_end(&mut bytes);
                 let output = String::from_utf8_lossy(&bytes);
-                // Print only known refusal codes, never child stderr or its paths.
+                eprintln!("Installed Manager stderr prefix: bytes={}", bytes.len());
+                // Print only known refusal codes and error categories, never child stderr or its paths.
                 for code in [
+                    "ZodError",
+                    "TypeError",
+                    "ReferenceError",
+                    "SyntaxError",
+                    "ERR_SQLITE_ERROR",
+                    "EACCES",
+                    "EPERM",
+                    "ENOENT",
+                    "EINVAL",
+                    "native_installation_invalid",
+                    "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+                    "ERR_INVALID_URL",
+                    "ERR_WORKER_UNSUPPORTED_OPERATION",
                     "native_bootstrap_unavailable",
                     "native_bootstrap_invalid",
                     "native_controller_changed",
@@ -517,6 +531,35 @@ impl NativeManager {
                 ] {
                     if output.contains(code) {
                         eprintln!("Installed Manager diagnostic: {code}");
+                    }
+                }
+                for file in [
+                    "main.js:",
+                    "native-service.js:",
+                    "native.js:",
+                    "store.js:",
+                    "security.js:",
+                    "backups.js:",
+                    "releases.js:",
+                ] {
+                    let line = output
+                        .match_indices(file)
+                        .filter(|(index, _)| {
+                            *index == 0
+                                || matches!(
+                                    output.as_bytes()[index - 1],
+                                    b'/' | b'\\' | b' ' | b'('
+                                )
+                        })
+                        .find_map(|(index, _)| {
+                            output[index + file.len()..]
+                                .split(':')
+                                .next()?
+                                .parse::<u32>()
+                                .ok()
+                        });
+                    if let Some(line) = line {
+                        eprintln!("Installed Manager frame: {file}{line}");
                     }
                 }
                 let _ = complete.send(());
