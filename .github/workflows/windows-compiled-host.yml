@@ -7,7 +7,11 @@ on:
         required: true
         type: string
       desktop_sha256:
-        description: 'Reviewed SHA-256 of the published Windows Desktop 0.1.1 EXE'
+        description: 'Reviewed SHA-256 of the corrected Windows Desktop 0.1.1 candidate EXE'
+        required: true
+        type: string
+      desktop_approval:
+        description: 'Immutable installer-candidates producer approval plus the reviewed Desktop sourceRevision'
         required: true
         type: string
 permissions:
@@ -27,6 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
@@ -164,19 +169,22 @@ jobs:
         run: |
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --ignored --exact --nocapture
           if ($LASTEXITCODE) { throw 'Windows private profile admission failed' }
-      - name: Exercise the companion with the published 0.1.1 Windows desktop
-        id: installed-desktop
-        shell: pwsh
+      - name: Obtain the reviewed corrected Windows Desktop candidate
+        shell: python
         env:
           GH_TOKEN: ${{ github.token }}
+          DESKTOP_APPROVAL: ${{ inputs.desktop_approval }}
           DESKTOP_SHA256: ${{ inputs.desktop_sha256 }}
         run: |
-          if ($env:DESKTOP_SHA256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'Expected a reviewed desktop SHA-256' }
-          $name = 'Frameleaf_0.1.1_x64-setup-unsigned.exe'
-          gh release download v0.1.1 --repo Frameleaf/frameleaf-desktop --pattern $name --dir $env:RUNNER_TEMP
-          if ($LASTEXITCODE) { throw 'Published desktop download failed' }
-          $setup = Join-Path $env:RUNNER_TEMP $name
-          if ((Get-FileHash $setup).Hash.ToLowerInvariant() -cne $env:DESKTOP_SHA256) { throw 'Published desktop identity changed' }
+          import sys
+          sys.path.insert(0, 'tools')
+          from windows_desktop_candidate import obtain
+          obtain()
+      - name: Exercise the companion with the corrected Windows Desktop candidate
+        id: installed-desktop
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'windows-compiled-host/desktop/setup.exe'
           $destination = Join-Path $env:RUNNER_TEMP 'FrameleafWelcome'
           $install = Start-Process $setup -ArgumentList '/S', "/D=$destination" -PassThru -Wait
           if ($install.ExitCode) { throw 'Desktop installation failed' }
@@ -204,6 +212,7 @@ jobs:
             ${{ runner.temp }}/windows-compiled-host/compiled-authority.json
             ${{ runner.temp }}/windows-compiled-host/candidate-producer.json
             ${{ runner.temp }}/windows-compiled-host/evidence-producer.json
+            ${{ runner.temp }}/windows-compiled-host/desktop-producer.json
             ${{ runner.temp }}/windows-compiled-host/signature-evidence/
           retention-days: 7
           if-no-files-found: warn
