@@ -24,9 +24,17 @@ const root = await mkdtemp(join(temporary, 'frameleaf-image-path-'));
 const physicalRoot = physical + root.slice(temporary.length);
 const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGNQaEigKWIYtWDUglELRi0YtWDUglELRi0YtWDUglELhooFAHfgAD2FaRhWAAAAAElFTkSuQmCC', 'base64');
 const results = [];
+let legacyDeviceLongMkdir;
 try {
   const attempt = join('media', 'thumbs', 'a'.repeat(36), 'aa', 'bb', '.attempts', 'b'.repeat(36), 'c'.repeat(36), 'd'.repeat(36), 'e'.repeat(36));
-  const layouts = [['short', root, physicalRoot], ['attempt', join(root, attempt), join(physicalRoot, attempt)]];
+  try {
+    await mkdir(join(physicalRoot, attempt), { recursive: true });
+    legacyDeviceLongMkdir = 'passed';
+  } catch (error) {
+    legacyDeviceLongMkdir = error?.code === 'ENOENT' ? 'ENOENT' : 'unreported';
+  }
+  const extended = '\\\\?\\' + physicalRoot.slice(4);
+  const layouts = [['short', root, physicalRoot], ['attempt', join(root, attempt), join(extended, attempt)]];
   assert.ok(layouts[1][2].length > 260);
   for (const [layout, ordinaryRoot, deviceRoot] of layouts) {
     await mkdir(deviceRoot, { recursive: true });
@@ -51,6 +59,6 @@ try {
       }
     }
   }
-  console.log(JSON.stringify({ diagnosticOnly: true, node: process.version, sharp: sharp.versions.sharp, nodePhysicalRead: true, results }));
+  console.log(JSON.stringify({ diagnosticOnly: true, node: process.version, sharp: sharp.versions.sharp, nodePhysicalRead: true, legacyDeviceLongMkdir, results }));
   assert.ok(results.every(result => result.passed), 'Image library physical-path contract failed');
 } finally { await rm(root, { recursive: true, force: true }); }
