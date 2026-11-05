@@ -429,6 +429,7 @@ impl Programs<'_> {
     }
 }
 impl NativeManager {
+    /// Start the owned Manager and send its bootstrap through private stdin.
     fn spawn(
         command: &mut Command,
         input: Zeroizing<Vec<u8>>,
@@ -485,10 +486,10 @@ impl NativeManager {
             _profile_pins: leases.profiles,
         };
         #[cfg(all(test, windows))]
-        if let Some(stderr) = owner.child.stderr.take() {
+        if let Some(mut stderr) = owner.child.stderr.take() {
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
-                let _ = stderr.take(8192).read_to_end(&mut bytes);
+                let _ = stderr.by_ref().take(8192).read_to_end(&mut bytes);
                 let output = String::from_utf8_lossy(&bytes);
                 // Print only known refusal codes, never child stderr or its paths.
                 for code in [
@@ -507,6 +508,7 @@ impl NativeManager {
                         eprintln!("Installed Manager diagnostic: {code}");
                     }
                 }
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
             });
         }
         let stdout = owner
