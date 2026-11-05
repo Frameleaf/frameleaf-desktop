@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import subprocess from 'node:child_process';
-import { writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { writeFileSync, rmSync, lstatSync, readdirSync, mkdirSync, renameSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { basename } from 'node:path';
 import filesystem from 'node:fs/promises';
@@ -50,6 +50,7 @@ test('owner refuses malformed bindings, changed bytes, links and unknown restore
 });
 
 
+/** Simulate restore commands and failures while retaining the original database as a sentinel. */
 async function restoreFixture(t, run) {
  await fixture(t,async f=>{
   f.recovery.checkpoint.sourceRevision=f.c.sourceRevision;
@@ -57,16 +58,29 @@ async function restoreFixture(t, run) {
   await writeFile(join(f.path,'input','recovery.json'),JSON.stringify(f.recovery),{mode:0o600});
   await writeFile(join(f.path,'restore-intent.json'),JSON.stringify(f.binding),{mode:0o600});
   await mkdir(join(f.c.state,'database'),{mode:0o700});await writeFile(join(f.c.state,'database','sentinel'),'original database must survive',{mode:0o600});
-  const calls=[];let pg,pgData,pgReadonly=false,exists=false,failRestore=false,canonical=true,failStop=false,badReceipt=false,failValidation=false,readOnlyProof=true,postgresMajor=19,vectorVersion='0.8.7';
+  const calls=[];let pg,pgData,pgReadonly=false,exists=false,failRestore=false,initFailure=null,canonical=true,failStop=false,badReceipt=false,failValidation=false,readOnlyProof=true,postgresMajor=19,vectorVersion='0.8.7';
   const original=subprocess.spawn;
   subprocess.spawn=(file,args,options)=>{
    const name=basename(file).replace(/\.exe$/,'');calls.push({name,args,options});
    assert.ok(['initdb','postgres','pgIsready','psql','createdb','pgRestore','node','pgCtl','pg_checksums'].includes(name),'unexpected process '+name);
+   if(name==='initdb'){
+    const data=args[args.indexOf('-D')+1],meta=lstatSync(data);
+    assert.ok(meta.isDirectory()&&!meta.isSymbolicLink());assert.deepEqual(readdirSync(data),[]);
+    if(process.platform!=='win32')assert.equal(meta.mode&0o077,0);
+   }
    const child=new EventEmitter();Object.assign(child,{pid:7000+calls.length,exitCode:null,signalCode:null,stdout:new PassThrough(),stderr:new PassThrough()});
    const exit=(code=0)=>{if(child.exitCode!==null)return;child.exitCode=code;child.stdout.end();child.stderr.end();child.emit('exit',code,null);child.emit('close',code,null);};child.kill=()=>exit();
    if(name==='postgres'){pg=child;pgData=args[args.indexOf('-D')+1];pgReadonly=args.includes('default_transaction_read_only=on');exists=pgReadonly;writeFileSync(join(pgData,'postmaster.pid'),String(child.pid)+'\n');}
    else queueMicrotask(()=>{
-    if(name==='initdb'){mkdirSync(args[args.indexOf('-D')+1],{mode:0o700});writeFileSync(join(args[args.indexOf('-D')+1],'PG_VERSION'),'19');}
+    if(name==='initdb'){
+     const data=args[args.indexOf('-D')+1];
+     if(initFailure){
+      if(initFailure==='partial')writeFileSync(join(data,'partial'),'retain partial database');
+      if(initFailure==='replaced'){renameSync(data,data+'-replaced');mkdirSync(data,{mode:0o700});}
+      exit(1);return;
+     }
+     writeFileSync(join(data,'PG_VERSION'),'19');
+    }
     if(name==='psql')child.stdout.write(args.at(-1).includes('pg_database')?(exists?'1\n':'\n'):JSON.stringify({postgresMajor,vectorVersion,canonical,...(args.at(-1).includes('transaction_read_only')?{readOnly:pgReadonly&&readOnlyProof}:{})})+'\n');
     if(name==='createdb')exists=true;
     if(name==='pgRestore'&&!args.includes('--list')&&failRestore){failRestore=false;exit(1);return;}
@@ -81,10 +95,52 @@ async function restoreFixture(t, run) {
    });
    return child;
   };syncBuiltinESMExports();
-  try{await run({...f,calls,failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;},invalidValidationReceipt:()=>{badReceipt=true;},failValidation:()=>{failValidation=true;},invalidReadOnly:()=>{readOnlyProof=false;},invalidPgVersion:()=>{postgresMajor=18;},invalidVector:()=>{vectorVersion='0.8.6';}});}
+  try{await run({...f,calls,failInitdb:mode=>{initFailure=mode;},failRestore:()=>{failRestore=true;},invalidSchema:()=>{canonical=false;},failStop:()=>{failStop=true;},invalidValidationReceipt:()=>{badReceipt=true;},failValidation:()=>{failValidation=true;},invalidReadOnly:()=>{readOnlyProof=false;},invalidPgVersion:()=>{postgresMajor=18;},invalidVector:()=>{vectorVersion='0.8.6';}});}
   finally{subprocess.spawn=original;syncBuiltinESMExports();pg?.kill();}
  });
 }
+
+test('failed initialization removes only its own empty directory and retains partial or replaced state',async t=>{
+ for(const mode of ['empty','partial','replaced'])await restoreFixture(t,async({c,binding,calls,failInitdb})=>{
+  failInitdb(mode);
+  await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),/host_command_failed/);
+  const call=calls.find(value=>value.name==='initdb'),data=call.args[call.args.indexOf('-D')+1];
+  if(mode==='empty')await assert.rejects(filesystem.lstat(data),{code:'ENOENT'});
+  if(mode==='partial')assert.equal(await readFile(join(data,'partial'),'utf8'),'retain partial database');
+  if(mode==='replaced')assert.ok((await filesystem.lstat(data)).isDirectory());
+  await assert.rejects(readFile(join(data,'..','database-password.tmp')),{code:'ENOENT'});
+  assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+ });
+});
+
+test('initialization validation cleanup requires a captured native directory identity',async t=>{
+ for(const failure of ['canonical','identity'])await restoreFixture(t,async({c,binding,calls})=>{
+  const original=filesystem.realpath,originalStat=filesystem.lstat;
+  let data;
+  filesystem.realpath=async path=>{
+   if(failure==='canonical'&&!data&&String(path).startsWith(join(c.state,'restore-targets'))&&basename(String(path))==='database'){
+    data=String(path);throw Object.assign(new Error('synthetic lookup failure'),{code:'EIO'});
+   }
+   return original(path);
+  };
+  filesystem.lstat=async(path,options)=>{
+   const meta=await originalStat(path,options);
+   if(failure==='identity'&&!data&&String(path).startsWith(join(c.state,'restore-targets'))&&basename(String(path))==='database'){
+    data=String(path);throw Object.assign(new Error('synthetic identity failure'),{code:'EIO'});
+   }
+   return meta;
+  };
+  syncBuiltinESMExports();
+  try{
+   await assert.rejects(owner.restoreHostDatabase(c,binding,new Promise(()=>{})),{code:'EIO'});
+   assert.ok(data);assert.deepEqual(calls,[]);
+   if(failure==='canonical')await assert.rejects(filesystem.lstat(data),{code:'ENOENT'});
+   else assert.ok((await filesystem.lstat(data)).isDirectory());
+   await assert.rejects(readFile(join(data,'..','database-password.tmp')),{code:'ENOENT'});
+   assert.equal(await readFile(join(c.state,'database','sentinel'),'utf8'),'original database must survive');
+  }finally{filesystem.realpath=original;filesystem.lstat=originalStat;syncBuiltinESMExports();}
+ });
+});
 
 test('restore creates and validates a fresh cluster, drains it, and retains the original database',async t=>{
  await restoreFixture(t,async({c,binding,calls})=>{

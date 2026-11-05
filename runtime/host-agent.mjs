@@ -770,6 +770,7 @@ export async function readHostDatabase(profile, supplied, pathBinding) {
   } catch { fail("host_database_reference_invalid"); }
 }
 
+/** Keep initialization and shutdown inside one validated private profile. */
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
   const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
@@ -931,7 +932,13 @@ export async function runHost(c, stopping, ready, restoreSession) {
       }
       const passwordFile = join(c.state, "database-password.tmp");
       await fs.writeFile(passwordFile, c.password, { flag: "wx", mode: 0o600 });
+      let created;
       try {
+        // initdb cannot recursively create physical Windows device-path ancestors.
+        await fs.mkdir(data, { mode: 0o700 });
+        // Capture cleanup authority before canonical-path validation can fail.
+        created = await fs.lstat(data, { bigint: true });
+        await checkpointIdentity(data, true, c.statePathBinding);
         await command([
           executable("initdb"),
           "-D",
@@ -944,6 +951,16 @@ export async function runHost(c, stopping, ready, restoreSession) {
           "--auth-host=scram-sha-256",
           `--pwfile=${passwordFile}`,
         ]);
+      } catch (error) {
+        try {
+          if (created?.isDirectory() && !created.isSymbolicLink() && created.ino > 0n) {
+            const current = await fs.lstat(data, { bigint: true });
+            if (current.isDirectory() && !current.isSymbolicLink() &&
+                current.dev === created.dev && current.ino === created.ino)
+              await fs.rmdir(data);
+          }
+        } catch {}
+        throw error;
       } finally {
         await fs.rm(passwordFile, { force: true });
       }
@@ -1202,7 +1219,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
         await exited(child, 5000);
       }
     await log.close();
-    if ((restoreOnly || validateOnly) && (!restoreStopped || pg?.exitCode !== 0 || pg?.signalCode !== null))
+    if ((restoreOnly || validateOnly) && pg && (!restoreStopped || pg.exitCode !== 0 || pg.signalCode !== null))
       stopError ??= new Error("host_restore_shutdown_unconfirmed");
     if (stopError) throw stopError;
   }

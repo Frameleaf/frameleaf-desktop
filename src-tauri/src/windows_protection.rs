@@ -669,6 +669,7 @@ mod native {
                 ]
             );
         }
+        /// Check that Node-created database state retains the native physical-path binding.
         #[test]
         fn captured_state_is_accepted_by_the_actual_node_canonical_check() {
             let scratch =
@@ -682,7 +683,7 @@ mod native {
                 .join("runtime/host-agent.mjs");
             let agent = url::Url::from_file_path(agent).unwrap();
             let script = format!(
-                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); if (!await isCanonicalHostPath(expected, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(expected),expected,binding}}));",
+                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; import {{join}} from 'node:path'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); const child=join(expected,'database'); await fs.mkdir(child,{{mode:0o700}}); for(const path of [expected,child]) if (!await isCanonicalHostPath(path, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(path),expected:path,binding}}));",
                 serde_json::to_string(agent.as_str()).unwrap(),
             );
             let output = std::process::Command::new("node")
