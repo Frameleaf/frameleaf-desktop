@@ -29,3 +29,10 @@ test('photo diagnostic preserves the original failure when endpoints are unavail
     { name: 'metadataExtraction', readable: false }, { name: 'thumbnailGeneration', readable: false },
   ]);
 });
+
+test('photo diagnostic classifies the pinned media idle timeout', async () => {
+  const result = await diagnosePhoto(async (path) => ({ json: async () => path.includes('/jobs?')
+    ? [{ failedReason: 'Media process stopped making progress' }]
+    : { statistics: {} } }));
+  assert.deepEqual(result[0].failures, [{ categories: ['process_timeout'], sharpExitCode: null }]);
+});

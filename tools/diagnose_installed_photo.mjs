@@ -5,7 +5,7 @@ const reasons = [
   ['unsupported_image', /unsupported image|unsupported file format|corrupt|pngload|libpng/i],
   ['missing_module', /MODULE_NOT_FOUND|Cannot find (?:module|package)|Could not load the .sharp. module/i],
   ['sharp_child_closed', /Sharp child closed/],
-  ['process_timeout', /timed out|timeout|deadline|idle child/i],
+  ['process_timeout', /timed out|timeout|deadline|idle child|Media process stopped making progress/i],
   ['source_changed', /source changed|lost its claim|lease expired/i],
   ['resource_limit', /resource limit|too large|capacity/i],
 ];
