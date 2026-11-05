@@ -204,11 +204,12 @@ jobs:
           powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe')
           if ($LASTEXITCODE) { throw 'Installed Welcome check failed' }
       - name: Retain private candidate artifacts
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-desktop-shell-${{ runner.os }}
           path: src-tauri/target/debug/bundle/
-          retention-days: 7
+          retention-days: 1
           if-no-files-found: error
 
   directory-probe:
