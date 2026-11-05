@@ -455,6 +455,18 @@ impl NativeManager {
             && std::env::var_os("FRAMELEAF_INSTALLED_HOST_MANIFEST").is_some()
         {
             command.stderr(Stdio::piped());
+            let audit = url::Url::from_file_path(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tools/audit_installed_controller.cjs"),
+            )
+            .map_err(|_| "native_manager_launch_failed")?;
+            command.env(
+                "NODE_OPTIONS",
+                format!(
+                    "{} --import={audit}",
+                    crate::windows_protection::NODE_PATH_OPTIONS
+                ),
+            );
         }
         let child = match &leases.code {
             Some(lease) => lease.spawn(command),
@@ -500,6 +512,19 @@ impl NativeManager {
                 let _ = stderr.by_ref().take(8192).read_to_end(&mut bytes);
                 let output = String::from_utf8_lossy(&bytes);
                 eprintln!("Installed Manager stderr prefix: bytes={}", bytes.len());
+                for code in output
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("Installed controller refusal: "))
+                {
+                    if code.len() <= 80
+                        && ["host_", "runtime_", "native_"]
+                            .iter()
+                            .any(|prefix| code.starts_with(prefix))
+                        && code.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+                    {
+                        eprintln!("Installed controller refusal: {code}");
+                    }
+                }
                 // Print only known refusal codes and error categories, never child stderr or its paths.
                 for code in [
                     "ZodError",

@@ -4,6 +4,10 @@ on:
     paths:
       - '.github/workflows/windows-installed-restart-diagnostic.yml'
       - 'src-tauri/src/host_control.rs'
+      - 'src-tauri/src/host_setup.rs'
+      - 'src-tauri/src/manager_host.rs'
+      - 'tools/audit_installed_controller.cjs'
+      - 'tools/test_audit_installed_controller.cjs'
 permissions:
   contents: read
   actions: read
@@ -68,6 +72,7 @@ jobs:
           $volumes = @($env:SystemDrive, (Split-Path -Qualifier $env:RUNNER_TEMP)) | Sort-Object -Unique
           foreach ($volume in $volumes) { fltmc.exe attach CldFlt $volume }
           $global:LASTEXITCODE = 0
+      - run: node --test tools/test_audit_installed_controller.cjs
       - run: npm ci
       - run: npm run build
       - name: Rust stable
@@ -82,10 +87,10 @@ jobs:
           workspaces: src-tauri -> target
           cache-bin: false
           save-if: false
-      - name: Observe the actual installed controller protocol through restart
+      - name: Observe the actual installed Manager control path through restart
         shell: pwsh
         env:
           FRAMELEAF_INSTALLED_HOST_MANIFEST: bbc2ac89c9cf5861107e48c8e705f9f087d8e4dad9ecd177b1a3c5089583052c
         run: |
-          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_control::tests::disposable_installed_controller_starts_stops_and_restarts -- --ignored --exact --nocapture
-          if ($LASTEXITCODE) { throw 'Private installed controller restart reproduction failed' }
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_setup::tests::disposable_installed_manager_controls_photo_restart -- --ignored --exact --nocapture
+          if ($LASTEXITCODE) { throw 'Private installed Manager restart reproduction failed' }

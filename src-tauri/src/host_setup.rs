@@ -562,6 +562,127 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "requires a fresh disposable hosted Windows profile and installed companion"]
+    async fn disposable_installed_manager_controls_photo_restart() {
+        use crate::manager::{Action, Command, SavedManager};
+        use std::{path::Path, process::Command as Process, time::Instant};
+        use uuid::Uuid;
+        use zeroize::Zeroizing;
+
+        async fn control(
+            saved: &SavedManager,
+            identity: &crate::connection::DeviceIdentity,
+            action: Action,
+            password: &str,
+        ) -> Result<(), String> {
+            let name = match action {
+                Action::Start => "start",
+                Action::Restart => "restart",
+                Action::Stop => "stop",
+                _ => unreachable!(),
+            };
+            if matches!(action, Action::Restart | Action::Stop) {
+                crate::manager::reauthenticate(saved, password.into()).await?;
+            }
+            let accepted = crate::manager::send(
+                saved,
+                identity,
+                Command::Control {
+                    action,
+                    key: Uuid::new_v4(),
+                },
+            )
+            .await?;
+            let id = Uuid::parse_str(
+                accepted["id"]
+                    .as_str()
+                    .ok_or("installed_manager_reply_invalid")?,
+            )
+            .map_err(|_| "installed_manager_reply_invalid")?;
+            let deadline = Instant::now() + Duration::from_secs(360);
+            loop {
+                let operation =
+                    crate::manager::send(saved, identity, Command::Operation { id }).await?;
+                match operation["state"].as_str() {
+                    Some("complete") => {
+                        println!("Installed Manager {name} completed");
+                        return Ok(());
+                    }
+                    Some("failed" | "interrupted") => {
+                        println!("Installed Manager {name} failed");
+                        return Err("installed_manager_operation_failed".into());
+                    }
+                    _ => {}
+                }
+                if Instant::now() >= deadline {
+                    return Err("installed_manager_operation_timeout".into());
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        }
+
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST").unwrap();
+        let (state, _) = crate::windows_host_profile::paths().unwrap();
+        assert!(!state.exists(), "never adopt an existing profile");
+        assert!(
+            crate::credentials::load::<SavedManager>(crate::manager::CREDENTIAL)
+                .unwrap()
+                .is_none()
+        );
+        let setup = HostSetup::default();
+        let password = Zeroizing::new(format!("Synthetic-Manager-{}!", Uuid::new_v4()));
+        let receipt =
+            std::env::temp_dir().join(format!("synthetic-manager-photo-{}.json", Uuid::new_v4()));
+        let result: Result<(), String> = async {
+            setup.provision(manifest.clone()).await?;
+            setup.start(manifest).await?;
+            setup.authorize(password.clone(), false).await?;
+            let saved = crate::credentials::load::<SavedManager>(crate::manager::CREDENTIAL)?
+                .ok_or("manager_pairing_required")?;
+            let identity = crate::credentials::identity()?;
+            for (action, phase) in [
+                (Action::Start, Some("upload")),
+                (Action::Restart, Some("verify")),
+                (Action::Stop, None),
+            ] {
+                control(&saved, &identity, action, &password).await?;
+                if let Some(phase) = phase {
+                    let status = Process::new("node")
+                        .arg(
+                            Path::new(env!("CARGO_MANIFEST_DIR"))
+                                .join("../tools/qualify_installed_photo.mjs"),
+                        )
+                        .arg(phase)
+                        .arg(&receipt)
+                        .env(
+                            "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
+                            "Synthetic-photo-manager-restart-only",
+                        )
+                        .status()
+                        .map_err(|_| "installed_photo_tool_unavailable")?;
+                    if !status.success() {
+                        return Err("installed_photo_verification_failed".into());
+                    }
+                }
+            }
+            crate::manager::disconnect(&saved, password.to_string()).await?;
+            Ok(())
+        }
+        .await;
+        let stopped = setup.stop().await;
+        drop(setup);
+        crate::credentials::delete(crate::manager::CREDENTIAL).unwrap();
+        result.expect("installed Manager lifecycle diagnostic failed");
+        stopped.expect("installed Manager shutdown failed");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     #[ignore = "requires an installed companion on a disposable hosted runner"]
     async fn disposable_runner_diagnoses_installed_manager_start() {
         assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
