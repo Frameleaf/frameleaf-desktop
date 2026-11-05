@@ -26,6 +26,7 @@ async function request(path, options, statuses) {
 function postJson(path, data) {
   return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }, [201]);
 }
+/** Require a processed image; report redacted queue diagnostics if it never appears. */
 async function thumbnail(id) {
   for (let i = 0; i < 90; i++) {
     const response = await request('/api/assets/' + id + '/thumbnail?size=thumbnail', {}, [200, 404]);
