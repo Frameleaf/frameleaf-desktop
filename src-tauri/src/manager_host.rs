@@ -543,8 +543,9 @@ impl NativeManager {
                     "releases.js:",
                 ] {
                     let line = output
-                        .split_once(file)
-                        .and_then(|(_, suffix)| suffix.split(':').next()?.parse::<u32>().ok());
+                        .split(file)
+                        .skip(1)
+                        .find_map(|suffix| suffix.split(':').next()?.parse::<u32>().ok());
                     if let Some(line) = line {
                         eprintln!("Installed Manager frame: {file}{line}");
                     }
