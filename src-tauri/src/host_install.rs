@@ -238,18 +238,16 @@ pub fn verify_installed_program(
         if crate::windows_protection::stable_path(&executable)? != layout.controller {
             return Err("host_install_controller_changed".into());
         }
-        match program {
-            "controller" => {}
-            "restic" => crate::manager_host::protect(
-                &layout
-                    .runtime
-                    .join("payload")
-                    .join("backup")
-                    .join("restic.exe"),
-                &mut BTreeSet::new(),
-            )?,
+        let target = match program {
+            "controller" => layout.controller,
+            "restic" => layout
+                .runtime
+                .join("payload")
+                .join("backup")
+                .join("restic.exe"),
             _ => return Err("host_install_program_invalid".into()),
-        }
+        };
+        crate::manager_host::protect(&target, &mut BTreeSet::new())?;
         Ok(serde_json::json!({"protocolVersion": 1, "state": "protected"}))
     }
     #[cfg(not(windows))]
