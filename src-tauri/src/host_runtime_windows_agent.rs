@@ -328,6 +328,8 @@ fn run_command(program: &Path, arguments: &[&OsStr]) -> Result<u32, String> {
                 return Err(error);
             }
         };
+        #[cfg(test)]
+        tests::assert_child_token(child.as_raw_handle());
         // The child cannot run before its kill-on-close owner is installed.
         if ResumeThread(thread.as_raw_handle()) == u32::MAX
             || WaitForSingleObject(child.as_raw_handle(), INFINITE) != WAIT_OBJECT_0
@@ -376,6 +378,108 @@ mod tests {
                 <= bytes as usize
         );
         unsafe { std::slice::from_raw_parts(value.Privileges.as_ptr(), count) }.to_vec()
+    }
+
+    /// Inspect the created child's token before it can execute any fixture code.
+    pub(super) fn assert_child_token(child: windows_sys::Win32::Foundation::HANDLE) {
+        use windows_sys::Win32::Security::{
+            Authorization::ConvertSidToStringSidW, CheckTokenMembership, DuplicateTokenEx,
+            GetTokenInformation, LookupPrivilegeValueW, SecurityImpersonation, TokenImpersonation,
+            TokenUser, TOKEN_USER,
+        };
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(child, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw) },
+            0
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut buffer = [0usize; 128];
+        let mut bytes = 0;
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buffer) as u32,
+                    &mut bytes,
+                )
+            },
+            0
+        );
+        assert!(bytes as usize <= std::mem::size_of_val(&buffer));
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut text = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) },
+            0
+        );
+        let allocation = Local(text.cast());
+        let length = (0..256)
+            .find(|index| unsafe { *text.add(*index) == 0 })
+            .unwrap();
+        let actual =
+            String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) }).unwrap();
+        assert_eq!(
+            actual,
+            crate::windows_protection::process_user_sid().unwrap()
+        );
+        drop(allocation);
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                DuplicateTokenEx(
+                    token.as_raw_handle(),
+                    TOKEN_QUERY,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut raw,
+                )
+            },
+            0
+        );
+        let membership = unsafe { OwnedHandle::from_raw_handle(raw) };
+        for kind in [WinBuiltinAdministratorsSid, WinBuiltinPowerUsersSid] {
+            let mut sid = [0u32; 17];
+            let mut size = std::mem::size_of_val(&sid) as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        kind,
+                        std::ptr::null_mut(),
+                        sid.as_mut_ptr().cast(),
+                        &mut size,
+                    )
+                },
+                0
+            );
+            let mut member = 1;
+            assert_ne!(
+                unsafe {
+                    CheckTokenMembership(
+                        membership.as_raw_handle(),
+                        sid.as_mut_ptr().cast(),
+                        &mut member,
+                    )
+                },
+                0
+            );
+            assert_eq!(member, 0);
+        }
+        let name: Vec<u16> = "SeChangeNotifyPrivilege"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut notify = windows_sys::Win32::Foundation::LUID::default();
+        assert_ne!(
+            unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut notify) },
+            0
+        );
+        assert!(privileges(&token)
+            .iter()
+            .all(|entry| entry.Luid.HighPart == notify.HighPart
+                && entry.Luid.LowPart == notify.LowPart));
     }
 
     #[test]
@@ -491,21 +595,26 @@ mod tests {
     }
 
     #[test]
-    /// Restriction must preserve the profile's user identity while removing administrator membership.
-    fn actual_child_has_no_administrator_role_and_preserves_exit_status() {
-        let shell = crate::windows_protection::system_root()
-            .unwrap()
-            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let expected = crate::windows_protection::process_user_sid().unwrap();
-        let script = format!("$i=[Security.Principal.WindowsIdentity]::GetCurrent(); if ($i.User.Value -ne '{expected}' -or ([Security.Principal.WindowsPrincipal]$i).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ exit 91 }}; exit 37");
+    /// Calibrate the supervisor with the shipped Node loader and the actual child's restricted token.
+    fn actual_node_child_has_restricted_token_and_preserves_exit_status() {
+        use sha2::{Digest, Sha256};
+        let output = std::process::Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let node = crate::windows_protection::stable_path(Path::new(
+            String::from_utf8(output.stdout).unwrap().trim(),
+        ))
+        .unwrap();
+        // Match the executable pin in tools/build_host_windows_support.py.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(std::fs::read(&node).unwrap())),
+            "a619e2e09eb0d50ef4c733d678b4d22689d2afef138cd67fd3fa107b535f8819"
+        );
         let code = run_command(
-            &shell,
-            &[
-                OsStr::new("-NoProfile"),
-                OsStr::new("-NonInteractive"),
-                OsStr::new("-Command"),
-                OsStr::new(&script),
-            ],
+            &node,
+            &[OsStr::new("--eval"), OsStr::new("process.exit(37)")],
         )
         .unwrap();
         assert_eq!(code, 37);

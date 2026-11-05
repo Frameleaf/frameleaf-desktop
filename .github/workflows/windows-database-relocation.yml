@@ -200,13 +200,16 @@ jobs:
                           if pg.poll() is None:
                               subprocess.run([binary('pg_ctl'), '-D', data, '-m', 'fast', '-w', '-t', '20', 'stop'],
                                              cwd=physical(installed_fixtures), env=clean_env,
-                                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=30)
+                                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
+                          elif ready:
+                              raise RuntimeError('Direct PostgreSQL exited before cleanup: ' + str(pg.returncode))
                       finally:
                           try:
                               pg.wait(timeout=10)
                           except subprocess.TimeoutExpired:
                               pg.kill()
                               pg.wait(timeout=10)
+                              raise RuntimeError('Direct PostgreSQL required forced shutdown')
               report['phase'] = 'database-with-raw-path'
               print(report['phase'], flush=True)
               raw_approved = {
