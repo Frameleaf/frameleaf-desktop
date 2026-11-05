@@ -770,6 +770,7 @@ export async function readHostDatabase(profile, supplied, pathBinding) {
   } catch { fail("host_database_reference_invalid"); }
 }
 
+/** Keep initialization and shutdown inside one validated private profile. */
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
   const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
@@ -929,11 +930,13 @@ export async function runHost(c, stopping, ready, restoreSession) {
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
       }
-      // initdb cannot recursively create physical Windows device-path ancestors.
-      await fs.mkdir(data, { mode: 0o700 });
       const passwordFile = join(c.state, "database-password.tmp");
       await fs.writeFile(passwordFile, c.password, { flag: "wx", mode: 0o600 });
+      let created;
       try {
+        // initdb cannot recursively create physical Windows device-path ancestors.
+        await fs.mkdir(data, { mode: 0o700 });
+        created = await checkpointIdentity(data, true, c.statePathBinding);
         await command([
           executable("initdb"),
           "-D",
@@ -946,6 +949,12 @@ export async function runHost(c, stopping, ready, restoreSession) {
           "--auth-host=scram-sha-256",
           `--pwfile=${passwordFile}`,
         ]);
+      } catch (error) {
+        try {
+          if (created && await checkpointIdentity(data, true, c.statePathBinding) === created)
+            await fs.rmdir(data);
+        } catch {}
+        throw error;
       } finally {
         await fs.rm(passwordFile, { force: true });
       }

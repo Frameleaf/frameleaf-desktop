@@ -126,6 +126,7 @@ jobs:
               kernel.CloseHandle.argtypes = [wintypes.HANDLE]
               kernel.CloseHandle.restype = wintypes.BOOL
               def physical(path):
+                  """Keep device-path tests bound to the original directory's OS identity."""
                   handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
                   if handle == ctypes.c_void_p(-1).value:
                       raise ctypes.WinError(ctypes.get_last_error())
