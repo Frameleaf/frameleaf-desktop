@@ -10,18 +10,20 @@ use std::{
     time::Duration,
 };
 use windows_sys::Win32::{
-    Foundation::{DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0},
+    Foundation::{
+        DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_INSUFFICIENT_BUFFER,
+        GENERIC_ALL, WAIT_OBJECT_0,
+    },
     Security::{
         Authorization::{
-            ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo,
-            EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
-            TRUSTEE_W,
+            ConvertStringSidToSidW, SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+            TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
         },
-        CreateRestrictedToken, CreateWellKnownSid, WinBuiltinAdministratorsSid,
-        WinBuiltinPowerUsersSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, NO_INHERITANCE,
-        SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+        CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, SetTokenInformation,
+        TokenDefaultDacl, WinBuiltinAdministratorsSid, WinBuiltinPowerUsersSid, ACL,
+        DISABLE_MAX_PRIVILEGE, OBJECT_INHERIT_ACE, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_QUERY,
     },
-    Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
     System::Threading::{
         CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
         InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
@@ -86,35 +88,81 @@ impl Attributes {
     }
 }
 
-/// Preserve existing token grants and let the process user access its token after administrator groups are denied.
+/// Retain an aligned, bounded copy of the ACL used for objects created by this token.
+fn default_dacl(token: &OwnedHandle) -> Result<Vec<usize>, String> {
+    let mut bytes = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenDefaultDacl,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes,
+        )
+    } != 0
+        || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+        || bytes < std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32
+        || bytes > 1_048_576
+    {
+        return Err(ERROR.into());
+    }
+    let mut buffer = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+    let capacity = std::mem::size_of_val(buffer.as_slice());
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenDefaultDacl,
+            buffer.as_mut_ptr().cast(),
+            capacity as u32,
+            &mut bytes,
+        )
+    } == 0
+        || bytes as usize > capacity
+        || (bytes as usize) < std::mem::size_of::<TOKEN_DEFAULT_DACL>()
+    {
+        return Err(ERROR.into());
+    }
+    let acl = unsafe { (*buffer.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl };
+    let offset = (acl as usize)
+        .checked_sub(buffer.as_ptr() as usize)
+        .ok_or(ERROR)?;
+    if acl.is_null()
+        || !(acl as usize).is_multiple_of(std::mem::align_of::<ACL>())
+        || offset
+            .checked_add(std::mem::size_of::<ACL>())
+            .is_none_or(|end| end > bytes as usize)
+    {
+        return Err(ERROR.into());
+    }
+    let size = usize::from(unsafe { (*acl).AclSize });
+    if size < std::mem::size_of::<ACL>()
+        || offset
+            .checked_add(size)
+            .is_none_or(|end| end > bytes as usize)
+    {
+        return Err(ERROR.into());
+    }
+    Ok(buffer)
+}
+
+/// Preserve default object grants and keep new objects accessible after administrator groups are denied.
 fn grant_token_user(token: &OwnedHandle) -> Result<(), String> {
     let name: Vec<u16> = crate::windows_protection::process_user_sid()?
         .encode_utf16()
         .chain(Some(0))
         .collect();
+    let defaults = default_dacl(token)?;
+    let previous = unsafe { (*defaults.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl };
     let mut sid = Local(std::ptr::null_mut());
-    let mut descriptor = Local(std::ptr::null_mut());
     let mut acl = Local(std::ptr::null_mut());
-    let mut previous = std::ptr::null_mut();
     unsafe {
-        if ConvertStringSidToSidW(name.as_ptr(), &mut sid.0) == 0
-            || GetSecurityInfo(
-                token.as_raw_handle(),
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut previous,
-                std::ptr::null_mut(),
-                &mut descriptor.0,
-            ) != 0
-        {
+        if ConvertStringSidToSidW(name.as_ptr(), &mut sid.0) == 0 {
             return Err(ERROR.into());
         }
         let entry = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: TOKEN_ALL_ACCESS,
+            grfAccessPermissions: GENERIC_ALL,
             grfAccessMode: GRANT_ACCESS,
-            grfInheritance: NO_INHERITANCE,
+            grfInheritance: OBJECT_INHERIT_ACE,
             Trustee: TRUSTEE_W {
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_USER,
@@ -125,16 +173,18 @@ fn grant_token_user(token: &OwnedHandle) -> Result<(), String> {
         let mut updated = std::ptr::null_mut();
         let result = SetEntriesInAclW(1, &entry, previous, &mut updated);
         acl.0 = updated.cast();
-        if result != 0
-            || SetSecurityInfo(
-                token.as_raw_handle(),
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                updated,
-                std::ptr::null_mut(),
-            ) != 0
+        if result != 0 {
+            return Err(ERROR.into());
+        }
+        let defaults = TOKEN_DEFAULT_DACL {
+            DefaultDacl: updated,
+        };
+        if SetTokenInformation(
+            token.as_raw_handle(),
+            TokenDefaultDacl,
+            (&defaults as *const TOKEN_DEFAULT_DACL).cast(),
+            std::mem::size_of_val(&defaults) as u32,
+        ) == 0
         {
             return Err(ERROR.into());
         }
@@ -200,7 +250,7 @@ fn restricted_token() -> Result<OwnedHandle, String> {
         let mut raw = std::ptr::null_mut();
         if OpenProcessToken(
             GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | READ_CONTROL | WRITE_DAC,
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
             &mut raw,
         ) == 0
         {
@@ -383,9 +433,10 @@ mod tests {
     /// Inspect the created child's token before it can execute any fixture code.
     pub(super) fn assert_child_token(child: windows_sys::Win32::Foundation::HANDLE) {
         use windows_sys::Win32::Security::{
-            Authorization::ConvertSidToStringSidW, CheckTokenMembership, DuplicateTokenEx,
-            GetTokenInformation, LookupPrivilegeValueW, SecurityImpersonation, TokenImpersonation,
-            TokenUser, TOKEN_USER,
+            Authorization::{ConvertSidToStringSidW, GetExplicitEntriesFromAclW},
+            CheckTokenMembership, DuplicateTokenEx, EqualSid, GetTokenInformation,
+            LookupPrivilegeValueW, SecurityImpersonation, TokenImpersonation, TokenUser,
+            TOKEN_USER,
         };
         let mut raw = std::ptr::null_mut();
         assert_ne!(
@@ -423,6 +474,27 @@ mod tests {
         assert_eq!(
             actual,
             crate::windows_protection::process_user_sid().unwrap()
+        );
+        drop(allocation);
+        let defaults = default_dacl(&token).unwrap();
+        let default = unsafe { (*defaults.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl };
+        let mut count = 0;
+        let mut entries = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { GetExplicitEntriesFromAclW(default, &mut count, &mut entries) },
+            0
+        );
+        let allocation = Local(entries.cast());
+        assert!(count > 0 && count <= 65536 && !entries.is_null());
+        let entries = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.grfAccessMode == GRANT_ACCESS
+                    && entry.grfAccessPermissions & GENERIC_ALL != 0
+                    && entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
+                    && unsafe { EqualSid(entry.Trustee.ptstrName.cast(), user.User.Sid) } != 0),
+            "the actual child's default object ACL must explicitly grant its user full access"
         );
         drop(allocation);
         let mut raw = std::ptr::null_mut();
