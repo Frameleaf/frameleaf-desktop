@@ -47,14 +47,14 @@ jobs:
           import subprocess
           node = shutil.which('node')
           script = "require('node:crypto').randomBytes(32); console.log('entropy-ready')"
-          result = subprocess.run(
-              [node, '-e', script],
-              env={'PATH': '', 'SystemRoot': os.environ['SystemRoot']},
-              capture_output=True, text=True, timeout=15,
-          )
-          print(json.dumps({'status': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr[:2048]}))
-          if result.returncode != 0 or result.stdout.strip() != 'entropy-ready':
-              raise SystemExit('Windows native crypto failed with the isolated OS environment')
+          for name, arguments, env in [
+              ('inherited', [node, '-e', script], {'PATH': '', 'SystemRoot': os.environ['SystemRoot']}),
+              ('adopted', [node, '-e', "const crypto=require('node:crypto'); process.env.SystemRoot=process.argv[1]; crypto.randomBytes(32); console.log('entropy-ready')", os.environ['SystemRoot']], {'PATH': ''}),
+          ]:
+              result = subprocess.run(arguments, env=env, capture_output=True, text=True, timeout=15)
+              print(json.dumps({'case': name, 'status': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr[:2048]}))
+              if result.returncode != 0 or result.stdout.strip() != 'entropy-ready':
+                  raise SystemExit('Windows native crypto failed with the isolated OS environment')
       - name: Check Manager staging and archive guards
         run: python -m unittest discover -s tools -p test_build_host_manager.py -v
       - name: Build the actual native Manager production component
