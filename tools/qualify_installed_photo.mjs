@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { setTimeout } from 'node:timers/promises';
+import { diagnosePhoto } from './diagnose_installed_photo.mjs';
 
 const [phase, receipt] = process.argv.slice(2);
 assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
@@ -25,6 +26,7 @@ async function request(path, options, statuses) {
 function postJson(path, data) {
   return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }, [201]);
 }
+/** Require a processed image; report redacted queue diagnostics if it never appears. */
 async function thumbnail(id) {
   for (let i = 0; i < 90; i++) {
     const response = await request('/api/assets/' + id + '/thumbnail?size=thumbnail', {}, [200, 404]);
@@ -37,6 +39,7 @@ async function thumbnail(id) {
     await response.body.cancel();
     await setTimeout(2000);
   }
+  console.log(JSON.stringify({ photoQueues: await diagnosePhoto(request) }));
   throw Error('Timed out waiting for thumbnail');
 }
 
