@@ -445,6 +445,8 @@ pub fn run() -> Result<(), String> {
         config.api_port,
         config.mode,
         Some(&mut owner),
+        #[cfg(windows)]
+        &std::env::current_exe().map_err(|_| "host_agent_start_failed")?,
     )?;
     if !process.wait_ready_or_cancel(Duration::from_secs(240), &cancelled)? {
         owner.clean_stop()?;

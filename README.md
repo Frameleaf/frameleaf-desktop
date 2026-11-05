@@ -974,7 +974,16 @@ The ignored cross-platform test `actual_postgres_restore_selection_finalization_
 exercises the compiled controller with a real synthetic PostgreSQL restore. Set
 `FRAMELEAF_TEST_HOST_PACK` to a complete measured candidate directory containing
 `manifest.json` and `payload`, and `FRAMELEAF_TEST_RESTORE_ROOT` to a new absolute
-fixture directory, then run:
+fixture directory.
+
+On Windows, also set `FRAMELEAF_TEST_HOST_CONTROLLER` to the absolute path of the
+separately built, measured and protected `frameleaf-native-host.exe`. The restore
+and photo qualification tests pass that controller explicitly; their test binaries
+do not implement the controller's internal agent command. The native controller
+can be built with `cargo build --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host`.
+Its path and ACL checks do not replace measurement of the qualification input.
+
+Then run:
 
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml --lib \

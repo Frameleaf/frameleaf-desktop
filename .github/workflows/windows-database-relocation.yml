@@ -33,8 +33,10 @@ jobs:
           import os
           from pathlib import Path
           import shutil
+          import socket
           import subprocess
           import sys
+          import time
           sys.path.insert(0, 'tools')
           from bind_host_raw import read_receipt
           from build_host_bundle import host_entries
@@ -160,6 +162,54 @@ jobs:
               report['installedSystemDrivePresent'] = 'SystemDrive' in clean_env
               report['installedEnvironmentChecks'] = qualify(
                   physical(relocated), physical(installed_fixtures), lock, clean_env)
+              report['phase'] = 'installed-direct-postgres-start'
+              print(report['phase'], flush=True)
+              with socket.socket() as listener:
+                  listener.bind(('127.0.0.1', 0))
+                  port = listener.getsockname()[1]
+              data = physical(installed_fixtures / 'fixture-data')
+              binary = lambda name: physical(relocated / 'bin' / (name + '.exe'))
+              direct_log = root / 'direct-postgres.log'
+              with direct_log.open('wb') as log:
+                  pg = subprocess.Popen([binary('postgres'), '-D', data, '-h', '127.0.0.1', '-p', str(port)],
+                                        cwd=physical(installed_fixtures), env=clean_env,
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                  try:
+                      deadline = time.monotonic() + 30
+                      ready = False
+                      while time.monotonic() < deadline:
+                          if pg.poll() is not None:
+                              log.flush()
+                              if pg.returncode != 1 or 'administrative permissions' not in direct_log.read_text():
+                                  raise RuntimeError('Unexpected direct PostgreSQL exit: ' + str(pg.returncode))
+                              report['installedDirectPostgres'] = 'administrator-token-refused'
+                              break
+                          result = subprocess.run([binary('pg_isready'), '-h', '127.0.0.1', '-p', str(port)],
+                                                  cwd=physical(installed_fixtures), env=clean_env,
+                                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=10)
+                          if result.returncode == 0:
+                              ready = True
+                              break
+                          time.sleep(0.1)
+                      if not ready and report.get('installedDirectPostgres') != 'administrator-token-refused':
+                          raise RuntimeError('Direct PostgreSQL readiness timed out')
+                      if ready:
+                          report['installedDirectPostgres'] = 'ready'
+                  finally:
+                      try:
+                          if pg.poll() is None:
+                              subprocess.run([binary('pg_ctl'), '-D', data, '-m', 'fast', '-w', '-t', '20', 'stop'],
+                                             cwd=physical(installed_fixtures), env=clean_env,
+                                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
+                          elif ready:
+                              raise RuntimeError('Direct PostgreSQL exited before cleanup: ' + str(pg.returncode))
+                      finally:
+                          try:
+                              pg.wait(timeout=10)
+                          except subprocess.TimeoutExpired:
+                              pg.kill()
+                              pg.wait(timeout=10)
+                              raise RuntimeError('Direct PostgreSQL required forced shutdown')
               report['phase'] = 'database-with-raw-path'
               print(report['phase'], flush=True)
               raw_approved = {
@@ -197,6 +247,11 @@ jobs:
                                          cwd=work, env=env, stdout=log, stderr=log, timeout=15)
               raise
           finally:
+              if 'direct_log' in locals() and direct_log.is_file():
+                  with direct_log.open('rb') as log:
+                      log.seek(max(0, direct_log.stat().st_size - 32768))
+                      tail = log.read(32768)
+                  direct_log.write_bytes(tail)
               try:
                   shutil.rmtree(work)
               except BaseException:
@@ -213,5 +268,6 @@ jobs:
             ${{ runner.temp }}/database-relocation/qualification.json
             ${{ runner.temp }}/database-relocation/command-error.log
             ${{ runner.temp }}/database-relocation/loader.log
+            ${{ runner.temp }}/database-relocation/direct-postgres.log
           retention-days: 7
           if-no-files-found: ignore

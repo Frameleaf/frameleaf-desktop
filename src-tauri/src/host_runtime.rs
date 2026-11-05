@@ -1,5 +1,10 @@
 //! Host packs have separate authority and component requirements from ML packs.
 mod reap;
+#[cfg(windows)]
+#[path = "host_runtime_windows_agent.rs"]
+mod windows_agent;
+#[cfg(windows)]
+pub use windows_agent::run as run_windows_host_agent;
 
 use crate::native_runtime::{digest_valid, relative, verify_files, Artifact};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -1023,12 +1028,14 @@ fn direct_profile(state: &Path) -> Result<(), String> {
 }
 impl VerifiedHostRuntime {
     /// Credentials are native-only; callers persist them in the OS credential store before first start.
+    /// Windows callers also supply the separately measured, protected native controller executable.
     pub fn start(
         &self,
         state: &Path,
         password: &Zeroizing<String>,
         database_port: u16,
         api_port: u16,
+        #[cfg(windows)] supervisor: &Path,
     ) -> Result<HostProcess, String> {
         self.start_mode(
             state,
@@ -1037,8 +1044,12 @@ impl VerifiedHostRuntime {
             api_port,
             HostMode::Server,
             None,
+            #[cfg(windows)]
+            supervisor,
         )
     }
+    /// Keep payload and supervisor authority explicit for production and qualification callers.
+    #[cfg_attr(windows, allow(clippy::too_many_arguments))]
     pub(crate) fn start_mode(
         &self,
         state: &Path,
@@ -1047,6 +1058,7 @@ impl VerifiedHostRuntime {
         api_port: u16,
         mode: HostMode,
         mut owner: Option<&mut crate::host_state::Owner>,
+        #[cfg(windows)] supervisor: &Path,
     ) -> Result<HostProcess, String> {
         let requested_state = state;
         #[cfg(windows)]
@@ -1133,9 +1145,30 @@ impl VerifiedHostRuntime {
         } else {
             direct_profile(state)?;
         }
-        let mut command = Command::new(self.root.join(relative(&self.manifest.entry_points.node)?));
+        let node = self.root.join(relative(&self.manifest.entry_points.node)?);
+        #[cfg(not(windows))]
+        let mut command = Command::new(&node);
+        #[cfg(not(windows))]
+        command.args(["--input-type=module", "--eval", AGENT_BOOTSTRAP]);
+        #[cfg(windows)]
+        let supervisor = crate::windows_protection::stable_path(supervisor)
+            .map_err(|_| "host_agent_start_failed")?;
+        #[cfg(windows)]
+        if !supervisor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("frameleaf-native-host.exe"))
+        {
+            return Err("host_agent_start_failed".into());
+        }
+        #[cfg(windows)]
+        crate::windows_protection::protect(&supervisor, &mut std::collections::BTreeSet::new())
+            .map_err(|_| "host_agent_start_failed")?;
+        #[cfg(windows)]
+        let mut command = Command::new(&supervisor);
+        #[cfg(windows)]
+        command.arg("--run-windows-host-agent").arg(&node);
         command
-            .args(["--input-type=module", "--eval", AGENT_BOOTSTRAP])
             .env_clear()
             .env("FRAMELEAF_HOST_AGENT", "1")
             .current_dir(state)
