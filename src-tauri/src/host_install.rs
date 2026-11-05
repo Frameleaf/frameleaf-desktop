@@ -220,6 +220,46 @@ fn verify_resources(layout: &Layout, manifest: &str, controller: &str) -> Result
     }
     Ok(())
 }
+/// Verify a fixed installed executable with the same Windows protections as Desktop.
+pub fn verify_installed_program(
+    manifest: &str,
+    controller: &str,
+    program: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        use std::collections::BTreeSet;
+        let record = Installation::read(manifest)?;
+        if record.controller_sha256 != controller {
+            return Err("host_install_controller_changed".into());
+        }
+        let layout = record.layout()?;
+        let executable = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|_| "host_install_controller_changed")?;
+        if std::fs::canonicalize(&layout.controller).ok().as_ref() != Some(&executable) {
+            return Err("host_install_controller_changed".into());
+        }
+        match program {
+            "controller" => {}
+            "restic" => crate::manager_host::protect(
+                &layout
+                    .runtime
+                    .join("payload")
+                    .join("backup")
+                    .join("restic.exe"),
+                &mut BTreeSet::new(),
+            )?,
+            _ => return Err("host_install_program_invalid".into()),
+        }
+        Ok(serde_json::json!({"protocolVersion": 1, "state": "protected"}))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller, program);
+        Err("host_install_platform_unsupported".into())
+    }
+}
 /// Installer-only fresh Windows package preparation; never starts or replaces a runtime.
 pub fn prepare_windows_package(
     manifest: &str,
