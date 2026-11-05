@@ -579,6 +579,7 @@ mod tests {
     #[ignore = "requires a fresh disposable hosted Windows profile and installed companion"]
     /// Observe the native failure without Manager's error generalization, using only a fresh profile.
     fn disposable_installed_controller_starts_stops_and_restarts() {
+        use sha2::Digest;
         use std::process::{Command, Stdio};
         assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
         assert_eq!(
@@ -588,16 +589,25 @@ mod tests {
         let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST").unwrap();
         let record = crate::host_install::Installation::read(&manifest).unwrap();
         let layout = record.layout().unwrap();
-        let (state, _) = crate::windows_host_profile::paths().unwrap();
+        let (state, data) = crate::windows_host_profile::paths().unwrap();
         assert!(!state.exists(), "never adopt an existing profile");
         crate::windows_host_profile::prepare(&record).unwrap();
-        let state = crate::windows_protection::stable_state_path(&state).unwrap();
+        let _profile_pins = crate::windows_host_profile::admit(&state, &data).unwrap();
+        let secure_id = crate::host_state::secure_installation_id(&state).unwrap();
+        let identity = serde_json::to_vec(&(
+            &record,
+            crate::windows_protection::process_user_sid().unwrap(),
+        ))
+        .unwrap();
+        let id = format!("{:x}", sha2::Sha256::digest(identity))[..12].to_owned();
+        drop(crate::host_state::Owner::acquire(&state, true).unwrap());
+        let system_root = crate::windows_protection::system_root().unwrap();
         let candidate = crate::windows_protection::stable_path(&layout.runtime).unwrap();
         let ports = [
             std::net::TcpListener::bind("127.0.0.1:54329").unwrap(),
             std::net::TcpListener::bind("127.0.0.1:2283").unwrap(),
         ];
-        let config = json!({"protocolVersion":1,"installationId":"a".repeat(12),
+        let config = json!({"protocolVersion":1,"installationId":id,"secureInstallationId":secure_id,
             "candidate":candidate,"state":state,"manifestSha256":manifest,
             "password":"synthetic-controller-restart-password-only",
             "databasePort":ports[0].local_addr().unwrap().port(),"apiPort":ports[1].local_addr().unwrap().port()});
@@ -607,9 +617,7 @@ mod tests {
         for cycle in 1..=2 {
             let mut command = Command::new(&layout.controller);
             command.arg("--owner-pipe").env_clear();
-            if let Some(root) = std::env::var_os("SystemRoot") {
-                command.env("SystemRoot", root);
-            }
+            command.env("SystemRoot", &system_root);
             let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -656,6 +664,7 @@ mod tests {
                 "Installed controller cycle {cycle}: {code}"
             );
             assert_eq!(ready["manifestSha256"], manifest);
+            assert_eq!(ready["secureInstallationId"], json!(secure_id));
             let photo = Command::new("node")
                 .arg(
                     Path::new(env!("CARGO_MANIFEST_DIR"))
