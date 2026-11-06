@@ -58,6 +58,7 @@ fn hostname(id: &str, origin: &str) -> Result<String, String> {
 }
 impl TlsIdentity {
     /// The certificate Manager last served for a profile binding, if it ever started.
+    #[cfg(unix)]
     pub(crate) fn saved_certificate(binding: &str) -> Result<Option<String>, String> {
         Ok(
             crate::credentials::load::<Self>(&account_for_profile(binding)?)?
@@ -65,6 +66,7 @@ impl TlsIdentity {
         )
     }
     /// Keep the paired Manager certificate when a profile moves to a newer package.
+    #[cfg(unix)]
     pub(crate) fn carry_forward(previous: &str, next: &str) -> Result<(), String> {
         Self::carry_forward_with(
             previous,
@@ -73,6 +75,7 @@ impl TlsIdentity {
             crate::credentials::save,
         )
     }
+    #[cfg(unix)]
     fn carry_forward_with(
         previous: &str,
         next: &str,
@@ -174,6 +177,7 @@ impl TlsIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     #[test]
     fn moved_profile_keeps_its_paired_certificate_without_replacing_a_newer_one() {
         let (old, new) = ("a".repeat(64), "b".repeat(64));

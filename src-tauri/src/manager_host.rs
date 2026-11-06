@@ -178,6 +178,7 @@ fn binding<'a>(
     })
 }
 /// Same fields and order as Manager's native descriptor, whose fingerprint is sha256(JSON).
+#[cfg(unix)]
 pub(crate) fn descriptor_fingerprint(
     config: &Configuration,
     candidate: &Path,

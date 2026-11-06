@@ -604,7 +604,7 @@ fn carry_forward(
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 struct Package<'a> {
     config: &'a Configuration,
     candidate: &'a std::path::Path,
@@ -613,7 +613,7 @@ struct Package<'a> {
 }
 
 /// Every check runs before the first change; the journal write last commits the move.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 fn move_library(
     mut owner: crate::host_state::Owner,
     previous: Package,
@@ -644,7 +644,7 @@ fn move_library(
     owner.carry_forward(id, previous.manifest, next.manifest)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 fn host_state_marker((manifest, revision): (&str, &str)) -> Result<String, String> {
     if !crate::native_runtime::digest_valid(manifest, 64)
         || !crate::native_runtime::digest_valid(revision, 40)
@@ -656,7 +656,7 @@ fn host_state_marker((manifest, revision): (&str, &str)) -> Result<String, Strin
     ))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 #[derive(Debug, PartialEq)]
 enum HostStatePackage {
     /// The host never created its database; the agent starts it fresh for any package.
@@ -666,7 +666,7 @@ enum HostStatePackage {
 }
 
 /// Read-only: which package the host agent's marker names.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 fn host_state_package(
     state: &std::path::Path,
     previous: (&str, &str),
@@ -707,7 +707,7 @@ fn host_state_package(
 }
 
 /// The host agent's package marker names the package that last ran this database.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 fn carry_host_state(
     state: &std::path::Path,
     previous: (&str, &str),

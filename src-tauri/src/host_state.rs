@@ -321,6 +321,7 @@ impl Owner {
         Ok(())
     }
     /// Read the stopped journal without taking ownership; None means a fresh profile.
+    #[cfg(unix)]
     pub(crate) fn peek(path: &Path) -> Result<Option<Marker>, String> {
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         match root.symlink_metadata(NAME) {
@@ -336,6 +337,7 @@ impl Owner {
         Ok(marker)
     }
     /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
+    #[cfg(unix)]
     pub(crate) fn check_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
         if !self.writable {
             return Err("host_controller_read_only".into());
@@ -363,6 +365,7 @@ impl Owner {
         Ok(())
     }
     /// Repoint a cleanly stopped library at a newer package. This write commits the move.
+    #[cfg(unix)]
     pub(crate) fn carry_forward(
         &mut self,
         id: &str,
