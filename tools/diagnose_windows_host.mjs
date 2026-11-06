@@ -28,7 +28,8 @@ export function diagnose(root) {
   try {
     fd = openSync(join(root, 'state', 'agent.log'), 'r');
     // The log is append-only across starts, so the latest failure is at its end.
-    const bytes = Buffer.alloc(8192);
+    // Read one byte before the window so a line starting exactly at the boundary stays complete.
+    const bytes = Buffer.alloc(8193);
     const start = Math.max(0, fstatSync(fd).size - bytes.length);
     const count = readSync(fd, bytes, 0, bytes.length, start);
     const lines = bytes.subarray(0, count).toString('utf8').split(/\r?\n/);

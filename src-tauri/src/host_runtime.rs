@@ -904,10 +904,11 @@ fn private_file(path: &Path, append: bool) -> Result<File, String> {
 }
 
 /// Keep the controller's fixed refusal code beside agent output; Manager reports only a generic failure.
+/// The leading newline terminates any partial agent line, so the code is always a whole line.
 pub(crate) fn record_failure(state: &Path, code: &str) {
     if code.len() <= 80 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
         if let Ok(mut log) = private_file(&state.join("agent.log"), true) {
-            let _ = std::io::Write::write_all(&mut log, format!("{code}\n").as_bytes());
+            let _ = std::io::Write::write_all(&mut log, format!("\n{code}\n").as_bytes());
         }
     }
 }
@@ -1593,13 +1594,13 @@ mod checkpoint_tests {
         let state =
             std::env::temp_dir().join(format!("frameleaf-failure-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&state).unwrap();
-        std::fs::write(state.join("agent.log"), "agent output\n").unwrap();
+        std::fs::write(state.join("agent.log"), "unterminated agent output").unwrap();
         record_failure(&state, "host_already_owned");
         record_failure(&state, "host_C:\\private\\path");
         record_failure(&state, &"host_".repeat(17));
         let log = std::fs::read_to_string(state.join("agent.log")).unwrap();
         std::fs::remove_dir_all(&state).unwrap();
-        assert_eq!(log, "agent output\nhost_already_owned\n");
+        assert_eq!(log, "unterminated agent output\nhost_already_owned\n");
     }
 
     fn restore_binding() -> RestoreBinding {
