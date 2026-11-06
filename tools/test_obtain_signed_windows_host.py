@@ -38,7 +38,7 @@ class SignedWindowsHostTests(unittest.TestCase):
         policy = self.policy()
         manifest = {'schemaVersion': 1, 'protocolVersion': 2, 'platform': 'windows',
                     'architecture': 'x86_64', 'epoch': 18, 'certified': False,
-                    'sourceRevision': 'c64039743af7bb0d68b602ff842683906019de52',
+                    'sourceRevision': '9f22a57adb7a271d97ead305103c094fb3d25ad2',
                     'files': {'fixture': {'bytes': 7, 'sha256': hashlib.sha256(b'fixture').hexdigest()}}}
         raw, signature = json.dumps(manifest).encode(), b's' * 64
         unsigned = {'schemaVersion': 1, 'qualification': 'passed', 'sourceRevision': manifest['sourceRevision'],

@@ -36,7 +36,7 @@ jobs:
             (.assetId|type=="number" and .>0 and .==floor) and
             ([.controllerSha256,.manifestSha256,.packageSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
           ' <<< "$APPROVAL" >/dev/null
-          PACKAGE="$RUNNER_TEMP/FrameleafCompanion_1.2.3_arm64.pkg"
+          PACKAGE="$RUNNER_TEMP/FrameleafCompanion_1.2.4_arm64.pkg"
           printf 'PACKAGE=%s\n' "$PACKAGE" >> "$GITHUB_ENV"
           asset=$(jq -r .assetId <<< "$APPROVAL")
           digest=$(jq -r .packageSha256 <<< "$APPROVAL")
@@ -98,7 +98,7 @@ jobs:
           name: frameleaf-macos-arm64-companion-installed
           compression-level: 0
           path: |
-            ${{ runner.temp }}/FrameleafCompanion_1.2.3_arm64.pkg
+            ${{ runner.temp }}/FrameleafCompanion_1.2.4_arm64.pkg
             ${{ runner.temp }}/SHA256SUMS
             ${{ runner.temp }}/installed-receipt.json
           if-no-files-found: error

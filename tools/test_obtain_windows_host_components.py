@@ -170,7 +170,7 @@ class WindowsComponentSetTests(unittest.TestCase):
                 record = json.loads(p.read_text())
                 if damage == 'bytes': (fixture / 'plugin/plugin/café-原本').write_bytes(b'tampered')
                 elif damage == 'source': record['sourceRevision'] = 'f' * 40
-                elif damage == 'old-manager': record['sourceRevision'] = SOURCE_REVISION
+                elif damage == 'old-manager': record['sourceRevision'] = '6cb1613e67a988fdfad7042c4e07be9d1bf609fc'
                 elif damage == 'platform': record['platform'] = 'linux-x64'
                 elif damage == 'archive': record['sourceArchiveSha256'] = 'f' * 64
                 elif damage == 'lock': record['lockfileSha256'] = 'f' * 64
