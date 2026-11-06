@@ -136,6 +136,82 @@ pub struct Configuration {
     pub database_port: u16,
     pub api_port: u16,
 }
+/// Manager accepts a changed package once, from the descriptor it last ran with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Transition {
+    pub operation_id: uuid::Uuid,
+    pub from_fingerprint: String,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Binding<'a> {
+    runtime: &'a str,
+    id: &'a str,
+    secure_installation_id: uuid::Uuid,
+    controller: &'a Path,
+    candidate: &'a Path,
+    state: &'a Path,
+    manifest_sha256: &'a str,
+    source_revision: &'a str,
+    certified: bool,
+    database_port: u16,
+    api_port: u16,
+}
+fn binding<'a>(
+    config: &'a Configuration,
+    candidate: &'a Path,
+    runtime: &'a crate::host_runtime::VerifiedHostRuntime,
+) -> Result<Binding<'a>, String> {
+    Ok(Binding {
+        runtime: "native",
+        id: &config.installation_id,
+        secure_installation_id: crate::host_state::secure_installation_id(&config.state)?,
+        controller: &config.controller,
+        candidate,
+        state: &config.state,
+        manifest_sha256: runtime.manifest_sha256(),
+        source_revision: runtime.source_revision(),
+        certified: runtime.certified(),
+        database_port: config.database_port,
+        api_port: config.api_port,
+    })
+}
+/// Same fields and order as Manager's native descriptor, whose fingerprint is sha256(JSON).
+pub(crate) fn descriptor_fingerprint(
+    config: &Configuration,
+    candidate: &Path,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    controller_sha256: &str,
+    certificate_pem: &str,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Descriptor<'a> {
+        protocol_version: u32,
+        installation: Binding<'a>,
+        controller_sha256: &'a str,
+        backup_engine: crate::host_runtime::BackupEngine,
+        name: &'a str,
+        release: &'a str,
+        tls_certificate_pem_sha256: String,
+    }
+    let descriptor = Descriptor {
+        protocol_version: 2,
+        installation: binding(config, candidate, runtime)?,
+        controller_sha256,
+        backup_engine: runtime.backup_engine()?,
+        name: &config.name,
+        release: &config.release,
+        tls_certificate_pem_sha256: format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
+    };
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&descriptor).map_err(|_| "native_manager_config_invalid")?
+        )
+    ))
+}
 fn protect_profile_parents(config: &Configuration) -> Result<Vec<fs::File>, String> {
     #[cfg(windows)]
     {
@@ -292,6 +368,7 @@ impl Programs<'_> {
             &profile.backup_key()?,
             &tls,
             Some(lease),
+            profile.installation_transition(),
         )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
@@ -302,7 +379,7 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
     ) -> Result<NativeManager, String> {
-        self.start_owned(config, password, backup_key, tls, None)
+        self.start_owned(config, password, backup_key, tls, None, None)
     }
     fn start_owned(
         &self,
@@ -311,6 +388,7 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
         startup_lease: Option<crate::host_state::Owner>,
+        transition: Option<&Transition>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
@@ -344,21 +422,6 @@ impl Programs<'_> {
             .map_err(|_| "native_manager_tls_invalid")?;
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Binding<'a> {
-            runtime: &'a str,
-            id: &'a str,
-            secure_installation_id: uuid::Uuid,
-            controller: &'a Path,
-            candidate: &'a Path,
-            state: &'a Path,
-            manifest_sha256: &'a str,
-            source_revision: &'a str,
-            certified: bool,
-            database_port: u16,
-            api_port: u16,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
         struct Bootstrap<'a> {
             protocol_version: u32,
             installation: Binding<'a>,
@@ -369,22 +432,12 @@ impl Programs<'_> {
             password: &'a str,
             backup_key: &'a str,
             tls: crate::manager_tls::BootstrapTls<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            installation_transition: Option<&'a Transition>,
         }
         let bootstrap = Bootstrap {
             protocol_version: 2,
-            installation: Binding {
-                runtime: "native",
-                id: &config.installation_id,
-                secure_installation_id: crate::host_state::secure_installation_id(&config.state)?,
-                controller: &config.controller,
-                candidate,
-                state: &config.state,
-                manifest_sha256: self.runtime.manifest_sha256(),
-                source_revision: self.runtime.source_revision(),
-                certified: self.runtime.certified(),
-                database_port: config.database_port,
-                api_port: config.api_port,
-            },
+            installation: binding(config, candidate, self.runtime)?,
             controller_sha256: &controller_hash,
             backup_engine: self.runtime.backup_engine()?,
             name: &config.name,
@@ -392,6 +445,7 @@ impl Programs<'_> {
             password,
             backup_key,
             tls: tls.wire(),
+            installation_transition: transition,
         };
         let mut input = Zeroizing::new(
             serde_json::to_vec(&bootstrap).map_err(|_| "native_manager_config_invalid")?,

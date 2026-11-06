@@ -57,6 +57,13 @@ fn hostname(id: &str, origin: &str) -> Result<String, String> {
         .to_owned())
 }
 impl TlsIdentity {
+    /// The certificate Manager last served for a profile binding, if it ever started.
+    pub(crate) fn saved_certificate(binding: &str) -> Result<Option<String>, String> {
+        Ok(
+            crate::credentials::load::<Self>(&account_for_profile(binding)?)?
+                .map(|saved| saved.certificate_pem.clone()),
+        )
+    }
     /// Keep the paired Manager certificate when a profile moves to a newer package.
     pub(crate) fn carry_forward(previous: &str, next: &str) -> Result<(), String> {
         Self::carry_forward_with(

@@ -27,6 +27,10 @@ pub(crate) struct Profile {
     database_password: String,
     #[serde(default)]
     backup_key: Option<String>,
+    /// Set when this profile moved from an older package; Manager accepts it idempotently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    installation_transition: Option<crate::manager_host::Transition>,
     #[serde(skip)]
     #[zeroize(skip)]
     guard: Option<ProfileGuard>,
@@ -45,6 +49,22 @@ impl Drop for ProfileGuard {
 impl Profile {
     pub(crate) fn binding(&self) -> &str {
         &self.binding_sha256
+    }
+    pub(crate) fn installation_transition(&self) -> Option<&crate::manager_host::Transition> {
+        self.installation_transition.as_ref()
+    }
+    /// The keystore binding of an existing profile for a given package, without changing it.
+    #[cfg(not(windows))]
+    pub(crate) fn binding_for(
+        config: &Configuration,
+        candidate: &Path,
+        manifest: &str,
+    ) -> Result<String, String> {
+        validate_configuration(config)?;
+        validate_paths(candidate, &config.state, &config.data)?;
+        let state = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&config.state)?);
+        let data = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&config.data)?);
+        binding_sha256(config, candidate, manifest, &state, &data)
     }
     pub(crate) fn require_current(&self, config: &Configuration) -> Result<(), String> {
         let guard = self.guard.as_ref().ok_or("native_profile_unavailable")?;
@@ -110,10 +130,12 @@ impl Profile {
     pub(crate) fn carry_forward(
         previous: (&Configuration, &Path, &str),
         next: (&Configuration, &Path, &str),
+        transition: Option<crate::manager_host::Transition>,
     ) -> Result<(String, String), String> {
         Self::carry_forward_with(
             previous,
             next,
+            transition,
             crate::credentials::load,
             crate::credentials::save,
         )
@@ -122,6 +144,7 @@ impl Profile {
     fn carry_forward_with(
         previous: (&Configuration, &Path, &str),
         next: (&Configuration, &Path, &str),
+        transition: Option<crate::manager_host::Transition>,
         load: impl Fn(&str) -> Result<Option<Self>, String>,
         persist: impl FnOnce(&str, &Self) -> Result<(), String>,
     ) -> Result<(String, String), String> {
@@ -197,6 +220,7 @@ impl Profile {
                     binding_sha256: new.clone(),
                     database_password: prior.database_password.clone(),
                     backup_key: prior.backup_key.clone(),
+                    installation_transition: transition,
                     guard: None,
                 };
                 persist(&format!("{ACCOUNT}-{new}"), &moved)?;
@@ -301,6 +325,7 @@ impl Profile {
                 binding_sha256,
                 database_password: STANDARD_NO_PAD.encode(bytes.as_ref()),
                 backup_key: Some(new_backup_key()),
+                installation_transition: None,
                 guard: None,
             };
             persist(&account, &profile)?;
@@ -647,6 +672,7 @@ mod tests {
         assert!(Profile::carry_forward_with(
             (previous.0, &previous.1, &previous.2),
             (&different, &following.1, &following.2),
+            None,
             load,
             save
         )
@@ -655,6 +681,7 @@ mod tests {
             Profile::carry_forward_with(
                 (previous.0, &previous.1, &previous.2),
                 (following.0, &following.1, &following.2),
+                None,
                 load,
                 |_, _| Err("credential_store_locked".into())
             )
@@ -664,6 +691,7 @@ mod tests {
         let (old, new) = Profile::carry_forward_with(
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
+            None,
             load,
             save,
         )
@@ -677,6 +705,7 @@ mod tests {
         Profile::carry_forward_with(
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
+            None,
             load,
             |_, _| panic!("must not move twice"),
         )
@@ -694,6 +723,7 @@ mod tests {
         assert!(Profile::carry_forward_with(
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
+            None,
             load,
             save
         )
@@ -703,6 +733,7 @@ mod tests {
             Profile::carry_forward_with(
                 (previous.0, &previous.1, &previous.2),
                 (following.0, &following.1, &following.2),
+                None,
                 |_| Ok(None),
                 save
             )

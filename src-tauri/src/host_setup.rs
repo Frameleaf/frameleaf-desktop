@@ -565,6 +565,26 @@ fn carry_forward(
     // Hold the previous package and the journal for the whole move.
     let _code = crate::package_lease::CodeLease::acquire(&previous_layout.runtime)?;
     let owner = crate::host_state::Owner::acquire(&next.state, true)?;
+    // Manager accepts the new package only from the exact descriptor it last ran with.
+    let old_binding = crate::manager_profile::Profile::binding_for(
+        &previous,
+        &previous_layout.runtime,
+        &marker.manifest_sha256,
+    )?;
+    let transition = crate::manager_tls::TlsIdentity::saved_certificate(&old_binding)?
+        .map(|certificate| -> Result<_, String> {
+            Ok(crate::manager_host::Transition {
+                operation_id: uuid::Uuid::new_v4(),
+                from_fingerprint: crate::manager_host::descriptor_fingerprint(
+                    &previous,
+                    &previous_layout.runtime,
+                    &previous_runtime,
+                    &previous_record.controller_sha256,
+                    &certificate,
+                )?,
+            })
+        })
+        .transpose()?;
     move_library(
         owner,
         Package {
@@ -579,7 +599,7 @@ fn carry_forward(
             manifest: &record.manifest_sha256,
             revision: runtime.source_revision(),
         },
-        crate::manager_profile::Profile::carry_forward,
+        |previous, next| crate::manager_profile::Profile::carry_forward(previous, next, transition),
         crate::manager_tls::TlsIdentity::carry_forward,
     )
 }
