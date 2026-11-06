@@ -27,6 +27,10 @@ pub(crate) struct Profile {
     database_password: String,
     #[serde(default)]
     backup_key: Option<String>,
+    /// Set when this profile moved from an older package; Manager accepts it idempotently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    installation_transition: Option<crate::manager_host::Transition>,
     #[serde(skip)]
     #[zeroize(skip)]
     guard: Option<ProfileGuard>,
@@ -45,6 +49,22 @@ impl Drop for ProfileGuard {
 impl Profile {
     pub(crate) fn binding(&self) -> &str {
         &self.binding_sha256
+    }
+    pub(crate) fn installation_transition(&self) -> Option<&crate::manager_host::Transition> {
+        self.installation_transition.as_ref()
+    }
+    /// The keystore binding of an existing profile for a given package, without changing it.
+    #[cfg(not(windows))]
+    pub(crate) fn binding_for(
+        config: &Configuration,
+        candidate: &Path,
+        manifest: &str,
+    ) -> Result<String, String> {
+        validate_configuration(config)?;
+        validate_paths(candidate, &config.state, &config.data)?;
+        let state = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&config.state)?);
+        let data = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&config.data)?);
+        binding_sha256(config, candidate, manifest, &state, &data)
     }
     pub(crate) fn require_current(&self, config: &Configuration) -> Result<(), String> {
         let guard = self.guard.as_ref().ok_or("native_profile_unavailable")?;
@@ -105,6 +125,155 @@ impl Profile {
             crate::credentials::save,
         )
     }
+    /// Move a stopped profile's saved credentials to a newer package; returns (previous, next) bindings.
+    #[cfg(not(windows))]
+    pub(crate) fn carry_forward(
+        previous: (&Configuration, &Path, &str),
+        next: (&Configuration, &Path, &str),
+        transition: Option<crate::manager_host::Transition>,
+    ) -> Result<(String, String), String> {
+        Self::carry_forward_with(
+            previous,
+            next,
+            transition,
+            crate::credentials::load,
+            crate::credentials::save,
+        )
+    }
+    /// `carry_forward` with injectable keystore access for tests.
+    #[cfg(not(windows))]
+    fn carry_forward_with(
+        previous: (&Configuration, &Path, &str),
+        next: (&Configuration, &Path, &str),
+        transition: Option<crate::manager_host::Transition>,
+        load: impl Fn(&str) -> Result<Option<Self>, String>,
+        persist: impl FnOnce(&str, &Self) -> Result<(), String>,
+    ) -> Result<(String, String), String> {
+        for (config, candidate, manifest) in [previous, next] {
+            validate_configuration(config)?;
+            if !crate::native_runtime::digest_valid(manifest, 64) {
+                return Err("native_profile_binding_invalid".into());
+            }
+            validate_paths(candidate, &config.state, &config.data)?;
+        }
+        if previous.0.state != next.0.state
+            || previous.0.data != next.0.data
+            || previous.0.installation_id != next.0.installation_id
+            || previous.2 == next.2
+        {
+            return Err("native_profile_binding_invalid".into());
+        }
+        let _lock = LOCK.lock().map_err(|_| "native_profile_unavailable")?;
+        let data = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&next.0.data)?);
+        let lease = data
+            .open_with(".setup.lock", &crate::host_state::options(false))
+            .map_err(|_| "native_profile_unavailable")?
+            .into_std();
+        crate::host_state::valid_file(&lease).map_err(|_| "native_profile_unavailable")?;
+        lease
+            .try_lock()
+            .map_err(|_| "native_profile_already_owned")?;
+        let state = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&next.0.state)?);
+        let old = binding_sha256(previous.0, previous.1, previous.2, &state, &data)?;
+        let new = binding_sha256(next.0, next.1, next.2, &state, &data)?;
+        let marker = {
+            let file = data
+                .open_with(".host-profile", &crate::host_state::options(false))
+                .map_err(|_| "native_profile_recovery_required")?
+                .into_std();
+            crate::host_state::valid_file(&file).map_err(|_| "native_profile_binding_changed")?;
+            let mut bytes = Vec::new();
+            file.take(65)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "native_profile_unavailable")?;
+            bytes
+        };
+        if marker != old.as_bytes() && marker != new.as_bytes() {
+            return Err("native_profile_binding_changed".into());
+        }
+        let valid = |saved: &Self, binding: &str| {
+            saved.schema_version == 1
+                && saved.binding_sha256 == binding
+                && (24..=256).contains(&saved.database_password.len())
+                && !saved.database_password.contains(['\r', '\n', '\0'])
+                && saved.backup_key.as_deref().is_none_or(valid_backup_key)
+        };
+        let source = load(&format!("{ACCOUNT}-{old}"))?;
+        match load(&format!("{ACCOUNT}-{new}"))? {
+            Some(saved) => {
+                // A retried move must find the same secrets it saved before stopping.
+                if !valid(&saved, &new)
+                    || source.as_ref().is_some_and(|prior| {
+                        prior.database_password != saved.database_password
+                            || prior.backup_key != saved.backup_key
+                    })
+                {
+                    return Err("native_profile_binding_changed".into());
+                }
+                // Manager has not run with this package while the journal names the previous one,
+                // so the transition must describe the package moved from now, not an earlier attempt.
+                if saved.installation_transition != transition {
+                    let refreshed = Self {
+                        schema_version: 1,
+                        binding_sha256: new.clone(),
+                        database_password: saved.database_password.clone(),
+                        backup_key: saved.backup_key.clone(),
+                        installation_transition: transition,
+                        guard: None,
+                    };
+                    persist(&format!("{ACCOUNT}-{new}"), &refreshed)?;
+                }
+            }
+            None => {
+                let prior = source.ok_or("native_profile_recovery_required")?;
+                if !valid(&prior, &old) {
+                    return Err("native_profile_binding_changed".into());
+                }
+                let moved = Self {
+                    schema_version: 1,
+                    binding_sha256: new.clone(),
+                    database_password: prior.database_password.clone(),
+                    backup_key: prior.backup_key.clone(),
+                    installation_transition: transition,
+                    guard: None,
+                };
+                persist(&format!("{ACCOUNT}-{new}"), &moved)?;
+            }
+        }
+        if marker != new.as_bytes() {
+            // A fixed name lets a retry replace what an interrupted move left behind.
+            let temp = ".host-profile.carry.tmp";
+            match data.remove_file(temp) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err("native_profile_unavailable".into())
+                }
+                _ => {}
+            }
+            let result = (|| -> Result<(), String> {
+                let mut options = crate::host_state::options(true);
+                options.create_new(true);
+                let mut file = data
+                    .open_with(temp, &options)
+                    .map_err(|_| "native_profile_unavailable")?
+                    .into_std();
+                file.write_all(new.as_bytes())
+                    .and_then(|_| file.sync_all())
+                    .map_err(|_| "native_profile_unavailable")?;
+                drop(file);
+                // Replacing the reservation is the only change; the old keystore entry is kept.
+                data.rename(temp, &data, ".host-profile")
+                    .map_err(|_| "native_profile_unavailable")?;
+                crate::host_storage::directory(&next.0.data)?
+                    .sync_all()
+                    .map_err(|_| "native_profile_unavailable".to_string())
+            })();
+            if result.is_err() {
+                let _ = data.remove_file(temp);
+            }
+            result?;
+        }
+        Ok((old, new))
+    }
     fn load_or_create(
         config: &Configuration,
         candidate: &Path,
@@ -131,38 +300,7 @@ impl Profile {
             .try_lock()
             .map_err(|_| "native_profile_already_owned")?;
         let state = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(&config.state)?);
-        #[cfg(not(windows))]
-        let binding = serde_json::json!({"schemaVersion":1,"configuration":config,"candidate":candidate,"manifestSha256":manifest,
-            "stateIdentity":crate::copy_source::root_identity(&state)?,"managerIdentity":crate::copy_source::root_identity(&data)?});
-        #[cfg(windows)]
-        let binding = {
-            let candidate =
-                cap_std::fs::Dir::from_std_file(crate::host_storage::directory(candidate)?);
-            let controller =
-                File::open(crate::windows_protection::stable_path(&config.controller)?)
-                    .map_err(|_| "native_profile_binding_invalid")?;
-            windows_binding::value(
-                config,
-                manifest,
-                [
-                    crate::copy_source::root_identity(&state)?,
-                    crate::copy_source::root_identity(&data)?,
-                ],
-                [
-                    crate::windows_protection::durable_name(&candidate)?,
-                    crate::windows_protection::durable_name(&controller)?,
-                    crate::windows_protection::durable_name(&state)?,
-                    crate::windows_protection::durable_name(&data)?,
-                ],
-            )?
-        };
-        let binding_sha256 = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json_canonicalizer::to_vec(&binding)
-                    .map_err(|_| "native_profile_binding_invalid")?
-            )
-        );
+        let binding_sha256 = binding_sha256(config, candidate, manifest, &state, &data)?;
         let account = format!("{ACCOUNT}-{binding_sha256}");
         let saved = load(&account)?;
         let mut profile = if let Some(saved) = saved {
@@ -201,6 +339,7 @@ impl Profile {
                 binding_sha256,
                 database_password: STANDARD_NO_PAD.encode(bytes.as_ref()),
                 backup_key: Some(new_backup_key()),
+                installation_transition: None,
                 guard: None,
             };
             persist(&account, &profile)?;
@@ -281,6 +420,47 @@ fn new_backup_key() -> String {
 }
 
 // Publish in one operation: an interrupted setup must never leave a two-link marker.
+/// The keystore account for a profile is bound to its exact package, paths and physical directories.
+fn binding_sha256(
+    config: &Configuration,
+    candidate: &Path,
+    manifest: &str,
+    state: &cap_std::fs::Dir,
+    data: &cap_std::fs::Dir,
+) -> Result<String, String> {
+    #[cfg(not(windows))]
+    let binding = serde_json::json!({"schemaVersion":1,"configuration":config,"candidate":candidate,"manifestSha256":manifest,
+        "stateIdentity":crate::copy_source::root_identity(state)?,"managerIdentity":crate::copy_source::root_identity(data)?});
+    #[cfg(windows)]
+    let binding = {
+        let candidate = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(candidate)?);
+        let controller = File::open(crate::windows_protection::stable_path(&config.controller)?)
+            .map_err(|_| "native_profile_binding_invalid")?;
+        windows_binding::value(
+            config,
+            manifest,
+            [
+                crate::copy_source::root_identity(state)?,
+                crate::copy_source::root_identity(data)?,
+            ],
+            [
+                crate::windows_protection::durable_name(&candidate)?,
+                crate::windows_protection::durable_name(&controller)?,
+                crate::windows_protection::durable_name(state)?,
+                crate::windows_protection::durable_name(data)?,
+            ],
+        )?
+    };
+    let binding_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json_canonicalizer::to_vec(&binding)
+                .map_err(|_| "native_profile_binding_invalid")?
+        )
+    );
+    Ok(binding_sha256)
+}
+
 fn publish_marker(data: &cap_std::fs::Dir, temp: &str) -> Result<(), String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -444,6 +624,150 @@ mod tests {
                     .any(|v| v == key.as_bytes()));
             }
         }
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn profile_moves_its_secrets_to_a_newer_package_and_a_retry_finishes_the_move() {
+        let f = Fixture::new();
+        std::fs::create_dir(f.0.join("runtime-next")).unwrap();
+        let store = std::cell::RefCell::new(std::collections::BTreeMap::<String, String>::new());
+        let profile = Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            |_| Ok(None),
+            |account, value| {
+                store
+                    .borrow_mut()
+                    .insert(account.into(), serde_json::to_string(value).unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let (password, key) = (profile.password(), profile.backup_key().unwrap());
+        drop(profile);
+        let next = Configuration {
+            installation_id: f.1.installation_id.clone(),
+            name: f.1.name.clone(),
+            release: "frameleaf-v3.0.1-1".into(),
+            controller: f.1.controller.clone(),
+            state: f.1.state.clone(),
+            data: f.1.data.clone(),
+            origin: f.1.origin.clone(),
+            database_port: f.1.database_port,
+            api_port: f.1.api_port,
+        };
+        let previous = (&f.1, f.0.join("runtime"), "b".repeat(64));
+        let following = (&next, f.0.join("runtime-next"), "c".repeat(64));
+        let load = |account: &str| {
+            Ok(store
+                .borrow()
+                .get(account)
+                .map(|v| serde_json::from_str(v).unwrap()))
+        };
+        let save = |account: &str, value: &Profile| {
+            store
+                .borrow_mut()
+                .insert(account.into(), serde_json::to_string(value).unwrap());
+            Ok(())
+        };
+        let mut different = Configuration {
+            installation_id: f.1.installation_id.clone(),
+            name: f.1.name.clone(),
+            release: "frameleaf-v3.0.1-1".into(),
+            controller: f.1.controller.clone(),
+            state: f.1.state.clone(),
+            data: f.1.data.clone(),
+            origin: f.1.origin.clone(),
+            database_port: f.1.database_port,
+            api_port: f.1.api_port,
+        };
+        different.installation_id = "b".repeat(12);
+        assert!(Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (&different, &following.1, &following.2),
+            None,
+            load,
+            save
+        )
+        .is_err());
+        assert_eq!(
+            Profile::carry_forward_with(
+                (previous.0, &previous.1, &previous.2),
+                (following.0, &following.1, &following.2),
+                None,
+                load,
+                |_, _| Err("credential_store_locked".into())
+            )
+            .unwrap_err(),
+            "credential_store_locked"
+        );
+        let (old, new) = Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            None,
+            load,
+            save,
+        )
+        .unwrap();
+        assert_ne!(old, new);
+        assert_eq!(
+            std::fs::read(f.1.data.join(".host-profile")).unwrap(),
+            new.as_bytes()
+        );
+        // A retry after the move finishes without saving again.
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            None,
+            load,
+            |_, _| panic!("must not move twice"),
+        )
+        .unwrap();
+        // A stale transition left by an earlier attempt is replaced by the current one.
+        let current = crate::manager_host::Transition {
+            operation_id: uuid::Uuid::new_v4(),
+            from_fingerprint: "c".repeat(64),
+        };
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(current.clone()),
+            load,
+            save,
+        )
+        .unwrap();
+        let moved =
+            Profile::load_or_create(following.0, &following.1, &following.2, load, |_, _| {
+                panic!("moved profile is complete")
+            })
+            .unwrap();
+        assert_eq!(moved.installation_transition(), Some(&current));
+        assert_eq!(moved.password().as_str(), password.as_str());
+        assert_eq!(moved.backup_key().unwrap().as_str(), key.as_str());
+        drop(moved);
+        // Unknown reservations and missing secrets are refused rather than replaced.
+        std::fs::write(f.1.data.join(".host-profile"), "f".repeat(64)).unwrap();
+        assert!(Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            None,
+            load,
+            save
+        )
+        .is_err());
+        std::fs::write(f.1.data.join(".host-profile"), old.as_bytes()).unwrap();
+        assert_eq!(
+            Profile::carry_forward_with(
+                (previous.0, &previous.1, &previous.2),
+                (following.0, &following.1, &following.2),
+                None,
+                |_| Ok(None),
+                save
+            )
+            .unwrap_err(),
+            "native_profile_recovery_required"
+        );
     }
     #[test]
     fn legacy_backup_key_migration_preserves_database_password_and_fails_closed_if_persistence_is_locked(

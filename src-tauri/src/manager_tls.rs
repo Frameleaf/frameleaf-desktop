@@ -57,6 +57,45 @@ fn hostname(id: &str, origin: &str) -> Result<String, String> {
         .to_owned())
 }
 impl TlsIdentity {
+    /// The certificate Manager last served for a profile binding, if it ever started.
+    #[cfg(unix)]
+    pub(crate) fn saved_certificate(binding: &str) -> Result<Option<String>, String> {
+        Ok(
+            crate::credentials::load::<Self>(&account_for_profile(binding)?)?
+                .map(|saved| saved.certificate_pem.clone()),
+        )
+    }
+    /// Keep the paired Manager certificate when a profile moves to a newer package.
+    #[cfg(unix)]
+    pub(crate) fn carry_forward(previous: &str, next: &str) -> Result<(), String> {
+        Self::carry_forward_with(
+            previous,
+            next,
+            crate::credentials::load,
+            crate::credentials::save,
+        )
+    }
+    /// `carry_forward` with injectable keystore access for tests.
+    #[cfg(unix)]
+    fn carry_forward_with(
+        previous: &str,
+        next: &str,
+        load: impl Fn(&str) -> Result<Option<Self>, String>,
+        persist: impl FnOnce(&str, &Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let (from, to) = (account_for_profile(previous)?, account_for_profile(next)?);
+        let _lock = IDENTITY_LOCK
+            .lock()
+            .map_err(|_| "credential_store_unavailable")?;
+        if load(&to)?.is_some() {
+            return Ok(());
+        }
+        // No saved certificate means Manager mints one at start; Desktop then asks to pair again.
+        match load(&from)? {
+            Some(saved) => persist(&to, &saved),
+            None => Ok(()),
+        }
+    }
     pub fn from_keystore(
         installation_id: &str,
         origin: &str,
@@ -139,6 +178,55 @@ impl TlsIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn moved_profile_keeps_its_paired_certificate_without_replacing_a_newer_one() {
+        let (old, new) = ("a".repeat(64), "b".repeat(64));
+        let identity = || {
+            TlsIdentity::load_or_create(
+                "aaaaaaaaaaaa",
+                "https://127.0.0.1:9443",
+                || Ok(None),
+                |_| Ok(()),
+            )
+            .unwrap()
+        };
+        let saved = identity();
+        let copied = std::cell::RefCell::new(None);
+        TlsIdentity::carry_forward_with(
+            &old,
+            &new,
+            |account| {
+                Ok((account == account_for_profile(&old).unwrap()).then(|| {
+                    serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap()
+                }))
+            },
+            |account, value| {
+                assert_eq!(account, account_for_profile(&new).unwrap());
+                *copied.borrow_mut() = Some(value.certificate_pem.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            copied.borrow().as_deref(),
+            Some(saved.certificate_pem.as_str())
+        );
+        let existing = identity();
+        TlsIdentity::carry_forward_with(
+            &old,
+            &new,
+            |_| {
+                Ok(Some(
+                    serde_json::from_value(serde_json::to_value(&existing).unwrap()).unwrap(),
+                ))
+            },
+            |_, _| panic!("an existing certificate is never replaced"),
+        )
+        .unwrap();
+        TlsIdentity::carry_forward_with(&old, &new, |_| Ok(None), |_, _| panic!("nothing to copy"))
+            .unwrap();
+    }
     #[test]
     fn tls_keystore_account_is_scoped_to_the_full_profile_binding() {
         let first = account_for_profile(&"a".repeat(64)).unwrap();

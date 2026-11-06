@@ -136,6 +136,103 @@ pub struct Configuration {
     pub database_port: u16,
     pub api_port: u16,
 }
+/// Manager accepts a changed package once, from the descriptor it last ran with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Transition {
+    pub operation_id: uuid::Uuid,
+    pub from_fingerprint: String,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Binding<'a> {
+    runtime: &'a str,
+    id: &'a str,
+    secure_installation_id: uuid::Uuid,
+    controller: &'a Path,
+    candidate: &'a Path,
+    state: &'a Path,
+    manifest_sha256: &'a str,
+    source_revision: &'a str,
+    certified: bool,
+    database_port: u16,
+    api_port: u16,
+}
+/// The installation part of the bootstrap and descriptor, in Manager's field order.
+fn binding<'a>(
+    config: &'a Configuration,
+    candidate: &'a Path,
+    runtime: &'a crate::host_runtime::VerifiedHostRuntime,
+) -> Result<Binding<'a>, String> {
+    Ok(Binding {
+        runtime: "native",
+        id: &config.installation_id,
+        secure_installation_id: crate::host_state::secure_installation_id(&config.state)?,
+        controller: &config.controller,
+        candidate,
+        state: &config.state,
+        manifest_sha256: runtime.manifest_sha256(),
+        source_revision: runtime.source_revision(),
+        certified: runtime.certified(),
+        database_port: config.database_port,
+        api_port: config.api_port,
+    })
+}
+/// Same fields and order as Manager's native descriptor, whose fingerprint is sha256(JSON).
+#[cfg(unix)]
+pub(crate) fn descriptor_fingerprint(
+    config: &Configuration,
+    candidate: &Path,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    controller_sha256: &str,
+    certificate_pem: &str,
+) -> Result<String, String> {
+    fingerprint(
+        binding(config, candidate, runtime)?,
+        controller_sha256,
+        runtime.backup_engine()?,
+        &config.name,
+        &config.release,
+        format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
+    )
+}
+/// sha256 of the compact JSON Manager computes for its stored descriptor.
+#[cfg(unix)]
+fn fingerprint(
+    installation: Binding,
+    controller_sha256: &str,
+    backup_engine: crate::host_runtime::BackupEngine,
+    name: &str,
+    release: &str,
+    tls_certificate_pem_sha256: String,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Descriptor<'a> {
+        protocol_version: u32,
+        installation: Binding<'a>,
+        controller_sha256: &'a str,
+        backup_engine: crate::host_runtime::BackupEngine,
+        name: &'a str,
+        release: &'a str,
+        tls_certificate_pem_sha256: String,
+    }
+    let descriptor = Descriptor {
+        protocol_version: 2,
+        installation,
+        controller_sha256,
+        backup_engine,
+        name,
+        release,
+        tls_certificate_pem_sha256,
+    };
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&descriptor).map_err(|_| "native_manager_config_invalid")?
+        )
+    ))
+}
 fn protect_profile_parents(config: &Configuration) -> Result<Vec<fs::File>, String> {
     #[cfg(windows)]
     {
@@ -292,6 +389,7 @@ impl Programs<'_> {
             &profile.backup_key()?,
             &tls,
             Some(lease),
+            profile.installation_transition(),
         )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
@@ -302,7 +400,7 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
     ) -> Result<NativeManager, String> {
-        self.start_owned(config, password, backup_key, tls, None)
+        self.start_owned(config, password, backup_key, tls, None, None)
     }
     fn start_owned(
         &self,
@@ -311,6 +409,7 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
         startup_lease: Option<crate::host_state::Owner>,
+        transition: Option<&Transition>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
@@ -344,21 +443,6 @@ impl Programs<'_> {
             .map_err(|_| "native_manager_tls_invalid")?;
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Binding<'a> {
-            runtime: &'a str,
-            id: &'a str,
-            secure_installation_id: uuid::Uuid,
-            controller: &'a Path,
-            candidate: &'a Path,
-            state: &'a Path,
-            manifest_sha256: &'a str,
-            source_revision: &'a str,
-            certified: bool,
-            database_port: u16,
-            api_port: u16,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
         struct Bootstrap<'a> {
             protocol_version: u32,
             installation: Binding<'a>,
@@ -369,22 +453,12 @@ impl Programs<'_> {
             password: &'a str,
             backup_key: &'a str,
             tls: crate::manager_tls::BootstrapTls<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            installation_transition: Option<&'a Transition>,
         }
         let bootstrap = Bootstrap {
             protocol_version: 2,
-            installation: Binding {
-                runtime: "native",
-                id: &config.installation_id,
-                secure_installation_id: crate::host_state::secure_installation_id(&config.state)?,
-                controller: &config.controller,
-                candidate,
-                state: &config.state,
-                manifest_sha256: self.runtime.manifest_sha256(),
-                source_revision: self.runtime.source_revision(),
-                certified: self.runtime.certified(),
-                database_port: config.database_port,
-                api_port: config.api_port,
-            },
+            installation: binding(config, candidate, self.runtime)?,
             controller_sha256: &controller_hash,
             backup_engine: self.runtime.backup_engine()?,
             name: &config.name,
@@ -392,6 +466,7 @@ impl Programs<'_> {
             password,
             backup_key,
             tls: tls.wire(),
+            installation_transition: transition,
         };
         let mut input = Zeroizing::new(
             serde_json::to_vec(&bootstrap).map_err(|_| "native_manager_config_invalid")?,
@@ -862,6 +937,43 @@ impl Drop for NativeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Captured from a Library 1.2.3 Manager's stored native-installation binding (synthetic fixture).
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_fingerprint_matches_the_one_manager_stored() {
+        let m = "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435";
+        let controller = format!("/opt/frameleaf/Controllers/{m}/bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b/frameleaf-native-host");
+        let candidate = format!("/opt/frameleaf/Runtimes/{m}");
+        let installation = Binding {
+            runtime: "native",
+            id: "1d0ea3c5161e",
+            secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
+            controller: Path::new(&controller),
+            candidate: Path::new(&candidate),
+            state: Path::new("/opt/frameleaf/Profiles/1001/state"),
+            manifest_sha256: m,
+            source_revision: "c64039743af7bb0d68b602ff842683906019de52",
+            certified: false,
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let backup = crate::host_runtime::BackupEngine {
+            executable: format!("{candidate}/payload/backup/restic").into(),
+            sha256: "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6".into(),
+        };
+        assert_eq!(
+            fingerprint(
+                installation,
+                "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b",
+                backup,
+                "My Frameleaf library",
+                "frameleaf-v1.2.3-native.c64039743af7-1",
+                "9fdf3df9908cdfa7823ee232f00c28e749bd4a5f04cdec60429c3c232b496ec2".into(),
+            )
+            .unwrap(),
+            "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
+        );
+    }
     #[test]
     fn readiness_is_bounded_and_bound_to_this_installation_manifest_and_origin() {
         let good = br#"{"protocolVersion":2,"state":"ready","installationId":"aaaaaaaaaaaa","manifestSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","origin":"https://127.0.0.1:9443"}
