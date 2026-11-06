@@ -690,10 +690,24 @@ pub(crate) async fn apply_worker_control(
         worker_control::WorkerControl::Running => {
             let previous = worker_control::load(saved)?;
             setup.stop().await;
-            let view = prepare(saved).await;
-            if view.state != "preparing" || !view.features.worker_session {
+            let client = match transport::client() {
+                Ok(client) => client,
+                Err(error) => {
+                    setup.hold(previous).await;
+                    return Err(error);
+                }
+            };
+            // Say why Resume failed: an expired sign-in or an unanswered server must not read as
+            // a permissions problem.
+            let capabilities = transport::capabilities(&client, saved).await;
+            if let Err(error) = &capabilities {
                 setup.hold(previous).await;
-                return Err("worker_setup_unavailable".into());
+                return Err(error.clone());
+            }
+            let view = prepare_with_capabilities(&client, saved, capabilities).await;
+            if let Some(error) = resume_refusal(&view.state, view.features.worker_session) {
+                setup.hold(previous).await;
+                return Err(error);
             }
             if let Err(error) = worker_control::save(saved, control) {
                 setup.hold(previous).await;
@@ -702,6 +716,21 @@ pub(crate) async fn apply_worker_control(
             start_worker_setup(app, saved, false).await?;
             Ok(setup.status())
         }
+    }
+}
+
+/// The error Resume returns when the server did not hand back a worker session, by connection state.
+fn resume_refusal(state: &str, worker_session: bool) -> Option<String> {
+    match state {
+        "preparing" if worker_session => None,
+        "preparing" | "unsupported-server" => Some("worker_resume_unsupported_server".into()),
+        "awaiting-approval"
+        | "enrollment-failed"
+        | "worker-setup-failed"
+        | "credential-store-unavailable"
+        | "identity-changed"
+        | "offline" => Some(format!("worker_resume_{}", state.replace('-', "_"))),
+        _ => Some("worker_setup_unavailable".into()),
     }
 }
 
@@ -898,5 +927,29 @@ async fn control_photo_import(
                 .await
         }
         _ => Err("source_control_invalid".into()),
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    #[test]
+    fn resume_names_why_the_server_refused() {
+        assert_eq!(super::resume_refusal("preparing", true), None);
+        assert_eq!(
+            super::resume_refusal("preparing", false).as_deref(),
+            Some("worker_resume_unsupported_server")
+        );
+        assert_eq!(
+            super::resume_refusal("awaiting-approval", true).as_deref(),
+            Some("worker_resume_awaiting_approval")
+        );
+        assert_eq!(
+            super::resume_refusal("worker-setup-failed", true).as_deref(),
+            Some("worker_resume_worker_setup_failed")
+        );
+        assert_eq!(
+            super::resume_refusal("paused", true).as_deref(),
+            Some("worker_setup_unavailable")
+        );
     }
 }
