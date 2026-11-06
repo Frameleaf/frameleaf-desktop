@@ -386,6 +386,7 @@ fn read_owner_commands(
     }
 }
 
+/// Serve the owner-pipe protocol for one controller session.
 pub fn run() -> Result<(), String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let invalid = Arc::new(AtomicBool::new(false));

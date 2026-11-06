@@ -1589,6 +1589,7 @@ mod checkpoint_tests {
         format!("{value}\n").into_bytes()
     }
 
+    /// Only fixed lowercase codes reach the log, each on its own line.
     #[test]
     fn controller_failure_appends_only_fixed_codes_to_the_agent_log() {
         let state =
