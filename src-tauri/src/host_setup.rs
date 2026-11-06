@@ -751,6 +751,48 @@ fn carry_host_state(
     result
 }
 
+/// The Library version a package carries, for display only.
+pub(crate) fn package_version(record: &Installation) -> Option<String> {
+    let layout = record.layout().ok()?;
+    let raw = crate::runtime_store::read_bounded(
+        &layout.runtime.join("payload/server/package.json"),
+        64 * 1024,
+    )
+    .ok()?;
+    let version = serde_json::from_slice::<serde_json::Value>(&raw).ok()?["version"]
+        .as_str()?
+        .to_owned();
+    (version.split('.').count() == 3
+        && version.split('.').all(|part| {
+            !part.is_empty() && part.len() <= 5 && part.bytes().all(|b| b.is_ascii_digit())
+        }))
+    .then_some(version)
+}
+
+/// The package this account's library last ran with, for display only.
+pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let state = records
+            .first()?
+            .layout()
+            .ok()?
+            .profiles
+            .join(uid.to_string())
+            .join("state");
+        crate::host_state::Owner::peek(&state)
+            .ok()
+            .flatten()
+            .map(|marker| marker.manifest_sha256)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = records;
+        None
+    }
+}
+
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {

@@ -346,9 +346,9 @@ impl Owner {
             return Err("host_recovery_requires_manager".into());
         }
         no_activation(&self.root)?;
-        let current = self.read()?.ok_or("host_controller_state_invalid")?;
-        self.binding(&current, id, previous)?;
-        if current.phase != Phase::Stopped || current.restore_pending {
+        // Same liveness proof as recovery: no host lease holder and no database PID file.
+        let current = self.inspect(id, previous)?;
+        if current.restore_pending {
             return Err("host_recovery_requires_manager".into());
         }
         // Their receipts name the previous package; finish or discard them with it first.
@@ -615,6 +615,14 @@ mod tests {
         drop(owner);
         let before = Owner::peek(&fixture.0).unwrap().unwrap();
         let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        crate::runtime_store::private_directory(&fixture.0.join("database")).unwrap();
+        fs::write(fixture.0.join("database/postmaster.pid"), b"synthetic").unwrap();
+        assert_eq!(
+            owner.carry_forward(ID, &sha(), &next).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        fs::remove_file(fixture.0.join("database/postmaster.pid")).unwrap();
+        fs::remove_dir(fixture.0.join("database")).unwrap();
         for (id, previous) in [("bbbbbbbbbbbb", sha()), (ID, "d".repeat(64))] {
             assert_eq!(
                 owner.carry_forward(id, &previous, &next).unwrap_err(),

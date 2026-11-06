@@ -4,14 +4,34 @@ use crate::{
     require_local,
 };
 use tauri::{Manager, State, WebviewWindow};
+/// Display-only details that let a person tell installed packages apart before a one-way move.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InstalledPackage {
+    #[serde(flatten)]
+    installation: host_install::Installation,
+    version: Option<String>,
+    library: bool,
+}
 #[tauri::command]
 pub(crate) async fn installed_local_hosts(
     window: WebviewWindow,
-) -> Result<Vec<host_install::Installation>, String> {
+) -> Result<Vec<InstalledPackage>, String> {
     require_local(&window)?;
-    tauri::async_runtime::spawn_blocking(host_install::installed)
-        .await
-        .map_err(|_| "native_host_setup_failed".to_string())?
+    tauri::async_runtime::spawn_blocking(|| {
+        let records = host_install::installed()?;
+        let current = crate::host_setup::library_package(&records);
+        Ok(records
+            .into_iter()
+            .map(|installation| InstalledPackage {
+                version: crate::host_setup::package_version(&installation),
+                library: current.as_deref() == Some(installation.manifest_sha256.as_str()),
+                installation,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|_| "native_host_setup_failed".to_string())?
 }
 #[tauri::command]
 pub(crate) async fn local_host_status(

@@ -186,6 +186,24 @@ pub(crate) fn descriptor_fingerprint(
     controller_sha256: &str,
     certificate_pem: &str,
 ) -> Result<String, String> {
+    fingerprint(
+        binding(config, candidate, runtime)?,
+        controller_sha256,
+        runtime.backup_engine()?,
+        &config.name,
+        &config.release,
+        format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
+    )
+}
+#[cfg(unix)]
+fn fingerprint(
+    installation: Binding,
+    controller_sha256: &str,
+    backup_engine: crate::host_runtime::BackupEngine,
+    name: &str,
+    release: &str,
+    tls_certificate_pem_sha256: String,
+) -> Result<String, String> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Descriptor<'a> {
@@ -199,12 +217,12 @@ pub(crate) fn descriptor_fingerprint(
     }
     let descriptor = Descriptor {
         protocol_version: 2,
-        installation: binding(config, candidate, runtime)?,
+        installation,
         controller_sha256,
-        backup_engine: runtime.backup_engine()?,
-        name: &config.name,
-        release: &config.release,
-        tls_certificate_pem_sha256: format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
+        backup_engine,
+        name,
+        release,
+        tls_certificate_pem_sha256,
     };
     Ok(format!(
         "{:x}",
@@ -917,6 +935,43 @@ impl Drop for NativeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Captured from a Library 1.2.3 Manager's stored native-installation binding (synthetic fixture).
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_fingerprint_matches_the_one_manager_stored() {
+        let m = "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435";
+        let controller = format!("/opt/frameleaf/Controllers/{m}/bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b/frameleaf-native-host");
+        let candidate = format!("/opt/frameleaf/Runtimes/{m}");
+        let installation = Binding {
+            runtime: "native",
+            id: "1d0ea3c5161e",
+            secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
+            controller: Path::new(&controller),
+            candidate: Path::new(&candidate),
+            state: Path::new("/opt/frameleaf/Profiles/1001/state"),
+            manifest_sha256: m,
+            source_revision: "c64039743af7bb0d68b602ff842683906019de52",
+            certified: false,
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let backup = crate::host_runtime::BackupEngine {
+            executable: format!("{candidate}/payload/backup/restic").into(),
+            sha256: "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6".into(),
+        };
+        assert_eq!(
+            fingerprint(
+                installation,
+                "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b",
+                backup,
+                "My Frameleaf library",
+                "frameleaf-v1.2.3-native.c64039743af7-1",
+                "9fdf3df9908cdfa7823ee232f00c28e749bd4a5f04cdec60429c3c232b496ec2".into(),
+            )
+            .unwrap(),
+            "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
+        );
+    }
     #[test]
     fn readiness_is_bounded_and_bound_to_this_installation_manifest_and_origin() {
         let good = br#"{"protocolVersion":2,"state":"ready","installationId":"aaaaaaaaaaaa","manifestSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","origin":"https://127.0.0.1:9443"}
