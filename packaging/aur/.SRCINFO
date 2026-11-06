@@ -1,0 +1,21 @@
+pkgbase = frameleaf-desktop-bin
+	pkgdesc = Desktop app for Frameleaf, a self-hosted photo and video library
+	pkgver = 0.1.1
+	pkgrel = 1
+	url = https://frameleaf.app/download/
+	arch = x86_64
+	arch = aarch64
+	license = AGPL-3.0-only
+	depends = gtk3
+	depends = libayatana-appindicator
+	depends = webkit2gtk-4.1
+	provides = frameleaf-desktop
+	conflicts = frameleaf-desktop
+	options = !strip
+	options = !debug
+	source_x86_64 = frameleaf-desktop-0.1.1-amd64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.1/Frameleaf_0.1.1_amd64.deb
+	sha256sums_x86_64 = 63dc5c299934ca1fc5cf3f547c55f825f779148db13b31557170216fef189507
+	source_aarch64 = frameleaf-desktop-0.1.1-arm64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.1/Frameleaf_0.1.1_arm64.deb
+	sha256sums_aarch64 = 3044ace04ea681a12c8eafaed961ffd21aa4e9d09e0b32e3e8cc63dfa9432e61
+
+pkgname = frameleaf-desktop-bin

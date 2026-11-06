@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>frameleaf</id>
+    <version>0.1.1</version>
+    <packageSourceUrl>https://github.com/Frameleaf/frameleaf-desktop/tree/main/packaging/chocolatey</packageSourceUrl>
+    <owners>Frameleaf</owners>
+    <title>Frameleaf Desktop</title>
+    <authors>Frameleaf</authors>
+    <projectUrl>https://frameleaf.app/download/</projectUrl>
+    <iconUrl>https://cdn.jsdelivr.net/gh/Frameleaf/frameleaf-desktop@main/src-tauri/icons/128x128@2x.png</iconUrl>
+    <licenseUrl>https://github.com/Frameleaf/frameleaf-desktop/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/Frameleaf/frameleaf-desktop</projectSourceUrl>
+    <docsUrl>https://frameleaf.app/docs/start/introduction/</docsUrl>
+    <bugTrackerUrl>https://github.com/Frameleaf/frameleaf-desktop/issues</bugTrackerUrl>
+    <tags>frameleaf photos videos photo-management self-hosted google-photos-alternative face-recognition privacy foss cross-platform</tags>
+    <summary>A self-hosted photo and video library with native apps, private face and smart search, photo and video editing, and optional cloud backup.</summary>
+    <description><![CDATA[Frameleaf is a photo and video library that runs on your own NAS, home server or Linux machine with Docker. Your originals stay as ordinary files on your own disks. Faces, smart search and AI captions are worked out on your own hardware, and there is no telemetry.
+
+Frameleaf Desktop for Windows connects to your Frameleaf server and to Frameleaf Cloud, and brings in photos from folders on your computer.
+
+The server is open source (AGPLv3) and a fork of Immich. Frameleaf is in beta, and the Windows installer is not code-signed yet.
+]]></description>
+    <releaseNotes>https://github.com/Frameleaf/frameleaf-desktop/releases/tag/v0.1.1</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

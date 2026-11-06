@@ -1,0 +1,23 @@
+# Maintainer: Frameleaf <support at frameleaf dot app>
+pkgname=frameleaf-desktop-bin
+_pkgname=frameleaf-desktop
+pkgver=0.1.1
+pkgrel=1
+pkgdesc="Desktop app for Frameleaf, a self-hosted photo and video library"
+arch=('x86_64' 'aarch64')
+url="https://frameleaf.app/download/"
+license=('AGPL-3.0-only')
+depends=('gtk3' 'libayatana-appindicator' 'webkit2gtk-4.1')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+options=('!strip' '!debug')
+source_x86_64=("$_pkgname-$pkgver-amd64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v$pkgver/Frameleaf_${pkgver}_amd64.deb")
+source_aarch64=("$_pkgname-$pkgver-arm64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v$pkgver/Frameleaf_${pkgver}_arm64.deb")
+sha256sums_x86_64=('63dc5c299934ca1fc5cf3f547c55f825f779148db13b31557170216fef189507')
+sha256sums_aarch64=('3044ace04ea681a12c8eafaed961ffd21aa4e9d09e0b32e3e8cc63dfa9432e61')
+
+package() {
+  bsdtar -xf data.tar.gz -C "$pkgdir"
+  # The deb ships its 256 px icon under 256x256@2, where icon themes don't look.
+  mv "$pkgdir/usr/share/icons/hicolor/256x256@2" "$pkgdir/usr/share/icons/hicolor/256x256"
+}
