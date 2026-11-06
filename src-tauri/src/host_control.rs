@@ -386,6 +386,7 @@ fn read_owner_commands(
     }
 }
 
+/// Serve the owner-pipe protocol for one controller session.
 pub fn run() -> Result<(), String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let invalid = Arc::new(AtomicBool::new(false));
@@ -405,9 +406,21 @@ pub fn run() -> Result<(), String> {
         // A missing owner or malformed command still cancels while a checkpoint is running.
         read_owner_commands(&mut input, commands, &input_cancelled, &input_invalid);
     });
-    let mut config = receiver
+    let config = receiver
         .recv()
         .map_err(|_| "host_control_config_invalid")??;
+    let state = config.state.clone();
+    serve(config, cancelled, invalid, command_receiver)
+        .inspect_err(|code| crate::host_runtime::record_failure(&state, code))
+}
+
+/// Run one admitted controller session; `run` records any refusal code for diagnosis.
+fn serve(
+    mut config: Config,
+    cancelled: Arc<AtomicBool>,
+    invalid: Arc<AtomicBool>,
+    command_receiver: mpsc::Receiver<CheckpointCommand>,
+) -> Result<(), String> {
     let password = Zeroizing::new(std::mem::take(&mut config.password));
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
