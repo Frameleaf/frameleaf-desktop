@@ -413,6 +413,7 @@ pub fn run() -> Result<(), String> {
         .inspect_err(|code| crate::host_runtime::record_failure(&state, code))
 }
 
+/// Run one admitted controller session; `run` records any refusal code for diagnosis.
 fn serve(
     mut config: Config,
     cancelled: Arc<AtomicBool>,
