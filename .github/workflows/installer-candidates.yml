@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/aj/fd8-windows-desktop-restart-release' && inputs.platforms == 'windows' && inputs.runtime_run_id == '41406368520'
+    if: github.ref == 'refs/heads/aj/fd8-windows-desktop-012-candidate' && inputs.platforms == 'windows' && inputs.runtime_run_id == '41406368520'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: c0dee33d3fe127405c642faa567cd74826960fc9
+          ref: 99782a918f857f617b85b813bc447a861ec7ce15
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
@@ -48,8 +48,8 @@ jobs:
             import { validateFactoryRun } from "./tools/release_inputs.mjs";
             console.log(validateFactoryRun(JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json")), process.env.GITHUB_REPOSITORY));
           ')
-          test "$(git rev-parse HEAD)" = "c0dee33d3fe127405c642faa567cd74826960fc9"
-          git merge-base --is-ancestor "$revision" "c0dee33d3fe127405c642faa567cd74826960fc9"
+          test "$(git rev-parse HEAD)" = "99782a918f857f617b85b813bc447a861ec7ce15"
+          git merge-base --is-ancestor "$revision" "99782a918f857f617b85b813bc447a861ec7ce15"
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
@@ -74,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: c0dee33d3fe127405c642faa567cd74826960fc9
+          ref: 99782a918f857f617b85b813bc447a861ec7ce15
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
@@ -239,7 +239,7 @@ jobs:
                   hashes[source.name] = hashlib.file_digest(binary, 'sha256').hexdigest()
           (output / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(hashes.items())))
           (output / 'candidate.json').write_text(json.dumps({
-              'sourceRevision': 'c0dee33d3fe127405c642faa567cd74826960fc9', 'target': os.environ['CANDIDATE_TARGET'],
+              'sourceRevision': '99782a918f857f617b85b813bc447a861ec7ce15', 'target': os.environ['CANDIDATE_TARGET'],
               'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': True, 'osSigned': False,
               'scope': 'GUI and existing-server helper candidate; full native host qualification remains separate',
               'files': hashes,
