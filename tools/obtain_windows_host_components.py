@@ -23,15 +23,15 @@ from build_runtime import BuildError, git_blob, inventory, regular, sha256
 from obtain_host_component import obtain as obtain_component, validate_approval
 from verify_reused_host_sources import verify as verify_reused
 
-SOURCE_REVISION = 'c64039743af7bb0d68b602ff842683906019de52'
-MANAGER_REVISION = '6cb1613e67a988fdfad7042c4e07be9d1bf609fc'
+SOURCE_REVISION = '9f22a57adb7a271d97ead305103c094fb3d25ad2'
+MANAGER_REVISION = '9f22a57adb7a271d97ead305103c094fb3d25ad2'
 # Canonical Git archives independently verified for this immutable application snapshot.
 SOURCE_ARCHIVES = {
-    'web': 'a2cace3f8eddb83ec5f5c4a90f00916e8fdeed92a0d5a510fabf31cb2f86c99a',
-    'plugin': '41aad26098c4db5807e37518a0e4868bc657cc02c778e59c08383a0381b5c6a2',
-    'studio': '4d6cb68c2eac8f59cf335111c260b44a43f1c93b49dd9ae39f49491ee02451b0',
-    'server': '1a542a8ceedb577eef058d9dca39f5558b1927d8d8ead6c9c36d9a6b1ce89a42',
-    'manager': '07549ce9a7145d1e5b5793b88fc5a926e40432db2db71542c887539447a77bd4',
+    'web': 'b43160636c09198b2797c54d8a4684989331e44f1c54755d66c69b18976e64a9',
+    'plugin': 'f16879136e3992c099f520c757acd63b94742c40fd02196851810ccfb978e5df',
+    'studio': '28df5e9c03c1846791625289a6c1ce92753385e1f332fc8c065cb31ce45a32d2',
+    'server': '386d262bf6f640cafbea419019d2241fd1bf2daf14f2b045966d60d4c0a66746',
+    'manager': '1477d006f1f234fadf6585c7d19bfdc65d44aed6d427768243e2fd47f075f063',
 }
 BUILD_NODE_SHA = 'dccc52de28d8df2ee22d2062424f8c563070d95d8ad70c54c4bf01d590dec14f'
 WORKFLOWS = {role: '.github/workflows/' + name + '.yml' for role, name in {

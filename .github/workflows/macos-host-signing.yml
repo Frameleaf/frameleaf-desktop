@@ -58,7 +58,7 @@ jobs:
           PYTHONPATH=tools python3 -c 'from pathlib import Path; from build_host_ffmpeg import unpack; import sys; unpack(Path(sys.argv[1]),Path(sys.argv[2]),max_bytes=8*1024**3)' "$archive" "$root"
           printf '%s  %s\n' "$(jq -r .manifestSha256 <<< "$APPROVAL")" "$root/candidate/manifest.json" | shasum -a 256 -c
           printf '%s  %s\n' "$(jq -r .controllerSha256 <<< "$APPROVAL")" "$root/frameleaf-native-host" | shasum -a 256 -c
-          jq -e '.platform=="macos" and .architecture=="aarch64" and .epoch==22 and .sourceRevision=="c64039743af7bb0d68b602ff842683906019de52"' "$root/candidate/manifest.json" >/dev/null
+          jq -e '.platform=="macos" and .architecture=="aarch64" and .epoch==22 and .sourceRevision=="9f22a57adb7a271d97ead305103c094fb3d25ad2"' "$root/candidate/manifest.json" >/dev/null
       - name: Retrieve the retained submission for the same approved input
         if: inputs.resume_submission != ''
         env:
@@ -189,7 +189,7 @@ jobs:
           release=$(jq -r .releaseId <<< "$APPROVAL")
           tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -er 'select(.draft == true) | .tag_name')
           pkg="$RUNNER_TEMP/macos-host-pkg"
-          name="FrameleafCompanion-1.2.3-macOS-arm64-unsigned-$GITHUB_RUN_ID.pkg"
+          name="FrameleafCompanion-1.2.4-macOS-arm64-unsigned-$GITHUB_RUN_ID.pkg"
           mv "$pkg/FrameleafNativeHost-internal.pkg" "$pkg/$name"
           mv "$pkg/qualification.json" "$pkg/FrameleafCompanion-macOS-$GITHUB_RUN_ID.json"
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$pkg/$name" "$pkg/FrameleafCompanion-macOS-$GITHUB_RUN_ID.json"
