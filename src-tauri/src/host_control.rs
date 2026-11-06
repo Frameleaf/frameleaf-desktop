@@ -405,9 +405,20 @@ pub fn run() -> Result<(), String> {
         // A missing owner or malformed command still cancels while a checkpoint is running.
         read_owner_commands(&mut input, commands, &input_cancelled, &input_invalid);
     });
-    let mut config = receiver
+    let config = receiver
         .recv()
         .map_err(|_| "host_control_config_invalid")??;
+    let state = config.state.clone();
+    serve(config, cancelled, invalid, command_receiver)
+        .inspect_err(|code| crate::host_runtime::record_failure(&state, code))
+}
+
+fn serve(
+    mut config: Config,
+    cancelled: Arc<AtomicBool>,
+    invalid: Arc<AtomicBool>,
+    command_receiver: mpsc::Receiver<CheckpointCommand>,
+) -> Result<(), String> {
     let password = Zeroizing::new(std::mem::take(&mut config.password));
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);

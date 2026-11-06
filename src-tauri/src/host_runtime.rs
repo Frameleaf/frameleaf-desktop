@@ -903,6 +903,15 @@ fn private_file(path: &Path, append: bool) -> Result<File, String> {
     Ok(file)
 }
 
+/// Keep the controller's fixed refusal code beside agent output; Manager reports only a generic failure.
+pub(crate) fn record_failure(state: &Path, code: &str) {
+    if code.len() <= 80 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        if let Ok(mut log) = private_file(&state.join("agent.log"), true) {
+            let _ = std::io::Write::write_all(&mut log, format!("{code}\n").as_bytes());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum HostMode {
@@ -1577,6 +1586,20 @@ mod checkpoint_tests {
     }
     fn wire(value: &serde_json::Value) -> Vec<u8> {
         format!("{value}\n").into_bytes()
+    }
+
+    #[test]
+    fn controller_failure_appends_only_fixed_codes_to_the_agent_log() {
+        let state =
+            std::env::temp_dir().join(format!("frameleaf-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("agent.log"), "agent output\n").unwrap();
+        record_failure(&state, "host_already_owned");
+        record_failure(&state, "host_C:\\private\\path");
+        record_failure(&state, &"host_".repeat(17));
+        let log = std::fs::read_to_string(state.join("agent.log")).unwrap();
+        std::fs::remove_dir_all(&state).unwrap();
+        assert_eq!(log, "agent output\nhost_already_owned\n");
     }
 
     fn restore_binding() -> RestoreBinding {
