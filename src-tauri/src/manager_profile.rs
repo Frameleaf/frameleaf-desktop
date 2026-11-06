@@ -209,6 +209,19 @@ impl Profile {
                 {
                     return Err("native_profile_binding_changed".into());
                 }
+                // Manager has not run with this package while the journal names the previous one,
+                // so the transition must describe the package moved from now, not an earlier attempt.
+                if saved.installation_transition != transition {
+                    let refreshed = Self {
+                        schema_version: 1,
+                        binding_sha256: new.clone(),
+                        database_password: saved.database_password.clone(),
+                        backup_key: saved.backup_key.clone(),
+                        installation_transition: transition,
+                        guard: None,
+                    };
+                    persist(&format!("{ACCOUNT}-{new}"), &refreshed)?;
+                }
             }
             None => {
                 let prior = source.ok_or("native_profile_recovery_required")?;
@@ -710,11 +723,25 @@ mod tests {
             |_, _| panic!("must not move twice"),
         )
         .unwrap();
+        // A stale transition left by an earlier attempt is replaced by the current one.
+        let current = crate::manager_host::Transition {
+            operation_id: uuid::Uuid::new_v4(),
+            from_fingerprint: "c".repeat(64),
+        };
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(current.clone()),
+            load,
+            save,
+        )
+        .unwrap();
         let moved =
             Profile::load_or_create(following.0, &following.1, &following.2, load, |_, _| {
                 panic!("moved profile is complete")
             })
             .unwrap();
+        assert_eq!(moved.installation_transition(), Some(&current));
         assert_eq!(moved.password().as_str(), password.as_str());
         assert_eq!(moved.backup_key().unwrap().as_str(), key.as_str());
         drop(moved);
