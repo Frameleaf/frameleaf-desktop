@@ -335,6 +335,33 @@ impl Owner {
         }
         Ok(marker)
     }
+    /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
+    pub(crate) fn check_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
+        if !self.writable {
+            return Err("host_controller_read_only".into());
+        }
+        if self.active.is_some() {
+            return Err("host_recovery_requires_manager".into());
+        }
+        no_activation(&self.root)?;
+        let current = self.read()?.ok_or("host_controller_state_invalid")?;
+        self.binding(&current, id, previous)?;
+        if current.phase != Phase::Stopped || current.restore_pending {
+            return Err("host_recovery_requires_manager".into());
+        }
+        // Their receipts name the previous package; finish or discard them with it first.
+        for name in ["checkpoints", "restore-input", "restore-targets"] {
+            let empty = match self.root.read_dir(name) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(mut entries) => entries.next().is_none(),
+                Err(_) => false,
+            };
+            if !empty {
+                return Err("host_upgrade_operation_pending".into());
+            }
+        }
+        Ok(())
+    }
     /// Repoint a cleanly stopped library at a newer package. This write commits the move.
     pub(crate) fn carry_forward(
         &mut self,
@@ -345,12 +372,8 @@ impl Owner {
         if !crate::native_runtime::digest_valid(next, 64) || previous == next {
             return Err("host_controller_binding_changed".into());
         }
-        no_activation(&self.root)?;
+        self.check_movable(id, previous)?;
         let current = self.read()?.ok_or("host_controller_state_invalid")?;
-        self.binding(&current, id, previous)?;
-        if current.phase != Phase::Stopped || current.restore_pending || self.active.is_some() {
-            return Err("host_recovery_requires_manager".into());
-        }
         let marker = Marker {
             manifest_sha256: next.into(),
             generation: Uuid::new_v4(),

@@ -203,12 +203,19 @@ impl Profile {
             }
         }
         if marker != new.as_bytes() {
-            let temp = format!(".host-profile-{}.tmp", uuid::Uuid::new_v4());
+            // A fixed name lets a retry replace what an interrupted move left behind.
+            let temp = ".host-profile.carry.tmp";
+            match data.remove_file(temp) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err("native_profile_unavailable".into())
+                }
+                _ => {}
+            }
             let result = (|| -> Result<(), String> {
                 let mut options = crate::host_state::options(true);
                 options.create_new(true);
                 let mut file = data
-                    .open_with(&temp, &options)
+                    .open_with(temp, &options)
                     .map_err(|_| "native_profile_unavailable")?
                     .into_std();
                 file.write_all(new.as_bytes())
@@ -216,14 +223,14 @@ impl Profile {
                     .map_err(|_| "native_profile_unavailable")?;
                 drop(file);
                 // Replacing the reservation is the only change; the old keystore entry is kept.
-                data.rename(&temp, &data, ".host-profile")
+                data.rename(temp, &data, ".host-profile")
                     .map_err(|_| "native_profile_unavailable")?;
                 crate::host_storage::directory(&next.0.data)?
                     .sync_all()
                     .map_err(|_| "native_profile_unavailable".to_string())
             })();
             if result.is_err() {
-                let _ = data.remove_file(&temp);
+                let _ = data.remove_file(temp);
             }
             result?;
         }

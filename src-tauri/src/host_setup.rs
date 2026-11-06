@@ -562,21 +562,128 @@ fn carry_forward(
     )?;
     previous.installation_id = marker.installation_id.clone();
     let layout = record.layout()?;
-    let (old, new) = crate::manager_profile::Profile::carry_forward(
-        (&previous, &previous_layout.runtime, &marker.manifest_sha256),
-        (next, &layout.runtime, &record.manifest_sha256),
-    )?;
-    crate::manager_tls::TlsIdentity::carry_forward(&old, &new)?;
-    carry_host_state(
-        &next.state,
-        (&marker.manifest_sha256, previous_runtime.source_revision()),
-        (&record.manifest_sha256, runtime.source_revision()),
-    )?;
-    crate::host_state::Owner::acquire(&next.state, true)?.carry_forward(
-        &marker.installation_id,
-        &marker.manifest_sha256,
-        &record.manifest_sha256,
+    // Hold the previous package and the journal for the whole move.
+    let _code = crate::package_lease::CodeLease::acquire(&previous_layout.runtime)?;
+    let owner = crate::host_state::Owner::acquire(&next.state, true)?;
+    move_library(
+        owner,
+        Package {
+            config: &previous,
+            candidate: &previous_layout.runtime,
+            manifest: &marker.manifest_sha256,
+            revision: previous_runtime.source_revision(),
+        },
+        Package {
+            config: next,
+            candidate: &layout.runtime,
+            manifest: &record.manifest_sha256,
+            revision: runtime.source_revision(),
+        },
+        crate::manager_profile::Profile::carry_forward,
+        crate::manager_tls::TlsIdentity::carry_forward,
     )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+struct Package<'a> {
+    config: &'a Configuration,
+    candidate: &'a std::path::Path,
+    manifest: &'a str,
+    revision: &'a str,
+}
+
+/// Every check runs before the first change; the journal write last commits the move.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn move_library(
+    mut owner: crate::host_state::Owner,
+    previous: Package,
+    next: Package,
+    profile: impl FnOnce(
+        (&Configuration, &std::path::Path, &str),
+        (&Configuration, &std::path::Path, &str),
+    ) -> Result<(String, String), String>,
+    tls: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let id = &previous.config.installation_id;
+    owner.check_movable(id, previous.manifest)?;
+    host_state_package(
+        &next.config.state,
+        (previous.manifest, previous.revision),
+        (next.manifest, next.revision),
+    )?;
+    let (old, new) = profile(
+        (previous.config, previous.candidate, previous.manifest),
+        (next.config, next.candidate, next.manifest),
+    )?;
+    tls(&old, &new)?;
+    carry_host_state(
+        &next.config.state,
+        (previous.manifest, previous.revision),
+        (next.manifest, next.revision),
+    )?;
+    owner.carry_forward(id, previous.manifest, next.manifest)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn host_state_marker((manifest, revision): (&str, &str)) -> Result<String, String> {
+    if !crate::native_runtime::digest_valid(manifest, 64)
+        || !crate::native_runtime::digest_valid(revision, 40)
+    {
+        return Err("host_state_invalid".into());
+    }
+    Ok(format!(
+        r#"{{"schemaVersion":1,"manifestSha256":"{manifest}","sourceRevision":"{revision}","postgresMajor":"19"}}"#
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Debug, PartialEq)]
+enum HostStatePackage {
+    /// The host never created its database; the agent starts it fresh for any package.
+    Unclaimed,
+    Previous,
+    Next,
+}
+
+/// Read-only: which package the host agent's marker names.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn host_state_package(
+    state: &std::path::Path,
+    previous: (&str, &str),
+    next: (&str, &str),
+) -> Result<HostStatePackage, String> {
+    use std::io::Read;
+    let (previous, next) = (host_state_marker(previous)?, host_state_marker(next)?);
+    let root = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(state)?);
+    let mut file = match root.open_with("host-state.json", &crate::host_state::options(false)) {
+        Ok(file) => file.into_std(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for entry in root.entries().map_err(|_| "host_state_invalid")? {
+                let name = entry.map_err(|_| "host_state_invalid")?.file_name();
+                if !["lease.lock", "agent.log", "controller-state.json"]
+                    .iter()
+                    .any(|allowed| name == std::ffi::OsStr::new(allowed))
+                {
+                    return Err("host_update_requires_manager".into());
+                }
+            }
+            return Ok(HostStatePackage::Unclaimed);
+        }
+        Err(_) => return Err("host_state_invalid".into()),
+    };
+    crate::host_state::valid_file(&file).map_err(|_| "host_state_invalid")?;
+    let mut current = String::new();
+    Read::by_ref(&mut file)
+        .take(4097)
+        .read_to_string(&mut current)
+        .map_err(|_| "host_state_invalid")?;
+    if current == next {
+        Ok(HostStatePackage::Next)
+    } else if current == previous {
+        Ok(HostStatePackage::Previous)
+    } else {
+        Err("host_update_requires_manager".into())
+    }
 }
 
 /// The host agent's package marker names the package that last ran this database.
@@ -586,57 +693,40 @@ fn carry_host_state(
     previous: (&str, &str),
     next: (&str, &str),
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
-    let marker = |(manifest, revision): (&str, &str)| {
-        format!(
-            r#"{{"schemaVersion":1,"manifestSha256":"{manifest}","sourceRevision":"{revision}","postgresMajor":"19"}}"#
-        )
-    };
-    for (manifest, revision) in [previous, next] {
-        if !crate::native_runtime::digest_valid(manifest, 64)
-            || !crate::native_runtime::digest_valid(revision, 40)
-        {
-            return Err("host_state_invalid".into());
-        }
-    }
-    let root = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(state)?);
-    let mut file = root
-        .open_with("host-state.json", &crate::host_state::options(false))
-        .map_err(|_| "host_state_invalid")?
-        .into_std();
-    crate::host_state::valid_file(&file).map_err(|_| "host_state_invalid")?;
-    let mut current = String::new();
-    Read::by_ref(&mut file)
-        .take(4097)
-        .read_to_string(&mut current)
-        .map_err(|_| "host_state_invalid")?;
-    if current == marker(next) {
+    use std::io::Write;
+    if host_state_package(state, previous, next)? != HostStatePackage::Previous {
         return Ok(());
     }
-    if current != marker(previous) {
-        return Err("host_update_requires_manager".into());
+    let marker = host_state_marker(next)?;
+    let root = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(state)?);
+    // A fixed name lets a retry replace what an interrupted move left behind.
+    let temp = ".host-state.json.carry.tmp";
+    match root.remove_file(temp) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err("host_state_invalid".into())
+        }
+        _ => {}
     }
-    let temp = format!(".host-state-{}.tmp", uuid::Uuid::new_v4());
     let result = (|| -> Result<(), String> {
         let mut options = crate::host_state::options(true);
         options.create_new(true);
         let mut output = root
-            .open_with(&temp, &options)
+            .open_with(temp, &options)
             .map_err(|_| "host_state_invalid")?
             .into_std();
         output
-            .write_all(marker(next).as_bytes())
+            .write_all(marker.as_bytes())
             .and_then(|_| output.sync_all())
             .map_err(|_| "host_state_invalid")?;
         drop(output);
-        root.rename(&temp, &root, "host-state.json")
+        root.rename(temp, &root, "host-state.json")
             .map_err(|_| "host_state_invalid")?;
         crate::host_storage::directory(state)?
             .sync_all()
             .map_err(|_| "host_state_invalid".to_string())
     })();
     if result.is_err() {
-        let _ = root.remove_file(&temp);
+        let _ = root.remove_file(temp);
     }
     result
 }
@@ -760,6 +850,136 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), marker(&c, &ra));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_move_checks_everything_before_its_first_change() {
+        use crate::host_state::Owner;
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let (ra, rb) = ("1".repeat(40), "2".repeat(40));
+        let id = "aaaaaaaaaaaa";
+        let setup = |active: bool, marker: Option<&str>, pending: bool| {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-library-move-{}", uuid::Uuid::new_v4()));
+            let state = root.join("state");
+            crate::runtime_store::private_directory(&root).unwrap();
+            let mut owner = Owner::acquire(&state, true).unwrap();
+            owner
+                .activate(id, &a, crate::host_runtime::HostMode::Server)
+                .unwrap();
+            if !active {
+                owner.clean_stop().unwrap();
+            }
+            drop(owner);
+            if let Some(text) = marker {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(state.join("host-state.json"))
+                    .unwrap();
+                std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+            }
+            if pending {
+                crate::runtime_store::private_directory(&state.join("checkpoints")).unwrap();
+                crate::runtime_store::private_directory(&state.join("checkpoints/op")).unwrap();
+            }
+            (root, state)
+        };
+        let config = |state: &std::path::Path| Configuration {
+            installation_id: id.into(),
+            name: "Synthetic".into(),
+            release: "frameleaf-v3.0.0-1".into(),
+            controller: "/bin/echo".into(),
+            state: state.into(),
+            data: state.with_file_name("manager"),
+            origin: "https://127.0.0.1:9443".into(),
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let run = |state: &std::path::Path| {
+            let config = config(state);
+            let calls = std::cell::Cell::new(0);
+            let owner = Owner::acquire(state, true);
+            let result = owner.and_then(|owner| {
+                move_library(
+                    owner,
+                    Package {
+                        config: &config,
+                        candidate: std::path::Path::new("/runtime/a"),
+                        manifest: &a,
+                        revision: &ra,
+                    },
+                    Package {
+                        config: &config,
+                        candidate: std::path::Path::new("/runtime/b"),
+                        manifest: &b,
+                        revision: &rb,
+                    },
+                    |_, _| {
+                        calls.set(calls.get() + 1);
+                        Ok(("d".repeat(64), "e".repeat(64)))
+                    },
+                    |_, _| Ok(()),
+                )
+            });
+            (result, calls.get())
+        };
+        let previous = host_state_marker((&a, &ra)).unwrap();
+        for (active, marker, pending, code) in [
+            (
+                true,
+                Some(previous.clone()),
+                false,
+                "host_recovery_requires_manager",
+            ),
+            (
+                false,
+                Some(previous.clone()),
+                true,
+                "host_upgrade_operation_pending",
+            ),
+            (
+                false,
+                Some(host_state_marker((&c, &ra)).unwrap()),
+                false,
+                "host_update_requires_manager",
+            ),
+        ] {
+            let (root, state) = setup(active, marker.as_deref(), pending);
+            let before = std::fs::read(state.join("host-state.json")).unwrap();
+            let (result, calls) = run(&state);
+            assert_eq!(result.unwrap_err(), code);
+            assert_eq!(calls, 0, "nothing changes before every check passes");
+            assert_eq!(
+                std::fs::read(state.join("host-state.json")).unwrap(),
+                before
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let (root, state) = setup(false, Some(&previous), false);
+        let (result, calls) = run(&state);
+        result.unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            std::fs::read_to_string(state.join("host-state.json")).unwrap(),
+            host_state_marker((&b, &rb)).unwrap()
+        );
+        assert_eq!(Owner::peek(&state).unwrap().unwrap().manifest_sha256, b);
+        assert_eq!(
+            run(&state).0.unwrap_err(),
+            "host_controller_binding_changed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        // A host that never created its database moves without a marker to rewrite.
+        let (root, state) = setup(false, None, false);
+        run(&state).0.unwrap();
+        assert!(!state.join("host-state.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

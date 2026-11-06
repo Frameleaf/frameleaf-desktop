@@ -40,7 +40,8 @@
     if (value === 'native_manager_start_cancelled') return 'Local setup was cancelled.';
     if (value === 'host_upgrade_downgrade_refused') return 'This library already uses a newer server package. Choose that package to continue.';
     if (value === 'host_upgrade_previous_package_missing') return 'Keep the server package this library last used installed until it has started once with the new package, then try again.';
-    if (value === 'host_update_requires_manager') return 'This library’s server package record does not match the installed packages. Your library has been preserved.';
+    if (value === 'host_upgrade_operation_pending') return 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.';
+    if (value === 'host_update_requires_manager') return 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.';
     if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, recover it in Manager first.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
     if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
