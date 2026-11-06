@@ -5,8 +5,9 @@ const messages: Record<string, string> = {
   worker_resume_offline: 'Your server did not answer. Check that it is online, then try Resume again.',
   worker_resume_awaiting_approval: 'An administrator on your server needs to approve this computer for AI processing.',
   worker_resume_unsupported_server: 'Your server does not accept AI processing from this computer. Update the server, then try Resume again.',
-  worker_resume_enrollment_failed: 'Your server refused this computer’s registration. Remove it from the server’s Computers settings, then sign in again.',
-  worker_resume_worker_setup_failed: 'Your server registered this computer but would not start an AI session. Check that AI features are on for your account, then try Resume again.',
+  // ponytail: these states drop the underlying error, so the copy covers both an interruption and a refusal.
+  worker_resume_enrollment_failed: 'This computer could not register with your server. Try Resume again. If it keeps failing, remove this computer from the server’s Computers settings, then sign in again.',
+  worker_resume_worker_setup_failed: 'This computer could not start or save an AI session with your server. Try Resume again. If it keeps failing, check that AI features are on for your account and that this computer’s credential store is unlocked.',
   worker_resume_credential_store_unavailable: 'Unlock your computer’s credential store, then try Resume again.',
   worker_resume_identity_changed: 'Your server’s identity changed. Sign out and sign in again to confirm it.',
   desktop_protocol_unsupported: 'Your server does not accept AI processing from this computer. Update the server, then try again.',
