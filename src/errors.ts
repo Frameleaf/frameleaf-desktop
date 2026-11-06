@@ -11,6 +11,7 @@ const messages: Record<string, string> = {
   worker_resume_identity_changed: 'Your server’s identity changed. Sign out and sign in again to confirm it.',
   desktop_protocol_unsupported: 'Your server does not accept AI processing from this computer. Update the server, then try again.',
   server_identity_changed: 'Your server’s identity changed. Sign out and sign in again to confirm it.',
+  network_client_unavailable: 'Frameleaf could not start its secure connection on this computer. Quit and reopen Frameleaf, then try again.',
   server_requires_https_origin: 'Enter your server’s address without a path or sign-in details. Use HTTPS unless the server is on your local network.',
   server_address_invalid: 'Enter a valid server address.',
   server_sign_in_retry_required: 'Your server’s identity could not be confirmed. Sign in again to continue.',
