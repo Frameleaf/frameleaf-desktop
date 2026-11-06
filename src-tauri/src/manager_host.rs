@@ -158,6 +158,7 @@ struct Binding<'a> {
     database_port: u16,
     api_port: u16,
 }
+/// The installation part of the bootstrap and descriptor, in Manager's field order.
 fn binding<'a>(
     config: &'a Configuration,
     candidate: &'a Path,
@@ -195,6 +196,7 @@ pub(crate) fn descriptor_fingerprint(
         format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
     )
 }
+/// sha256 of the compact JSON Manager computes for its stored descriptor.
 #[cfg(unix)]
 fn fingerprint(
     installation: Binding,

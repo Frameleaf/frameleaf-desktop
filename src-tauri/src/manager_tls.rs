@@ -75,6 +75,7 @@ impl TlsIdentity {
             crate::credentials::save,
         )
     }
+    /// `carry_forward` with injectable keystore access for tests.
     #[cfg(unix)]
     fn carry_forward_with(
         previous: &str,

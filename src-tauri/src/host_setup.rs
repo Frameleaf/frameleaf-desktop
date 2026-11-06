@@ -458,6 +458,7 @@ fn pin_profile_leaf(path: &std::path::Path) -> Result<Vec<std::fs::File>, String
         .map_err(|_| "host_install_windows_profile_required".into())
 }
 
+/// Re-read an installed package record and verify its controller and signed runtime.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn verified(
     record: &Installation,
@@ -496,6 +497,7 @@ fn verified(
     Ok((layout, runtime))
 }
 
+/// The Manager configuration for a verified package and this account's profile paths.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn configuration<U: Serialize>(
     record: &Installation,
@@ -604,6 +606,7 @@ fn carry_forward(
     )
 }
 
+/// One side of a library move: the package's configuration, location and identity.
 #[cfg(unix)]
 struct Package<'a> {
     config: &'a Configuration,
@@ -644,6 +647,7 @@ fn move_library(
     owner.carry_forward(id, previous.manifest, next.manifest)
 }
 
+/// The exact bytes the host agent writes for a package's marker.
 #[cfg(unix)]
 fn host_state_marker((manifest, revision): (&str, &str)) -> Result<String, String> {
     if !crate::native_runtime::digest_valid(manifest, 64)

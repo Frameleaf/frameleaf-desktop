@@ -140,6 +140,7 @@ impl Profile {
             crate::credentials::save,
         )
     }
+    /// `carry_forward` with injectable keystore access for tests.
     #[cfg(not(windows))]
     fn carry_forward_with(
         previous: (&Configuration, &Path, &str),
