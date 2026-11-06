@@ -202,6 +202,10 @@ impl VerifiedHostRuntime {
     pub fn source_revision(&self) -> &str {
         &self.manifest.source_revision
     }
+    /// Signed release order; a library only moves forward to a newer epoch.
+    pub fn epoch(&self) -> u64 {
+        self.manifest.epoch
+    }
     pub fn certified(&self) -> bool {
         self.manifest.certified
     }

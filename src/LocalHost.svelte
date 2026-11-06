@@ -38,6 +38,9 @@
     if (value === 'host_package_maintenance' || value === 'host_package_busy') return 'Server component maintenance is unfinished or the component is in use. Local management is unavailable until maintenance completes.';
     if (value.startsWith('host_package_')) return 'The server component installation could not be verified. Local management is blocked; your existing library has been preserved.';
     if (value === 'native_manager_start_cancelled') return 'Local setup was cancelled.';
+    if (value === 'host_upgrade_downgrade_refused') return 'This library already uses a newer server package. Choose that package to continue.';
+    if (value === 'host_upgrade_previous_package_missing') return 'Keep the server package this library last used installed until it has started once with the new package, then try again.';
+    if (value === 'host_update_requires_manager') return 'This library’s server package record does not match the installed packages. Your library has been preserved.';
     if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, recover it in Manager first.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
     if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
@@ -147,6 +150,7 @@
           {#each installations as installation (installation.manifestSha256)}<option value={installation.manifestSha256}>Package {installation.manifestSha256.slice(0, 12)}</option>{/each}
         </select>
       </div>
+      <small>Starting an existing library with a newer package moves it to that package. It cannot go back to an older one.</small>
     {/if}
     {#if view?.state === 'manager-ready'}
       <div class="row">

@@ -320,6 +320,44 @@ impl Owner {
         self.active = Some(marker);
         Ok(())
     }
+    /// Read the stopped journal without taking ownership; None means a fresh profile.
+    pub(crate) fn peek(path: &Path) -> Result<Option<Marker>, String> {
+        let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+        match root.symlink_metadata(NAME) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("host_controller_state_invalid".into()),
+            Ok(_) => {}
+        }
+        let mut owner = Self::acquire(path, false)?;
+        let marker = owner.read()?;
+        if let Some(marker) = &marker {
+            owner.binding(marker, &marker.installation_id, &marker.manifest_sha256)?;
+        }
+        Ok(marker)
+    }
+    /// Repoint a cleanly stopped library at a newer package. This write commits the move.
+    pub(crate) fn carry_forward(
+        &mut self,
+        id: &str,
+        previous: &str,
+        next: &str,
+    ) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(next, 64) || previous == next {
+            return Err("host_controller_binding_changed".into());
+        }
+        no_activation(&self.root)?;
+        let current = self.read()?.ok_or("host_controller_state_invalid")?;
+        self.binding(&current, id, previous)?;
+        if current.phase != Phase::Stopped || current.restore_pending || self.active.is_some() {
+            return Err("host_recovery_requires_manager".into());
+        }
+        let marker = Marker {
+            manifest_sha256: next.into(),
+            generation: Uuid::new_v4(),
+            ..current
+        };
+        self.write(&marker)
+    }
     pub fn clean_stop(&mut self) -> Result<(), String> {
         let mut marker = self.active.clone().ok_or("host_controller_state_invalid")?;
         let current = self.read()?.ok_or("host_controller_state_invalid")?;
@@ -534,6 +572,44 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn stopped_library_moves_to_a_newer_package_only_once_and_only_when_cleanly_stopped() {
+        let fixture = Fixture::new();
+        assert!(Owner::peek(&fixture.0).unwrap().is_none());
+        let next = "c".repeat(64);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(
+            owner.carry_forward(ID, &sha(), &next).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.clean_stop().unwrap();
+        drop(owner);
+        let before = Owner::peek(&fixture.0).unwrap().unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        for (id, previous) in [("bbbbbbbbbbbb", sha()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.carry_forward(id, &previous, &next).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+        owner.carry_forward(ID, &sha(), &next).unwrap();
+        assert!(owner.carry_forward(ID, &sha(), &next).is_err());
+        drop(owner);
+        let after = Owner::peek(&fixture.0).unwrap().unwrap();
+        assert_eq!(after.manifest_sha256, next);
+        assert_eq!(after.installation_id, before.installation_id);
+        assert_eq!(after.phase, Phase::Stopped);
+        assert_ne!(after.generation, before.generation);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &next, crate::host_runtime::HostMode::Server)
+            .unwrap();
+        owner.clean_stop().unwrap();
+    }
+
     #[test]
     fn owner_drop_releases_fork_style_descriptor_without_claiming_clean_shutdown() {
         let fixture = Fixture::new();

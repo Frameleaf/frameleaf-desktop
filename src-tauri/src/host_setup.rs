@@ -458,6 +458,189 @@ fn pin_profile_leaf(path: &std::path::Path) -> Result<Vec<std::fs::File>, String
         .map_err(|_| "host_install_windows_profile_required".into())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn verified(
+    record: &Installation,
+) -> Result<
+    (
+        crate::host_install::Layout,
+        crate::host_runtime::VerifiedHostRuntime,
+    ),
+    String,
+> {
+    let current = Installation::read(&record.manifest_sha256)?;
+    if &current != record {
+        return Err("host_install_record_invalid".into());
+    }
+    let layout = record.layout()?;
+    let controller = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
+    if format!("{:x}", Sha256::digest(controller)) != record.controller_sha256 {
+        return Err("host_install_controller_changed".into());
+    }
+    let raw = crate::runtime_store::read_bounded(
+        &layout.runtime.join("manifest.json"),
+        16 * 1024 * 1024,
+    )?;
+    let signature: [u8; 64] =
+        crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
+            .try_into()
+            .map_err(|_| "host_signature_invalid")?;
+    let runtime = crate::release_policy::verify_host_runtime(
+        &layout.runtime.join("payload"),
+        &raw,
+        &signature,
+    )?;
+    if runtime.manifest_sha256() != record.manifest_sha256 {
+        return Err("host_install_runtime_changed".into());
+    }
+    Ok((layout, runtime))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn configuration<U: Serialize>(
+    record: &Installation,
+    layout: &crate::host_install::Layout,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    uid: &U,
+    state: std::path::PathBuf,
+    data: std::path::PathBuf,
+) -> Result<Configuration, String> {
+    let package: serde_json::Value = serde_json::from_slice(&crate::runtime_store::read_bounded(
+        &layout.runtime.join("payload/server/package.json"),
+        64 * 1024,
+    )?)
+    .map_err(|_| "native_host_version_invalid")?;
+    let release = native_release(
+        package["version"]
+            .as_str()
+            .ok_or("native_host_version_invalid")?,
+        runtime.source_revision(),
+    )?;
+    let identity = serde_json::to_vec(&(record, uid)).map_err(|_| "native_host_setup_failed")?;
+    Ok(Configuration {
+        installation_id: format!("{:x}", Sha256::digest(identity))[..12].into(),
+        name: "My Frameleaf library".into(),
+        release,
+        controller: layout.controller.clone(),
+        state,
+        data,
+        origin: "https://127.0.0.1:9443".into(),
+        database_port: 54329,
+        api_port: 2283,
+    })
+}
+
+/// A library keeps its first installation identity. Moving it to a newer signed package copies its
+/// saved secrets and repoints its journals while it is cleanly stopped; downgrades are refused.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn carry_forward(
+    record: &Installation,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    next: &mut Configuration,
+    uid: u32,
+) -> Result<(), String> {
+    let Some(marker) = crate::host_state::Owner::peek(&next.state)? else {
+        return Ok(());
+    };
+    next.installation_id = marker.installation_id.clone();
+    if marker.manifest_sha256 == record.manifest_sha256 {
+        return Ok(());
+    }
+    let previous_record = Installation::read(&marker.manifest_sha256)
+        .map_err(|_| "host_upgrade_previous_package_missing")?;
+    let (previous_layout, previous_runtime) = verified(&previous_record)?;
+    if runtime.epoch() <= previous_runtime.epoch() {
+        return Err("host_upgrade_downgrade_refused".into());
+    }
+    let mut previous = configuration(
+        &previous_record,
+        &previous_layout,
+        &previous_runtime,
+        &uid,
+        next.state.clone(),
+        next.data.clone(),
+    )?;
+    previous.installation_id = marker.installation_id.clone();
+    let layout = record.layout()?;
+    let (old, new) = crate::manager_profile::Profile::carry_forward(
+        (&previous, &previous_layout.runtime, &marker.manifest_sha256),
+        (next, &layout.runtime, &record.manifest_sha256),
+    )?;
+    crate::manager_tls::TlsIdentity::carry_forward(&old, &new)?;
+    carry_host_state(
+        &next.state,
+        (&marker.manifest_sha256, previous_runtime.source_revision()),
+        (&record.manifest_sha256, runtime.source_revision()),
+    )?;
+    crate::host_state::Owner::acquire(&next.state, true)?.carry_forward(
+        &marker.installation_id,
+        &marker.manifest_sha256,
+        &record.manifest_sha256,
+    )
+}
+
+/// The host agent's package marker names the package that last ran this database.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn carry_host_state(
+    state: &std::path::Path,
+    previous: (&str, &str),
+    next: (&str, &str),
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let marker = |(manifest, revision): (&str, &str)| {
+        format!(
+            r#"{{"schemaVersion":1,"manifestSha256":"{manifest}","sourceRevision":"{revision}","postgresMajor":"19"}}"#
+        )
+    };
+    for (manifest, revision) in [previous, next] {
+        if !crate::native_runtime::digest_valid(manifest, 64)
+            || !crate::native_runtime::digest_valid(revision, 40)
+        {
+            return Err("host_state_invalid".into());
+        }
+    }
+    let root = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(state)?);
+    let mut file = root
+        .open_with("host-state.json", &crate::host_state::options(false))
+        .map_err(|_| "host_state_invalid")?
+        .into_std();
+    crate::host_state::valid_file(&file).map_err(|_| "host_state_invalid")?;
+    let mut current = String::new();
+    Read::by_ref(&mut file)
+        .take(4097)
+        .read_to_string(&mut current)
+        .map_err(|_| "host_state_invalid")?;
+    if current == marker(next) {
+        return Ok(());
+    }
+    if current != marker(previous) {
+        return Err("host_update_requires_manager".into());
+    }
+    let temp = format!(".host-state-{}.tmp", uuid::Uuid::new_v4());
+    let result = (|| -> Result<(), String> {
+        let mut options = crate::host_state::options(true);
+        options.create_new(true);
+        let mut output = root
+            .open_with(&temp, &options)
+            .map_err(|_| "host_state_invalid")?
+            .into_std();
+        output
+            .write_all(marker(next).as_bytes())
+            .and_then(|_| output.sync_all())
+            .map_err(|_| "host_state_invalid")?;
+        drop(output);
+        root.rename(&temp, &root, "host-state.json")
+            .map_err(|_| "host_state_invalid")?;
+        crate::host_storage::directory(state)?
+            .sync_all()
+            .map_err(|_| "host_state_invalid".to_string())
+    })();
+    if result.is_err() {
+        let _ = root.remove_file(&temp);
+    }
+    result
+}
+
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -466,31 +649,7 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
     }
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
-        let current = Installation::read(&record.manifest_sha256)?;
-        if &current != record {
-            return Err("host_install_record_invalid".into());
-        }
-        let layout = record.layout()?;
-        let controller = crate::runtime_store::read_bounded(&layout.controller, 256 * 1024 * 1024)?;
-        if format!("{:x}", Sha256::digest(controller)) != record.controller_sha256 {
-            return Err("host_install_controller_changed".into());
-        }
-        let raw = crate::runtime_store::read_bounded(
-            &layout.runtime.join("manifest.json"),
-            16 * 1024 * 1024,
-        )?;
-        let signature: [u8; 64] =
-            crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
-                .try_into()
-                .map_err(|_| "host_signature_invalid")?;
-        let runtime = crate::release_policy::verify_host_runtime(
-            &layout.runtime.join("payload"),
-            &raw,
-            &signature,
-        )?;
-        if runtime.manifest_sha256() != record.manifest_sha256 {
-            return Err("host_install_runtime_changed".into());
-        }
+        let (layout, runtime) = verified(record)?;
         #[cfg(unix)]
         let uid = {
             let uid = unsafe { libc::geteuid() };
@@ -515,31 +674,10 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];
         require_leaf(&state)?;
         require_leaf(&data)?;
-        let package: serde_json::Value =
-            serde_json::from_slice(&crate::runtime_store::read_bounded(
-                &layout.runtime.join("payload/server/package.json"),
-                64 * 1024,
-            )?)
-            .map_err(|_| "native_host_version_invalid")?;
-        let release = native_release(
-            package["version"]
-                .as_str()
-                .ok_or("native_host_version_invalid")?,
-            runtime.source_revision(),
-        )?;
-        let identity =
-            serde_json::to_vec(&(record, uid)).map_err(|_| "native_host_setup_failed")?;
-        let configuration = Configuration {
-            installation_id: format!("{:x}", Sha256::digest(identity))[..12].into(),
-            name: "My Frameleaf library".into(),
-            release,
-            controller: layout.controller,
-            state,
-            data,
-            origin: "https://127.0.0.1:9443".into(),
-            database_port: 54329,
-            api_port: 2283,
-        };
+        #[allow(unused_mut)]
+        let mut configuration = configuration(record, &layout, &runtime, &uid, state, data)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        carry_forward(record, &runtime, &mut configuration, uid)?;
         if cancel.load(Ordering::Acquire) {
             return Err("native_manager_start_cancelled".into());
         }
@@ -581,6 +719,47 @@ mod tests {
             .stop()
             .await
             .expect("installed Manager shutdown failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_package_marker_moves_forward_once_and_refuses_unknown_packages() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-host-marker-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let path = root.join("host-state.json");
+        let marker = |m: &str, r: &str| {
+            format!(
+                r#"{{"schemaVersion":1,"manifestSha256":"{m}","sourceRevision":"{r}","postgresMajor":"19"}}"#
+            )
+        };
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let (ra, rb) = ("1".repeat(40), "2".repeat(40));
+        let write = |text: &str| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::remove_file(&path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        write(&marker(&a, &ra));
+        carry_host_state(&root, (&a, &ra), (&b, &rb)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), marker(&b, &rb));
+        carry_host_state(&root, (&a, &ra), (&b, &rb)).unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        write(&marker(&c, &ra));
+        assert_eq!(
+            carry_host_state(&root, (&a, &ra), (&b, &rb)).unwrap_err(),
+            "host_update_requires_manager"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), marker(&c, &ra));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
