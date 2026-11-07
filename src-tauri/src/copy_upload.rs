@@ -224,6 +224,19 @@ fn limits(response: &Response, bytes: u64) -> Result<usize, String> {
         _ => Err("source_upload_response_invalid".into()),
     }
 }
+/// The upload's Content-Type from the file's extension; a name without one is plain bytes.
+fn upload_mime(filename: &str) -> &'static str {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
 fn date(ms: i64) -> Result<String, String> {
     let value = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
         .map_err(|_| "source_date_invalid")?;
@@ -353,17 +366,7 @@ pub(crate) async fn transfer(
                     .map_err(|_| "source_stage_invalid")
             })
             .collect::<Result<_, _>>()?;
-        let mime = match filename
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "mp4" | "m4v" => "video/mp4",
-            "mov" => "video/quicktime",
-            _ => "image/octet-stream",
-        };
+        let mime = upload_mime(filename);
         let response = send(
             request(Method::POST, "api/assets/uploads")
                 .header("Upload-Draft-Interop-Version", "9")

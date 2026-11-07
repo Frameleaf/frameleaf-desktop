@@ -6,9 +6,11 @@
   import Sheet from '../Sheet.svelte';
   import LocalHost from '../LocalHost.svelte';
   import ManagerPanel from '../ManagerPanel.svelte';
+  import ServerSignIn from '../ServerSignIn.svelte';
+  import FrameleafAccount from '../FrameleafAccount.svelte';
   import { connectionError, savedSignInNeedsRecovery } from '../errors';
-  import { mergeServers, initials, computerWord, platformFromUserAgent, type ServerEntry } from '../ui-state';
-  import type { Connection, CloudAccount, CloudServer, DiscoveredServer } from '../server-types';
+  import { mergeServers, initials, computerWord, platformFromUserAgent, nearbySignIn, type ServerEntry } from '../ui-state';
+  import type { Connection, CloudAccount, CloudServer, DiscoveredServer, SignInOptions } from '../server-types';
 
   let { native, hostActive, cloudAccount, managerRevision, onlocked, onconnected, oncloudaccount, onhostactive, onmanagerchange, onmanagerstate }: {
     native: boolean; hostActive: boolean; cloudAccount: CloudAccount | null; managerRevision: number;
@@ -19,12 +21,17 @@
   const computer = computerWord(platform);
   const version = (import.meta.env?.VITE_APP_VERSION as string | undefined) || '0.1.0';
   let mode = $state<'client-worker' | 'local-server'>('client-worker');
-  let addressMode = $state(false);
+  // start: Welcome (or your servers); address: enter an address; server: that server's sign-in.
+  let step = $state<'start' | 'address' | 'server' | 'account'>('start');
+  let accountStart = $state<'sign-in' | 'create'>('sign-in');
+  // A server sign-in that went to the Frameleaf account first, to finish once signed in.
+  let resume = $state<SignInOptions | null>(null);
+  let resumeFrameleaf = $state(false);
+  let signIn = $state<SignInOptions | null>(null);
+  let looking = $state(false);
+  let lookingUp = $state(false);
   let managerOnly = $state(false);
   let server = $state('');
-  let email = $state('');
-  let password = $state('');
-  let deviceName = $state('My computer');
   let busy = $state(false);
   let discovering = $state(false);
   let cloudBusy = $state(false);
@@ -37,7 +44,7 @@
   let nearby = $state<DiscoveredServer[]>([]);
   let connectingKey = $state('');
   const entries = $derived(mergeServers(cloudServers, nearby));
-  const showServers = $derived(mode === 'client-worker' && !!cloudAccount && !addressMode);
+  const showServers = $derived(mode === 'client-worker' && !!cloudAccount && step === 'start');
   const explain = connectionError;
 
   let cloudLocked = $state(false);
@@ -56,7 +63,28 @@
       failure = explain(error);
     } finally { cloudBusy = false; }
   }
-  onMount(() => { if (native) void restoreCloud(); });
+  onMount(() => { if (native) { void restoreCloud(); void lookNearby(); } });
+  async function lookNearby() {
+    looking = true;
+    try { nearby = await invoke<DiscoveredServer[]>('discover_servers') ?? []; } catch { nearby = []; }
+    finally { looking = false; }
+  }
+  /** Asks the server at `address` how one signs in, then shows its sign-in screen. Nothing secret is sent. */
+  async function openServer(address: string) {
+    if (!native || lookingUp || !address) return;
+    lookingUp = true; failure = ''; notice = '';
+    try { signIn = await invoke<SignInOptions>('server_sign_in_options', { server: address.trim() }); step = 'server'; }
+    catch (error) { failure = explain(error); }
+    finally { lookingUp = false; }
+  }
+  function openAccount(start: 'sign-in' | 'create') { accountStart = start; resume = null; failure = ''; notice = ''; step = 'account'; }
+  /** Signed in to the Frameleaf account: finish the server sign-in that asked for it, or show the account's servers. */
+  function accountSignedIn(account: CloudAccount) {
+    oncloudaccount(account); failure = ''; notice = '';
+    if (resume) { signIn = resume; resume = null; resumeFrameleaf = true; step = 'server'; }
+    else { step = 'start'; void loadServers(); }
+  }
+  function lookUp(event: SubmitEvent) { event.preventDefault(); void openServer(server); }
   async function loadServers() {
     loadingServers = true; failure = '';
     const [cloud, lan] = await Promise.allSettled([invoke<CloudServer[]>('cloud_servers'), invoke<DiscoveredServer[]>('discover_servers')]);
@@ -65,14 +93,18 @@
     nearby = lan.status === 'fulfilled' ? lan.value ?? [] : [];
     loadingServers = false;
   }
-  async function cloudSignIn() {
-    if (!native || cloudBusy) return;
-    cloudBusy = true; failure = ''; notice = 'Finish signing in to Frameleaf Cloud in your browser…';
+  // Accounts are created at Frameleaf Cloud: its sign-in page in the browser offers Create account,
+  // email code and passkey. (The phones' native email-code grant is for the mobile client only.)
+  async function cloudSignIn(create = false, stay = false): Promise<CloudAccount | null> {
+    if (!native || cloudBusy) return null;
+    cloudBusy = true; failure = '';
+    notice = create ? 'Create your Frameleaf account in your browser, then come back here.' : 'Finish signing in to Frameleaf in your browser…';
     try {
       const account = await invoke<CloudAccount>('cloud_sign_in');
-      oncloudaccount(account); addressMode = false; notice = '';
-      await loadServers();
-    } catch (error) { cloudLocked = savedSignInNeedsRecovery(error); notice = ''; failure = explain(error); }
+      oncloudaccount(account); notice = '';
+      if (!stay) { step = 'start'; await loadServers(); }
+      return account;
+    } catch (error) { cloudLocked = savedSignInNeedsRecovery(error); notice = ''; failure = explain(error); return null; }
     finally { cloudBusy = false; }
   }
   async function cloudSignOut() {
@@ -82,25 +114,16 @@
     catch (error) { failure = explain(error); }
     finally { cloudBusy = false; }
   }
-  async function connect(event: SubmitEvent) {
-    event.preventDefault();
-    if (!native || busy) return;
-    busy = true; failure = ''; notice = '';
-    const secret = password; password = '';
-    try { onconnected(await invoke<Connection>('connect_server', { server, email, password: secret, deviceName })); }
-    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); }
-    finally { busy = false; }
-  }
   async function connectCloud(entry: ServerEntry) {
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
-    try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName })); }
+    try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName: 'My computer', server: null })); }
     catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {
     server = entry.nearby?.url ?? entry.cloud?.connections?.[0]?.uri ?? '';
-    addressMode = true; failure = ''; notice = entry.action === 'setup' ? `“${entry.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.` : '';
+    void openServer(server);
   }
   async function findServer() {
     if (!native || discovering) return;
@@ -126,6 +149,13 @@
     {#if showServers}
       <h2>Choose a server</h2>
       <p class="sub"><span class="av" aria-hidden="true">{initials(cloudAccount?.name || cloudAccount?.email)}</span>Signed in to Frameleaf Cloud as {cloudAccount?.email} <button class="btn quiet small" type="button" disabled={cloudBusy} onclick={cloudSignOut}>Switch account</button></p>
+    {:else if mode === 'client-worker' && step === 'address'}
+      <h2>Server address</h2>
+      <p class="sub">The address you open your Frameleaf server at in a browser.</p>
+    {:else if mode === 'client-worker' && step === 'server'}
+      <h2>Sign in to your server</h2>
+    {:else if mode === 'client-worker' && step === 'account'}
+      <!-- FrameleafAccount names its own screen: it switches between sign-in, create and code. -->
     {:else}
       <h2>Welcome</h2>
       <p class="sub">Keep everything on this {computer}, or connect to your server and put this {computer} to work.</p>
@@ -171,20 +201,55 @@
       <div class="wfoot wide">
         <p>Choose a server from your account or your local network.</p>
         <button class="btn quiet" type="button" disabled={loadingServers} onclick={loadServers}>Refresh</button>
-        <button class="btn quiet" type="button" onclick={() => { addressMode = true; }}>Enter an address…</button>
+        <button class="btn quiet" type="button" onclick={() => { step = 'address'; }}>Enter an address…</button>
         <button class="btn" type="button" disabled={busy} onclick={() => { mode = 'local-server'; }}>Run Frameleaf on this {computer}</button>
       </div>
-    {:else}
-      <form class="form" id="connect-form" aria-label="Connect to your server" onsubmit={connect}>
-        <div class="form-row"><label for="srv">Server address</label><span class="with-button"><input id="srv" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={busy} autocomplete="url" /><button class="btn" type="button" disabled={busy || discovering || !native} onclick={findServer}><Icon name="radar" />{discovering ? 'Searching…' : 'Find My Server'}</button></span></div>
-        <div class="form-row"><label for="em">Account</label><span class="two"><input id="em" type="email" placeholder="Email" bind:value={email} required disabled={busy} autocomplete="username" /><input id="pw" type="password" placeholder="Password" aria-label="Password" bind:value={password} required disabled={busy} autocomplete="current-password" /></span></div>
-        <div class="form-row"><label for="nm">This {computer}’s name</label><input id="nm" type="text" bind:value={deviceName} required maxlength="128" disabled={busy} autocomplete="off" /></div>
+    {:else if step === 'server' && signIn}
+      <ServerSignIn options={signIn} {native} {computer} {cloudAccount} {onconnected} {onlocked} autostart={resumeFrameleaf}
+        oncloudsignin={() => { resume = signIn; resumeFrameleaf = false; accountStart = 'sign-in'; step = 'account'; }}
+        onback={() => { step = 'start'; signIn = null; resumeFrameleaf = false; failure = ''; }} />
+    {:else if step === 'account'}
+      <FrameleafAccount start={accountStart} {native}
+        onsignedin={account => accountSignedIn(account)}
+        onbrowser={async () => { const account = await cloudSignIn(false, true); if (account) accountSignedIn(account); }}
+        onownlogin={() => { resume = null; step = 'start'; }}
+        onback={() => { if (resume) { signIn = resume; resume = null; step = 'server'; } else step = 'start'; }} />
+    {:else if step === 'address'}
+      <form class="form" id="address-form" aria-label="Server address" onsubmit={lookUp}>
+        <div class="form-row"><label for="srv">Server address</label><span class="with-button"><input id="srv" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={lookingUp} autocomplete="url" /><button class="btn" type="button" disabled={lookingUp || discovering || !native} onclick={findServer}><Icon name="radar" />{discovering ? 'Searching…' : 'Find My Server'}</button></span></div>
       </form>
       <div class="wfoot">
-        <p>Your password is used only to sign in and is never saved. Signing in lets this {computer} help your server process photos when compatible workers are available. Local photo folders are connected separately.</p>
-        {#if cloudAccount}<button class="btn quiet" type="button" onclick={() => { addressMode = false; }}>Back to your servers</button>{/if}
+        <p>Copy it from your browser’s address bar when you have your server’s page open, or ask whoever runs the server.</p>
+        <button class="btn quiet" type="button" onclick={() => { step = 'start'; failure = ''; notice = ''; void lookNearby(); }}>{cloudAccount ? 'Back to your servers' : 'Look on this network again'}</button>
+        <button class="btn primary" type="submit" form="address-form" disabled={lookingUp || !native || !server}>{lookingUp ? 'Checking…' : 'Continue'}</button>
+      </div>
+    {:else}
+      <div class="start">
+        <button class="btn primary" type="button" disabled={cloudBusy || !native} onclick={() => openAccount('create')}>Create a Frameleaf Account</button>
+        <button class="btn" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : openAccount('sign-in')}><Icon name="cloud" />{cloudLocked ? 'Restore Saved Frameleaf Sign-In' : 'Sign In with Frameleaf'}</button>
+        <p class="sub">One free Frameleaf account signs you in to your servers from home or away. Your photos stay on your own server. Accounts are made at Frameleaf, never on someone’s server.</p>
+      </div>
+      <div class="list" role="list" aria-label="Servers on this network" aria-busy={looking}>
+        <div class="sec">Servers on this network{looking ? ' · Looking…' : ''}</div>
+        {#each nearby as entry (entry.id || entry.url)}
+          <div class="srv" role="listitem">
+            <span class="ic" aria-hidden="true"><Icon name="radar" /></span>
+            <span class="l"><b>{entry.name}</b><small>{nearbySignIn(entry)} · {entry.host}</small></span>
+            <button class="btn" type="button" disabled={lookingUp || !native} onclick={() => openServer(entry.url)}>{entry.setup === 'needed' && !entry.linked ? 'Set Up…' : 'Sign In…'}</button>
+          </div>
+        {:else}
+          <div class="empty" role="listitem">{looking ? 'Looking…' : 'None found yet'}</div>
+        {/each}
+        <div class="srv" role="listitem">
+          <span class="ic" aria-hidden="true"><Icon name="globe" /></span>
+          <span class="l"><b>Another server</b><small>Enter its address</small></span>
+          <button class="btn" type="button" onclick={() => { step = 'address'; failure = ''; notice = ''; }}>Enter Address…</button>
+        </div>
+      </div>
+      <div class="wfoot">
+        <p>Signing in lets this {computer} help your server process photos when compatible workers are available. Local photo folders are connected separately.</p>
+        <button class="btn quiet" type="button" disabled={looking} onclick={lookNearby}>Look Again</button>
         <button class="btn quiet" type="button" disabled={busy} onclick={() => { managerOnly = true; }}>Pair a Manager instead…</button>
-        <button class="btn primary" type="submit" form="connect-form" disabled={busy || !native || !server || !email || !password}>{busy ? 'Connecting…' : 'Connect'}</button>
       </div>
     {/if}
   </div>
@@ -197,14 +262,13 @@
     {/if}
     <span class="sp"></span>
     {#if cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={cloudSignOut}>Clear unreadable Cloud sign-in</button>{/if}
-    {#if mode === 'client-worker' && !cloudAccount && !cloudDamaged}<button class="btn quiet" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Restore saved Cloud sign-in' : cloudBusy ? 'Signing in…' : 'Sign in with Frameleaf Cloud'}</button>{/if}
     Version {version}
   </footer>
 </div>
 {/if}
 {#if picker}
   <Sheet title="Several servers answered" onclose={() => { picker = false; }}>
-    <p>Choose the server to sign in to. Its address fills the form; you still sign in with your email and password.</p>
+    <p>Choose the server to sign in to. Its address fills the form, then Continue shows how you can sign in.</p>
     <div class="list">
       {#each found as entry (entry.id || entry.url)}
         <div class="row">

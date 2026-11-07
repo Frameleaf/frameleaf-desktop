@@ -622,3 +622,11 @@ fn a_resume_journal_cannot_be_rebound_to_a_different_source_run_or_item() {
         assert!(FolderUploadBinding::new(&fixture.copy, "invalid", RESOURCE).is_err());
     });
 }
+#[test]
+fn upload_mime_reads_only_a_real_extension() {
+    assert_eq!(upload_mime("clip.MOV"), "video/quicktime");
+    assert_eq!(upload_mime("clip.m4v"), "video/mp4");
+    assert_eq!(upload_mime("IMG_0001.HEIC"), "application/octet-stream");
+    assert_eq!(upload_mime("mov"), "application/octet-stream");
+    assert_eq!(upload_mime(".mp4"), "application/octet-stream");
+}
