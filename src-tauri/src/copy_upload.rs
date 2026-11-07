@@ -325,14 +325,15 @@ async fn put_part(
     request: RequestBuilder,
     start: u64,
     len: u64,
+    generation: u32,
     delay: Duration,
     cancelled: &AtomicBool,
-) -> (u64, u64, Result<Response, String>) {
+) -> (u64, u64, u32, Result<Response, String>) {
     let result = match pause(delay, cancelled).await {
         Ok(()) => send(request, cancelled).await,
         Err(error) => Err(error),
     };
-    (start, len, result)
+    (start, len, generation, result)
 }
 /// Reads a short error body (the server's JSON message) without trusting its size.
 async fn error_text(mut response: Response) -> String {
@@ -394,6 +395,8 @@ async fn put_parts(
     let parts = format!("{path}/parts");
     let stage_failed = Arc::new(AtomicBool::new(false));
     let (mut failures, mut rate_limited, mut busy, mut replans) = (0, 0, 0, 0);
+    // Bumped by every counted failure; parts carry the generation they were sent under.
+    let mut generation = 0u32;
     gate()?;
     let mut queue: std::collections::VecDeque<_> =
         parts_listing(request, &parts, size, &mut policy, cancelled)
@@ -426,15 +429,15 @@ async fn put_parts(
                 .header("Content-Type", "application/octet-stream")
                 .timeout(upload_parts::part_timeout(len, policy.parallel))
                 .body(part_body(file.clone(), start, len, stage_failed.clone()));
-            inflight.push(put_part(builder, start, len, delay, cancelled));
+            inflight.push(put_part(builder, start, len, generation, delay, cancelled));
         }
-        let Some((start, len, result)) = inflight.next().await else {
+        let Some((start, len, sent, result)) = inflight.next().await else {
             return Ok(None);
         };
         let mut retry = |delay, charged| queue.push_front((start, start + len, delay, charged));
-        // Parts sent before the last halving fail together on a slow shared link: one failure
-        // (and one halving) per size step, so stragglers retry smaller without spending the budget.
-        let stale = len > policy.part_size;
+        // Parts in flight fail together on a slow shared link. Only the first failure of a wave
+        // counts and halves; parts sent before it (any size, even at the 8 MiB floor) just retry.
+        let stale = sent < generation;
         let response = match result {
             Ok(response) => response,
             Err(_) if stage_failed.load(Ordering::Acquire) => {
@@ -443,6 +446,7 @@ async fn put_parts(
             Err(error) if error == "source_upload_interrupted" => {
                 if !stale {
                     failures += 1;
+                    generation += 1;
                     if failures > MAX_PART_FAILURES {
                         return Err(error);
                     }
@@ -473,6 +477,7 @@ async fn put_parts(
             400 => {
                 if !stale {
                     failures += 1;
+                    generation += 1;
                     if failures > MAX_PART_FAILURES {
                         return Err("source_upload_http_400".into());
                     }

@@ -1163,3 +1163,29 @@ fn resent_bytes_are_charged_only_when_the_server_read_the_body() {
         assert_eq!(admitted, 10 + 4);
     });
 }
+#[test]
+fn parts_failing_together_spend_one_retry_per_wave_even_when_short() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        // Three short parts fail three times each, in waves. Counting every failure would pass
+        // the six-failure budget; counting one per wave spends three.
+        let mut attempts = std::collections::HashMap::new();
+        let server = parts_server(
+            true,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
+            move |offset, _| {
+                let n = attempts.entry(offset).or_insert(0);
+                *n += 1;
+                if *n <= 3 {
+                    protocol(400, "", "")
+                } else {
+                    stored()
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        let (outcome, _) = run_admitted(&fixture, &server).await;
+        assert!(matches!(outcome.unwrap(), UploadOutcome::Ingested { .. }));
+        assert_eq!(puts(&server).len(), 12);
+    });
+}
