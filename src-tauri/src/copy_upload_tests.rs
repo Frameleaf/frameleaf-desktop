@@ -84,10 +84,14 @@ impl Server {
                 while !headers.ends_with(b"\r\n\r\n") {
                     let mut byte = [0];
                     if socket.read_exact(&mut byte).is_err() {
-                        return;
+                        break;
                     }
                     headers.push(byte[0]);
                     assert!(headers.len() < 16384);
+                }
+                // A request the client abandoned (a dropped part) is skipped, not answered.
+                if !headers.ends_with(b"\r\n\r\n") {
+                    continue;
                 }
                 let headers = String::from_utf8(headers).unwrap();
                 let length = headers
@@ -100,10 +104,13 @@ impl Server {
                     .map(|x| x.parse::<usize>().unwrap())
                     .unwrap_or(0);
                 let mut body = vec![0; length];
-                socket.read_exact(&mut body).unwrap();
+                // A client that abandons a part mid-body is not a fixture failure.
+                if socket.read_exact(&mut body).is_err() {
+                    continue;
+                }
                 let response = reply(&headers, &body);
                 captured.lock().unwrap().push((headers, body));
-                socket.write_all(response.as_bytes()).unwrap();
+                let _ = socket.write_all(response.as_bytes());
             }
         });
         Self {
@@ -642,7 +649,7 @@ fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
 /// A parts-capable server: preflight, create, a parts listing, then `on_part` for each PUT.
 fn parts_server(
     create: bool,
-    listing: &'static str,
+    mut listing: impl FnMut() -> String + Send + 'static,
     mut on_part: impl FnMut(u64, &[u8]) -> String + Send + 'static,
     result: String,
 ) -> Server {
@@ -655,7 +662,7 @@ fn parts_server(
     Server::handle(move |headers, body| {
         let line = headers.lines().next().unwrap();
         if line.starts_with(&format!("GET /api/assets/uploads/{RESOURCE}/parts ")) {
-            protocol(200, "Content-Type: application/json\r\n", listing)
+            protocol(200, "Content-Type: application/json\r\n", &listing())
         } else if line.starts_with(&format!("PUT /api/assets/uploads/{RESOURCE}/parts ")) {
             assert_eq!(
                 header_value(headers, "content-type"),
@@ -723,7 +730,7 @@ fn parallel_parts_cover_the_file_and_the_completing_part_carries_the_result() {
         let done = result_json(&fixture.copy);
         let server = parts_server(
             true,
-            r#"{"offset":0,"size":10,"parts":[]}"#,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
             move |_, body| {
                 received += body.len();
                 if received == 10 {
@@ -789,7 +796,7 @@ fn resumed_parallel_upload_sends_only_the_gaps_and_retries_incomplete_or_throttl
         // The first attempt dies on a server error after the resource exists.
         let server = parts_server(
             true,
-            r#"{"offset":0,"size":10,"parts":[]}"#,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
             |_, _| protocol(500, "", ""),
             String::new(),
         );
@@ -805,7 +812,7 @@ fn resumed_parallel_upload_sends_only_the_gaps_and_retries_incomplete_or_throttl
         let mut attempts = 0;
         let server = parts_server(
             false,
-            r#"{"offset":4,"size":10,"parts":[{"offset":8,"size":2}]}"#,
+            move || r#"{"offset":4,"size":10,"parts":[{"offset":8,"size":2}]}"#.to_string(),
             move |offset, body| {
                 assert_eq!((offset, body), (4, &b"efgh"[..]));
                 attempts += 1;
@@ -859,5 +866,237 @@ fn servers_without_upload_parts_keep_the_sequential_patch_path() {
         assert!(!requests
             .iter()
             .any(|(h, _)| h.starts_with("PUT ") || h.contains("/parts")));
+    });
+}
+
+fn puts(server: &Server) -> Vec<(u64, usize)> {
+    parts_received(server)
+        .into_iter()
+        .map(|(offset, body)| (offset, body.len()))
+        .collect()
+}
+fn count(server: &Server, needle: &str) -> usize {
+    server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(h, _)| h.lines().next().unwrap().contains(needle))
+        .count()
+}
+fn conflict(message: &str) -> String {
+    protocol(
+        409,
+        "Content-Type: application/json\r\n",
+        &format!(r#"{{"message":"{message}","error":"Conflict","statusCode":409}}"#),
+    )
+}
+fn stored() -> String {
+    protocol(204, "Upload-Offset: 0\r\nUpload-Complete: ?0\r\n", "")
+}
+async fn run_parts(fixture: &Fixture, server: &Server) -> Result<UploadOutcome, String> {
+    let mut journal = None;
+    fixture.run(server, &mut journal, |_| Ok(())).await
+}
+#[test]
+fn an_overlap_conflict_rereads_the_listing_and_resends_only_the_missing_bytes() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut listings = 0;
+        let mut conflicted = false;
+        let server = parts_server(
+            true,
+            move || {
+                listings += 1;
+                // After the conflict, the server reports [4, 6) already received.
+                if listings == 1 {
+                    r#"{"offset":0,"size":10,"parts":[]}"#
+                } else {
+                    r#"{"offset":0,"size":10,"parts":[{"offset":4,"size":2}]}"#
+                }
+                .to_string()
+            },
+            move |offset, _| {
+                if offset == 4 && !conflicted {
+                    conflicted = true;
+                    conflict("Part overlaps a different received part")
+                } else {
+                    stored()
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        assert!(matches!(
+            run_parts(&fixture, &server).await.unwrap(),
+            UploadOutcome::Ingested { .. }
+        ));
+        assert_eq!(puts(&server), [(0, 4), (4, 4), (6, 2), (8, 2)]);
+        assert_eq!(count(&server, "/parts "), 6);
+    });
+}
+#[test]
+fn a_conflict_whose_listing_is_complete_goes_straight_to_the_result() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut listings = 0;
+        let server = parts_server(
+            true,
+            move || {
+                listings += 1;
+                if listings == 1 {
+                    r#"{"offset":0,"size":10,"parts":[]}"#
+                } else {
+                    r#"{"offset":10,"size":10,"parts":[]}"#
+                }
+                .to_string()
+            },
+            |offset, _| {
+                if offset == 0 {
+                    conflict("Upload is no longer accepting bytes")
+                } else {
+                    stored()
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        assert!(matches!(
+            run_parts(&fixture, &server).await.unwrap(),
+            UploadOutcome::Ingested { .. }
+        ));
+        assert_eq!(count(&server, "/parts"), puts(&server).len() + 2);
+        assert_eq!(puts(&server).iter().filter(|(o, _)| *o == 0).count(), 1);
+        assert_eq!(count(&server, "/result "), 1);
+    });
+}
+#[test]
+fn a_busy_part_waits_and_retries_without_rereading_the_listing() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut busy = 0;
+        let server = parts_server(
+            true,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
+            move |offset, _| {
+                if offset == 0 && busy < 3 {
+                    busy += 1;
+                    conflict(if busy == 2 {
+                        "Upload admission expired"
+                    } else {
+                        "Upload has an active request"
+                    })
+                } else {
+                    stored()
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        assert!(matches!(
+            run_parts(&fixture, &server).await.unwrap(),
+            UploadOutcome::Ingested { .. }
+        ));
+        assert_eq!(puts(&server).iter().filter(|(o, _)| *o == 0).count(), 4);
+        assert_eq!(
+            count(
+                &server,
+                "GET /api/assets/uploads/11111111-1111-4111-8111-111111111111/parts "
+            ),
+            1
+        );
+    });
+}
+#[test]
+fn an_accepted_part_awaiting_ingestion_polls_the_result() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let server = parts_server(
+            true,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
+            |_, _| protocol(202, "Upload-Offset: 10\r\nUpload-Complete: ?0\r\n", ""),
+            result_json(&fixture.copy),
+        );
+        assert!(matches!(
+            run_parts(&fixture, &server).await.unwrap(),
+            UploadOutcome::Ingested { .. }
+        ));
+        assert_eq!(count(&server, "/result "), 1);
+    });
+}
+#[test]
+fn an_interrupted_part_is_sent_again() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut dropped = false;
+        let server = parts_server(
+            true,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
+            move |offset, _| {
+                if offset == 8 && !dropped {
+                    dropped = true;
+                    // Close without a response, as a lost connection would.
+                    String::new()
+                } else {
+                    stored()
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        assert!(matches!(
+            run_parts(&fixture, &server).await.unwrap(),
+            UploadOutcome::Ingested { .. }
+        ));
+        assert_eq!(puts(&server), [(0, 4), (4, 4), (8, 2), (8, 2)]);
+    });
+}
+#[test]
+fn a_staged_file_that_shrinks_mid_upload_is_a_staging_error_not_a_retry() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let original = fixture
+            .root
+            .join("stage")
+            .join(&fixture.copy.id)
+            .join("original");
+        let server = parts_server(
+            true,
+            move || {
+                // Verification already passed; now the staged bytes disappear under the upload.
+                let mut permissions = std::fs::metadata(&original).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&original, permissions).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&original)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                r#"{"offset":0,"size":10,"parts":[]}"#.to_string()
+            },
+            |_, _| stored(),
+            String::new(),
+        );
+        let mut admitted = 0;
+        let mut journal = None;
+        let error = transfer(
+            &crate::transport::client().unwrap(),
+            &server.base,
+            &fixture.saved,
+            &fixture.identity,
+            &fixture.copy,
+            &fixture.binding(),
+            &fixture.root.join("stage"),
+            &mut journal,
+            |_, bytes| {
+                admitted += bytes;
+                Ok(())
+            },
+            &AtomicBool::new(false),
+            &|| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "source_stage_changed");
+        // Only the first wave was admitted; nothing was retried.
+        assert!(admitted <= 10, "{admitted}");
     });
 }

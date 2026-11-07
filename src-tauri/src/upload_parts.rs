@@ -81,9 +81,10 @@ pub(crate) fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
 }
 
-/// A part gets at least a minute plus a second per MiB before the client gives up on it.
-pub(crate) fn part_timeout(len: u64) -> Duration {
-    Duration::from_secs(60 + len / MIB)
+/// Parts in flight share one link: allow a minute plus a second per MiB for every part in flight,
+/// so `parallel` parts of `len` bytes finish at an aggregate 1 MiB/s before any gives up.
+pub(crate) fn part_timeout(len: u64, parallel: usize) -> Duration {
+    Duration::from_secs(60 + (len / MIB).saturating_mul(parallel.max(1) as u64))
 }
 
 #[cfg(test)]
@@ -162,6 +163,8 @@ mod tests {
         assert_eq!(backoff(1), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(4));
         assert_eq!(backoff(50), Duration::from_secs(30));
-        assert_eq!(part_timeout(256 * MIB), Duration::from_secs(316));
+        assert_eq!(part_timeout(256 * MIB, 1), Duration::from_secs(316));
+        assert_eq!(part_timeout(256 * MIB, 4), Duration::from_secs(1084));
+        assert_eq!(part_timeout(16 * MIB, 0), Duration::from_secs(76));
     }
 }

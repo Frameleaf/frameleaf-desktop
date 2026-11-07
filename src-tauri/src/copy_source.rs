@@ -337,6 +337,7 @@ impl CopyApproval {
             || saved.account_id.is_empty()
             || saved.device_id.as_deref().is_none_or(str::is_empty)
             || max_item_bytes == 0
+            || max_item_bytes > UNLIMITED_ITEM_BYTES
         {
             return Err("source_approval_invalid".into());
         }
@@ -362,7 +363,10 @@ impl CopyApproval {
     }
     fn validate(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
         let scope = &self.scope;
+        // Canonical signing rounds larger integers, so a changed limit could share a signature.
         if scope.version != 1
+            || scope.max_item_bytes == 0
+            || scope.max_item_bytes > UNLIMITED_ITEM_BYTES
             || scope.server != saved.server
             || scope.server_id != saved.server_id
             || scope.account_id != saved.account_id
