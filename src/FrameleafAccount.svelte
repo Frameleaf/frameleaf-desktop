@@ -28,10 +28,15 @@
   let failureCode = $state('');
   const countries = countryOptions(navigator.language);
 
+  // Only the latest load may set the terms: a slower, older answer must not replace what the person read and accepted.
+  let consentRequest = 0;
   async function loadConsents() {
     if (!native || consents) return;
-    try { consents = await invoke<Consents>('cloud_email_consents'); }
-    catch (error) { fail(error); }
+    const asked = ++consentRequest;
+    try {
+      const loaded = await invoke<Consents>('cloud_email_consents');
+      if (asked === consentRequest) consents = loaded;
+    } catch (error) { if (asked === consentRequest) fail(error); }
   }
   $effect(() => { if (mode === 'create') void loadConsents(); });
   function fail(error: unknown) { failureCode = String(error); failure = connectionError(error); }
