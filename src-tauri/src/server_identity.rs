@@ -37,8 +37,12 @@ pub(crate) fn pinned_keys(instances: &Value, instance: &str) -> Option<Vec<Pinne
         item.get("instanceId").and_then(Value::as_str) == Some(instance)
             || item.get("id").and_then(Value::as_str) == Some(instance)
     })?;
-    let keys: Vec<PinnedKey> =
-        serde_json::from_value(entry.get("identityKeys")?.clone()).unwrap_or_default();
+    // A listed server that publishes no keys (field absent or empty) is still listed: no keys, not "unlisted".
+    let keys: Vec<PinnedKey> = entry
+        .get("identityKeys")
+        .cloned()
+        .and_then(|keys| serde_json::from_value(keys).ok())
+        .unwrap_or_default();
     Some(keys)
 }
 
@@ -275,6 +279,8 @@ mod tests {
         let list = serde_json::json!([{ "instanceId": ID, "identityKeys": [{ "kid": pinned.kid, "jwk": { "kty": "OKP", "crv": "Ed25519", "x": pinned.jwk.x } }] }]);
         assert_eq!(pinned_keys(&list, ID).unwrap().len(), 1);
         assert!(pinned_keys(&list, "not-listed").is_none());
+        let keyless = serde_json::json!({ "instances": [{ "instanceId": ID }] });
+        assert_eq!(pinned_keys(&keyless, ID).unwrap().len(), 0);
         assert_eq!(
             proof_origin(&Url::parse("HTTP://Tower.LAN:2283/").unwrap()),
             "http://tower.lan:2283"
