@@ -991,9 +991,22 @@ fn a_conflict_whose_listing_is_complete_goes_straight_to_the_result() {
             run_parts(&fixture, &server).await.unwrap(),
             UploadOutcome::Ingested { .. }
         ));
-        assert_eq!(count(&server, "/parts"), puts(&server).len() + 2);
-        assert_eq!(puts(&server).iter().filter(|(o, _)| *o == 0).count(), 1);
-        assert_eq!(count(&server, "/result "), 1);
+        // One snapshot: dropped parts may still be recorded after the upload returns.
+        let requests = server.requests.lock().unwrap().clone();
+        let lines = |needle: &str| {
+            requests
+                .iter()
+                .filter(|(h, _)| h.lines().next().unwrap().contains(needle))
+                .count()
+        };
+        let offsets: Vec<u64> = requests
+            .iter()
+            .filter(|(h, _)| h.starts_with("PUT "))
+            .map(|(h, _)| header_value(h, "upload-offset").unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(lines("/parts"), offsets.len() + 2);
+        assert_eq!(offsets.iter().filter(|o| **o == 0).count(), 1);
+        assert_eq!(lines("/result "), 1);
     });
 }
 #[test]

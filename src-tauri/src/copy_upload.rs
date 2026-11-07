@@ -298,11 +298,22 @@ fn part_body(
             if left == 0 {
                 return Ok(None);
             }
-            let mut chunk = vec![0; left.min(1024 * 1024) as usize];
-            if let Err(error) = read_exact_at(&file, &mut chunk, at) {
-                stage_failed.store(true, Ordering::Release);
-                return Err(error);
-            }
+            // Read on the blocking pool so a slow staging disk never stalls the other parts in
+            // flight or the cancellation check on the async executor.
+            let count = left.min(1024 * 1024) as usize;
+            let read = tauri::async_runtime::spawn_blocking(move || {
+                let mut chunk = vec![0; count];
+                read_exact_at(&file, &mut chunk, at).map(|()| chunk)
+            })
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::other("staged read task failed")));
+            let chunk = match read {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    stage_failed.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            };
             let n = chunk.len() as u64;
             Ok::<_, std::io::Error>(Some((chunk, (at + n, left - n))))
         }
