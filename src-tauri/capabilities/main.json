@@ -53,6 +53,11 @@
     "allow-cloud-account",
     "allow-cloud-sign-out",
     "allow-cloud-servers",
+    "allow-server-sign-in-options",
+    "allow-server-oauth-sign-in",
+    "allow-cloud-email-consents",
+    "allow-cloud-email-start",
+    "allow-cloud-email-complete",
     "allow-connect-cloud-server"
   ]
 }

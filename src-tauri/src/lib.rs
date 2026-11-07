@@ -35,6 +35,8 @@ mod resource_policy;
 pub mod runtime_epochs;
 pub mod runtime_store;
 mod server_admin;
+mod server_identity;
+mod server_login;
 mod source_consent;
 mod source_import;
 mod source_metadata;
@@ -70,7 +72,7 @@ pub(crate) fn require_local(window: &WebviewWindow) -> Result<(), String> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LoginResponse {
+pub(crate) struct LoginResponse {
     access_token: String,
     user_id: String,
     name: String,
@@ -229,6 +231,7 @@ async fn sign_in(
 ) -> Result<(SavedConnection, ConnectionView), String> {
     let base = normalize_server(server)?;
     let password = Zeroizing::new(password);
+    let email = email.trim();
     if email.is_empty() || email.len() > 320 || password.is_empty() || password.len() > 4096 {
         return Err("login_details_invalid".into());
     }
@@ -236,16 +239,27 @@ async fn sign_in(
     let identity = identity()?;
     identity.enrollment("validation", "validation", device_name, "client-worker")?;
     let response = client.post(base.join("api/auth/login").unwrap())
-        .json(&serde_json::json!({ "email": email.trim(), "password": password.as_str(), "rememberMe": true }))
+        .json(&serde_json::json!({ "email": email, "password": password.as_str(), "rememberMe": true }))
         .send().await.map_err(|_| "server_unreachable_or_certificate_invalid")?;
     let login: LoginResponse = transport::json(response).await?;
+    keep_login(client, &base, login, device_name, confirm).await
+}
+
+/// A server session from any sign-in method becomes this computer's saved connection.
+pub(crate) async fn keep_login(
+    client: &reqwest::Client,
+    base: &url::Url,
+    login: LoginResponse,
+    device_name: &str,
+    confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
+) -> Result<(SavedConnection, ConnectionView), String> {
     let mut saved = SavedConnection {
         server: base.to_string(),
         server_id: String::new(),
         account_id: login.user_id,
         name: login.name,
         token: login.access_token,
-        device_name: device_name.into(),
+        device_name: device_name.trim().into(),
         mode: "client-worker".into(),
         device_id: None,
     };
@@ -312,6 +326,13 @@ async fn restore_connection(
         retry.unwrap_or(false),
     )?
     else {
+        // The saved sign-in is gone: drop any connection still held so the window and the
+        // background agree (the jobs above already stopped).
+        let held = current.take().is_some();
+        drop(current);
+        if held {
+            tray::refresh(&app).await;
+        }
         return Ok(None);
     };
     if saved.server_id.is_empty() {
@@ -500,6 +521,7 @@ pub fn run() {
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
         .manage(tray::TrayState::default())
+        .manage(cloud_account::email::EmailAttempt::default())
         .setup(|app| {
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
@@ -553,6 +575,11 @@ pub fn run() {
             cloud_account::cloud_account,
             cloud_account::cloud_sign_out,
             cloud_account::cloud_servers,
+            server_login::server_sign_in_options,
+            server_login::server_oauth_sign_in,
+            cloud_account::email::cloud_email_consents,
+            cloud_account::email::cloud_email_start,
+            cloud_account::email::cloud_email_complete,
             cloud_account::connect_cloud_server
         ])
         .on_window_event(|window, event| {
@@ -677,14 +704,16 @@ pub(crate) async fn apply_worker_control(
     let setup = app.state::<worker_setup::WorkerSetup>();
     match control {
         worker_control::WorkerControl::Paused => {
-            let status = setup.pause();
+            // Persist first: a pause that cannot be saved would silently resume after a restart.
             worker_control::save(saved, control)?;
+            let status = setup.pause();
             tray::set_worker_status(app, &status);
             Ok(status)
         }
         worker_control::WorkerControl::Stopped => {
-            let status = setup.hold(control).await;
+            // Persist first, as for Pause: a stop that cannot be saved must not stop the worker.
             worker_control::save(saved, control)?;
+            let status = setup.hold(control).await;
             tray::set_worker_status(app, &status);
             Ok(status)
         }
@@ -714,7 +743,16 @@ pub(crate) async fn apply_worker_control(
                 setup.hold(previous).await;
                 return Err(error);
             }
-            start_worker_setup(app, saved, false).await?;
+            if let Err(error) = start_worker_setup(app, saved, false).await {
+                // Put the saved control back too, so a restart does not resume what failed here.
+                let rolled_back = worker_control::save(saved, previous);
+                setup.hold(previous).await;
+                // If the old setting can't be saved back, say so: a restart would resume the worker.
+                return Err(match rolled_back {
+                    Ok(()) => error,
+                    Err(_) => "worker_control_unsaved".into(),
+                });
+            }
             Ok(setup.status())
         }
     }

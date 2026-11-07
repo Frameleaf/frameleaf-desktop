@@ -58,6 +58,11 @@ fn main() {
             "cloud_account",
             "cloud_sign_out",
             "cloud_servers",
+            "server_sign_in_options",
+            "server_oauth_sign_in",
+            "cloud_email_consents",
+            "cloud_email_start",
+            "cloud_email_complete",
             "connect_cloud_server",
         ]),
     ))

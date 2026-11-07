@@ -1,0 +1,93 @@
+<script lang="ts">
+  // One server's sign-in (mobile onboarding screens 6 and 8): every method the server offers, on one screen.
+  import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
+  import Icon from './Icon.svelte';
+  import { connectionError, savedSignInNeedsRecovery } from './errors';
+  import { signInMethods } from './ui-state';
+  import type { Connection, CloudAccount, SignInOptions } from './server-types';
+
+  let { options, native, computer, cloudAccount, autostart = false, deviceName = $bindable('My computer'), onconnected, onlocked, oncloudsignin, onback }: {
+    options: SignInOptions; native: boolean; computer: string; cloudAccount: CloudAccount | null; autostart?: boolean; deviceName?: string;
+    onconnected: (connection: Connection) => void; onlocked: () => void;
+    oncloudsignin: () => void; onback: () => void;
+  } = $props();
+  let email = $state('');
+  let password = $state('');
+  let busy = $state(false);
+  let failure = $state('');
+  const methods = $derived(signInMethods(options));
+  const route = $derived(options.local ? `On this network · ${new URL(options.server).host}` : `Over the internet · ${new URL(options.server).host}`);
+
+  async function withFrameleaf() {
+    if (!native || busy) return;
+    busy = true; failure = '';
+    try {
+      // No Frameleaf account yet: sign in to it first, then this screen comes back and finishes.
+      if (!cloudAccount) { oncloudsignin(); return; }
+      onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: options.id, deviceName, server: options.server }));
+    } catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = connectionError(error); }
+    finally { busy = false; }
+  }
+  onMount(() => { if (autostart && cloudAccount) void withFrameleaf(); });
+  async function withProvider() {
+    if (!native || busy) return;
+    busy = true; failure = '';
+    try { onconnected(await invoke<Connection>('server_oauth_sign_in', { server: options.server, deviceName })); }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); if (String(error) !== 'server_oauth_cancelled') failure = connectionError(error); }
+    finally { busy = false; }
+  }
+  async function withPassword(event: SubmitEvent) {
+    event.preventDefault();
+    if (!native || busy) return;
+    busy = true; failure = '';
+    const secret = password; password = '';
+    try { onconnected(await invoke<Connection>('connect_server', { server: options.server, email, password: secret, deviceName })); }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = connectionError(error); }
+    finally { busy = false; }
+  }
+</script>
+
+<div class="srv-head">
+  <span class="ic" aria-hidden="true"><Icon name="server" /></span>
+  <span class="l"><b>{options.name}</b><small><i class="route" class:local={options.local} aria-hidden="true"></i>{route}</small></span>
+  <button class="btn quiet small" type="button" disabled={busy} onclick={onback}>Use a Different Server</button>
+</div>
+{#if failure}<div class="inline-msg error notice" role="alert"><p>{failure}</p><button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+{#if options.loginMessage}<p class="sub">{options.loginMessage}</p>{/if}
+
+{#if options.needsSetup}
+  <div class="inline-msg notice" role="status"><p>“{options.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.</p></div>
+{:else}
+  <div class="form">
+    {#if methods.frameleaf}
+      <p class="sub">This server is linked to Frameleaf, so your Frameleaf account works here.</p>
+      <button class="btn primary" type="button" disabled={busy || !native} onclick={withFrameleaf}><Icon name="cloud" />{busy ? 'Signing in…' : 'Sign In with Frameleaf'}</button>
+    {/if}
+    {#if methods.oauth}
+      {#if methods.frameleaf}<div class="or" role="separator">or use this server’s login</div>{/if}
+      <!-- The administrator's own label; primary only when it is the server's sole method. -->
+      <button class="btn" class:primary={!methods.frameleaf && !methods.password} type="button" disabled={busy || !native} onclick={withProvider}>{busy ? 'Signing in…' : methods.oauth}</button>
+      {#if !methods.frameleaf && !methods.password}<p class="sub">A sign-in window opens for {methods.oauth}. It stores nothing after you finish.</p>{/if}
+    {/if}
+    {#if methods.password}
+      {#if methods.frameleaf || methods.oauth}<div class="or" role="separator">{methods.oauth ? 'or with email and password' : 'or use this server’s login'}</div>{:else}<h3>This server’s login</h3>{/if}
+      <form id="server-login" aria-label="This server’s login" onsubmit={withPassword}>
+        <div class="form-row"><label for="sl-em">Account</label><span class="two"><input id="sl-em" type="email" placeholder="Email" bind:value={email} required disabled={busy} autocomplete="username" /><input id="sl-pw" type="password" placeholder="Password" aria-label="Password" bind:value={password} required disabled={busy} autocomplete="current-password" /></span></div>
+      </form>
+    {/if}
+    {#if !options.linked}
+      <div class="inline-msg" role="note"><p>This server isn’t linked to Frameleaf, so Sign in with Frameleaf doesn’t work here yet. If you run it, you can link it after you sign in.</p></div>
+    {/if}
+    {#if !methods.oauth && !methods.password && !methods.frameleaf}
+      <div class="inline-msg error" role="alert"><p>This server doesn’t offer a way to sign in from this app. Ask the person who runs it to turn on password login or link it to Frameleaf.</p></div>
+    {/if}
+    {#if methods.password || methods.frameleaf || methods.oauth}
+      <div class="form-row"><label for="sl-nm">This {computer}’s name</label><input id="sl-nm" type="text" bind:value={deviceName} required maxlength="128" disabled={busy} autocomplete="off" /></div>
+    {/if}
+  </div>
+  <div class="wfoot">
+    <p>No login for this server? The person who runs it adds you on the server’s web page; you can’t make one here.{methods.password ? ' Your password is used only to sign in and is never saved.' : ''}</p>
+    {#if methods.password}<button class="btn" class:primary={!methods.frameleaf} type="submit" form="server-login" disabled={busy || !native || !email || !password}>{busy ? 'Signing in…' : 'Sign In'}</button>{/if}
+  </div>
+{/if}

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort } from '../src/ui-state.ts';
+import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort, signInMethods, nearbySignIn, countryOptions, defaultCountry } from '../src/ui-state.ts';
 import type { CloudServer, DiscoveredServer } from '../src/server-types.ts';
 
 test('money renders USD doubles and micro-USD integers without ever printing NaN', () => {
@@ -137,4 +137,27 @@ test('connection transport reflects the server URL', () => {
   assert.equal(connectionTransport('https://photos.example.com'), 'Encrypted connection');
   assert.equal(connectionTransport(''), 'Connection type unknown');
   assert.equal(connectionTransport('ftp://photos.example.com'), 'Connection type unknown');
+});
+
+test('sign-in methods follow the server: Frameleaf only when linked, OAuth by its name', () => {
+  const base = { frameleafSignIn: true, linked: true, passwordLogin: true, oauth: false, oauthButtonText: '' };
+  assert.deepEqual(signInMethods(base), { frameleaf: true, password: true, oauth: '' });
+  assert.deepEqual(signInMethods({ ...base, linked: false }), { frameleaf: false, password: true, oauth: '' });
+  assert.deepEqual(signInMethods({ ...base, passwordLogin: false, oauth: true, oauthButtonText: ' Authentik ' }), { frameleaf: true, password: false, oauth: 'Authentik' });
+  assert.equal(signInMethods({ ...base, oauth: true }).oauth, 'Sign In with Single Sign-On');
+  assert.equal(nearbySignIn({ linked: true, setup: 'needed' }), 'Frameleaf or its own login');
+  assert.equal(nearbySignIn({ linked: false, setup: 'complete' }), 'Its own login');
+  assert.equal(nearbySignIn({ linked: false, setup: 'needed' }), 'New server');
+});
+
+test('the country picker names real places and starts at the person’s region', () => {
+  const options = countryOptions('en-CA');
+  const codes = options.map(option => option.code);
+  assert.ok(codes.includes('CA') && codes.includes('FR') && codes.includes('JP'));
+  for (const fake of ['EU', 'UN', 'ZZ', 'AA']) assert.ok(!codes.includes(fake), fake);
+  assert.ok(options.length > 200);
+  assert.equal(options.find(option => option.code === 'DE')?.name, 'Germany');
+  assert.equal(defaultCountry('en-CA'), 'CA');
+  assert.equal(defaultCountry('fr'), 'FR');
+  assert.equal(defaultCountry('not a locale!'), 'US');
 });
