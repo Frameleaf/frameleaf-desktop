@@ -43,6 +43,7 @@ const messages: Record<string, string> = {
   cloud_server_unreachable: 'None of this server’s addresses answered. Check that it is online, or try again on its home network.',
   worker_control_unsaved: 'AI processing couldn’t start, and its saved setting couldn’t be restored. Unlock your credential store, then choose Pause or Resume again.',
   server_identity_unverified: 'This server couldn’t prove it is the server your Frameleaf account lists. Check the address, or sign in with the server’s own login.',
+  server_identity_keys_unavailable: 'Frameleaf can’t confirm this server’s identity yet. Update the server, or sign in with its own login.',
   cloud_server_not_on_account: 'This server isn’t on your Frameleaf account. Ask its owner to share it with you, or sign in with the server’s own login.',
   cloud_email_invalid: 'Enter a valid email address.',
   cloud_email_wrong_code: 'That code is incorrect. Check it and try again.',

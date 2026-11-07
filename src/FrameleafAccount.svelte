@@ -49,7 +49,8 @@
     } catch (error) {
       fail(error);
       // The terms changed while this screen was open: show the new ones to accept again.
-      if (String(error) === 'cloud_email_consent_changed') { mode = 'create'; consents = null; agreed = false; void loadConsents(); }
+      // Clearing the consents makes the create-mode effect load the current ones.
+      if (String(error) === 'cloud_email_consent_changed') { mode = 'create'; consents = null; agreed = false; }
     } finally { busy = false; }
   }
   async function verify(event: SubmitEvent) {

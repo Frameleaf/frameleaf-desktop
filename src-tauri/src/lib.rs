@@ -710,8 +710,9 @@ pub(crate) async fn apply_worker_control(
             Ok(status)
         }
         worker_control::WorkerControl::Stopped => {
-            let status = setup.hold(control).await;
+            // Persist first, as for Pause: a stop that cannot be saved must not stop the worker.
             worker_control::save(saved, control)?;
+            let status = setup.hold(control).await;
             tray::set_worker_status(app, &status);
             Ok(status)
         }

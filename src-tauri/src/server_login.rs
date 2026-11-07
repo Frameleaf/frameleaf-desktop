@@ -317,7 +317,8 @@ async fn provider_window(app: &tauri::AppHandle, base: &Url, page: Url) -> Resul
     if let Some(open) = app.get_webview_window(PROVIDER_WINDOW) {
         let _ = open.destroy();
     }
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Option<Url>>();
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Url, &'static str>>();
     let returned = sender.clone();
     let server = base.clone();
     let opened =
@@ -328,24 +329,30 @@ async fn provider_window(app: &tauri::AppHandle, base: &Url, page: Url) -> Resul
             .incognito(true)
             .on_navigation(move |url| {
                 if is_oauth_return(&server, url) {
-                    let _ = returned.send(Some(url.clone()));
+                    let _ = returned.send(Ok(url.clone()));
                     return false;
                 }
-                // The provider's pages only: https anywhere, plain http only on this network.
-                provider_page_allowed(url)
+                // The provider's pages only: https anywhere, plain http only on this network. A blocked
+                // page ends the sign-in with an error rather than leaving a stuck window.
+                let allowed = provider_page_allowed(url);
+                if !allowed {
+                    let _ = returned.send(Err("server_oauth_failed"));
+                }
+                allowed
             })
             .build()
             .map_err(|_| "server_oauth_failed")?;
     opened.on_window_event(move |event| {
         if matches!(event, tauri::WindowEvent::Destroyed) {
-            let _ = sender.send(None);
+            let _ = sender.send(Err("server_oauth_cancelled"));
         }
     });
     let outcome = tokio::time::timeout(PROVIDER_TIMEOUT, receiver.recv()).await;
     let _ = opened.destroy();
     match outcome {
-        Ok(Some(Some(callback))) => Ok(callback),
-        Ok(_) => Err("server_oauth_cancelled".into()),
+        Ok(Some(Ok(callback))) => Ok(callback),
+        Ok(Some(Err(code))) => Err(code.into()),
+        Ok(None) => Err("server_oauth_cancelled".into()),
         Err(_) => Err("server_oauth_failed".into()),
     }
 }
