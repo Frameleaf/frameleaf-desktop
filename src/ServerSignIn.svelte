@@ -7,14 +7,13 @@
   import { signInMethods } from './ui-state';
   import type { Connection, CloudAccount, SignInOptions } from './server-types';
 
-  let { options, native, computer, cloudAccount, autostart = false, onconnected, onlocked, oncloudsignin, onback }: {
-    options: SignInOptions; native: boolean; computer: string; cloudAccount: CloudAccount | null; autostart?: boolean;
+  let { options, native, computer, cloudAccount, autostart = false, deviceName = $bindable('My computer'), onconnected, onlocked, oncloudsignin, onback }: {
+    options: SignInOptions; native: boolean; computer: string; cloudAccount: CloudAccount | null; autostart?: boolean; deviceName?: string;
     onconnected: (connection: Connection) => void; onlocked: () => void;
     oncloudsignin: () => void; onback: () => void;
   } = $props();
   let email = $state('');
   let password = $state('');
-  let deviceName = $state('My computer');
   let busy = $state(false);
   let failure = $state('');
   const methods = $derived(signInMethods(options));

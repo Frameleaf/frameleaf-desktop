@@ -30,6 +30,8 @@
   let signIn = $state<SignInOptions | null>(null);
   let looking = $state(false);
   let lookingUp = $state(false);
+  // Kept here so the name typed on a server's screen survives a detour through the Frameleaf account sign-in.
+  let deviceName = $state('My computer');
   let managerOnly = $state(false);
   let server = $state('');
   let busy = $state(false);
@@ -117,7 +119,7 @@
   async function connectCloud(entry: ServerEntry) {
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
-    try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName: 'My computer', server: null })); }
+    try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName, server: null })); }
     catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
     finally { busy = false; connectingKey = ''; }
   }
@@ -205,7 +207,7 @@
         <button class="btn" type="button" disabled={busy} onclick={() => { mode = 'local-server'; }}>Run Frameleaf on this {computer}</button>
       </div>
     {:else if step === 'server' && signIn}
-      <ServerSignIn options={signIn} {native} {computer} {cloudAccount} {onconnected} {onlocked} autostart={resumeFrameleaf}
+      <ServerSignIn options={signIn} {native} {computer} {cloudAccount} {onconnected} {onlocked} autostart={resumeFrameleaf} bind:deviceName
         oncloudsignin={() => { resume = signIn; resumeFrameleaf = false; accountStart = 'sign-in'; step = 'account'; }}
         onback={() => { step = 'start'; signIn = null; resumeFrameleaf = false; failure = ''; }} />
     {:else if step === 'account'}
