@@ -124,7 +124,12 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.handle.take().unwrap().join().unwrap();
+        let joined = self.handle.take().unwrap().join();
+        // A server-thread panic fails the test, but never as a second panic while one unwinds:
+        // that aborts the whole test binary (0xc0000409 on Windows) and hides the first failure.
+        if !thread::panicking() {
+            joined.unwrap();
+        }
     }
 }
 fn reply(status: u16, headers: &str, body: &str) -> String {
@@ -898,6 +903,29 @@ async fn run_parts(fixture: &Fixture, server: &Server) -> Result<UploadOutcome, 
     let mut journal = None;
     fixture.run(server, &mut journal, |_| Ok(())).await
 }
+/// Runs a fresh upload and returns the bytes admitted against the run budget.
+async fn run_admitted(fixture: &Fixture, server: &Server) -> (Result<UploadOutcome, String>, u64) {
+    let mut admitted = 0;
+    let mut journal = None;
+    let result = transfer(
+        &crate::transport::client().unwrap(),
+        &server.base,
+        &fixture.saved,
+        &fixture.identity,
+        &fixture.copy,
+        &fixture.binding(),
+        &fixture.root.join("stage"),
+        &mut journal,
+        |_, bytes| {
+            admitted += bytes;
+            Ok(())
+        },
+        &AtomicBool::new(false),
+        &|| Ok(()),
+    )
+    .await;
+    (result, admitted)
+}
 #[test]
 fn an_overlap_conflict_rereads_the_listing_and_resends_only_the_missing_bytes() {
     tauri::async_runtime::block_on(async {
@@ -979,21 +1007,25 @@ fn a_busy_part_waits_and_retries_without_rereading_the_listing() {
             move |offset, _| {
                 if offset == 0 && busy < 3 {
                     busy += 1;
-                    conflict(if busy == 2 {
-                        "Upload admission expired"
-                    } else {
-                        "Upload has an active request"
-                    })
+                    match busy {
+                        // A body larger than one 4 KiB read still shows its message.
+                        1 => conflict(&format!(
+                            "Upload has an active request\",\"detail\":\"{}",
+                            "x".repeat(8192)
+                        )),
+                        2 => conflict("Upload admission expired"),
+                        _ => conflict("Upload has an active request"),
+                    }
                 } else {
                     stored()
                 }
             },
             result_json(&fixture.copy),
         );
-        assert!(matches!(
-            run_parts(&fixture, &server).await.unwrap(),
-            UploadOutcome::Ingested { .. }
-        ));
+        let (outcome, admitted) = run_admitted(&fixture, &server).await;
+        assert!(matches!(outcome.unwrap(), UploadOutcome::Ingested { .. }));
+        // Turned away at admission, the busy part's resends reuse its first charge.
+        assert_eq!(admitted, 10);
         assert_eq!(puts(&server).iter().filter(|(o, _)| *o == 0).count(), 4);
         assert_eq!(
             count(
@@ -1047,6 +1079,9 @@ fn an_interrupted_part_is_sent_again() {
         assert_eq!(puts(&server), [(0, 4), (4, 4), (8, 2), (8, 2)]);
     });
 }
+// Unix only: on Windows the verified staged file stays open with read-only sharing, so no
+// writer can shrink it mid-upload and this test cannot provoke the read failure.
+#[cfg(unix)]
 #[test]
 fn a_staged_file_that_shrinks_mid_upload_is_a_staging_error_not_a_retry() {
     tauri::async_runtime::block_on(async {
@@ -1098,5 +1133,33 @@ fn a_staged_file_that_shrinks_mid_upload_is_a_staging_error_not_a_retry() {
         assert_eq!(error, "source_stage_changed");
         // Only the first wave was admitted; nothing was retried.
         assert!(admitted <= 10, "{admitted}");
+    });
+}
+#[test]
+fn resent_bytes_are_charged_only_when_the_server_read_the_body() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut attempts = 0;
+        let server = parts_server(
+            true,
+            move || r#"{"offset":0,"size":10,"parts":[]}"#.to_string(),
+            move |offset, _| {
+                if offset != 0 {
+                    return stored();
+                }
+                attempts += 1;
+                match attempts {
+                    // Throttled before the body was read: no new charge.
+                    1 => protocol(429, "", ""),
+                    // The server read an incomplete body: the resend is charged again.
+                    2 => protocol(400, "", ""),
+                    _ => stored(),
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        let (outcome, admitted) = run_admitted(&fixture, &server).await;
+        assert!(matches!(outcome.unwrap(), UploadOutcome::Ingested { .. }));
+        assert_eq!(admitted, 10 + 4);
     });
 }

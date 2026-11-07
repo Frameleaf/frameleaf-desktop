@@ -343,6 +343,8 @@ fn approvals_refuse_limits_beyond_exact_canonical_signing() {
     let saved = saved();
     fs::write(source.0.join("movie.mov"), b"large enough").unwrap();
     assert!(CopyApproval::approve(&saved, &identity, &source.0, 1 << 53, true).is_err());
+    // 2 GiB is reserved for approvals signed before FL-1268, which no longer cap files.
+    assert!(CopyApproval::approve(&saved, &identity, &source.0, 2 << 30, true).is_err());
     let approval =
         CopyApproval::approve(&saved, &identity, &source.0, (1u64 << 53) - 1, true).unwrap();
     let mut value = serde_json::to_value(&approval).unwrap();

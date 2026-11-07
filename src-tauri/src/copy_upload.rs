@@ -338,10 +338,11 @@ async fn put_part(
 async fn error_text(mut response: Response) -> String {
     let mut bytes = Vec::new();
     while let Ok(Some(chunk)) = response.chunk().await {
-        if bytes.len() + chunk.len() > 4096 {
+        // Keep the first 4 KiB even when one chunk crosses the limit.
+        bytes.extend_from_slice(&chunk[..chunk.len().min(4096 - bytes.len())]);
+        if bytes.len() == 4096 {
             break;
         }
-        bytes.extend_from_slice(&chunk);
     }
     String::from_utf8_lossy(&bytes).to_ascii_lowercase()
 }
@@ -398,22 +399,27 @@ async fn put_parts(
         parts_listing(request, &parts, size, &mut policy, cancelled)
             .await?
             .into_iter()
-            .map(|(start, end)| (start, end, Duration::ZERO))
+            .map(|(start, end)| (start, end, Duration::ZERO, false))
             .collect();
     let mut inflight = FuturesUnordered::new();
     loop {
         while inflight.len() < policy.parallel {
-            let Some((start, end, delay)) = queue.pop_front() else {
+            let Some((start, end, delay, charged)) = queue.pop_front() else {
                 break;
             };
             check_cancel(cancelled)?;
             gate()?;
             let len = (end - start).min(policy.part_size);
             if start + len < end {
-                queue.push_front((start + len, end, Duration::ZERO));
+                queue.push_front((start + len, end, Duration::ZERO, charged));
             }
             // Persist admission before a send; a lost response or cancellation never refunds it.
-            persist(session, len)?;
+            // The budget counts bytes put on the wire, so an interrupted or incomplete part is
+            // charged again when resent. A part the server turned away at admission (429, busy
+            // 409) never had its body read, so its resend reuses the earlier charge.
+            if !charged {
+                persist(session, len)?;
+            }
             let builder = request(Method::PUT, &parts)
                 .header("Upload-Offset", start)
                 .header("Content-Length", len)
@@ -425,7 +431,7 @@ async fn put_parts(
         let Some((start, len, result)) = inflight.next().await else {
             return Ok(None);
         };
-        let mut retry = |delay| queue.push_front((start, start + len, delay));
+        let mut retry = |delay, charged| queue.push_front((start, start + len, delay, charged));
         // Parts sent before the last halving fail together on a slow shared link: one failure
         // (and one halving) per size step, so stragglers retry smaller without spending the budget.
         let stale = len > policy.part_size;
@@ -442,7 +448,7 @@ async fn put_parts(
                     }
                     policy.halve();
                 }
-                retry(upload_parts::backoff(failures.max(1)));
+                retry(upload_parts::backoff(failures.max(1)), false);
                 continue;
             }
             Err(error) => return Err(error),
@@ -472,14 +478,14 @@ async fn put_parts(
                     }
                     policy.halve();
                 }
-                retry(upload_parts::backoff(failures.max(1)));
+                retry(upload_parts::backoff(failures.max(1)), false);
             }
             429 => {
                 rate_limited += 1;
                 if rate_limited > MAX_RATE_LIMITED {
                     return Err("source_upload_http_429".into());
                 }
-                retry(Duration::from_secs(1));
+                retry(Duration::from_secs(1), true);
             }
             409 => {
                 let message = error_text(response).await;
@@ -488,7 +494,7 @@ async fn put_parts(
                     if busy > MAX_BUSY {
                         return Err("source_upload_http_409".into());
                     }
-                    retry(BUSY_RETRY);
+                    retry(BUSY_RETRY, true);
                     continue;
                 }
                 // A lost response may have committed a different part over this range: resend
@@ -505,7 +511,7 @@ async fn put_parts(
                 for (gap_start, gap_end) in missing.into_iter().rev() {
                     let (from, to) = (gap_start.max(start), gap_end.min(start + len));
                     if from < to {
-                        queue.push_front((from, to, Duration::ZERO));
+                        queue.push_front((from, to, Duration::ZERO, false));
                     }
                 }
             }

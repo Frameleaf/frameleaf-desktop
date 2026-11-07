@@ -337,6 +337,8 @@ impl CopyApproval {
             || saved.account_id.is_empty()
             || saved.device_id.as_deref().is_none_or(str::is_empty)
             || max_item_bytes == 0
+            // Reserved: approvals signed with the old 2 GiB default are read as unlimited.
+            || max_item_bytes == LEGACY_ITEM_CAP
             || max_item_bytes > UNLIMITED_ITEM_BYTES
         {
             return Err("source_approval_invalid".into());
