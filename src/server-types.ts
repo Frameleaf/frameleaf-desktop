@@ -10,6 +10,11 @@ export type DiscoveredServer = {
   name: string; id: string; url: string; host: string; port: number; addresses: string[];
   setup: 'needed' | 'complete' | string; linked: boolean; cloud: 'available' | 'unavailable' | string;
 };
+/** server_sign_in_options: how one can sign in to the server at an address. */
+export type SignInOptions = {
+  server: string; id: string; name: string; linked: boolean; local: boolean; needsSetup: boolean;
+  passwordLogin: boolean; frameleafSignIn: boolean; oauth: boolean; oauthButtonText: string; loginMessage: string | null;
+};
 export type CloudAccount = { email: string; name: string };
 export type CloudServerConnection = { kind: 'local' | 'wan' | 'relay' | 'ipv6' | string; uri: string; verified: boolean };
 export type CloudServer = {

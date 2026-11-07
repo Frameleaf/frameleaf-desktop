@@ -622,3 +622,24 @@ fn a_resume_journal_cannot_be_rebound_to_a_different_source_run_or_item() {
         assert!(FolderUploadBinding::new(&fixture.copy, "invalid", RESOURCE).is_err());
     });
 }
+#[test]
+fn upload_mime_reads_only_a_real_extension() {
+    assert_eq!(upload_mime("clip.MOV"), "video/quicktime");
+    assert_eq!(upload_mime("clip.m4v"), "video/mp4");
+    assert_eq!(upload_mime("IMG_0001.HEIC"), "image/heic");
+    assert_eq!(upload_mime("photo.JPG"), "image/jpeg");
+    // Unknown or missing extensions still pass the server's media Content-Type check.
+    assert_eq!(upload_mime("RAW_0001.CR3"), "image/octet-stream");
+    assert_eq!(upload_mime("mov"), "image/octet-stream");
+    assert_eq!(upload_mime(".mp4"), "image/octet-stream");
+    let media = |value: &str| {
+        let (kind, sub) = value.split_once('/').unwrap();
+        matches!(kind, "image" | "video" | "audio")
+            && sub
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".+-".contains(c))
+    };
+    for name in ["a.mov", "a.mp4", "a.heic", "a.dng", "noext"] {
+        assert!(media(upload_mime(name)), "{name}");
+    }
+}

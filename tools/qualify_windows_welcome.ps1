@@ -71,7 +71,8 @@ if ($InstalledHost) {
 $app = Start-Process -FilePath $Executable -PassThru
 try {
     $null = Wait-Control 'Welcome'
-    $null = Wait-Control 'Server address'
+    # Welcome lists servers on this network and always offers another server by its address.
+    $null = Wait-Control 'Another server'
     Select-Radio (Wait-Control 'Run Frameleaf here' -Radio)
     if ($InstalledHost) {
         $managerPassword = 'Synthetic!' + [guid]::NewGuid().ToString('N')
@@ -103,7 +104,7 @@ try {
     }
     $null = Wait-Control 'Server component not installed'
     Select-Radio (Wait-Control 'Connect to my server' -Radio)
-    $null = Wait-Control 'Server address'
+    $null = Wait-Control 'Another server'
     Write-Output 'Installed Welcome, native host discovery, and return to connection passed'
 } finally {
     if ($InstalledHost) {

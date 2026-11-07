@@ -1,5 +1,5 @@
 // Pure helpers for the desktop UI. No DOM, no Tauri: everything here is unit-tested in test/ui-state.test.ts.
-import type { CloudServer, DiscoveredServer, RemoteConnection } from './server-types';
+import type { CloudServer, DiscoveredServer, RemoteConnection, SignInOptions } from './server-types';
 
 export type Platform = 'mac' | 'windows' | 'linux';
 export function platformFromUserAgent(userAgent: string): Platform {
@@ -249,3 +249,38 @@ export function fingerprintShort(value: unknown): string {
   return hex.length >= 8 ? `${hex.slice(0, 4)}…${hex.slice(-4)}` : value;
 }
 export function clamp(value: number, min: number, max: number): number { return Math.min(max, Math.max(min, value)); }
+
+/** The sign-in methods to show for a server: Frameleaf only when linked, the OAuth provider's name when it has one. */
+export function signInMethods(options: Pick<SignInOptions, 'frameleafSignIn' | 'linked' | 'passwordLogin' | 'oauth' | 'oauthButtonText'>): { frameleaf: boolean; password: boolean; oauth: string } {
+  return {
+    frameleaf: options.frameleafSignIn && options.linked,
+    password: options.passwordLogin,
+    oauth: options.oauth ? options.oauthButtonText.trim() || 'Sign In with Single Sign-On' : '',
+  };
+}
+
+/** How one signs in to a server found on this network, as the Welcome list says it. */
+export function nearbySignIn(server: Pick<DiscoveredServer, 'linked' | 'setup'>): string {
+  if (server.linked) return 'Frameleaf or its own login';
+  return server.setup === 'needed' ? 'New server' : 'Its own login';
+}
+
+// Region codes Intl names that are not places a person lives (the EU, the UN, "Unknown Region", pseudo-locales).
+const NOT_COUNTRIES = new Set(['EU', 'EZ', 'UN', 'ZZ', 'QO', 'XA', 'XB']);
+/** Every country or region the platform can name, in the person's language, sorted by name. */
+export function countryOptions(locale: string): { code: string; name: string }[] {
+  let names: Intl.DisplayNames;
+  try { names = new Intl.DisplayNames([locale, 'en'], { type: 'region', fallback: 'none' }); } catch { names = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' }); }
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const options: { code: string; name: string }[] = [];
+  for (const a of letters) for (const b of letters) {
+    const code = a + b;
+    const name = NOT_COUNTRIES.has(code) ? undefined : names.of(code);
+    if (name && name !== code) options.push({ code, name });
+  }
+  return options.sort((x, y) => x.name.localeCompare(y.name, locale));
+}
+/** The region in a BCP 47 tag (`en-CA` → `CA`), or the United States. */
+export function defaultCountry(locale: string): string {
+  try { return new Intl.Locale(locale).maximize().region ?? 'US'; } catch { return 'US'; }
+}

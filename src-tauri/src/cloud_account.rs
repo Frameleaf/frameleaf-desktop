@@ -20,6 +20,9 @@ use tauri::{Manager, State, WebviewWindow};
 use url::Url;
 use zeroize::ZeroizeOnDrop;
 
+#[path = "cloud_email.rs"]
+pub(crate) mod email;
+
 pub(crate) const CLIENT_ID: &str = "frameleaf-desktop";
 pub(crate) const SCOPE: &str = "openid email profile offline_access account";
 const CLOUD_ORIGIN: &str = "https://api.frameleaf.cloud";
@@ -223,7 +226,7 @@ async fn discover_hosts(client: &Client, cloud: &Url) -> CloudHosts {
     hosts_from_discovery(cloud, document.as_ref())
 }
 
-fn random_token(bytes: usize) -> String {
+pub(crate) fn random_token(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     rand::rngs::OsRng.fill_bytes(&mut buffer);
     URL_SAFE_NO_PAD.encode(buffer)
@@ -326,19 +329,22 @@ fn page(title: &str, text: &str) -> String {
 
 /// One request's target (`GET /callback?… HTTP/1.1`), read with a bound and a read timeout.
 fn request_target(stream: &mut TcpStream) -> Option<String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    // One deadline for the whole request: a per-read timeout alone lets a slow sender hold the
+    // single callback loop for minutes, past the sign-in's own deadline.
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut request = Vec::new();
     let mut byte = [0u8];
     while !request.ends_with(b"\r\n\r\n") {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return None;
+        }
         match stream.read(&mut byte) {
             Ok(1) => request.push(byte[0]),
             _ => return None,
         }
         if request.len() > 8192 {
             return None;
-        }
-        if request.ends_with(b"\r\n") && !request.contains(&b'\n') {
-            break;
         }
     }
     let line = request.split(|b| *b == b'\n').next()?;
@@ -616,6 +622,17 @@ pub(crate) async fn cloud_sign_in(
         ],
     )
     .await?;
+    keep_sign_in(&client, &window, &cloud, &hosts, token).await
+}
+
+/// Saves a new sign-in's tokens and reads the account; a sign-in that can't be kept is revoked.
+async fn keep_sign_in(
+    client: &Client,
+    window: &WebviewWindow,
+    cloud: &Url,
+    hosts: &CloudHosts,
+    token: TokenResponse,
+) -> Result<CloudAccount, String> {
     let refresh_token = token
         .refresh_token
         .ok_or("cloud_sign_in_no_refresh_token")?;
@@ -627,17 +644,33 @@ pub(crate) async fn cloud_sign_in(
         access_token: token.access_token.clone(),
         expires_at: now() + token.expires_in.unwrap_or(600),
     };
-    store(&credential)?;
-    if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, &window) {
+    {
+        // Two sign-ins finishing at once (browser and email code) must not overwrite each other:
+        // the check and the save happen under the same lock sign-out and refresh use.
+        let kept = {
+            let _held = LIFECYCLE.lock().await;
+            match load() {
+                Ok(Some(_)) => Err("cloud_sign_out_before_switching_accounts".into()),
+                Ok(None) => store(&credential),
+                Err(error) => Err(error),
+            }
+        };
+        // A new sign-in that can't be kept is revoked once, after the lock is released.
+        if let Err(error) = kept {
+            let _ = revoke(client, &credential).await;
+            return Err(error);
+        }
+    }
+    if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, window) {
         if error == "credential_confirmation_changed" {
-            let _ = revoke(&client, &credential).await;
+            let _ = revoke(client, &credential).await;
         }
         return Err(error);
     }
-    match profile(&client, &credential, &token.access_token).await {
+    match profile(client, &credential, &token.access_token).await {
         Ok(account) => Ok(account),
         Err(error) => {
-            let _ = revoke(&client, &credential).await;
+            let _ = revoke(client, &credential).await;
             let _ = credentials::delete(CREDENTIAL);
             Err(error)
         }
@@ -845,8 +878,10 @@ pub(crate) async fn connect_cloud_server(
     state: State<'_, crate::DesktopState>,
     instance_id: String,
     device_name: String,
+    server: Option<String>,
 ) -> Result<ConnectionView, String> {
     crate::require_local(&window)?;
+    let requested = server.as_deref().map(normalize_server).transpose()?;
     let instance = uuid::Uuid::parse_str(instance_id.trim())
         .map_err(|_| "cloud_server_invalid")?
         .to_string();
@@ -867,20 +902,84 @@ pub(crate) async fn connect_cloud_server(
     let (credential, app_token) = signed_in(&client).await?;
     let issuer = Url::parse(&credential.issuer).map_err(|_| "cloud_address_invalid")?;
 
-    // 1. Where the server answers: every usable candidate is asked at once, the best one wins.
-    let listed = cloud_get(
+    // 1. Where the server answers.
+    let listed = async {
+        let listed = cloud_get(
+            &client,
+            &issuer,
+            &format!("v1/instances/{instance}/connections"),
+            &app_token,
+        )
+        .await?;
+        let candidates: Vec<Candidate> = listed
+            .get("connections")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or("cloud_response_invalid")?;
+        Ok::<_, String>(order_candidates(candidates))
+    };
+    let verify_identity = requested.is_some();
+    let base = match requested {
+        // A server found on this network or typed in: an address on this network or one the account
+        // lists for this instance, answering as that instance.
+        Some(base) => {
+            if !base.host().is_some_and(crate::connection::is_local_network)
+                && !address_listed(&listed.await?, &base)
+            {
+                return Err("cloud_server_address_unlisted".into());
+            }
+            if probe(client.clone(), base.clone()).await? != instance {
+                return Err("server_identity_changed".into());
+            }
+            base
+        }
+        None => choose_listed(&client, listed.await?, &instance).await?,
+    };
+    // FL-430: before a server token goes to an address the account didn't hand us, or over plain
+    // http, the address proves it holds the server's pinned identity key.
+    if verify_identity || base.scheme() == "http" {
+        // The keys this account's instance list pins for the server: only a listed server can prove
+        // who it is, and an unlisted one could not take the account's token anyway.
+        let instances = cloud_get(&client, &issuer, "v1/instances", &app_token).await?;
+        let keys = crate::server_identity::pinned_keys(&instances, &instance)
+            .ok_or("cloud_server_not_on_account")?;
+        if keys.is_empty() {
+            return Err("server_identity_keys_unavailable".into());
+        }
+        crate::server_identity::verify(&client, &base, &instance, &keys).await?;
+    }
+    let view = connect_with_token(
+        &app,
+        &window,
+        &mut current,
         &client,
         &issuer,
-        &format!("v1/instances/{instance}/connections"),
         &app_token,
+        &instance,
+        base,
+        device_name,
     )
-    .await?;
-    let candidates: Vec<Candidate> = listed
-        .get("connections")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .ok_or("cloud_response_invalid")?;
-    let ordered = order_candidates(candidates);
+    .await;
+    drop(current);
+    if view.is_ok() {
+        crate::tray::refresh(&app).await;
+    }
+    view
+}
+
+/// Whether the account's addresses for an instance include `base`'s origin.
+fn address_listed(ordered: &[Candidate], base: &Url) -> bool {
+    ordered.iter().any(|candidate| {
+        Url::parse(&candidate.uri).is_ok_and(|listed| listed.origin() == base.origin())
+    })
+}
+
+/// Every address the account lists is asked at once; the best one answering as `instance` wins.
+async fn choose_listed(
+    client: &Client,
+    ordered: Vec<Candidate>,
+    instance: &str,
+) -> Result<Url, String> {
     if ordered.is_empty() {
         return Err("cloud_server_has_no_https_address".into());
     }
@@ -906,19 +1005,33 @@ pub(crate) async fn connect_cloud_server(
         }
     }
     let chosen =
-        select_candidate(&ordered, &results, &instance).ok_or("cloud_server_unreachable")?;
-    let base = normalize_server(&chosen.uri)?;
+        select_candidate(&ordered, &results, instance).ok_or("cloud_server_unreachable")?;
+    normalize_server(&chosen.uri)
+}
 
+/// Steps 2 and 3 of a Frameleaf connection, once `base` is known to answer as `instance`.
+#[allow(clippy::too_many_arguments)]
+async fn connect_with_token(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+    current: &mut Option<SavedConnection>,
+    client: &Client,
+    issuer: &Url,
+    app_token: &str,
+    instance: &str,
+    base: Url,
+    device_name: String,
+) -> Result<ConnectionView, String> {
     // 2. A 120-second server-audience token, minted only now that the server is known to answer.
     let exchange = token_request(
-        &client,
-        &issuer,
+        client,
+        issuer,
         &[
             ("grant_type", TOKEN_EXCHANGE_GRANT),
             ("client_id", CLIENT_ID),
-            ("subject_token", app_token.as_str()),
+            ("subject_token", app_token),
             ("subject_token_type", ACCESS_TOKEN_TYPE),
-            ("audience", instance.as_str()),
+            ("audience", instance),
             ("requested_token_type", ID_TOKEN_TYPE),
         ],
     )
@@ -974,21 +1087,17 @@ pub(crate) async fn connect_cloud_server(
         mode: "client-worker".into(),
         device_id: None,
     };
-    let mut view = crate::finish_new_connection(&client, &mut saved, |saved| {
-        credentials::confirm_new_sign_in("connection", saved, &window)
+    let mut view = crate::finish_new_connection(client, &mut saved, |saved| {
+        credentials::confirm_new_sign_in("connection", saved, window)
     })
     .await?;
     if view.state == "preparing"
         && view.features.worker_session
-        && crate::start_worker_setup(&app, &saved, false)
-            .await
-            .is_err()
+        && crate::start_worker_setup(app, &saved, false).await.is_err()
     {
         view.state = "worker-setup-failed".into();
     }
     *current = Some(saved);
-    drop(current);
-    crate::tray::refresh(&app).await;
     Ok(view)
 }
 
@@ -1332,5 +1441,26 @@ mod tests {
             parse_instances(json!("x")).unwrap_err(),
             "cloud_response_invalid"
         );
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn a_typed_address_must_be_one_the_account_lists() {
+        let listed = order_candidates(vec![Candidate {
+            kind: "wan".into(),
+            uri: "https://photos.example.com".into(),
+            custom: true,
+            verified: true,
+        }]);
+        let ok = |uri: &str| address_listed(&listed, &Url::parse(uri).unwrap());
+        assert!(ok("https://photos.example.com/"));
+        assert!(ok("https://PHOTOS.example.com"));
+        assert!(!ok("https://photos.example.com:8443/"));
+        assert!(!ok("https://evil.example.com/"));
+        assert!(!ok("http://photos.example.com/"));
     }
 }
