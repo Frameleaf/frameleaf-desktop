@@ -57,6 +57,11 @@ pub(crate) struct Server {
 }
 impl Server {
     pub(crate) fn new(replies: Vec<String>) -> Self {
+        let mut replies: VecDeque<_> = replies.into();
+        Self::handle(move |_, _| replies.pop_front().expect("unexpected HTTP request"))
+    }
+    /// Answers each request from its headers and body, for parallel parts that arrive in any order.
+    pub(crate) fn handle(mut reply: impl FnMut(&str, &[u8]) -> String + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
@@ -66,7 +71,6 @@ impl Server {
         let stopped = stop.clone();
         let handle = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
-            let mut replies: VecDeque<_> = replies.into();
             while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
                 let Ok((mut socket, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(5));
@@ -97,8 +101,8 @@ impl Server {
                     .unwrap_or(0);
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).unwrap();
+                let response = reply(&headers, &body);
                 captured.lock().unwrap().push((headers, body));
-                let response = replies.pop_front().expect("unexpected HTTP request");
                 socket.write_all(response.as_bytes()).unwrap();
             }
         });
@@ -620,5 +624,240 @@ fn a_resume_journal_cannot_be_rebound_to_a_different_source_run_or_item() {
         legacy.as_object_mut().unwrap().remove("binding");
         assert!(serde_json::from_value::<UploadSession>(legacy).is_err());
         assert!(FolderUploadBinding::new(&fixture.copy, "invalid", RESOURCE).is_err());
+    });
+}
+
+fn parts_options() -> String {
+    protocol(
+        204,
+        "Upload-Limit: max-size=100000, max-append-size=4, max-age=86400, min-size=1\r\nUpload-Parts: max-parallel=6\r\n",
+        "",
+    )
+}
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+}
+/// A parts-capable server: preflight, create, a parts listing, then `on_part` for each PUT.
+fn parts_server(
+    create: bool,
+    listing: &'static str,
+    mut on_part: impl FnMut(u64, &[u8]) -> String + Send + 'static,
+    result: String,
+) -> Server {
+    let mut preflight: VecDeque<_> = preflight().into();
+    preflight.pop_back();
+    preflight.push_back(parts_options());
+    if create {
+        preflight.push_back(protocol(201,&format!("Location: /api/assets/uploads/{RESOURCE}\r\nUpload-Offset: 0\r\nUpload-Complete: ?0\r\n"),""));
+    }
+    Server::handle(move |headers, body| {
+        let line = headers.lines().next().unwrap();
+        if line.starts_with(&format!("GET /api/assets/uploads/{RESOURCE}/parts ")) {
+            protocol(200, "Content-Type: application/json\r\n", listing)
+        } else if line.starts_with(&format!("PUT /api/assets/uploads/{RESOURCE}/parts ")) {
+            assert_eq!(
+                header_value(headers, "content-type"),
+                Some("application/octet-stream")
+            );
+            assert_eq!(
+                header_value(headers, "content-length")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
+                body.len()
+            );
+            on_part(
+                header_value(headers, "upload-offset")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                body,
+            )
+        } else if line.starts_with(&format!("GET /api/assets/uploads/{RESOURCE}/result ")) {
+            result.clone()
+        } else {
+            assert!(
+                !line.starts_with("PATCH ") && !line.starts_with("HEAD "),
+                "{line}"
+            );
+            preflight
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected {line}"))
+        }
+    })
+}
+fn parts_received(server: &Server) -> Vec<(u64, Vec<u8>)> {
+    let mut parts: Vec<_> = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(h, _)| h.starts_with("PUT "))
+        .map(|(h, b)| {
+            (
+                header_value(h, "upload-offset").unwrap().parse().unwrap(),
+                b.clone(),
+            )
+        })
+        .collect();
+    parts.sort();
+    parts
+}
+fn result_json(copy: &crate::copy_source::StagedCopy) -> String {
+    protocol(
+        200,
+        "Content-Type: application/json\r\n",
+        &format!(
+            r#"{{"id":"{RESOURCE}","status":"created","sha256":"{}"}}"#,
+            copy.sha256
+        ),
+    )
+}
+#[test]
+fn parallel_parts_cover_the_file_and_the_completing_part_carries_the_result() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut received = 0;
+        let done = result_json(&fixture.copy);
+        let server = parts_server(
+            true,
+            r#"{"offset":0,"size":10,"parts":[]}"#,
+            move |_, body| {
+                received += body.len();
+                if received == 10 {
+                    done.clone()
+                } else {
+                    protocol(204, "Upload-Offset: 0\r\nUpload-Complete: ?0\r\n", "")
+                }
+            },
+            String::new(),
+        );
+        let mut journal = None;
+        let mut admitted = 0;
+        let outcome = transfer(
+            &crate::transport::client().unwrap(),
+            &server.base,
+            &fixture.saved,
+            &fixture.identity,
+            &fixture.copy,
+            &fixture.binding(),
+            &fixture.root.join("stage"),
+            &mut journal,
+            |_, bytes| {
+                admitted += bytes;
+                Ok(())
+            },
+            &AtomicBool::new(false),
+            &|| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            UploadOutcome::Ingested {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert_eq!(admitted, 10);
+        // max-append-size=4 caps the 256 MiB Wi-Fi part: three parts, the last one short.
+        assert_eq!(
+            parts_received(&server),
+            [
+                (0, b"abcd".to_vec()),
+                (4, b"efgh".to_vec()),
+                (8, b"ij".to_vec())
+            ]
+        );
+        let requests = server.requests.lock().unwrap();
+        let create = requests
+            .iter()
+            .find(|(h, _)| h.starts_with("POST "))
+            .unwrap();
+        assert_eq!(header_value(&create.0, "upload-length"), Some("10"));
+        assert!(create.1.is_empty());
+        assert!(!requests.iter().any(|(h, _)| h.contains("/result ")));
+    });
+}
+#[test]
+fn resumed_parallel_upload_sends_only_the_gaps_and_retries_incomplete_or_throttled_parts() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut journal = None;
+        // The first attempt dies on a server error after the resource exists.
+        let server = parts_server(
+            true,
+            r#"{"offset":0,"size":10,"parts":[]}"#,
+            |_, _| protocol(500, "", ""),
+            String::new(),
+        );
+        assert_eq!(
+            fixture
+                .run(&server, &mut journal, |_| Ok(()))
+                .await
+                .unwrap_err(),
+            "source_upload_http_500"
+        );
+        drop(server);
+        assert!(journal.is_some());
+        let mut attempts = 0;
+        let server = parts_server(
+            false,
+            r#"{"offset":4,"size":10,"parts":[{"offset":8,"size":2}]}"#,
+            move |offset, body| {
+                assert_eq!((offset, body), (4, &b"efgh"[..]));
+                attempts += 1;
+                match attempts {
+                    1 => protocol(400, "", ""),
+                    2 => protocol(429, "", ""),
+                    _ => protocol(204, "Upload-Offset: 10\r\nUpload-Complete: ?0\r\n", ""),
+                }
+            },
+            result_json(&fixture.copy),
+        );
+        let outcome = fixture
+            .run(&server, &mut journal, |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, UploadOutcome::Ingested { .. }));
+        assert_eq!(parts_received(&server).len(), 3);
+        let requests = server.requests.lock().unwrap();
+        assert!(!requests.iter().any(|(h, _)| h.starts_with("POST ")));
+        assert!(requests.iter().any(|(h, _)| h.contains("/result ")));
+    });
+}
+#[test]
+fn servers_without_upload_parts_keep_the_sequential_patch_path() {
+    tauri::async_runtime::block_on(async {
+        let fixture = Fixture::new();
+        let mut responses = preflight();
+        responses.push(protocol(201,&format!("Location: /api/assets/uploads/{RESOURCE}\r\nUpload-Offset: 0\r\nUpload-Complete: ?0\r\n"),""));
+        for offset in [4, 8, 10] {
+            responses.push(protocol(
+                204,
+                &format!("Upload-Offset: {offset}\r\nUpload-Complete: ?0\r\n"),
+                "",
+            ));
+        }
+        responses.push(result_json(&fixture.copy));
+        let server = Server::new(responses);
+        let mut journal = None;
+        fixture
+            .run(&server, &mut journal, |_| Ok(()))
+            .await
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(h, _)| h.starts_with("PATCH "))
+                .count(),
+            3
+        );
+        assert!(!requests
+            .iter()
+            .any(|(h, _)| h.starts_with("PUT ") || h.contains("/parts")));
     });
 }

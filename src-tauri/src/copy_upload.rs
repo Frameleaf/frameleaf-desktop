@@ -3,17 +3,22 @@ use crate::{
     connection::{normalize_server, Capabilities, DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,
     transport,
+    upload_parts::{self, Network, PartPolicy},
 };
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-use reqwest::{Client, Method, Response};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Seek, SeekFrom},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use url::Url;
@@ -192,7 +197,8 @@ fn protocol(response: &Response) -> Result<(), String> {
         Err("source_upload_protocol_unsupported".into())
     }
 }
-fn limits(response: &Response, bytes: u64) -> Result<usize, String> {
+/// The server's per-request byte limit; the sequential PATCH path still caps it at 1 MiB.
+fn limits(response: &Response, bytes: u64) -> Result<u64, String> {
     let mut max_size = None;
     let mut append = None;
     for part in header(response, "upload-limit")?.split(',') {
@@ -220,9 +226,222 @@ fn limits(response: &Response, bytes: u64) -> Result<usize, String> {
         return Err("source_upload_capacity_exceeded".into());
     }
     match append {
-        Some(n) if n > 0 => Ok(n.min(1024 * 1024) as usize),
+        Some(n) if n > 0 => Ok(n),
         _ => Err("source_upload_response_invalid".into()),
     }
+}
+/// FL-1268 servers answer `Upload-Parts: max-parallel=N`; without it the server only knows PATCH.
+fn parallel_parts(response: &Response) -> Result<Option<usize>, String> {
+    if response.headers().get("upload-parts").is_none() {
+        return Ok(None);
+    }
+    let mut max = None;
+    for part in header(response, "upload-parts")?.split(',') {
+        if let Some(("max-parallel", value)) = part.trim().split_once('=') {
+            if max.replace(number(value)?).is_some() {
+                return Err("source_upload_response_invalid".into());
+            }
+        }
+    }
+    match max {
+        Some(n) if n > 0 => Ok(Some(n.min(64) as usize)),
+        _ => Err("source_upload_response_invalid".into()),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultDto {
+    id: String,
+    status: String,
+    sha256: String,
+}
+#[derive(Deserialize)]
+struct PartsListing {
+    offset: u64,
+    size: Option<u64>,
+    parts: Vec<ReceivedPart>,
+}
+#[derive(Deserialize)]
+struct ReceivedPart {
+    offset: u64,
+    size: u64,
+}
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buffer, at)
+}
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, mut buffer: &mut [u8], mut at: u64) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(file, buffer, at)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buffer = &mut buffer[n..];
+                at += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+/// Streams `[start, start + len)` from the staged original so parts in flight never sit in memory.
+fn part_body(file: Arc<std::fs::File>, start: u64, len: u64) -> reqwest::Body {
+    let stream = futures_util::stream::try_unfold((start, len), move |(at, left)| {
+        let file = file.clone();
+        async move {
+            if left == 0 {
+                return Ok(None);
+            }
+            let mut chunk = vec![0; left.min(1024 * 1024) as usize];
+            read_exact_at(&file, &mut chunk, at)?;
+            let n = chunk.len() as u64;
+            Ok::<_, std::io::Error>(Some((chunk, (at + n, left - n))))
+        }
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+async fn pause(delay: Duration, cancelled: &AtomicBool) -> Result<(), String> {
+    let until = tokio::time::Instant::now() + delay;
+    while tokio::time::Instant::now() < until {
+        check_cancel(cancelled)?;
+        tokio::time::sleep(
+            Duration::from_millis(100)
+                .min(until.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+    check_cancel(cancelled)
+}
+async fn put_part(
+    request: RequestBuilder,
+    start: u64,
+    len: u64,
+    delay: Duration,
+    cancelled: &AtomicBool,
+) -> (u64, u64, Result<Response, String>) {
+    let result = match pause(delay, cancelled).await {
+        Ok(()) => send(request, cancelled).await,
+        Err(error) => Err(error),
+    };
+    (start, len, result)
+}
+const MAX_PART_FAILURES: u32 = 6;
+const MAX_RATE_LIMITED: u32 = 60;
+const MAX_REPLANS: u32 = 4;
+/// Sends every missing range as parallel `PUT :id/parts`. Returns the response that completed the
+/// file with a result, or `None` once every part is acknowledged and `GET :id/result` must decide.
+#[allow(clippy::too_many_arguments)]
+async fn put_parts(
+    request: &impl Fn(Method, &str) -> RequestBuilder,
+    path: &str,
+    size: u64,
+    file: Arc<std::fs::File>,
+    session: &UploadSession,
+    mut policy: PartPolicy,
+    persist: &mut impl FnMut(&UploadSession, u64) -> Result<(), String>,
+    cancelled: &AtomicBool,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Option<Response>, String> {
+    let parts = format!("{path}/parts");
+    let mut failures = 0;
+    let mut rate_limited = 0;
+    for _ in 0..MAX_REPLANS {
+        gate()?;
+        let response = send(request(Method::GET, &parts), cancelled).await?;
+        success(&response, &[200])?;
+        protocol(&response)?;
+        if response.headers().contains_key("upload-limit") {
+            policy.cap(limits(&response, size)?);
+        }
+        let listing: PartsListing = transport::json(response).await?;
+        if listing.size != Some(size) {
+            return Err("source_upload_response_invalid".into());
+        }
+        let received: Vec<_> = listing.parts.iter().map(|p| (p.offset, p.size)).collect();
+        let mut queue: std::collections::VecDeque<_> =
+            upload_parts::gaps(size, listing.offset, &received)?
+                .into_iter()
+                .map(|(start, end)| (start, end, Duration::ZERO))
+                .collect();
+        let mut inflight = FuturesUnordered::new();
+        let mut replan = false;
+        while !replan {
+            while inflight.len() < policy.parallel {
+                let Some((start, end, delay)) = queue.pop_front() else {
+                    break;
+                };
+                check_cancel(cancelled)?;
+                gate()?;
+                let len = (end - start).min(policy.part_size);
+                if start + len < end {
+                    queue.push_front((start + len, end, Duration::ZERO));
+                }
+                // Persist admission before a send; a lost response or cancellation never refunds it.
+                persist(session, len)?;
+                let builder = request(Method::PUT, &parts)
+                    .header("Upload-Offset", start)
+                    .header("Content-Length", len)
+                    .header("Content-Type", "application/octet-stream")
+                    .timeout(upload_parts::part_timeout(len))
+                    .body(part_body(file.clone(), start, len));
+                inflight.push(put_part(builder, start, len, delay, cancelled));
+            }
+            let Some((start, len, result)) = inflight.next().await else {
+                return Ok(None);
+            };
+            let retry = |queue: &mut std::collections::VecDeque<_>, delay| {
+                queue.push_front((start, start + len, delay));
+            };
+            let response = match result {
+                Ok(response) => response,
+                Err(error) if error == "source_upload_interrupted" => {
+                    failures += 1;
+                    if failures > MAX_PART_FAILURES {
+                        return Err(error);
+                    }
+                    policy.halve();
+                    retry(&mut queue, upload_parts::backoff(failures));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match response.status().as_u16() {
+                204 => {
+                    protocol(&response)?;
+                    offset(&response, size)?;
+                    failures = 0;
+                    rate_limited = 0;
+                }
+                200 => {
+                    protocol(&response)?;
+                    return Ok(Some(response));
+                }
+                202 => {
+                    protocol(&response)?;
+                    return Ok(None);
+                }
+                // The server discarded an incomplete part: send it again, smaller.
+                400 => {
+                    failures += 1;
+                    if failures > MAX_PART_FAILURES {
+                        return Err("source_upload_http_400".into());
+                    }
+                    policy.halve();
+                    retry(&mut queue, upload_parts::backoff(failures));
+                }
+                429 => {
+                    rate_limited += 1;
+                    if rate_limited > MAX_RATE_LIMITED {
+                        return Err("source_upload_http_429".into());
+                    }
+                    retry(&mut queue, Duration::from_secs(1));
+                }
+                // A lost response may have committed a larger part than the one now resent: ask again.
+                409 => replan = true,
+                status => return Err(format!("source_upload_http_{status}")),
+            }
+        }
+    }
+    Err("source_upload_http_409".into())
 }
 fn date(ms: i64) -> Result<String, String> {
     let value = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
@@ -330,9 +549,14 @@ pub(crate) async fn transfer(
     let response = send(request(Method::OPTIONS, "api/assets/uploads"), cancelled).await?;
     success(&response, &[204])?;
     protocol(&response)?;
-    let chunk_size = limits(&response, copy.bytes)?;
+    let max_append = limits(&response, copy.bytes)?;
+    let chunk_size = max_append.min(1024 * 1024) as usize;
+    let parallel = parallel_parts(&response)?;
     gate()?;
-    let (mut durable, complete) = if let Some(current) = session.as_ref() {
+    let (mut durable, complete) = if parallel.is_some() && session.is_some() {
+        // The parts listing, not HEAD, says what a parallel upload still needs.
+        (0, false)
+    } else if let Some(current) = session.as_ref() {
         let response = send(
             request(
                 Method::HEAD,
@@ -399,7 +623,22 @@ pub(crate) async fn transfer(
         "api/assets/uploads/{}",
         session.as_ref().unwrap().resource_id
     );
-    if !complete {
+    let mut finished = None;
+    if let Some(max_parallel) = parallel {
+        // Never PATCH a resource once parts are in play; parts carry the same admission and signing.
+        finished = put_parts(
+            &request,
+            &path,
+            copy.bytes,
+            Arc::new(file.into_std()),
+            session.as_ref().unwrap(),
+            PartPolicy::new(Network::Unmetered, max_append, max_parallel),
+            &mut persist,
+            cancelled,
+            gate,
+        )
+        .await?;
+    } else if !complete {
         file.seek(SeekFrom::Start(durable))
             .map_err(|_| "source_stage_unavailable")?;
         // An empty completion retries ingestion when all bytes were acknowledged before interruption.
@@ -438,20 +677,28 @@ pub(crate) async fn transfer(
             }
         }
     }
-    gate()?;
-    let response = send(request(Method::GET, &format!("{path}/result")), cancelled).await?;
-    success(&response, &[200, 202])?;
-    protocol(&response)?;
-    if response.status().as_u16() == 202 {
-        return Ok(UploadOutcome::Pending);
-    }
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct ResultDto {
-        id: String,
-        status: String,
-        sha256: String,
-    }
+    let response = match finished {
+        Some(response) => response,
+        None => {
+            // Parallel uploads may finish in another request's hands; give ingestion a moment.
+            let mut polls = if parallel.is_some() { 10 } else { 1 };
+            loop {
+                gate()?;
+                let response =
+                    send(request(Method::GET, &format!("{path}/result")), cancelled).await?;
+                success(&response, &[200, 202])?;
+                protocol(&response)?;
+                polls -= 1;
+                if response.status().as_u16() == 200 {
+                    break response;
+                }
+                if polls == 0 {
+                    return Ok(UploadOutcome::Pending);
+                }
+                pause(Duration::from_secs(1), cancelled).await?;
+            }
+        }
+    };
     let result: ResultDto = transport::json(response).await?;
     if !canonical_uuid(&result.id)
         || result.sha256 != copy.sha256

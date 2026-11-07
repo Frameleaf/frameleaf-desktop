@@ -102,7 +102,8 @@ impl SourceConsent {
             saved,
             identity,
             path,
-            2 * 1024 * 1024 * 1024,
+            // FL-1268: no per-file ceiling; staging space and the server's limit decide.
+            crate::copy_source::UNLIMITED_ITEM_BYTES,
             allow_download,
         )?;
         let name = source_label(

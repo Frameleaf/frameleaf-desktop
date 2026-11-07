@@ -311,3 +311,26 @@ fn staging_retains_old_filesystem_dates_when_the_original_is_removed() {
             .unwrap();
     assert_eq!(restored.file_modified_at_ms, -86_400_000);
 }
+
+#[test]
+fn approvals_have_no_per_file_ceiling_and_survive_a_signed_round_trip() {
+    let source = Folder::new();
+    let stage = Folder::new();
+    let identity = DeviceIdentity::generate();
+    let saved = saved();
+    fs::write(source.0.join("movie.mov"), b"large enough").unwrap();
+    for max in [3 * 1024 * 1024 * 1024, (1u64 << 53) - 1] {
+        let approval = CopyApproval::approve(&saved, &identity, &source.0, max, true).unwrap();
+        let restored: CopyApproval =
+            serde_json::from_slice(&serde_json::to_vec(&approval).unwrap()).unwrap();
+        restored
+            .stage(
+                &saved,
+                &identity,
+                "movie.mov",
+                &stage.0,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    }
+}
