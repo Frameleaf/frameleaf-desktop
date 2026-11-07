@@ -44,6 +44,7 @@ mod transport;
 mod tray;
 mod updates;
 mod upload_budget;
+mod upload_parts;
 #[cfg(windows)]
 mod windows_host_profile;
 #[cfg(any(windows, test))]

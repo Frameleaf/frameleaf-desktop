@@ -311,3 +311,56 @@ fn staging_retains_old_filesystem_dates_when_the_original_is_removed() {
             .unwrap();
     assert_eq!(restored.file_modified_at_ms, -86_400_000);
 }
+
+#[test]
+fn approvals_have_no_per_file_ceiling_and_survive_a_signed_round_trip() {
+    let source = Folder::new();
+    let stage = Folder::new();
+    let identity = DeviceIdentity::generate();
+    let saved = saved();
+    fs::write(source.0.join("movie.mov"), b"large enough").unwrap();
+    for max in [3 * 1024 * 1024 * 1024, (1u64 << 53) - 1] {
+        let approval = CopyApproval::approve(&saved, &identity, &source.0, max, true).unwrap();
+        let restored: CopyApproval =
+            serde_json::from_slice(&serde_json::to_vec(&approval).unwrap()).unwrap();
+        restored
+            .stage(
+                &saved,
+                &identity,
+                "movie.mov",
+                &stage.0,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn approvals_refuse_limits_beyond_exact_canonical_signing() {
+    let source = Folder::new();
+    let stage = Folder::new();
+    let identity = DeviceIdentity::generate();
+    let saved = saved();
+    fs::write(source.0.join("movie.mov"), b"large enough").unwrap();
+    assert!(CopyApproval::approve(&saved, &identity, &source.0, 1 << 53, true).is_err());
+    // 2 GiB is reserved for approvals signed before FL-1268, which no longer cap files.
+    assert!(CopyApproval::approve(&saved, &identity, &source.0, 2 << 30, true).is_err());
+    let approval =
+        CopyApproval::approve(&saved, &identity, &source.0, (1u64 << 53) - 1, true).unwrap();
+    let mut value = serde_json::to_value(&approval).unwrap();
+    value["scope"]["maxItemBytes"] = serde_json::json!(u64::MAX);
+    let forged: CopyApproval = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        forged
+            .stage(
+                &saved,
+                &identity,
+                "movie.mov",
+                &stage.0,
+                &AtomicBool::new(false)
+            )
+            .err()
+            .as_deref(),
+        Some("source_approval_invalid")
+    );
+}

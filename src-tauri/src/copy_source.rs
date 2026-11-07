@@ -29,6 +29,9 @@ struct CopyScope {
     max_item_bytes: u64,
     allow_download: bool,
 }
+const LEGACY_ITEM_CAP: u64 = 2 * 1024 * 1024 * 1024;
+/// FL-1268: no per-file ceiling. The largest integer that survives canonical JSON signing exactly.
+pub(crate) const UNLIMITED_ITEM_BYTES: u64 = (1 << 53) - 1;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CopyApproval {
@@ -334,7 +337,9 @@ impl CopyApproval {
             || saved.account_id.is_empty()
             || saved.device_id.as_deref().is_none_or(str::is_empty)
             || max_item_bytes == 0
-            || max_item_bytes > 2 * 1024 * 1024 * 1024
+            // Reserved: approvals signed with the old 2 GiB default are read as unlimited.
+            || max_item_bytes == LEGACY_ITEM_CAP
+            || max_item_bytes > UNLIMITED_ITEM_BYTES
         {
             return Err("source_approval_invalid".into());
         }
@@ -360,7 +365,10 @@ impl CopyApproval {
     }
     fn validate(&self, saved: &SavedConnection, identity: &DeviceIdentity) -> Result<(), String> {
         let scope = &self.scope;
+        // Canonical signing rounds larger integers, so a changed limit could share a signature.
         if scope.version != 1
+            || scope.max_item_bytes == 0
+            || scope.max_item_bytes > UNLIMITED_ITEM_BYTES
             || scope.server != saved.server
             || scope.server_id != saved.server_id
             || scope.account_id != saved.account_id
@@ -443,7 +451,9 @@ impl CopyApproval {
         if expected_bytes.is_some_and(|bytes| bytes != before.len()) {
             return Err("source_item_changed".into());
         }
-        if before.len() > self.scope.max_item_bytes {
+        // Approvals signed before FL-1268 carry the old 2 GiB default, which is no longer a per-file limit.
+        if self.scope.max_item_bytes != LEGACY_ITEM_CAP && before.len() > self.scope.max_item_bytes
+        {
             return Err("source_copy_budget_exceeded".into());
         }
         let source_stamp = path_stamp(&dir, relative_path, &before)?;

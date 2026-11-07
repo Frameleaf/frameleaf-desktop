@@ -289,7 +289,8 @@ fn manifest_for(
     }
     let mut total_bytes = 0u64;
     for file in &scan.files {
-        if file.bytes == 0 || file.bytes > (1u64 << 31) {
+        // FL-1268: no per-file ceiling; the server's free-space limit and the run budget still apply.
+        if file.bytes == 0 {
             return Err("source_copy_budget_exceeded".into());
         }
         total_bytes = total_bytes
