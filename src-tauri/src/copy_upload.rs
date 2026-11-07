@@ -224,7 +224,8 @@ fn limits(response: &Response, bytes: u64) -> Result<usize, String> {
         _ => Err("source_upload_response_invalid".into()),
     }
 }
-/// The upload's Content-Type from the file's extension; a name without one is plain bytes.
+/// The upload's Content-Type from the file's extension. The server requires an image, video or audio
+/// type before it reads the filename, so anything else is sent as an image of unknown format.
 fn upload_mime(filename: &str) -> &'static str {
     let extension = Path::new(filename)
         .extension()
@@ -234,7 +235,14 @@ fn upload_mime(filename: &str) -> &'static str {
     match extension.as_str() {
         "mp4" | "m4v" => "video/mp4",
         "mov" => "video/quicktime",
-        _ => "application/octet-stream",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "tif" | "tiff" => "image/tiff",
+        _ => "image/octet-stream",
     }
 }
 fn date(ms: i64) -> Result<String, String> {
