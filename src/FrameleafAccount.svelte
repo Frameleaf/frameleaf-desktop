@@ -38,6 +38,8 @@
 
   async function send(kind: 'sign-in' | 'create') {
     if (!native || busy) return;
+    // A sign-up needs the current terms accepted; without them it must never go out as a sign-in.
+    if (kind === 'create' && (!consents || !agreed)) { mode = 'create'; void loadConsents(); return; }
     busy = true; failure = ''; failureCode = '';
     try {
       const registration = kind === 'create' && consents
@@ -47,7 +49,7 @@
     } catch (error) {
       fail(error);
       // The terms changed while this screen was open: show the new ones to accept again.
-      if (String(error) === 'cloud_email_consent_changed') { consents = null; agreed = false; void loadConsents(); }
+      if (String(error) === 'cloud_email_consent_changed') { mode = 'create'; consents = null; agreed = false; void loadConsents(); }
     } finally { busy = false; }
   }
   async function verify(event: SubmitEvent) {

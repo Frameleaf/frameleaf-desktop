@@ -35,6 +35,7 @@ mod resource_policy;
 pub mod runtime_epochs;
 pub mod runtime_store;
 mod server_admin;
+mod server_identity;
 mod server_login;
 mod source_consent;
 mod source_import;
@@ -742,9 +743,13 @@ pub(crate) async fn apply_worker_control(
             }
             if let Err(error) = start_worker_setup(app, saved, false).await {
                 // Put the saved control back too, so a restart does not resume what failed here.
-                let _ = worker_control::save(saved, previous);
+                let rolled_back = worker_control::save(saved, previous);
                 setup.hold(previous).await;
-                return Err(error);
+                // If the old setting can't be saved back, say so: a restart would resume the worker.
+                return Err(match rolled_back {
+                    Ok(()) => error,
+                    Err(_) => "worker_control_unsaved".into(),
+                });
             }
             Ok(setup.status())
         }

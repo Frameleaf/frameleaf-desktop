@@ -280,7 +280,10 @@ pub(crate) async fn server_oauth_sign_in(
         .send()
         .await
         .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    if response.status() == reqwest::StatusCode::BAD_REQUEST {
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
+    ) {
         return Err("server_oauth_failed".into());
     }
     let login: crate::LoginResponse = transport::json(response).await?;
@@ -328,7 +331,8 @@ async fn provider_window(app: &tauri::AppHandle, base: &Url, page: Url) -> Resul
                     let _ = returned.send(Some(url.clone()));
                     return false;
                 }
-                matches!(url.scheme(), "https" | "http")
+                // The provider's pages only: https anywhere, plain http only on this network.
+                provider_page_allowed(url)
             })
             .build()
             .map_err(|_| "server_oauth_failed")?;

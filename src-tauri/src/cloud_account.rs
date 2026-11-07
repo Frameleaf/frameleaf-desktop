@@ -644,7 +644,16 @@ async fn keep_sign_in(
         access_token: token.access_token.clone(),
         expires_at: now() + token.expires_in.unwrap_or(600),
     };
-    store(&credential)?;
+    {
+        // Two sign-ins finishing at once (browser and email code) must not overwrite each other:
+        // the check and the save happen under the same lock sign-out and refresh use.
+        let _held = LIFECYCLE.lock().await;
+        if load()?.is_some() {
+            let _ = revoke(client, &credential).await;
+            return Err("cloud_sign_out_before_switching_accounts".into());
+        }
+        store(&credential)?;
+    }
     if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, window) {
         if error == "credential_confirmation_changed" {
             let _ = revoke(client, &credential).await;
@@ -902,10 +911,15 @@ pub(crate) async fn connect_cloud_server(
             .ok_or("cloud_response_invalid")?;
         Ok::<_, String>(order_candidates(candidates))
     };
+    // The keys this account's instance list pins for the server: only a listed server can prove who
+    // it is, and an unlisted one could not take the account's token anyway.
+    let instances = cloud_get(&client, &issuer, "v1/instances", &app_token).await?;
+    let keys = crate::server_identity::pinned_keys(&instances, &instance)
+        .ok_or("cloud_server_not_on_account")?;
+    let verify_identity = requested.is_some();
     let base = match requested {
-        // A server found on this network or typed in. As on the phones, its server token goes only
-        // to an address on this network or one the account lists for this instance, and only once
-        // the address answers as that instance.
+        // A server found on this network or typed in: an address on this network or one the account
+        // lists for this instance, answering as that instance.
         Some(base) => {
             if !base.host().is_some_and(crate::connection::is_local_network)
                 && !address_listed(&listed.await?, &base)
@@ -919,6 +933,11 @@ pub(crate) async fn connect_cloud_server(
         }
         None => choose_listed(&client, listed.await?, &instance).await?,
     };
+    // FL-430: before a server token goes to an address the account didn't hand us, or over plain
+    // http, the address proves it holds the server's pinned identity key.
+    if verify_identity || base.scheme() == "http" {
+        crate::server_identity::verify(&client, &base, &instance, &keys).await?;
+    }
     let view = connect_with_token(
         &app,
         &window,
