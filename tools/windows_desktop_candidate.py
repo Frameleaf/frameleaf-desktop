@@ -12,8 +12,8 @@ import zipfile
 from build_runtime import BuildError
 from obtain_host_component import api, download, validate_approval, validate_producer
 
-EXE = "Frameleaf_0.1.3_x64-setup.exe"
-MSI = "Frameleaf_0.1.3_x64_en-US.msi"
+EXE = "Frameleaf_0.1.4_x64-setup.exe"
+MSI = "Frameleaf_0.1.4_x64_en-US.msi"
 
 
 def extract_desktop(archive: Path, output: Path, source: str, digest: str) -> dict:
