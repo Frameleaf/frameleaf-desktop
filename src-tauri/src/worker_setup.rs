@@ -1023,6 +1023,9 @@ mod tests {
             let profiles: Vec<_> = catalogue["profiles"].as_array().unwrap().iter().filter(|p|
                 p["workload"] == workload && p["spec"]["provider"] == "CPUExecutionProvider" &&
                 p["runtimeSourceRevision"] == "25b22c16e47a27a2eb50017d838497abce850d11").collect();
+            // the first listed model of each workload (the release default), as one server config selects one
+            let default = profiles.first().map(|p| p["modelName"].clone());
+            let profiles: Vec<_> = profiles.into_iter().filter(|p| Some(&p["modelName"]) == default.as_ref()).collect();
             serde_json::json!({"workload":workload,"state":if workload == "enrichment" {"unsupported"} else {"eligible"},
                 "modelNames":profiles.first().map(|p| vec![p["modelName"].clone()]).unwrap_or_default(),
                 "modelKeys":profiles.iter().map(|p|p["modelKey"].clone()).collect::<Vec<_>>()})

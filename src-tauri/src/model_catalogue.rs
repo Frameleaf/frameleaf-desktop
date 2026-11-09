@@ -1059,11 +1059,15 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(selected.model_key(), raw["modelKey"].as_str().unwrap());
-            assert!(
-                approved_profile("ViT-B-32__openai", entries, source, "CPUExecutionProvider")
-                    .unwrap()
-                    .is_none()
-            );
+            // a selectable model the catalogue has no profile for
+            assert!(approved_profile(
+                "ViT-B-16-SigLIP2__webli",
+                entries,
+                source,
+                "CPUExecutionProvider"
+            )
+            .unwrap()
+            .is_none());
             assert!(
                 approved_profile(name, &json!({}), source, "CPUExecutionProvider")
                     .unwrap()
@@ -1132,7 +1136,7 @@ mod tests {
     fn pr274_profiles_preserve_every_legacy_profile_and_use_distinct_new_identities() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 21);
+        assert_eq!(profiles.len(), 31);
         let legacy = Value::Array(profiles[..11].to_vec());
         assert_eq!(
             digest(&serde_json_canonicalizer::to_vec(&legacy).unwrap()),
@@ -1178,6 +1182,16 @@ mod tests {
             "31337c0063a85bdf957d27ef7ec581b34e65ee4a73f53215c238ff2c9342d40c",
             "75d39bab3c7ce04a0b3864ae8eb420664970faa66ab2f55a82c043a8d4c9ebc1",
             "eae6ee5d7291fec288026e79094c294de27187f769310e373625e80a18bab1c2",
+            "f27d2e6a303cff1789e855e0f1561a3a04b030639d4ff789800394a6ead51b94",
+            "064de008feb79e0ce67642f2613a17a33479e9238ef0ccc58db3eb5571bd8a77",
+            "a40b7628bbc61c2dbab819e83fae6bc738e4e5d0fba06eed749bede91c1dba70",
+            "207621ca4431e3358137b8ce4a742887b0db1e003b78548ea8fc36209a25512e",
+            "b3c98ec6de5f9e761a62044b8a261dc66d6273eff91f4a40fe7a9f97ea7f1016",
+            "25c77459eda63cc99a54f72320de3d0ef2029ce9a0c7d239eea62e24c499ad24",
+            "5b33ebee9460aa445513f196cc73597daa3f874ea2b527801f18bc67121f0759",
+            "6a1a473fc90069f0b222e697272cb1a78f8fadd4a1c52af7e42ed3d6eb8bb37e",
+            "194ab4b05a9b81e28466bc4341bd26d3c80349f3508f701ae63c9569a11a4d58",
+            "efa3e6033ea6b6c6aa769444ef5e3ba2432f1ed236ed37d919083edf255c5452",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
@@ -1199,8 +1213,7 @@ mod tests {
             "2e8b52cf4107668d2df47eb0564398028cb75502d766a3403b4201a41c7b03a1"
         );
         let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
-        assert_eq!(profiles[16..].len(), 5);
-        for profile in &profiles[16..] {
+        for profile in &profiles[16..21] {
             assert_eq!(profile["runtimeSourceRevision"], source);
             assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
             assert_eq!(
