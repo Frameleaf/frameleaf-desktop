@@ -1017,14 +1017,21 @@ mod tests {
         assert_eq!(*progress.status.lock().unwrap(), status);
     }
     fn inventory_fixture() -> serde_json::Value {
+        inventory_fixture_with("ViT-B-16-SigLIP-384__webli")
+    }
+    fn inventory_fixture_with(clip_model: &str) -> serde_json::Value {
         let catalogue: serde_json::Value =
             serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
         let workloads = ["clip", "ocr", "face", "enrichment"].map(|workload| {
             let profiles: Vec<_> = catalogue["profiles"].as_array().unwrap().iter().filter(|p|
                 p["workload"] == workload && p["spec"]["provider"] == "CPUExecutionProvider" &&
                 p["runtimeSourceRevision"] == "25b22c16e47a27a2eb50017d838497abce850d11").collect();
-            // the first listed model of each workload (the release default), as one server config selects one
-            let default = profiles.first().map(|p| p["modelName"].clone());
+            // one model per workload, as one server config selects one: the release default, or `clip_model`
+            let default = if workload == "clip" {
+                Some(serde_json::json!(clip_model))
+            } else {
+                profiles.first().map(|p| p["modelName"].clone())
+            };
             let profiles: Vec<_> = profiles.into_iter().filter(|p| Some(&p["modelName"]) == default.as_ref()).collect();
             serde_json::json!({"workload":workload,"state":if workload == "enrichment" {"unsupported"} else {"eligible"},
                 "modelNames":profiles.first().map(|p| vec![p["modelName"].clone()]).unwrap_or_default(),
@@ -1050,6 +1057,35 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(statuses[1].state, "unsupported");
         assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
+    }
+    #[test]
+    fn inventory_selects_each_new_clip_model_and_rejects_mixed_model_groups() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let models = ["ViT-B-32__openai", "ViT-SO400M-16-SigLIP2-384__webli"];
+        for model in models {
+            let value = inventory_fixture_with(model);
+            let keys = value["workloads"][0]["modelKeys"].clone();
+            assert_eq!(keys.as_array().unwrap().len(), 3);
+            let (groups, _) = inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+            let mut selected: Vec<_> = groups[0].iter().map(|p| p.model_key().to_owned()).collect();
+            let mut expected: Vec<_> = keys
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k.as_str().unwrap().to_owned())
+                .collect();
+            selected.sort();
+            expected.sort();
+            assert_eq!(selected, expected);
+        }
+        // one key from the other model leaves no complete group: search is unsupported, the rest stay
+        let mut value = inventory_fixture_with(models[0]);
+        value["workloads"][0]["modelKeys"][0] =
+            inventory_fixture_with(models[1])["workloads"][0]["modelKeys"][0].clone();
+        let (groups, statuses) =
+            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(statuses[0].state, "unsupported");
+        assert!(groups.iter().all(|group| group.len() == 1));
     }
     #[test]
     fn inventory_rejects_partial_clip_groups_and_invalid_authority_shapes() {
