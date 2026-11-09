@@ -1213,6 +1213,19 @@ mod tests {
             "2e8b52cf4107668d2df47eb0564398028cb75502d766a3403b4201a41c7b03a1"
         );
         let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
+        // Epoch 8: the other selectable models, for the factory runtime only.
+        assert_eq!(profiles[21..].len(), 10);
+        for profile in &profiles[21..] {
+            assert_eq!(
+                profile["runtimeSourceRevision"],
+                "25b22c16e47a27a2eb50017d838497abce850d11"
+            );
+            assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
+            assert_eq!(
+                profile["spec"]["preprocessingSha256"],
+                profiles[0]["spec"]["preprocessingSha256"]
+            );
+        }
         for profile in &profiles[16..21] {
             assert_eq!(profile["runtimeSourceRevision"], source);
             assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
