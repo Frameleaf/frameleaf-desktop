@@ -1085,7 +1085,7 @@ mod tests {
         let (groups, statuses) =
             inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
         assert_eq!(statuses[0].state, "unsupported");
-        assert!(groups.iter().all(|group| group.len() == 1));
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
     }
     #[test]
     fn inventory_rejects_partial_clip_groups_and_invalid_authority_shapes() {
