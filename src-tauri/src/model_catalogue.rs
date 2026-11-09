@@ -1136,7 +1136,7 @@ mod tests {
     fn pr274_profiles_preserve_every_legacy_profile_and_use_distinct_new_identities() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 31);
+        assert_eq!(profiles.len(), 46);
         let legacy = Value::Array(profiles[..11].to_vec());
         assert_eq!(
             digest(&serde_json_canonicalizer::to_vec(&legacy).unwrap()),
@@ -1192,6 +1192,21 @@ mod tests {
             "6a1a473fc90069f0b222e697272cb1a78f8fadd4a1c52af7e42ed3d6eb8bb37e",
             "194ab4b05a9b81e28466bc4341bd26d3c80349f3508f701ae63c9569a11a4d58",
             "efa3e6033ea6b6c6aa769444ef5e3ba2432f1ed236ed37d919083edf255c5452",
+            "6f146c1d05e93818586ed9fcf70e3ae6de1ff195dbfcf15e96cec4f8a93975c4",
+            "a6d03f7df8104794200ac2c6f7734c77634dd0dd4a119fc24a85015730be0fa7",
+            "2d8945f2b72d68508c39e87b2cbc123cf51723d8b302d67a678d4bd00720b582",
+            "0832de93d79c15053749f2f17dddaae95e2a18b00fa0e86d104b6e0d2d14e438",
+            "1f104316fb10128ad1444d40b1de21b968b52459a9096b7f4163b2613f2ec25e",
+            "9e8cc701380276c1af1036c3493460904e91b6dc3c49193100f2733b244fed1f",
+            "994248b4729d33ae1dfc09365b7fd56f4949f80f15e1a6d4608b256b5308e54c",
+            "003981e4139fad9a251f21c59a89824c06a109640a358a8367683bd6b865cd4c",
+            "439a10ed09c75b25a0a4e39df0928e4636f6cc71eb73fecffa3eda028cbf4738",
+            "c7d74c2feef0e1abd8ab48c519338f7d2bbebd7b5785544d21729dadb7231742",
+            "8ae4a97bd0e176b44e519bf6c850310979364b986bd0f113913d3fe4df43fcf7",
+            "9c3beed723095dbca064cc7b8af523d703fe249740367b9cb6d1ebc034ae2ab6",
+            "c6af78be57ce709d21297e95b4be5030212ecd52d140899983dbd9f56fef9873",
+            "9b285e797d131b12e0a583a467d11ab107610d4b81c196e6b438f274296d3657",
+            "933b0789ec4350b99e64b3cb3b6d6bccaa850c54868131116a331a751ee60836",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
         assert_eq!(profiles.len(), expected.len());
@@ -1214,8 +1229,8 @@ mod tests {
         );
         let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
         // Epoch 8: the other selectable models, for the factory runtime only.
-        assert_eq!(profiles[21..].len(), 10);
-        for profile in &profiles[21..] {
+        assert_eq!(profiles[21..31].len(), 10);
+        for profile in &profiles[21..31] {
             assert_eq!(
                 profile["runtimeSourceRevision"],
                 "25b22c16e47a27a2eb50017d838497abce850d11"
@@ -1247,5 +1262,39 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+    #[test]
+    fn epoch_9_selects_every_released_group_for_the_current_factory_source() {
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let profiles = catalogue["profiles"].as_array().unwrap();
+        assert_eq!(catalogue["epoch"], 9);
+        let source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
+        for profile in &profiles[31..] {
+            assert_eq!(profile["runtimeSourceRevision"], source);
+            assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
+            assert_eq!(
+                profile["spec"]["preprocessingSha256"],
+                "8d9fc77dbb8d8c1ee262ed800a564b7cc82b0160e3c29166f724b84529ec353a"
+            );
+        }
+        for (name, roles) in [
+            ("ViT-B-16-SigLIP-384__webli", 3),
+            ("ViT-B-32__openai", 3),
+            ("ViT-SO400M-16-SigLIP2-384__webli", 3),
+            ("PP-OCRv5_mobile", 1),
+            ("PP-OCRv5_server", 1),
+            ("buffalo_l", 1),
+            ("antelopev2", 1),
+            ("buffalo_s", 1),
+            ("buffalo_m", 1),
+        ] {
+            assert_eq!(
+                setup_profiles(name, source, "CPUExecutionProvider")
+                    .unwrap()
+                    .len(),
+                roles,
+                "{name}"
+            );
+        }
     }
 }
