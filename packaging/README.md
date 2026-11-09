@@ -19,7 +19,7 @@ Needs a [community.chocolatey.org](https://community.chocolatey.org/) account an
 choco apikey --key <api key> --source https://push.chocolatey.org/
 cd packaging\chocolatey
 choco pack
-choco push frameleaf.0.1.3.nupkg --source https://push.chocolatey.org/
+choco push frameleaf.0.1.4.nupkg --source https://push.chocolatey.org/
 ```
 
 Moderation then runs automated validation and an install test before a human review.
@@ -34,7 +34,7 @@ git clone ssh://aur@aur.archlinux.org/frameleaf-desktop-bin.git
 cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO frameleaf-desktop-bin/
 cd frameleaf-desktop-bin
 git add PKGBUILD .SRCINFO
-git commit -m "Frameleaf Desktop 0.1.3"
+git commit -m "Frameleaf Desktop 0.1.4"
 git push
 ```
 
