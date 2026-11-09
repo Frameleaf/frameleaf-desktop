@@ -365,9 +365,10 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     ),
   ).profiles;
   const source = "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4";
+  // FL-1329: the factory CPU source is the runtime the server admits for faces and text.
   assert.equal(
     profiles["cpu-ort"].sourceRevision,
-    "25b22c16e47a27a2eb50017d838497abce850d11",
+    "f2c451a6bf71ca3f3aec986e07f0852937268e2f",
   );
   assert.deepEqual(profiles["cpu-ort"].additionalSources, {
     "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
