@@ -12,8 +12,8 @@ import zipfile
 from build_runtime import BuildError
 from obtain_host_component import api, download, validate_approval, validate_producer
 
-EXE = "Frameleaf_0.1.4_x64-setup.exe"
-MSI = "Frameleaf_0.1.4_x64_en-US.msi"
+EXE = "Frameleaf_0.1.5_x64-setup.exe"
+MSI = "Frameleaf_0.1.5_x64_en-US.msi"
 
 
 def extract_desktop(archive: Path, output: Path, source: str, digest: str) -> dict:
@@ -38,7 +38,7 @@ def extract_desktop(archive: Path, output: Path, source: str, digest: str) -> di
             raise BuildError("desktop_candidate_receipt_invalid")
         hashes = receipt.get("files")
         if (receipt.get("sourceRevision") != source or receipt.get("target") != "windows-x86_64"
-                or receipt.get("runtimeRunId") != "41406368520" or receipt.get("installedQualified") is not True
+                or receipt.get("runtimeRunId") != "42717141687" or receipt.get("installedQualified") is not True
                 or receipt.get("osSigned") is not False or not isinstance(hashes, dict) or set(hashes) != {EXE, MSI}
                 or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes.values())
                 or hashes[EXE] != digest):

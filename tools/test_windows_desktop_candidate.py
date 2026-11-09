@@ -18,10 +18,10 @@ from windows_desktop_candidate import extract_desktop
 
 class WindowsDesktopCandidateTests(unittest.TestCase):
     def package(self, root, *, source="a" * 40, qualified=True, tamper=False, extra=None):
-        exe = "Frameleaf_0.1.4_x64-setup.exe"
-        msi = "Frameleaf_0.1.4_x64_en-US.msi"
+        exe = "Frameleaf_0.1.5_x64-setup.exe"
+        msi = "Frameleaf_0.1.5_x64_en-US.msi"
         hashes = {exe: hashlib.sha256(b"MZ-synthetic-exe").hexdigest(), msi: hashlib.sha256(b"synthetic-msi").hexdigest()}
-        receipt = {"sourceRevision": source, "runtimeRunId": "41406368520", "target": "windows-x86_64",
+        receipt = {"sourceRevision": source, "runtimeRunId": "42717141687", "target": "windows-x86_64",
                    "installedQualified": qualified, "osSigned": False, "files": hashes}
         files = {exe: b"modified" if tamper else b"MZ-synthetic-exe", msi: b"synthetic-msi",
                  "candidate.json": json.dumps(receipt).encode(),
