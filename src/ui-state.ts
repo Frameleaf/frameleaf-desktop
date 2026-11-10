@@ -237,7 +237,7 @@ export function workloadPill(state: string): { label: string; tone: 'ok' | 'wait
 }
 export function workerTone(state: string): 'ok' | 'wait' | 'off' {
   if (['working', 'waiting-for-work', 'qualified'].includes(state)) return 'ok';
-  if (['stopped', 'paused', 'revoked', 'incompatible', 'setup-needs-attention', 'worker-setup-failed', 'credential-store-unavailable', 'identity-changed', 'offline', 'enrollment-failed'].includes(state)) return 'off';
+  if (['stopped', 'paused', 'revoked', 'incompatible', 'setup-needs-attention', 'no-eligible-work', 'worker-setup-failed', 'credential-store-unavailable', 'identity-changed', 'offline', 'enrollment-failed'].includes(state)) return 'off';
   return 'wait';
 }
 

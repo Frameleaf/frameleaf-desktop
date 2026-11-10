@@ -434,6 +434,9 @@ impl InstalledRuntime {
     pub fn manifest_sha256(&self) -> &str {
         self.runtime.manifest_sha256()
     }
+    pub fn epoch(&self) -> u64 {
+        self.runtime.epoch()
+    }
     pub fn provider(&self) -> &str {
         self.runtime.provider()
     }

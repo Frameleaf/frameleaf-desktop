@@ -146,10 +146,11 @@ impl WorkerSetup {
             match work(progress.clone()).await {
                 Ok(()) => progress.set("qualified", None),
                 Err(code) => {
-                    let state = if code == "model_download_permission_required" {
-                        "model-download-required"
-                    } else {
-                        "setup-needs-attention"
+                    let state = match code.as_str() {
+                        "model_download_permission_required" => "model-download-required",
+                        // Server configuration, not a fault here: retrying cannot change it.
+                        "worker_no_eligible_workloads" => "no-eligible-work",
+                        _ => "setup-needs-attention",
                     };
                     let safe = if code.len() <= 128
                         && code
@@ -182,22 +183,45 @@ impl WorkerSetup {
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
     ) {
         self.start_work(notify, move |progress| async move {
-            reconnect(&progress, |refresh| {
-                let saved = saved.clone();
-                let paths = paths.clone();
-                let progress = progress.clone();
-                async move {
-                    if refresh {
-                        refresh_session(&saved).await?;
-                        check_cancel(&progress.cancelled)?;
+            loop {
+                let result = reconnect(&progress, |refresh| {
+                    let saved = saved.clone();
+                    let paths = paths.clone();
+                    let progress = progress.clone();
+                    async move {
+                        if refresh {
+                            refresh_session(&saved).await?;
+                            check_cancel(&progress.cancelled)?;
+                        }
+                        prepare(saved, paths, allow_download, progress).await
                     }
-                    prepare(saved, paths, allow_download, progress).await
+                })
+                .await;
+                if !matches!(&result, Err(code) if code == "worker_no_eligible_workloads") {
+                    return result;
                 }
-            })
-            .await
+                // An administrator can assign work at any time: ask the server again later.
+                progress.set(
+                    "no-eligible-work",
+                    Some("worker_no_eligible_workloads".into()),
+                );
+                recheck_after(&progress, NO_WORK_RECHECK).await?;
+            }
         })
         .await;
     }
+}
+
+const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
+
+/// Wait out the period, and any user pause beyond it; Stop or a new start cancels the wait.
+async fn recheck_after(progress: &Progress, period: Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < period || progress.user_paused.load(Ordering::Acquire) {
+        check_cancel(&progress.cancelled)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(())
 }
 
 pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
@@ -579,6 +603,20 @@ pub(crate) fn inventory_profiles(
     Ok((groups, statuses))
 }
 
+/// Whether the app's bundled runtime should replace the active one. The bundle is only read here,
+/// not trusted: activation verifies its signature and refuses a reused or rolled-back epoch, so a
+/// rebuilt runtime that kept its epoch fails visibly instead of leaving the old runtime running.
+fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    if format!("{:x}", Sha256::digest(manifest)) == active_sha256 {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|value| value.get("epoch")?.as_u64())
+        .is_none_or(|epoch| epoch >= active_epoch)
+}
+
 async fn prepare(
     saved: SavedConnection,
     paths: SetupPaths,
@@ -615,19 +653,31 @@ async fn prepare(
             return Err("runtime_pack_unavailable".into());
         }
         let store = open_runtime_store(&data.join("runtimes"))?;
-        let installed = match store.load_active()? {
-            Some(value) => value,
-            None => {
-                if !paths.bundle.exists() {
-                    return Err("runtime_pack_unavailable".into());
-                }
-                let manifest = read_bounded(&paths.bundle.join("manifest.json"), 8 * 1024 * 1024)?;
+        let active = store.load_active()?;
+        let bundled = if paths.bundle.exists() {
+            Some(read_bounded(&paths.bundle.join("manifest.json"), 8 * 1024 * 1024)?)
+        } else {
+            None
+        };
+        // An app update ships a new runtime: activate it, or the old runtime keeps running forever.
+        // An older bundle (the app was downgraded) leaves the newer active runtime in place.
+        let install = match (&active, &bundled) {
+            (None, Some(_)) => true,
+            (Some(active), Some(manifest)) => bundle_supersedes(active.manifest_sha256(), active.epoch(), manifest),
+            _ => false,
+        };
+        let installed = match (active, bundled) {
+            (Some(value), _) if !install => value,
+            (active, Some(manifest)) => {
+                // Release the shared lease first: activation takes the store's exclusive lock.
+                drop(active);
                 let signature: [u8; 64] = read_bounded(&paths.bundle.join("manifest.sig"), 64)?
                     .try_into()
                     .map_err(|_| "runtime_signature_invalid")?;
                 store.install_and_activate(&paths.bundle.join("payload"), &manifest, &signature)?;
                 store.load_active()?.ok_or("runtime_activation_failed")?
             }
+            (_, None) => return Err("runtime_pack_unavailable".into()),
         };
         check_cancel(&cancelled)?;
         let attestation = store.attestation(&installed)?;
@@ -824,7 +874,9 @@ async fn prepare(
             progress.workload(workload, "ready", None);
         }
         if prepared.is_empty() {
-            return Err("worker_no_eligible_workloads".into());
+            // The server offered work but none qualified here (timeout, refusal): a local fault
+            // that Retry Setup can clear, not the server-configuration state.
+            return Err("worker_no_qualified_workloads".into());
         }
         let mut memory_by_cache = std::collections::BTreeMap::new();
         for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
@@ -1694,6 +1746,81 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, "setup-needs-attention");
         assert_eq!(status.code.as_deref(), Some("runtime_pack_unavailable"));
+        setup.stop().await;
+    }
+    #[tokio::test]
+    async fn the_no_work_recheck_waits_out_pauses_and_stops_on_cancel() {
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(true)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(SetupStatus::default())),
+            notify: Arc::new(|_| {}),
+        };
+        // Paused: the recheck holds past its period until resumed.
+        let held = tokio::time::timeout(
+            Duration::from_millis(600),
+            recheck_after(&progress, Duration::ZERO),
+        )
+        .await;
+        assert!(held.is_err());
+        progress.user_paused.store(false, Ordering::Release);
+        assert!(recheck_after(&progress, Duration::ZERO).await.is_ok());
+        progress.cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            recheck_after(&progress, Duration::from_secs(60)).await,
+            Err("worker_setup_cancelled".into())
+        );
+    }
+    #[test]
+    fn an_updated_app_replaces_the_active_runtime_but_a_downgrade_does_not() {
+        use sha2::{Digest, Sha256};
+        let active = br#"{"epoch":6,"sourceRevision":"old"}"#;
+        let active_sha = format!("{:x}", Sha256::digest(active));
+        assert!(!bundle_supersedes(&active_sha, 6, active));
+        assert!(bundle_supersedes(&active_sha, 6, br#"{"epoch":7}"#));
+        // Same epoch, new bytes: activation must run so the store reports runtime_epoch_reused.
+        assert!(bundle_supersedes(
+            &active_sha,
+            6,
+            br#"{"epoch":6,"sourceRevision":"new"}"#
+        ));
+        assert!(!bundle_supersedes(&active_sha, 6, br#"{"epoch":5}"#));
+        assert!(bundle_supersedes(&active_sha, 6, b"not json"));
+    }
+    #[tokio::test]
+    async fn no_eligible_workloads_is_reported_as_server_configuration() {
+        let setup = WorkerSetup::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                |_| async { Err("worker_no_eligible_workloads".into()) },
+            )
+            .await;
+        let status = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "no-eligible-work");
+        setup.stop().await;
+
+        // Offered work that failed to qualify here stays a retryable setup fault.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                |_| async { Err("worker_no_qualified_workloads".into()) },
+            )
+            .await;
+        let status = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "setup-needs-attention");
         setup.stop().await;
     }
 }

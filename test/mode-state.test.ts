@@ -69,6 +69,7 @@ test('automatic runtime and model qualification never claim active processing', 
     ['qualified', 'Models qualified'],
     ['paused', 'AI processing paused'],
     ['setup-needs-attention', 'Computer setup needs attention'],
+    ['no-eligible-work', 'No AI work is assigned to this computer'],
   ]) assert.equal(workerStatus({ state: state!, workerSupported: false }), expected);
 });
 

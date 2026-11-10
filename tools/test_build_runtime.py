@@ -31,6 +31,10 @@ class RuntimeBuilderTests(unittest.TestCase):
         self.assertEqual(
             builder.source_build_requirements(antlr + setuptools), setuptools
         )
+        # Pruning can drop setuptools from the install set; the pin then comes from the full lock.
+        self.assertEqual(
+            builder.source_build_requirements(antlr, antlr + setuptools), setuptools
+        )
         for invalid in [antlr, antlr.replace("4.9.3", "4.9.4") + setuptools]:
             with self.assertRaises(builder.BuildError):
                 builder.source_build_requirements(invalid)

@@ -16,6 +16,7 @@ export function workerStatus({ state, workerSupported }: { state: string; worker
   if (state === 'stopped') return 'AI processing stopped';
   if (state === 'paused') return 'AI processing paused';
   if (state === 'setup-needs-attention') return 'Computer setup needs attention';
+  if (state === 'no-eligible-work') return 'No AI work is assigned to this computer';
   if (state === 'worker-setup-failed' || state === 'credential-store-unavailable') return 'Computer setup needs attention';
   if (state === 'awaiting-approval') return 'Waiting for administrator approval';
   if (state === 'revoked') return 'This computer’s access was revoked';
