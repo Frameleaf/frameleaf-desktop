@@ -183,22 +183,45 @@ impl WorkerSetup {
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
     ) {
         self.start_work(notify, move |progress| async move {
-            reconnect(&progress, |refresh| {
-                let saved = saved.clone();
-                let paths = paths.clone();
-                let progress = progress.clone();
-                async move {
-                    if refresh {
-                        refresh_session(&saved).await?;
-                        check_cancel(&progress.cancelled)?;
+            loop {
+                let result = reconnect(&progress, |refresh| {
+                    let saved = saved.clone();
+                    let paths = paths.clone();
+                    let progress = progress.clone();
+                    async move {
+                        if refresh {
+                            refresh_session(&saved).await?;
+                            check_cancel(&progress.cancelled)?;
+                        }
+                        prepare(saved, paths, allow_download, progress).await
                     }
-                    prepare(saved, paths, allow_download, progress).await
+                })
+                .await;
+                if !matches!(&result, Err(code) if code == "worker_no_eligible_workloads") {
+                    return result;
                 }
-            })
-            .await
+                // An administrator can assign work at any time: ask the server again later.
+                progress.set(
+                    "no-eligible-work",
+                    Some("worker_no_eligible_workloads".into()),
+                );
+                recheck_after(&progress, NO_WORK_RECHECK).await?;
+            }
         })
         .await;
     }
+}
+
+const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
+
+/// Wait out the period, and any user pause beyond it; Stop or a new start cancels the wait.
+async fn recheck_after(progress: &Progress, period: Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < period || progress.user_paused.load(Ordering::Acquire) {
+        check_cancel(&progress.cancelled)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(())
 }
 
 pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
@@ -1724,6 +1747,29 @@ mod tests {
         assert_eq!(status.state, "setup-needs-attention");
         assert_eq!(status.code.as_deref(), Some("runtime_pack_unavailable"));
         setup.stop().await;
+    }
+    #[tokio::test]
+    async fn the_no_work_recheck_waits_out_pauses_and_stops_on_cancel() {
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(true)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(SetupStatus::default())),
+            notify: Arc::new(|_| {}),
+        };
+        // Paused: the recheck holds past its period until resumed.
+        let held = tokio::time::timeout(
+            Duration::from_millis(600),
+            recheck_after(&progress, Duration::ZERO),
+        )
+        .await;
+        assert!(held.is_err());
+        progress.user_paused.store(false, Ordering::Release);
+        assert!(recheck_after(&progress, Duration::ZERO).await.is_ok());
+        progress.cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            recheck_after(&progress, Duration::from_secs(60)).await,
+            Err("worker_setup_cancelled".into())
+        );
     }
     #[test]
     fn an_updated_app_replaces_the_active_runtime_but_a_downgrade_does_not() {
