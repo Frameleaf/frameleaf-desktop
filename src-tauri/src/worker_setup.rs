@@ -851,7 +851,9 @@ async fn prepare(
             progress.workload(workload, "ready", None);
         }
         if prepared.is_empty() {
-            return Err("worker_no_eligible_workloads".into());
+            // The server offered work but none qualified here (timeout, refusal): a local fault
+            // that Retry Setup can clear, not the server-configuration state.
+            return Err("worker_no_qualified_workloads".into());
         }
         let mut memory_by_cache = std::collections::BTreeMap::new();
         for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
@@ -1756,6 +1758,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(status.state, "no-eligible-work");
+        setup.stop().await;
+
+        // Offered work that failed to qualify here stays a retryable setup fault.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                |_| async { Err("worker_no_qualified_workloads".into()) },
+            )
+            .await;
+        let status = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "setup-needs-attention");
         setup.stop().await;
     }
 }
