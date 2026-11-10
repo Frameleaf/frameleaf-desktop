@@ -1,3 +1,4 @@
+mod camera_sources;
 pub mod cloud_account;
 pub mod connection;
 pub mod copy_source;
@@ -559,6 +560,7 @@ pub fn run() {
             worker_setup_status,
             prepare_models,
             control_worker,
+            discover_camera_folders,
             discover_onedrive,
             choose_photo_folder,
             approve_photo_folder,
@@ -813,28 +815,65 @@ async fn discover_onedrive(
         .map_err(|_| "source_discovery_failed")?
 }
 #[tauri::command]
+async fn discover_camera_folders(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<Vec<photo_sources::RootHint>, String> {
+    require_local(&window)?;
+    tauri::async_runtime::spawn_blocking(move || camera_hints(&app))
+        .await
+        .map_err(|_| "source_discovery_failed")?
+}
+
+fn camera_hints(app: &tauri::AppHandle) -> Result<Vec<photo_sources::RootHint>, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|_| "source_home_unavailable")?;
+    Ok(camera_sources::discover(&home))
+}
+
+#[tauri::command]
 async fn choose_photo_folder(
     window: WebviewWindow,
     app: tauri::AppHandle,
     one_drive: Option<usize>,
+    camera: Option<String>,
 ) -> Result<Option<source_consent::SelectedFolder>, String> {
     use tauri_plugin_dialog::DialogExt;
     require_local(&window)?;
+    if one_drive.is_some() && camera.is_some() {
+        return Err("source_folder_invalid".into());
+    }
     let generation = app.state::<source_consent::SourceConsent>().generation()?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut picker = app.dialog().file().set_title("Choose a photo folder");
+        let from_camera = camera.is_some();
         if let Some(index) = one_drive {
             let hints = source_hints(&app)?;
             let hint = hints.get(index).ok_or("source_account_unavailable")?;
             picker = picker.set_directory(&hint.path);
         }
+        if let Some(path) = camera {
+            let hint = camera_hints(&app)?
+                .into_iter()
+                .find(|hint| hint.path == path)
+                .ok_or("source_camera_unavailable")?;
+            picker = picker
+                .set_title("Choose photos from camera storage")
+                .set_directory(hint.path);
+        }
         let Some(folder) = picker.blocking_pick_folder() else {
             return Ok(None);
         };
         let path = folder.into_path().map_err(|_| "source_folder_invalid")?;
-        app.state::<source_consent::SourceConsent>()
-            .select(generation, path)
-            .map(Some)
+        let consent = app.state::<source_consent::SourceConsent>();
+        if from_camera {
+            consent.select_camera(generation, path)
+        } else {
+            consent.select(generation, path)
+        }
+        .map(Some)
     })
     .await
     .map_err(|_| "source_inventory_failed")?

@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from './Icon.svelte';
+  import CameraSources from './CameraSources.svelte';
   import Sheet from './Sheet.svelte';
   import { formatBytes, percent } from './ui-state';
   type Hint = { label: string; path: string };
@@ -10,7 +11,7 @@
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean };
+  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean };
   type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
@@ -76,6 +77,8 @@
     source_package_requires_provider: 'Apple Photos libraries need the Photos connection. Choose an ordinary folder here.',
     source_folder_unavailable: 'This folder is unavailable. Check that its drive is connected and you have access.',
     source_account_unavailable: 'This OneDrive folder moved or is unavailable. Choose its new location.',
+    source_camera_unavailable: 'This camera or card is no longer available. Reconnect it and choose it again.',
+    source_camera_changed: 'This camera or card changed after the preview. Clear the preview and choose the folder again.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
   async function loadConsent() {
@@ -147,11 +150,11 @@
     } catch { message = 'Could not check OneDrive locations. Choose a synced folder yourself.'; }
     finally { busy = false; }
   }
-  async function choose(oneDrive: number | null = null) {
+  async function choose(oneDrive: number | null = null, camera: string | null = null) {
     busy = true; message = '';
     try {
-      const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive });
-      if (selected) { folder = selected; allowReads = false; watchFolder = false; watchAvailable = oneDrive === null; }
+      const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive, camera });
+      if (selected) { folder = selected; allowReads = false; watchFolder = false; watchAvailable = oneDrive === null && camera === null; }
     } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
     finally { busy = false; }
   }
@@ -173,6 +176,9 @@
   <div class="body">
     {#if busy}<div class="inline-msg" role="status"><span class="spin" aria-hidden="true"></span><p>Waiting for the folder or server operation to finish…</p></div>{/if}
     {#if message}<div class="inline-msg" role="status"><p>{message}</p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
+    {#if native && !consent && !blockedConsent && !folder}
+      <CameraSources {busy} onchoose={(path) => choose(null, path)} />
+    {/if}
     {#if hints.length}
       <div>
         <div class="group-head"><h2 class="group-title">Known OneDrive folders</h2></div>
@@ -213,11 +219,14 @@
             <div class="row"><span class="l"><small>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</small></span></div>
           {/if}
           {#if job?.code}<div class="row"><span class="l"><small role="status" class="danger-text">{explain(job.code)}</small></span></div>{/if}
+          {#if consent.camera && job?.state === 'complete' && job.completed === job.total && !job.code}
+            <div class="row"><span class="l"><small>All files in this copy were verified on your server. Eject the card or camera in your computer’s file manager before disconnecting it.</small></span></div>
+          {/if}
           {#if job?.state === 'cancelled'}<div class="row"><span class="l"><small>Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</small></span></div>{/if}
         {:else if blockedConsent}
           <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><span class="l"><b>A previous folder permission needs removing</b><small>It belongs to an earlier sign-in or no longer matches this connection.</small></span><button class="btn" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove Previous Permission…</button></div>
         {:else if !folder}
-          <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="folder" /></span><span class="l"><b>No folder approved</b><small>Choose where to bring photos from. Local folders are separate from this computer’s AI processing permission.</small></span></div>
+          <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="folder" /></span><span class="l"><b>No folder approved</b><small>Choose a folder or connect a memory card or a camera that appears as a drive.</small></span></div>
         {/if}
         {#if folder && !consent && !blockedConsent}
           <div class="row top" aria-label="Selected folder preview">

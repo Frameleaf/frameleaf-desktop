@@ -10,6 +10,8 @@ pub struct FolderInventory {
     pub skipped: u64,
     pub truncated: bool,
     pub availability: crate::source_metadata::AvailabilitySummary,
+    #[serde(skip)]
+    pub(crate) root_identity: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -31,17 +33,23 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
     scan(root, limit).map(|scan| scan.inventory)
 }
 pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
-    scan_inner(root, limit, None)
+    scan_inner(root, limit, None, false)
+}
+
+/// Bind a removable-media preview to the directory that was actually scanned.
+pub(crate) fn camera_inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
+    scan_inner(root, limit, None, true).map(|scan| scan.inventory)
 }
 
 pub(crate) fn scan_approved(root: &Path, root_identity: &str) -> Result<FolderScan, String> {
-    scan_inner(root, 10_000, Some(root_identity))
+    scan_inner(root, 10_000, Some(root_identity), false)
 }
 
 fn scan_inner(
     root: &Path,
     limit: usize,
     approved_root: Option<&str>,
+    bind_identity: bool,
 ) -> Result<FolderScan, String> {
     #[cfg(target_os = "macos")]
     let _policy = metadata_only::Guard::new()?;
@@ -89,6 +97,9 @@ fn scan_inner(
         skipped: 0,
         truncated: false,
         availability: Default::default(),
+        root_identity: bind_identity
+            .then(|| crate::copy_source::root_identity(&dir))
+            .transpose()?,
     };
     let mut files = Vec::new();
     let mut unreadable = 0;

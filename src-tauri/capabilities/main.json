@@ -17,6 +17,7 @@
     "allow-worker-setup-status",
     "allow-prepare-models",
     "allow-control-worker",
+    "allow-discover-camera-folders",
     "allow-discover-onedrive",
     "allow-choose-photo-folder",
     "allow-approve-photo-folder",
