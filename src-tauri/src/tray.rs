@@ -52,6 +52,7 @@ pub(crate) fn labels(status: &SetupStatus, connected: bool) -> Labels {
             "pausing" => "pausing",
             "paused" => "paused",
             "stopped" => "stopped",
+            "no-eligible-work" => "no work assigned",
             "" => "not set up",
             _ if status.code.is_some() => "needs attention",
             other => other,

@@ -45,7 +45,9 @@
     : setup?.state === 'preparing-runtime'
     ? 'Checking the signed runtime included with this app.'
     : setup?.state === 'setup-needs-attention'
-    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.' : ''));
+    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.'
+    : setup?.state === 'no-eligible-work'
+    ? 'Your server keeps every AI task on its own destination, has it turned off, or uses a model this computer doesn’t support yet. A server administrator can send a task to computers in the server’s machine learning settings.' : ''));
   const connectionDetail = $derived(connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : `Processing starts only after the selected models pass qualification on this ${computer}. Pausing finishes the current task first.`);
   const connectionPill = $derived(connection.state === 'offline' ? { label: 'Server unavailable', tone: 'off' } : connection.state === 'identity-changed' ? { label: 'Identity changed', tone: 'bad' } : connection.state === 'awaiting-approval' ? { label: 'Awaiting approval', tone: 'wait' } : { label: 'Connected', tone: 'ok' });
   const control = $derived(setup?.control ?? 'running');

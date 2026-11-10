@@ -20,6 +20,12 @@ class BuildError(RuntimeError):
     pass
 
 
+# Server-only features (image description via torch/transformers, Studio captions via Whisper)
+# and the GUI OpenCV that rapidocr drags in beside headless; the desktop runs CLIP/OCR/face on
+# onnxruntime only. Every import of these in the ML package is optional. ~450 MB per platform.
+DESKTOP_UNUSED = ("torch", "torchvision", "transformers", "faster-whisper", "opencv-python")
+
+
 def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -277,14 +283,14 @@ def requirement_block(text: str, name: str) -> str:
     return block
 
 
-def source_build_requirements(text: str) -> str:
+def source_build_requirements(text: str, locked: str | None = None) -> str:
     if not re.search(r"^antlr4-python3-runtime==", text, re.MULTILINE):
         return ""
     if not requirement_block(text, "antlr4-python3-runtime").startswith(
         "antlr4-python3-runtime==4.9.3 "
     ):
         raise BuildError("runtime_source_build_not_approved")
-    return requirement_block(text, "setuptools")
+    return requirement_block(text if locked is None else locked, "setuptools")
 
 
 def dependency_indexes(system: str, architecture: str) -> list[str]:
@@ -391,17 +397,24 @@ def build(
             (ml / name).write_bytes(
                 git_blob(git, source, revision, f"machine-learning/{name}", env)
             )
+        export = [
+            uv,
+            "--no-config",
+            "export",
+            "--frozen",
+            "--extra",
+            profile["extra"],
+            "--no-dev",
+            "--no-emit-project",
+            "--no-header",
+        ]
+        # The full lock still pins the setuptools that builds ANTLR, even once torch is pruned.
+        locked = work / "locked-requirements.txt"
+        run([*export, "--output-file", locked], cwd=ml, env=env)
         run(
             [
-                uv,
-                "--no-config",
-                "export",
-                "--frozen",
-                "--extra",
-                profile["extra"],
-                "--no-dev",
-                "--no-emit-project",
-                "--no-header",
+                *export,
+                *(arg for name in DESKTOP_UNUSED for arg in ("--prune", name)),
                 "--output-file",
                 requirements,
             ],
@@ -436,7 +449,9 @@ def build(
             else f"bin/python{'.'.join(profile['python'].split('.')[:2])}"
         )
         build_tools = payload / "build-requirements.txt"
-        build_tools.write_text(source_build_requirements(requirements.read_text()))
+        build_tools.write_text(
+            source_build_requirements(requirements.read_text(), locked.read_text())
+        )
         # Only the legacy lock-hashed ANTLR dependency may execute a source backend.
         if build_tools.stat().st_size:
             run(

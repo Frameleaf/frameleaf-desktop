@@ -146,10 +146,11 @@ impl WorkerSetup {
             match work(progress.clone()).await {
                 Ok(()) => progress.set("qualified", None),
                 Err(code) => {
-                    let state = if code == "model_download_permission_required" {
-                        "model-download-required"
-                    } else {
-                        "setup-needs-attention"
+                    let state = match code.as_str() {
+                        "model_download_permission_required" => "model-download-required",
+                        // Server configuration, not a fault here: retrying cannot change it.
+                        "worker_no_eligible_workloads" => "no-eligible-work",
+                        _ => "setup-needs-attention",
                     };
                     let safe = if code.len() <= 128
                         && code
@@ -579,6 +580,20 @@ pub(crate) fn inventory_profiles(
     Ok((groups, statuses))
 }
 
+/// Whether the app's bundled runtime should replace the active one. The bundle is only read here,
+/// not trusted: activation verifies its signature and refuses a reused or rolled-back epoch, so a
+/// rebuilt runtime that kept its epoch fails visibly instead of leaving the old runtime running.
+fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    if format!("{:x}", Sha256::digest(manifest)) == active_sha256 {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|value| value.get("epoch")?.as_u64())
+        .is_none_or(|epoch| epoch >= active_epoch)
+}
+
 async fn prepare(
     saved: SavedConnection,
     paths: SetupPaths,
@@ -615,19 +630,31 @@ async fn prepare(
             return Err("runtime_pack_unavailable".into());
         }
         let store = open_runtime_store(&data.join("runtimes"))?;
-        let installed = match store.load_active()? {
-            Some(value) => value,
-            None => {
-                if !paths.bundle.exists() {
-                    return Err("runtime_pack_unavailable".into());
-                }
-                let manifest = read_bounded(&paths.bundle.join("manifest.json"), 8 * 1024 * 1024)?;
+        let active = store.load_active()?;
+        let bundled = if paths.bundle.exists() {
+            Some(read_bounded(&paths.bundle.join("manifest.json"), 8 * 1024 * 1024)?)
+        } else {
+            None
+        };
+        // An app update ships a new runtime: activate it, or the old runtime keeps running forever.
+        // An older bundle (the app was downgraded) leaves the newer active runtime in place.
+        let install = match (&active, &bundled) {
+            (None, Some(_)) => true,
+            (Some(active), Some(manifest)) => bundle_supersedes(active.manifest_sha256(), active.epoch(), manifest),
+            _ => false,
+        };
+        let installed = match (active, bundled) {
+            (Some(value), _) if !install => value,
+            (active, Some(manifest)) => {
+                // Release the shared lease first: activation takes the store's exclusive lock.
+                drop(active);
                 let signature: [u8; 64] = read_bounded(&paths.bundle.join("manifest.sig"), 64)?
                     .try_into()
                     .map_err(|_| "runtime_signature_invalid")?;
                 store.install_and_activate(&paths.bundle.join("payload"), &manifest, &signature)?;
                 store.load_active()?.ok_or("runtime_activation_failed")?
             }
+            (_, None) => return Err("runtime_pack_unavailable".into()),
         };
         check_cancel(&cancelled)?;
         let attestation = store.attestation(&installed)?;
@@ -1694,6 +1721,41 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, "setup-needs-attention");
         assert_eq!(status.code.as_deref(), Some("runtime_pack_unavailable"));
+        setup.stop().await;
+    }
+    #[test]
+    fn an_updated_app_replaces_the_active_runtime_but_a_downgrade_does_not() {
+        use sha2::{Digest, Sha256};
+        let active = br#"{"epoch":6,"sourceRevision":"old"}"#;
+        let active_sha = format!("{:x}", Sha256::digest(active));
+        assert!(!bundle_supersedes(&active_sha, 6, active));
+        assert!(bundle_supersedes(&active_sha, 6, br#"{"epoch":7}"#));
+        // Same epoch, new bytes: activation must run so the store reports runtime_epoch_reused.
+        assert!(bundle_supersedes(
+            &active_sha,
+            6,
+            br#"{"epoch":6,"sourceRevision":"new"}"#
+        ));
+        assert!(!bundle_supersedes(&active_sha, 6, br#"{"epoch":5}"#));
+        assert!(bundle_supersedes(&active_sha, 6, b"not json"));
+    }
+    #[tokio::test]
+    async fn no_eligible_workloads_is_reported_as_server_configuration() {
+        let setup = WorkerSetup::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                |_| async { Err("worker_no_eligible_workloads".into()) },
+            )
+            .await;
+        let status = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "no-eligible-work");
         setup.stop().await;
     }
 }
