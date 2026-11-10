@@ -24,6 +24,7 @@ pub(crate) struct View {
     pub background_active: bool,
     profile_setup_available: bool,
     profile_requires_authorization: bool,
+    companion_platform: Option<&'static str>,
 }
 impl Default for View {
     fn default() -> Self {
@@ -35,6 +36,12 @@ impl Default for View {
             background_active: false,
             profile_setup_available: cfg!(any(target_os = "linux", windows)),
             profile_requires_authorization: cfg!(target_os = "linux"),
+            companion_platform: match (std::env::consts::OS, std::env::consts::ARCH) {
+                ("macos", "aarch64") => Some("mac"),
+                ("windows", "x86_64") => Some("windows"),
+                ("linux", "x86_64") => Some("linux"),
+                _ => None,
+            },
         }
     }
 }
@@ -69,9 +76,7 @@ impl HostSetup {
                 .as_ref()
                 .map(|_| "https://127.0.0.1:9443".into()),
             installation,
-            background_active: false,
-            profile_setup_available: cfg!(any(target_os = "linux", windows)),
-            profile_requires_authorization: cfg!(target_os = "linux"),
+            ..View::default()
         };
     }
     fn snapshot(&self) -> View {
@@ -776,25 +781,22 @@ pub(crate) fn package_version(record: &Installation) -> Option<String> {
 /// The package this account's library last ran with, for display only.
 pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
     #[cfg(unix)]
-    {
-        let uid = unsafe { libc::geteuid() };
-        let state = records
-            .first()?
-            .layout()
-            .ok()?
-            .profiles
-            .join(uid.to_string())
-            .join("state");
-        crate::host_state::Owner::peek(&state)
-            .ok()
-            .flatten()
-            .map(|marker| marker.manifest_sha256)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = records;
-        None
-    }
+    let state = records
+        .first()?
+        .layout()
+        .ok()?
+        .profiles
+        .join(unsafe { libc::geteuid() }.to_string())
+        .join("state");
+    #[cfg(windows)]
+    let state = {
+        records.first()?;
+        crate::windows_host_profile::paths().ok()?.0
+    };
+    crate::host_state::Owner::peek(&state)
+        .ok()
+        .flatten()
+        .map(|marker| marker.manifest_sha256)
 }
 
 fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
