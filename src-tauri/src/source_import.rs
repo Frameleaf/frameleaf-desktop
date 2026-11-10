@@ -863,6 +863,7 @@ impl SourceJobs {
         value.code = None;
         *status.lock().map_err(|_| "source_status_unavailable")? = value.clone();
         watching.store(watch, Ordering::Release);
+        crate::tray::set_import_status(&app, Some(&value));
         // Network probes and journal I/O must not occupy an async worker.
         let task = tauri::async_runtime::spawn_blocking(move || {
             tauri::async_runtime::block_on(async move {
@@ -870,6 +871,7 @@ impl SourceJobs {
                     if let Ok(mut current) = status.lock() {
                         *current = value.clone();
                     }
+                    crate::tray::set_import_status(&app, Some(&value));
                     let _ = app.emit_to("main", "photo-import", value);
                 };
                 let result = async {
@@ -920,12 +922,16 @@ impl SourceJobs {
                 }
                 .await;
                 if let Err(code) = result {
-                    if let Ok(mut current) = status.lock() {
-                        if (watch && !stop.load(Ordering::Acquire)) || current.state == "copying" {
-                            current.state = "needs-attention".into();
-                            current.code = Some(code);
-                            let _ = app.emit_to("main", "photo-import", current.clone());
-                        }
+                    let failed = status.lock().ok().and_then(|current| {
+                        ((watch && !stop.load(Ordering::Acquire)) || current.state == "copying")
+                            .then(|| ImportView {
+                                state: "needs-attention".into(),
+                                code: Some(code),
+                                ..current.clone()
+                            })
+                    });
+                    if let Some(failed) = failed {
+                        notify(failed);
                     }
                 }
                 watching.store(false, Ordering::Release);

@@ -342,23 +342,29 @@ fn persisted_controls_survive_reload_and_do_not_cross_associations() {
         mode: "client-worker".into(),
     };
     assert_eq!(
-        worker_control::load(&saved).unwrap(),
+        worker_control::load(&saved).unwrap().held(),
         WorkerControl::Running
     );
     worker_control::save(&saved, WorkerControl::Paused).unwrap();
-    assert_eq!(worker_control::load(&saved).unwrap(), WorkerControl::Paused);
+    assert_eq!(
+        worker_control::load(&saved).unwrap().held(),
+        WorkerControl::Paused
+    );
     saved.account_id = "account-b".into();
     assert_eq!(
-        worker_control::load(&saved).unwrap(),
+        worker_control::load(&saved).unwrap().held(),
         WorkerControl::Running
     );
     worker_control::save(&saved, WorkerControl::Stopped).unwrap();
     saved.account_id = "account-a".into();
-    assert_eq!(worker_control::load(&saved).unwrap(), WorkerControl::Paused);
+    assert_eq!(
+        worker_control::load(&saved).unwrap().held(),
+        WorkerControl::Paused
+    );
     worker_control::save(&saved, WorkerControl::Running).unwrap();
     saved.account_id = "account-b".into();
     assert_eq!(
-        worker_control::load(&saved).unwrap(),
+        worker_control::load(&saved).unwrap().held(),
         WorkerControl::Stopped
     );
 }
