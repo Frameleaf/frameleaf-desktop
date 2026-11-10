@@ -364,6 +364,18 @@ async fn restore_connection(
     {
         view.state = "worker-setup-failed".into();
     }
+    if let Ok(Some(consent)) =
+        credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
+    {
+        if consent.watch && consent.registered && !consent.watch_paused {
+            if let Ok(base) = import_base(&app) {
+                let _ = app
+                    .state::<source_import::SourceJobs>()
+                    .start(app.clone(), base, saved.clone())
+                    .await;
+            }
+        }
+    }
     *current = Some(saved);
     drop(current);
     tray::refresh(&app).await;
@@ -584,7 +596,8 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if window.label() == "main"
-                && window.state::<host_setup::HostSetup>().background_active()
+                && (window.state::<host_setup::HostSetup>().background_active()
+                    || window.state::<source_import::SourceJobs>().watching())
             {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
@@ -849,6 +862,7 @@ async fn approve_photo_folder(
     state: State<'_, DesktopState>,
     selection_id: Option<String>,
     allow_download: bool,
+    watch: Option<bool>,
 ) -> Result<source_consent::ConsentView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
@@ -863,6 +877,7 @@ async fn approve_photo_folder(
             &identity,
             &selection,
             allow_download,
+            watch.unwrap_or(false),
             |value| credentials::save(source_consent::CREDENTIAL, value),
         )?
     } else {
@@ -871,6 +886,11 @@ async fn approve_photo_folder(
     };
     consent.register(saved, &identity).await?;
     credentials::save(source_consent::CREDENTIAL, &consent)?;
+    if consent.watch && !consent.watch_paused {
+        app.state::<source_import::SourceJobs>()
+            .start(app.clone(), import_base(&app)?, saved.clone())
+            .await?;
+    }
     Ok(consent.view())
 }
 #[tauri::command]
@@ -950,6 +970,16 @@ async fn control_photo_import(
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let base = import_base(&app)?;
     match action.as_str() {
+        "watch-resume" => {
+            app.state::<source_import::SourceJobs>()
+                .resume_watch(app.clone(), base, saved.clone())
+                .await
+        }
+        "watch-pause" => {
+            app.state::<source_import::SourceJobs>()
+                .pause_watch(&base, saved)
+                .await
+        }
         "resume" => {
             app.state::<source_import::SourceJobs>()
                 .start(app.clone(), base, saved.clone())

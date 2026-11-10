@@ -1,4 +1,6 @@
 //! One bounded approved-folder copy, with immutable inventory and a small signed progress checkpoint.
+mod watch;
+
 use crate::{
     connection::{DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,
@@ -8,6 +10,7 @@ use crate::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -47,6 +50,8 @@ struct Cursor {
     upload_budget: Option<UploadBudget>,
     position: usize,
     active: Option<Active>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    watch_skipped: BTreeSet<usize>,
     state: String,
 }
 fn digest(value: &impl Serialize) -> Result<String, String> {
@@ -73,6 +78,7 @@ impl Cursor {
             }),
             position: 0,
             active: None,
+            watch_skipped: BTreeSet::new(),
             state: "ready".into(),
         })
     }
@@ -99,6 +105,9 @@ impl Cursor {
             .is_some_and(|budget| budget.used > budget.limit)
             || self.manifest_hash != digest(manifest)?
             || self.position > manifest.files.len()
+            || self.watch_skipped.iter().any(|&index| {
+                index >= self.position || manifest.files[index].watch_version.is_none()
+            })
             || !matches!(
                 self.state.as_str(),
                 "ready" | "open" | "paused" | "cancelled" | "complete"
@@ -239,7 +248,7 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
         state: state.into(),
         source_id: manifest.source_id.clone(),
         total: manifest.files.len(),
-        completed: cursor.position,
+        completed: cursor.position - cursor.watch_skipped.len(),
         logical_bytes: manifest.total_bytes,
         upload_remaining: cursor
             .upload_budget
@@ -250,7 +259,7 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
             .map(|file| file.bytes)
             .sum::<u64>()
             .saturating_mul(2),
-        skipped: manifest.skipped,
+        skipped: manifest.skipped + cursor.watch_skipped.len() as u64,
         availability: manifest.availability.clone(),
         code,
     }
@@ -284,6 +293,13 @@ fn manifest_for(
     if scan.unreadable > 0 {
         return Err("source_inventory_unreadable".into());
     }
+    make_manifest(consent, approval, scan)
+}
+fn make_manifest(
+    consent: &Consent,
+    approval: &crate::copy_source::CopyApproval,
+    scan: crate::photo_sources::FolderScan,
+) -> Result<Manifest, String> {
     if scan.files.is_empty() {
         return Err("source_no_media".into());
     }
@@ -542,18 +558,43 @@ async fn execute(
                 } else {
                     // The signed intent owns this attempt; never remove an existing signed receipt as an incomplete copy.
                     crate::copy_source::release_stage(&stage, id)?;
-                    consent.approval(saved, identity)?.stage_to(
+                    let staged = consent.approval(saved, identity)?.stage_to(
                         saved,
                         identity,
                         &entry.relative,
                         &stage,
                         id,
                         Some(entry.bytes),
+                        entry.watch_version.as_deref(),
                         cancel,
                         gate,
-                    )?
+                    );
+                    match staged {
+                        Err(code)
+                            if entry.watch_version.is_some()
+                                && matches!(
+                                    code.as_str(),
+                                    "source_item_changed"
+                                        | "source_item_unavailable"
+                                        | "source_item_excluded"
+                                        | "source_item_invalid"
+                                ) =>
+                        {
+                            // No item was planned or uploaded. A later scan can reconsider this path.
+                            cursor.watch_skipped.insert(cursor.position);
+                            cursor.position += 1;
+                            cursor.active = None;
+                            journal.write("cursor.json", &cursor, identity)?;
+                            continue;
+                        }
+                        other => other?,
+                    }
                 };
                 if !copy.matches_entry(&entry.relative, entry.bytes)
+                    || entry
+                        .watch_version
+                        .as_ref()
+                        .is_some_and(|version| version != &copy.version())
                     || copy.source_id() != manifest.source_id
                 {
                     return Err("source_item_changed".into());
@@ -570,6 +611,10 @@ async fn execute(
                 .unwrap()
                 .clone();
             if !copy.matches_entry(&entry.relative, entry.bytes)
+                || entry
+                    .watch_version
+                    .as_ref()
+                    .is_some_and(|version| version != &copy.version())
                 || copy.source_id() != manifest.source_id
             {
                 return Err("source_item_changed".into());
@@ -682,16 +727,22 @@ async fn execute(
 struct Running {
     cancel: Arc<AtomicBool>,
     task: tauri::async_runtime::JoinHandle<()>,
+    wake: Arc<tokio::sync::Notify>,
 }
 #[derive(Default)]
 pub(crate) struct SourceJobs {
     running: tokio::sync::Mutex<Option<Running>>,
     status: Arc<Mutex<ImportView>>,
+    watching: Arc<AtomicBool>,
 }
 impl SourceJobs {
+    pub fn watching(&self) -> bool {
+        self.watching.load(Ordering::Acquire)
+    }
     pub async fn stop(&self) {
         if let Some(running) = self.running.lock().await.take() {
             running.cancel.store(true, Ordering::Release);
+            running.wake.notify_one();
             let _ = running.task.await;
         }
     }
@@ -711,6 +762,9 @@ impl SourceJobs {
             .clone();
         if live.source_id == consent.source_id() && !live.state.is_empty() {
             return Ok(Some(live));
+        }
+        if consent.watch {
+            return watch::status(base, saved, &consent, &identity).map(Some);
         }
         if !base
             .join("photo-imports")
@@ -738,11 +792,14 @@ impl SourceJobs {
         base: &Path,
         saved: &SavedConnection,
     ) -> Result<ImportView, String> {
-        self.stop().await;
         let identity = credentials::identity()?;
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
         let approval = consent.approval(saved, &identity)?;
+        if consent.watch {
+            return Err("source_control_invalid".into());
+        }
+        self.stop().await;
         if base.starts_with(approval.root()) || approval.root().starts_with(base) {
             return Err("source_staging_overlap".into());
         }
@@ -781,19 +838,31 @@ impl SourceJobs {
         saved: SavedConnection,
     ) -> Result<ImportView, String> {
         self.stop().await;
+        let identity = credentials::identity()?;
+        let consent =
+            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+        consent.approval(&saved, &identity)?;
+        let watch = consent.watch && !consent.watch_paused;
+        if consent.watch_paused {
+            return Err("source_control_invalid".into());
+        }
         let value = self
             .status(&base, &saved)?
             .ok_or("source_manifest_required")?;
-        if matches!(value.state.as_str(), "complete" | "cancelled") {
+        if !watch && matches!(value.state.as_str(), "complete" | "cancelled") {
             return Err("source_run_terminal".into());
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let status = self.status.clone();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let wake_task = wake.clone();
+        let watching = self.watching.clone();
         let mut value = value;
-        value.state = "copying".into();
+        value.state = if watch { "watching" } else { "copying" }.into();
         value.code = None;
         *status.lock().map_err(|_| "source_status_unavailable")? = value.clone();
+        watching.store(watch, Ordering::Release);
         // Network probes and journal I/O must not occupy an async worker.
         let task = tauri::async_runtime::spawn_blocking(move || {
             tauri::async_runtime::block_on(async move {
@@ -816,7 +885,10 @@ impl SourceJobs {
                         if stop.load(Ordering::Acquire) {
                             return Err("source_copy_cancelled".into());
                         }
-                        current(&saved, &identity, source.source_id())?;
+                        let permission = current(&saved, &identity, source.source_id())?;
+                        if watch && (!permission.watch || permission.watch_paused) {
+                            return Err("source_copy_cancelled".into());
+                        }
                         let mut snapshot = network.lock().map_err(|_| "network_unknown")?;
                         if snapshot.0.elapsed() >= std::time::Duration::from_secs(1) {
                             *snapshot = (
@@ -830,33 +902,79 @@ impl SourceJobs {
                             None => Err("network_unknown".into()),
                         }
                     };
-                    execute(
-                        &transport::client()?,
-                        &crate::connection::normalize_server(&saved.server)?,
-                        &saved,
-                        &identity,
-                        &source,
-                        &journal,
-                        &stop,
-                        &gate,
-                        &notify,
-                    )
-                    .await
+                    let client = transport::client()?;
+                    let origin = crate::connection::normalize_server(&saved.server)?;
+                    if watch {
+                        watch::run(
+                            &client, &origin, &saved, &identity, &source, &journal, &stop,
+                            &wake_task, &gate, &notify,
+                        )
+                        .await
+                    } else {
+                        execute(
+                            &client, &origin, &saved, &identity, &source, &journal, &stop, &gate,
+                            &notify,
+                        )
+                        .await
+                    }
                 }
                 .await;
                 if let Err(code) = result {
                     if let Ok(mut current) = status.lock() {
-                        if current.state == "copying" {
+                        if (watch && !stop.load(Ordering::Acquire)) || current.state == "copying" {
                             current.state = "needs-attention".into();
                             current.code = Some(code);
                             let _ = app.emit_to("main", "photo-import", current.clone());
                         }
                     }
                 }
+                watching.store(false, Ordering::Release);
             });
         });
-        *self.running.lock().await = Some(Running { cancel, task });
+        *self.running.lock().await = Some(Running { cancel, task, wake });
         Ok(value)
+    }
+    pub async fn pause_watch(
+        &self,
+        base: &Path,
+        saved: &SavedConnection,
+    ) -> Result<ImportView, String> {
+        let identity = credentials::identity()?;
+        let mut consent =
+            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+        consent.approval(saved, &identity)?;
+        if !consent.watch {
+            return Err("source_control_invalid".into());
+        }
+        consent.watch_paused = true;
+        let persisted = credentials::save(CREDENTIAL, &consent);
+        self.stop().await;
+        persisted?;
+        let value = watch::status(base, saved, &consent, &identity)?;
+        *self
+            .status
+            .lock()
+            .map_err(|_| "source_status_unavailable")? = value.clone();
+        Ok(value)
+    }
+    pub async fn resume_watch(
+        &self,
+        app: tauri::AppHandle,
+        base: PathBuf,
+        saved: SavedConnection,
+    ) -> Result<ImportView, String> {
+        let identity = credentials::identity()?;
+        let mut consent =
+            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+        consent.approval(&saved, &identity)?;
+        if !consent.watch {
+            return Err("source_control_invalid".into());
+        }
+        if consent.watch_paused {
+            consent.watch_paused = false;
+            credentials::save(CREDENTIAL, &consent)?;
+        }
+        self.start(app, base, saved).await
     }
     pub async fn approve_upload(
         &self,
@@ -868,6 +986,11 @@ impl SourceJobs {
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
         let journal = Journal::new(base, consent.source_id())?;
+        let journal = if consent.watch {
+            watch::batch(&journal)?
+        } else {
+            journal
+        };
         let (manifest, mut cursor) = load(&journal, &identity, &consent, saved)?;
         cursor.approve_upload(&manifest)?;
         journal.write("cursor.json", &cursor, &identity)?;
@@ -884,10 +1007,13 @@ impl SourceJobs {
         saved: &SavedConnection,
         cancel: bool,
     ) -> Result<ImportView, String> {
-        self.stop().await;
         let identity = credentials::identity()?;
         let consent =
             credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+        if consent.watch {
+            return Err("source_control_invalid".into());
+        }
+        self.stop().await;
         let journal = Journal::new(base, consent.source_id())?;
         let (manifest, mut cursor) = load(&journal, &identity, &consent, saved)?;
         if !matches!(cursor.state.as_str(), "complete" | "cancelled") {
@@ -1098,6 +1224,7 @@ mod tests {
             files: vec![SourceFile {
                 relative: "nested/photo.jpg".into(),
                 bytes: 8,
+                watch_version: None,
             }],
             total_bytes: 8,
             skipped: 0,
@@ -1164,7 +1291,14 @@ mod tests {
                 .select(state.generation().unwrap(), base.join("source"))
                 .unwrap();
             let mut consent = state
-                .approve(&saved, &identity, &selected.selection_id, true, |_| Ok(()))
+                .approve(
+                    &saved,
+                    &identity,
+                    &selected.selection_id,
+                    true,
+                    false,
+                    |_| Ok(()),
+                )
                 .unwrap();
             consent.registered = true;
             let manifest = manifest_for(&consent, &saved, &identity, &base.join("data")).unwrap();
@@ -1284,6 +1418,48 @@ mod tests {
             let _ = fs::remove_dir_all(&self.base);
         }
     }
+    #[test]
+    fn a_changed_watch_file_is_reconsidered_without_uploading_under_its_old_version() {
+        tauri::async_runtime::block_on(async {
+            let mut f = Fixture::new();
+            f.manifest.files[0].watch_version = Some(f.probe.version());
+            f.journal
+                .write("manifest.json", &f.manifest, &f.identity)
+                .unwrap();
+            f.journal
+                .write(
+                    "cursor.json",
+                    &Cursor::new(&f.manifest).unwrap(),
+                    &f.identity,
+                )
+                .unwrap();
+            let path = f.base.join("source/photo.jpg");
+            fs::rename(&path, f.base.join("previous.jpg")).unwrap();
+            fs::write(&path, b"0123456789").unwrap();
+            let server = Server::new(vec![
+                preflight()[0].clone(),
+                f.run_ack("open"),
+                f.state_ack("open"),
+                f.run_ack("open"),
+                f.state_ack("complete"),
+            ]);
+            f.run(&server, &|| Ok(())).await.unwrap();
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(cursor.watch_skipped, BTreeSet::from([0]));
+            assert_eq!(view(&f.manifest, &cursor, "complete", None).completed, 0);
+            assert!(!server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(
+                    |(headers, _)| headers.starts_with("POST /api/assets/uploads/")
+                        || headers.contains("/items")
+                ));
+            assert_eq!(fs::read(&path).unwrap(), b"0123456789");
+        });
+    }
+
     #[test]
     fn real_copy_job_keeps_its_stage_until_a_bound_nas_receipt_and_then_finishes_without_touching_source(
     ) {
@@ -1417,6 +1593,7 @@ mod tests {
                     &f.journal.root.join("stage"),
                     &attempt,
                     Some(data.len() as u64),
+                    None,
                     &AtomicBool::new(false),
                     &gate
                 )

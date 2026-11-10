@@ -34,6 +34,10 @@ pub struct Consent {
     name: String,
     allow_download: bool,
     pub registered: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) watch: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) watch_paused: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +47,10 @@ pub struct ConsentView {
     path: String,
     allow_download: bool,
     registered: bool,
+    watch: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 impl SourceConsent {
     pub fn generation(&self) -> Result<u64, String> {
@@ -86,6 +94,7 @@ impl SourceConsent {
         identity: &DeviceIdentity,
         selection: &str,
         allow_download: bool,
+        watch: bool,
         persist: impl FnOnce(&Consent) -> Result<(), String>,
     ) -> Result<Consent, String> {
         let mut pending = self
@@ -98,6 +107,13 @@ impl SourceConsent {
             .filter(|(id, _)| id == selection)
             .ok_or("source_selection_changed")?
             .1;
+        if watch
+            && (!allow_download
+                || !watch_folder(path)
+                || !crate::host_storage::is_local(&crate::host_storage::directory(path)?)?)
+        {
+            return Err("source_watch_local_required".into());
+        }
         let approval = CopyApproval::approve(
             saved,
             identity,
@@ -117,11 +133,31 @@ impl SourceConsent {
             name,
             allow_download,
             registered: false,
+            watch,
+            watch_paused: false,
         };
         persist(&consent)?;
         pending.selected = None;
         Ok(consent)
     }
+}
+fn watch_folder(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    if !matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))
+    ) {
+        return false;
+    }
+    !path.components().any(|part| {
+        let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "cloudstorage" | "mobile documents" | "onedrive"
+        ) || name.starts_with("onedrive - ")
+            || name.starts_with("onedrive-")
+    })
 }
 // Match the server's trimmed, control-free 128 UTF-16-unit label without changing the root path.
 fn source_label(raw: &str) -> String {
@@ -180,6 +216,7 @@ impl Consent {
             path: self.approval.root().to_string_lossy().into(),
             allow_download: self.allow_download,
             registered: self.registered,
+            watch: self.watch,
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
@@ -278,7 +315,7 @@ mod tests {
         let called = AtomicBool::new(false);
         assert_eq!(
             state
-                .approve(&saved(), &identity, "forged", true, |_| {
+                .approve(&saved(), &identity, "forged", true, false, |_| {
                     called.store(true, Ordering::Release);
                     Ok(())
                 })
@@ -288,9 +325,14 @@ mod tests {
         );
         assert!(!called.load(Ordering::Acquire));
         assert!(state
-            .approve(&saved(), &identity, &selected.selection_id, true, |_| Err(
-                "credential_store_locked_or_unavailable".into()
-            ))
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                false,
+                |_| Err("credential_store_locked_or_unavailable".into())
+            )
             .is_err());
         let consent = state
             .approve(
@@ -298,6 +340,7 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
                 |_| Ok(()),
             )
             .unwrap();
@@ -308,6 +351,7 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
                 |_| Ok(())
             )
             .is_err());
@@ -337,6 +381,7 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
                 |_| Ok(()),
             )
             .unwrap();
@@ -371,6 +416,7 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
                 |_| Ok(()),
             )
             .unwrap();

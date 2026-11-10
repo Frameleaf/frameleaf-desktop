@@ -17,6 +17,8 @@ pub struct FolderInventory {
 pub(crate) struct SourceFile {
     pub relative: String,
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_version: Option<String>,
 }
 pub(crate) struct FolderScan {
     pub inventory: FolderInventory,
@@ -29,6 +31,18 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
     scan(root, limit).map(|scan| scan.inventory)
 }
 pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
+    scan_inner(root, limit, None)
+}
+
+pub(crate) fn scan_approved(root: &Path, root_identity: &str) -> Result<FolderScan, String> {
+    scan_inner(root, 10_000, Some(root_identity))
+}
+
+fn scan_inner(
+    root: &Path,
+    limit: usize,
+    approved_root: Option<&str>,
+) -> Result<FolderScan, String> {
     #[cfg(target_os = "macos")]
     let _policy = metadata_only::Guard::new()?;
     if !root.is_absolute() || root.parent().is_none() || limit == 0 || limit > 10_000 {
@@ -50,6 +64,18 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
         return Err("source_choose_photo_subfolder".into());
     }
     let dir = crate::source_metadata::open_preview_root(root)?;
+    if let Some(expected) = approved_root {
+        if crate::copy_source::root_identity(&dir)? != expected {
+            return Err("source_root_changed".into());
+        }
+        let directory = dir
+            .try_clone()
+            .map_err(|_| "source_folder_unavailable")?
+            .into_std_file();
+        if !crate::host_storage::is_local(&directory)? {
+            return Err("source_watch_local_required".into());
+        }
+    }
     let root_meta = dir
         .dir_metadata()
         .map_err(|_| "source_folder_unavailable")?;
@@ -144,13 +170,35 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
                     continue;
                 }
                 match crate::source_metadata::open_preview_child(&dir, Path::new(name), true) {
-                    Ok(child) => pending.push_back((child, relative.join(name), depth + 1)),
+                    Ok(child) => {
+                        if let Some(expected) = approved_root {
+                            let actual = crate::copy_source::root_identity(&child)?;
+                            if actual.split(':').next() != expected.split(':').next() {
+                                result.skipped += 1;
+                                continue;
+                            }
+                        }
+                        pending.push_back((child, relative.join(name), depth + 1));
+                    }
                     Err(_) => {
                         unreadable += 1;
                         result.skipped += 1;
                     }
                 }
             } else if meta.is_file() && is_media_filename(name) {
+                let watch_version = if approved_root.is_some() {
+                    if meta.len() == 0 || !crate::copy_source::watchable(&meta, observation) {
+                        result.skipped += 1;
+                        continue;
+                    }
+                    Some(crate::copy_source::watch_version(
+                        &dir,
+                        Path::new(name),
+                        &meta,
+                    )?)
+                } else {
+                    None
+                };
                 files.push(SourceFile {
                     relative: relative
                         .join(name)
@@ -158,6 +206,7 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
                         .ok_or("source_item_invalid")?
                         .into(),
                     bytes: meta.len(),
+                    watch_version,
                 });
                 result.photos += 1;
                 result.availability.record(observation, meta.len());
@@ -262,7 +311,7 @@ fn covers_home(root: &Path, home: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-mod metadata_only {
+pub(crate) mod metadata_only {
     use std::{marker::PhantomData, rc::Rc};
     // Darwin sys/resource.h; Apple TN3150 requires disabling directory materialization too.
     const KIND: libc::c_int = 3; // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
@@ -283,13 +332,13 @@ mod metadata_only {
             Ok(value)
         }
     }
-    pub(super) struct Guard {
+    pub(crate) struct Guard {
         previous: libc::c_int,
         // The policy must be restored on the same OS thread, never across an await.
         _thread: PhantomData<Rc<()>>,
     }
     impl Guard {
-        pub(super) fn new() -> Result<Self, String> {
+        pub(crate) fn new() -> Result<Self, String> {
             let previous = current()?;
             if unsafe { setiopolicy_np(KIND, THREAD, 1) } != 0 {
                 return Err("source_preview_policy_unavailable".into());

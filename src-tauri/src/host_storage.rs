@@ -39,6 +39,11 @@ pub(crate) fn check(path: &Path) -> Result<(), String> {
     admit(&inspect(&directory)?)
 }
 
+/// A watched folder must be on a local volume. Its files remain subject to source admission.
+pub(crate) fn is_local(directory: &std::fs::File) -> Result<bool, String> {
+    Ok(inspect(directory)?.local)
+}
+
 /// Retirement may reclaim storage below the startup floor; all volume and cloud checks still apply.
 pub(crate) fn check_cleanup(path: &Path) -> Result<(), String> {
     let directory = directory(path)?;
