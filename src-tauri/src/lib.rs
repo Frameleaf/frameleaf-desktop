@@ -621,6 +621,7 @@ pub fn run() {
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
             }
+            updates::observe_restart(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
