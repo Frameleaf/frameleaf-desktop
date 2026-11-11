@@ -58,6 +58,8 @@ fn main() {
             "photo_source_status",
             "revoke_photo_source",
             "photo_import_status",
+            "photo_import_history",
+            "retry_photo_import",
             "prepare_photo_import",
             "control_photo_import",
             "manager_view",

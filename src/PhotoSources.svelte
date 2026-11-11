@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from './Icon.svelte';
   import CameraSources from './CameraSources.svelte';
+  import ImportHistory from './ImportHistory.svelte';
   import Sheet from './Sheet.svelte';
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import { albumErrors, type AlbumDestination } from './import-destination';
@@ -282,6 +283,7 @@
       </div>
       <p class="foot">Originals stay in their folders. A copy counts only after your server verifies its stored bytes. Copy jobs require explicit folder approval and an unmetered connection. Cloud-only files may download while staging an approved original. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
     </div>
+    <ImportHistory />
   </div>
 </section>
 

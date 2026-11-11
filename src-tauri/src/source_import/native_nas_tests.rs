@@ -40,7 +40,8 @@ fn actual_native_folder_copy() {
         .unwrap();
     transport::FIXTURE_CLIENT.set(client.clone()).unwrap();
     tauri::async_runtime::block_on(async {
-        let identity = credentials::identity().unwrap();
+        // This fixture uses process-only credentials, so leave the installed identity anchor alone.
+        let identity = DeviceIdentity::generate();
         let mut saved = SavedConnection {
             server: base.to_string(),
             server_id: String::new(),
@@ -56,7 +57,12 @@ fn actual_native_folder_copy() {
             .unwrap()
             .unwrap()
             .server_id;
-        saved.device_id = Some(transport::enroll(&client, &saved).await.unwrap().id);
+        saved.device_id = Some(
+            transport::enroll_with_identity(&client, &saved, &identity)
+                .await
+                .unwrap()
+                .id,
+        );
         credentials::save("connection", &saved).unwrap();
         for name in ["source", "data"] {
             crate::runtime_store::private_directory(&configuration.root.join(name)).unwrap();

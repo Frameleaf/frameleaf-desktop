@@ -35,6 +35,8 @@
     "allow-photo-source-status",
     "allow-revoke-photo-source",
     "allow-photo-import-status",
+    "allow-photo-import-history",
+    "allow-retry-photo-import",
     "allow-prepare-photo-import",
     "allow-control-photo-import",
     "allow-manager-view",
