@@ -215,7 +215,7 @@ pub(crate) fn root_identity(dir: &Dir) -> Result<String, String> {
         ))
     }
 }
-fn available_bytes(dir: &Dir) -> Result<u64, String> {
+pub(crate) fn available_bytes(dir: &Dir) -> Result<u64, String> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;

@@ -23,6 +23,7 @@ mod manager_commands;
 pub mod manager_host;
 mod manager_profile;
 pub mod manager_tls;
+mod media_copy;
 pub mod ml_transport;
 mod model_cache;
 pub mod model_catalogue;
@@ -320,6 +321,7 @@ async fn restore_connection(
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<media_copy::MediaCopy>().cancel();
     if app.state::<host_setup::HostSetup>().background_active() {
         return Ok(None);
     }
@@ -412,6 +414,7 @@ async fn sign_out(
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<media_copy::MediaCopy>().cancel();
     app.state::<source_import::SourceJobs>().stop().await;
     app.state::<drop_import::DropImport>().stop().await;
     app.state::<source_consent::SourceConsent>().clear()?;
@@ -590,6 +593,7 @@ pub fn run() {
         .manage(source_import::SourceJobs::default())
         .manage(source_import::ImportTransfer::default())
         .manage(drop_import::DropImport::default())
+        .manage(media_copy::MediaCopy::default())
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
         .setup(|app| {
@@ -634,6 +638,9 @@ pub fn run() {
             control_worker,
             discover_camera_folders,
             discover_onedrive,
+            media_copy::preservation_copy_packages,
+            media_copy::save_preservation_copy,
+            media_copy::cancel_preservation_copy,
             choose_photo_folder,
             approve_photo_folder,
             import_album::list_photo_import_albums,
@@ -706,6 +713,7 @@ pub fn run() {
                     if cfg!(target_os = "macos")
                         || window.state::<host_setup::HostSetup>().background_active()
                         || window.state::<source_import::SourceJobs>().watching()
+                        || window.state::<media_copy::MediaCopy>().is_active()
                     {
                         api.prevent_close();
                         let _ = window.hide();
@@ -726,7 +734,14 @@ pub fn run() {
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 app.state::<window_placement::WindowPlacement>().save(app);
-                if app.state::<host_setup::HostSetup>().background_active() {
+                if app.state::<media_copy::MediaCopy>().is_active() {
+                    api.prevent_exit();
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.emit("tray-action-failed", "media_copy_exit_blocked");
+                    }
+                } else if app.state::<host_setup::HostSetup>().background_active() {
                     api.prevent_exit();
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
