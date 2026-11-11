@@ -1420,6 +1420,6 @@ mod tests {
             Some("host_media_move_stream_unsupported")
         );
         assert!(!f.profile.join(MEDIA_MOVE).exists());
-        assert_eq!(fs::read_dir(f.target).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&f.target).unwrap().count(), 0);
     }
 }

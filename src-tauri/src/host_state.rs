@@ -48,6 +48,7 @@ pub(crate) struct Marker {
     restore_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     database_reference: Option<crate::host_database::Reference>,
+    #[cfg(any(windows, test))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     media_reference: Option<media_move::MediaReference>,
 }
@@ -286,7 +287,9 @@ impl Owner {
         if mode == crate::host_runtime::HostMode::Server {
             no_activation(&self.root)?;
         }
-        let (database_reference, restore_pending, media_reference) = match self.read()? {
+        #[cfg(any(windows, test))]
+        let media_reference;
+        let (database_reference, restore_pending) = match self.read()? {
             Some(marker) => {
                 self.binding(&marker, id, sha)?;
                 if marker.phase != Phase::Stopped
@@ -299,17 +302,17 @@ impl Owner {
                         reference.resolve(&self.path)?;
                     }
                 }
-                if let Some(reference) = &marker.media_reference {
-                    if mode != crate::host_runtime::HostMode::Server {
-                        return Err("host_external_media_maintenance_unavailable".into());
+                #[cfg(any(windows, test))]
+                {
+                    if let Some(reference) = &marker.media_reference {
+                        if mode != crate::host_runtime::HostMode::Server {
+                            return Err("host_external_media_maintenance_unavailable".into());
+                        }
+                        reference.resolve(&self.path)?;
                     }
-                    reference.resolve(&self.path)?;
+                    media_reference = marker.media_reference;
                 }
-                (
-                    marker.database_reference,
-                    marker.restore_pending,
-                    marker.media_reference,
-                )
+                (marker.database_reference, marker.restore_pending)
             }
             None => {
                 for entry in self
@@ -325,7 +328,11 @@ impl Owner {
                         return Err("host_recovery_requires_manager".into());
                     }
                 }
-                (None, false, None)
+                #[cfg(any(windows, test))]
+                {
+                    media_reference = None;
+                }
+                (None, false)
             }
         };
         let marker = Marker {
@@ -337,6 +344,7 @@ impl Owner {
             phase: Phase::Active,
             restore_pending,
             database_reference,
+            #[cfg(any(windows, test))]
             media_reference,
         };
         self.write(&marker)?;
