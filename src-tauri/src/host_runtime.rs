@@ -1,5 +1,7 @@
 //! Host packs have separate authority and component requirements from ML packs.
 mod reap;
+#[path = "studio_voiceover_candidate.rs"]
+mod studio_voiceover_candidate;
 #[cfg(windows)]
 #[path = "host_runtime_windows_agent.rs"]
 mod windows_agent;
@@ -189,6 +191,11 @@ impl VerifiedHostRuntime {
             .map_err(|_| "host_runtime_path_unavailable")?;
         #[cfg(windows)]
         let root = stable_root.as_path();
+        studio_voiceover_candidate::verify_inventory(
+            &manifest.files,
+            &manifest.platform,
+            &manifest.architecture,
+        )?;
         verify_files(root, &manifest.files)?;
         Ok(Self {
             root: root.into(),
