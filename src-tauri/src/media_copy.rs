@@ -1,6 +1,7 @@
 //! Owner-scoped preservation copies. Archive paths are used only to verify ZIP entries.
 mod archive;
 mod destination;
+pub(crate) use destination::start_export;
 
 use crate::{connection::SavedConnection, require_local, transport, DesktopState};
 use serde::{Deserialize, Serialize};
