@@ -104,6 +104,9 @@ code, .mono { font: inherit; color: var(--text-soft); overflow-wrap: anywhere; }
 .url { font: inherit; color: var(--text); overflow-wrap: anywhere; word-break: break-all; }
 h1, h2, h3, p { margin: 0; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.skip-link { position: fixed; top: 8px; left: 8px; z-index: 10; padding: 8px 12px; border-radius: 6px; background: var(--panel); color: var(--text); transform: translateY(-150%); }
+.skip-link:focus { transform: none; }
+.platform-mac .skip-link:focus { top: 40px; }
 ::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--muted) 35%, transparent); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
@@ -255,8 +258,8 @@ input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
 .sr { position: absolute; left: -9999px; }
 
 /* ---------- sheet ---------- */
-.sheet-backdrop { position: fixed; inset: 0; background: var(--dim); display: flex; justify-content: center; align-items: flex-start; padding-top: 52px; z-index: 20; }
-.sheet { width: 460px; max-width: calc(100vw - 32px); max-height: calc(100vh - 80px); overflow: auto; background: var(--panel); border-radius: 0 0 12px 12px; box-shadow: var(--sheet-shadow); padding: 22px 24px 20px; display: flex; gap: 16px; }
+.sheet::backdrop { background: var(--dim); }
+.sheet { position: fixed; inset: 52px 0 auto; margin: 0 auto; border: 0; color: inherit; width: 460px; max-width: calc(100vw - 32px); max-height: calc(100vh - 80px); overflow: auto; background: var(--panel); border-radius: 0 0 12px 12px; box-shadow: var(--sheet-shadow); padding: 22px 24px 20px; }
 .sheet.wide { width: 560px; }
 .sheet .sheet-form { display: flex; gap: 16px; flex: 1; min-width: 0; }
 .sheet .warn { width: 56px; height: 56px; flex-shrink: 0; position: relative; }
@@ -358,7 +361,7 @@ button.link:disabled { color: var(--muted); cursor: default; }
 .platform-windows .progress { height: 4px; border-radius: 2px; }
 .platform-windows .table th { text-transform: none; letter-spacing: 0; font-size: 12px; }
 .platform-windows .sheet { border-radius: 8px; }
-.platform-windows .sheet-backdrop { padding-top: 80px; }
+.platform-windows .sheet { top: 80px; }
 .platform-windows input[type="text"], .platform-windows input[type="url"], .platform-windows input[type="email"], .platform-windows input[type="password"], .platform-windows select { font-size: 14px; }
 
 /* ---------- platform: Linux (GNOME) ---------- */
@@ -380,7 +383,7 @@ button.link:disabled { color: var(--muted); cursor: default; }
 .platform-linux .kv div { padding: 14px 16px; }
 .platform-linux .table th { text-transform: none; letter-spacing: 0; font-size: 13px; font-weight: 700; color: var(--text); }
 .platform-linux .sheet { border-radius: 12px; }
-.platform-linux .sheet-backdrop { align-items: center; padding-top: 0; }
+.platform-linux .sheet { inset: 0; margin: auto; }
 
 @media (max-width: 760px) {
   .kv, .tile { grid-template-columns: 1fr; }

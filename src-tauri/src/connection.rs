@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use uuid::Uuid;
@@ -212,6 +213,7 @@ pub struct Enrollment {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionView {
+    pub navigation_scope: Option<String>,
     pub server: String,
     pub name: String,
     pub mode: String,
@@ -220,7 +222,22 @@ pub struct ConnectionView {
 }
 impl ConnectionView {
     pub fn new(saved: &SavedConnection, state: String, features: Features) -> Self {
+        let navigation_scope = (!saved.server_id.is_empty()
+            && !saved.account_id.is_empty()
+            && !matches!(
+                state.as_str(),
+                "identity-changed"
+                    | "offline"
+                    | "unsupported-server"
+                    | "credential-store-unavailable"
+            ))
+        .then(|| {
+            let binding = serde_json::to_vec(&(&saved.server, &saved.server_id, &saved.account_id))
+                .expect("serializing strings cannot fail");
+            format!("{:x}", Sha256::digest(binding))
+        });
         Self {
+            navigation_scope,
             server: saved.server.clone(),
             name: saved.name.clone(),
             mode: saved.mode.clone(),

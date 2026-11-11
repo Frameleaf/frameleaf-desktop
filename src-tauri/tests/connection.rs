@@ -95,3 +95,48 @@ fn native_origin_checks_include_port_and_userinfo() {
         );
     }
 }
+
+#[test]
+fn navigation_scope_binds_server_origin_identity_and_account_without_using_credentials() {
+    use frameleaf_desktop::connection::{ConnectionView, Features, SavedConnection};
+
+    let mut saved = SavedConnection {
+        server: "https://nas.example/".into(),
+        server_id: "library".into(),
+        account_id: "person".into(),
+        name: "Pat".into(),
+        token: "secret".into(),
+        device_name: "Mac".into(),
+        mode: "client".into(),
+        device_id: None,
+    };
+    let scope = |saved: &SavedConnection, state: &str| {
+        ConnectionView::new(
+            saved,
+            state.into(),
+            Features {
+                enrollment: true,
+                worker: false,
+                worker_session: false,
+                sources: false,
+                native_host: false,
+            },
+        )
+        .navigation_scope
+    };
+    let original = scope(&saved, "ready");
+    assert_eq!(original.as_ref().unwrap().len(), 64);
+    saved.token = "new secret".into();
+    assert_eq!(scope(&saved, "ready"), original);
+    assert_eq!(scope(&saved, "identity-changed"), None);
+    for change in [
+        ("https://other.example/", "library", "person"),
+        ("https://nas.example/", "other-library", "person"),
+        ("https://nas.example/", "library", "other-person"),
+    ] {
+        saved.server = change.0.into();
+        saved.server_id = change.1.into();
+        saved.account_id = change.2.into();
+        assert_ne!(scope(&saved, "ready"), original);
+    }
+}
