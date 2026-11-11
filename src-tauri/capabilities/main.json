@@ -33,6 +33,7 @@
     "allow-reauthenticate-manager",
     "allow-disconnect-manager",
     "allow-installed-local-hosts",
+    "allow-check-local-host-package",
     "allow-local-host-status",
     "allow-prepare-local-host",
     "allow-provision-local-host-profile",

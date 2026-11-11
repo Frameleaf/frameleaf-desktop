@@ -18,6 +18,7 @@ fn main() {
             "install_desktop_update",
             "authorize_local_manager",
             "installed_local_hosts",
+            "check_local_host_package",
             "local_host_status",
             "prepare_local_host",
             "provision_local_host_profile",
