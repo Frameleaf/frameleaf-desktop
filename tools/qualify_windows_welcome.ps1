@@ -337,10 +337,24 @@ try {
     $null = Wait-Control 'Another server'
     Write-Output 'Installed Welcome, native host discovery, and return to connection passed'
 } finally {
-    if ($InstalledHost) {
-        Remove-Item Env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD -ErrorAction SilentlyContinue
-        if ($receipt -and (Test-Path $receipt)) { Remove-Item -LiteralPath $receipt }
-        if ($recoveryRoot) { Remove-Item -LiteralPath $recoveryRoot -Recurse }
+    try {
+        if (!$app.HasExited) {
+            Stop-Process -Id $app.Id -Force
+            if (!$app.WaitForExit(10000)) { Write-Warning 'Desktop did not exit before recovery cleanup.' }
+        }
+    } finally {
+        if ($InstalledHost) {
+            Remove-Item Env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD -ErrorAction SilentlyContinue
+            foreach ($temporaryPath in @($receipt, $recoveryRoot)) {
+                if (!$temporaryPath) { continue }
+                try {
+                    if (Test-Path -LiteralPath $temporaryPath) {
+                        Remove-Item -LiteralPath $temporaryPath -Recurse -ErrorAction Stop
+                    }
+                } catch {
+                    Write-Warning "Could not remove temporary recovery files at $temporaryPath."
+                }
+            }
+        }
     }
-    if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
 }
