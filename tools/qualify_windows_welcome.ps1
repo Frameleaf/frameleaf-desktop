@@ -227,16 +227,28 @@ function Test-InstalledRecovery([string]$State, [string]$Root) {
 
     Press 'Done with database restore'
     Confirm-ServerAction 'Stop' 'Server stop completed.'
+    if (Get-NetTCPConnection -State Listen -LocalPort 2283,54329 -ErrorAction SilentlyContinue) {
+        throw 'The disposable Library and database must be stopped before media recovery'
+    }
     if (Test-Path -LiteralPath $destination) { throw 'Media recovery destination already exists' }
     Expand-Archive -LiteralPath $archive -DestinationPath $destination
     & node $photoTool recovery-media $receipt | Out-Host
     if ($LASTEXITCODE) { throw 'Separate archive original readback failed' }
+    Write-Host ('Recovered photo: ' + (Join-Path $destination 'synthetic-recovery-photo.png'))
+    Write-Host ('Recovered video: ' + (Join-Path $destination 'synthetic-recovery-video.mp4'))
+    if ((Read-Host 'Open the recovered photo at full size and play the recovered video through the end in local viewers. Keep Library stopped. Type yes if both worked') -cne 'yes') {
+        throw 'Offline viewing of the recovered originals was not confirmed'
+    }
+    if (Get-NetTCPConnection -State Listen -LocalPort 2283,54329 -ErrorAction SilentlyContinue) {
+        throw 'The disposable Library must remain stopped during original readback'
+    }
     $media = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
     [ordered]@{
         databaseRestoredToSeparateTarget = $true
         previousDatabaseRetained = $true
         existingLibraryOriginalsReadBack = $true
         independentMediaArchiveRestoredToSeparateFolder = $true
+        recoveredOriginalsOpenedAndPlayedByOperator = $true
         mediaRestoredByDatabaseRecovery = $false
         photoSha256 = $media[0].sha256
         videoSha256 = $media[1].sha256

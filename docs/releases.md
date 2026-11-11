@@ -97,13 +97,17 @@ both originals still read back from the Library's existing media storage.
 
 After stopping the Library, the harness restores the independent archive to a
 new temporary folder and checks the recovered photo and video against their
-original hashes without consulting Library. The archive is a synthetic media
+original hashes without consulting Library. When prompted, open the photo at
+full size and play the video to the end from the listed paths. Confirm only if
+both work while the Library is stopped. The receipt records this operator
+observation separately from the byte checks. The archive is a synthetic media
 backup for this qualification. The database result covers database recovery and
 does not establish that Manager recovers media. The two results are recorded
 separately with the tested executable and manifest hashes. Keep the final JSON
 receipt and discard the disposable profile and terminal transcript, including
 after an interrupted run. This optional path does not change the existing
-installed restart qualification.
+installed restart qualification. Package installation, supported upgrades, and
+interrupted upgrade recovery require their own installed evidence.
 
 ## Build and signing boundaries
 
