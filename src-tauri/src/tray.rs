@@ -492,7 +492,7 @@ mod tests {
             state: state.into(),
             code: code.map(Into::into),
             control,
-            workloads: Vec::new(),
+            ..SetupStatus::default()
         }
     }
 

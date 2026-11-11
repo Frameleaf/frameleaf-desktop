@@ -3,6 +3,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from '../Icon.svelte';
+  import AiLibrary from './AiLibrary.svelte';
   import { workerStatus, runtimeRecoveryMessage } from '../mode-state';
   import { connectionError } from '../errors';
   import { workloadName, workloadPill, workerTone, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
@@ -18,7 +19,7 @@
   let failure = $state('');
   const explain = connectionError;
   const setupState = $derived(setup?.state || connection?.state || '');
-  const headline = $derived(connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : workerStatus({ state: setupState, workerSupported: connection.features.worker }));
+  const headline = $derived(connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : setup?.activeWorkload ? 'Processing on this computer' : workerStatus({ state: setupState, workerSupported: connection.features.worker }));
   const setupDetail = $derived(runtimeRecoveryMessage(setup?.code ?? null) ?? (setup?.code === 'runtime_pack_unavailable'
     ? 'This build does not include a signed AI runtime yet. Photos remain available.'
     : setup?.state === 'model-download-required'
@@ -199,7 +200,7 @@
 
     <div>
       <div class="group-head">
-        <h2 class="group-title">AI processing</h2>
+        <h2 class="group-title">{section === 'ai' ? 'This computer' : 'AI processing'}</h2>
         {#if section === 'all' && canControl}
           <div class="seg" role="group" aria-label="Worker control">
             <button class:on={control === 'running'} aria-pressed={control === 'running'} disabled={busy || !native} onclick={() => controlWorker('running')}>Running</button>
@@ -217,6 +218,23 @@
           {#if connection.state === 'awaiting-approval'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Approval</button>{/if}
           {#if setup?.state === 'setup-needs-attention'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(false)}>Retry Setup</button>{/if}
         </div>
+        {#if section === 'ai'}
+          {#if setup?.activeWorkload}
+            <div class="row"><span class="l"><b>{workloadName(setup.activeWorkload)}</b><small>Processing on this computer</small></span></div>
+          {/if}
+          <div class="row" class:top={!!setup?.models?.download}>
+            <span class="l">
+              <b>Selected model files</b>
+              <small>{setup?.models ? `${formatBytes(setup.models.verifiedBytes)} verified on this computer · ${formatBytes(setup.models.totalBytes)} needed` : 'Storage unknown'}</small>
+              {#if setup?.models?.download}
+                {@const transfer = setup.models.download}
+                {@const downloaded = Math.min(100, Math.round(transfer.receivedBytes / transfer.totalBytes * 100))}
+                <small>Downloading a model file · {formatBytes(transfer.receivedBytes)} of {formatBytes(transfer.totalBytes)}</small>
+                <span class="progress" role="progressbar" aria-valuenow={downloaded} aria-valuemin="0" aria-valuemax="100" aria-label="Model file download"><span style="width:{downloaded}%"></span></span>
+              {/if}
+            </span>
+          </div>
+        {/if}
         {#each setup?.workloads ?? [] as workload (workload.workload)}
           {@const pill = workloadPill(workload.state)}
           <div class="row">
@@ -227,6 +245,12 @@
       </div>
       <p class="foot">{connectionDetail} Server administration uses your existing Frameleaf permissions inside Photos.</p>
     </div>
+
+    {#if section === 'ai'}
+      {#key JSON.stringify([connection.server, summary?.me?.id])}
+        <AiLibrary {native} server={connection.server} accountId={summary?.me?.id} admin={summary?.me?.isAdmin === true} connected={connection.state !== 'offline' && connection.state !== 'identity-changed'} />
+      {/key}
+    {/if}
 
     {#if section === 'all'}
       <div>
