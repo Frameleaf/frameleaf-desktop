@@ -940,17 +940,14 @@ async fn prepare(
                     Err(code) => return Err(code),
                 };
                 check_cancel(&progress.cancelled)?;
-                if accepted
-                    .write_evidence(
-                        &paths.data.join("qualification-evidence"),
-                        &paths.app_version,
-                        profile,
-                        &installed,
-                        &qualified,
-                    )
-                    .is_err()
-                {
-                    eprintln!("worker_qualification_evidence_write_failed");
+                if let Err(code) = accepted.write_evidence(
+                    &paths.data.join("qualification-evidence"),
+                    &paths.app_version,
+                    profile,
+                    &installed,
+                    &qualified,
+                ) {
+                    eprintln!("worker_qualification_evidence_failed: {code}");
                 }
                 group_prepared.push((qualified, accepted));
             }
