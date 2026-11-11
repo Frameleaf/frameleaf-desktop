@@ -88,12 +88,18 @@
       message = explain(error);
     } finally { busy = false; }
   }
-  async function changeShortcut() {
-    if (shortcut === null) return;
+  async function manageShortcut(enabled?: boolean) {
     shortcutBusy = true;
-    shortcutMessage = '';
-    try { shortcut = await invoke<boolean | null>('explorer_import_shortcut', { enabled: !shortcut }); }
-    catch { shortcutMessage = 'Frameleaf could not change the Explorer shortcut.'; }
+    try {
+      shortcut = await invoke<boolean | null>('explorer_import_shortcut', { enabled });
+      shortcutMessage = '';
+    }
+    catch (error) {
+      shortcut = null;
+      shortcutMessage = String(error) === 'explorer_shortcut_conflict'
+        ? 'Frameleaf can’t verify the existing Import to Frameleaf shortcut. Rename it in the File Explorer Send to folder, then check again.'
+        : 'Frameleaf couldn’t access the File Explorer Send to folder. Check again in a moment.';
+    }
     finally { shortcutBusy = false; }
   }
   onMount(() => {
@@ -118,7 +124,7 @@
         if (connected) await refresh();
       }
       if (live && connected) {
-        shortcut = await invoke<boolean | null>('explorer_import_shortcut').catch(() => null);
+        await manageShortcut();
       }
     })().catch(error => { if (live) message = explain(error); });
     return () => { live = false; listeners.forEach(stop => stop()); };
@@ -164,11 +170,15 @@
     <p>Drop one folder or up to 100 photos and videos from the same folder into this window.</p>
     {#if status}<button class="btn small" onclick={() => { open = true; }}>File import</button>{/if}
   </div>
-  {#if shortcut !== null}
+  {#if shortcut !== null || shortcutMessage}
     <div class="inline-msg drop-entry">
-      <p>{shortcut ? 'In File Explorer, select items and choose Send to → Import to Frameleaf.' : 'Add an Import to Frameleaf shortcut to the File Explorer Send to menu.'}</p>
-      <button class="btn small" type="button" disabled={shortcutBusy} onclick={changeShortcut}>{shortcut ? 'Remove Explorer Shortcut' : 'Add Explorer Shortcut'}</button>
-      {#if shortcutMessage}<p role="status">{shortcutMessage}</p>{/if}
+      {#if shortcut === null}
+        <p role="status">{shortcutMessage}</p>
+        <button class="btn small" type="button" disabled={shortcutBusy} onclick={() => manageShortcut()}>Check Again</button>
+      {:else}
+        <p>{shortcut ? 'In File Explorer, select items and choose Send to → Import to Frameleaf.' : 'Add an Import to Frameleaf shortcut to the File Explorer Send to menu.'}</p>
+        <button class="btn small" type="button" disabled={shortcutBusy} onclick={() => manageShortcut(!shortcut)}>{shortcut ? 'Remove Explorer Shortcut' : 'Add Explorer Shortcut'}</button>
+      {/if}
     </div>
   {/if}
 {/if}
