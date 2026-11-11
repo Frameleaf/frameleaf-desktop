@@ -1,3 +1,4 @@
+mod camera_identity;
 mod camera_sources;
 pub mod cloud_account;
 pub mod connection;
@@ -582,6 +583,7 @@ pub fn run() {
             prepare_models,
             control_worker,
             discover_camera_folders,
+            reconnect_photo_camera,
             discover_onedrive,
             media_copy::preservation_copy_packages,
             media_copy::save_preservation_copy,
@@ -957,6 +959,58 @@ async fn choose_photo_folder(
     })
     .await
     .map_err(|_| "source_inventory_failed")?
+}
+
+#[tauri::command]
+async fn reconnect_photo_camera(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Option<source_import::ImportView>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    require_local(&window)?;
+    let (source_id, original) = {
+        let current = state.0.lock().await;
+        let saved = current.as_ref().ok_or("sign_in_required")?;
+        let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
+            .ok_or("source_approval_required")?;
+        let identity = credentials::identity()?;
+        let approval = consent.approval(saved, &identity)?;
+        if !consent.camera() || approval.media().is_none() {
+            return Err("source_camera_identity_unavailable".into());
+        }
+        (
+            consent.source_id().to_string(),
+            approval.root().to_path_buf(),
+        )
+    };
+    let picker_app = app.clone();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        let mut picker = picker_app
+            .dialog()
+            .file()
+            .set_title("Choose the same camera folder to resume");
+        if original.is_dir() {
+            picker = picker.set_directory(original);
+        }
+        picker
+            .blocking_pick_folder()
+            .map(|folder| folder.into_path().map_err(|_| "source_folder_invalid"))
+            .transpose()
+    })
+    .await
+    .map_err(|_| "source_inventory_failed")??;
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let base = import_base(&app)?;
+    let jobs = app.state::<source_import::SourceJobs>();
+    jobs.reconnect_camera(base.clone(), saved.clone(), source_id, path)
+        .await?;
+    jobs.start(app.clone(), base, saved.clone()).await.map(Some)
 }
 
 #[tauri::command]

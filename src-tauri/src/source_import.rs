@@ -131,6 +131,15 @@ impl Cursor {
         Ok(())
     }
 }
+const CAMERA_LOCATION: &str = "camera-location.json";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CameraLocation {
+    manifest_hash: String,
+    path: PathBuf,
+}
+
 struct Journal {
     root: PathBuf,
 }
@@ -299,14 +308,20 @@ fn manifest_for(
     if base.starts_with(approval.root()) || approval.root().starts_with(base) {
         return Err("source_staging_overlap".into());
     }
-    let scan = crate::photo_sources::scan(approval.root(), 10_000)?;
+    let scan = if let Some(media) = approval.media() {
+        crate::photo_sources::scan_camera(approval.root(), media)?
+    } else {
+        crate::photo_sources::scan(approval.root(), 10_000)?
+    };
     if scan.inventory.truncated {
         return Err("source_inventory_partial".into());
     }
     if scan.unreadable > 0 {
         return Err("source_inventory_unreadable".into());
     }
-    make_manifest(consent, approval, scan)
+    let mut manifest = make_manifest(consent, approval, scan)?;
+    approval.bind_camera_fingerprints(&mut manifest.files)?;
+    Ok(manifest)
 }
 fn make_manifest(
     consent: &Consent,
@@ -372,6 +387,72 @@ fn load(
     cursor.validate(&manifest)?;
     Ok((manifest, cursor))
 }
+fn camera_location(
+    journal: &Journal,
+    manifest: &Manifest,
+    identity: &DeviceIdentity,
+    approval: &crate::copy_source::CopyApproval,
+) -> Result<Option<PathBuf>, String> {
+    match fs::symlink_metadata(journal.root.join(CAMERA_LOCATION)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        _ => {}
+    }
+    let location: CameraLocation = journal.read(CAMERA_LOCATION, identity)?;
+    if approval.media().is_none()
+        || location.manifest_hash != digest(manifest)?
+        || !location.path.is_absolute()
+    {
+        return Err("source_journal_invalid".into());
+    }
+    Ok(Some(location.path))
+}
+
+fn reconnect_camera_at(
+    journal: &Journal,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    consent: &Consent,
+    root: PathBuf,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let _no_materialization = crate::photo_sources::metadata_only::Guard::new()?;
+    let approval = consent.approval(saved, identity)?;
+    if !consent.camera() || approval.media().is_none() {
+        return Err("source_camera_identity_unavailable".into());
+    }
+    let (manifest, cursor) = load(journal, identity, consent, saved)?;
+    if matches!(cursor.state.as_str(), "complete" | "cancelled") {
+        return Err("source_run_terminal".into());
+    }
+    if root.starts_with(&journal.root) || journal.root.starts_with(&root) {
+        return Err("source_staging_overlap".into());
+    }
+    let directory = approval.open_source(&root)?;
+    let mounted = crate::copy_source::root_identity(&directory)?;
+    let (volume, _) = mounted
+        .split_once(':')
+        .ok_or("source_camera_identity_unavailable")?;
+    // Verified originals and any verified receipt awaiting its album already have durable proof.
+    let first = cursor.position
+        + usize::from(
+            cursor
+                .active
+                .as_ref()
+                .is_some_and(|active| active.receipt.is_some()),
+        );
+    for entry in &manifest.files[first..] {
+        approval.require_camera_file(&directory, volume, entry)?;
+    }
+    journal.write(
+        CAMERA_LOCATION,
+        &CameraLocation {
+            manifest_hash: digest(&manifest)?,
+            path: root,
+        },
+        identity,
+    )
+}
+
 struct SourceApi<'a> {
     client: &'a Client,
     base: &'a url::Url,
@@ -527,6 +608,12 @@ async fn execute(
     notify: &(dyn Fn(ImportView) + Sync),
 ) -> Result<(), String> {
     let (manifest, mut cursor) = load(journal, identity, consent, saved)?;
+    let approval = consent.approval(saved, identity)?;
+    let reconnected = if approval.media().is_some() {
+        camera_location(journal, &manifest, identity, approval)?
+    } else {
+        None
+    };
     if matches!(cursor.state.as_str(), "cancelled" | "complete") {
         return Err("source_run_terminal".into());
     }
@@ -619,6 +706,7 @@ async fn execute(
                         id,
                         Some(entry.bytes),
                         entry.watch_version.as_deref(),
+                        reconnected.as_deref(),
                         cancel,
                         gate,
                     );
@@ -920,7 +1008,15 @@ impl SourceJobs {
         {
             load(&journal, &identity, &consent, saved)?
         } else {
-            let manifest = manifest_for(&consent, saved, &identity, base)?;
+            let saved = saved.clone();
+            let base = base.to_path_buf();
+            let (manifest, identity) = tauri::async_runtime::spawn_blocking(move || {
+                let manifest = manifest_for(&consent, &saved, &identity, &base);
+                (manifest, identity)
+            })
+            .await
+            .map_err(|_| "source_inventory_failed")?;
+            let manifest = manifest?;
             let cursor = Cursor::new(&manifest)?;
             journal.write("manifest.json", &manifest, &identity)?;
             journal.write("cursor.json", &cursor, &identity)?;
@@ -1095,6 +1191,25 @@ impl SourceJobs {
         *self.running.lock().await = Some(Running { cancel, task, wake });
         Ok(value)
     }
+    pub(crate) async fn reconnect_camera(
+        &self,
+        base: PathBuf,
+        saved: SavedConnection,
+        source_id: String,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.stop().await;
+        let credential = self.credential;
+        tauri::async_runtime::spawn_blocking(move || {
+            let identity = credentials::identity()?;
+            let consent = current(credential, &saved, &identity, &source_id)?;
+            let journal = Journal::new(&base, consent.source_id())?;
+            reconnect_camera_at(&journal, &saved, &identity, &consent, path)
+        })
+        .await
+        .map_err(|_| "source_inventory_failed")?
+    }
+
     pub async fn pause_watch(
         &self,
         base: &Path,
@@ -1586,6 +1701,120 @@ mod tests {
             let _ = fs::remove_dir_all(&self.base);
         }
     }
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn reconnect_binds_the_remounted_folder_to_the_same_signed_run_and_preserves_progress() {
+        let f = Fixture::new();
+        let original = f.base.join("source");
+        fs::write(original.join("already-verified.jpg"), b"verified").unwrap();
+        let selector = crate::source_consent::SourceConsent::default();
+        let chosen = selector
+            .select_camera(selector.generation().unwrap(), original.clone())
+            .unwrap();
+        let album = Destination {
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            name: "Trip".into(),
+            shared: false,
+        };
+        let mut consent = selector
+            .approve(
+                &f.saved,
+                &f.identity,
+                &chosen.selection_id,
+                true,
+                false,
+                Some(album.clone()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        consent.registered = true;
+        let approval = consent.approval(&f.saved, &f.identity).unwrap();
+        assert!(
+            approval.media().is_some(),
+            "fixture volume must provide a durable identity"
+        );
+        let manifest = manifest_for(&consent, &f.saved, &f.identity, &f.base.join("data")).unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        let journal = Journal::new(&f.base.join("data"), consent.source_id()).unwrap();
+        let mut cursor = Cursor::new(&manifest).unwrap();
+        cursor.position = 1;
+        cursor.state = "paused".into();
+        journal
+            .write("manifest.json", &manifest, &f.identity)
+            .unwrap();
+        journal.write("cursor.json", &cursor, &f.identity).unwrap();
+        let saved_cursor = fs::read(journal.root.join("cursor.json")).unwrap();
+
+        fs::remove_file(original.join("already-verified.jpg")).unwrap();
+        let remount = f.base.join("remounted");
+        fs::rename(&original, &remount).unwrap();
+        reconnect_camera_at(&journal, &f.saved, &f.identity, &consent, remount.clone()).unwrap();
+        let (after, current) = load(&journal, &f.identity, &consent, &f.saved).unwrap();
+        assert_eq!(after.id, manifest.id);
+        assert_eq!(after.destination, Some(album));
+        assert_eq!(current.position, 1);
+        assert_eq!(
+            fs::read(journal.root.join("cursor.json")).unwrap(),
+            saved_cursor
+        );
+        let location = camera_location(&journal, &after, &f.identity, approval).unwrap();
+        assert_eq!(location.as_deref(), Some(remount.as_path()));
+
+        let entry = &after.files[current.position];
+        let staged = approval
+            .stage_to(
+                &f.saved,
+                &f.identity,
+                &entry.relative,
+                &journal.root.join("stage"),
+                &uuid::Uuid::new_v4().to_string(),
+                Some(entry.bytes),
+                entry.watch_version.as_deref(),
+                location.as_deref(),
+                &AtomicBool::new(false),
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(staged.version(), entry.watch_version.clone().unwrap());
+
+        let checkpoint = fs::read(journal.root.join(CAMERA_LOCATION)).unwrap();
+        fs::rename(&remount, f.base.join("retained-original")).unwrap();
+        fs::create_dir(&remount).unwrap();
+        fs::write(remount.join("photo.jpg"), b"abcdefghij").unwrap();
+        assert_eq!(
+            reconnect_camera_at(&journal, &f.saved, &f.identity, &consent, remount.clone())
+                .unwrap_err(),
+            "source_camera_changed"
+        );
+        assert_eq!(
+            fs::read(journal.root.join(CAMERA_LOCATION)).unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            approval.open_source(&remount).err().as_deref(),
+            Some("source_camera_changed")
+        );
+
+        fs::remove_dir_all(&remount).unwrap();
+        fs::rename(f.base.join("retained-original"), &remount).unwrap();
+        fs::write(remount.join(&entry.relative), b"changed123").unwrap();
+        assert_eq!(
+            reconnect_camera_at(&journal, &f.saved, &f.identity, &consent, remount).unwrap_err(),
+            "source_camera_changed"
+        );
+        assert_eq!(
+            fs::read(journal.root.join(CAMERA_LOCATION)).unwrap(),
+            checkpoint
+        );
+
+        let mut other_run = after;
+        other_run.id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            camera_location(&journal, &other_run, &f.identity, approval).unwrap_err(),
+            "source_journal_invalid"
+        );
+    }
+
     #[test]
     fn pending_album_attachment_restarts_from_the_verified_receipt_without_uploading_again() {
         tauri::async_runtime::block_on(async {
@@ -1938,6 +2167,7 @@ mod tests {
                     &f.journal.root.join("stage"),
                     &attempt,
                     Some(data.len() as u64),
+                    None,
                     None,
                     &AtomicBool::new(false),
                     &gate
