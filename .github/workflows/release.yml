@@ -318,6 +318,27 @@ jobs:
           pattern: signed-installers-*
           merge-multiple: true
           path: release-assets
+      - name: Install the updater signature verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - name: Verify updater signatures and create the manifest
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+          import { updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
+          const dir = "release-assets";
+          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
+          const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
+          const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
+          const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+          for (const name of packages) verifyUpdaterAsset(`${dir}/${name}`, signatures[name], updater.pubkey, manifest.version);
+          writeFileSync(`${dir}/latest.json`, JSON.stringify(manifest, null, 2) + "\n");
+          JS
       - name: Create checksums and a draft release after every target succeeds
         env:
           GH_TOKEN: ${{ github.token }}
@@ -326,15 +347,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node --input-type=module <<'JS'
-          import { readFileSync, readdirSync, writeFileSync } from "node:fs";
-          import { updateManifest } from "./tools/release_inputs.mjs";
-          const dir = "release-assets";
-          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
-          const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
-          const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
-          writeFileSync(`${dir}/latest.json`, JSON.stringify(manifest, null, 2) + "\n");
-          JS
           cd release-assets
           sha256sum -- * > SHA256SUMS
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
