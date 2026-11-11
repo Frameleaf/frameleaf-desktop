@@ -945,6 +945,15 @@ impl HostMode {
     }
 }
 
+#[cfg(windows)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalMedia<'a> {
+    path: &'a Path,
+    identity: &'a str,
+    path_binding: crate::windows_protection::StatePathBinding,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostStart<'a> {
@@ -952,6 +961,9 @@ struct HostStart<'a> {
     state: &'a Path,
     #[cfg(windows)]
     state_path_binding: crate::windows_protection::StatePathBinding,
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_media: Option<ExternalMedia<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     database_reference: Option<&'a crate::host_database::Reference>,
     runtime: &'a Path,
@@ -968,6 +980,8 @@ struct HostOwner {
     tree: crate::process_tree::ProcessTree,
     terminated: Mutex<bool>,
     _code_lease: crate::package_lease::CodeLease,
+    #[cfg(windows)]
+    _external_media: Option<crate::host_state::media_move::PinnedMedia>,
 }
 impl HostOwner {
     fn terminate(&self) {
@@ -1101,6 +1115,24 @@ impl VerifiedHostRuntime {
             direct_profile(state)?;
             (None, None)
         };
+        #[cfg(windows)]
+        let external_media = owner
+            .as_ref()
+            .and_then(|owner| owner.media_reference())
+            .map(|reference| reference.resolve(requested_state))
+            .transpose()?;
+        #[cfg(windows)]
+        let external_config = external_media
+            .as_ref()
+            .map(|media| {
+                crate::host_control::separate_paths(&self.root, &media.path)?;
+                Ok::<_, String>(ExternalMedia {
+                    path: &media.path,
+                    identity: &media.identity,
+                    path_binding: crate::windows_protection::state_path_binding(&media.path)?,
+                })
+            })
+            .transpose()?;
         self.check_files()?;
         if password.len() < 24
             || password.len() > 512
@@ -1150,6 +1182,8 @@ impl VerifiedHostRuntime {
                 #[cfg(windows)]
                 state_path_binding: crate::windows_protection::state_path_binding(state)
                     .map_err(|_| "host_state_not_private")?,
+                #[cfg(windows)]
+                external_media: external_config,
                 database_reference: if mode.uses_database() {
                     database_reference.as_ref()
                 } else {
@@ -1226,6 +1260,8 @@ impl VerifiedHostRuntime {
             tree,
             terminated: Mutex::new(false),
             _code_lease: code_lease,
+            #[cfg(windows)]
+            _external_media: external_media,
         });
         let pid = child.id();
         let (input_sender, pending_input) = mpsc::channel();
@@ -1654,6 +1690,8 @@ mod checkpoint_tests {
                 tree: crate::process_tree::ProcessTree::attach(&child).unwrap(),
                 terminated: Mutex::new(false),
                 _code_lease: crate::package_lease::CodeLease::acquire(&profile).unwrap(),
+                #[cfg(windows)]
+                _external_media: None,
             });
             let (_, ready) = mpsc::channel();
             let (exit_sender, exited) = mpsc::channel();
@@ -1764,6 +1802,8 @@ mod checkpoint_tests {
             tree: crate::process_tree::ProcessTree::attach(&child).unwrap(),
             terminated: Mutex::new(false),
             _code_lease: crate::package_lease::CodeLease::acquire(&profile).unwrap(),
+            #[cfg(windows)]
+            _external_media: None,
         });
         let (_, ready) = mpsc::channel();
         let (_, exited) = mpsc::channel();

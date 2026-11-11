@@ -771,9 +771,30 @@ export async function readHostDatabase(profile, supplied, pathBinding) {
   } catch { fail("host_database_reference_invalid"); }
 }
 
+/** The native owner pins the directory; confirm Node resolves the same volume and file ID. */
+export async function readHostMedia(c) {
+  if (c.externalMedia === undefined) return join(c.state, "media");
+  try {
+    const { path, identity, pathBinding } = c.externalMedia;
+    if (process.platform !== "win32" || c.mode !== "server" ||
+        typeof path !== "string" || !isAbsolute(path) ||
+        typeof identity !== "string" || !/^[a-f0-9]{64}$/.test(identity) ||
+        !pathBinding || pathBinding.physicalRoot !== path ||
+        !await isCanonicalHostPath(path, pathBinding)) fail("host_media_reference_invalid");
+    const meta = await fs.lstat(path, { bigint: true });
+    if (!meta.isDirectory() || meta.isSymbolicLink() || meta.ino <= 0n ||
+        createHash("sha256").update(`${meta.dev}:${meta.ino >> 32n}:${meta.ino & 0xffffffffn}`).digest("hex") !== identity) {
+      fail("host_media_reference_invalid");
+    }
+    return path;
+  } catch { fail("host_media_reference_invalid"); }
+}
+
 /** Keep initialization and shutdown inside one validated private profile. */
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
+  if (c.externalMedia !== undefined && restoreSession !== undefined) fail("host_media_reference_invalid");
+  await readHostMedia(c);
   const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
   const validateOnly = restoreSession?.[RESTORE_VALIDATION] === true;
   if ((restoreSession !== undefined && !restoreOnly && !validateOnly) || (validateOnly && c.mode !== "database")) fail("host_restore_authority_invalid");
@@ -826,7 +847,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  for (const name of databaseOnly || restoreOnly ? ["home"] : ["home", "media", "studio-trust", "studio-work"]) {
+  for (const name of databaseOnly || restoreOnly ? ["home"] : ["home", ...(c.externalMedia === undefined ? ["media"] : []), "studio-trust", "studio-work"]) {
     const path = join(c.state, name);
     try {
       await fs.mkdir(path, { mode: 0o700 });
@@ -1067,7 +1088,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
           DB_DATABASE_NAME: "frameleaf",
           FRAMELEAF_HOST: "127.0.0.1",
           FRAMELEAF_PORT: String(c.apiPort),
-          FRAMELEAF_MEDIA_LOCATION: join(c.state, "media"),
+          FRAMELEAF_MEDIA_LOCATION: await readHostMedia(c),
           FRAMELEAF_BUILD_DATA: join(c.runtime, "build"),
           FRAMELEAF_HDR_BINDING: executable("hdr"),
           FRAMELEAF_WORKERS_INCLUDE: "api,microservices",

@@ -13,6 +13,10 @@ fn main() {
             }
         }
         [mode] if mode == "--owner-pipe" => frameleaf_desktop::host_control::run(),
+        #[cfg(windows)]
+        [mode] if mode == "--media-move-owner" => {
+            frameleaf_desktop::host_control::media_move_owner()
+        }
         [mode] if mode == "--inspect-owner" => frameleaf_desktop::host_control::inspect_owner(),
         [mode, manifest, controller]
             if mode == "--prepare-install"

@@ -1,5 +1,5 @@
 //! Candidate native media transaction. A selected destination stays fenced until an installed
-//! Manager/owner handshake can admit writers there. This module has no IPC or UI entry point.
+//! Manager/owner handshake can admit writers there.
 use super::{
     activation, identity, options, valid_sized_file, Marker, Owner, SafetySnapshot, MEDIA_MOVE,
 };
@@ -17,6 +17,8 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(any(windows, test))]
+const CUTOVER: &str = "cutover.json";
 const INVALID: &str = "host_media_move_invalid";
 const CHANGED: &str = "host_media_move_changed";
 const CANCELLED: &str = "host_media_move_cancelled";
@@ -143,6 +145,9 @@ impl Review {
         super::no_media_move(&owner.root)?;
         owner.check_movable(installation_id, manifest)?;
         let marker = owner.inspect(installation_id, manifest)?;
+        if marker.media_reference.is_some() {
+            return Err(INVALID.into());
+        }
         let backup: SafetySnapshot = serde_json::from_value(backup).map_err(|_| INVALID)?;
         verify_backup(&owner, &marker, library_id, &backup)?;
         let source = source(&owner)?;
@@ -283,6 +288,10 @@ impl Approval {
     ) -> Result<Status, String> {
         let owner = self.open(profile, device)?;
         let journal = self.journal(&owner)?;
+        #[cfg(any(windows, test))]
+        if activation::read_record(&journal, CUTOVER)?.is_some() {
+            return Err(INVALID.into());
+        }
         let previous = self.has_rollback(&journal, device)?;
         if activation::read_record(&owner.root, MEDIA_MOVE)?.is_none() && previous {
             return Ok(Status::RolledBack);
@@ -320,6 +329,9 @@ impl Approval {
         let mut owner = Owner::acquire(profile, true)?;
         let expected = &self.review.owner;
         owner.check_movable(&expected.installation_id, &expected.manifest_sha256)?;
+        if expected.media_reference.is_some() {
+            return Err(INVALID.into());
+        }
         if owner.inspect(&expected.installation_id, &expected.manifest_sha256)? != *expected {
             return Err(CHANGED.into());
         }
@@ -474,6 +486,262 @@ impl Approval {
             Some(raw) if raw == self.rollback_record(device)?.as_bytes() => Ok(true),
             Some(_) => Err(INVALID.into()),
         }
+    }
+}
+
+/// Written only by the protected owner. Paths from IPC cannot become media roots.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MediaReference {
+    pub path: PathBuf,
+    pub identity: String,
+    parent_identity: String,
+}
+
+#[cfg(windows)]
+pub(crate) struct PinnedMedia {
+    pub path: PathBuf,
+    pub identity: String,
+    _pins: Vec<std::fs::File>,
+}
+
+impl MediaReference {
+    #[cfg(not(windows))]
+    pub(crate) fn resolve(&self, _profile: &Path) -> Result<(), String> {
+        Err(INVALID.into())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn resolve(&self, profile: &Path) -> Result<PinnedMedia, String> {
+        let parent = self.path.parent().ok_or(INVALID)?;
+        let target = Target::open(profile, parent)?;
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(INVALID)?;
+        let pins = crate::windows_protection::pin_private_directory(&self.path)?;
+        if identity(&target.directory)? != self.parent_identity
+            || identity(&child(&target.directory, name)?)? != self.identity
+        {
+            return Err(CHANGED.into());
+        }
+        let path = crate::windows_protection::stable_state_path(&self.path)?;
+        Ok(PinnedMedia {
+            path,
+            identity: self.identity.clone(),
+            _pins: pins,
+        })
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CutoverRequest {
+    protocol_version: u32,
+    operation_id: Uuid,
+    binding: CutoverBinding,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CutoverBinding {
+    move_id: Uuid,
+    secure_installation_id: Uuid,
+    manifest_sha256: String,
+    library_id: String,
+    profile_identity: String,
+    source_generation: Uuid,
+    source_identity: String,
+    target_identity: String,
+    staged_identity: String,
+    approval_sha256: String,
+    copy_receipt_sha256: String,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Decision {
+    Target,
+    Original,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CutoverIntent {
+    request: CutoverRequest,
+    decision: Decision,
+    generation: Uuid,
+}
+
+#[cfg(any(windows, test))]
+impl CutoverRequest {
+    #[cfg(windows)]
+    pub(crate) fn matches_host(&self, secure: Uuid, manifest: &str) -> bool {
+        self.protocol_version == 1
+            && !self.operation_id.is_nil()
+            && !self.binding.move_id.is_nil()
+            && self.binding.secure_installation_id == secure
+            && self.binding.manifest_sha256 == manifest
+    }
+
+    pub(crate) fn apply_or_inspect(
+        self,
+        mut owner: Owner,
+        installation_id: &str,
+        device: &DeviceIdentity,
+        decision: Option<Decision>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<serde_json::Value, String> {
+        if self.protocol_version != 1
+            || self.operation_id.is_nil()
+            || self.binding.move_id.is_nil()
+            || self.binding.secure_installation_id != owner.secure_installation_id()
+        {
+            return Err(INVALID.into());
+        }
+        let binding = &self.binding;
+        let move_id = binding.move_id;
+        let journal_path = owner.path.join("media-moves").join(move_id.to_string());
+        #[cfg(windows)]
+        let _journal_pins = crate::windows_protection::pin_private_directory(&journal_path)?;
+        let journal = Dir::from_std_file(crate::host_storage::directory(&journal_path)?);
+        let raw = activation::read_record(&journal, "approval.json")?.ok_or(INVALID)?;
+        let approval: Approval = serde_json::from_slice(&raw).map_err(|_| INVALID)?;
+        let review = &approval.review;
+        let source_marker = &review.owner;
+        if approval.signature != sign(device, "approval", review)?
+            || move_id != review.operation_id
+            || installation_id != source_marker.installation_id
+            || binding.manifest_sha256 != source_marker.manifest_sha256
+            || binding.profile_identity != source_marker.profile_identity
+            || binding.source_generation != source_marker.generation
+            || binding.library_id != review.library_id
+            || binding.source_identity != review.source_identity
+            || binding.target_identity != review.target_identity
+            || binding.approval_sha256 != digest(&raw)
+            || source_marker.media_reference.is_some()
+        {
+            return Err(INVALID.into());
+        }
+        let copy = approval.receipt(&journal, device)?.ok_or(INVALID)?;
+        if binding.staged_identity != copy.stage_identity
+            || binding.copy_receipt_sha256 != digest(&bytes(&copy)?)
+            || approval.copied_status(&journal, &copy, device)? != Status::SelectedFenced
+        {
+            return Err(INVALID.into());
+        }
+        let reference = MediaReference {
+            path: review.target.join(format!("frameleaf-media-{move_id}")),
+            identity: copy.stage_identity.clone(),
+            parent_identity: copy.target_identity.clone(),
+        };
+        let current = owner.inspect(installation_id, &binding.manifest_sha256)?;
+        let mut output = serde_json::to_value(&self).map_err(|_| INVALID)?;
+        let complete = |mut output: serde_json::Value, intent: &CutoverIntent| {
+            let target = intent.decision == Decision::Target;
+            output["state"] = serde_json::json!(if target {
+                "target-admitted"
+            } else {
+                "original-restored"
+            });
+            output["writerFence"] = serde_json::json!("released");
+            output["activeMediaIdentity"] = serde_json::json!(if target {
+                &binding.staged_identity
+            } else {
+                &binding.source_identity
+            });
+            output["generation"] = serde_json::json!(intent.generation);
+            output
+        };
+        let intent: Option<CutoverIntent> = activation::read_record(&journal, CUTOVER)?
+            .map(|raw| serde_json::from_slice(&raw).map_err(|_| INVALID))
+            .transpose()?;
+        let expected = |intent: &CutoverIntent| {
+            let mut marker = source_marker.clone();
+            if intent.decision == Decision::Target {
+                marker.generation = intent.generation;
+                marker.media_reference = Some(reference.clone());
+            }
+            marker
+        };
+        if let Some(previous) = &intent {
+            if previous.request != self
+                || decision.is_some_and(|decision| decision != previous.decision)
+                || previous.generation.is_nil()
+                || (previous.decision == Decision::Target)
+                    == (previous.generation == source_marker.generation)
+                || (current != *source_marker && current != expected(previous))
+            {
+                return Err(INVALID.into());
+            }
+        } else if current != *source_marker {
+            return Err(CHANGED.into());
+        }
+        if activation::read_record(&owner.root, MEDIA_MOVE)?.is_none() {
+            let previous = intent.as_ref().ok_or(INVALID)?;
+            if current != expected(previous) {
+                return Err(CHANGED.into());
+            }
+            if previous.decision == Decision::Target {
+                reference.resolve(&owner.path)?;
+            } else if !approval.has_rollback(&journal, device)? {
+                return Err(INVALID.into());
+            }
+            return Ok(complete(output, previous));
+        }
+        approval.require_fence(&owner)?;
+        let Some(decision) = decision else {
+            output["state"] = serde_json::json!("selected-fenced");
+            output["writerFence"] = serde_json::json!("held");
+            return Ok(output);
+        };
+        if approval.has_rollback(&journal, device)? && decision != Decision::Original {
+            return Err(INVALID.into());
+        }
+        owner.check_movable(installation_id, &binding.manifest_sha256)?;
+        verify_backup(&owner, source_marker, &review.library_id, &review.backup)?;
+        approval.verified_source(&owner, &cancelled)?;
+        let _pins = if decision == Decision::Target {
+            let target = approval.target(&owner.path)?;
+            approval.verify_stage(&target, &target.stage(move_id), &copy, &cancelled)?;
+            Some(reference.resolve(&owner.path)?)
+        } else {
+            None
+        };
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
+        // Once intent is durable, only the same Manager operation and decision can resume.
+        let intent = intent.unwrap_or_else(|| CutoverIntent {
+            request: self.clone(),
+            decision,
+            generation: if decision == Decision::Target {
+                Uuid::new_v4()
+            } else {
+                source_marker.generation
+            },
+        });
+        persist(&journal, CUTOVER, &bytes(&intent)?)?;
+        if decision == Decision::Target {
+            let marker = expected(&intent);
+            if current != marker {
+                owner.write(&marker)?;
+            }
+        } else {
+            persist(
+                &journal,
+                "rolled-back.json",
+                approval.rollback_record(device)?.as_bytes(),
+            )?;
+        }
+        owner.root.remove_file(MEDIA_MOVE).map_err(|_| INVALID)?;
+        activation::sync_directory(&owner.root)?;
+        Ok(complete(output, &intent))
     }
 }
 
@@ -831,6 +1099,131 @@ mod tests {
             .unwrap()
             .write_all(contents)
             .unwrap();
+    }
+
+    fn selected(f: &Fixture) -> CutoverRequest {
+        let approval = f.approval();
+        approval.copy(&f.profile, &f.device, || false).unwrap();
+        approval
+            .select_fenced(&f.profile, &f.device, || false)
+            .unwrap();
+        let owner = Owner::acquire(&f.profile, true).unwrap();
+        let journal = approval.journal(&owner).unwrap();
+        let copy = approval.receipt(&journal, &f.device).unwrap().unwrap();
+        CutoverRequest {
+            protocol_version: 1,
+            operation_id: Uuid::new_v4(),
+            binding: CutoverBinding {
+                move_id: approval.review.operation_id,
+                secure_installation_id: owner.secure_installation_id(),
+                manifest_sha256: f.sha.clone(),
+                library_id: LIBRARY.into(),
+                profile_identity: approval.review.owner.profile_identity,
+                source_generation: approval.review.owner.generation,
+                source_identity: approval.review.source_identity,
+                target_identity: copy.target_identity.clone(),
+                staged_identity: copy.stage_identity.clone(),
+                approval_sha256: copy.approval_sha256.clone(),
+                copy_receipt_sha256: digest(&bytes(&copy).unwrap()),
+            },
+        }
+    }
+
+    fn owner_request(
+        f: &Fixture,
+        request: &CutoverRequest,
+        decision: Option<Decision>,
+    ) -> Result<serde_json::Value, String> {
+        let owner = Owner::acquire(&f.profile, true).unwrap();
+        request
+            .clone()
+            .apply_or_inspect(owner, ID, &f.device, decision, || false)
+    }
+
+    #[test]
+    fn protected_cutover_binds_manager_operation_and_recovers_rollback_after_lost_reply() {
+        let f = Fixture::new();
+        let selected = selected(&f);
+        let mut wrong_copy = selected.clone();
+        wrong_copy.binding.copy_receipt_sha256 = "0".repeat(64);
+        assert!(owner_request(&f, &wrong_copy, Some(Decision::Original)).is_err());
+        f.assert_fenced();
+
+        let held = owner_request(&f, &selected, None).unwrap();
+        assert_eq!(held["state"], "selected-fenced");
+        assert_eq!(held["writerFence"], "held");
+
+        let final_receipt = owner_request(&f, &selected, Some(Decision::Original)).unwrap();
+        assert_eq!(final_receipt["state"], "original-restored");
+        assert_eq!(final_receipt["writerFence"], "released");
+        assert_eq!(
+            final_receipt["generation"],
+            serde_json::json!(selected.binding.source_generation)
+        );
+        assert_eq!(final_receipt, owner_request(&f, &selected, None).unwrap());
+        assert!(owner_request(&f, &selected, Some(Decision::Target)).is_err());
+        let mut other_operation = selected.clone();
+        other_operation.operation_id = Uuid::new_v4();
+        assert!(owner_request(&f, &other_operation, None).is_err());
+        assert_eq!(
+            fs::read(f.profile.join("media/originals/photo.jpg")).unwrap(),
+            PHOTO
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_admission_resumes_durable_intent_and_refuses_replaced_root_on_startup() {
+        let f = Fixture::new();
+        let selected = selected(&f);
+        let stage = f
+            .target
+            .join(format!("frameleaf-media-{}", selected.binding.move_id));
+        let generation = Uuid::new_v4();
+        {
+            let owner = Owner::acquire(&f.profile, true).unwrap();
+            let journal_path = f
+                .profile
+                .join("media-moves")
+                .join(selected.binding.move_id.to_string());
+            let journal =
+                Dir::from_std_file(crate::host_storage::directory(&journal_path).unwrap());
+            let intent = CutoverIntent {
+                request: selected.clone(),
+                decision: Decision::Target,
+                generation,
+            };
+            persist(&journal, CUTOVER, &bytes(&intent).unwrap()).unwrap();
+            drop(owner);
+        }
+        f.assert_fenced();
+        assert!(owner_request(&f, &selected, Some(Decision::Original)).is_err());
+        let final_receipt = owner_request(&f, &selected, Some(Decision::Target)).unwrap();
+        assert_eq!(final_receipt["state"], "target-admitted");
+        assert_eq!(final_receipt["generation"], serde_json::json!(generation));
+        assert_eq!(final_receipt, owner_request(&f, &selected, None).unwrap());
+        assert_eq!(
+            fs::read(f.profile.join("media/originals/photo.jpg")).unwrap(),
+            PHOTO
+        );
+        assert_eq!(fs::read(stage.join("originals/photo.jpg")).unwrap(), PHOTO);
+        {
+            let mut owner = Owner::acquire(&f.profile, true).unwrap();
+            owner
+                .activate(ID, &f.sha, crate::host_runtime::HostMode::Server)
+                .unwrap();
+            assert_eq!(
+                owner.media_reference().unwrap().identity,
+                selected.binding.staged_identity
+            );
+            owner.clean_stop().unwrap();
+        }
+        fs::rename(&stage, stage.with_extension("retained")).unwrap();
+        runtime_store::create_private_directory(&stage).unwrap();
+        let mut owner = Owner::acquire(&f.profile, true).unwrap();
+        assert!(owner
+            .activate(ID, &f.sha, crate::host_runtime::HostMode::Server)
+            .is_err());
     }
 
     #[test]
