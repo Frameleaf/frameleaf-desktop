@@ -1,0 +1,40 @@
+# Qwen photo description qualification
+
+The component harness runs an offline llama.cpp process on loopback. It supplies two generated
+images, checks that the output names their different colors and shapes, and cancels a third
+streaming request. It accepts bounded description JSON and maps it to Library's existing
+`image-description-tagging` response. The resulting receipt records the binary and both GGUF
+digests, golden descriptions, backend, and process cleanup. Its release qualification flag is false.
+
+## Prepare model artifacts
+
+Provide a locally materialized [Qwen source checkout](https://huggingface.co/Qwen/Qwen3.5-4B/tree/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a),
+a clean [llama.cpp checkout](https://github.com/ggml-org/llama.cpp/tree/7fe450e19305b828c199d602c23a8337aaa1f03b)
+and the quantizer built from that revision. The converter uses the local Python environment.
+Use the same filesystem for the Qwen checkout and the new output directory so the tool can hard-link
+verified inputs. Allow 24 GiB of free space on that filesystem.
+
+```sh
+python3 tools/qwen_description.py convert \
+  --source /path/to/Qwen3.5-4B --llama /path/to/llama.cpp \
+  --quantizer /path/to/llama-quantize --output /path/to/new-candidate
+```
+
+The tool verifies the checkpoint files against Git and LFS, then converts to BF16, quantizes to
+Q4_K_M, exports the F16 vision projector, and copies the Apache license. The receipt records the
+exact inputs, converter revision, quantizer binary and resulting artifacts.
+
+```sh
+python3 tools/qwen_description.py qualify --backend metal \
+  --binary /path/to/llama-server \
+  --model /path/to/new-candidate/model.gguf --projector /path/to/new-candidate/mmproj.gguf \
+  --receipt /path/to/new-candidate/candidate.json --output /path/to/new-report.json
+```
+
+The diagnostic also accepts the exact [published GGUF and projector pair](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/tree/e87f176479d0855a907a41277aca2f8ee7a09523)
+when the conversion receipt is omitted. That export identifies its base model and license. The
+converter's input revision and build are unverified for those published bytes.
+
+Desktop activation still requires a qualified model catalogue entry, signed runtime and model
+inventory, authenticated Library claims, and installed execution, resource and cancellation checks
+on the platforms where the provider will be offered.
