@@ -39,6 +39,7 @@ fn main() {
             "approve_photo_drop",
             "control_photo_drop",
             "approve_photo_folder",
+            "list_photo_import_albums",
             "photo_source_status",
             "revoke_photo_source",
             "photo_import_status",

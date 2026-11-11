@@ -339,6 +339,7 @@ pub(crate) async fn approve_photo_drop(
     app: AppHandle,
     state: State<'_, DesktopState>,
     selection_id: Option<String>,
+    album: Option<crate::import_album::Destination>,
 ) -> Result<Status, String> {
     crate::require_local(&window)?;
     let current = state.0.lock().await;
@@ -350,6 +351,7 @@ pub(crate) async fn approve_photo_drop(
         if existing.is_some() {
             return Err("source_drop_existing".into());
         }
+        let destination = crate::import_album::approve(saved, album).await?;
         let plan =
             {
                 let mut pending = drops
@@ -376,7 +378,14 @@ pub(crate) async fn approve_photo_drop(
         } else {
             "Dropped files"
         };
-        let consent = Consent::dropped(saved, &identity, &plan.root, &plan.identity, name)?;
+        let consent = Consent::dropped(
+            saved,
+            &identity,
+            &plan.root,
+            &plan.identity,
+            name,
+            destination,
+        )?;
         drops.jobs.prepare_drop(
             &crate::import_base(&app)?,
             saved,
@@ -387,6 +396,9 @@ pub(crate) async fn approve_photo_drop(
         credentials::save(CREDENTIAL, &consent)?;
         consent
     } else {
+        if album.is_some() {
+            return Err("source_album_selection_changed".into());
+        }
         existing.ok_or("source_approval_required")?
     };
     if !consent.registered {
@@ -548,7 +560,8 @@ mod tests {
                 &DeviceIdentity::generate(),
                 &preview.root,
                 &preview.identity,
-                "Dropped folder"
+                "Dropped folder",
+                None
             )
             .err()
             .as_deref(),
