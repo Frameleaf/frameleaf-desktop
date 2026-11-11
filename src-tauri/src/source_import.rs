@@ -1,4 +1,5 @@
 //! One bounded approved-folder copy, with immutable inventory and a small signed progress checkpoint.
+pub(crate) mod history;
 mod watch;
 
 use crate::{
@@ -22,6 +23,8 @@ struct Manifest {
     id: String,
     source_id: String,
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     destination: Option<Destination>,
     files: Vec<SourceFile>,
@@ -346,6 +349,10 @@ fn make_manifest(
         id: uuid::Uuid::new_v4().to_string(),
         source_id: consent.source_id().into(),
         scope: approval.fingerprint(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|value| u64::try_from(value.as_millis()).ok()),
         destination: consent.destination.clone(),
         files: scan.files,
         total_bytes,
@@ -353,12 +360,12 @@ fn make_manifest(
         availability: Some(scan.inventory.availability),
     })
 }
-fn load(
+fn load_manifest(
     journal: &Journal,
     identity: &DeviceIdentity,
     consent: &Consent,
     saved: &SavedConnection,
-) -> Result<(Manifest, Cursor), String> {
+) -> Result<Manifest, String> {
     let manifest: Manifest = journal.read("manifest.json", identity)?;
     if !uuid(&manifest.id)
         || manifest.source_id != consent.source_id()
@@ -367,6 +374,15 @@ fn load(
     {
         return Err("source_journal_invalid".into());
     }
+    Ok(manifest)
+}
+fn load(
+    journal: &Journal,
+    identity: &DeviceIdentity,
+    consent: &Consent,
+    saved: &SavedConnection,
+) -> Result<(Manifest, Cursor), String> {
+    let manifest = load_manifest(journal, identity, consent, saved)?;
     let cursor: Cursor = match fs::symlink_metadata(journal.root.join("cursor.json")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Empty staging cannot prove that no earlier uploads occurred; recovery needs a new allowance.
@@ -1079,6 +1095,7 @@ impl SourceJobs {
         value.code = None;
         *status.lock().map_err(|_| "source_status_unavailable")? = value.clone();
         watching.store(watch, Ordering::Release);
+        let _ = app.emit_to("main", "photo-import-history", ());
         if ordinary {
             crate::tray::set_import_status(&app, Some(&value));
         } else {
@@ -1142,7 +1159,7 @@ impl SourceJobs {
                     let transfer = app.state::<ImportTransfer>();
                     if watch {
                         watch::run(
-                            &client, &origin, &saved, &identity, &source, &journal, &stop,
+                            &client, &origin, &saved, &identity, &source, &journal, &base, &stop,
                             &wake_task, &gate, &notify, &transfer,
                         )
                         .await
@@ -1498,6 +1515,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             source_id: uuid::Uuid::new_v4().to_string(),
             scope: "a".repeat(64),
+            created_at: None,
             destination: None,
             files: vec![SourceFile {
                 relative: "nested/photo.jpg".into(),
@@ -2237,6 +2255,7 @@ mod tests {
     fn legacy_manifests_keep_their_signed_representation_and_resume_cursor() {
         let mut f = Fixture::new();
         f.manifest.availability = None;
+        f.manifest.created_at = None;
         let legacy = json!({"id":f.manifest.id,"sourceId":f.manifest.source_id,"scope":f.manifest.scope,
             "files":f.manifest.files,"totalBytes":f.manifest.total_bytes,"skipped":f.manifest.skipped});
         assert_eq!(digest(&f.manifest).unwrap(), digest(&legacy).unwrap());
@@ -2252,6 +2271,7 @@ mod tests {
             .unwrap();
         let (manifest, cursor) = load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
         assert!(manifest.availability.is_none());
+        assert!(manifest.created_at.is_none());
         assert_eq!(cursor.position, 0);
     }
     #[cfg(target_os = "macos")]

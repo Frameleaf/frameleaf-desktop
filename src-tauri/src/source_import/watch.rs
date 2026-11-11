@@ -100,6 +100,23 @@ fn status_at(
     Ok(view(&manifest, &cursor, "watch-paused", None))
 }
 
+pub(super) fn history_run(
+    journal: &Journal,
+    saved: &SavedConnection,
+    consent: &Consent,
+    identity: &DeviceIdentity,
+) -> Result<Option<(Manifest, Cursor)>, String> {
+    let state = WatchState::load(journal, consent, identity)?;
+    let batch = Journal {
+        root: journal.root.join("watch-batch"),
+    };
+    let run = history::snapshot(&batch, saved, consent, identity)?;
+    Ok(run.filter(|(manifest, cursor)| match &state.active {
+        Some(id) => id == &manifest.id,
+        None => cursor.state == "complete",
+    }))
+}
+
 fn check_location(base: &Path, approval: &crate::copy_source::CopyApproval) -> Result<(), String> {
     if base.starts_with(approval.root()) || approval.root().starts_with(base) {
         return Err("source_staging_overlap".into());
@@ -193,6 +210,7 @@ pub(super) async fn run(
     identity: &DeviceIdentity,
     consent: &Consent,
     journal: &Journal,
+    base: &Path,
     cancel: &AtomicBool,
     wake: &tokio::sync::Notify,
     gate: &(dyn Fn() -> Result<(), String> + Sync),
@@ -202,11 +220,20 @@ pub(super) async fn run(
     let approval = consent.approval(saved, identity)?;
     let batch = batch(journal)?;
     let mut observed = BTreeSet::new();
+    let mut backfill = true;
     while !cancel.load(Ordering::Acquire) {
         let result = async {
             // Recheck the current session and pause state before inspecting any folder entries.
             gate()?;
             let mut watch = WatchState::load(journal, consent, identity)?;
+            if backfill && watch.active.is_none() {
+                if let Ok(Some((manifest, cursor))) =
+                    history::snapshot(&batch, saved, consent, identity)
+                {
+                    history::completed_watch(base, saved, identity, &manifest, &cursor)?;
+                }
+                backfill = false;
+            }
             if watch.active.is_none()
                 && !prepare_batch(
                     journal,
@@ -243,6 +270,8 @@ pub(super) async fn run(
             if cursor.state != "complete" {
                 return Err("source_run_terminal".into());
             }
+            history::completed_watch(base, saved, identity, &manifest, &cursor)?;
+            backfill = false;
             let keys = manifest
                 .files
                 .iter()
