@@ -115,7 +115,7 @@ impl Cache {
         let binding = scope(saved)?;
         let key = match credentials::load::<Credential>(KEY)? {
             Some(key) if key.scope == binding => key,
-            Some(_) => return Err("offline_album_access_changed".into()),
+            Some(_) => return Err("offline_album_other_library".into()),
             None if create => {
                 // A key discarded on sign-out cannot make earlier ciphertext readable again.
                 Self::purge(base)?;

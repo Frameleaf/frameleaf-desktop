@@ -466,11 +466,13 @@ pub(crate) async fn offline_album_remove(
     native.clear_playback();
     let saved = native.saved()?;
     let base = crate::import_base(&app)?;
-    if let Some(cache) = Cache::open(&base, &saved, false)? {
-        match album {
-            Some(id) => cache.remove(id)?,
-            None => Cache::purge(&base)?,
+    match album {
+        Some(id) => {
+            if let Some(cache) = Cache::open(&base, &saved, false)? {
+                cache.remove(id)?;
+            }
         }
+        None => Cache::purge(&base)?,
     }
     native.set_progress(None);
     Ok(())
