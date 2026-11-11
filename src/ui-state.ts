@@ -11,15 +11,13 @@ export function platformFromUserAgent(userAgent: string): Platform {
 export function platformClass(userAgent: string): string { return `platform-${platformFromUserAgent(userAgent)}`; }
 export function computerWord(platform: Platform): string { return platform === 'mac' ? 'Mac' : platform === 'windows' ? 'PC' : 'computer'; }
 
-/** Measure distinct verified completions in the current sign-in's retained import history. */
-export function verifiedImportMilestone(entries: readonly {
+/** Count distinct verified completions in the current sign-in's retained import history. */
+export function verifiedImportCount(entries: readonly {
   runId: string; status: string; verified: number; albumPending: boolean;
-}[]): 'unobserved' | 'first' | 'repeat' {
-  const complete = new Set(entries
+}[]): number {
+  return new Set(entries
     .filter(entry => entry.status === 'complete' && entry.verified > 0 && !entry.albumPending)
-    .map(entry => entry.runId));
-  if (complete.size > 1) return 'repeat';
-  return complete.size === 1 ? 'first' : 'unobserved';
+    .map(entry => entry.runId)).size;
 }
 
 // ---- money ------------------------------------------------------------------------------------

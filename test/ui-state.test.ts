@@ -2,18 +2,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort, signInMethods, nearbySignIn, countryOptions, defaultCountry } from '../src/ui-state.ts';
 import type { CloudServer, DiscoveredServer } from '../src/server-types.ts';
-import { verifiedImportMilestone } from '../src/ui-state.ts';
+import { verifiedImportCount } from '../src/ui-state.ts';
 
-test('import milestones count distinct completed runs with verified originals and no pending album work', () => {
+test('verified import counts exclude duplicates and runs with originals or album work still pending', () => {
   const complete = { runId: 'first', status: 'complete', verified: 2, albumPending: false };
   const incomplete = [
     { ...complete, runId: 'empty', verified: 0 },
     { ...complete, runId: 'album', albumPending: true },
     ...['ready', 'running', 'interrupted', 'cancelled'].map(status => ({ ...complete, runId: status, status })),
   ];
-  assert.equal(verifiedImportMilestone(incomplete), 'unobserved');
-  assert.equal(verifiedImportMilestone([...incomplete, complete, complete]), 'first');
-  assert.equal(verifiedImportMilestone([...incomplete, complete, { ...complete, runId: 'repeat' }]), 'repeat');
+  assert.equal(verifiedImportCount(incomplete), 0);
+  assert.equal(verifiedImportCount([...incomplete, complete, complete]), 1);
+  assert.equal(verifiedImportCount([...incomplete, complete, { ...complete, runId: 'repeat' }]), 2);
 });
 
 test('money renders USD doubles and micro-USD integers without ever printing NaN', () => {

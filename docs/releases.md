@@ -75,7 +75,7 @@ results across devices or accounts.
 
 | Signal | Available evidence |
 | --- | --- |
-| First and repeat imports | **Photo sources → Import history** derives the milestone from the current sign-in's retained signed history. Count one distinct completed run with at least one verified original and no pending album attachment as the first observed run, and a second distinct run as repeat. The archive holds up to 100 prior runs, so an absent milestone is not a lifetime count. |
+| First and repeat imports | Use the verified import count next to **Photo sources → Import history**. One distinct completed run with at least one verified original and no pending album attachment shows a first observed import, and two or more show repeat imports. The count uses the current sign-in's signed history, including up to 100 archived runs. |
 | Update success | The signed updater checks, installs, and requests a restart. Confirm that the expected version opens after restart for installed evidence. The updater does not retain a success count. |
 | Restore drill | Manager's completed restore with `native-restore-started` confirms the database and server start. Record original photo and video readback separately using a media recovery drill. |
 | Local job completion | The worker accepts a completion when Library acknowledges the result for its lease. A ready or active worker status alone does not establish a completed job. |
