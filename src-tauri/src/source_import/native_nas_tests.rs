@@ -76,6 +76,7 @@ fn actual_native_folder_copy() {
                 &chosen.selection_id,
                 true,
                 false,
+                None,
                 |value| credentials::save(CREDENTIAL, value),
             )
             .unwrap();

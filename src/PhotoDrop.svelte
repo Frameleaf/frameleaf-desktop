@@ -3,22 +3,27 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Sheet from './Sheet.svelte';
+  import PhotoImportDestination from './PhotoImportDestination.svelte';
+  import { albumErrors, type AlbumDestination } from './import-destination';
   import { formatBytes, percent } from './ui-state';
 
   type Preview = { selectionId: string; path: string; count: number; bytes: number; skipped: number; folder: boolean; names: string[] };
-  type Job = { sourceId: string; state: string; total: number; completed: number; code: string | null; uploadRemaining: number | null; additionalUploadAllowance: number };
-  type Status = { consent: { id: string; name: string; registered: boolean }; job: Job | null };
+  type Job = { sourceId: string; state: string; total: number; completed: number; code: string | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
+  type Status = { consent: { id: string; name: string; registered: boolean; destination: AlbumDestination | null }; job: Job | null };
   let { visible }: { visible: boolean } = $props();
   let preview = $state<Preview | null>(null);
   let status = $state<Status | null>(null);
   let open = $state(false);
   let busy = $state(false);
   let allowed = $state(false);
+  let albumMode = $state(false);
+  let destination = $state<AlbumDestination | null>(null);
   let message = $state('');
   const job = $derived(status?.job);
   const terminal = $derived(job?.state === 'complete' || job?.state === 'cancelled');
-  const allowance = $derived(!!job && !terminal && !['copying', 'queued'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
+  const allowance = $derived(!!job && !job.albumPending && !terminal && !['copying', 'queued'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
   const messages: Record<string, string> = {
+    ...albumErrors,
     source_drop_limit: 'Drop one folder or up to 100 photos and videos from the same folder.',
     source_drop_mixed: 'Drop one folder or select photos and videos from the same folder.',
     source_drop_existing: 'Finish or remove the current dropped import before starting another.',
@@ -46,6 +51,8 @@
     if (busy) return;
     open = true;
     allowed = false;
+    albumMode = false;
+    destination = null;
     message = '';
     preview = null;
     if (result !== 'ready') {
@@ -75,14 +82,16 @@
     const selectionId = preview?.selectionId;
     preview = null;
     allowed = false;
+    albumMode = false;
+    destination = null;
     if (selectionId) void invoke('control_photo_drop', { action: 'discard-preview', selectionId }).catch(() => {});
   }
   async function approve() {
-    if (preview && !allowed) return;
+    if (preview && (!allowed || (albumMode && !destination))) return;
     busy = true;
     message = '';
     try {
-      status = await invoke<Status>('approve_photo_drop', { selectionId: preview?.selectionId ?? null });
+      status = await invoke<Status>('approve_photo_drop', { selectionId: preview?.selectionId ?? null, album: preview ? destination : null });
       preview = null;
       allowed = false;
     } catch (error) {
@@ -118,9 +127,12 @@
       <p><strong>{preview.path}</strong></p>
       <p>{preview.count.toLocaleString()} photos or videos · {formatBytes(preview.bytes)}{preview.skipped ? ` · ${preview.skipped} unavailable or excluded entries skipped` : ''}</p>
       {#if preview.names.length}<ul class="drop-list">{#each preview.names as name (name)}<li>{name}</li>{/each}</ul>{/if}
-      <label class="check"><input type="checkbox" bind:checked={allowed} disabled={busy} /> Allow these items to be copied to my current Frameleaf library. Originals stay in place.</label>
+      <PhotoImportDestination bind:albumMode bind:destination disabled={busy} onchange={() => { allowed = false; }} />
+      <label class="check"><input type="checkbox" bind:checked={allowed} disabled={busy} /> Allow these items to be copied to the selected destination. Originals stay in place.</label>
     {:else if status}
       <p><strong>{status.consent.name}</strong></p>
+      {#if status.consent.destination}<p>Album: {status.consent.destination.name}{status.consent.destination.shared ? ' (shared)' : ''}</p>{/if}
+      {#if job?.albumPending}<p>Copy verified. Waiting to add it to the album.</p>{/if}
       {#if !status.consent.registered}
         <p>Finish connecting this import to your library before starting the copy.</p>
       {:else if job}
@@ -134,7 +146,7 @@
     {#snippet actions()}
       <button class="btn" type="button" disabled={busy} onclick={close}>{preview ? 'Cancel' : 'Close'}</button>
       {#if preview}
-        <button class="btn primary" type="submit" disabled={busy || !allowed}>Approve Copy</button>
+        <button class="btn primary" type="submit" disabled={busy || !allowed || (albumMode && !destination)}>Approve Copy</button>
       {:else if status}
         {#if !status.consent.registered}
           <button class="btn primary" type="button" disabled={busy} onclick={approve}>Retry Registration</button>
@@ -143,7 +155,7 @@
         {:else if job && ['copying', 'queued'].includes(job.state)}
           <button class="btn" type="button" disabled={busy} onclick={() => control('pause')}>Pause Copy</button>
         {:else if job && !terminal}
-          <button class="btn primary" type="button" disabled={busy} onclick={() => control('resume')}>{job.state === 'ready' ? 'Start Copy' : 'Resume Copy'}</button>
+          <button class="btn primary" type="button" disabled={busy} onclick={() => control('resume')}>{job.state === 'ready' ? 'Start Copy' : job.albumPending ? 'Retry Adding to Album' : 'Resume Copy'}</button>
         {/if}
         {#if job && !terminal}
           <button class="btn quiet" type="button" disabled={busy} onclick={() => control('cancel')}>Cancel Copy</button>

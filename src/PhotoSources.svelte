@@ -5,19 +5,23 @@
   import Icon from './Icon.svelte';
   import CameraSources from './CameraSources.svelte';
   import Sheet from './Sheet.svelte';
+  import PhotoImportDestination from './PhotoImportDestination.svelte';
+  import { albumErrors, type AlbumDestination } from './import-destination';
   import { formatBytes, percent } from './ui-state';
   type Hint = { label: string; path: string };
   type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
+  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean; destination: AlbumDestination | null };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
   let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowReads = $state(false);
   let watchFolder = $state(false);
+  let albumMode = $state(false);
+  let destination = $state<AlbumDestination | null>(null);
   let watchAvailable = $state(false);
   let alive = true;
   let busy = $state(false);
@@ -26,6 +30,7 @@
   let detailsOpen = $state(false);
   const native = isTauri();
   const errors: Record<string, string> = {
+    ...albumErrors,
     source_metadata_unavailable: 'File metadata could not be checked safely. Check folder access before resuming; staged data is kept.',
     source_folder_excluded: 'This folder is hidden or excluded. Choose an ordinary visible photo folder.',
     source_item_excluded: 'A file or folder became hidden or excluded. Copying stopped before reading it; existing staged data is kept.',
@@ -124,12 +129,12 @@
     finally { busy = false; }
   }
   async function approve(retry = false) {
-    if (!retry && (!folder || !allowReads)) return;
+    if (!retry && (!folder || !allowReads || (albumMode && !destination))) return;
     busy = true; message = '';
     try {
-      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads, watch: watchFolder });
+      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads, watch: watchFolder, album: retry ? null : destination });
       if (consent.watch) job = await invoke<CopyJob | null>('photo_import_status');
-      folder = null; allowReads = false; watchFolder = false;
+      folder = null; allowReads = false; watchFolder = false; albumMode = false; destination = null;
     } catch (error) { await loadConsent(); message = explain(error); }
     finally { busy = false; }
   }
@@ -154,7 +159,7 @@
     busy = true; message = '';
     try {
       const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive, camera });
-      if (selected) { folder = selected; allowReads = false; watchFolder = false; watchAvailable = oneDrive === null && camera === null; }
+      if (selected) { folder = selected; allowReads = false; watchFolder = false; albumMode = false; destination = null; watchAvailable = oneDrive === null && camera === null; }
     } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
     finally { busy = false; }
   }
@@ -162,7 +167,7 @@
   const jobTone = $derived(!job ? 'off' : ['complete', 'watching'].includes(job.state) ? 'ok' : job.state === 'copying' ? 'wait' : job.state === 'needs-attention' ? 'bad' : 'off');
   const canResume = $derived(!!job && ['ready', 'paused', 'needs-attention'].includes(job.state));
   const watchRunning = $derived(!!job && ['watching', 'copying', 'complete'].includes(job.state));
-  const needsAllowance = $derived(!!job && job.total > 0 && !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
+  const needsAllowance = $derived(!!job && !job.albumPending && job.total > 0 && !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
 </script>
 
 <section class="page" aria-labelledby="photo-sources-heading" aria-busy={busy}>
@@ -200,6 +205,8 @@
             <span class="ic" aria-hidden="true"><Icon name="folder" /></span>
             <span class="l">
               <b>{consent.name}</b>
+              {#if consent.destination}<small>Album: {consent.destination.name}{consent.destination.shared ? ' (shared)' : ''}</small>{/if}
+              {#if job?.albumPending}<small>Copy verified. Waiting to add it to the album.</small>{/if}
               <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {consent.watch && (!job || job.total === 0) ? (job ? jobLabel : 'Automatic import to your current library') : job ? `${jobLabel} · ${job.completed.toLocaleString()} of ${job.total.toLocaleString()} copies confirmed${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
               {#if job && job.total > 0 && !['complete', 'cancelled'].includes(job.state)}<span class="progress" role="progressbar" aria-valuenow={percent(job.completed, job.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(job.completed, job.total)}%"></span></span>{/if}
             </span>
@@ -210,7 +217,7 @@
             {#if consent.watch && consent.registered}
               {#if watchRunning}<button class="btn" disabled={busy} onclick={() => controlCopy('watch-pause')}><Icon name="pause" />Pause Watching</button>
               {:else if job?.code !== 'source_run_terminal'}<button class="btn primary" disabled={busy || needsAllowance} onclick={() => controlCopy('watch-resume')}>Resume Watching</button>{/if}
-            {:else if canResume}<button class="btn primary" disabled={busy || job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : 'Resume'}</button>{/if}
+            {:else if canResume}<button class="btn primary" disabled={busy || (!job!.albumPending && (job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'))} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : job!.albumPending ? 'Retry Adding to Album' : 'Resume'}</button>{/if}
             {#if !consent.watch && job?.state === 'copying'}<button class="btn" disabled={busy} onclick={() => controlCopy('pause')}><Icon name="pause" />Pause</button>{/if}
             {#if !consent.watch && job && !['complete', 'cancelled'].includes(job.state)}<button class="btn quiet" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel</button>{/if}
             <button class="btn quiet" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove…</button>
@@ -235,13 +242,14 @@
               <b>{folder.path}</b>
               <small>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}. {folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</small>
               {#if folder.availability}<small aria-label="Preview file availability">{availabilityText(folder.availability)}</small>{/if}
+              <PhotoImportDestination bind:albumMode bind:destination disabled={busy} onchange={() => { allowReads = false; }} />
               {#if watchAvailable && !folder.truncated}
-                <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={watchFolder} onchange={() => { allowReads = false; }} disabled={busy} /> Watch this folder and automatically copy photos and videos to my current Frameleaf library.</label>
+                <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={watchFolder} onchange={() => { allowReads = false; }} disabled={busy} /> Watch this folder and automatically copy photos and videos to the selected destination.</label>
               {/if}
               <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={allowReads} disabled={busy} /> {watchFolder ? 'Allow Frameleaf to read this folder in the background, including after I close the window. Existing files are included. Originals stay in place.' : 'Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.'}</label>
             </span>
-            <button class="btn quiet" disabled={busy} onclick={() => { folder = null; allowReads = false; watchFolder = false; }}>Clear</button>
-            <button class="btn primary" disabled={busy || !allowReads} onclick={() => approve()}>{watchFolder ? 'Approve and Watch' : 'Approve Folder'}</button>
+            <button class="btn quiet" disabled={busy} onclick={() => { folder = null; allowReads = false; watchFolder = false; albumMode = false; destination = null; }}>Clear</button>
+            <button class="btn primary" disabled={busy || !allowReads || (albumMode && !destination)} onclick={() => approve()}>{watchFolder ? 'Approve and Watch' : 'Approve Folder'}</button>
           </div>
         {/if}
       </div>

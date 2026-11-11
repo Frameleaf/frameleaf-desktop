@@ -319,9 +319,15 @@ mod tests {
             .select(picker.generation().unwrap(), source.clone())
             .unwrap();
         let mut consent = picker
-            .approve(&saved, &identity, &chosen.selection_id, true, true, |_| {
-                Ok(())
-            })
+            .approve(
+                &saved,
+                &identity,
+                &chosen.selection_id,
+                true,
+                true,
+                None,
+                |_| Ok(()),
+            )
             .unwrap();
         consent.registered = true;
         let approval = consent.approval(&saved, &identity).unwrap();

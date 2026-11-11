@@ -5,6 +5,7 @@ use crate::{
     connection::{DeviceIdentity, SavedConnection},
     copy_source::StagedCopy,
     copy_upload::UploadSession,
+    import_album::{self, Destination},
     photo_sources::SourceFile,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -21,6 +22,8 @@ struct Manifest {
     id: String,
     source_id: String,
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination: Option<Destination>,
     files: Vec<SourceFile>,
     total_bytes: u64,
     skipped: u64,
@@ -35,6 +38,8 @@ struct Active {
     copy: Option<StagedCopy>,
     upload: Option<UploadSession>,
     receipt: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    album_attached: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,10 +118,11 @@ impl Cursor {
                 "ready" | "open" | "paused" | "cancelled" | "complete"
             )
             || (self.active.is_some() && self.position >= manifest.files.len())
-            || self
-                .active
-                .as_ref()
-                .is_some_and(|a| !uuid(&a.stage_id) || !uuid(&a.item_id))
+            || self.active.as_ref().is_some_and(|a| {
+                !uuid(&a.stage_id)
+                    || !uuid(&a.item_id)
+                    || (a.album_attached && (manifest.destination.is_none() || a.receipt.is_none()))
+            })
             || (self.state == "complete"
                 && (self.position != manifest.files.len() || self.active.is_some()))
         {
@@ -241,6 +247,7 @@ pub struct ImportView {
     pub additional_upload_allowance: u64,
     pub skipped: u64,
     pub code: Option<String>,
+    pub album_pending: bool,
     pub availability: Option<crate::source_metadata::AvailabilitySummary>,
 }
 fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>) -> ImportView {
@@ -260,6 +267,11 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
             .sum::<u64>()
             .saturating_mul(2),
         skipped: manifest.skipped + cursor.watch_skipped.len() as u64,
+        album_pending: manifest.destination.is_some()
+            && cursor
+                .active
+                .as_ref()
+                .is_some_and(|active| active.receipt.is_some() && !active.album_attached),
         availability: manifest.availability.clone(),
         code,
     }
@@ -319,6 +331,7 @@ fn make_manifest(
         id: uuid::Uuid::new_v4().to_string(),
         source_id: consent.source_id().into(),
         scope: approval.fingerprint(),
+        destination: consent.destination.clone(),
         files: scan.files,
         total_bytes,
         skipped: scan.inventory.skipped,
@@ -335,6 +348,7 @@ fn load(
     if !uuid(&manifest.id)
         || manifest.source_id != consent.source_id()
         || manifest.scope != consent.approval(saved, identity)?.fingerprint()
+        || manifest.destination != consent.destination
     {
         return Err("source_journal_invalid".into());
     }
@@ -467,6 +481,39 @@ fn check_receipt(
     }
     Ok(())
 }
+async fn attach_verified(
+    api: &SourceApi<'_>,
+    manifest: &Manifest,
+    cursor: &mut Cursor,
+    copy: &StagedCopy,
+    journal: &Journal,
+    identity: &DeviceIdentity,
+) -> Result<(), String> {
+    let Some(destination) = manifest.destination.as_ref() else {
+        return Ok(());
+    };
+    let active = cursor.active.as_ref().ok_or("source_journal_invalid")?;
+    let Some(receipt) = active.receipt.as_ref().filter(|_| !active.album_attached) else {
+        return Ok(());
+    };
+    check_receipt(receipt, api.saved, manifest, active, copy, None)?;
+    let asset = receipt["assetId"]
+        .as_str()
+        .ok_or("source_receipt_invalid")?;
+    (api.gate)()?;
+    import_album::attach(
+        api.client,
+        api.base,
+        api.saved,
+        destination,
+        asset,
+        api.cancel,
+    )
+    .await?;
+    cursor.active.as_mut().unwrap().album_attached = true;
+    journal.write("cursor.json", cursor, identity)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     client: &Client,
@@ -505,6 +552,10 @@ async fn execute(
         .await?;
         if caps.protocol_version != 1 || caps.server_id != saved.server_id {
             return Err("server_identity_changed".into());
+        }
+        if let Some(destination) = &manifest.destination {
+            gate()?;
+            import_album::require_writable(client, base, saved, destination, cancel).await?;
         }
         let state = api.run(&manifest).await?;
         if state["state"] == "cancelled" {
@@ -548,6 +599,7 @@ async fn execute(
                     copy: None,
                     upload: None,
                     receipt: None,
+                    album_attached: false,
                 });
                 journal.write("cursor.json", &cursor, identity)?;
             }
@@ -621,6 +673,8 @@ async fn execute(
             {
                 return Err("source_item_changed".into());
             }
+            // Resume album work from the signed verification receipt without entering upload.
+            attach_verified(&api, &manifest, &mut cursor, &copy, journal, identity).await?;
             let mut asset = cursor
                 .active
                 .as_ref()
@@ -685,6 +739,7 @@ async fn execute(
             check_receipt(&receipt, saved, &manifest, active, &copy, asset.as_deref())?;
             cursor.active.as_mut().unwrap().receipt = Some(receipt);
             journal.write("cursor.json", &cursor, identity)?;
+            attach_verified(&api, &manifest, &mut cursor, &copy, journal, identity).await?;
             let active = cursor.active.as_ref().unwrap();
             check_receipt(
                 active.receipt.as_ref().unwrap(),
@@ -1328,6 +1383,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             source_id: uuid::Uuid::new_v4().to_string(),
             scope: "a".repeat(64),
+            destination: None,
             files: vec![SourceFile {
                 relative: "nested/photo.jpg".into(),
                 bytes: 8,
@@ -1374,6 +1430,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_destination(None)
+        }
+        fn with_destination(destination: Option<Destination>) -> Self {
             let base = std::fs::canonicalize(std::env::temp_dir())
                 .unwrap()
                 .join(format!("frameleaf-copy-job-{}", uuid::Uuid::new_v4()));
@@ -1404,6 +1463,7 @@ mod tests {
                     &selected.selection_id,
                     true,
                     false,
+                    destination,
                     |_| Ok(()),
                 )
                 .unwrap();
@@ -1430,6 +1490,7 @@ mod tests {
                 copy: None,
                 upload: None,
                 receipt: None,
+                album_attached: false,
             });
             journal
                 .write("manifest.json", &manifest, &identity)
@@ -1526,6 +1587,90 @@ mod tests {
         }
     }
     #[test]
+    fn pending_album_attachment_restarts_from_the_verified_receipt_without_uploading_again() {
+        tauri::async_runtime::block_on(async {
+            let album = Destination {
+                id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                name: "Vacation".into(),
+                shared: false,
+            };
+            let f = Fixture::with_destination(Some(album.clone()));
+            let album_reply = protocol(
+                200,
+                "",
+                &json!({
+                    "id": album.id, "albumName": album.name, "kind": "album", "shared": false,
+                    "albumUsers": [{"user": {"id": "owner"}, "role": "owner"}]
+                })
+                .to_string(),
+            );
+
+            let refused = Server::new(vec![preflight()[0].clone(), protocol(400, "", "{}")]);
+            assert_eq!(
+                f.run(&refused, &|| Ok(())).await.unwrap_err(),
+                "source_album_unavailable_for_write"
+            );
+            assert!(!f.journal.root.join("stage").join(&f.stage).exists());
+
+            let mut first = f.replies(f.receipt(), false, false);
+            first.insert(1, album_reply.clone());
+            first.pop();
+            first.push(protocol(503, "", "{}"));
+            let interrupted = Server::new(first);
+            assert_eq!(
+                f.run(&interrupted, &|| Ok(())).await.unwrap_err(),
+                "server_http_503"
+            );
+            let pending: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(pending.position, 0);
+            assert!(view(&f.manifest, &pending, "paused", None).album_pending);
+            assert_eq!(
+                pending.active.as_ref().unwrap().receipt.as_ref().unwrap()["assetId"],
+                ASSET
+            );
+            assert!(f.journal.root.join("stage").join(&f.stage).exists());
+
+            let restarted = Server::new(vec![
+                preflight()[0].clone(),
+                album_reply,
+                f.run_ack("open"),
+                f.state_ack("open"),
+                protocol(
+                    200,
+                    "",
+                    &json!([{"id": ASSET, "success": false, "error": "duplicate"}]).to_string(),
+                ),
+                protocol(200, "", &f.receipt().to_string()),
+                f.state_ack("complete"),
+            ]);
+            f.run(&restarted, &|| Ok(())).await.unwrap();
+            let requests = restarted.requests.lock().unwrap();
+            let attach = requests
+                .iter()
+                .position(|(header, _)| {
+                    header.starts_with(&format!("PUT /api/albums/{}/assets ", album.id))
+                })
+                .unwrap();
+            let verify = requests
+                .iter()
+                .position(|(header, _)| header.starts_with("POST ") && header.contains("/verify "))
+                .unwrap();
+            assert!(attach < verify);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&requests[attach].1).unwrap(),
+                json!({"ids": [ASSET]})
+            );
+            assert!(requests
+                .iter()
+                .all(|(header, _)| !header.contains("/api/assets/uploads")));
+            let finished: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(finished.state, "complete");
+            assert_eq!(finished.position, 1);
+            assert!(!f.journal.root.join("stage").join(&f.stage).exists());
+        });
+    }
+
+    #[test]
     fn a_dropped_manifest_resumes_after_a_lost_ack_and_refuses_file_replacement() {
         tauri::async_runtime::block_on(async {
             let mut f = Fixture::new();
@@ -1571,6 +1716,7 @@ mod tests {
                 copy: None,
                 upload: None,
                 receipt: None,
+                album_attached: false,
             });
             f.journal
                 .write("cursor.json", &checkpoint, &f.identity)

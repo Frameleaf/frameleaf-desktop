@@ -2,6 +2,7 @@
 use crate::{
     connection::{normalize_server, DeviceIdentity, SavedConnection},
     copy_source::CopyApproval,
+    import_album::Destination,
     photo_sources::{self, FolderInventory},
     transport,
 };
@@ -31,6 +32,8 @@ pub struct SelectedFolder {
 pub struct Consent {
     approval: CopyApproval,
     session_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) destination: Option<Destination>,
     name: String,
     allow_download: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -51,6 +54,7 @@ pub struct ConsentView {
     camera: bool,
     registered: bool,
     watch: bool,
+    destination: Option<Destination>,
 }
 fn is_false(value: &bool) -> bool {
     !value
@@ -103,6 +107,7 @@ impl SourceConsent {
             inventory,
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn approve(
         &self,
         saved: &SavedConnection,
@@ -110,6 +115,7 @@ impl SourceConsent {
         selection: &str,
         allow_download: bool,
         watch: bool,
+        destination: Option<Destination>,
         persist: impl FnOnce(&Consent) -> Result<(), String>,
     ) -> Result<Consent, String> {
         let mut pending = self
@@ -149,8 +155,9 @@ impl SourceConsent {
                 .ok_or("source_folder_name_invalid")?,
         );
         let consent = Consent {
+            session_signature: session_signature(saved, identity, &approval, destination.as_ref()),
             approval,
-            session_signature: session_signature(saved, identity),
+            destination,
             name,
             allow_download,
             camera: preview_identity.is_some(),
@@ -199,11 +206,26 @@ fn source_label(raw: &str) -> String {
         name.into()
     }
 }
-fn session_signature(saved: &SavedConnection, identity: &DeviceIdentity) -> String {
-    identity.sign(&format!(
-        "frameleaf-desktop/photo-source-session/v1\n{}",
-        saved.token
-    ))
+fn session_signature(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    approval: &CopyApproval,
+    destination: Option<&Destination>,
+) -> String {
+    match destination {
+        Some(destination) => identity.sign(&format!(
+            "frameleaf-desktop/photo-source-album/v1\n{}\n{}\n{}\n{}\n{}",
+            saved.token,
+            approval.fingerprint(),
+            destination.id,
+            destination.shared,
+            destination.name
+        )),
+        None => identity.sign(&format!(
+            "frameleaf-desktop/photo-source-session/v1\n{}",
+            saved.token
+        )),
+    }
 }
 impl Consent {
     pub(crate) fn dropped(
@@ -212,11 +234,13 @@ impl Consent {
         root: &std::path::Path,
         root_identity: &str,
         name: &str,
+        destination: Option<Destination>,
     ) -> Result<Self, String> {
         let approval = CopyApproval::approve_drop(saved, identity, root, root_identity)?;
         Ok(Self {
+            session_signature: session_signature(saved, identity, &approval, destination.as_ref()),
             approval,
-            session_signature: session_signature(saved, identity),
+            destination,
             name: source_label(name),
             allow_download: true,
             camera: false,
@@ -257,7 +281,9 @@ impl Consent {
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
         self.approval.validate_current(saved, identity)?;
-        if self.session_signature != session_signature(saved, identity) {
+        if self.session_signature
+            != session_signature(saved, identity, &self.approval, self.destination.as_ref())
+        {
             return Err("source_photo_session_changed".into());
         }
         Ok(())
@@ -271,6 +297,7 @@ impl Consent {
             camera: self.camera,
             registered: self.registered,
             watch: self.watch,
+            destination: self.destination.clone(),
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
@@ -357,6 +384,45 @@ mod tests {
         }
     }
     #[test]
+    fn album_consent_cannot_change_destination_or_fall_back_to_library() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-consent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let state = SourceConsent::default();
+        let identity = DeviceIdentity::generate();
+        let selected = state
+            .select(state.generation().unwrap(), root.clone())
+            .unwrap();
+        let destination = Destination {
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            name: "Vacation".into(),
+            shared: false,
+        };
+        let consent = state
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                false,
+                Some(destination),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let serialized = serde_json::to_value(&consent).unwrap();
+        let mut decoded: Consent = serde_json::from_value(serialized.clone()).unwrap();
+        decoded.require(&saved(), &identity).unwrap();
+        decoded.destination.as_mut().unwrap().id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into();
+        assert!(decoded.require(&saved(), &identity).is_err());
+        let mut decoded: Consent = serde_json::from_value(serialized).unwrap();
+        decoded.destination = None;
+        assert!(decoded.require(&saved(), &identity).is_err());
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn picker_handles_expire_on_signout_and_failed_secure_persistence_keeps_the_selection_retryable(
     ) {
         let root = std::env::temp_dir().join(format!("frameleaf-consent-{}", uuid::Uuid::new_v4()));
@@ -369,7 +435,7 @@ mod tests {
         let called = AtomicBool::new(false);
         assert_eq!(
             state
-                .approve(&saved(), &identity, "forged", true, false, |_| {
+                .approve(&saved(), &identity, "forged", true, false, None, |_| {
                     called.store(true, Ordering::Release);
                     Ok(())
                 })
@@ -385,6 +451,7 @@ mod tests {
                 &selected.selection_id,
                 true,
                 false,
+                None,
                 |_| Err("credential_store_locked_or_unavailable".into())
             )
             .is_err());
@@ -395,6 +462,7 @@ mod tests {
                 &selected.selection_id,
                 true,
                 false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();
@@ -406,6 +474,7 @@ mod tests {
                 &selected.selection_id,
                 true,
                 false,
+                None,
                 |_| Ok(())
             )
             .is_err());
@@ -440,6 +509,7 @@ mod tests {
                     &selection.selection_id,
                     true,
                     false,
+                    None,
                     |_| { panic!("replacement folder must not gain consent") }
                 )
                 .err()
@@ -454,6 +524,7 @@ mod tests {
                 &selection.selection_id,
                 true,
                 false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();
@@ -477,6 +548,7 @@ mod tests {
                 &selected.selection_id,
                 true,
                 false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();
@@ -512,6 +584,7 @@ mod tests {
                 &selected.selection_id,
                 true,
                 false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();

@@ -25,6 +25,7 @@
     "allow-approve-photo-drop",
     "allow-control-photo-drop",
     "allow-approve-photo-folder",
+    "allow-list-photo-import-albums",
     "allow-photo-source-status",
     "allow-revoke-photo-source",
     "allow-photo-import-status",

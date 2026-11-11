@@ -16,6 +16,7 @@ mod host_setup;
 mod host_state;
 mod host_storage;
 mod identity_anchor;
+mod import_album;
 pub mod lifecycle;
 pub mod manager;
 mod manager_commands;
@@ -572,6 +573,7 @@ pub fn run() {
             discover_onedrive,
             choose_photo_folder,
             approve_photo_folder,
+            import_album::list_photo_import_albums,
             photo_source_status,
             revoke_photo_source,
             photo_import_status,
@@ -942,6 +944,7 @@ async fn approve_photo_folder(
     selection_id: Option<String>,
     allow_download: bool,
     watch: Option<bool>,
+    album: Option<import_album::Destination>,
 ) -> Result<source_consent::ConsentView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
@@ -951,15 +954,20 @@ async fn approve_photo_folder(
         if credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?.is_some() {
             return Err("source_remove_previous_approval".into());
         }
+        let destination = import_album::approve(saved, album).await?;
         app.state::<source_consent::SourceConsent>().approve(
             saved,
             &identity,
             &selection,
             allow_download,
             watch.unwrap_or(false),
+            destination,
             |value| credentials::save(source_consent::CREDENTIAL, value),
         )?
     } else {
+        if album.is_some() {
+            return Err("source_album_selection_changed".into());
+        }
         credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
             .ok_or("source_approval_required")?
     };
