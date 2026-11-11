@@ -197,6 +197,7 @@ pub(super) async fn run(
     wake: &tokio::sync::Notify,
     gate: &(dyn Fn() -> Result<(), String> + Sync),
     notify: &(dyn Fn(ImportView) + Sync),
+    transfer: &ImportTransfer,
 ) -> Result<(), String> {
     let approval = consent.approval(saved, identity)?;
     let batch = batch(journal)?;
@@ -224,6 +225,7 @@ pub(super) async fn run(
                 return Err("source_journal_invalid".into());
             }
             if !matches!(cursor.state.as_str(), "complete" | "cancelled") {
+                let _permit = transfer.acquire(cancel, wake).await?;
                 notify(view(&manifest, &cursor, "copying", None));
                 let publish = |value: ImportView| {
                     if value.state != "needs-attention"
