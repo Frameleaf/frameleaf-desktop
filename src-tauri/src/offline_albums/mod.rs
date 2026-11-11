@@ -334,10 +334,11 @@ pub(crate) async fn offline_album_status(
         None => Vec::new(),
     };
     require_local_photos(&window)?;
+    let progress = native.progress.lock().map_err(|_| BUSY)?.take();
     Ok(Status {
         busy: false,
         albums,
-        progress: native.progress.lock().map_err(|_| BUSY)?.take(),
+        progress,
     })
 }
 
