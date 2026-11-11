@@ -89,6 +89,7 @@
     } finally { busy = false; }
   }
   async function manageShortcut(enabled?: boolean) {
+    if (shortcutBusy) return;
     shortcutBusy = true;
     try {
       shortcut = await invoke<boolean | null>('explorer_import_shortcut', { enabled });
