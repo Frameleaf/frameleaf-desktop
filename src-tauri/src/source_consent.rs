@@ -1,5 +1,6 @@
 //! Picker-issued, photo-session-bound folder permission, stored only in the OS credential store.
 use crate::{
+    camera_identity::MediaIdentity,
     connection::{normalize_server, DeviceIdentity, SavedConnection},
     copy_source::CopyApproval,
     import_album::Destination,
@@ -18,7 +19,13 @@ pub struct SourceConsent {
 #[derive(Default)]
 struct Pending {
     generation: u64,
-    selected: Option<(String, PathBuf, Option<String>)>,
+    selected: Option<Selection>,
+}
+struct Selection {
+    id: String,
+    path: PathBuf,
+    root: Option<String>,
+    media: Option<MediaIdentity>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +59,7 @@ pub struct ConsentView {
     path: String,
     allow_download: bool,
     camera: bool,
+    can_reconnect: bool,
     registered: bool,
     watch: bool,
     destination: Option<Destination>,
@@ -101,7 +109,12 @@ impl SourceConsent {
             return Err("source_selection_changed".into());
         }
         let selection_id = uuid::Uuid::new_v4().to_string();
-        pending.selected = Some((selection_id.clone(), path, inventory.root_identity.take()));
+        pending.selected = Some(Selection {
+            id: selection_id.clone(),
+            path,
+            root: inventory.root_identity.take(),
+            media: inventory.media_identity.take(),
+        });
         Ok(SelectedFolder {
             selection_id,
             inventory,
@@ -122,11 +135,13 @@ impl SourceConsent {
             .pending
             .lock()
             .map_err(|_| "source_selection_unavailable")?;
-        let (_, path, preview_identity) = pending
+        let selection = pending
             .selected
             .as_ref()
-            .filter(|(id, ..)| id == selection)
+            .filter(|pending| pending.id == selection)
             .ok_or("source_selection_changed")?;
+        let path = &selection.path;
+        let preview_identity = selection.root.as_deref();
         if watch
             && (preview_identity.is_some()
                 || !allow_download
@@ -135,20 +150,32 @@ impl SourceConsent {
         {
             return Err("source_watch_local_required".into());
         }
-        let approval = CopyApproval::approve(
-            saved,
-            identity,
-            path,
-            // FL-1268: no per-file ceiling; staging space and the server's limit decide.
-            crate::copy_source::UNLIMITED_ITEM_BYTES,
-            allow_download,
-        )?;
-        if preview_identity
-            .as_deref()
-            .is_some_and(|expected| approval.root_identity() != expected)
-        {
-            return Err("source_camera_changed".into());
-        }
+        let approval = if let Some(expected) = preview_identity {
+            CopyApproval::approve_camera(
+                saved,
+                identity,
+                path,
+                allow_download,
+                expected,
+                selection.media.clone(),
+            )
+            .map_err(|code| {
+                if code == "source_root_changed" {
+                    "source_camera_changed".into()
+                } else {
+                    code
+                }
+            })?
+        } else {
+            CopyApproval::approve(
+                saved,
+                identity,
+                path,
+                // FL-1268: no per-file ceiling; staging space and the server's limit decide.
+                crate::copy_source::UNLIMITED_ITEM_BYTES,
+                allow_download,
+            )?
+        };
         let name = source_label(
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -272,6 +299,9 @@ impl Consent {
         }
         self.approved_scope(saved, identity)
     }
+    pub(crate) fn camera(&self) -> bool {
+        self.camera
+    }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()
     }
@@ -295,6 +325,7 @@ impl Consent {
             path: self.approval.root().to_string_lossy().into(),
             allow_download: self.allow_download,
             camera: self.camera,
+            can_reconnect: self.approval.media().is_some(),
             registered: self.registered,
             watch: self.watch,
             destination: self.destination.clone(),

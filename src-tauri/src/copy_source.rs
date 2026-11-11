@@ -1,5 +1,8 @@
 //! Approved, account-bound source reads into independent, verified staging bytes.
-use crate::connection::{normalize_server, DeviceIdentity, SavedConnection};
+use crate::{
+    camera_identity::MediaIdentity,
+    connection::{normalize_server, DeviceIdentity, SavedConnection},
+};
 use cap_std::{
     ambient_authority,
     fs::{Dir, Metadata, OpenOptions},
@@ -26,6 +29,8 @@ struct CopyScope {
     installation_id: String,
     root: String,
     root_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media: Option<MediaIdentity>,
     max_item_bytes: u64,
     allow_download: bool,
 }
@@ -178,9 +183,27 @@ fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String,
 }
 /// The same metadata identity used by the staging receipt, without opening original data.
 pub(crate) fn watch_version(dir: &Dir, name: &Path, meta: &Metadata) -> Result<String, String> {
-    Ok(version(&path_stamp(dir, name, meta)?))
+    Ok(version(&path_stamp(dir, name, meta)?, false))
 }
-fn version(stamp: &str) -> String {
+pub(crate) fn camera_version(dir: &Dir, name: &Path, meta: &Metadata) -> Result<String, String> {
+    Ok(version(&path_stamp(dir, name, meta)?, true))
+}
+fn version(stamp: &str, camera: bool) -> String {
+    #[cfg(unix)]
+    if camera {
+        // The mounted device number is ephemeral. The signed volume ID is checked separately.
+        let mut parts = stamp.splitn(4, ':');
+        if let (Some(bytes), Some(modified), Some(_device), Some(file)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        {
+            return format!(
+                "{:x}",
+                Sha256::digest(format!("{bytes}:{modified}:{file}").as_bytes())
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = camera;
     format!("{:x}", Sha256::digest(stamp.as_bytes()))
 }
 pub(crate) fn watchable(meta: &Metadata, observation: crate::source_metadata::Observation) -> bool {
@@ -326,6 +349,59 @@ impl CopyApproval {
     pub(crate) fn root_identity(&self) -> &str {
         &self.scope.root_identity
     }
+    pub(crate) fn media(&self) -> Option<&MediaIdentity> {
+        self.scope.media.as_ref()
+    }
+    pub(crate) fn open_source(&self, root: &Path) -> Result<Dir, String> {
+        crate::native_runtime::absolute_directory(root).map_err(|code| {
+            match (self.media().is_some(), code.as_str()) {
+                (true, "runtime_file_unavailable") => "source_camera_unavailable".into(),
+                (true, "runtime_link_forbidden" | "runtime_root_invalid") => {
+                    "source_camera_changed".into()
+                }
+                _ => code,
+            }
+        })?;
+        let dir = Dir::open_ambient_dir(root, ambient_authority()).map_err(|_| {
+            if self.media().is_some() {
+                "source_camera_unavailable"
+            } else {
+                "source_root_unavailable"
+            }
+        })?;
+        if let Some(media) = self.media() {
+            media.require(&dir)?;
+        } else if root != self.root() || root_identity(&dir)? != self.scope.root_identity {
+            return Err("source_root_changed".into());
+        }
+        Ok(dir)
+    }
+
+    pub(crate) fn require_camera_file(
+        &self,
+        root: &Dir,
+        mounted_volume: &str,
+        entry: &crate::photo_sources::SourceFile,
+    ) -> Result<(), String> {
+        let (parent, name) = parent_dir(root, relative_path(&entry.relative)?)?;
+        if root_identity(&parent)?.split(':').next() != Some(mounted_volume) {
+            return Err("source_camera_changed".into());
+        }
+        let meta = parent
+            .symlink_metadata(&name)
+            .map_err(|_| "source_camera_changed")?;
+        let item = crate::source_metadata::probe(&parent, &name, &meta)?;
+        if !meta.is_file()
+            || meta.len() != entry.bytes
+            || item.excluded
+            || !watchable(&meta, item)
+            || entry.watch_version.as_deref() != Some(&camera_version(&parent, &name, &meta)?)
+        {
+            return Err("source_camera_changed".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_current(
         &self,
         saved: &SavedConnection,
@@ -342,7 +418,15 @@ impl CopyApproval {
     ) -> Result<Self, String> {
         // Reuse the preview's broad-root and package refusals, without opening media.
         crate::photo_sources::inventory(root, 1)?;
-        Self::approve_root(saved, identity, root, max_item_bytes, allow_download, None)
+        Self::approve_root(
+            saved,
+            identity,
+            root,
+            max_item_bytes,
+            allow_download,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn approve_drop(
@@ -358,6 +442,26 @@ impl CopyApproval {
             UNLIMITED_ITEM_BYTES,
             true,
             Some(expected),
+            None,
+        )
+    }
+
+    pub(crate) fn approve_camera(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        root: &Path,
+        allow_download: bool,
+        expected: &str,
+        media: Option<MediaIdentity>,
+    ) -> Result<Self, String> {
+        Self::approve_root(
+            saved,
+            identity,
+            root,
+            UNLIMITED_ITEM_BYTES,
+            allow_download,
+            Some(expected),
+            media,
         )
     }
 
@@ -368,6 +472,7 @@ impl CopyApproval {
         max_item_bytes: u64,
         allow_download: bool,
         expected: Option<&str>,
+        media: Option<MediaIdentity>,
     ) -> Result<Self, String> {
         normalize_server(&saved.server)?;
         #[cfg(windows)]
@@ -390,6 +495,9 @@ impl CopyApproval {
         }
         let dir = Dir::open_ambient_dir(root, ambient_authority())
             .map_err(|_| "source_root_unavailable")?;
+        if let Some(media) = &media {
+            media.require(&dir)?;
+        }
         let root_identity = root_identity(&dir)?;
         if expected.is_some_and(|expected| expected != root_identity) {
             return Err("source_root_changed".into());
@@ -404,6 +512,7 @@ impl CopyApproval {
             installation_id: identity.installation_id.clone(),
             root: root.to_str().ok_or("source_root_invalid")?.into(),
             root_identity,
+            media,
             max_item_bytes,
             allow_download,
         };
@@ -445,6 +554,7 @@ impl CopyApproval {
             &Uuid::new_v4().to_string(),
             None,
             None,
+            None,
             cancelled,
             &|| Ok(()),
         )
@@ -459,6 +569,7 @@ impl CopyApproval {
         stage_id: &str,
         expected_bytes: Option<u64>,
         expected_watch_version: Option<&str>,
+        reconnected_root: Option<&Path>,
         cancelled: &AtomicBool,
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<StagedCopy, String> {
@@ -476,22 +587,23 @@ impl CopyApproval {
             return Err("source_download_permission_required".into());
         }
         let relative_path = relative_path(relative)?;
-        let root = Path::new(&self.scope.root);
-        crate::native_runtime::absolute_directory(root)?;
+        let root = reconnected_root.unwrap_or_else(|| self.root());
         crate::native_runtime::absolute_directory(destination)?;
         if destination.starts_with(root) || root.starts_with(destination) {
             return Err("source_staging_overlap".into());
         }
-        let dir = Dir::open_ambient_dir(root, ambient_authority())
-            .map_err(|_| "source_root_unavailable")?;
-        if root_identity(&dir)? != self.scope.root_identity {
-            return Err("source_root_changed".into());
-        }
+        let dir = self.open_source(root)?;
+        let mounted_root = self.media().map(|_| root_identity(&dir)).transpose()?;
         let root_meta = dir.dir_metadata().map_err(|_| "source_root_unavailable")?;
         if crate::source_metadata::probe(&dir, Path::new("."), &root_meta)?.excluded {
             return Err("source_item_excluded".into());
         }
         let (dir, name) = parent_dir(&dir, relative_path)?;
+        if let Some(root_identity_string) = mounted_root {
+            if root_identity(&dir)?.split(':').next() != root_identity_string.split(':').next() {
+                return Err("source_camera_changed".into());
+            }
+        }
         let relative_path = name.as_path();
         let before = dir
             .symlink_metadata(relative_path)
@@ -515,7 +627,9 @@ impl CopyApproval {
             return Err("source_item_changed".into());
         }
         let source_stamp = path_stamp(&dir, relative_path, &before)?;
-        if expected_watch_version.is_some_and(|expected| expected != version(&source_stamp)) {
+        if expected_watch_version
+            .is_some_and(|expected| expected != version(&source_stamp, self.media().is_some()))
+        {
             return Err("source_item_changed".into());
         }
         let staging = Dir::open_ambient_dir(destination, ambient_authority())
@@ -678,7 +792,7 @@ impl StagedCopy {
         )
     }
     pub(crate) fn version(&self) -> String {
-        version(&self.source_stamp)
+        version(&self.source_stamp, self.approval.media().is_some())
     }
     pub(crate) fn release(
         &self,
@@ -959,6 +1073,17 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn camera_version_survives_a_changed_mount_device_but_keeps_file_identity() {
+        let original = "10:123:5:81:2:7";
+        let remount = "10:123:9:81:2:7";
+        assert_eq!(version(original, true), version(remount, true));
+        assert_ne!(version(original, false), version(remount, false));
+        assert_ne!(version(original, true), version("10:123:5:82:2:7", true));
+        assert_ne!(version(original, true), version("10:123:5:81:2:8", true));
+    }
+
     #[cfg(windows)]
     #[test]
     fn fresh_windows_source_metadata_matches_opened_handles() {

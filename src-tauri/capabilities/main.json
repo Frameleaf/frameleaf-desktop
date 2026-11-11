@@ -18,6 +18,7 @@
     "allow-prepare-models",
     "allow-control-worker",
     "allow-discover-camera-folders",
+    "allow-reconnect-photo-camera",
     "allow-discover-onedrive",
     "allow-choose-photo-folder",
     "allow-preview-photo-drop",

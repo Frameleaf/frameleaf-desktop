@@ -32,6 +32,7 @@ fn main() {
             "prepare_models",
             "control_worker",
             "discover_camera_folders",
+            "reconnect_photo_camera",
             "discover_onedrive",
             "choose_photo_folder",
             "preview_photo_drop",

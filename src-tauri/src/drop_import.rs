@@ -205,6 +205,7 @@ fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
                 truncated: false,
                 availability,
                 root_identity: None,
+                media_identity: None,
             },
             files,
             unreadable: 0,
