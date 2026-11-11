@@ -81,10 +81,14 @@ Desktop writes a private JSON receipt in
 for each model key and provider replaces its previous receipt. Collect only
 receipts with qualification timestamps from the current run and the expected
 app version, target architecture and signed runtime manifest digest. Search has
-separate receipts for default text, English text and vision. Match the model key
-and configuration digest for each route. Check the model name, snapshot,
-provider and execution state in each receipt. A mixed accelerator
-result records `ready-mixed`.
+separate receipts for default text, English text and vision. In the candidate
+revision's `runtime/model-catalogue.json`, locate the profile matching the
+receipt's `modelKey`, `runtimeSourceRevision` and `spec.provider`. Canonicalize
+only that profile's `spec.entries` using JSON Canonicalization Scheme, the same
+serialization the harness uses. Compute the lowercase SHA-256 of the canonical
+UTF-8 bytes without a trailing newline and compare it with `configSha256`.
+Check the model name, snapshot, provider and execution state in each receipt.
+A mixed accelerator result records `ready-mixed`.
 
 Keep the receipts with the matching installer digest. They record fixture
 acceptance by Library. Run a representative Library job for each route on the
