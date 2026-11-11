@@ -138,6 +138,17 @@ fn scoped_source_account(account: &str, saved: &SavedConnection) -> String {
     format!("{account}-{}", photo_session_scope(saved))
 }
 
+/// Re-read approval without opening the user-presence connection item on the job's hot path.
+pub(crate) fn load_source<T: DeserializeOwned>(
+    account: &str,
+    saved: &SavedConnection,
+) -> Result<Option<T>, String> {
+    if saved.server_id.is_empty() {
+        return load_record(account);
+    }
+    load_record(&scoped_source_account(account, saved))
+}
+
 fn source_account(account: &str) -> Result<Cow<'_, str>, String> {
     if SOURCE_APPROVALS.contains(&account) {
         if let Some(saved) = load_record::<SavedConnection>("connection")? {
@@ -394,5 +405,35 @@ mod library_switch_source_scope_tests {
         assert_ne!(scoped_source_account(account, &different), original_key);
         different.token = original.token.clone();
         assert_eq!(scoped_source_account(account, &different), original_key);
+    }
+
+    #[test]
+    #[ignore = "uses a process-local synthetic Keychain; run alone"]
+    fn job_rereads_only_its_scoped_approval_when_connection_cannot_be_read() {
+        crate::ml_transport::native_nas_tests::install_test_keyring();
+        let mut saved = SavedConnection {
+            server: "https://example.invalid/".into(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Fixture".into(),
+            token: "fixture".into(),
+            device_name: "Desktop".into(),
+            mode: "client-worker".into(),
+            device_id: None,
+        };
+        let account = crate::source_consent::CREDENTIAL;
+        let approval = scoped_source_account(account, &saved);
+        save_record("connection", &"unreadable as a saved connection").unwrap();
+        save_record(&approval, &"signed approval fixture").unwrap();
+        assert!(load::<String>(account).is_err());
+        assert_eq!(
+            load_source::<String>(account, &saved).unwrap().as_deref(),
+            Some("signed approval fixture")
+        );
+        saved.token = "different-token".into();
+        assert!(load_source::<String>(account, &saved).unwrap().is_none());
+        saved.token = "fixture".into();
+        delete_record(&approval).unwrap();
+        assert!(load_source::<String>(account, &saved).unwrap().is_none());
     }
 }

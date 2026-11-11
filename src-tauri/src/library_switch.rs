@@ -1,9 +1,9 @@
 //! The active credential remains the commit point for Photos, imports and AI work.
 use crate::{
-    connection::{Capabilities, ConnectionView, SavedConnection},
+    connection::{photo_session_scope, Capabilities, ConnectionView, SavedConnection},
     credentials, DesktopState,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
@@ -13,20 +13,76 @@ const MAX_APPROVED: usize = 16;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApprovedLibrary {
-    id: String,
-    server: String,
-    name: String,
+    #[serde(flatten)]
+    display: LibraryDisplay,
     active: bool,
 }
 
-impl ApprovedLibrary {
-    fn from_saved(saved: &SavedConnection, active: bool) -> Self {
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryDisplay {
+    id: String,
+    server: String,
+    name: String,
+}
+
+impl LibraryDisplay {
+    fn from_saved(saved: &SavedConnection) -> Self {
         Self {
             id: library_id(saved),
             server: saved.server.clone(),
             name: saved.name.clone(),
-            active,
         }
+    }
+}
+
+/// Older indexes contained only IDs. Keep those slots selectable without opening them to list.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum IndexEntry {
+    Display {
+        display: LibraryDisplay,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<uuid::Uuid>,
+    },
+    Legacy(String),
+}
+
+impl IndexEntry {
+    /// Use the stable Library and account identity for both index versions.
+    fn id(&self) -> &str {
+        match self {
+            Self::Display { display, .. } => &display.id,
+            Self::Legacy(id) => id,
+        }
+    }
+
+    /// Give an old approval a label without unlocking its sign-in.
+    fn display(&self) -> LibraryDisplay {
+        match self {
+            Self::Display { display, .. } => display.clone(),
+            Self::Legacy(id) => LibraryDisplay {
+                id: id.clone(),
+                server: String::new(),
+                name: format!("Saved library {}", id.chars().take(8).collect::<String>()),
+            },
+        }
+    }
+
+    /// Legacy approvals use the original slot until the user signs in again.
+    fn generation(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Display { generation, .. } => *generation,
+            Self::Legacy(_) => None,
+        }
+    }
+
+    fn account(&self) -> Result<String, String> {
+        let account = slot(self.id())?;
+        Ok(match self.generation() {
+            Some(generation) => format!("{account}-{generation}"),
+            None => account,
+        })
     }
 }
 
@@ -49,23 +105,28 @@ fn slot(id: &str) -> Result<String, String> {
     Ok(format!("approved-library-{id}"))
 }
 
-fn index() -> Result<Vec<String>, String> {
+fn index() -> Result<Vec<IndexEntry>, String> {
     Ok(credentials::load(INDEX)?.unwrap_or_default())
 }
 
 pub(crate) fn already_approved(saved: &SavedConnection) -> Result<bool, String> {
-    Ok(!saved.server_id.is_empty() && index()?.contains(&library_id(saved)))
+    if saved.server_id.is_empty() {
+        return Ok(false);
+    }
+    let id = library_id(saved);
+    Ok(index()?.iter().any(|entry| entry.id() == id))
 }
 
+/// Read exactly one approved credential and verify that the slot matches its account and Library.
 fn stored_library(
     window: &WebviewWindow,
-    approved: &[String],
+    approved: &[IndexEntry],
     id: &str,
 ) -> Result<Option<SavedConnection>, String> {
-    if !approved.iter().any(|item| item == id) {
+    let Some(entry) = approved.iter().find(|entry| entry.id() == id) else {
         return Ok(None);
-    }
-    let saved = credentials::load_interactive::<SavedConnection>(&slot(id)?, window, true)?;
+    };
+    let saved = credentials::load_interactive::<SavedConnection>(&entry.account()?, window, true)?;
     if saved
         .as_ref()
         .is_some_and(|saved| saved.server_id.is_empty() || library_id(saved) != id)
@@ -75,41 +136,65 @@ fn stored_library(
     Ok(saved)
 }
 
+/// Persist the display record and confirm the protected slot before treating it as usable.
 fn park(
     window: &WebviewWindow,
-    approved: &mut Vec<String>,
+    approved: &mut Vec<IndexEntry>,
     saved: &SavedConnection,
-) -> Result<(), String> {
+    replace: bool,
+) -> Result<Option<String>, String> {
     if saved.server_id.is_empty() {
         return Err("server_identity_not_confirmed".into());
     }
     let id = library_id(saved);
-    let existing = approved.contains(&id);
-    if !existing && approved.len() >= MAX_APPROVED {
+    let existing = approved.iter().position(|entry| entry.id() == id);
+    if existing.is_none() && approved.len() >= MAX_APPROVED {
         return Err("approved_library_limit".into());
     }
-    let account = slot(&id)?;
+    let previous = existing.map(|position| &approved[position]);
+    let retired = previous
+        .filter(|_| replace)
+        .map(IndexEntry::account)
+        .transpose()?;
+    // Commit a new slot through the index so a failed confirmation leaves the old slot intact.
+    let display = IndexEntry::Display {
+        display: LibraryDisplay::from_saved(saved),
+        generation: if retired.is_some() {
+            Some(uuid::Uuid::new_v4())
+        } else {
+            previous.and_then(IndexEntry::generation)
+        },
+    };
+    let account = display.account()?;
+    let new_slot = existing.is_none() || retired.is_some();
     credentials::save(&account, saved)?;
     if let Err(error) = credentials::confirm_new_sign_in(&account, saved, window) {
-        if !existing && error != "credential_confirmation_changed" {
+        if new_slot && error != "credential_confirmation_changed" {
             let _ = credentials::delete(&account);
         }
         return Err(error);
     }
-    if !existing {
-        approved.push(id);
-        if let Err(error) = credentials::save(INDEX, approved) {
-            let _ = credentials::delete(&account);
-            return Err(error);
-        }
+    let mut next = approved.clone();
+    if let Some(existing) = existing {
+        next[existing] = display;
+    } else {
+        next.push(display);
     }
-    Ok(())
+    if let Err(error) = credentials::save(INDEX, &next) {
+        if new_slot {
+            let _ = credentials::delete(&account);
+        }
+        return Err(error);
+    }
+    *approved = next;
+    Ok(retired)
 }
 
-fn forget(id: &str, approved: &mut Vec<String>) -> Result<(), String> {
-    if approved.iter().any(|item| item == id) {
-        credentials::delete(&slot(id)?)?;
-        approved.retain(|item| item != id);
+/// Delete a selected credential before removing its approval from the index.
+fn forget(id: &str, approved: &mut Vec<IndexEntry>) -> Result<(), String> {
+    if let Some(entry) = approved.iter().find(|entry| entry.id() == id) {
+        credentials::delete(&entry.account()?)?;
+        approved.retain(|item| item.id() != id);
         credentials::save(INDEX, approved)?;
     }
     Ok(())
@@ -130,6 +215,33 @@ async fn verify(client: &reqwest::Client, saved: &SavedConnection) -> Result<Cap
     Ok(capabilities)
 }
 
+/// Retire only the superseded login, whose signed local approvals cannot be reused.
+async fn retire_replaced(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    mut previous: SavedConnection,
+    target: &SavedConnection,
+) -> Result<(), String> {
+    if previous.token != target.token
+        && (previous.server == target.server || verify(client, &previous).await.is_ok())
+    {
+        // The new login may reuse the device. Revoke only the replaced bearer session.
+        previous.device_id = None;
+        let _ = crate::revoke_photo_connection(&previous).await;
+    }
+    if photo_session_scope(&previous) != photo_session_scope(target) {
+        let offline = app.state::<crate::offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        let copies = offline.purge(app, &previous).await;
+        let approvals = credentials::delete_parked_source_approvals(&previous);
+        copies
+            .and(approvals)
+            .map_err(|_| "library_reapproval_cleanup_failed")?;
+    }
+    Ok(())
+}
+
+/// Build the switcher list from display records without unlocking protected sign-ins.
 #[tauri::command]
 pub(crate) async fn approved_libraries(
     window: WebviewWindow,
@@ -139,17 +251,24 @@ pub(crate) async fn approved_libraries(
     let active = state.0.lock().await;
     let approved = index()?;
     let mut result = Vec::with_capacity(approved.len() + 1);
-    if let Some(saved) = active.as_ref().filter(|saved| !saved.server_id.is_empty()) {
-        result.push(ApprovedLibrary::from_saved(saved, true));
-    }
-    for id in &approved {
-        if result.first().is_some_and(|active| active.id == *id) {
-            continue;
-        }
-        if let Some(saved) = stored_library(&window, &approved, id)? {
-            result.push(ApprovedLibrary::from_saved(&saved, false));
-        }
-    }
+    let active = active
+        .as_ref()
+        .filter(|saved| !saved.server_id.is_empty())
+        .map(LibraryDisplay::from_saved);
+    let active_id = active.as_ref().map(|display| display.id.clone());
+    result.extend(active.map(|display| ApprovedLibrary {
+        display,
+        active: true,
+    }));
+    result.extend(
+        approved
+            .iter()
+            .filter(|entry| active_id.as_deref() != Some(entry.id()))
+            .map(|entry| ApprovedLibrary {
+                display: entry.display(),
+                active: false,
+            }),
+    );
     Ok(result)
 }
 
@@ -163,6 +282,7 @@ fn current_connection(
     credentials::load_interactive("connection", window, true)
 }
 
+/// Verify a new sign-in before saving a new or renewed approval and activating it.
 #[tauri::command]
 pub(crate) async fn add_approved_library(
     window: WebviewWindow,
@@ -198,15 +318,25 @@ pub(crate) async fn add_approved_library(
         if previous
             .as_ref()
             .is_some_and(|saved| library_id(saved) == id)
-            || stored_library(&window, &approved, &id)?.is_some()
         {
             return Err("library_already_approved".into());
         }
+        let replaced = stored_library(&window, &approved, &id)?;
         if let Some(previous) = previous.as_ref() {
-            park(&window, &mut approved, previous)?;
+            park(&window, &mut approved, previous, false)?;
         }
-        park(&window, &mut approved, &target)?;
+        let retired = park(&window, &mut approved, &target, true)?;
         target_parked = true;
+        if let Some(retired) = retired {
+            let removed = credentials::delete(&retired)
+                .map_err(|_| "library_reapproval_cleanup_failed".to_owned());
+            let cleanup = if let Some(replaced) = replaced {
+                retire_replaced(&app, &client, replaced, &target).await
+            } else {
+                Ok(())
+            };
+            removed.and(cleanup)?;
+        }
         activate(
             &app,
             &client,
@@ -226,6 +356,7 @@ pub(crate) async fn add_approved_library(
     result
 }
 
+/// Unlock and reverify the one approved Library chosen by the user.
 #[tauri::command]
 pub(crate) async fn activate_approved_library(
     window: WebviewWindow,
@@ -252,9 +383,14 @@ pub(crate) async fn activate_approved_library(
     let mut approved = index()?;
     let target = stored_library(&window, &approved, &id)?.ok_or("library_not_approved")?;
     let client = crate::transport::client()?;
-    let caps = verify(&client, &target).await?;
+    let caps = verify(&client, &target)
+        .await
+        .map_err(|error| match error.as_str() {
+            "server_http_401" => "library_sign_in_expired".into(),
+            _ => error,
+        })?;
     if let Some(previous) = previous.as_ref().filter(|saved| library_id(saved) != id) {
-        park(&window, &mut approved, previous)?;
+        park(&window, &mut approved, previous, false)?;
     }
     let result = activate(&app, &client, &mut active, previous.as_ref(), target, caps).await;
     drop(active);
@@ -471,12 +607,37 @@ mod tests {
 
     #[test]
     fn approved_library_list_exposes_no_session_credential() {
-        let card =
-            serde_json::to_value(ApprovedLibrary::from_saved(&saved("one", "account"), false))
-                .unwrap();
+        let display = LibraryDisplay::from_saved(&saved("one", "account"));
+        let card = serde_json::to_value(ApprovedLibrary {
+            display,
+            active: false,
+        })
+        .unwrap();
         assert_eq!(card.as_object().unwrap().len(), 4);
         assert!(card.get("token").is_none());
         assert!(card.get("accountId").is_none());
+    }
+
+    #[test]
+    fn old_and_new_approvals_can_be_listed_without_reading_either_protected_slot() {
+        let legacy_id = library_id(&saved("old", "account"));
+        let display = LibraryDisplay::from_saved(&saved("new", "account"));
+        let generation = uuid::Uuid::new_v4();
+        let approved: Vec<IndexEntry> = serde_json::from_value(serde_json::json!([
+            legacy_id,
+            {"display": display, "generation": generation}
+        ]))
+        .unwrap();
+        assert_eq!(approved[0].id(), legacy_id);
+        assert_eq!(approved[0].display().server, "");
+        assert!(approved[0].display().name.starts_with("Saved library "));
+        assert_eq!(approved[1].display().name, "Fixture");
+        assert_eq!(approved[1].display().server, "https://example.invalid/");
+        assert_eq!(approved[0].account().unwrap(), slot(&legacy_id).unwrap());
+        assert_eq!(
+            approved[1].account().unwrap(),
+            format!("{}-{generation}", slot(approved[1].id()).unwrap())
+        );
     }
 
     #[test]
@@ -493,7 +654,14 @@ mod tests {
 
         forget_active(&active).unwrap();
 
-        assert_eq!(index().unwrap(), vec![inactive_id.clone()]);
+        assert_eq!(
+            index()
+                .unwrap()
+                .iter()
+                .map(IndexEntry::id)
+                .collect::<Vec<_>>(),
+            vec![inactive_id.as_str()]
+        );
         assert!(
             credentials::load::<SavedConnection>(&slot(&active_id).unwrap())
                 .unwrap()

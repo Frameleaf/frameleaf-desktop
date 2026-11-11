@@ -66,9 +66,9 @@
   {busy} onclose={onclose} onsubmit={submit}
 >
   {#if removing}
-    <p>Remove {removing.name} at {removing.server} from this computer? Desktop removes its saved sign-in, import permissions, and offline copies.</p>
+    <p>Remove {removing.name}{removing.server ? ` at ${removing.server}` : ''} from this computer? Desktop removes its saved sign-in, import permissions, and offline copies.</p>
   {:else if adding}
-    <p>Sign in to approve this library on this computer. Switching closes Photos and stops imports and AI work for the previous library.</p>
+    <p>Sign in to approve this library on this computer. Switching closes Photos and stops imports and AI work for the previous library. A new sign-in for an approved library clears the previous sign-in’s import permissions and offline copies.</p>
     <div class="form">
       <label>Server address <input type="text" inputmode="url" placeholder="https://photos.example.com" required bind:value={server} /></label>
       <label>Email <input type="email" autocomplete="username" required bind:value={email} /></label>
@@ -81,7 +81,7 @@
       <ul class="libraries" aria-label="Approved libraries">
         {#each libraries as library (library.id)}
           <li>
-            <div><strong>{library.name}</strong><small>{library.server}</small></div>
+            <div><strong>{library.name}</strong>{#if library.server}<small>{library.server}</small>{/if}</div>
             {#if library.active}
               <span>Active</span>
             {:else}
