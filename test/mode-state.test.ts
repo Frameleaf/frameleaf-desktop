@@ -32,14 +32,28 @@ test('every invoke() in the Svelte front end names a registered, permitted comma
   walk(root);
   const manifest = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
   const handler = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8').match(/tauri::generate_handler!\[([\s\S]*?)\]/)?.[1] ?? '';
-  const capability = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
+  const main = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/main.json', import.meta.url), 'utf8'));
+  const offline = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/offline-photos.json', import.meta.url), 'utf8'));
+  const offlineComponent = join(root, 'OfflinePhotos.svelte');
+  assert.equal(offline.local, true);
+  assert.deepEqual(offline.windows, ['photos']);
+  assert.equal(offline.remote, undefined);
   const commands = new Set<string>();
-  for (const file of files) for (const match of readFileSync(file, 'utf8').matchAll(/\binvoke(?:<[^>]+>)?\(\s*['"]([a-z_]+)['"]/g)) commands.add(match[1]!);
-  for (const expected of ['discover_servers', 'server_summary', 'cloud_status', 'wallet_status', 'update_wallet', 'remote_status', 'update_remote', 'test_remote_access', 'open_external', 'tray_refresh', 'cloud_sign_in', 'cloud_account', 'cloud_sign_out', 'cloud_servers', 'connect_cloud_server']) assert.ok(commands.has(expected), `front end never calls ${expected}`);
-  for (const command of commands) {
-    assert.match(handler, new RegExp(`\\b${command}\\b`), `missing invoke handler: ${command}`);
-    assert.ok(manifest.includes(JSON.stringify(command)), `missing app command: ${command}`);
-    assert.ok(capability.permissions.includes(`allow-${command.replaceAll('_', '-')}`), `missing permission: ${command}`);
+  for (const file of files) {
+    const localOffline = file === offlineComponent;
+    const capability = localOffline ? offline : main;
+    for (const match of readFileSync(file, 'utf8').matchAll(/\binvoke(?:<[^>]+>)?\(\s*['"]([a-z_]+)['"]/g)) {
+      const command = match[1]!;
+      const permission = `allow-${command.replaceAll('_', '-')}`;
+      commands.add(command);
+      assert.match(handler, new RegExp(`\\b${command}\\b`), `missing invoke handler: ${command}`);
+      assert.ok(manifest.includes(JSON.stringify(command)), `missing app command: ${command}`);
+      assert.ok(capability.permissions.includes(permission), `missing permission: ${command}`);
+      assert.ok(!(localOffline ? main : offline).permissions.includes(permission), `permission shared across windows: ${command}`);
+    }
+  }
+  for (const expected of ['discover_servers', 'server_summary', 'cloud_status', 'wallet_status', 'update_wallet', 'remote_status', 'update_remote', 'test_remote_access', 'open_external', 'tray_refresh', 'cloud_sign_in', 'cloud_account', 'cloud_sign_out', 'cloud_servers', 'connect_cloud_server', 'offline_album_status']) {
+    assert.ok(commands.has(expected), `front end never calls ${expected}`);
   }
 });
 
