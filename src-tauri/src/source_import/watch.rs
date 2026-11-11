@@ -284,7 +284,16 @@ mod tests {
 
     #[test]
     fn checkpoint_reconciles_new_files_and_refuses_a_replaced_root() {
-        let base = fs::canonicalize(std::env::temp_dir())
+        // Linux /tmp can be tmpfs, which is outside the watched-volume allowlist.
+        #[cfg(target_os = "linux")]
+        let fixture_parent = {
+            let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            fs::create_dir_all(&target).unwrap();
+            target
+        };
+        #[cfg(not(target_os = "linux"))]
+        let fixture_parent = std::env::temp_dir();
+        let base = fs::canonicalize(fixture_parent)
             .unwrap()
             .join(format!("frameleaf-watch-{}", uuid::Uuid::new_v4()));
         crate::runtime_store::private_directory(&base).unwrap();
