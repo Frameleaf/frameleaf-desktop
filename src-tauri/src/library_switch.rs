@@ -1,7 +1,9 @@
 //! The active credential remains the commit point for Photos, imports and AI work.
 use crate::{
-    connection::{photo_session_scope, Capabilities, ConnectionView, SavedConnection},
-    credentials, DesktopState,
+    connection::{Capabilities, ConnectionView, SavedConnection},
+    credentials,
+    offline_albums::{CleanupScope, OfflineAlbums},
+    DesktopState,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,8 +46,19 @@ enum IndexEntry {
         display: LibraryDisplay,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         generation: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleanup_scope: Option<CleanupScope>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<PendingCleanup>,
     },
     Legacy(String),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct PendingCleanup {
+    generation: Option<uuid::Uuid>,
+    scope: CleanupScope,
+    revoke_bearer: bool,
 }
 
 impl IndexEntry {
@@ -78,11 +91,25 @@ impl IndexEntry {
     }
 
     fn account(&self) -> Result<String, String> {
-        let account = slot(self.id())?;
-        Ok(match self.generation() {
-            Some(generation) => format!("{account}-{generation}"),
-            None => account,
-        })
+        slot_for(self.id(), self.generation())
+    }
+
+    fn pending(&self) -> Option<&PendingCleanup> {
+        match self {
+            Self::Display { pending, .. } => pending.as_ref(),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    /// Older records require a readable credential to recover the exact cleanup scope.
+    fn cleanup_scope(&self, saved: Option<&SavedConnection>) -> Result<CleanupScope, String> {
+        match self {
+            Self::Display {
+                cleanup_scope: Some(scope),
+                ..
+            } => Ok(scope.clone()),
+            _ => CleanupScope::from_saved(saved.ok_or("library_cleanup_scope_unavailable")?),
+        }
     }
 }
 
@@ -103,6 +130,14 @@ fn slot(id: &str) -> Result<String, String> {
         return Err("library_not_approved".into());
     }
     Ok(format!("approved-library-{id}"))
+}
+
+fn slot_for(id: &str, generation: Option<uuid::Uuid>) -> Result<String, String> {
+    let account = slot(id)?;
+    Ok(match generation {
+        Some(generation) => format!("{account}-{generation}"),
+        None => account,
+    })
 }
 
 fn index() -> Result<Vec<IndexEntry>, String> {
@@ -126,7 +161,21 @@ fn stored_library(
     let Some(entry) = approved.iter().find(|entry| entry.id() == id) else {
         return Ok(None);
     };
-    let saved = credentials::load_interactive::<SavedConnection>(&entry.account()?, window, true)?;
+    let saved = read_slot(window, id, &entry.account()?)?;
+    if let (Some(saved), Ok(scope)) = (saved.as_ref(), entry.cleanup_scope(None)) {
+        if CleanupScope::from_saved(saved)? != scope {
+            return Err("credential_record_invalid".into());
+        }
+    }
+    Ok(saved)
+}
+
+fn read_slot(
+    window: &WebviewWindow,
+    id: &str,
+    account: &str,
+) -> Result<Option<SavedConnection>, String> {
+    let saved = credentials::load_interactive::<SavedConnection>(account, window, true)?;
     if saved
         .as_ref()
         .is_some_and(|saved| saved.server_id.is_empty() || library_id(saved) != id)
@@ -141,8 +190,8 @@ fn park(
     window: &WebviewWindow,
     approved: &mut Vec<IndexEntry>,
     saved: &SavedConnection,
-    replace: bool,
-) -> Result<Option<String>, String> {
+    pending: Option<PendingCleanup>,
+) -> Result<(), String> {
     if saved.server_id.is_empty() {
         return Err("server_identity_not_confirmed".into());
     }
@@ -152,21 +201,22 @@ fn park(
         return Err("approved_library_limit".into());
     }
     let previous = existing.map(|position| &approved[position]);
-    let retired = previous
-        .filter(|_| replace)
-        .map(IndexEntry::account)
-        .transpose()?;
+    if previous.and_then(IndexEntry::pending).is_some() {
+        return Err("library_reapproval_cleanup_failed".into());
+    }
     // Commit a new slot through the index so a failed confirmation leaves the old slot intact.
     let display = IndexEntry::Display {
         display: LibraryDisplay::from_saved(saved),
-        generation: if retired.is_some() {
+        generation: if pending.is_some() {
             Some(uuid::Uuid::new_v4())
         } else {
             previous.and_then(IndexEntry::generation)
         },
+        cleanup_scope: Some(CleanupScope::from_saved(saved)?),
+        pending,
     };
     let account = display.account()?;
-    let new_slot = existing.is_none() || retired.is_some();
+    let new_slot = existing.is_none() || display.pending().is_some();
     credentials::save(&account, saved)?;
     if let Err(error) = credentials::confirm_new_sign_in(&account, saved, window) {
         if new_slot && error != "credential_confirmation_changed" {
@@ -187,12 +237,15 @@ fn park(
         return Err(error);
     }
     *approved = next;
-    Ok(retired)
+    Ok(())
 }
 
 /// Delete a selected credential before removing its approval from the index.
 fn forget(id: &str, approved: &mut Vec<IndexEntry>) -> Result<(), String> {
     if let Some(entry) = approved.iter().find(|entry| entry.id() == id) {
+        if entry.pending().is_some() {
+            return Err("library_reapproval_cleanup_failed".into());
+        }
         credentials::delete(&entry.account()?)?;
         approved.retain(|item| item.id() != id);
         credentials::save(INDEX, approved)?;
@@ -215,30 +268,65 @@ async fn verify(client: &reqwest::Client, saved: &SavedConnection) -> Result<Cap
     Ok(capabilities)
 }
 
-/// Retire only the superseded login, whose signed local approvals cannot be reused.
-async fn retire_replaced(
-    app: &AppHandle,
-    client: &reqwest::Client,
-    mut previous: SavedConnection,
-    target: &SavedConnection,
-) -> Result<(), String> {
-    if previous.token != target.token
-        && (previous.server == target.server || verify(client, &previous).await.is_ok())
+async fn purge_scope(app: &AppHandle, scope: &CleanupScope) -> Result<(), String> {
+    let copies = app.state::<OfflineAlbums>().purge_scope(app, scope).await;
+    let approvals = credentials::delete_source_scope(scope.id());
+    copies.and(approvals)
+}
+
+/// Best-effort revocation uses only a readable old bearer verified for its original scope.
+async fn revoke_replaced(window: &WebviewWindow, id: &str, account: &str, scope: &CleanupScope) {
+    let Ok(Some(mut old)) = read_slot(window, id, account) else {
+        return;
+    };
+    let Ok(client) = crate::transport::client() else {
+        return;
+    };
+    if CleanupScope::from_saved(&old).ok().as_ref() == Some(scope)
+        && verify(&client, &old).await.is_ok()
     {
-        // The new login may reuse the device. Revoke only the replaced bearer session.
-        previous.device_id = None;
-        let _ = crate::revoke_photo_connection(&previous).await;
+        // The renewed sign-in can reuse the device. Revoke only the old bearer.
+        old.device_id = None;
+        let _ = crate::revoke_photo_connection(&old).await;
     }
-    if photo_session_scope(&previous) != photo_session_scope(target) {
-        let offline = app.state::<crate::offline_albums::OfflineAlbums>();
-        offline.deactivate().await;
-        let copies = offline.purge(app, &previous).await;
-        let approvals = credentials::delete_parked_source_approvals(&previous);
-        copies
-            .and(approvals)
-            .map_err(|_| "library_reapproval_cleanup_failed")?;
+}
+
+/// Retry the exact previous scope before deleting its protected credential and journal entry.
+async fn retry_cleanup(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    approved: &mut [IndexEntry],
+    id: &str,
+) -> Result<(), String> {
+    let Some(position) = approved.iter().position(|entry| entry.id() == id) else {
+        return Ok(());
+    };
+    let Some(pending) = approved[position].pending().cloned() else {
+        return Ok(());
+    };
+    let account = slot_for(id, pending.generation)?;
+    if account == approved[position].account()? {
+        return Err("credential_record_invalid".into());
     }
-    Ok(())
+    let result = async {
+        if pending.scope != approved[position].cleanup_scope(None)? {
+            app.state::<OfflineAlbums>().deactivate().await;
+            purge_scope(app, &pending.scope).await?;
+        }
+        if pending.revoke_bearer {
+            revoke_replaced(window, id, &account, &pending.scope).await;
+        }
+        credentials::delete(&account)?;
+        let mut next = approved.to_vec();
+        if let IndexEntry::Display { pending, .. } = &mut next[position] {
+            *pending = None;
+        }
+        credentials::save(INDEX, &next)?;
+        approved.clone_from_slice(&next);
+        Ok::<(), String>(())
+    }
+    .await;
+    result.map_err(|_| "library_reapproval_cleanup_failed".into())
 }
 
 /// Build the switcher list from display records without unlocking protected sign-ins.
@@ -321,22 +409,23 @@ pub(crate) async fn add_approved_library(
         {
             return Err("library_already_approved".into());
         }
-        let replaced = stored_library(&window, &approved, &id)?;
+        retry_cleanup(&app, &window, &mut approved, &id).await?;
+        let pending = if let Some(entry) = approved.iter().find(|entry| entry.id() == id) {
+            let replaced = stored_library(&window, &approved, &id).ok().flatten();
+            Some(PendingCleanup {
+                generation: entry.generation(),
+                scope: entry.cleanup_scope(replaced.as_ref())?,
+                revoke_bearer: replaced.is_some_and(|saved| saved.token != target.token),
+            })
+        } else {
+            None
+        };
         if let Some(previous) = previous.as_ref() {
-            park(&window, &mut approved, previous, false)?;
+            park(&window, &mut approved, previous, None)?;
         }
-        let retired = park(&window, &mut approved, &target, true)?;
+        park(&window, &mut approved, &target, pending)?;
         target_parked = true;
-        if let Some(retired) = retired {
-            let removed = credentials::delete(&retired)
-                .map_err(|_| "library_reapproval_cleanup_failed".to_owned());
-            let cleanup = if let Some(replaced) = replaced {
-                retire_replaced(&app, &client, replaced, &target).await
-            } else {
-                Ok(())
-            };
-            removed.and(cleanup)?;
-        }
+        retry_cleanup(&app, &window, &mut approved, &id).await?;
         activate(
             &app,
             &client,
@@ -381,6 +470,7 @@ pub(crate) async fn activate_approved_library(
         return Err("library_already_active".into());
     }
     let mut approved = index()?;
+    retry_cleanup(&app, &window, &mut approved, &id).await?;
     let target = stored_library(&window, &approved, &id)?.ok_or("library_not_approved")?;
     let client = crate::transport::client()?;
     let caps = verify(&client, &target)
@@ -390,7 +480,7 @@ pub(crate) async fn activate_approved_library(
             _ => error,
         })?;
     if let Some(previous) = previous.as_ref().filter(|saved| library_id(saved) != id) {
-        park(&window, &mut approved, previous, false)?;
+        park(&window, &mut approved, previous, None)?;
     }
     let result = activate(&app, &client, &mut active, previous.as_ref(), target, caps).await;
     drop(active);
@@ -498,13 +588,28 @@ pub(crate) async fn remove_approved_library(
         return Err("library_active_sign_out_required".into());
     }
     let mut approved = index()?;
-    let saved = stored_library(&window, &approved, &id)?.ok_or("library_not_approved")?;
-    app.state::<crate::offline_albums::OfflineAlbums>()
-        .purge(&app, &saved)
-        .await?;
-    credentials::delete_parked_source_approvals(&saved)?;
+    retry_cleanup(&app, &window, &mut approved, &id).await?;
+    let position = approved
+        .iter()
+        .position(|entry| entry.id() == id)
+        .ok_or("library_not_approved")?;
+    let saved = stored_library(&window, &approved, &id).ok().flatten();
+    let scope = approved[position].cleanup_scope(saved.as_ref())?;
+    if approved[position].cleanup_scope(None).is_err() {
+        // Keep legacy cleanup possible if removal is interrupted after deleting the old slot.
+        approved[position] = IndexEntry::Display {
+            display: LibraryDisplay::from_saved(
+                saved.as_ref().ok_or("library_cleanup_scope_unavailable")?,
+            ),
+            generation: approved[position].generation(),
+            cleanup_scope: Some(scope.clone()),
+            pending: None,
+        };
+        credentials::save(INDEX, &approved)?;
+    }
+    purge_scope(&app, &scope).await?;
     forget(&id, &mut approved)?;
-    let Ok(client) = crate::transport::client() else {
+    let (Some(saved), Ok(client)) = (saved, crate::transport::client()) else {
         return Ok(false);
     };
     let revoked =
@@ -637,6 +742,41 @@ mod tests {
         assert_eq!(
             approved[1].account().unwrap(),
             format!("{}-{generation}", slot(approved[1].id()).unwrap())
+        );
+    }
+
+    #[test]
+    fn pending_cleanup_round_trips_both_exact_scopes_without_a_readable_slot() {
+        let old = saved("one", "account");
+        let mut next = old.clone();
+        next.token = "renewed-fixture-token".into();
+        let old_scope = CleanupScope::from_saved(&old).unwrap();
+        let next_scope = CleanupScope::from_saved(&next).unwrap();
+        let entry = IndexEntry::Display {
+            display: LibraryDisplay::from_saved(&next),
+            generation: Some(uuid::Uuid::new_v4()),
+            cleanup_scope: Some(next_scope.clone()),
+            pending: Some(PendingCleanup {
+                generation: None,
+                scope: old_scope.clone(),
+                revoke_bearer: true,
+            }),
+        };
+        let encoded = serde_json::to_string(&entry).unwrap();
+        assert!(!encoded.contains(&next.token));
+        let restored: IndexEntry = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.cleanup_scope(None).unwrap() == next_scope);
+        assert!(restored.pending().unwrap().scope == old_scope);
+        assert_ne!(
+            restored.account().unwrap(),
+            slot_for(restored.id(), restored.pending().unwrap().generation).unwrap()
+        );
+        assert_eq!(
+            IndexEntry::Legacy(library_id(&old))
+                .cleanup_scope(None)
+                .err()
+                .as_deref(),
+            Some("library_cleanup_scope_unavailable")
         );
     }
 

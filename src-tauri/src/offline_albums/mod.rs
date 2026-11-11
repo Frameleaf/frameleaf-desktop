@@ -4,6 +4,7 @@ pub(crate) use playback::serve;
 mod remote;
 
 use crate::{connection::SavedConnection, credentials, DesktopState};
+pub(crate) use cache::CleanupScope;
 use cache::{AlbumView, Cache};
 use playback::Playback;
 use serde::Serialize;
@@ -73,6 +74,11 @@ impl OfflineAlbums {
     pub async fn purge(&self, app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
         let _permit = self.operation.lock().await;
         Cache::purge(&crate::import_base(app)?, saved)
+    }
+
+    pub async fn purge_scope(&self, app: &AppHandle, scope: &CleanupScope) -> Result<(), String> {
+        let _permit = self.operation.lock().await;
+        Cache::purge_scope(&crate::import_base(app)?, scope)
     }
 
     fn clear_playback(&self) {

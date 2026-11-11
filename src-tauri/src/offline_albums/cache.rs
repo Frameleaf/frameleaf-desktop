@@ -45,6 +45,26 @@ fn scope(saved: &SavedConnection) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(binding.as_slice()).into())
 }
 
+/// Non-secret selectors for the exact scoped and legacy caches, even after credential loss.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct CleanupScope {
+    id: String,
+    legacy: [u8; 32],
+}
+
+impl CleanupScope {
+    pub(crate) fn from_saved(saved: &SavedConnection) -> Result<Self, String> {
+        Ok(Self {
+            id: crate::connection::photo_session_scope(saved),
+            legacy: scope(saved)?,
+        })
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 pub(super) struct Cache {
     base: PathBuf,
     root: PathBuf,
@@ -208,23 +228,32 @@ impl Cache {
 
     fn location(base: &Path, saved: &SavedConnection) -> (PathBuf, String) {
         let id = crate::connection::photo_session_scope(saved);
+        Self::scoped_location(base, &id)
+    }
+
+    fn scoped_location(base: &Path, id: &str) -> (PathBuf, String) {
         (
-            base.join(SCOPED_ROOT).join(&id),
+            base.join(SCOPED_ROOT).join(id),
             format!("offline-albums-key-{id}"),
         )
     }
 
     pub fn purge(base: &Path, saved: &SavedConnection) -> Result<(), String> {
-        let (root, account) = Self::location(base, saved);
-        let binding = scope(saved)?;
+        Self::purge_scope(base, &CleanupScope::from_saved(saved)?)
+    }
+
+    pub fn purge_scope(base: &Path, binding: &CleanupScope) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(binding.id(), 64) {
+            return Err(ERROR.into());
+        }
+        let (root, account) = Self::scoped_location(base, binding.id());
         let deleted = credentials::delete(&account);
         let removed = remove_directory(&root);
-        let legacy =
-            credentials::load::<Credential>(LEGACY_KEY)?.filter(|legacy| legacy.scope == binding);
+        let legacy = credentials::load::<Credential>(LEGACY_KEY)?
+            .filter(|legacy| legacy.scope == binding.legacy);
         if legacy.is_some() {
-            let deleted = credentials::delete(LEGACY_KEY);
-            let removed = remove_directory(&base.join(LEGACY_ROOT));
-            deleted.and(removed)?;
+            remove_directory(&base.join(LEGACY_ROOT))?;
+            credentials::delete(LEGACY_KEY)?;
         }
         deleted.and(removed)
     }
@@ -937,7 +966,8 @@ mod tests {
             b"approved-original"
         );
 
-        Cache::purge(&fixture.base, saved).unwrap();
+        let removed = CleanupScope::from_saved(saved).unwrap();
+        Cache::purge_scope(&fixture.base, &removed).unwrap();
         assert!(Cache::open(&fixture.base, saved, false).unwrap().is_none());
         let parked = Cache::open(&fixture.base, &other, false).unwrap().unwrap();
         assert_eq!(

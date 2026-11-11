@@ -178,9 +178,12 @@ pub(crate) fn migrate_source_approvals(saved: &SavedConnection) -> Result<(), St
     Ok(())
 }
 
-pub(crate) fn delete_parked_source_approvals(saved: &SavedConnection) -> Result<(), String> {
+pub(crate) fn delete_source_scope(scope: &str) -> Result<(), String> {
+    if !crate::native_runtime::digest_valid(scope, 64) {
+        return Err("credential_record_invalid".into());
+    }
     for account in SOURCE_APPROVALS {
-        delete_record(&scoped_source_account(account, saved))?;
+        delete_record(&format!("{account}-{scope}"))?;
     }
     Ok(())
 }
