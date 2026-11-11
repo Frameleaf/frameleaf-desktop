@@ -18,6 +18,14 @@ on:
         description: 'Qualify hidden-window watched folder import with the signed Desktop at this main revision'
         type: boolean
         default: false
+      media_move:
+        description: 'Sign and run only the disposable installed media move qualification'
+        type: boolean
+        default: false
+      media_move_manager_revision:
+        description: 'Exact Manager source SHA in the reviewed signed host for media move qualification'
+        type: string
+        required: false
 permissions:
   contents: read
   actions: read
@@ -27,6 +35,11 @@ concurrency:
 jobs:
   qualify:
     if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    environment: ${{ inputs.media_move && 'desktop-release' || '' }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     runs-on: windows-2022
     timeout-minutes: 120
     env:
@@ -37,6 +50,16 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Validate the private media move qualification selection
+        if: inputs.media_move
+        shell: pwsh
+        env:
+          WATCHED_FOLDER: ${{ inputs.watched_folder }}
+          MEDIA_MOVE_MANAGER_REVISION: ${{ inputs.media_move_manager_revision }}
+        run: |
+          if ($env:WATCHED_FOLDER -eq 'true' -or $env:MEDIA_MOVE_MANAGER_REVISION -cnotmatch '^[a-f0-9]{40}$') {
+            throw 'Select media move alone and specify the exact Manager source SHA'
+          }
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
@@ -89,12 +112,54 @@ jobs:
           if ($result.qualification -ne 'passed' -or $result.manifestSha256 -ne $staged.manifestSha256 -or $result.signatureSha256 -ne $staged.signatureSha256) {
             throw 'Compiled host authority receipt does not match the admitted candidate'
           }
+      - name: Obtain the reviewed corrected Windows Desktop candidate
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DESKTOP_APPROVAL: ${{ inputs.desktop_approval }}
+          DESKTOP_SHA256: ${{ inputs.desktop_sha256 }}
+        run: |
+          import sys
+          sys.path.insert(0, 'tools')
+          from windows_desktop_candidate import obtain
+          obtain()
+      - name: Configure signing for the private media move candidate
+        if: inputs.media_move
+        uses: ./.github/actions/windows-signing
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
+          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+      - name: Require the exact signed media move inputs before building the fixture
+        if: inputs.media_move
+        shell: pwsh
+        env:
+          MEDIA_MOVE_MANAGER_REVISION: ${{ inputs.media_move_manager_revision }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $component = Get-Content (Join-Path $root 'candidate/payload/manager/component.json') -Raw | ConvertFrom-Json
+          if ($component.sourceRevision -cne $env:MEDIA_MOVE_MANAGER_REVISION) {
+            throw 'The signed host Manager does not match the reviewed source'
+          }
+          $producer = Get-Content (Join-Path $root 'desktop-producer.json') -Raw | ConvertFrom-Json
+          if ($producer.candidate.osSigned -ne $true -or $producer.candidate.sourceRevision -cne $env:GITHUB_SHA) {
+            throw 'Media move qualification requires a signed Desktop candidate at this main revision'
+          }
+          & ./tools/windows_sign.ps1 -Path (Join-Path $root 'desktop/setup.exe') -VerifyOnly
       - name: Build the native server installer from the verified host
         shell: pwsh
+        env:
+          MEDIA_MOVE: ${{ inputs.media_move }}
         run: |
-          cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host
+          $controllerArgs = @('build', '--release', '--locked', '--manifest-path', 'src-tauri/Cargo.toml', '--bin', 'frameleaf-native-host')
+          if ($env:MEDIA_MOVE -eq 'true') { $controllerArgs += @('--features', 'qualify-windows-media-move') }
+          & cargo @controllerArgs
           if ($LASTEXITCODE) { throw 'Controller build failed' }
           $env:HOST_CONTROLLER = (Resolve-Path 'src-tauri/target/release/frameleaf-native-host.exe').Path
+          if ($env:MEDIA_MOVE -eq 'true') { & ./tools/windows_sign.ps1 -Path $env:HOST_CONTROLLER }
           $env:HOST_CONTROLLER_SHA256 = (Get-FileHash $env:HOST_CONTROLLER).Hash.ToLowerInvariant()
           $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
           $env:HOST_MANIFEST = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
@@ -108,13 +173,26 @@ jobs:
           $env:HOST_OUTPUT = Join-Path $root 'installer'
           & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /Q tools/windows/native-host.iss
           if ($LASTEXITCODE) { throw 'Installer build failed' }
+          if ($env:MEDIA_MOVE -eq 'true') {
+            $setup = Join-Path $env:HOST_OUTPUT 'FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe'
+            & ./tools/windows_sign.ps1 -Path $setup
+          }
+      - name: Clear the private signing session before installing candidates
+        if: inputs.media_move
+        shell: pwsh
+        run: |
+          az account clear
+          if ($LASTEXITCODE) { throw 'Could not clear the private signing session' }
       - name: Install the actual package twice and verify its protected receipt
         shell: pwsh
+        env:
+          MEDIA_MOVE: ${{ inputs.media_move }}
         run: |
           $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
           $manifest = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
           $digest = (Get-FileHash 'src-tauri/target/release/frameleaf-native-host.exe').Hash.ToLowerInvariant()
           $setup = (Get-Item "$root/installer/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe").FullName
+          if ($env:MEDIA_MOVE -eq 'true') { & ./tools/windows_sign.ps1 -Path $setup -VerifyOnly }
           $base = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Frameleaf'
           if (Test-Path -LiteralPath $base) { throw 'Expected a fresh machine location' }
           $receipt = Join-Path $base "Runtimes/$manifest/installation.json"
@@ -147,6 +225,7 @@ jobs:
           if ($LASTEXITCODE -ne 1) { throw 'Unknown program was not refused' }
           $global:LASTEXITCODE = 0
       - name: Retain private Windows installer candidate
+        if: ${{ !inputs.media_move }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-windows-native-server-installer
@@ -173,17 +252,6 @@ jobs:
         run: |
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib windows_host_profile::tests::disposable_runner_prepares_only_a_fresh_os_selected_profile -- --ignored --exact --nocapture
           if ($LASTEXITCODE) { throw 'Windows private profile admission failed' }
-      - name: Obtain the reviewed corrected Windows Desktop candidate
-        shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DESKTOP_APPROVAL: ${{ inputs.desktop_approval }}
-          DESKTOP_SHA256: ${{ inputs.desktop_sha256 }}
-        run: |
-          import sys
-          sys.path.insert(0, 'tools')
-          from windows_desktop_candidate import obtain
-          obtain()
       - name: Install the reviewed Windows Desktop candidate
         id: desktop-install
         shell: pwsh
@@ -201,7 +269,7 @@ jobs:
           if ($install.ExitCode) { throw 'Desktop installation failed' }
           "executable=$(Join-Path $destination 'frameleaf-desktop.exe')" >> $env:GITHUB_OUTPUT
       - name: Exercise the companion with the reviewed Windows Desktop candidate
-        if: ${{ !inputs.watched_folder }}
+        if: ${{ !inputs.watched_folder && !inputs.media_move }}
         id: installed-desktop
         shell: pwsh
         env:
@@ -227,6 +295,50 @@ jobs:
           if ($LASTEXITCODE -or ($output -join '') -cnotmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Installed watched folder acceptance did not pass' }
           @{ state = 'watcher-passed'; sourceRevision = $env:GITHUB_SHA; manifestSha256 = $env:FRAMELEAF_INSTALLED_HOST_MANIFEST
              executableSha256 = $env:FRAMELEAF_WATCH_DESKTOP_SHA256 } | ConvertTo-Json | Set-Content (Join-Path $root 'installed-watcher.json')
+      - name: Qualify installed media cutover and rollback on separate disposable profiles
+        if: inputs.media_move
+        shell: pwsh
+        env:
+          MEDIA_MOVE_MANAGER_REVISION: ${{ inputs.media_move_manager_revision }}
+          MEDIA_MOVE_DESKTOP: ${{ steps.desktop-install.outputs.executable }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $receipt = Get-Content (Join-Path $root 'protected-install.json') -Raw | ConvertFrom-Json
+          $base = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Frameleaf'
+          $env:MEDIA_MOVE_CONTROLLER = Join-Path $base "Controllers/$($receipt.manifestSha256)/$($receipt.controllerSha256)/frameleaf-native-host.exe"
+          $env:MEDIA_MOVE_CANDIDATE = Join-Path $base "Runtimes/$($receipt.manifestSha256)"
+          $env:MEDIA_MOVE_MANIFEST = $receipt.manifestSha256
+          $env:MEDIA_MOVE_CONTROLLER_SHA256 = $receipt.controllerSha256
+          & ./tools/windows_sign.ps1 -Path $env:MEDIA_MOVE_CONTROLLER -VerifyOnly
+          & ./tools/windows_sign.ps1 -Path $env:MEDIA_MOVE_DESKTOP -VerifyOnly
+          @'
+          import assert from 'node:assert/strict';
+          import { randomBytes } from 'node:crypto';
+          import { writeFile } from 'node:fs/promises';
+          import { basename, dirname, join } from 'node:path';
+          import { qualifyWindowsMediaMove } from './tools/qualify_windows_media_move.mjs';
+          const outcomes = [];
+          for (const [offset, decision] of ['target', 'original'].entries()) {
+            const installationId = randomBytes(6).toString('hex');
+            outcomes.push(await qualifyWindowsMediaMove({
+              controller: process.env.MEDIA_MOVE_CONTROLLER,
+              host: { installationId, candidate: process.env.MEDIA_MOVE_CANDIDATE, manifestSha256: process.env.MEDIA_MOVE_MANIFEST },
+              libraryId: installationId, release: 'frameleaf-v3.0.0-1', decision,
+              managerPort: 33941 + offset * 3, databasePort: 33942 + offset * 3, apiPort: 33943 + offset * 3,
+              confirmReview: async ({ targetPath, reviewSha256 }) => {
+                assert.equal(basename(targetPath), 'target');
+                assert.match(basename(dirname(targetPath)), /^Frameleaf Media Move Qualification [a-f0-9-]{36}$/);
+                assert.match(reviewSha256, /^[a-f0-9]{64}$/);
+                return reviewSha256;
+              },
+            }));
+          }
+          await writeFile(join(process.env.RUNNER_TEMP, 'windows-compiled-host', 'installed-media-move.json'),
+            JSON.stringify({ state: 'media-move-passed', sourceRevision: process.env.GITHUB_SHA,
+              managerRevision: process.env.MEDIA_MOVE_MANAGER_REVISION, manifestSha256: process.env.MEDIA_MOVE_MANIFEST,
+              controllerSha256: process.env.MEDIA_MOVE_CONTROLLER_SHA256, outcomes: outcomes.map(({ decision }) => decision) }) + '\n');
+          '@ | node --input-type=module
+          if ($LASTEXITCODE) { throw 'Installed media move qualification failed' }
       - name: Report bounded installed host operation categories
         if: failure() && steps.installed-desktop.outcome == 'failure'
         run: node tools/diagnose_windows_host.mjs
@@ -251,6 +363,7 @@ jobs:
             ${{ runner.temp }}/windows-compiled-host/evidence-producer.json
             ${{ runner.temp }}/windows-compiled-host/desktop-producer.json
             ${{ runner.temp }}/windows-compiled-host/installed-watcher.json
+            ${{ runner.temp }}/windows-compiled-host/installed-media-move.json
             ${{ runner.temp }}/windows-compiled-host/signature-evidence/
           retention-days: 7
           if-no-files-found: warn
