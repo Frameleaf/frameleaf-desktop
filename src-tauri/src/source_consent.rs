@@ -206,16 +206,47 @@ fn session_signature(saved: &SavedConnection, identity: &DeviceIdentity) -> Stri
     ))
 }
 impl Consent {
-    pub(crate) fn approval(
+    pub(crate) fn dropped(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        root: &std::path::Path,
+        root_identity: &str,
+        name: &str,
+    ) -> Result<Self, String> {
+        let approval = CopyApproval::approve_drop(saved, identity, root, root_identity)?;
+        Ok(Self {
+            approval,
+            session_signature: session_signature(saved, identity),
+            name: source_label(name),
+            allow_download: true,
+            camera: false,
+            registered: false,
+            watch: false,
+            watch_paused: false,
+        })
+    }
+
+    pub(crate) fn approved_scope(
         &self,
         saved: &SavedConnection,
         identity: &DeviceIdentity,
     ) -> Result<&CopyApproval, String> {
         self.require(saved, identity)?;
-        if !self.registered || !self.allow_download {
+        if !self.allow_download {
             return Err("source_approval_required".into());
         }
         Ok(&self.approval)
+    }
+
+    pub(crate) fn approval(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<&CopyApproval, String> {
+        if !self.registered {
+            return Err("source_approval_required".into());
+        }
+        self.approved_scope(saved, identity)
     }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()

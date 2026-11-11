@@ -6,6 +6,7 @@ pub mod copy_upload;
 mod credential_lock;
 mod credentials;
 mod discovery;
+mod drop_import;
 mod host_commands;
 pub mod host_control;
 mod host_database;
@@ -320,6 +321,7 @@ async fn restore_connection(
         return Ok(None);
     }
     app.state::<source_import::SourceJobs>().stop().await;
+    app.state::<drop_import::DropImport>().stop().await;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
         "connection",
@@ -392,6 +394,7 @@ async fn sign_out(
     require_local(&window)?;
     let mut current = state.0.lock().await;
     app.state::<source_import::SourceJobs>().stop().await;
+    app.state::<drop_import::DropImport>().stop().await;
     app.state::<source_consent::SourceConsent>().clear()?;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let saved = match current.as_ref() {
@@ -411,7 +414,8 @@ async fn sign_out(
             let worker = credentials::delete("worker-session").is_ok();
             let connection = credentials::delete("connection").is_ok();
             let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
-            worker && connection && sources
+            let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
+            worker && connection && sources && drops
         },
         async {
             if let Some(photos) = app.get_webview_window("photos") {
@@ -534,6 +538,8 @@ pub fn run() {
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
+        .manage(source_import::ImportTransfer::default())
+        .manage(drop_import::DropImport::default())
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
         .setup(|app| {
@@ -570,6 +576,10 @@ pub fn run() {
             photo_import_status,
             prepare_photo_import,
             control_photo_import,
+            drop_import::preview_photo_drop,
+            drop_import::photo_drop_status,
+            drop_import::approve_photo_drop,
+            drop_import::control_photo_drop,
             manager_commands::manager_view,
             manager_commands::manager_certificate_fingerprint,
             manager_commands::pair_manager,
@@ -597,7 +607,23 @@ pub fn run() {
             cloud_account::email::cloud_email_complete,
             cloud_account::connect_cloud_server
         ])
+        .on_webview_event(|webview, event| {
+            if webview.label() == "main" {
+                if let tauri::WebviewEvent::DragDrop(event) = event {
+                    if let Some(window) = webview.app_handle().get_webview_window("main") {
+                        drop_import::native_event(&window, event);
+                    }
+                }
+            }
+        })
         .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::DragDrop(event) = event {
+                    if let Some(main) = window.app_handle().get_webview_window("main") {
+                        drop_import::native_event(&main, event);
+                    }
+                }
+            }
             if window.label() == "main"
                 && (window.state::<host_setup::HostSetup>().background_active()
                     || window.state::<source_import::SourceJobs>().watching())

@@ -340,9 +340,36 @@ impl CopyApproval {
         max_item_bytes: u64,
         allow_download: bool,
     ) -> Result<Self, String> {
-        normalize_server(&saved.server)?;
         // Reuse the preview's broad-root and package refusals, without opening media.
         crate::photo_sources::inventory(root, 1)?;
+        Self::approve_root(saved, identity, root, max_item_bytes, allow_download, None)
+    }
+
+    pub(crate) fn approve_drop(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        root: &Path,
+        expected: &str,
+    ) -> Result<Self, String> {
+        Self::approve_root(
+            saved,
+            identity,
+            root,
+            UNLIMITED_ITEM_BYTES,
+            true,
+            Some(expected),
+        )
+    }
+
+    fn approve_root(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        root: &Path,
+        max_item_bytes: u64,
+        allow_download: bool,
+        expected: Option<&str>,
+    ) -> Result<Self, String> {
+        normalize_server(&saved.server)?;
         #[cfg(windows)]
         crate::native_runtime::absolute_directory(root).map_err(|code| {
             if code == "runtime_link_forbidden" {
@@ -363,6 +390,10 @@ impl CopyApproval {
         }
         let dir = Dir::open_ambient_dir(root, ambient_authority())
             .map_err(|_| "source_root_unavailable")?;
+        let root_identity = root_identity(&dir)?;
+        if expected.is_some_and(|expected| expected != root_identity) {
+            return Err("source_root_changed".into());
+        }
         let scope = CopyScope {
             version: 1,
             source_id: Uuid::new_v4().to_string(),
@@ -372,7 +403,7 @@ impl CopyApproval {
             device_id: saved.device_id.clone().unwrap(),
             installation_id: identity.installation_id.clone(),
             root: root.to_str().ok_or("source_root_invalid")?.into(),
-            root_identity: root_identity(&dir)?,
+            root_identity,
             max_item_bytes,
             allow_download,
         };

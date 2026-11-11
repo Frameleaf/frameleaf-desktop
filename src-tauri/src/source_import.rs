@@ -228,7 +228,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 #[derive(Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportView {
@@ -265,11 +265,12 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
     }
 }
 fn current(
+    credential: &'static str,
     saved: &SavedConnection,
     identity: &DeviceIdentity,
     source: &str,
 ) -> Result<Consent, String> {
-    let consent = credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+    let consent = credentials::load::<Consent>(credential)?.ok_or("source_approval_required")?;
     consent.approval(saved, identity)?;
     if consent.source_id() != source {
         return Err("source_approval_changed".into());
@@ -571,7 +572,8 @@ async fn execute(
                     );
                     match staged {
                         Err(code)
-                            if entry.watch_version.is_some()
+                            if consent.watch
+                                && entry.watch_version.is_some()
                                 && matches!(
                                     code.as_str(),
                                     "source_item_changed"
@@ -730,12 +732,66 @@ struct Running {
     wake: Arc<tokio::sync::Notify>,
 }
 #[derive(Default)]
+pub(crate) struct ImportTransfer(tokio::sync::Mutex<()>);
+impl ImportTransfer {
+    async fn acquire(
+        &self,
+        cancelled: &AtomicBool,
+        wake: &tokio::sync::Notify,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        tokio::select! {
+            biased;
+            _ = wake.notified() => Err("source_copy_cancelled".into()),
+            guard = self.0.lock() => {
+                if cancelled.load(Ordering::Acquire) {
+                    Err("source_copy_cancelled".into())
+                } else {
+                    Ok(guard)
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct SourceJobs {
+    credential: &'static str,
     running: tokio::sync::Mutex<Option<Running>>,
     status: Arc<Mutex<ImportView>>,
     watching: Arc<AtomicBool>,
 }
+impl Default for SourceJobs {
+    fn default() -> Self {
+        Self::with_credential(CREDENTIAL)
+    }
+}
 impl SourceJobs {
+    pub(crate) fn with_credential(credential: &'static str) -> Self {
+        Self {
+            credential,
+            running: Default::default(),
+            status: Default::default(),
+            watching: Default::default(),
+        }
+    }
+
+    pub(crate) fn prepare_drop(
+        &self,
+        base: &Path,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        consent: &Consent,
+        scan: crate::photo_sources::FolderScan,
+    ) -> Result<(), String> {
+        let approval = consent.approved_scope(saved, identity)?;
+        if base.starts_with(approval.root()) || approval.root().starts_with(base) {
+            return Err("source_staging_overlap".into());
+        }
+        let manifest = make_manifest(consent, approval, scan)?;
+        let journal = Journal::new(base, consent.source_id())?;
+        journal.write("manifest.json", &manifest, identity)?;
+        journal.write("cursor.json", &Cursor::new(&manifest)?, identity)
+    }
+
     pub fn watching(&self) -> bool {
         self.watching.load(Ordering::Acquire)
     }
@@ -753,7 +809,7 @@ impl SourceJobs {
     ) -> Result<Option<ImportView>, String> {
         let identity = credentials::identity()?;
         let consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         consent.require(saved, &identity)?;
         let live = self
             .status
@@ -794,7 +850,7 @@ impl SourceJobs {
     ) -> Result<ImportView, String> {
         let identity = credentials::identity()?;
         let consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         let approval = consent.approval(saved, &identity)?;
         if consent.watch {
             return Err("source_control_invalid".into());
@@ -840,7 +896,7 @@ impl SourceJobs {
         self.stop().await;
         let identity = credentials::identity()?;
         let consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         consent.approval(&saved, &identity)?;
         let watch = consent.watch && !consent.watch_paused;
         if consent.watch_paused {
@@ -858,12 +914,23 @@ impl SourceJobs {
         let wake = Arc::new(tokio::sync::Notify::new());
         let wake_task = wake.clone();
         let watching = self.watching.clone();
+        let credential = self.credential;
+        let ordinary = credential == CREDENTIAL;
         let mut value = value;
-        value.state = if watch { "watching" } else { "copying" }.into();
+        value.state = if watch {
+            "watching"
+        } else if ordinary {
+            "copying"
+        } else {
+            "queued"
+        }
+        .into();
         value.code = None;
         *status.lock().map_err(|_| "source_status_unavailable")? = value.clone();
         watching.store(watch, Ordering::Release);
-        crate::tray::set_import_status(&app, Some(&value));
+        if ordinary {
+            crate::tray::set_import_status(&app, Some(&value));
+        }
         // Network probes and journal I/O must not occupy an async worker.
         let task = tauri::async_runtime::spawn_blocking(move || {
             tauri::async_runtime::block_on(async move {
@@ -871,12 +938,22 @@ impl SourceJobs {
                     if let Ok(mut current) = status.lock() {
                         *current = value.clone();
                     }
-                    crate::tray::set_import_status(&app, Some(&value));
-                    let _ = app.emit_to("main", "photo-import", value);
+                    if ordinary {
+                        crate::tray::set_import_status(&app, Some(&value));
+                    }
+                    let _ = app.emit_to(
+                        "main",
+                        if ordinary {
+                            "photo-import"
+                        } else {
+                            "photo-drop-import"
+                        },
+                        value,
+                    );
                 };
                 let result = async {
                     let identity = credentials::identity()?;
-                    let source = credentials::load::<Consent>(CREDENTIAL)?
+                    let source = credentials::load::<Consent>(credential)?
                         .ok_or("source_approval_required")?;
                     let journal = Journal::new(&base, source.source_id())?;
                     let network = Mutex::new((
@@ -887,7 +964,8 @@ impl SourceJobs {
                         if stop.load(Ordering::Acquire) {
                             return Err("source_copy_cancelled".into());
                         }
-                        let permission = current(&saved, &identity, source.source_id())?;
+                        let permission =
+                            current(credential, &saved, &identity, source.source_id())?;
                         if watch && (!permission.watch || permission.watch_paused) {
                             return Err("source_copy_cancelled".into());
                         }
@@ -906,13 +984,23 @@ impl SourceJobs {
                     };
                     let client = transport::client()?;
                     let origin = crate::connection::normalize_server(&saved.server)?;
+                    let transfer = app.state::<ImportTransfer>();
                     if watch {
                         watch::run(
                             &client, &origin, &saved, &identity, &source, &journal, &stop,
-                            &wake_task, &gate, &notify,
+                            &wake_task, &gate, &notify, &transfer,
                         )
                         .await
                     } else {
+                        let _permit = transfer.acquire(&stop, &wake_task).await?;
+                        if !ordinary {
+                            let mut queued = status
+                                .lock()
+                                .map_err(|_| "source_status_unavailable")?
+                                .clone();
+                            queued.state = "copying".into();
+                            notify(queued);
+                        }
                         execute(
                             &client, &origin, &saved, &identity, &source, &journal, &stop, &gate,
                             &notify,
@@ -923,12 +1011,13 @@ impl SourceJobs {
                 .await;
                 if let Err(code) = result {
                     let failed = status.lock().ok().and_then(|current| {
-                        ((watch && !stop.load(Ordering::Acquire)) || current.state == "copying")
-                            .then(|| ImportView {
-                                state: "needs-attention".into(),
-                                code: Some(code),
-                                ..current.clone()
-                            })
+                        ((watch && !stop.load(Ordering::Acquire))
+                            || matches!(current.state.as_str(), "copying" | "queued"))
+                        .then(|| ImportView {
+                            state: "needs-attention".into(),
+                            code: Some(code),
+                            ..current.clone()
+                        })
                     });
                     if let Some(failed) = failed {
                         notify(failed);
@@ -947,13 +1036,13 @@ impl SourceJobs {
     ) -> Result<ImportView, String> {
         let identity = credentials::identity()?;
         let mut consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         consent.approval(saved, &identity)?;
         if !consent.watch {
             return Err("source_control_invalid".into());
         }
         consent.watch_paused = true;
-        let persisted = credentials::save(CREDENTIAL, &consent);
+        let persisted = credentials::save(self.credential, &consent);
         self.stop().await;
         persisted?;
         let value = watch::status(base, saved, &consent, &identity)?;
@@ -971,14 +1060,14 @@ impl SourceJobs {
     ) -> Result<ImportView, String> {
         let identity = credentials::identity()?;
         let mut consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         consent.approval(&saved, &identity)?;
         if !consent.watch {
             return Err("source_control_invalid".into());
         }
         if consent.watch_paused {
             consent.watch_paused = false;
-            credentials::save(CREDENTIAL, &consent)?;
+            credentials::save(self.credential, &consent)?;
         }
         self.start(app, base, saved).await
     }
@@ -990,7 +1079,7 @@ impl SourceJobs {
         self.stop().await;
         let identity = credentials::identity()?;
         let consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         let journal = Journal::new(base, consent.source_id())?;
         let journal = if consent.watch {
             watch::batch(&journal)?
@@ -1015,7 +1104,7 @@ impl SourceJobs {
     ) -> Result<ImportView, String> {
         let identity = credentials::identity()?;
         let consent =
-            credentials::load::<Consent>(CREDENTIAL)?.ok_or("source_approval_required")?;
+            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
         if consent.watch {
             return Err("source_control_invalid".into());
         }
@@ -1029,7 +1118,8 @@ impl SourceJobs {
         let client = transport::client()?;
         let base = crate::connection::normalize_server(&saved.server)?;
         let pending = AtomicBool::new(false);
-        let control_gate = || current(saved, &identity, consent.source_id()).map(|_| ());
+        let control_gate =
+            || current(self.credential, saved, &identity, consent.source_id()).map(|_| ());
         let api = SourceApi {
             client: &client,
             base: &base,
@@ -1425,9 +1515,101 @@ mod tests {
         }
     }
     #[test]
+    fn a_dropped_manifest_resumes_after_a_lost_ack_and_refuses_file_replacement() {
+        tauri::async_runtime::block_on(async {
+            let mut f = Fixture::new();
+            f.manifest.files[0].watch_version = Some(f.probe.version());
+            f.journal
+                .write("manifest.json", &f.manifest, &f.identity)
+                .unwrap();
+            f.journal
+                .write(
+                    "cursor.json",
+                    &Cursor::new(&f.manifest).unwrap(),
+                    &f.identity,
+                )
+                .unwrap();
+            let original = f.base.join("source/photo.jpg");
+            fs::rename(&original, f.base.join("saved.jpg")).unwrap();
+            fs::write(&original, b"0123456789").unwrap();
+            let refused = Server::new(vec![
+                preflight()[0].clone(),
+                f.run_ack("open"),
+                f.state_ack("open"),
+                f.run_ack("open"),
+            ]);
+            assert_eq!(
+                f.run(&refused, &|| Ok(())).await.err().as_deref(),
+                Some("source_item_changed")
+            );
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(cursor.position, 0);
+            assert_eq!(cursor.state, "paused");
+            assert!(cursor.active.unwrap().copy.is_none());
+
+            // A fresh drop can be completed by reloading the same signed journal after interruption.
+            let mut f = Fixture::new();
+            f.manifest.files[0].watch_version = Some(f.probe.version());
+            f.journal
+                .write("manifest.json", &f.manifest, &f.identity)
+                .unwrap();
+            let mut checkpoint = Cursor::new(&f.manifest).unwrap();
+            checkpoint.active = Some(Active {
+                stage_id: f.stage.clone(),
+                item_id: f.item.clone(),
+                copy: None,
+                upload: None,
+                receipt: None,
+            });
+            f.journal
+                .write("cursor.json", &checkpoint, &f.identity)
+                .unwrap();
+            let interrupted = Server::new(f.replies(f.receipt(), false, true));
+            assert!(f.run(&interrupted, &|| Ok(())).await.is_err());
+            let before: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(before.position, 0);
+            assert!(before.active.unwrap().copy.is_some());
+            let resumed = Server::new(f.replies(f.receipt(), true, false));
+            f.run(&resumed, &|| Ok(())).await.unwrap();
+            let after: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(after.position, 1);
+            assert_eq!(after.state, "complete");
+            assert_eq!(
+                fs::read(f.base.join("source/photo.jpg")).unwrap(),
+                b"abcdefghij"
+            );
+        });
+    }
+
+    #[test]
+    fn cancel_while_waiting_for_the_shared_transfer_does_not_claim_a_turn() {
+        tauri::async_runtime::block_on(async {
+            let shared = ImportTransfer::default();
+            let wake = tokio::sync::Notify::new();
+            let stop = AtomicBool::new(false);
+            let held = shared.acquire(&stop, &wake).await.unwrap();
+            let cancelled = AtomicBool::new(false);
+            let dropped = tokio::sync::Notify::new();
+            let result = tokio::select! {
+                result = shared.acquire(&cancelled, &dropped) => result,
+                _ = async {
+                    tokio::task::yield_now().await;
+                    cancelled.store(true, Ordering::Release);
+                    dropped.notify_one();
+                    std::future::pending::<()>().await;
+                } => unreachable!(),
+            };
+            assert_eq!(result.err().as_deref(), Some("source_copy_cancelled"));
+            drop(held);
+            assert!(shared.acquire(&stop, &wake).await.is_ok());
+        });
+    }
+
+    #[test]
     fn a_changed_watch_file_is_reconsidered_without_uploading_under_its_old_version() {
         tauri::async_runtime::block_on(async {
             let mut f = Fixture::new();
+            f.consent.watch = true;
             f.manifest.files[0].watch_version = Some(f.probe.version());
             f.journal
                 .write("manifest.json", &f.manifest, &f.identity)

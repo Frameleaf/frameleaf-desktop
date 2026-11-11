@@ -90,7 +90,7 @@ fn actual_native_folder_copy() {
             .write("cursor.json", &Cursor::new(&manifest).unwrap(), &identity)
             .unwrap();
         let cancel = AtomicBool::new(false);
-        let gate = || current(&saved, &identity, consent.source_id()).map(|_| ());
+        let gate = || current(CREDENTIAL, &saved, &identity, consent.source_id()).map(|_| ());
         let run = || {
             execute(
                 &client,
