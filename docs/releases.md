@@ -68,6 +68,43 @@ Keep the final result and hashes, and discard the account and its terminal
 transcript after the run. This is a manual qualification on the identified
 installed bytes.
 
+## Installed Windows database and media recovery
+
+Use a fresh disposable Windows desktop with the approved signed Desktop and
+Library companion already installed. Use Node and an interactive PowerShell
+terminal. Leave Desktop closed and ports 2283, 9443, and 54329 free. Use the
+existing synthetic H.264 fixture from the Library checkout at
+`server/test/fixtures/formats/video/h264.mp4`. The harness checks its pinned
+size and SHA-256 before uploading it. Start from the Desktop repository root.
+
+```powershell
+$env:FRAMELEAF_RECOVERY_DISPOSABLE = '1'
+$env:FRAMELEAF_INSTALLED_HOST_MANIFEST = '<approved-companion-manifest-sha256>'
+$env:FRAMELEAF_RECOVERY_DESKTOP_SHA256 = '<verified-installed-executable-sha256>'
+powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 `
+  -Executable '<installed-frameleaf-desktop.exe>' -InstalledHost -InstalledRecovery `
+  -RecoveryVideo '<Library-checkout>/server/test/fixtures/formats/video/h264.mp4'
+```
+
+The harness seeds a synthetic photo and video, reads back their original bytes,
+and saves an independent archive outside the Library profile. Follow the
+prompts to create one database backup and approve its restore in Manager. Use
+the temporary Manager password if asked to authorize again. The harness changes
+the photo description after backup and verifies that the original description
+returns after recovery. It also checks that the controller selected a finalized
+database in a separate target, that the old database remains in place, and that
+both originals still read back from the Library's existing media storage.
+
+After stopping the Library, the harness restores the independent archive to a
+new temporary folder and checks the recovered photo and video against their
+original hashes without consulting Library. The archive is a synthetic media
+backup for this qualification. The database result covers database recovery and
+does not establish that Manager recovers media. The two results are recorded
+separately with the tested executable and manifest hashes. Keep the final JSON
+receipt and discard the disposable profile and terminal transcript, including
+after an interrupted run. This optional path does not change the existing
+installed restart qualification.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers

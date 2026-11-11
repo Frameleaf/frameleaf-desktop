@@ -3,24 +3,30 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { constants } from 'node:fs';
-import { access, lstat, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { access, lstat, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout } from 'node:timers/promises';
 import { diagnosePhoto } from './diagnose_installed_photo.mjs';
 
-const [phase, receipt, executable, executableSha256] = process.argv.slice(2);
+const [phase, receipt, qualificationInput, executableSha256] = process.argv.slice(2);
 const interactive = phase === 'watch-interactive';
-assert.ok(['upload', 'verify', 'watch-signup', 'watch-create', 'watch-verify', 'watch-interactive'].includes(phase));
+const recovery = ['recovery-seed', 'recovery-change', 'recovery-database', 'recovery-media'].includes(phase);
+assert.ok(interactive || recovery || ['upload', 'verify', 'watch-signup', 'watch-create', 'watch-verify'].includes(phase));
 if (interactive) {
   assert.ok(['darwin', 'linux'].includes(process.platform));
   assert.equal(process.env.FRAMELEAF_WATCH_DISPOSABLE, '1');
   assert.ok(process.stdin.isTTY && process.stderr.isTTY, 'An interactive desktop and terminal are required');
-  assert.ok(isAbsolute(executable) && isAbsolute(receipt));
+  assert.ok(isAbsolute(qualificationInput) && isAbsolute(receipt));
   assert.match(basename(receipt), /^frameleaf-watch-source-[0-9a-f-]{36}$/);
   assert.equal(await realpath(receipt), receipt);
   assert.deepEqual(await readdir(receipt), []);
-  await verifyWatchExecutable(executable, executableSha256);
+  await verifyWatchExecutable(qualificationInput, executableSha256);
+} else if (recovery) {
+  assert.equal(process.platform, 'win32');
+  assert.equal(process.env.FRAMELEAF_RECOVERY_DISPOSABLE, '1');
+  assert.ok(isAbsolute(receipt) && basename(receipt) === 'media.json');
+  assert.match(basename(dirname(receipt)), /^frameleaf-installed-recovery-[0-9a-f-]{36}$/);
 } else {
   assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 }
@@ -29,11 +35,16 @@ if (!interactive && phase.startsWith('watch-')) {
   assert.equal(process.platform, 'win32');
 }
 const password = process.env.FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD;
-assert.ok(password?.length >= 32);
+if (phase !== 'recovery-media') assert.ok(password?.length >= 32);
 const credentials = { email: 'native-photo@example.invalid', password };
 const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGNQaEigKWIYtWDUglELRi0YtWDUglELRi0YtWDUglELhooFAHfgAD2FaRhWAAAAAElFTkSuQmCC', 'base64');
 const filename = phase.startsWith('watch-') ? 'synthetic-watched-photo.png' : 'synthetic-native-photo.png';
 let token;
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const recoveryNames = ['synthetic-recovery-photo.png', 'synthetic-recovery-video.mp4'];
+const beforeBackup = 'Synthetic description at recovery point';
+const afterBackup = 'Synthetic description after recovery point';
+const recoveryVideoSha256 = '7c8e01b8017b1bee64061b83a1e6bd047900dfc105294a04be2e3937374a8ab6';
 
 /** Admit only a physical path whose executable and ancestors the test account cannot replace. */
 async function verifyWatchExecutable(path, expected) {
@@ -83,8 +94,53 @@ async function request(path, options, statuses) {
 function postJson(path, data) {
   return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }, [201]);
 }
+async function upload(name, bytes, mime) {
+  const form = new FormData();
+  form.set('fileCreatedAt', '2026-01-01T00:00:00.000Z');
+  form.set('fileModifiedAt', '2026-01-01T00:00:00.000Z');
+  form.set('assetData', new Blob([bytes], { type: mime }), name);
+  const asset = await (await request('/api/assets', { method: 'POST', body: form }, [201])).json();
+  assert.equal(asset.status, 'created');
+  assert.match(asset.id, /^[0-9a-f-]{36}$/);
+  return asset.id;
+}
+const assetPath = id => '/api/assets/' + id;
+const originalBytes = async id => Buffer.from(await (await request(assetPath(id) + '/original', {}, [200])).arrayBuffer());
+const assetInfo = async id => (await request(assetPath(id), {}, [200])).json();
+async function describe(id, description) {
+  await request(assetPath(id), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ description }) }, [200]);
+  assert.equal((await assetInfo(id)).exifInfo?.description, description);
+}
+async function mediaReceipt() {
+  const items = JSON.parse(await readFile(receipt, 'utf8'));
+  assert.deepEqual(items.map(item => item.name), recoveryNames);
+  assert.notEqual(items[0].id, items[1].id);
+  for (const item of items) {
+    assert.match(item.id, /^[0-9a-f-]{36}$/);
+    assert.match(item.sha256, /^[0-9a-f]{64}$/);
+  }
+  return items;
+}
+async function seedRecovery() {
+  assert.ok(isAbsolute(qualificationInput));
+  assert.equal((await stat(qualificationInput)).size, 5876);
+  const video = await readFile(qualificationInput);
+  assert.equal(sha256(video), recoveryVideoSha256, 'Expected the reviewed synthetic Library H.264 fixture');
+  const items = [];
+  for (const [index, bytes, mime] of [[0, original, 'image/png'], [1, video, 'video/mp4']]) {
+    const name = recoveryNames[index];
+    const id = await upload(name, bytes, mime);
+    const stored = await originalBytes(id);
+    assert.deepEqual(stored, bytes);
+    await thumbnail(id, bytes);
+    await writeFile(join(dirname(receipt), 'media-source', name), stored, { flag: 'wx' });
+    items.push({ id, name, sha256: sha256(stored) });
+  }
+  await describe(items[0].id, beforeBackup);
+  await writeFile(receipt, JSON.stringify(items), { flag: 'wx' });
+}
 async function verifyOriginal(id, expected = original) {
-  assert.deepEqual(Buffer.from(await (await request('/api/assets/' + id + '/original', {}, [200])).arrayBuffer()), expected);
+  assert.deepEqual(await originalBytes(id), expected);
   console.log('Installed Library synthetic original readback passed');
 }
 /** Require a processed image; report redacted queue diagnostics if it never appears. */
@@ -152,7 +208,7 @@ async function qualifyInteractive() {
   const pausedFile = join(receipt, resumedName);
   const appEnvironment = { ...process.env };
   delete appEnvironment.FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD;
-  const app = spawn(executable, [], { detached: true, stdio: 'ignore', env: appEnvironment });
+  const app = spawn(qualificationInput, [], { detached: true, stdio: 'ignore', env: appEnvironment });
   await once(app, 'spawn');
   const terminal = createInterface({ input: process.stdin, output: process.stderr });
   const stop = () => {
@@ -212,8 +268,17 @@ if (phase === 'watch-create') {
   await writeFile(receipt, original, { flag: 'wx' });
   process.exit(0);
 }
+if (phase === 'recovery-media') {
+  const restored = join(dirname(receipt), 'media-restored');
+  assert.deepEqual((await readdir(restored)).sort(), [...recoveryNames].sort());
+  for (const item of await mediaReceipt()) {
+    assert.equal(sha256(await readFile(join(restored, item.name))), item.sha256);
+  }
+  console.log('Separate media archive restored and verified original photo and video bytes without Library access');
+  process.exit(0);
+}
 assert.match(await (await request('/', {}, [200])).text(), /<html/i);
-if (phase === 'upload' || phase === 'watch-signup' || interactive) {
+if (phase === 'upload' || phase === 'watch-signup' || interactive || phase === 'recovery-seed') {
   await postJson('/api/auth/admin-sign-up', { ...credentials, name: 'Synthetic qualification' });
 }
 if (phase === 'watch-signup') process.exit(0);
@@ -221,20 +286,28 @@ token = (await (await postJson('/api/auth/login', credentials)).json()).accessTo
 assert.ok(typeof token === 'string' && token.length > 0);
 if (interactive) {
   await qualifyInteractive();
+} else if (phase === 'recovery-seed') {
+  await seedRecovery();
+} else if (phase === 'recovery-change') {
+  const [photo] = await mediaReceipt();
+  assert.equal((await assetInfo(photo.id)).exifInfo?.description, beforeBackup);
+  await describe(photo.id, afterBackup);
+} else if (phase === 'recovery-database') {
+  const items = await mediaReceipt();
+  assert.equal((await assetInfo(items[0].id)).exifInfo?.description, beforeBackup, 'Database did not return to the selected recovery point');
+  for (const item of items) {
+    assert.equal((await assetInfo(item.id)).originalFileName, item.name);
+    assert.equal(sha256(await originalBytes(item.id)), item.sha256);
+  }
+  console.log('Restored database metadata and verified both originals still readable from existing Library storage');
 } else if (phase === 'watch-verify') {
   await waitWatched(filename, original);
 } else if (phase === 'upload') {
-  const form = new FormData();
-  form.set('fileCreatedAt', '2026-01-01T00:00:00.000Z');
-  form.set('fileModifiedAt', '2026-01-01T00:00:00.000Z');
-  form.set('assetData', new Blob([original], { type: 'image/png' }), filename);
-  const asset = await (await request('/api/assets', { method: 'POST', body: form }, [201])).json();
-  assert.equal(asset.status, 'created');
-  assert.match(asset.id, /^[0-9a-f-]{36}$/);
-  const checks = await Promise.allSettled([verifyOriginal(asset.id), thumbnail(asset.id)]);
+  const id = await upload(filename, original, 'image/png');
+  const checks = await Promise.allSettled([verifyOriginal(id), thumbnail(id)]);
   const failures = checks.filter(result => result.status === 'rejected');
   if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'Installed photo qualification failed');
-  await writeFile(receipt, JSON.stringify({ id: asset.id, thumbnail: checks[1].value }), { flag: 'wx' });
+  await writeFile(receipt, JSON.stringify({ id, thumbnail: checks[1].value }), { flag: 'wx' });
 } else {
   const asset = JSON.parse(await readFile(receipt, 'utf8'));
   const path = '/api/assets/' + asset.id;
