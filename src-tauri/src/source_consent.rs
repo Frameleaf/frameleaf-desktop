@@ -403,18 +403,28 @@ mod tests {
         let identity = DeviceIdentity::generate();
         assert_eq!(
             state
-                .approve(&saved(), &identity, &selection.selection_id, true, |_| {
-                    panic!("replacement folder must not gain consent")
-                })
+                .approve(
+                    &saved(),
+                    &identity,
+                    &selection.selection_id,
+                    true,
+                    false,
+                    |_| { panic!("replacement folder must not gain consent") }
+                )
                 .err()
                 .as_deref(),
             Some("source_camera_changed"),
         );
         let selection = state.select_camera(generation, root).unwrap();
         let consent = state
-            .approve(&saved(), &identity, &selection.selection_id, true, |_| {
-                Ok(())
-            })
+            .approve(
+                &saved(),
+                &identity,
+                &selection.selection_id,
+                true,
+                false,
+                |_| Ok(()),
+            )
             .unwrap();
         assert!(consent.view().camera);
         std::fs::remove_dir_all(base).unwrap();

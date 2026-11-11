@@ -163,6 +163,8 @@ fn retryable(code: &str) -> bool {
             | "source_upload_interrupted"
             | "source_item_changed"
             | "source_folder_unavailable"
+            | "source_inventory_unreadable"
+            | "source_inventory_partial"
             | "source_root_unavailable"
             | "runtime_file_unavailable"
     ) || ["server_http_", "source_upload_http_"]
@@ -253,6 +255,13 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_inventory_retries_but_replaced_roots_require_approval() {
+        assert!(retryable("source_inventory_unreadable"));
+        assert!(retryable("source_inventory_partial"));
+        assert!(!retryable("source_root_changed"));
+    }
 
     #[test]
     fn checkpoint_reconciles_new_files_and_refuses_a_replaced_root() {
