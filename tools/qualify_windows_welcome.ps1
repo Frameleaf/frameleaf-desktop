@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Executable, [switch]$InstalledHost)
+param([Parameter(Mandatory)][string]$Executable, [switch]$InstalledHost, [string]$WatchedFolder)
 
 $ErrorActionPreference = 'Stop'
 if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Requires a disposable Windows runner' }
@@ -64,6 +64,125 @@ function Confirm-ServerAction([string]$Action, [string]$Outcome) {
     Press "$Action Server"
     $null = Wait-Control $Outcome -PollOperation -Seconds 360
 }
+function Check-Box([string]$Prefix) {
+    $window = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
+    $items = @($window.FindAll($tree, $all) | Where-Object {
+        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -and
+        $_.Current.Name.StartsWith($Prefix) -and $_.Current.IsEnabled
+    })
+    if ($items.Count -ne 1) { throw 'Expected one enabled watcher consent checkbox' }
+    $toggle = $items[0].GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($toggle.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { $toggle.Toggle() }
+}
+function Pick-WatchedFolder([string]$Path) {
+    $desktop = [System.Windows.Automation.AutomationElement]::RootElement
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $dialog = $desktop.FindAll([System.Windows.Automation.TreeScope]::Children, $all) | Where-Object {
+            $_.Current.ProcessId -eq $app.Id -and $_.Current.Name -ceq 'Choose a photo folder'
+        } | Select-Object -First 1
+        if ($dialog) { break }
+        Start-Sleep -Milliseconds 250
+    } while ($timer.Elapsed.TotalSeconds -lt 30)
+    if (!$dialog) { throw 'The installed app did not open its folder picker' }
+    $fields = @($dialog.FindAll($tree, $all) | Where-Object {
+        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and $_.Current.IsEnabled
+    })
+    $field = $fields | Where-Object { $_.Current.Name -in 'Folder', 'Folder:', 'File name', 'File name:' } | Select-Object -First 1
+    if (!$field -and $fields.Count -eq 1) { $field = $fields[0] }
+    $accept = $dialog.FindAll($tree, $all) | Where-Object {
+        $_.Current.Name -ceq 'Select Folder' -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button
+    } | Select-Object -First 1
+    if (!$field -or !$accept) { throw 'Expected a folder path field and Select Folder button' }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Path)
+    $accept.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+}
+function Wait-WindowVisibility([IntPtr]$Handle, [bool]$Visible) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $app.Refresh()
+        if ($app.HasExited -or ![FrameleafSmokeWindow]::IsWindow($Handle)) {
+            throw 'The original Desktop window or process was destroyed'
+        }
+        if ([FrameleafSmokeWindow]::IsWindowVisible($Handle) -eq $Visible) { return }
+        Start-Sleep -Milliseconds 250
+    } while ($timer.Elapsed.TotalSeconds -lt 30)
+    throw 'The original Desktop window did not reach the expected visibility'
+}
+function Test-WatchedFolder {
+    $photoTool = Join-Path $PSScriptRoot 'qualify_installed_photo.mjs'
+    & node $photoTool watch-signup
+    if ($LASTEXITCODE) { throw 'A fresh disposable Library is required' }
+    Press 'Enter Address…'
+    Fill 'Server address' 'http://127.0.0.1:2283'
+    Press 'Continue'
+    Fill 'Account' 'native-photo@example.invalid'
+    Fill 'Password' $env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD
+    Press 'Sign In'
+    Press 'Photo sources'
+    Press 'Add Folder…'
+    Pick-WatchedFolder $WatchedFolder
+    $null = Wait-Control $WatchedFolder
+    Check-Box 'Watch this folder'
+    Check-Box 'Allow Frameleaf to read this folder in the background'
+    Press 'Approve and Watch'
+    $null = Wait-Control 'Pause Watching' -Type Button -Seconds 120
+
+    $app.Refresh()
+    $handle = $app.MainWindowHandle
+    $window = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+    $window.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
+    Wait-WindowVisibility $handle $false
+    $original = Join-Path $WatchedFolder 'synthetic-watched-photo.png'
+    & node $photoTool watch-create $original
+    if ($LASTEXITCODE) { throw 'Could not create the synthetic watched original' }
+    $originalHash = (Get-FileHash -LiteralPath $original -Algorithm SHA256).Hash
+    & node $photoTool watch-verify
+    if ($LASTEXITCODE) { throw 'The watched original did not verify while Desktop was hidden' }
+    Wait-WindowVisibility $handle $false
+    if ((Get-FileHash -LiteralPath $original -Algorithm SHA256).Hash -ne $originalHash) {
+        throw 'Watcher changed the source original'
+    }
+
+    $second = Start-Process -FilePath $Executable -PassThru
+    if (!$second.WaitForExit(20000)) {
+        Stop-Process -Id $second.Id -Force
+        throw 'Expected a second launch to reopen the original Desktop process'
+    }
+    Wait-WindowVisibility $handle $true
+    $null = Wait-Control 'Pause Watching' -Type Button -Seconds 30
+    Press 'Remove…'
+    Press 'Remove Permission'
+    $null = Wait-Control 'No folder approved'
+    Press 'Overview'
+    Press 'Sign Out…'
+    Press 'Sign Out'
+    $null = Wait-Control 'Welcome'
+    Write-Output 'Installed Desktop watched a synthetic folder while hidden, verified the copy, and reopened with watching still active'
+}
+
+if ($WatchedFolder) {
+    if ($InstalledHost -or $env:GITHUB_ACTIONS -ne 'true' -or $env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD.Length -lt 32) {
+        throw 'Requires the installed watched-folder fixture on a disposable Windows runner'
+    }
+    if ([Console]::ReadLine() -cne 'frameleaf-watch-smoke') { throw 'The owned acceptance harness must launch this check' }
+    $folder = Get-Item -LiteralPath $WatchedFolder
+    if (!$folder.PSIsContainer -or ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        $folder.Name -cnotmatch '^frameleaf-watch-source-[a-f0-9-]{36}$' -or
+        $folder.Parent.FullName -ine (Get-Item -LiteralPath $env:USERPROFILE).FullName -or
+        (Get-ChildItem -LiteralPath $WatchedFolder -Force | Select-Object -First 1) -or
+        (Get-Process -Name frameleaf-desktop -ErrorAction SilentlyContinue)) {
+        throw 'Expected a fresh synthetic watch folder and no running Desktop app'
+    }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FrameleafSmokeWindow {
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+}
+'@
+}
 if ($InstalledHost) {
     if (Test-Path (Join-Path $env:LOCALAPPDATA 'Frameleaf Desktop Host')) { throw 'Expected a fresh user profile' }
     if (Get-NetTCPConnection -State Listen -LocalPort 2283,9443,54329 -ErrorAction SilentlyContinue) { throw 'Expected unused local server ports' }
@@ -73,6 +192,7 @@ try {
     $null = Wait-Control 'Welcome'
     # Welcome lists servers on this network and always offers another server by its address.
     $null = Wait-Control 'Another server'
+    if ($WatchedFolder) { Test-WatchedFolder; return }
     Select-Radio (Wait-Control 'Run Frameleaf here' -Radio)
     if ($InstalledHost) {
         $managerPassword = 'Synthetic!' + [guid]::NewGuid().ToString('N')

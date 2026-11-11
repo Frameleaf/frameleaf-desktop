@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { diagnosePhoto } from './diagnose_installed_photo.mjs';
 
 const [phase, receipt] = process.argv.slice(2);
 assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
-assert.ok(['upload', 'verify'].includes(phase));
+assert.ok(['upload', 'verify', 'watch-signup', 'watch-create', 'watch-verify'].includes(phase));
+if (phase.startsWith('watch-')) {
+  assert.equal(process.env.GITHUB_ACTIONS, 'true');
+  assert.equal(process.platform, 'win32');
+}
 const password = process.env.FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD;
 assert.ok(password?.length >= 32);
 const credentials = { email: 'native-photo@example.invalid', password };
 const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGNQaEigKWIYtWDUglELRi0YtWDUglELRi0YtWDUglELhooFAHfgAD2FaRhWAAAAAElFTkSuQmCC', 'base64');
-const filename = 'synthetic-native-photo.png';
+const filename = phase.startsWith('watch-') ? 'synthetic-watched-photo.png' : 'synthetic-native-photo.png';
 let token;
 
 async function request(path, options, statuses) {
@@ -47,11 +52,40 @@ async function thumbnail(id) {
   throw Error('Timed out waiting for thumbnail');
 }
 
+if (phase === 'watch-create') {
+  assert.ok(isAbsolute(receipt) && basename(receipt) === filename &&
+    /^frameleaf-watch-source-[0-9a-f-]{36}$/.test(basename(dirname(receipt))));
+  await writeFile(receipt, original, { flag: 'wx' });
+  process.exit(0);
+}
 assert.match(await (await request('/', {}, [200])).text(), /<html/i);
-if (phase === 'upload') await postJson('/api/auth/admin-sign-up', { ...credentials, name: 'Synthetic qualification' });
+if (phase === 'upload' || phase === 'watch-signup') {
+  await postJson('/api/auth/admin-sign-up', { ...credentials, name: 'Synthetic qualification' });
+}
+if (phase === 'watch-signup') process.exit(0);
 token = (await (await postJson('/api/auth/login', credentials)).json()).accessToken;
 assert.ok(typeof token === 'string' && token.length > 0);
-if (phase === 'upload') {
+if (phase === 'watch-verify') {
+  const deadline = Date.now() + 210_000;
+  for (;;) {
+    const response = await request('/api/search/metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ originalFileName: filename }),
+    }, [200]);
+    const { assets } = await response.json();
+    const matches = assets.items.filter(item => item.originalFileName === filename);
+    assert.ok(matches.length <= 1, 'Watcher imported duplicate originals');
+    if (matches.length === 1) {
+      assert.match(matches[0].id, /^[0-9a-f-]{36}$/);
+      await verifyOriginal(matches[0].id);
+      await thumbnail(matches[0].id);
+      break;
+    }
+    if (Date.now() >= deadline) throw Error('Watched original did not appear while Desktop was hidden');
+    await setTimeout(2000);
+  }
+} else if (phase === 'upload') {
   const form = new FormData();
   form.set('fileCreatedAt', '2026-01-01T00:00:00.000Z');
   form.set('fileModifiedAt', '2026-01-01T00:00:00.000Z');
