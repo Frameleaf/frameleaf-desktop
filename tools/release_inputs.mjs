@@ -1,5 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function validateFactoryRun(run, repository) {
@@ -72,6 +75,28 @@ export function updateManifest(tag, repository, signatures) {
   }
   if (!Object.keys(platforms).length) throw new Error("update_assets_missing");
   return { version, platforms };
+}
+
+export function verifyUpdaterAsset(file, signature, publicKey, version) {
+  const dir = mkdtempSync(join(tmpdir(), "frameleaf-updater-"));
+  try {
+    const signatureFile = join(dir, "signature");
+    const keyFile = join(dir, "public-key");
+    writeFileSync(signatureFile, Buffer.from(signature, "base64"));
+    writeFileSync(keyFile, Buffer.from(publicKey, "base64"));
+    let comment;
+    try {
+      comment = execFileSync("minisign", ["-VQ", "-m", file, "-x", signatureFile, "-p", keyFile], { encoding: "utf8" });
+    } catch (cause) {
+      throw new Error(`update_signature_verification_failed: ${file}`, { cause });
+    }
+    // Match Tauri's first version field after the artifact and trusted comment have both verified.
+    if (comment.replace(/\r?\n$/, "").split("\t").find((field) => field.startsWith("version:")) !== `version:${version}`) {
+      throw new Error(`update_signature_version_mismatch: ${file}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

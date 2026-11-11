@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { releaseMatrix, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
 
 test("release tags must match all application versions", () => {
@@ -82,4 +86,36 @@ test("update manifests match each installed package format to its signed asset",
   assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {
     "Frameleaf_1.2.3_amd64.deb": "",
   }), /update_signature_invalid/);
+});
+
+test("updater verification requires the embedded key, exact bytes and release version", {
+  skip: spawnSync("minisign", ["-v"]).error?.code === "ENOENT" && "minisign is unavailable",
+}, async () => {
+  const { verifyUpdaterAsset } = await import("./release_inputs.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "frameleaf-updater-test-"));
+  try {
+    const asset = join(dir, "desktop.deb");
+    const pubkey = join(dir, "public");
+    const secret = join(dir, "secret");
+    const otherPubkey = join(dir, "other-public");
+    const otherSecret = join(dir, "other-secret");
+    execFileSync("minisign", ["-GW", "-p", pubkey, "-s", secret]);
+    execFileSync("minisign", ["-GW", "-p", otherPubkey, "-s", otherSecret]);
+    writeFileSync(asset, "signed package fixture");
+    const signaturePath = join(dir, "signature");
+    execFileSync("minisign", ["-S", "-s", secret, "-m", asset, "-x", signaturePath, "-t", "timestamp:0\tfile:desktop.deb\tversion:1.2.3"]);
+    const signature = readFileSync(signaturePath).toString("base64");
+    const trusted = readFileSync(pubkey).toString("base64");
+    const other = readFileSync(otherPubkey).toString("base64");
+
+    assert.doesNotThrow(() => verifyUpdaterAsset(asset, signature, trusted, "1.2.3"));
+    assert.throws(() => verifyUpdaterAsset(asset, signature, trusted, "1.2.4"), /update_signature_version_mismatch/);
+    assert.throws(() => verifyUpdaterAsset(asset, signature, other, "1.2.3"), /update_signature_verification_failed/);
+    const editedComment = Buffer.from(readFileSync(signaturePath, "utf8").replace("version:1.2.3", "version:1.2.4")).toString("base64");
+    assert.throws(() => verifyUpdaterAsset(asset, editedComment, trusted, "1.2.4"), /update_signature_verification_failed/);
+    writeFileSync(asset, "changed package fixture");
+    assert.throws(() => verifyUpdaterAsset(asset, signature, trusted, "1.2.3"), /update_signature_verification_failed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
