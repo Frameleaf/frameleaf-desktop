@@ -56,12 +56,25 @@ impl ApprovedProfile {
     pub fn challenge(&self, id: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         self.0.challenge(id)
     }
+    pub(crate) fn cache_identity(&self) -> (&str, &str, &str) {
+        (
+            self.0.spec["models"][0]["task"]
+                .as_str()
+                .expect("validated model task"),
+            &self.0.model_name,
+            &self.0.model_snapshot_revision,
+        )
+    }
+    pub(crate) fn cache_bytes(&self) -> u64 {
+        self.0.artifact_bytes.values().copied().sum()
+    }
     pub(crate) async fn prepare_cache(
         &self,
         root: &std::path::Path,
         client: &reqwest::Client,
         cancel: &std::sync::atomic::AtomicBool,
         allow_download: bool,
+        progress: impl Fn(crate::model_cache::CacheProgress),
     ) -> Result<std::path::PathBuf, String> {
         crate::model_cache::prepare(
             crate::model_cache::CachePlan {
@@ -79,6 +92,7 @@ impl ApprovedProfile {
             client,
             cancel,
             allow_download,
+            progress,
         )
         .await
     }
@@ -895,6 +909,7 @@ mod tests {
                     &crate::transport::client().unwrap(),
                     &std::sync::atomic::AtomicBool::new(false),
                     false,
+                    |_| {},
                 )
                 .await;
             std::fs::remove_dir_all(&root).unwrap();
@@ -1003,6 +1018,7 @@ mod tests {
                     &client,
                     &std::sync::atomic::AtomicBool::new(false),
                     true,
+                    |_| {},
                 )
                 .await
                 .unwrap();

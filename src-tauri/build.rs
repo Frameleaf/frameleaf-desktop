@@ -52,6 +52,7 @@ fn main() {
             "disconnect_manager",
             "discover_servers",
             "server_summary",
+            "server_ai_processing",
             "cloud_status",
             "wallet_status",
             "update_wallet",

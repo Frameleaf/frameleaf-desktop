@@ -1,4 +1,7 @@
-use crate::{connection::SavedConnection, model_cache::check_cancel};
+use crate::{
+    connection::SavedConnection,
+    model_cache::{check_cancel, CacheProgress},
+};
 use serde::Serialize;
 use std::{
     future::Future,
@@ -17,6 +20,21 @@ pub(crate) struct SetupStatus {
     pub code: Option<String>,
     pub control: crate::worker_control::WorkerControl,
     pub workloads: Vec<WorkloadStatus>,
+    pub active_workload: Option<String>,
+    pub models: Option<ModelProgress>,
+}
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelProgress {
+    total_bytes: u64,
+    verified_bytes: u64,
+    download: Option<ModelDownload>,
+}
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ModelDownload {
+    received_bytes: u64,
+    total_bytes: u64,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +66,11 @@ impl Progress {
                 crate::worker_control::WorkerControl::Running
             },
             workloads: current.workloads.clone(),
+            active_workload: None,
+            models: current.models.clone().map(|mut models| {
+                models.download = None;
+                models
+            }),
         };
         if *current == status {
             return;
@@ -56,15 +79,43 @@ impl Progress {
         drop(current);
         (self.notify)(status);
     }
-    fn workloads(&self, workloads: Vec<WorkloadStatus>) {
+    fn update(&self, update: impl FnOnce(&mut SetupStatus)) {
         if self.cancelled.load(Ordering::Acquire) {
             return;
         }
         let mut status = self.status.lock().unwrap();
-        status.workloads = workloads;
-        let snapshot = status.clone();
-        drop(status);
-        (self.notify)(snapshot);
+        let previous = status.clone();
+        update(&mut status);
+        if *status != previous {
+            let snapshot = status.clone();
+            drop(status);
+            (self.notify)(snapshot);
+        }
+    }
+    fn active(&self, workload: Option<&str>) {
+        self.update(|status| status.active_workload = workload.map(str::to_owned));
+    }
+    fn cache_progress(&self, event: CacheProgress) {
+        self.update(|status| {
+            let Some(models) = &mut status.models else {
+                return;
+            };
+            match event {
+                CacheProgress::Verified(bytes) => {
+                    models.verified_bytes += bytes;
+                    models.download = None;
+                }
+                CacheProgress::Download { received, total } => {
+                    models.download = Some(ModelDownload {
+                        received_bytes: received,
+                        total_bytes: total,
+                    });
+                }
+            }
+        });
+    }
+    fn workloads(&self, workloads: Vec<WorkloadStatus>) {
+        self.update(|status| status.workloads = workloads);
     }
     fn workload(&self, workload: &str, state: &str, code: Option<String>) {
         let mut statuses = self.status.lock().unwrap().workloads.clone();
@@ -119,7 +170,7 @@ impl WorkerSetup {
             .into(),
             code: None,
             control,
-            workloads: Vec::new(),
+            ..SetupStatus::default()
         };
         *self.status.lock().unwrap() = status.clone();
         status
@@ -629,6 +680,7 @@ async fn prepare(
         runtime_store::{private_directory, read_bounded},
         transport,
     };
+    progress.update(|status| status.models = None);
     progress.set("preparing-runtime", None);
     let cancelled = progress.cancelled.clone();
     let data = paths.data.clone();
@@ -716,10 +768,25 @@ async fn prepare(
         .map_err(|_| "resource_status_unavailable")?;
     let explicit_permission = allow_download;
     let allow_download = explicit_permission || network.unmetered == Some(true);
+    let mut counted = std::collections::BTreeSet::new();
+    let total_bytes = profiles
+        .iter()
+        .filter(|profile| counted.insert(profile.cache_identity()))
+        .map(|profile| profile.cache_bytes())
+        .sum();
+    counted.clear();
+    progress.update(|status| {
+        status.models = Some(ModelProgress {
+            total_bytes,
+            verified_bytes: 0,
+            download: None,
+        })
+    });
     progress.set("preparing-models", None);
     // Complete acquisition before requesting short-lived nonces.
     let mut caches = Vec::new();
     for profile in &profiles {
+        let count = counted.insert(profile.cache_identity());
         wait_for_user(&progress, || worker.maintain_session()).await?;
         let cache = acquisition(
             profile.prepare_cache(
@@ -727,6 +794,11 @@ async fn prepare(
                 &client,
                 &progress.cancelled,
                 allow_download,
+                |event| {
+                    if count {
+                        progress.cache_progress(event);
+                    }
+                },
             ),
             explicit_permission,
             || worker.maintain_session(),
@@ -970,9 +1042,10 @@ async fn prepare(
                     tokio::select! {
                         biased;
                         reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
-                        result = predictor.execute_next_many(&worker, &accepted, &mut cancel) => result,
+                        result = predictor.execute_next_with_activity(&worker, &accepted, &mut cancel, |workload| progress.active(Some(workload))) => result,
                     }
                 }, &progress.cancelled).await;
+                progress.active(None);
                 match completed {
                     Ok(true) => {}
                     Ok(false) => {

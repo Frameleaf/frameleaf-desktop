@@ -589,6 +589,7 @@ pub fn run() {
             manager_commands::disconnect_manager,
             discovery::discover_servers,
             server_admin::server_summary,
+            server_admin::server_ai_processing,
             server_admin::cloud_status,
             server_admin::wallet_status,
             server_admin::update_wallet,

@@ -33,6 +33,64 @@ pub(crate) struct ServerSummary {
     pub attention: Option<Value>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiQueue {
+    name: String,
+    state: Option<String>,
+    unavailable: Option<bool>,
+    is_paused: bool,
+    held_for_night: Option<bool>,
+    resumes_at: Option<String>,
+    active: u64,
+    waiting: u64,
+    processed: u64,
+    total: u64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningJobs {
+    can_manage_queues: bool,
+    queues: Vec<AiQueue>,
+}
+#[derive(Deserialize, Serialize)]
+struct ProcessingOrder {
+    order: Vec<String>,
+    workloads: Vec<WorkloadOrder>,
+}
+#[derive(Deserialize, Serialize)]
+struct WorkloadOrder {
+    workload: String,
+    sources: Vec<String>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AiProcessing {
+    queues: Option<Vec<AiQueue>>,
+    processing_order: Option<ProcessingOrder>,
+}
+
+fn ai_queues(value: Value) -> Option<Vec<AiQueue>> {
+    let jobs: RunningJobs = serde_json::from_value(value).ok()?;
+    jobs.can_manage_queues.then(|| {
+        jobs.queues
+            .into_iter()
+            .filter(|queue| {
+                matches!(
+                    queue.name.as_str(),
+                    "faceDetection"
+                        | "facialRecognition"
+                        | "smartSearch"
+                        | "ocr"
+                        | "imageEnrichment"
+                        | "imageDescription"
+                        | "nsfwDetection"
+                )
+            })
+            .collect()
+    })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CloudStatus {
@@ -169,6 +227,26 @@ pub(crate) async fn server_summary(
         storage: storage.ok(),
         version: version.ok(),
         attention,
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn server_ai_processing(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+) -> Result<AiProcessing, String> {
+    crate::require_local(&window)?;
+    let session = session(&state).await?;
+    session.require_admin().await?;
+    let (jobs, order) = tokio::join!(
+        session.get("api/jobs/running"),
+        session.get("api/ml-destinations/processing-order"),
+    );
+    Ok(AiProcessing {
+        queues: jobs.ok().and_then(ai_queues),
+        processing_order: order
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok()),
     })
 }
 
@@ -522,5 +600,36 @@ mod tests {
         assert_eq!(refusal(400, Some("Bad Request!")), "server_http_400");
         assert_eq!(refusal(500, None), "server_http_500");
         assert_eq!(refusal(401, Some(&"a".repeat(65))), "server_http_401");
+    }
+}
+
+#[cfg(test)]
+mod ai_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn library_ai_queue_summary_filters_other_queues_and_refuses_ungranted_counts() {
+        let queue = |name| {
+            json!({
+                "name": name, "isPaused": false, "active": 1, "waiting": 4, "processed": 5, "total": 10
+            })
+        };
+        let result = ai_queues(json!({
+            "canManageQueues": true, "queues": [queue("smartSearch"), queue("videoConversion")],
+            "operations": [{ "private": "omitted" }]
+        }))
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "smartSearch");
+        assert_eq!(result[0].total, 10);
+        assert!(
+            ai_queues(json!({ "canManageQueues": false, "queues": [queue("smartSearch")] }))
+                .is_none()
+        );
+        assert!(ai_queues(json!({ "queues": [] })).is_none());
+        assert!(ai_queues(json!({ "canManageQueues": true, "queues": [] }))
+            .unwrap()
+            .is_empty());
     }
 }

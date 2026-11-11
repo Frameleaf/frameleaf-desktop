@@ -103,6 +103,7 @@ fn write_pinned(path: &Path, bytes: &[u8], cancel: &AtomicBool) -> Result<(), St
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn acquire_file(
     client: &Client,
     url: &str,
@@ -111,12 +112,25 @@ pub(crate) async fn acquire_file(
     sha256: &str,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    acquire_file_with_progress(client, url, path, bytes, sha256, cancel, |_| {}).await
+}
+
+async fn acquire_file_with_progress(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    cancel: &AtomicBool,
+    progress: impl Fn(u64),
+) -> Result<(), String> {
     check_cancel(cancel)?;
     crate::native_runtime::absolute_directory(path.parent().ok_or("model_path_invalid")?)?;
     if fs::symlink_metadata(path).is_ok() {
         return verify_file(path, bytes, sha256, cancel);
     }
     let (temporary, mut file) = partial(path, sha256)?;
+    progress(0);
     let mut response = client
         .get(url)
         .timeout(std::time::Duration::from_secs(600))
@@ -129,6 +143,7 @@ pub(crate) async fn acquire_file(
         return Err("model_download_invalid".into());
     }
     let mut count = 0u64;
+    let mut reported_percent = 0;
     let mut hash = Sha256::new();
     while let Some(chunk) = response
         .chunk()
@@ -145,6 +160,11 @@ pub(crate) async fn acquire_file(
         hash.update(&chunk);
         file.write_all(&chunk)
             .map_err(|_| "model_file_write_failed")?;
+        let percent = count.saturating_mul(100) / bytes.max(1);
+        if percent > reported_percent {
+            reported_percent = percent;
+            progress(count);
+        }
     }
     check_cancel(cancel)?;
     if count != bytes || format!("{:x}", hash.finalize()) != sha256 {
@@ -164,12 +184,18 @@ pub(crate) struct CachePlan<'a> {
     pub hashes: &'a serde_json::Map<String, serde_json::Value>,
     pub sizes: &'a std::collections::BTreeMap<String, u64>,
 }
+#[derive(Debug, PartialEq)]
+pub(crate) enum CacheProgress {
+    Verified(u64),
+    Download { received: u64, total: u64 },
+}
 pub(crate) async fn prepare(
     plan: CachePlan<'_>,
     root: &Path,
     client: &Client,
     cancel: &AtomicBool,
     allow_download: bool,
+    progress: impl Fn(CacheProgress),
 ) -> Result<PathBuf, String> {
     use crate::{native_runtime::absolute_directory, runtime_store::private_directory};
     use std::collections::BTreeSet;
@@ -206,6 +232,7 @@ pub(crate) async fn prepare(
                 plan.hashes[name].as_str().ok_or("model_plan_invalid")?,
                 cancel,
             )?;
+            progress(CacheProgress::Verified(*bytes));
             continue;
         }
         let mut directory = model.clone();
@@ -227,16 +254,23 @@ pub(crate) async fn prepare(
                 "https://models.frameleaf.cloud/frameleaf/{}/resolve/{}/{name}",
                 plan.name, plan.revision
             );
-            acquire_file(
+            acquire_file_with_progress(
                 client,
                 &url,
                 &path,
                 *bytes,
                 plan.hashes[name].as_str().ok_or("model_plan_invalid")?,
                 cancel,
+                |received| {
+                    progress(CacheProgress::Download {
+                        received,
+                        total: *bytes,
+                    })
+                },
             )
             .await?;
         }
+        progress(CacheProgress::Verified(*bytes));
     }
     let receipt = serde_json::to_vec(plan.hashes).map_err(|_| "model_plan_invalid")?;
     let receipt_path = model.join(".frameleaf-staged.json");
@@ -436,6 +470,7 @@ mod tests {
             &crate::transport::client().unwrap(),
             &AtomicBool::new(false),
             false,
+            |_| {},
         )
         .await;
         assert_eq!(result.unwrap_err(), "model_download_permission_required");
@@ -505,9 +540,17 @@ mod tests {
         };
         let client = crate::transport::client().unwrap();
         let cancel = AtomicBool::new(false);
-        let cache = prepare(plan(), &root.0, &client, &cancel, false)
-            .await
-            .unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let cache = prepare(plan(), &root.0, &client, &cancel, false, |event| {
+            events.borrow_mut().push(event)
+        })
+        .await
+        .unwrap();
+        let events = events.into_inner();
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, CacheProgress::Verified(_))));
+        assert!(events.contains(&CacheProgress::Verified(7)));
         assert_eq!(cache, root.0.join(&reference));
         assert!(!stage.exists());
         assert_eq!(
@@ -520,13 +563,13 @@ mod tests {
         .unwrap();
         assert_eq!(receipt, hashes);
         assert_eq!(
-            prepare(plan(), &root.0, &client, &cancel, false)
+            prepare(plan(), &root.0, &client, &cancel, false, |_| {})
                 .await
                 .unwrap(),
             cache
         );
         fs::write(cache.join("clip/test/visual/model.onnx"), b"changed").unwrap();
-        assert!(prepare(plan(), &root.0, &client, &cancel, false)
+        assert!(prepare(plan(), &root.0, &client, &cancel, false, |_| {})
             .await
             .is_err());
         assert_eq!(

@@ -324,13 +324,23 @@ impl NativePredictor {
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
+        self.execute_next_with_activity(transport, qualifications, cancel, |_| {})
+            .await
+    }
+    pub(crate) async fn execute_next_with_activity(
+        &mut self,
+        transport: &WorkerTransport,
+        qualifications: &[&AcceptedQualification],
+        cancel: &mut watch::Receiver<bool>,
+        on_claim: impl FnOnce(&str),
+    ) -> Result<bool, String> {
         let mut active = ActiveExecution {
             predictor: self,
             retain: false,
         };
         let outcome = active
             .predictor
-            .execute(transport, qualifications, cancel)
+            .execute(transport, qualifications, cancel, on_claim)
             .await;
         if outcome.is_err() {
             active.predictor.stop()?;
@@ -343,6 +353,7 @@ impl NativePredictor {
         transport: &WorkerTransport,
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
+        on_claim: impl FnOnce(&str),
     ) -> Result<bool, String> {
         if self.roles.len() != qualifications.len()
             || self
@@ -364,6 +375,9 @@ impl NativePredictor {
         let Some((index, task)) = task else {
             return Ok(false);
         };
+        if let Some((workload, _)) = task.model_key.split_once(':') {
+            on_claim(workload);
+        }
         let qualification = qualifications[index];
         let result = async {
             let input = race_prediction(

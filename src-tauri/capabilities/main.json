@@ -47,6 +47,7 @@
     "allow-open-local-photos",
     "allow-discover-servers",
     "allow-server-summary",
+    "allow-server-ai-processing",
     "allow-cloud-status",
     "allow-wallet-status",
     "allow-update-wallet",

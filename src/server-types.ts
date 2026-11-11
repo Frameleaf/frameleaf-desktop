@@ -27,7 +27,8 @@ export type CloudServer = {
 export type ConnectionFeatures = { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean };
 export type Connection = { server: string; name: string; mode: string; state: string; features: ConnectionFeatures };
 export type Workload = { workload: string; state: string; modelNames: string[]; code: string | null };
-export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[] };
+export type ModelProgress = { totalBytes: number; verifiedBytes: number; download: { receivedBytes: number; totalBytes: number } | null };
+export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[]; activeWorkload?: string | null; models?: ModelProgress | null };
 
 // ---- server_summary --------------------------------------------------------------------------------
 export type Me = { id?: string; name?: string; email?: string; isAdmin?: boolean };
