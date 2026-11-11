@@ -932,6 +932,134 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 mod tests {
     use super::*;
 
+    /// Run the released app as a client of a separate disposable signed Library.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed Desktop and signed companion on a fresh Windows runner"]
+    fn disposable_runner_installed_desktop_watches_while_hidden() {
+        use std::{
+            io::Write,
+            net::TcpListener,
+            path::PathBuf,
+            process::{Command, Stdio},
+            time::Instant,
+        };
+        use zeroize::Zeroizing;
+
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let runner = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap())
+            .canonicalize()
+            .unwrap();
+        let executable = PathBuf::from(std::env::var_os("FRAMELEAF_WATCH_DESKTOP_EXE").unwrap());
+        let physical = executable.canonicalize().unwrap();
+        assert!(executable.is_absolute() && physical.starts_with(&runner) && physical.is_file());
+        assert_eq!(physical.file_name().unwrap(), "frameleaf-desktop.exe");
+        let expected = std::env::var("FRAMELEAF_WATCH_DESKTOP_SHA256").unwrap();
+        let bytes = crate::runtime_store::read_bounded(&physical, 256 * 1024 * 1024).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
+
+        let (state, _) = crate::windows_host_profile::paths().unwrap();
+        assert!(
+            !state.parent().unwrap().exists(),
+            "requires a fresh native profile"
+        );
+        let local_data = crate::host_install::windows_local_app_data().unwrap();
+        assert!(
+            !local_data.join("app.frameleaf.desktop").exists(),
+            "requires a fresh Desktop app data directory"
+        );
+        for account in [
+            "connection",
+            "installation",
+            crate::manager::CREDENTIAL,
+            crate::source_consent::CREDENTIAL,
+        ] {
+            assert!(
+                crate::credentials::load::<serde_json::Value>(account)
+                    .unwrap()
+                    .is_none(),
+                "requires a fresh Desktop credential store"
+            );
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 2283)).unwrap();
+        let database = TcpListener::bind(("127.0.0.1", 54329)).unwrap();
+        let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST").unwrap();
+        let record =
+            Installation::read(&manifest).expect("expected the approved installed companion");
+        let (layout, runtime) = verified(&record).expect("installed companion verification failed");
+
+        let scratch = crate::runtime_store::Staging::create(
+            runner.join(format!("frameleaf-watch-library-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let source = crate::runtime_store::Staging::create(
+            PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join(format!("frameleaf-watch-source-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let database_password = Zeroizing::new(format!("Synthetic-db-{}!", uuid::Uuid::new_v4()));
+        let photo_password = Zeroizing::new(format!("Synthetic-photo-{}!", uuid::Uuid::new_v4()));
+        drop((listener, database));
+        let mut host = runtime
+            .start(
+                scratch.path(),
+                &database_password,
+                54329,
+                2283,
+                &layout.controller,
+            )
+            .expect("disposable signed Library did not start");
+        host.wait_ready(Duration::from_secs(240)).unwrap();
+
+        let tools = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools");
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-File"])
+            .arg(tools.join("qualify_windows_welcome.ps1"))
+            .arg("-Executable")
+            .arg(&executable)
+            .arg("-WatchedFolder")
+            .arg(source.path())
+            .stdin(Stdio::piped())
+            .env(
+                "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
+                photo_password.as_str(),
+            );
+        let mut smoke = command
+            .spawn()
+            .expect("Windows UI Automation could not start");
+        let tree = crate::process_tree::ProcessTree::attach(&smoke).unwrap_or_else(|_| {
+            let _ = smoke.kill();
+            let _ = smoke.wait();
+            panic!("could not own the Windows acceptance process tree");
+        });
+        let handshake_sent = smoke
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(b"frameleaf-watch-smoke\r\n").is_ok());
+        let deadline = Instant::now() + Duration::from_secs(900);
+        let result = handshake_sent
+            && loop {
+                match smoke.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(250))
+                    }
+                    _ => break false,
+                }
+            };
+        let terminated = tree.terminate_confirmed(Duration::from_secs(20));
+        let stopped = host.stop();
+        terminated.expect("Windows acceptance process cleanup failed");
+        assert!(handshake_sent, "Windows acceptance handshake failed");
+        assert!(result, "installed Desktop watcher acceptance failed");
+        stopped.expect("disposable Library shutdown failed");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires an installed companion on a disposable hosted runner"]

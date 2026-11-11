@@ -4,6 +4,28 @@ Tracked in [FD-2](https://heroit.atlassian.net/browse/FD-2). The first pipeline
 packages the current `main` worker-enabled desktop, not the stacked native-host
 drafts. CodeRabbit remains independent of Actions.
 
+## Installed Windows watched-folder acceptance
+
+On a fresh GitHub-hosted Windows runner, install the approved signed Library
+companion with the photo-source API and the approved Desktop candidate under
+`RUNNER_TEMP`. Use an interactive Windows desktop with WebView2, Node and an
+unmetered network. Initialize the runner's cloud-files filter as in the Windows
+compiled host qualification before running the test. Do not start the app first.
+
+Set `FRAMELEAF_INSTALLED_HOST_MANIFEST` to the approved companion manifest
+SHA-256 in lowercase hexadecimal, and `FRAMELEAF_WATCH_DESKTOP_EXE` and `FRAMELEAF_WATCH_DESKTOP_SHA256`
+to the installed `frameleaf-desktop.exe` path and the verified installed
+executable's SHA-256 in lowercase hexadecimal. Run the test from the repository root:
+
+```powershell
+cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_setup::tests::disposable_runner_installed_desktop_watches_while_hidden -- --ignored --exact --nocapture
+```
+
+The test owns a temporary loopback Library and a new synthetic folder. It creates
+the test image after the Desktop window hides, reads back the original and
+thumbnail, and reopens the same window before revoking permission and signing
+out. A passing run applies to those installed bytes.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers
