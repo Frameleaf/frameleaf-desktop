@@ -3,13 +3,15 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=src/macos_keychain.m");
         println!("cargo:rerun-if-changed=src/macos_keychain.h");
+        println!("cargo:rerun-if-changed=src/finder_import.m");
         cc::Build::new()
-            .file("src/macos_keychain.m")
+            .files(["src/macos_keychain.m", "src/finder_import.m"])
             .flag("-fobjc-arc")
             .compile("frameleaf_keychain");
         println!("cargo:rustc-link-lib=framework=LocalAuthentication");
         println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=AppKit");
     }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
@@ -38,6 +40,7 @@ fn main() {
             "photo_drop_status",
             "approve_photo_drop",
             "control_photo_drop",
+            "explorer_import_shortcut",
             "approve_photo_folder",
             "list_photo_import_albums",
             "photo_source_status",

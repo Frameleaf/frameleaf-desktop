@@ -10,7 +10,7 @@
   type Preview = { selectionId: string; path: string; count: number; bytes: number; skipped: number; folder: boolean; names: string[] };
   type Job = { sourceId: string; state: string; total: number; completed: number; code: string | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
   type Status = { consent: { id: string; name: string; registered: boolean; destination: AlbumDestination | null }; job: Job | null };
-  let { visible }: { visible: boolean } = $props();
+  let { connected, visible }: { connected: boolean; visible: boolean } = $props();
   let preview = $state<Preview | null>(null);
   let status = $state<Status | null>(null);
   let open = $state(false);
@@ -19,20 +19,33 @@
   let albumMode = $state(false);
   let destination = $state<AlbumDestination | null>(null);
   let message = $state('');
+  type PendingEvent = 'ready' | 'limit' | 'busy';
+  let queued = $state<PendingEvent | null>(null);
+  let shortcut = $state<boolean | null>(null);
+  let shortcutBusy = $state(false);
+  let shortcutMessage = $state('');
+  $effect(() => {
+    if (!busy && queued) {
+      const result = queued;
+      queued = null;
+      void loadPreview(result);
+    }
+  });
   const job = $derived(status?.job);
   const terminal = $derived(job?.state === 'complete' || job?.state === 'cancelled');
   const allowance = $derived(!!job && !job.albumPending && !terminal && !['copying', 'queued'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
   const messages: Record<string, string> = {
     ...albumErrors,
-    source_drop_limit: 'Drop one folder or up to 100 photos and videos from the same folder.',
-    source_drop_mixed: 'Drop one folder or select photos and videos from the same folder.',
-    source_drop_existing: 'Finish or remove the current dropped import before starting another.',
-    source_selection_changed: 'This preview has changed. Drop the folder or files again.',
-    source_root_changed: 'This folder was replaced after the preview. Drop the items again.',
-    source_item_changed: 'A file changed after the preview. Remove this import and drop the items again to approve the new version.',
+    source_drop_limit: 'Select one folder or up to 100 photos and videos from the same folder.',
+    source_drop_mixed: 'Select one folder or choose photos and videos from the same folder.',
+    source_drop_existing: 'Finish or remove the current import before starting another.',
+    source_selection_changed: 'This preview has changed. Send or drop the folder or files again.',
+    source_root_changed: 'This folder was replaced after the preview. Send or drop the items again.',
+    source_item_changed: 'A file changed after the preview. Remove this import and select the items again to approve the new version.',
     source_item_invalid: 'Choose ordinary local photos or videos. Links and cloud-only files cannot be copied this way.',
     source_item_unavailable: 'A selected file is unavailable. Check the folder before resuming.',
-    source_watch_local_required: 'Drop a folder or files stored on this computer.',
+    source_watch_local_required: 'Choose a folder or files stored on this computer.',
+    sign_in_required: 'Sign in to your Frameleaf library, then send the selection again.',
     source_no_media: 'No available photos or videos were found.',
     source_inventory_partial: 'The full folder could not be checked. Choose a smaller accessible folder.',
     source_upload_budget_required: 'Approve the displayed upload allowance before resuming.',
@@ -47,33 +60,58 @@
   async function refresh() {
     status = await invoke<Status | null>('photo_drop_status');
   }
-  async function loadPreview(result: 'ready' | 'limit' | 'busy') {
-    if (busy) return;
-    open = true;
-    allowed = false;
-    albumMode = false;
-    destination = null;
-    message = '';
-    preview = null;
+  async function loadPreview(result: PendingEvent) {
     if (result !== 'ready') {
-      message = result === 'limit' ? messages.source_drop_limit! : 'Frameleaf is finishing another action. Drop the items again when it’s ready.';
+      open = true;
+      allowed = false;
+      preview = null;
+      message = result === 'limit' ? messages.source_drop_limit! : 'Frameleaf is finishing another action. Try again when it’s ready.';
       return;
     }
     busy = true;
-    try { preview = await invoke<Preview | null>('preview_photo_drop'); }
-    catch (error) { message = explain(error); }
-    finally { busy = false; }
+    try {
+      const found = await invoke<Preview | null>('preview_photo_drop');
+      if (found) {
+        open = true;
+        if (preview?.selectionId !== found.selectionId) {
+          allowed = false;
+          albumMode = false;
+          destination = null;
+        }
+        preview = found;
+        message = '';
+      }
+    } catch (error) {
+      open = true;
+      allowed = false;
+      preview = null;
+      message = explain(error);
+    } finally { busy = false; }
+  }
+  async function changeShortcut() {
+    if (shortcut === null) return;
+    shortcutBusy = true;
+    shortcutMessage = '';
+    try { shortcut = await invoke<boolean | null>('explorer_import_shortcut', { enabled: !shortcut }); }
+    catch { shortcutMessage = 'Frameleaf could not change the Explorer shortcut.'; }
+    finally { shortcutBusy = false; }
   }
   onMount(() => {
     let live = true;
     const listeners: UnlistenFn[] = [];
     void (async () => {
       const add = (stop: UnlistenFn) => { if (live) listeners.push(stop); else stop(); };
-      add(await listen<'ready' | 'limit' | 'busy'>('photo-drop-pending', event => { if (live) void loadPreview(event.payload); }));
+      add(await listen<PendingEvent>('photo-drop-pending', event => { if (live) queued = event.payload; }));
       add(await listen<Job>('photo-drop-import', event => {
         if (live && status?.consent.id === event.payload.sourceId) status = { ...status, job: event.payload };
       }));
-      if (live) await refresh();
+      if (live) {
+        queued ??= 'ready';
+        if (connected) await refresh();
+      }
+      if (live && connected) {
+        shortcut = await invoke<boolean | null>('explorer_import_shortcut').catch(() => null);
+      }
     })().catch(error => { if (live) message = explain(error); });
     return () => { live = false; listeners.forEach(stop => stop()); };
   });
@@ -116,12 +154,19 @@
 {#if visible}
   <div class="inline-msg drop-entry">
     <p>Drop one folder or up to 100 photos and videos from the same folder into this window.</p>
-    {#if status}<button class="btn small" onclick={() => { open = true; }}>Dropped import</button>{/if}
+    {#if status}<button class="btn small" onclick={() => { open = true; }}>File import</button>{/if}
   </div>
+  {#if shortcut !== null}
+    <div class="inline-msg drop-entry">
+      <p>{shortcut ? 'In File Explorer, select items and choose Send to → Import to Frameleaf.' : 'Add an Import to Frameleaf shortcut to the File Explorer Send to menu.'}</p>
+      <button class="btn small" type="button" disabled={shortcutBusy} onclick={changeShortcut}>{shortcut ? 'Remove Explorer Shortcut' : 'Add Explorer Shortcut'}</button>
+      {#if shortcutMessage}<p role="status">{shortcutMessage}</p>{/if}
+    </div>
+  {/if}
 {/if}
 
 {#if open}
-  <Sheet title={preview ? (preview.folder ? 'Review dropped folder' : 'Review dropped files') : 'Dropped import'} {busy} onclose={close} onsubmit={preview ? approve : undefined}>
+  <Sheet title={preview ? (preview.folder ? 'Review selected folder' : 'Review selected files') : 'File import'} {busy} onclose={close} onsubmit={preview ? approve : undefined}>
     {#if message}<p role="status">{message}</p>{/if}
     {#if preview}
       <p><strong>{preview.path}</strong></p>

@@ -7,6 +7,7 @@ mod credential_lock;
 mod credentials;
 mod discovery;
 mod drop_import;
+mod file_manager_import;
 mod host_commands;
 pub mod host_control;
 mod host_database;
@@ -323,7 +324,9 @@ async fn restore_connection(
         return Ok(None);
     }
     app.state::<source_import::SourceJobs>().stop().await;
-    app.state::<drop_import::DropImport>().stop().await;
+    app.state::<drop_import::DropImport>()
+        .reset_for_restore()
+        .await;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
         "connection",
@@ -529,7 +532,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            #[cfg(windows)]
+            if let Some(selection) =
+                file_manager_import::windows_selection(args.into_iter().map(Into::into))
+            {
+                drop_import::launch_event(app, selection);
+                return;
+            }
+            #[cfg(not(windows))]
+            let _ = args;
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -552,6 +564,7 @@ pub fn run() {
                 let _ = window.show();
                 placement.remember(&window);
             }
+            file_manager_import::setup(app.handle());
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
@@ -591,6 +604,7 @@ pub fn run() {
             drop_import::photo_drop_status,
             drop_import::approve_photo_drop,
             drop_import::control_photo_drop,
+            file_manager_import::explorer_import_shortcut,
             manager_commands::manager_view,
             manager_commands::manager_certificate_fingerprint,
             manager_commands::pair_manager,
