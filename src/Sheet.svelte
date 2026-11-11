@@ -8,37 +8,50 @@
     onclose?: () => void; onsubmit?: () => void; children?: Snippet; actions?: Snippet; labelledby?: string | undefined;
   } = $props();
   const id = `sheet-${Math.random().toString(36).slice(2, 8)}`;
-  let panel = $state<HTMLElement | null>(null);
-  const tabbable = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  let panel = $state<HTMLDialogElement | null>(null);
+  const tabbable = 'a[href], button, input:not([type="hidden"]), select, textarea, [tabindex]';
+  function controls(dialog: HTMLDialogElement) {
+    return [...dialog.querySelectorAll<HTMLElement>(tabbable)]
+      .filter(item => item.tabIndex >= 0 && !item.matches(':disabled') && item.getClientRects().length > 0);
+  }
   $effect(() => {
-    if (!open || !panel) return;
+    const dialog = panel;
+    if (!open || !dialog) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusable = panel.querySelector<HTMLElement>('input:not([type="checkbox"]), select, textarea, button.primary, button.danger, button');
-    focusable?.focus();
-    return () => { if (opener?.isConnected) opener.focus(); };
+    dialog.showModal();
+    const focusable = controls(dialog);
+    const input = focusable.find(item => item.matches('input:not([type="checkbox"]), select, textarea'));
+    (input ?? focusable[0] ?? dialog).focus();
+    return () => {
+      dialog.close();
+      if (opener?.isConnected) opener.focus();
+    };
   });
-  // On the window, so Escape and Tab still work when focus has dropped to the body (a control went disabled).
   function keydown(event: KeyboardEvent) {
-    if (!open || !panel) return;
-    if (event.key === 'Escape' && !busy) { event.preventDefault(); onclose?.(); return; }
-    if (event.key !== 'Tab') return;
-    const items = [...panel.querySelectorAll<HTMLElement>(tabbable)];
-    if (items.length === 0) { event.preventDefault(); return; }
-    const first = items[0]!, last = items[items.length - 1]!;
-    const inside = panel.contains(document.activeElement);
-    if (!inside || (event.shiftKey ? document.activeElement === first : document.activeElement === last)) {
+    if (event.key !== 'Tab' || !panel) return;
+    const items = controls(panel);
+    const first = items[0], last = items.at(-1);
+    const focused = document.activeElement;
+    if (!first || !last || !items.includes(focused as HTMLElement) ||
+        focused === (event.shiftKey ? first : last)) {
       event.preventDefault();
-      (event.shiftKey && inside ? last : first).focus();
+      (event.shiftKey ? last ?? panel : first ?? panel).focus();
     }
+  }
+  function dismiss(event: Event) {
+    event.preventDefault();
+    if (!busy) onclose?.();
+  }
+  function backdrop(event: PointerEvent) {
+    if (!panel || event.target !== panel || busy) return;
+    const box = panel.getBoundingClientRect();
+    if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) onclose?.();
   }
   function submit(event: SubmitEvent) { event.preventDefault(); if (!busy) onsubmit?.(); }
 </script>
 
-<svelte:window onkeydown={keydown} />
-
 {#if open}
-  <div class="sheet-backdrop" role="presentation" onpointerdown={event => { if (event.target === event.currentTarget && !busy) onclose?.(); }}>
-    <div class="sheet" class:wide role="dialog" aria-modal="true" aria-labelledby={labelledby ?? id} aria-busy={busy} bind:this={panel}>
+  <dialog class="sheet" class:wide aria-labelledby={labelledby ?? id} aria-busy={busy} bind:this={panel} oncancel={dismiss} onkeydown={keydown} onpointerdown={backdrop}>
     <form class="sheet-form" onsubmit={submit}>
       {#if kind !== 'plain'}
         <span class="warn" aria-hidden="true">
@@ -52,6 +65,5 @@
         {#if actions}<div class="acts">{@render actions()}</div>{/if}
       </div>
     </form>
-    </div>
-  </div>
+  </dialog>
 {/if}

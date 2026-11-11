@@ -47,6 +47,7 @@ mod tray;
 mod updates;
 mod upload_budget;
 mod upload_parts;
+mod window_placement;
 #[cfg(windows)]
 mod windows_host_profile;
 #[cfg(any(windows, test))]
@@ -534,6 +535,7 @@ pub fn run() {
             }
         }))
         .manage(DesktopState::default())
+        .manage(window_placement::WindowPlacement::default())
         .manage(host_setup::HostSetup::default())
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
@@ -543,6 +545,12 @@ pub fn run() {
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let placement = app.state::<window_placement::WindowPlacement>();
+                placement.restore(&window);
+                let _ = window.show();
+                placement.remember(&window);
+            }
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
@@ -618,21 +626,34 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let tauri::WindowEvent::DragDrop(event) = event {
-                    if let Some(main) = window.app_handle().get_webview_window("main") {
+            if window.label() != "main" {
+                return;
+            }
+            let placement = window.state::<window_placement::WindowPlacement>();
+            match event {
+                tauri::WindowEvent::DragDrop(event) => {
+                    if let Some(main) = window.get_webview_window("main") {
                         drop_import::native_event(&main, event);
                     }
                 }
-            }
-            if window.label() == "main"
-                && (window.state::<host_setup::HostSetup>().background_active()
-                    || window.state::<source_import::SourceJobs>().watching())
-            {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
+                tauri::WindowEvent::Moved(_)
+                | tauri::WindowEvent::Resized(_)
+                | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                    if let Some(main) = window.get_webview_window("main") {
+                        placement.remember(&main);
+                    }
                 }
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    placement.save(window.app_handle());
+                    if cfg!(target_os = "macos")
+                        || window.state::<host_setup::HostSetup>().background_active()
+                        || window.state::<source_import::SourceJobs>().watching()
+                    {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())
@@ -646,6 +667,7 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                app.state::<window_placement::WindowPlacement>().save(app);
                 if app.state::<host_setup::HostSetup>().background_active() {
                     api.prevent_exit();
                     if let Some(window) = app.get_webview_window("main") {
