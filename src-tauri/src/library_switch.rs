@@ -49,7 +49,7 @@ enum IndexEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cleanup_scope: Option<CleanupScope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pending: Option<PendingCleanup>,
+        pending: Option<Box<PendingCleanup>>,
     },
     Legacy(String),
 }
@@ -96,7 +96,7 @@ impl IndexEntry {
 
     fn pending(&self) -> Option<&PendingCleanup> {
         match self {
-            Self::Display { pending, .. } => pending.as_ref(),
+            Self::Display { pending, .. } => pending.as_deref(),
             Self::Legacy(_) => None,
         }
     }
@@ -213,7 +213,7 @@ fn park(
             previous.and_then(IndexEntry::generation)
         },
         cleanup_scope: Some(CleanupScope::from_saved(saved)?),
-        pending,
+        pending: pending.map(Box::new),
     };
     let account = display.account()?;
     let new_slot = existing.is_none() || display.pending().is_some();
@@ -756,11 +756,11 @@ mod tests {
             display: LibraryDisplay::from_saved(&next),
             generation: Some(uuid::Uuid::new_v4()),
             cleanup_scope: Some(next_scope.clone()),
-            pending: Some(PendingCleanup {
+            pending: Some(Box::new(PendingCleanup {
                 generation: None,
                 scope: old_scope.clone(),
                 revoke_bearer: true,
-            }),
+            })),
         };
         let encoded = serde_json::to_string(&entry).unwrap();
         assert!(!encoded.contains(&next.token));
