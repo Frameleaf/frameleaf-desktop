@@ -932,13 +932,54 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 mod tests {
     use super::*;
 
+    /// Deny replacement of the executable and of its path while either Desktop launch is possible.
+    #[cfg(windows)]
+    fn pin_watcher_executable(path: &std::path::Path) -> (Vec<std::fs::File>, std::fs::File) {
+        use std::{
+            fs::OpenOptions,
+            os::windows::fs::{MetadataExt, OpenOptionsExt},
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let ancestors: Vec<_> = path.ancestors().skip(1).collect();
+        let pins = ancestors
+            .into_iter()
+            .rev()
+            .map(|ancestor| {
+                let pin = OpenOptions::new()
+                    .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(ancestor)
+                    .expect("could not pin the installed Desktop directory");
+                let info = pin.metadata().unwrap();
+                assert!(
+                    info.is_dir() && info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                );
+                pin
+            })
+            .collect();
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .expect("could not pin the installed Desktop executable");
+        let info = file.metadata().unwrap();
+        assert!(info.is_file() && info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0);
+        (pins, file)
+    }
+
     /// Run the released app as a client of a separate disposable signed Library.
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an installed Desktop and signed companion on a fresh Windows runner"]
     fn disposable_runner_installed_desktop_watches_while_hidden() {
         use std::{
-            io::Write,
+            io::{Read, Write},
             net::TcpListener,
             path::PathBuf,
             process::{Command, Stdio},
@@ -958,8 +999,25 @@ mod tests {
         let physical = executable.canonicalize().unwrap();
         assert!(executable.is_absolute() && physical.starts_with(&runner) && physical.is_file());
         assert_eq!(physical.file_name().unwrap(), "frameleaf-desktop.exe");
+        // Start-Process needs the physical DOS path, with no user-controlled alias or reparse point.
+        let launch_path = physical
+            .to_str()
+            .and_then(|path| path.strip_prefix(r"\\?\"))
+            .unwrap();
+        assert!(std::path::Path::new(launch_path).is_absolute());
+        let (directories, mut executable_file) = pin_watcher_executable(&physical);
+        assert_eq!(
+            std::path::Path::new(launch_path).canonicalize().unwrap(),
+            physical
+        );
         let expected = std::env::var("FRAMELEAF_WATCH_DESKTOP_SHA256").unwrap();
-        let bytes = crate::runtime_store::read_bounded(&physical, 256 * 1024 * 1024).unwrap();
+        let limit = 256 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        (&mut executable_file)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() as u64 <= limit);
         assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
 
         let (state, _) = crate::windows_host_profile::paths().unwrap();
@@ -1021,7 +1079,7 @@ mod tests {
             .args(["-NoProfile", "-File"])
             .arg(tools.join("qualify_windows_welcome.ps1"))
             .arg("-Executable")
-            .arg(&executable)
+            .arg(launch_path)
             .arg("-WatchedFolder")
             .arg(source.path())
             .stdin(Stdio::piped())
@@ -1053,11 +1111,112 @@ mod tests {
                 }
             };
         let terminated = tree.terminate_confirmed(Duration::from_secs(20));
+        drop((executable_file, directories));
         let stopped = host.stop();
         terminated.expect("Windows acceptance process cleanup failed");
         assert!(handshake_sent, "Windows acceptance handshake failed");
         assert!(result, "installed Desktop watcher acceptance failed");
         stopped.expect("disposable Library shutdown failed");
+    }
+
+    /// Exercise an installed watcher in a fresh graphical account with a synthetic Library.
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    #[test]
+    #[ignore = "requires an interactive disposable account with approved installed packages"]
+    fn disposable_unix_installed_desktop_watch_and_resume() {
+        use std::{io::IsTerminal, net::TcpListener, path::PathBuf, process::Command};
+        use zeroize::Zeroizing;
+
+        assert_eq!(
+            std::env::var("FRAMELEAF_WATCH_DISPOSABLE").as_deref(),
+            Ok("1")
+        );
+        assert!(std::io::stdin().is_terminal() && std::io::stderr().is_terminal());
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "requires an unprivileged account"
+        );
+        let security = crate::credential_lock::directory().unwrap();
+        let home = security.parent().unwrap().canonicalize().unwrap();
+        assert!(
+            !security.exists(),
+            "requires a fresh Desktop installation identity"
+        );
+        let data = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support")
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/share"))
+        };
+        assert!(data.is_absolute() && !data.join("app.frameleaf.desktop").exists());
+        for account in [
+            "connection",
+            "installation",
+            crate::manager::CREDENTIAL,
+            crate::source_consent::CREDENTIAL,
+        ] {
+            assert!(
+                crate::credentials::load::<serde_json::Value>(account)
+                    .unwrap()
+                    .is_none(),
+                "requires a fresh Desktop credential store"
+            );
+        }
+
+        let executable = PathBuf::from(std::env::var_os("FRAMELEAF_WATCH_DESKTOP_EXE").unwrap());
+        assert!(executable.is_absolute() && executable.is_file());
+        assert_eq!(executable.canonicalize().unwrap(), executable);
+        assert_eq!(executable.file_name().unwrap(), "frameleaf-desktop");
+        let expected = std::env::var("FRAMELEAF_WATCH_DESKTOP_SHA256").unwrap();
+        assert!(crate::native_runtime::digest_valid(&expected, 64));
+
+        let listener = TcpListener::bind(("127.0.0.1", 2283)).unwrap();
+        let database = TcpListener::bind(("127.0.0.1", 54329)).unwrap();
+        let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST").unwrap();
+        let record =
+            Installation::read(&manifest).expect("expected the approved installed companion");
+        let (_, runtime) = verified(&record).expect("installed companion verification failed");
+        // Both the database and watcher require admitted local filesystems. /tmp can be tmpfs.
+        let scratch = crate::runtime_store::Staging::create(
+            home.join(format!("frameleaf-watch-library-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let source = crate::runtime_store::Staging::create(
+            home.join(format!("frameleaf-watch-source-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let database_password = Zeroizing::new(format!("Synthetic-db-{}!", uuid::Uuid::new_v4()));
+        let photo_password = Zeroizing::new(format!("Synthetic-photo-{}!", uuid::Uuid::new_v4()));
+        drop((listener, database));
+        let mut host = runtime
+            .start(scratch.path(), &database_password, 54329, 2283)
+            .expect("disposable signed Library did not start");
+        host.wait_ready(Duration::from_secs(240)).unwrap();
+
+        let tools = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools");
+        let result = Command::new("node")
+            .arg(tools.join("qualify_installed_photo.mjs"))
+            .arg("watch-interactive")
+            .arg(source.path())
+            .arg(&executable)
+            .arg(&expected)
+            .env(
+                "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
+                photo_password.as_str(),
+            )
+            .status();
+        host.stop().expect("disposable Library shutdown failed");
+        assert!(
+            result.is_ok_and(|status| status.success()),
+            "installed Desktop watcher acceptance failed"
+        );
+        println!("Installed watcher acceptance executable SHA-256: {expected}; companion manifest: {manifest}");
     }
 
     #[cfg(windows)]

@@ -165,6 +165,7 @@ if ($WatchedFolder) {
     if ($InstalledHost -or $env:GITHUB_ACTIONS -ne 'true' -or $env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD.Length -lt 32) {
         throw 'Requires the installed watched-folder fixture on a disposable Windows runner'
     }
+    # The Rust caller holds the measured executable and directory handles across both launches.
     if ([Console]::ReadLine() -cne 'frameleaf-watch-smoke') { throw 'The owned acceptance harness must launch this check' }
     $folder = Get-Item -LiteralPath $WatchedFolder
     if (!$folder.PSIsContainer -or ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
