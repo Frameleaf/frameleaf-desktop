@@ -16,6 +16,8 @@ pub mod host_install;
 pub mod host_runtime;
 mod host_setup;
 mod host_state;
+#[cfg(windows)]
+pub use host_state::media_move as windows_library_move;
 mod host_storage;
 mod identity_anchor;
 mod import_album;

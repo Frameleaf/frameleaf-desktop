@@ -278,6 +278,11 @@ pub(crate) struct CheckpointReceipt {
     dump: CheckpointDump,
 }
 impl CheckpointReceipt {
+    #[cfg(any(windows, test))]
+    pub(crate) fn matches_manifest(&self, manifest: &str) -> bool {
+        self.manifest_sha256 == manifest
+    }
+
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }

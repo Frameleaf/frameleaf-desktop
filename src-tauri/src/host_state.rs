@@ -10,10 +10,19 @@ use std::{
 use uuid::Uuid;
 
 mod activation;
+#[cfg(any(windows, test))]
+pub mod media_move;
 pub(crate) use activation::SafetySnapshot;
 
 const NAME: &str = "controller-state.json";
 const ACTIVATION: &str = "restore-activation.json";
+const MEDIA_MOVE: &str = "media-move.pending";
+fn no_media_move(root: &Dir) -> Result<(), String> {
+    match root.symlink_metadata(MEDIA_MOVE) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_media_move_pending".into()),
+    }
+}
 fn no_activation(root: &Dir) -> Result<(), String> {
     match root.symlink_metadata(ACTIVATION) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -268,6 +277,7 @@ impl Owner {
         sha: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(), String> {
+        no_media_move(&self.root)?;
         if mode == crate::host_runtime::HostMode::RestorePrepare {
             self.reconcile_restore(id, sha)?;
         }
@@ -336,7 +346,7 @@ impl Owner {
         Ok(marker)
     }
     /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn check_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
         if !self.writable {
             return Err("host_controller_read_only".into());
@@ -374,6 +384,7 @@ impl Owner {
         if !crate::native_runtime::digest_valid(next, 64) || previous == next {
             return Err("host_controller_binding_changed".into());
         }
+        no_media_move(&self.root)?;
         self.check_movable(id, previous)?;
         let current = self.read()?.ok_or("host_controller_state_invalid")?;
         let marker = Marker {
@@ -594,6 +605,55 @@ mod tests {
             drop(inherited);
             next.unlock().unwrap();
         }
+    }
+
+    #[test]
+    fn move_preflight_requires_exact_stopped_owner_and_no_unfinished_recovery() {
+        let fixture = Fixture::new();
+        let manifest = sha();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &manifest, crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(
+            owner.check_movable(ID, &manifest).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.clean_stop().unwrap();
+        let stopped = fs::read(fixture.0.join(NAME)).unwrap();
+
+        for (id, digest) in [("bbbbbbbbbbbb", manifest.clone()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.check_movable(id, &digest).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+
+        let database = fixture.0.join("database");
+        crate::runtime_store::private_directory(&database).unwrap();
+        let pid = database.join("postmaster.pid");
+        fs::write(&pid, b"synthetic").unwrap();
+        assert_eq!(
+            owner.check_movable(ID, &manifest).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        fs::remove_file(pid).unwrap();
+
+        for name in ["checkpoints", "restore-input", "restore-targets"] {
+            let directory = fixture.0.join(name);
+            crate::runtime_store::private_directory(&directory).unwrap();
+            let operation = directory.join("unfinished");
+            fs::write(&operation, b"synthetic").unwrap();
+            assert_eq!(
+                owner.check_movable(ID, &manifest).unwrap_err(),
+                "host_upgrade_operation_pending"
+            );
+            assert_eq!(fs::read(&operation).unwrap(), b"synthetic");
+            fs::remove_file(operation).unwrap();
+        }
+
+        owner.check_movable(ID, &manifest).unwrap();
+        assert_eq!(fs::read(fixture.0.join(NAME)).unwrap(), stopped);
     }
 
     #[cfg(unix)]
