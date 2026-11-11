@@ -229,9 +229,12 @@
             {#if consent.watch && consent.registered}
               {#if watchRunning}<button class="btn" disabled={busy} onclick={() => controlCopy('watch-pause')}><Icon name="pause" />Pause Watching</button>
               {:else if job?.code !== 'source_run_terminal'}<button class="btn primary" disabled={busy || needsAllowance} onclick={() => controlCopy('watch-resume')}>Resume Watching</button>{/if}
-            {:else if canResume && consent.camera && consent.canReconnect && job!.state !== 'ready' && !job!.albumPending}
-              <button class="btn primary" disabled={busy || needsAllowance} onclick={reconnectCamera}>Reconnect and Resume</button>
-            {:else if canResume}<button class="btn primary" disabled={busy || (!job!.albumPending && (job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'))} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : job!.albumPending ? 'Retry Adding to Album' : 'Resume'}</button>{/if}
+            {:else if canResume}
+              <button class="btn primary" disabled={busy || (!job!.albumPending && (job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'))} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : job!.albumPending ? 'Retry Adding to Album' : 'Resume'}</button>
+              {#if consent.camera && consent.canReconnect && job!.state !== 'ready' && !job!.albumPending}
+                <button class="btn" disabled={busy || needsAllowance} onclick={reconnectCamera}>Reconnect Camera…</button>
+              {/if}
+            {/if}
             {#if !consent.watch && job?.state === 'copying'}<button class="btn" disabled={busy} onclick={() => controlCopy('pause')}><Icon name="pause" />Pause</button>{/if}
             {#if !consent.watch && job && !['complete', 'cancelled'].includes(job.state)}<button class="btn quiet" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel</button>{/if}
             <button class="btn quiet" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove…</button>
