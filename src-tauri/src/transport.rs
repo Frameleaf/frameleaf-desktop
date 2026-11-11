@@ -1,6 +1,6 @@
 use crate::connection::{normalize_server, Capabilities, Enrollment, SavedConnection};
 use crate::credentials;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, ClientBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
@@ -14,14 +14,18 @@ pub fn client() -> Result<Client, String> {
         return Ok(client.clone());
     }
 
+    client_builder()
+        .build()
+        .map_err(|_| "network_client_unavailable".into())
+}
+
+pub(crate) fn client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|_| "network_client_unavailable".into())
 }
 pub async fn json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
     json_limit(response, 65_536).await

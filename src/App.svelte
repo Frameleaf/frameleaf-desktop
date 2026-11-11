@@ -60,6 +60,13 @@
     }
     void invoke('tray_refresh').catch(() => {});
   }
+  async function offlinePhotos() {
+    try { await invoke('open_offline_photos'); }
+    catch (error) {
+      notice = error === 'offline_album_none' ? 'No albums have been kept offline on this computer.' : explain(error);
+    }
+  }
+
   async function restoreSaved(retry = false) {
     busy = true;
     try {
@@ -213,6 +220,7 @@
           <div id="account-actions" class="acct-menu" hidden={!accountMenu}>
             <div class="acct-info">{connection.name}{summary?.me?.email ? ` · ${summary.me.email}` : ''}<br />{connection.server}{isAdmin ? ' · Administrator' : ''}</div>
             <button onclick={() => { accountMenu = false; accountButton?.focus(); void photos(); }} disabled={busy || connection.state === 'identity-changed'}>Open Photos</button>
+            <button onclick={() => { accountMenu = false; accountButton?.focus(); void offlinePhotos(); }} disabled={busy || connection.state === 'identity-changed'}>Offline Albums</button>
             <button onclick={() => { accountMenu = false; accountButton?.focus(); signOutSheet = true; }} disabled={busy}>Sign out…</button>
           </div>
         </div>
@@ -228,6 +236,7 @@
       </div>
     {/if}
     {#if (connectionLocked || staleSignIn) && !connection}<button class="btn" disabled={busy} onclick={() => restoreSaved(true)}>Restore saved server sign-in</button>{/if}
+    {#if (connectionLocked || staleSignIn) && !connection}<button class="btn" disabled={busy} onclick={offlinePhotos}>Offline Albums</button>{/if}
     {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}

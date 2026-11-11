@@ -14,6 +14,7 @@
     "allow-restore-connection",
     "allow-sign-out",
     "allow-open-photos",
+    "allow-open-offline-photos",
     "allow-worker-setup-status",
     "allow-prepare-models",
     "allow-control-worker",

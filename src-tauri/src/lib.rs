@@ -28,6 +28,7 @@ mod model_cache;
 pub mod model_catalogue;
 pub mod native_predictor;
 pub mod native_runtime;
+mod offline_albums;
 mod package_lease;
 pub mod photo_sources;
 mod process_tree;
@@ -334,6 +335,9 @@ async fn restore_connection(
         // The saved sign-in is gone: drop any connection still held so the window and the
         // background agree (the jobs above already stopped).
         let held = current.take().is_some();
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
         drop(current);
         if held {
             tray::refresh(&app).await;
@@ -355,14 +359,27 @@ async fn restore_connection(
         .send()
         .await
         .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    if matches!(response.status().as_u16(), 401 | 403) {
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
+    }
     let user: User = transport::json(response).await?;
     if user.id != saved.account_id {
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
         return Err("account_identity_changed".into());
     }
     if retry.unwrap_or(false) {
         credentials::unlock_existing_identity(&window)?;
     }
     let mut view = prepare(&mut saved).await;
+    if view.state == "identity-changed" {
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
+    }
     if view.state == "preparing"
         && view.features.worker_session
         && start_worker_setup(&app, &saved, false).await.is_err()
@@ -409,6 +426,10 @@ async fn sign_out(
         },
     };
     *current = None;
+    let offline = app
+        .state::<offline_albums::OfflineAlbums>()
+        .clear(&app)
+        .await;
     drop(current);
     tray::refresh(&app).await;
     Ok(lifecycle::finish_sign_out(
@@ -417,7 +438,7 @@ async fn sign_out(
             let connection = credentials::delete("connection").is_ok();
             let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
             let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
-            worker && connection && sources && drops
+            worker && connection && sources && drops && offline
         },
         async {
             if let Some(photos) = app.get_webview_window("photos") {
@@ -480,18 +501,13 @@ async fn open_photos(
 pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
     if let Some(photos) = app.get_webview_window("photos") {
-        photos.show().map_err(|_| "photo_window_unavailable")?;
-        photos.set_focus().map_err(|_| "photo_window_unavailable")?;
-        return Ok(());
+        if photos.url().is_ok_and(|url| url.origin() == base.origin()) {
+            photos.show().map_err(|_| "photo_window_unavailable")?;
+            photos.set_focus().map_err(|_| "photo_window_unavailable")?;
+            return Ok(());
+        }
     }
-    let origin = base.origin();
-    let photos =
-        tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(base.clone()))
-            .title("Frameleaf Photos")
-            .inner_size(1280.0, 850.0)
-            .on_navigation(move |url| url.origin() == origin)
-            .build()
-            .map_err(|_| "photo_window_unavailable")?;
+    let photos = photo_window(app, &base, base.clone())?;
     let domain = base.host_str().ok_or("server_address_invalid")?;
     let secure = base.scheme() == "https";
     let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
@@ -520,11 +536,41 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
     photos
         .navigate(base.join("photos").unwrap())
         .map_err(|_| "photo_window_unavailable")?;
+    photos.show().map_err(|_| "photo_window_unavailable")?;
+    photos.set_focus().map_err(|_| "photo_window_unavailable")?;
     Ok(())
+}
+
+pub(crate) fn photo_window(
+    app: &AppHandle,
+    base: &url::Url,
+    initial: url::Url,
+) -> Result<WebviewWindow, String> {
+    if connection::native_origin_allowed("main", base, cfg!(debug_assertions)) {
+        return Err("photo_window_unavailable".into());
+    }
+    if let Some(window) = app.get_webview_window("photos") {
+        return Ok(window);
+    }
+    let origin = base.origin();
+    let web_origin = serde_json::to_string(&origin.ascii_serialization())
+        .map_err(|_| "photo_window_unavailable")?;
+    let handle = app.clone();
+    tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(initial))
+        .title("Frameleaf Photos")
+        .inner_size(1280.0, 850.0)
+        .initialization_script(format!("if (window.top === window && location.origin === {web_origin}) window.__FRAMELEAF_DESKTOP_OFFLINE_ALBUMS__ = true;"))
+        .on_navigation(move |url| {
+            offline_albums::local_url(url)
+                || (url.origin() == origin && !offline_albums::intercept(&handle, url))
+        })
+        .build()
+        .map_err(|_| "photo_window_unavailable".into())
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("offline-media", offline_albums::serve)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -537,6 +583,7 @@ pub fn run() {
         }))
         .manage(DesktopState::default())
         .manage(window_placement::WindowPlacement::default())
+        .manage(offline_albums::OfflineAlbums::default())
         .manage(host_setup::HostSetup::default())
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
@@ -574,6 +621,14 @@ pub fn run() {
             restore_connection,
             sign_out,
             open_photos,
+            offline_albums::open_offline_photos,
+            offline_albums::offline_album_status,
+            offline_albums::offline_album_original,
+            offline_albums::offline_album_save_original,
+            offline_albums::offline_album_close_media,
+            offline_albums::offline_album_remove,
+            offline_albums::offline_album_cancel,
+            offline_albums::offline_album_browse_library,
             worker_setup_status,
             prepare_models,
             control_worker,

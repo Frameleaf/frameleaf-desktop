@@ -29,8 +29,10 @@ url = "2"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+sha1 = "0.10"
+ring = "0.17"
 zeroize = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "net"] }
 time = { version = "0.3", features = ["parsing"] }
 
 tauri-plugin-single-instance = "2"
