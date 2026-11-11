@@ -56,7 +56,7 @@
     const result = await invoke<ServerSummary>('server_summary').catch(() => null);
     if (summaryRequest === asked) {
       summary = result;
-      if (!availablePage(page, result?.me?.isAdmin === true)) page = 'overview';
+      if (result && !availablePage(page, result.me?.isAdmin === true)) page = 'overview';
     }
     void invoke('tray_refresh').catch(() => {});
   }

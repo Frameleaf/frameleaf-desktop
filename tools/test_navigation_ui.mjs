@@ -35,6 +35,7 @@ try {
   };
   let scope = 'server-account-a';
   let admin = true;
+  let summaryUnavailable = false;
   let releaseSignOut;
   const signOut = new Promise(resolve => { releaseSignOut = resolve; });
   page.on('pageerror', error => errors.push(error.message));
@@ -47,7 +48,11 @@ try {
       navigationScope: scope, server: 'https://nas.example', name: 'Pat', mode: 'client', state: 'ready',
       features: { worker: false, workerSession: false, enrollment: true, nativeHost: false, sources: false },
     };
-    if (command === 'server_summary') return { me: { isAdmin: admin } };
+    if (command === 'server_summary') {
+      if (summaryUnavailable) throw Error('Temporary library outage');
+      return { me: { isAdmin: admin } };
+    }
+    if (command === 'remote_status') return { remote: { enabled: false } };
     if (command === 'manager_view') return manager;
     if (command === 'manager_request') {
       managerRequests.push(args.command.kind);
@@ -68,6 +73,8 @@ try {
   await heading('My computer').waitFor();
   await page.keyboard.press('Tab');
   assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Skip to main content');
+  assert.ok(await page.getByRole('link', { name: 'Skip to main content' }).evaluate(element =>
+    element.getBoundingClientRect().top >= 40));
   await page.keyboard.press('Enter');
   assert.equal(await heading('My computer').evaluate(element => element === document.activeElement), true);
 
@@ -109,6 +116,17 @@ try {
   await sidebar.getByRole('button', { name: 'AI credit' }).waitFor();
   await page.keyboard.press('Meta+7');
   await heading('AI credit').waitFor();
+  await page.keyboard.press('Meta+8');
+  await heading('Remote access').waitFor();
+  const remoteToggle = page.getByRole('switch', { name: 'Remote access' });
+  const refreshCount = calls.filter(command => command === 'server_summary').length;
+  summaryUnavailable = true;
+  await remoteToggle.click();
+  await remoteToggle.waitFor();
+  await page.waitForFunction(() => !document.querySelector('[role="switch"][aria-label="Remote access"]').disabled);
+  assert.equal(calls.filter(command => command === 'server_summary').length, refreshCount + 1);
+  assert.equal(await heading('Remote access').isVisible(), true);
+  summaryUnavailable = false;
   admin = false;
   await page.reload();
   await heading('My computer').waitFor();
