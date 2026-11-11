@@ -373,6 +373,7 @@ async fn restore_connection(
         if let Some(saved) = held.as_ref() {
             let _ = offline.purge(&app, saved).await;
         }
+        app.state::<media_copy::MediaCopy>().fence_session();
         drop(current);
         if held.is_some() {
             tray::refresh(&app).await;
@@ -411,6 +412,7 @@ async fn restore_connection(
     }
     resume_approved_watch(&app, &saved).await;
     *current = Some(saved);
+    app.state::<media_copy::MediaCopy>().fence_session();
     drop(current);
     tray::refresh(&app).await;
     Ok(Some(view))
@@ -502,6 +504,7 @@ async fn sign_out(
     )
     .await;
     *current = None;
+    app.state::<media_copy::MediaCopy>().fence_session();
     drop(current);
     tray::refresh(&app).await;
     Ok(result)

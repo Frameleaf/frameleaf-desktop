@@ -7,18 +7,20 @@
   type SavedCopy = { path: string; originals: number; bytes: number };
   const native = isTauri();
   let packages = $state<Package[] | null>(null);
+  let packageEpoch = $state<number | null>(null);
+  let copyEpoch = $state<number | null>(null);
   let loading = $state(false);
   let copying = $state(false);
   let cancelling = $state(false);
   let saved = $state<SavedCopy | null>(null);
   let message = $state('');
   onDestroy(() => {
-    if (native && copying) void invoke('cancel_preservation_copy').catch(() => {});
+    if (native && copyEpoch !== null) void invoke('cancel_preservation_copy', { epoch: copyEpoch }).catch(() => {});
   });
 
   const errors: Record<string, string> = {
     media_copy_package_unavailable: 'This package is no longer available as a complete, verified export. Refresh the list or verify it again in Photos.',
-    media_copy_session_changed: 'Your server sign-in changed. Sign in again before saving a copy.',
+    media_copy_session_changed: 'Your library changed. Reload the verified packages before saving a copy.',
     media_copy_destination_invalid: 'Choose a writable folder on a local drive. Check that the drive is still connected.',
     media_copy_destination_unsupported: 'Choose a drive that can safely save a copy without replacing another file, such as an APFS drive.',
     sign_in_required: 'Sign in to your library before saving a media copy.',
@@ -38,21 +40,28 @@
   async function load() {
     loading = true;
     message = '';
-    try { packages = await invoke<Package[]>('preservation_copy_packages'); }
+    try {
+      const result = await invoke<{ epoch: number; packages: Package[] }>('preservation_copy_packages');
+      packages = result.packages;
+      packageEpoch = result.epoch;
+    }
     catch (error) { message = explain(error); }
     finally { loading = false; }
   }
   async function save(id: string) {
+    if (packageEpoch === null) return;
+    copyEpoch = packageEpoch;
     copying = true;
     message = '';
     saved = null;
-    try { saved = await invoke<SavedCopy | null>('save_preservation_copy', { packageId: id }); }
+    try { saved = await invoke<SavedCopy | null>('save_preservation_copy', { packageId: id, epoch: copyEpoch }); }
     catch (error) { message = error === 'media_copy_cancelled' ? 'Media copy cancelled.' : explain(error); }
-    finally { copying = false; cancelling = false; }
+    finally { copyEpoch = null; copying = false; cancelling = false; }
   }
   async function cancel() {
+    if (copyEpoch === null) return;
     cancelling = true;
-    try { await invoke('cancel_preservation_copy'); }
+    try { await invoke('cancel_preservation_copy', { epoch: copyEpoch }); }
     catch (error) { message = explain(error); cancelling = false; }
   }
   async function openPhotos() {

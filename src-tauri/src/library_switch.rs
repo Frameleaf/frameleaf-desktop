@@ -273,6 +273,8 @@ async fn activate(
     if let Some(previous) = previous {
         credentials::migrate_source_approvals(previous)?;
     }
+    let copies = app.state::<crate::media_copy::MediaCopy>();
+    copies.cancel();
     app.state::<crate::offline_albums::OfflineAlbums>()
         .deactivate()
         .await;
@@ -316,6 +318,7 @@ async fn activate(
         return Err(error);
     }
 
+    copies.fence_session();
     crate::tray::set_import_status(app, None);
     crate::tray::set_drop_status(app, None);
     crate::publish_worker_status(app, setup.status());
