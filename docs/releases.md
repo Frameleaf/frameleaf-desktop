@@ -26,6 +26,44 @@ the test image after the Desktop window hides, reads back the original and
 thumbnail, and reopens the same window before revoking permission and signing
 out. A passing run applies to those installed bytes.
 
+## Installed macOS and Linux watched-folder acceptance
+
+Use a disposable, unprivileged graphical account on Apple silicon macOS or
+x86-64 Linux. Install the approved Desktop candidate and the signed Library
+companion with the photo-source API. Linux needs a working system tray,
+WebKitGTK, and an unlocked Secret Service session. Use an unmetered connection,
+an interactive terminal, and a home directory on a supported local filesystem.
+Leave ports 2283 and 54329 free. Start with a fresh Desktop profile and keychain
+and leave Desktop closed before starting the harness.
+
+From a Desktop checkout containing this harness, set the reviewed identities and
+run the ignored qualification explicitly. Use the physical installed binary
+path, for example `/Applications/Frameleaf.app/Contents/MacOS/frameleaf-desktop`
+or `/usr/bin/frameleaf-desktop`. Copy the lowercase hashes from the reviewed
+companion manifest and verified candidate, respectively.
+
+```sh
+export FRAMELEAF_WATCH_DISPOSABLE=1
+export FRAMELEAF_INSTALLED_HOST_MANIFEST='<approved-companion-manifest-sha256>'
+export FRAMELEAF_WATCH_DESKTOP_EXE='<physical-installed-executable>'
+export FRAMELEAF_WATCH_DESKTOP_SHA256='<verified-executable-sha256>'
+cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib \
+  host_setup::tests::disposable_unix_installed_desktop_watch_and_resume \
+  -- --ignored --exact --nocapture
+```
+
+The harness verifies the installed executable and starts an isolated signed
+Library. Use the temporary synthetic sign-in shown in the terminal. Follow the
+prompts to approve background reads, close the window, reopen it from the Dock
+or tray, pause, resume the same approval, and remove permission before signing
+out. Window visibility and button state are operator observations. The harness
+checks the original bytes and thumbnails over the Library API, requires the
+second original to stay absent for two scan intervals while paused, and checks
+that each filename still resolves to exactly one stable asset ID after resume.
+Keep the final result and hashes, and discard the account and its terminal
+transcript after the run. This is a manual qualification on the identified
+installed bytes.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers

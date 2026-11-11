@@ -1060,6 +1060,118 @@ mod tests {
         stopped.expect("disposable Library shutdown failed");
     }
 
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    #[test]
+    #[ignore = "requires an interactive disposable account with approved installed packages"]
+    fn disposable_unix_installed_desktop_watch_and_resume() {
+        use std::{io::IsTerminal, net::TcpListener, path::PathBuf, process::Command};
+        use zeroize::Zeroizing;
+
+        assert_eq!(
+            std::env::var("FRAMELEAF_WATCH_DISPOSABLE").as_deref(),
+            Ok("1")
+        );
+        assert!(std::io::stdin().is_terminal() && std::io::stderr().is_terminal());
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "requires an unprivileged account"
+        );
+        let security = crate::credential_lock::directory().unwrap();
+        let home = security.parent().unwrap().canonicalize().unwrap();
+        assert!(
+            !security.exists(),
+            "requires a fresh Desktop installation identity"
+        );
+        let data = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support")
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/share"))
+        };
+        assert!(data.is_absolute() && !data.join("app.frameleaf.desktop").exists());
+        for account in [
+            "connection",
+            "installation",
+            crate::manager::CREDENTIAL,
+            crate::source_consent::CREDENTIAL,
+        ] {
+            assert!(
+                crate::credentials::load::<serde_json::Value>(account)
+                    .unwrap()
+                    .is_none(),
+                "requires a fresh Desktop credential store"
+            );
+        }
+
+        let executable = PathBuf::from(std::env::var_os("FRAMELEAF_WATCH_DESKTOP_EXE").unwrap());
+        assert!(executable.is_absolute() && executable.is_file());
+        assert_eq!(executable.canonicalize().unwrap(), executable);
+        assert_eq!(executable.file_name().unwrap(), "frameleaf-desktop");
+        let expected = std::env::var("FRAMELEAF_WATCH_DESKTOP_SHA256").unwrap();
+        let bytes = crate::runtime_store::read_bounded(&executable, 256 * 1024 * 1024).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
+        #[cfg(target_os = "macos")]
+        {
+            let bundle = executable.ancestors().nth(3).unwrap();
+            assert_eq!(
+                bundle.extension().and_then(|value| value.to_str()),
+                Some("app")
+            );
+            assert!(Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict", "--deep"])
+                .arg(bundle)
+                .status()
+                .is_ok_and(|status| status.success()));
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 2283)).unwrap();
+        let database = TcpListener::bind(("127.0.0.1", 54329)).unwrap();
+        let manifest = std::env::var("FRAMELEAF_INSTALLED_HOST_MANIFEST").unwrap();
+        let record =
+            Installation::read(&manifest).expect("expected the approved installed companion");
+        let (_, runtime) = verified(&record).expect("installed companion verification failed");
+        // Both the database and watcher require admitted local filesystems. /tmp can be tmpfs.
+        let scratch = crate::runtime_store::Staging::create(
+            home.join(format!("frameleaf-watch-library-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let source = crate::runtime_store::Staging::create(
+            home.join(format!("frameleaf-watch-source-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let database_password = Zeroizing::new(format!("Synthetic-db-{}!", uuid::Uuid::new_v4()));
+        let photo_password = Zeroizing::new(format!("Synthetic-photo-{}!", uuid::Uuid::new_v4()));
+        drop((listener, database));
+        let mut host = runtime
+            .start(scratch.path(), &database_password, 54329, 2283)
+            .expect("disposable signed Library did not start");
+        host.wait_ready(Duration::from_secs(240)).unwrap();
+
+        let tools = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools");
+        let result = Command::new("node")
+            .arg(tools.join("qualify_installed_photo.mjs"))
+            .arg("watch-interactive")
+            .arg(source.path())
+            .arg(&executable)
+            .env(
+                "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
+                photo_password.as_str(),
+            )
+            .status();
+        host.stop().expect("disposable Library shutdown failed");
+        assert!(
+            result.is_ok_and(|status| status.success()),
+            "installed Desktop watcher acceptance failed"
+        );
+        println!("Installed watcher acceptance executable SHA-256: {expected}; companion manifest: {manifest}");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires an installed companion on a disposable hosted runner"]

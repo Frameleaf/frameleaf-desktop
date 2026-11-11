@@ -44,3 +44,29 @@ for (const status of [404, 500]) {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+test('watched readback rejects two assets for the same synthetic original', () => {
+  const loader = `
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    globalThis.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/') return new Response('<html>fixture</html>');
+      if (path === '/api/auth/login') return Response.json({ accessToken: 'synthetic-token' }, { status: 201 });
+      if (path === '/api/search/metadata') {
+        const first = { originalFileName: 'synthetic-watched-photo.png', id: '12345678-1234-4234-8234-123456789abc' };
+        return Response.json({ assets: { items: [first, { ...first, id: '22345678-1234-4234-8234-123456789abc' }] } });
+      }
+      throw Error('Unexpected fixture request');
+    };
+  `;
+  const result = spawnSync(process.execPath, [
+    '--import', 'data:text/javascript,' + encodeURIComponent(loader),
+    'tools/qualify_installed_photo.mjs', 'watch-verify',
+  ], { encoding: 'utf8', timeout: 10_000, env: {
+    ...process.env, RUNNER_ENVIRONMENT: 'github-hosted', GITHUB_ACTIONS: 'true',
+    FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD: 'synthetic-password-long-enough-for-qualification',
+  } });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Watcher imported duplicate originals/);
+});
