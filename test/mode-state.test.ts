@@ -52,7 +52,13 @@ test('every invoke() in the Svelte front end names a registered, permitted comma
       assert.ok(!(localOffline ? main : offline).permissions.includes(permission), `permission shared across windows: ${command}`);
     }
   }
-  for (const expected of ['discover_servers', 'server_summary', 'cloud_status', 'wallet_status', 'update_wallet', 'remote_status', 'update_remote', 'test_remote_access', 'open_external', 'tray_refresh', 'cloud_sign_in', 'cloud_account', 'cloud_sign_out', 'cloud_servers', 'connect_cloud_server', 'offline_album_status']) {
+  for (const expected of [
+    'discover_servers', 'server_summary', 'cloud_status', 'wallet_status', 'update_wallet',
+    'remote_status', 'update_remote', 'test_remote_access', 'open_external', 'tray_refresh',
+    'cloud_sign_in', 'cloud_account', 'cloud_sign_out', 'cloud_servers', 'connect_cloud_server',
+    'offline_album_status', 'approved_libraries', 'add_approved_library',
+    'activate_approved_library', 'remove_approved_library',
+  ]) {
     assert.ok(commands.has(expected), `front end never calls ${expected}`);
   }
 });
