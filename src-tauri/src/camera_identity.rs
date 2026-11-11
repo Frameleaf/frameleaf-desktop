@@ -2,6 +2,9 @@
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+mod linux_fat;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MediaIdentity {
@@ -13,6 +16,17 @@ const UNAVAILABLE: &str = "source_camera_identity_unavailable";
 
 impl MediaIdentity {
     pub(crate) fn read(dir: &Dir) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(folder) = linux_fat::folder(dir)? {
+            return Ok(Self {
+                volume: volume(dir)?,
+                folder,
+            });
+        }
+        Self::legacy(dir)
+    }
+
+    fn legacy(dir: &Dir) -> Result<Self, String> {
         let mounted = crate::copy_source::root_identity(dir)?;
         let (_, folder) = mounted.split_once(':').ok_or(UNAVAILABLE)?;
         Ok(Self {
@@ -21,8 +35,18 @@ impl MediaIdentity {
         })
     }
 
+    pub(crate) fn uses_content_fingerprint(&self) -> bool {
+        self.folder.starts_with("linux-fat-v1:")
+    }
+
     pub(crate) fn require(&self, dir: &Dir) -> Result<(), String> {
-        if *self != Self::read(dir)? {
+        // Existing signed grants retain their original inode-based verification.
+        let actual = if self.uses_content_fingerprint() {
+            Self::read(dir)?
+        } else {
+            Self::legacy(dir)?
+        };
+        if *self != actual {
             return Err("source_camera_changed".into());
         }
         Ok(())
@@ -130,4 +154,31 @@ fn volume(dir: &Dir) -> Result<String, String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn volume(_dir: &Dir) -> Result<String, String> {
     Err(UNAVAILABLE.into())
+}
+
+pub(crate) fn camera_mount_matches(root: &Dir, child: &Dir) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_fat::same_mount(root, child)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, child);
+        Err(UNAVAILABLE.into())
+    }
+}
+
+pub(crate) fn camera_file_birth(dir: &Dir, file: &cap_std::fs::File) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if !linux_fat::same_mount(dir, file)? {
+            return Err("source_camera_changed".into());
+        }
+        linux_fat::file_birth(file)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dir, file);
+        Err(UNAVAILABLE.into())
+    }
 }

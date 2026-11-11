@@ -202,7 +202,10 @@ fn scan_inner(
                     Ok(child) => {
                         if let Some(expected) = pinned_root {
                             let actual = crate::copy_source::root_identity(&child)?;
-                            if actual.split(':').next() != expected.split(':').next() {
+                            if actual.split(':').next() != expected.split(':').next()
+                                || (media.is_some_and(MediaIdentity::uses_content_fingerprint)
+                                    && !crate::camera_identity::camera_mount_matches(&dir, &child)?)
+                            {
                                 result.skipped += 1;
                                 continue;
                             }

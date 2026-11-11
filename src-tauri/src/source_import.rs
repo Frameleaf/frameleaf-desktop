@@ -319,7 +319,9 @@ fn manifest_for(
     if scan.unreadable > 0 {
         return Err("source_inventory_unreadable".into());
     }
-    make_manifest(consent, approval, scan)
+    let mut manifest = make_manifest(consent, approval, scan)?;
+    approval.bind_camera_fingerprints(&mut manifest.files)?;
+    Ok(manifest)
 }
 fn make_manifest(
     consent: &Consent,
@@ -1006,7 +1008,15 @@ impl SourceJobs {
         {
             load(&journal, &identity, &consent, saved)?
         } else {
-            let manifest = manifest_for(&consent, saved, &identity, base)?;
+            let saved = saved.clone();
+            let base = base.to_path_buf();
+            let (manifest, identity) = tauri::async_runtime::spawn_blocking(move || {
+                let manifest = manifest_for(&consent, &saved, &identity, &base);
+                (manifest, identity)
+            })
+            .await
+            .map_err(|_| "source_inventory_failed")?;
+            let manifest = manifest?;
             let cursor = Cursor::new(&manifest)?;
             journal.write("manifest.json", &manifest, &identity)?;
             journal.write("cursor.json", &cursor, &identity)?;

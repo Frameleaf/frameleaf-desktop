@@ -188,6 +188,43 @@ pub(crate) fn watch_version(dir: &Dir, name: &Path, meta: &Metadata) -> Result<S
 pub(crate) fn camera_version(dir: &Dir, name: &Path, meta: &Metadata) -> Result<String, String> {
     Ok(version(&path_stamp(dir, name, meta)?, true))
 }
+fn fat_version(birth: &str, sha256: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("linux-fat-file-v1\n{birth}\n{sha256}").as_bytes())
+    )
+}
+
+fn fingerprint_camera_file(dir: &Dir, name: &Path, meta: &Metadata) -> Result<String, String> {
+    let stamp = path_stamp(dir, name, meta)?;
+    let mut file = staged_file(dir, name)?;
+    if opened_stamp(&file)? != stamp {
+        return Err("source_camera_changed".into());
+    }
+    let birth = crate::camera_identity::camera_file_birth(dir, &file)?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "source_item_unavailable")?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > meta.len() {
+            return Err("source_camera_changed".into());
+        }
+        hash.update(&buffer[..count]);
+    }
+    unchanged(dir, name, &file, &stamp, meta.len(), bytes)?;
+    if crate::camera_identity::camera_file_birth(dir, &file)? != birth {
+        return Err("source_camera_changed".into());
+    }
+    Ok(fat_version(&birth, &format!("{:x}", hash.finalize())))
+}
+
 fn version(stamp: &str, camera: bool) -> String {
     #[cfg(unix)]
     if camera {
@@ -383,23 +420,70 @@ impl CopyApproval {
         mounted_volume: &str,
         entry: &crate::photo_sources::SourceFile,
     ) -> Result<(), String> {
+        let actual = self.camera_entry_version(root, mounted_volume, entry, false)?;
+        if entry.watch_version.as_deref() != Some(actual.as_str()) {
+            return Err("source_camera_changed".into());
+        }
+        Ok(())
+    }
+
+    /// Called only after the persisted consent has authorized reads for this exact root.
+    pub(crate) fn bind_camera_fingerprints(
+        &self,
+        entries: &mut [crate::photo_sources::SourceFile],
+    ) -> Result<(), String> {
+        if !self
+            .media()
+            .is_some_and(MediaIdentity::uses_content_fingerprint)
+        {
+            return Ok(());
+        }
+        if !self.scope.allow_download {
+            return Err("source_download_permission_required".into());
+        }
+        let root = self.open_source(self.root())?;
+        let identity = root_identity(&root)?;
+        let (volume, _) = identity
+            .split_once(':')
+            .ok_or("source_camera_identity_unavailable")?;
+        for entry in entries {
+            entry.watch_version = Some(self.camera_entry_version(&root, volume, entry, true)?);
+        }
+        Ok(())
+    }
+
+    fn camera_entry_version(
+        &self,
+        root: &Dir,
+        mounted_volume: &str,
+        entry: &crate::photo_sources::SourceFile,
+        preparing: bool,
+    ) -> Result<String, String> {
         let (parent, name) = parent_dir(root, relative_path(&entry.relative)?)?;
-        if root_identity(&parent)?.split(':').next() != Some(mounted_volume) {
+        let fat = self
+            .media()
+            .is_some_and(MediaIdentity::uses_content_fingerprint);
+        if root_identity(&parent)?.split(':').next() != Some(mounted_volume)
+            || (fat && !crate::camera_identity::camera_mount_matches(root, &parent)?)
+        {
             return Err("source_camera_changed".into());
         }
         let meta = parent
             .symlink_metadata(&name)
             .map_err(|_| "source_camera_changed")?;
         let item = crate::source_metadata::probe(&parent, &name, &meta)?;
-        if !meta.is_file()
-            || meta.len() != entry.bytes
-            || item.excluded
-            || !watchable(&meta, item)
-            || entry.watch_version.as_deref() != Some(&camera_version(&parent, &name, &meta)?)
+        if !meta.is_file() || meta.len() != entry.bytes || item.excluded || !watchable(&meta, item)
         {
             return Err("source_camera_changed".into());
         }
-        Ok(())
+        let metadata_version = camera_version(&parent, &name, &meta)?;
+        if !fat {
+            return Ok(metadata_version);
+        }
+        if preparing && entry.watch_version.as_deref() != Some(metadata_version.as_str()) {
+            return Err("source_camera_changed".into());
+        }
+        fingerprint_camera_file(&parent, &name, &meta)
     }
 
     pub(crate) fn validate_current(
@@ -598,7 +682,17 @@ impl CopyApproval {
         if crate::source_metadata::probe(&dir, Path::new("."), &root_meta)?.excluded {
             return Err("source_item_excluded".into());
         }
-        let (dir, name) = parent_dir(&dir, relative_path)?;
+        let fat = self
+            .media()
+            .is_some_and(MediaIdentity::uses_content_fingerprint);
+        let (parent, name) = parent_dir(&dir, relative_path)?;
+        if fat
+            && (!crate::camera_identity::camera_mount_matches(&dir, &parent)?
+                || expected_watch_version.is_none())
+        {
+            return Err("source_camera_changed".into());
+        }
+        let dir = parent;
         if let Some(root_identity_string) = mounted_root {
             if root_identity(&dir)?.split(':').next() != root_identity_string.split(':').next() {
                 return Err("source_camera_changed".into());
@@ -627,8 +721,9 @@ impl CopyApproval {
             return Err("source_item_changed".into());
         }
         let source_stamp = path_stamp(&dir, relative_path, &before)?;
-        if expected_watch_version
-            .is_some_and(|expected| expected != version(&source_stamp, self.media().is_some()))
+        if !fat
+            && expected_watch_version
+                .is_some_and(|expected| expected != version(&source_stamp, self.media().is_some()))
         {
             return Err("source_item_changed".into());
         }
@@ -676,6 +771,9 @@ impl CopyApproval {
             );
             return Err("source_item_changed".into());
         }
+        let birth = fat
+            .then(|| crate::camera_identity::camera_file_birth(&dir, &source))
+            .transpose()?;
         let id = stage_id.to_string();
         let path = destination.join(&id);
         crate::runtime_store::create_private_directory(&path)
@@ -727,13 +825,25 @@ impl CopyApproval {
             before.len(),
             bytes,
         )?;
+        let sha256 = format!("{:x}", hash.finalize());
+        let source_stamp = if let Some(birth) = birth {
+            let portable = fat_version(&birth, &sha256);
+            if crate::camera_identity::camera_file_birth(&dir, &source)? != birth
+                || expected_watch_version != Some(portable.as_str())
+            {
+                return Err("source_camera_changed".into());
+            }
+            portable
+        } else {
+            source_stamp
+        };
         output.sync_all().map_err(|_| "source_stage_write_failed")?;
         drop(output);
         let approval = self.clone();
         let mut result = StagedCopy {
             id,
             bytes,
-            sha256: format!("{:x}", hash.finalize()),
+            sha256,
             file_modified_at_ms: milliseconds(
                 before
                     .modified()
@@ -792,6 +902,13 @@ impl StagedCopy {
         )
     }
     pub(crate) fn version(&self) -> String {
+        if self
+            .approval
+            .media()
+            .is_some_and(MediaIdentity::uses_content_fingerprint)
+        {
+            return self.source_stamp.clone();
+        }
         version(&self.source_stamp, self.approval.media().is_some())
     }
     pub(crate) fn release(
