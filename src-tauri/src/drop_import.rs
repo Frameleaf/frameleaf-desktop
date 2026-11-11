@@ -26,6 +26,18 @@ struct Pending {
     preview: Option<(String, Plan)>,
 }
 
+impl Pending {
+    fn discard(&mut self, id: &str, session: [u8; 32]) {
+        if self
+            .drop
+            .as_ref()
+            .is_some_and(|selection| selection.id == id && selection.session == session)
+        {
+            *self = Self::default();
+        }
+    }
+}
+
 struct DropSelection {
     id: String,
     session: [u8; 32],
@@ -231,9 +243,6 @@ pub(crate) async fn preview_photo_drop(
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let drops = app.state::<DropImport>();
-    if credentials::load::<Consent>(CREDENTIAL)?.is_some() {
-        return Err("source_drop_existing".into());
-    }
     let Some((id, paths)) = drops
         .pending
         .lock()
@@ -245,9 +254,15 @@ pub(crate) async fn preview_photo_drop(
     else {
         return Ok(None);
     };
-    let plan = tauri::async_runtime::spawn_blocking(move || preview_paths(&paths))
-        .await
-        .map_err(|_| "source_inventory_failed")??;
+    let result = async {
+        if credentials::load::<Consent>(CREDENTIAL)?.is_some() {
+            return Err("source_drop_existing".into());
+        }
+        tauri::async_runtime::spawn_blocking(move || preview_paths(&paths))
+            .await
+            .map_err(|_| "source_inventory_failed")?
+    }
+    .await;
     let mut pending = drops
         .pending
         .lock()
@@ -259,6 +274,7 @@ pub(crate) async fn preview_photo_drop(
     {
         return Err("source_selection_changed".into());
     }
+    let plan = result.inspect_err(|_| pending.discard(&id, session(saved)))?;
     let preview = Preview {
         selection_id: id.clone(),
         path: plan.scan.inventory.path.clone(),
@@ -397,13 +413,8 @@ pub(crate) async fn control_photo_drop(
             .pending
             .lock()
             .map_err(|_| "source_selection_unavailable")?;
-        if pending.preview.is_none()
-            && pending.drop.as_ref().is_some_and(|selection| {
-                selection_id.as_deref() == Some(&selection.id)
-                    && selection.session == session(saved)
-            })
-        {
-            *pending = Pending::default();
+        if let Some(id) = selection_id {
+            pending.discard(&id, session(saved));
         }
         return Ok(None);
     }
@@ -457,6 +468,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn discard_only_clears_the_matching_selection_and_session() {
+        let folder = Folder::new();
+        let photo = folder.0.join("photo.jpg");
+        std::fs::write(&photo, b"image").unwrap();
+        let paths = vec![photo];
+        let mut pending = Pending {
+            preview: Some(("current".into(), preview_paths(&paths).unwrap())),
+            drop: Some(DropSelection {
+                id: "current".into(),
+                session: [1; 32],
+                paths,
+            }),
+        };
+        pending.discard("old", [1; 32]);
+        pending.discard("current", [0; 32]);
+        assert!(pending.drop.is_some() && pending.preview.is_some());
+        pending.discard("current", [1; 32]);
+        assert!(pending.drop.is_none() && pending.preview.is_none());
     }
 
     #[test]

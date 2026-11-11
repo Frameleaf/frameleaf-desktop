@@ -1015,6 +1015,13 @@ impl SourceJobs {
                 .await;
                 if let Err(code) = result {
                     let failed = status.lock().ok().and_then(|current| {
+                        if current.state == "queued" && code == "source_copy_cancelled" {
+                            return Some(ImportView {
+                                state: "paused".into(),
+                                code: None,
+                                ..current.clone()
+                            });
+                        }
                         ((watch && !stop.load(Ordering::Acquire))
                             || matches!(current.state.as_str(), "copying" | "queued"))
                         .then(|| ImportView {
