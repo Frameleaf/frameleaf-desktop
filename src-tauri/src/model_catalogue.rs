@@ -37,6 +37,9 @@ impl ApprovedProfile {
     pub fn model_key(&self) -> &str {
         self.0.model_key()
     }
+    pub(crate) fn model_snapshot_revision(&self) -> &str {
+        &self.0.model_snapshot_revision
+    }
     pub fn runtime_source_revision(&self) -> &str {
         &self.0.runtime_source_revision
     }

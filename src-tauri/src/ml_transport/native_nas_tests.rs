@@ -401,8 +401,8 @@ fn automatic_setup_job(
     // Seed approved staged weights for this offline automatic-setup fixture.
     let pack = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap());
     let cache = std::path::PathBuf::from(std::env::var("FRAMELEAF_FACTORY_MODEL_CACHE").unwrap());
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(pack.join("manifest.json")).unwrap()).unwrap();
+    let manifest_bytes = std::fs::read(pack.join("manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
     let catalogue: serde_json::Value =
         serde_json::from_str(include_str!("../../../runtime/model-catalogue.json")).unwrap();
     let profile = catalogue["profiles"]
@@ -447,6 +447,7 @@ fn automatic_setup_job(
                 saved,
                 crate::worker_setup::SetupPaths {
                     data: root.0.join("worker"),
+                    app_version: "test".into(),
                     bundle: std::env::var("FRAMELEAF_FACTORY_TEST_PACK").unwrap().into(),
                 },
                 false,
@@ -473,6 +474,37 @@ fn automatic_setup_job(
                 "automatic setup deadline: {status:?}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let evidence_dir = root.0.join("worker/qualification-evidence");
+        let receipts = std::fs::read_dir(evidence_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(receipts[0].path()).unwrap()).unwrap();
+        assert_eq!(evidence["kind"], "nas-accepted-native-fixture");
+        assert_eq!(evidence["modelKey"], profile["modelKey"]);
+        assert_eq!(
+            evidence["modelSnapshotRevision"],
+            profile["modelSnapshotRevision"]
+        );
+        assert_eq!(evidence["provider"], manifest["provider"]);
+        assert_eq!(evidence["targetArch"], std::env::consts::ARCH);
+        assert_eq!(evidence["targetOs"], std::env::consts::OS);
+        assert_eq!(evidence["appVersion"], "test");
+        assert_eq!(evidence["fixtureSha256"], profile["spec"]["fixtureSha256"]);
+        assert_eq!(evidence["manifestSha256"], super::hash(&manifest_bytes));
+        assert_eq!(
+            evidence["runtimeSourceRevision"],
+            manifest["sourceRevision"]
+        );
+        assert_eq!(evidence["runtimeEpoch"], manifest["epoch"]);
+        for key in ["configSha256", "reportSha256"] {
+            assert_eq!(evidence[key].as_str().unwrap().len(), 64, "{key}");
+        }
+        for key in ["deviceId", "sessionId", "accountId", "report"] {
+            assert!(evidence.get(key).is_none(), "{key}");
         }
         println!("NATIVE_QUALIFIED {{\"roles\":1}}");
         std::io::stdout().flush().unwrap();

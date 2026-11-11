@@ -14,8 +14,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    model_catalogue::ApprovedProfile, native_runtime::QualifiedRuntime,
-    runtime_store::RuntimeAttestation,
+    model_catalogue::ApprovedProfile,
+    native_runtime::QualifiedRuntime,
+    runtime_store::{InstalledRuntime, RuntimeAttestation, Staging},
 };
 
 #[derive(Deserialize)]
@@ -197,6 +198,7 @@ pub struct AcceptedQualification {
     manifest_sha256: String,
     runtime_fingerprint: String,
     report_sha256: String,
+    qualified_at: i64,
     expires_at: i64,
 }
 impl AcceptedQualification {
@@ -247,6 +249,7 @@ impl AcceptedQualification {
             manifest_sha256: response.manifest_sha256,
             runtime_fingerprint: response.runtime_fingerprint,
             report_sha256: response.report_sha256,
+            qualified_at,
             expires_at,
         };
         accepted.validate_authority(worker, at)?;
@@ -275,6 +278,59 @@ impl AcceptedQualification {
             return Err("worker_qualified_runtime_changed_or_expired".into());
         }
         Ok(())
+    }
+    /// Record the observed fixture result without persisting association details or raw reports.
+    pub(crate) fn write_evidence(
+        &self,
+        root: &std::path::Path,
+        app_version: &str,
+        profile: &ApprovedProfile,
+        installed: &InstalledRuntime,
+        qualified: &QualifiedRuntime,
+    ) -> Result<(), String> {
+        self.validate_runtime(qualified, now()?)?;
+        let report = qualified.report();
+        let provider = installed.provider();
+        if profile.model_key() != self.model_key
+            || report["provider"] != provider
+            || profile.runtime_source_revision() != installed.source_revision()
+            || installed.manifest_sha256() != self.manifest_sha256
+        {
+            return Err("worker_qualification_evidence_mismatch".into());
+        }
+        let evidence = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "nas-accepted-native-fixture",
+            "targetOs": std::env::consts::OS,
+            "targetArch": std::env::consts::ARCH,
+            "appVersion": app_version,
+            "modelKey": self.model_key,
+            "modelSnapshotRevision": profile.model_snapshot_revision(),
+            "provider": provider,
+            "executionState": report["state"],
+            "runtimeSourceRevision": installed.source_revision(),
+            "runtimeEpoch": installed.epoch(),
+            "manifestSha256": self.manifest_sha256,
+            "runtimeFingerprint": self.runtime_fingerprint,
+            "qualificationId": self.id,
+            "qualifiedAtUnixMs": self.qualified_at,
+            "expiresAtUnixMs": self.expires_at,
+            "inputKind": self.input_kind,
+            "configSha256": self.config_sha256,
+            "fixtureSha256": report["fixtureSha256"],
+            "preprocessingSha256": report["preprocessingSha256"],
+            "bindingSha256": self.binding_sha256,
+            "reportSha256": self.report_sha256,
+        });
+        let name = hash(format!("{}\0{provider}", self.model_key).as_bytes());
+        crate::runtime_store::private_directory(root)?;
+        let staging = Staging::create(root.join(format!(".pending-{}", Uuid::new_v4())))?;
+        let staged = staging.path().join("evidence.json");
+        let bytes = serde_json::to_vec_pretty(&evidence)
+            .map_err(|_| "worker_qualification_evidence_encode_failed")?;
+        crate::runtime_store::write_new(&staged, &bytes)?;
+        std::fs::rename(staged, root.join(format!("{name}.json")))
+            .map_err(|_| "worker_qualification_evidence_write_failed".into())
     }
     pub fn validate_task(
         &self,

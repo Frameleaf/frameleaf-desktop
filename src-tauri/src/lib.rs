@@ -787,6 +787,7 @@ pub(crate) async fn start_worker_setup(
         return Ok(());
     }
     let paths = worker_setup::SetupPaths {
+        app_version: app.package_info().version.to_string(),
         data: app
             .path()
             .app_local_data_dir()

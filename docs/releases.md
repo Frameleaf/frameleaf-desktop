@@ -26,6 +26,27 @@ the test image after the Desktop window hides, reads back the original and
 thumbnail, and reopens the same window before revoking permission and signing
 out. A passing run applies to those installed bytes.
 
+## Installed model and provider evidence
+
+Install the approved Desktop candidate on Apple Silicon, Windows x64 or the
+Linux target under test. Record the installer SHA-256 and verify the installed
+app identity. Pair the app with the test Library, enable the intended search,
+face or OCR workload, and let Desktop finish native worker setup.
+
+After Library accepts a native fixture and Desktop verifies the acceptance,
+Desktop writes a private JSON receipt in
+`<app-local-data>/worker/qualification-evidence/`. The latest successful fixture
+for each model key and provider replaces its previous receipt. Collect only
+receipts with qualification timestamps from the current run and the expected
+app version, target architecture and signed runtime manifest digest. Search has
+separate receipts for its text, vision and joint roles. Check the exact model
+snapshot, provider and execution state in each receipt. A mixed accelerator
+result records `ready-mixed`.
+
+Keep the receipts with the matching installer digest. They record fixture
+acceptance by Library. Run a representative Library job on each installed
+combination to qualify end-to-end processing.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers

@@ -294,6 +294,7 @@ pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
 pub(crate) struct SetupPaths {
     pub data: PathBuf,
     pub bundle: PathBuf,
+    pub app_version: String,
 }
 async fn cancellable<T>(
     future: impl Future<Output = Result<T, String>>,
@@ -938,6 +939,19 @@ async fn prepare(
                     }
                     Err(code) => return Err(code),
                 };
+                check_cancel(&progress.cancelled)?;
+                if accepted
+                    .write_evidence(
+                        &paths.data.join("qualification-evidence"),
+                        &paths.app_version,
+                        profile,
+                        &installed,
+                        &qualified,
+                    )
+                    .is_err()
+                {
+                    eprintln!("worker_qualification_evidence_write_failed");
+                }
                 group_prepared.push((qualified, accepted));
             }
             prepared.extend(group_prepared);
@@ -1764,6 +1778,7 @@ mod tests {
             SetupPaths {
                 data: data.clone(),
                 bundle: root.join("absent"),
+                app_version: "test".into(),
             },
             false,
             progress,
