@@ -7,11 +7,11 @@ on:
         required: true
         type: string
       desktop_sha256:
-        description: 'Reviewed SHA-256 of the corrected Windows Desktop 0.1.5 candidate EXE'
+        description: 'Reviewed SHA-256 of the Windows Desktop candidate EXE'
         required: true
         type: string
       desktop_approval:
-        description: 'Immutable installer-candidates producer approval plus the reviewed Desktop sourceRevision'
+        description: 'Immutable installer-candidates producer approval plus sourceRevision and runtimeRunId (signed candidates)'
         required: true
         type: string
 permissions:

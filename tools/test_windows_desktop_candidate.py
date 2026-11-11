@@ -17,12 +17,13 @@ from windows_desktop_candidate import extract_desktop
 
 
 class WindowsDesktopCandidateTests(unittest.TestCase):
-    def package(self, root, *, source="a" * 40, qualified=True, tamper=False, extra=None):
-        exe = "Frameleaf_0.1.5_x64-setup.exe"
-        msi = "Frameleaf_0.1.5_x64_en-US.msi"
+    def package(self, root, *, source="a" * 40, qualified=True, tamper=False, extra=None,
+                version="0.1.5", runtime_run="42717141687", signed=False):
+        exe = f"Frameleaf_{version}_x64-setup.exe"
+        msi = f"Frameleaf_{version}_x64_en-US.msi"
         hashes = {exe: hashlib.sha256(b"MZ-synthetic-exe").hexdigest(), msi: hashlib.sha256(b"synthetic-msi").hexdigest()}
-        receipt = {"sourceRevision": source, "runtimeRunId": "42717141687", "target": "windows-x86_64",
-                   "installedQualified": qualified, "osSigned": False, "files": hashes}
+        receipt = {"sourceRevision": source, "runtimeRunId": runtime_run, "target": "windows-x86_64",
+                   "installedQualified": qualified, "osSigned": signed, "files": hashes}
         files = {exe: b"modified" if tamper else b"MZ-synthetic-exe", msi: b"synthetic-msi",
                  "candidate.json": json.dumps(receipt).encode(),
                  "SHA256SUMS": "".join(f"{digest}  {name}\n" for name, digest in sorted(hashes.items())).encode()}
@@ -71,6 +72,38 @@ class WindowsDesktopCandidateTests(unittest.TestCase):
             self.assertEqual(receipt["candidate"]["sourceRevision"], "b" * 40)
             self.assertEqual((root / "windows-compiled-host/desktop/setup.exe").read_bytes(), b"MZ-synthetic-exe")
             self.assertFalse((root / "windows-compiled-host/desktop/artifact.zip").exists())
+
+    def test_signed_main_candidate_matches_source_version_and_reviewed_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "windows-compiled-host").mkdir()
+            tar, digest = self.package(root, version="0.1.6", runtime_run="42870045811",
+                                       signed=True, qualified=False)
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as package:
+                package.writestr("installer-candidates.tar.gz", tar.read_bytes())
+            data = stream.getvalue()
+            _, pin, artifact, run = components.ComponentAcquisitionTests().fixture()
+            pin["workflow"] = run["path"] = ".github/workflows/installer-candidates.yml"
+            pin["archiveSha256"] = hashlib.sha256(data).hexdigest()
+            run.update(head_branch="main", event="workflow_dispatch")
+            artifact.update(name="frameleaf-installer-candidates-windows-x86_64",
+                            size_in_bytes=len(data), digest="sha256:" + pin["archiveSha256"])
+            env = {"RUNNER_TEMP": temp, "GITHUB_SHA": "c" * 40, "DESKTOP_SHA256": digest,
+                   "DESKTOP_APPROVAL": json.dumps({**pin, "sourceRevision": "a" * 40,
+                                                   "runtimeRunId": "42870045811"})}
+            with patch.dict(os.environ, env), patch.object(desktop, "api", side_effect=[artifact, run]), \
+                    patch.object(desktop, "download", side_effect=lambda approved, path, size: path.write_bytes(data)), \
+                    patch.object(desktop.subprocess, "run"), \
+                    patch.object(desktop.subprocess, "check_output", return_value=b'{"version":"0.1.6"}'):
+                desktop.obtain()
+            result = json.loads((root / "windows-compiled-host/desktop-producer.json").read_text())
+            self.assertEqual(result["approval"]["runtimeRunId"], "42870045811")
+            self.assertEqual(result["candidate"]["osSigned"], True)
+            for expected in [{"runtime_run": "1"}, {"version": "0.1.7"}, {"signed": False}]:
+                options = {"version": "0.1.6", "runtime_run": "42870045811", "signed": True, **expected}
+                with self.subTest(expected=expected), self.assertRaises(BuildError):
+                    extract_desktop(tar, root / "wrong.exe", "a" * 40, digest, **options)
 
     def test_unmerged_desktop_source_is_refused_before_any_download(self):
         _, pin, _, _ = components.ComponentAcquisitionTests().fixture()
