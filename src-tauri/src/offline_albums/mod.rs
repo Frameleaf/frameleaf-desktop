@@ -299,10 +299,6 @@ pub(crate) async fn open_offline_photos(
     };
     let native = app.state::<OfflineAlbums>();
     let _permit = native.operation.try_lock().map_err(|_| BUSY)?;
-    let base = crate::import_base(&app)?;
-    if Cache::open(&base, &saved, false)?.is_none() {
-        return Err("offline_album_none".into());
-    }
     native.set_session(saved.clone())?;
     show(&app, &saved)
 }

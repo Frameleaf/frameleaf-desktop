@@ -63,7 +63,7 @@
   async function offlinePhotos() {
     try { await invoke('open_offline_photos'); }
     catch (error) {
-      notice = error === 'offline_album_none' ? 'No albums have been kept offline on this computer.' : explain(error);
+      notice = explain(error);
     }
   }
 
