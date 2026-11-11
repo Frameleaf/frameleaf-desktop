@@ -23,6 +23,7 @@
   const native = isTauri();
   const mac = document.documentElement.classList.contains('platform-mac');
   let connection = $state<Connection | null>(null);
+  let importReady = $state(false);
   let setup = $state<SetupStatus | null>(null);
   let summary = $state<ServerSummary | null>(null);
   let cloudAccount = $state<CloudAccount | null>(null);
@@ -104,7 +105,7 @@
         hostActive = host.backgroundActive;
         await restoreSaved();
       } catch (error) { failure = explain(error); }
-      finally { busy = false; }
+      finally { busy = false; importReady = !disposed; }
     })();
     return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
@@ -238,7 +239,11 @@
     {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if staleSignIn && !connection && !failure && !notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>A saved sign-in is still on this computer. Clear it before connecting to a server.</p><button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button></div>{/if}
-    {#if connection && native}<PhotoDrop visible={page === 'sources'} />{/if}
+    {#if native && importReady}
+      {#key !!connection}
+        <PhotoDrop connected={!!connection} visible={!!connection && page === 'sources'} />
+      {/key}
+    {/if}
     {#if !connection}
       <Welcome {native} {hostActive} {cloudAccount} onlocked={() => { connectionLocked = true; }} onconnected={connected} oncloudaccount={account => { cloudAccount = account; }} onhostactive={active => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} {managerRevision} onmanagerstate={paired => { managerPaired = paired; }} />
     {:else if page === 'overview' || page === 'ai'}

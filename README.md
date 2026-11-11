@@ -39,6 +39,10 @@ Your computer helps with smart search, face recognition and text recognition. It
 
 Copy OneDrive or local folders to your server. Preview a folder before you approve it, every copy is verified against the server, your originals are never moved or deleted, and uploads can be paused and resumed.
 
+- On macOS, select photos, videos, or a folder in Finder and choose **Services → Import to Frameleaf**. Enable or disable the action in **System Settings → Keyboard → Keyboard Shortcuts → Services**.
+- On Windows, choose **Add Explorer Shortcut** in **Photo Sources**, then select items in File Explorer and choose **Send to → Import to Frameleaf**. Remove it from **Photo Sources** or delete **Import to Frameleaf** from the **SendTo** folder.
+- Each action opens a preview for one folder or up to 100 files from the same folder. If Desktop is signed out, sign in to your library and send the selection again.
+
 <p align="center">
   <img src="https://frameleaf.app/desktop/sources-preview.webp" alt="A OneDrive Pictures folder previewed before approval: 4,812 photo or video filenames found, nothing read or downloaded" width="49%">
   <img src="https://frameleaf.app/desktop/sources.webp" alt="Photo sources: a OneDrive Pictures folder copying to the server, 3,127 of 4,812 copies confirmed" width="49%">

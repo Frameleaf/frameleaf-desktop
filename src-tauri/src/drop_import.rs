@@ -1,4 +1,4 @@
-//! One-time import authority issued only by native drops in the trusted Desktop window.
+//! One-time import authority issued by native drops and file manager actions.
 use crate::{
     connection::SavedConnection,
     credentials,
@@ -18,22 +18,53 @@ use std::{
 use tauri::{AppHandle, DragDropEvent, Emitter, Manager, State, WebviewWindow};
 
 pub(crate) const CREDENTIAL: &str = "photo-source-drop";
-const MAX_FILES: usize = 100;
+pub(crate) const MAX_FILES: usize = 100;
+pub(crate) type FileSelection = Result<Vec<PathBuf>, &'static str>;
 
 #[derive(Default)]
 struct Pending {
     drop: Option<DropSelection>,
     preview: Option<(String, Plan)>,
+    launch: Option<FileSelection>,
 }
 
 impl Pending {
+    fn set_selection(&mut self, paths: Vec<PathBuf>, session: [u8; 32]) {
+        self.drop = Some(DropSelection {
+            id: uuid::Uuid::new_v4().to_string(),
+            session,
+            paths,
+        });
+        self.preview = None;
+    }
+
+    #[cfg(any(target_os = "macos", windows, test))]
+    fn enqueue_launch(&mut self, incoming: FileSelection) -> bool {
+        if self.launch.as_ref() == Some(&incoming) {
+            return false;
+        }
+        self.launch = Some(incoming);
+        true
+    }
+
+    fn apply_launch(&mut self, session: Option<[u8; 32]>) -> Result<(), &'static str> {
+        if let Some(launch) = self.launch.take() {
+            self.drop = None;
+            self.preview = None;
+            let session = session.ok_or("sign_in_required")?;
+            self.set_selection(launch?, session);
+        }
+        Ok(())
+    }
+
     fn discard(&mut self, id: &str, session: [u8; 32]) {
         if self
             .drop
             .as_ref()
             .is_some_and(|selection| selection.id == id && selection.session == session)
         {
-            *self = Self::default();
+            self.drop = None;
+            self.preview = None;
         }
     }
 }
@@ -66,6 +97,14 @@ impl Default for DropImport {
 }
 
 impl DropImport {
+    pub(crate) async fn reset_for_restore(&self) {
+        self.jobs.stop().await;
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.drop = None;
+            pending.preview = None;
+        }
+    }
+
     pub(crate) async fn stop(&self) {
         self.jobs.stop().await;
         if let Ok(mut pending) = self.pending.lock() {
@@ -107,13 +146,26 @@ pub(crate) fn native_event(window: &WebviewWindow, event: &DragDropEvent) {
     let valid = !paths.is_empty() && paths.len() <= MAX_FILES;
     *pending = Pending::default();
     if valid {
-        pending.drop = Some(DropSelection {
-            id: uuid::Uuid::new_v4().to_string(),
-            session: session(saved),
-            paths: paths.clone(),
-        });
+        pending.set_selection(paths.clone(), session(saved));
     }
     let _ = window.emit("photo-drop-pending", if valid { "ready" } else { "limit" });
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn launch_event(app: &AppHandle, selection: FileSelection) {
+    let drops = app.state::<DropImport>();
+    let queued = drops
+        .pending
+        .lock()
+        .is_ok_and(|mut pending| pending.enqueue_launch(selection));
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        if queued {
+            let _ = window.emit("photo-drop-pending", "ready");
+        }
+    }
 }
 
 fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
@@ -242,18 +294,25 @@ pub(crate) async fn preview_photo_drop(
 ) -> Result<Option<Preview>, String> {
     crate::require_local(&window)?;
     let current = state.0.lock().await;
-    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let saved = current.as_ref();
     let drops = app.state::<DropImport>();
-    let Some((id, paths)) = drops
-        .pending
-        .lock()
-        .map_err(|_| "source_selection_unavailable")?
-        .drop
-        .as_ref()
-        .filter(|selection| selection.session == session(saved))
-        .map(|selection| (selection.id.clone(), selection.paths.clone()))
-    else {
-        return Ok(None);
+    let (saved, id, paths) = {
+        let mut pending = drops
+            .pending
+            .lock()
+            .map_err(|_| "source_selection_unavailable")?;
+        pending.apply_launch(saved.map(session))?;
+        let Some(saved) = saved else {
+            return Ok(None);
+        };
+        let Some(selection) = pending
+            .drop
+            .as_ref()
+            .filter(|value| value.session == session(saved))
+        else {
+            return Ok(None);
+        };
+        (saved, selection.id.clone(), selection.paths.clone())
     };
     let result = async {
         if credentials::load::<Consent>(CREDENTIAL)?.is_some() {
@@ -268,10 +327,11 @@ pub(crate) async fn preview_photo_drop(
         .pending
         .lock()
         .map_err(|_| "source_selection_unavailable")?;
-    if pending
-        .drop
-        .as_ref()
-        .is_none_or(|selection| selection.id != id || selection.session != session(saved))
+    if pending.launch.is_some()
+        || pending
+            .drop
+            .as_ref()
+            .is_none_or(|selection| selection.id != id || selection.session != session(saved))
     {
         return Err("source_selection_changed".into());
     }
@@ -353,31 +413,32 @@ pub(crate) async fn approve_photo_drop(
             return Err("source_drop_existing".into());
         }
         let destination = crate::import_album::approve(saved, album).await?;
-        let plan =
-            {
-                let mut pending = drops
-                    .pending
-                    .lock()
-                    .map_err(|_| "source_selection_unavailable")?;
-                if pending.drop.as_ref().is_none_or(|selection| {
+        let plan = {
+            let mut pending = drops
+                .pending
+                .lock()
+                .map_err(|_| "source_selection_unavailable")?;
+            if pending.launch.is_some()
+                || pending.drop.as_ref().is_none_or(|selection| {
                     selection.id != id || selection.session != session(saved)
-                }) || pending
+                })
+                || pending
                     .preview
                     .as_ref()
                     .is_none_or(|(preview, _)| preview != &id)
-                {
-                    return Err("source_selection_changed".into());
-                }
-                pending.drop = None;
-                pending.preview.take().unwrap().1
-            };
+            {
+                return Err("source_selection_changed".into());
+            }
+            pending.drop = None;
+            pending.preview.take().unwrap().1
+        };
         let name = if plan.folder {
             plan.root
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or("source_folder_name_invalid")?
         } else {
-            "Dropped files"
+            "Selected files"
         };
         let consent = Consent::dropped(
             saved,
@@ -490,6 +551,7 @@ mod tests {
         std::fs::write(&photo, b"image").unwrap();
         let paths = vec![photo];
         let mut pending = Pending {
+            launch: None,
             preview: Some(("current".into(), preview_paths(&paths).unwrap())),
             drop: Some(DropSelection {
                 id: "current".into(),
@@ -502,6 +564,48 @@ mod tests {
         assert!(pending.drop.is_some() && pending.preview.is_some());
         pending.discard("current", [1; 32]);
         assert!(pending.drop.is_none() && pending.preview.is_none());
+    }
+
+    #[test]
+    fn cold_and_repeated_launches_keep_one_preview_and_never_cross_sign_in() {
+        let folder = Folder::new();
+        let first = folder.0.join("first.jpg");
+        let second = folder.0.join("second.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut pending = Pending::default();
+
+        assert!(pending.enqueue_launch(Ok(vec![first.clone()])));
+        assert!(!pending.enqueue_launch(Ok(vec![first.clone()])));
+        assert!(pending.drop.is_none() && pending.preview.is_none());
+        assert_eq!(pending.apply_launch(None), Err("sign_in_required"));
+        pending.apply_launch(Some([2; 32])).unwrap();
+        assert!(pending.drop.is_none() && pending.preview.is_none() && pending.launch.is_none());
+
+        assert!(pending.enqueue_launch(Ok(vec![first.clone()])));
+        pending.apply_launch(Some([2; 32])).unwrap();
+        let id = pending.drop.as_ref().unwrap().id.clone();
+        pending.preview = Some((
+            id.clone(),
+            preview_paths(std::slice::from_ref(&first)).unwrap(),
+        ));
+        std::fs::write(&first, b"updated photo").unwrap();
+        assert!(pending.enqueue_launch(Ok(vec![first.clone()])));
+        pending.apply_launch(Some([2; 32])).unwrap();
+        let repeated = pending.drop.as_ref().unwrap();
+        assert_ne!(repeated.id, id);
+        assert_eq!(repeated.paths, vec![first]);
+        assert!(pending.preview.is_none());
+        pending.discard(&id, [2; 32]);
+        assert!(pending.drop.is_some());
+        assert!(pending.enqueue_launch(Ok(vec![second.clone()])));
+        pending.discard(&id, [2; 32]);
+        pending.apply_launch(Some([2; 32])).unwrap();
+        assert!(pending.preview.is_none());
+        let selected = pending.drop.unwrap();
+        assert_ne!(selected.id, id);
+        assert_eq!(selected.session, [2; 32]);
+        assert_eq!(selected.paths, vec![second]);
     }
 
     #[test]

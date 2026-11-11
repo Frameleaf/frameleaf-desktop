@@ -28,6 +28,7 @@
     "allow-photo-drop-status",
     "allow-approve-photo-drop",
     "allow-control-photo-drop",
+    "allow-explorer-import-shortcut",
     "allow-approve-photo-folder",
     "allow-list-photo-import-albums",
     "allow-photo-source-status",
