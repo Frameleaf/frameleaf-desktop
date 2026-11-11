@@ -932,13 +932,54 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 mod tests {
     use super::*;
 
+    /// Deny replacement of the executable and of its path while either Desktop launch is possible.
+    #[cfg(windows)]
+    fn pin_watcher_executable(path: &std::path::Path) -> (Vec<std::fs::File>, std::fs::File) {
+        use std::{
+            fs::OpenOptions,
+            os::windows::fs::{MetadataExt, OpenOptionsExt},
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let ancestors: Vec<_> = path.ancestors().skip(1).collect();
+        let pins = ancestors
+            .into_iter()
+            .rev()
+            .map(|ancestor| {
+                let pin = OpenOptions::new()
+                    .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(ancestor)
+                    .expect("could not pin the installed Desktop directory");
+                let info = pin.metadata().unwrap();
+                assert!(
+                    info.is_dir() && info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                );
+                pin
+            })
+            .collect();
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .expect("could not pin the installed Desktop executable");
+        let info = file.metadata().unwrap();
+        assert!(info.is_file() && info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0);
+        (pins, file)
+    }
+
     /// Run the released app as a client of a separate disposable signed Library.
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an installed Desktop and signed companion on a fresh Windows runner"]
     fn disposable_runner_installed_desktop_watches_while_hidden() {
         use std::{
-            io::Write,
+            io::{Read, Write},
             net::TcpListener,
             path::PathBuf,
             process::{Command, Stdio},
@@ -958,8 +999,25 @@ mod tests {
         let physical = executable.canonicalize().unwrap();
         assert!(executable.is_absolute() && physical.starts_with(&runner) && physical.is_file());
         assert_eq!(physical.file_name().unwrap(), "frameleaf-desktop.exe");
+        // Start-Process needs the physical DOS path, with no user-controlled alias or reparse point.
+        let launch_path = physical
+            .to_str()
+            .and_then(|path| path.strip_prefix(r"\\?\"))
+            .unwrap();
+        assert!(std::path::Path::new(launch_path).is_absolute());
+        let (directories, mut executable_file) = pin_watcher_executable(&physical);
+        assert_eq!(
+            std::path::Path::new(launch_path).canonicalize().unwrap(),
+            physical
+        );
         let expected = std::env::var("FRAMELEAF_WATCH_DESKTOP_SHA256").unwrap();
-        let bytes = crate::runtime_store::read_bounded(&physical, 256 * 1024 * 1024).unwrap();
+        let limit = 256 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        (&mut executable_file)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() as u64 <= limit);
         assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
 
         let (state, _) = crate::windows_host_profile::paths().unwrap();
@@ -1021,7 +1079,7 @@ mod tests {
             .args(["-NoProfile", "-File"])
             .arg(tools.join("qualify_windows_welcome.ps1"))
             .arg("-Executable")
-            .arg(&executable)
+            .arg(launch_path)
             .arg("-WatchedFolder")
             .arg(source.path())
             .stdin(Stdio::piped())
@@ -1053,6 +1111,7 @@ mod tests {
                 }
             };
         let terminated = tree.terminate_confirmed(Duration::from_secs(20));
+        drop((executable_file, directories));
         let stopped = host.stop();
         terminated.expect("Windows acceptance process cleanup failed");
         assert!(handshake_sent, "Windows acceptance handshake failed");
@@ -1060,6 +1119,7 @@ mod tests {
         stopped.expect("disposable Library shutdown failed");
     }
 
+    /// Exercise an installed watcher in a fresh graphical account with a synthetic Library.
     #[cfg(any(
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "linux", target_arch = "x86_64")
@@ -1114,21 +1174,7 @@ mod tests {
         assert_eq!(executable.canonicalize().unwrap(), executable);
         assert_eq!(executable.file_name().unwrap(), "frameleaf-desktop");
         let expected = std::env::var("FRAMELEAF_WATCH_DESKTOP_SHA256").unwrap();
-        let bytes = crate::runtime_store::read_bounded(&executable, 256 * 1024 * 1024).unwrap();
-        assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
-        #[cfg(target_os = "macos")]
-        {
-            let bundle = executable.ancestors().nth(3).unwrap();
-            assert_eq!(
-                bundle.extension().and_then(|value| value.to_str()),
-                Some("app")
-            );
-            assert!(Command::new("/usr/bin/codesign")
-                .args(["--verify", "--strict", "--deep"])
-                .arg(bundle)
-                .status()
-                .is_ok_and(|status| status.success()));
-        }
+        assert!(crate::native_runtime::digest_valid(&expected, 64));
 
         let listener = TcpListener::bind(("127.0.0.1", 2283)).unwrap();
         let database = TcpListener::bind(("127.0.0.1", 54329)).unwrap();
@@ -1159,6 +1205,7 @@ mod tests {
             .arg("watch-interactive")
             .arg(source.path())
             .arg(&executable)
+            .arg(&expected)
             .env(
                 "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
                 photo_password.as_str(),

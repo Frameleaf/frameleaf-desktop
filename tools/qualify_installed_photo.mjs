@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, lstat, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout } from 'node:timers/promises';
 import { diagnosePhoto } from './diagnose_installed_photo.mjs';
 
-const [phase, receipt, executable] = process.argv.slice(2);
+const [phase, receipt, executable, executableSha256] = process.argv.slice(2);
 const interactive = phase === 'watch-interactive';
 assert.ok(['upload', 'verify', 'watch-signup', 'watch-create', 'watch-verify', 'watch-interactive'].includes(phase));
 if (interactive) {
@@ -19,6 +20,7 @@ if (interactive) {
   assert.match(basename(receipt), /^frameleaf-watch-source-[0-9a-f-]{36}$/);
   assert.equal(await realpath(receipt), receipt);
   assert.deepEqual(await readdir(receipt), []);
+  await verifyWatchExecutable(executable, executableSha256);
 } else {
   assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 }
@@ -32,6 +34,42 @@ const credentials = { email: 'native-photo@example.invalid', password };
 const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGNQaEigKWIYtWDUglELRi0YtWDUglELRi0YtWDUglELhooFAHfgAD2FaRhWAAAAAElFTkSuQmCC', 'base64');
 const filename = phase.startsWith('watch-') ? 'synthetic-watched-photo.png' : 'synthetic-native-photo.png';
 let token;
+
+/** Admit only a physical path whose executable and ancestors the test account cannot replace. */
+async function verifyWatchExecutable(path, expected) {
+  assert.ok(process.getuid() !== 0 && process.geteuid() !== 0);
+  assert.equal(basename(path), 'frameleaf-desktop');
+  assert.equal(await realpath(path), path);
+  assert.match(expected, /^[a-f0-9]{64}$/);
+  const ancestors = [];
+  for (let ancestor = dirname(path); ; ancestor = dirname(ancestor)) {
+    ancestors.push(ancestor);
+    if (ancestor === dirname(ancestor)) break;
+  }
+  for (const directory of ancestors.reverse()) {
+    const info = await lstat(directory);
+    assert.ok(info.isDirectory(), 'Expected a physical installed Desktop directory');
+    await requireProtectedPath(directory, info);
+  }
+  const file = await lstat(path);
+  assert.ok(file.isFile() && file.size <= 256 * 1024 * 1024);
+  await requireProtectedPath(path, file);
+  assert.equal(createHash('sha256').update(await readFile(path)).digest('hex'), expected);
+  if (process.platform === 'darwin') {
+    const bundle = dirname(dirname(dirname(path)));
+    assert.ok(bundle.endsWith('.app') && basename(dirname(path)) === 'MacOS' && basename(dirname(dirname(path))) === 'Contents');
+    const codesign = spawn('/usr/bin/codesign', ['--verify', '--strict', '--deep', bundle], { stdio: 'ignore' });
+    const [code] = await once(codesign, 'exit');
+    assert.equal(code, 0, 'Installed Desktop bundle signature verification failed');
+  }
+}
+
+/** Refuse ordinary-user writers while allowing the standard macOS admin-owned Applications group. */
+async function requireProtectedPath(path, info) {
+  const trustedGroup = info.gid === 0 || (process.platform === 'darwin' && info.gid === 80);
+  assert.ok(info.uid === 0 && !(info.mode & (trustedGroup ? 0o002 : 0o022)), 'Expected an administrator-protected Desktop installation');
+  await assert.rejects(access(path, constants.W_OK), { code: /^(EACCES|EPERM|EROFS)$/ }, 'The qualification account can modify its installed Desktop path');
+}
 
 async function request(path, options, statuses) {
   const headers = new Headers(options.headers);
@@ -66,6 +104,7 @@ async function thumbnail(id, expected = original) {
   throw Error('Timed out waiting for thumbnail');
 }
 
+/** Return the single matching asset ID, failing immediately if the watcher created duplicates. */
 async function findWatched(name) {
   const response = await request('/api/search/metadata', {
     method: 'POST',
@@ -79,6 +118,7 @@ async function findWatched(name) {
   return matches[0]?.id;
 }
 
+/** Wait for the original and its processed thumbnail to become readable. */
 async function waitWatched(name, bytes) {
   const deadline = Date.now() + 210_000;
   for (;;) {
@@ -93,6 +133,7 @@ async function waitWatched(name, bytes) {
   }
 }
 
+/** Recheck throughout two complete scan intervals rather than at one point in time. */
 async function observeScans(check) {
   // The watcher scans every 60 seconds. Check beyond two complete scan intervals.
   const deadline = Date.now() + 130_000;
@@ -103,6 +144,7 @@ async function observeScans(check) {
   await check();
 }
 
+/** Keep one launched process while the operator confirms native window and approval actions. */
 async function qualifyInteractive() {
   const resumed = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGM4o9FEU8QwasGoBaMWjFowasGoBaMWjFowasGoBaMWDBULAMew2Ewi/wTvAAAAAElFTkSuQmCC', 'base64');
   const resumedName = 'synthetic-resumed-photo.png';

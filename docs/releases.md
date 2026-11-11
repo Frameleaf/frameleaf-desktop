@@ -15,7 +15,8 @@ compiled host qualification before running the test. Do not start the app first.
 Set `FRAMELEAF_INSTALLED_HOST_MANIFEST` to the approved companion manifest
 SHA-256 in lowercase hexadecimal, and `FRAMELEAF_WATCH_DESKTOP_EXE` and `FRAMELEAF_WATCH_DESKTOP_SHA256`
 to the installed `frameleaf-desktop.exe` path and the verified installed
-executable's SHA-256 in lowercase hexadecimal. Run the test from the repository root:
+executable's SHA-256 in lowercase hexadecimal. The harness holds the executable
+and directory handles across both launches. Run the test from the repository root:
 
 ```powershell
 cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_setup::tests::disposable_runner_installed_desktop_watches_while_hidden -- --ignored --exact --nocapture
@@ -39,8 +40,11 @@ and leave Desktop closed before starting the harness.
 From a Desktop checkout containing this harness, set the reviewed identities and
 run the ignored qualification explicitly. Use the physical installed binary
 path, for example `/Applications/Frameleaf.app/Contents/MacOS/frameleaf-desktop`
-or `/usr/bin/frameleaf-desktop`. Copy the lowercase hashes from the reviewed
-companion manifest and verified candidate, respectively.
+or `/usr/bin/frameleaf-desktop`. Install the app as an administrator so the
+executable and its parent directories are root-owned and the qualification
+account cannot modify them. The macOS harness also checks the bundle signature.
+Copy the lowercase hashes from the reviewed companion manifest and verified
+candidate, respectively.
 
 ```sh
 export FRAMELEAF_WATCH_DISPOSABLE=1
