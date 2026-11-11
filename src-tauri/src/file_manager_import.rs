@@ -132,7 +132,9 @@ mod explorer {
                 CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
             },
-            UI::Shell::{FOLDERID_SendTo, IShellLinkW, SHGetKnownFolderPath, ShellLink},
+            UI::Shell::{
+                FOLDERID_SendTo, IShellLinkW, SHGetKnownFolderPath, ShellLink, SLGP_RAWPATH,
+            },
         },
     };
 
@@ -158,6 +160,7 @@ mod explorer {
         let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
             .map_err(|_| UNAVAILABLE)?;
         let file: IPersistFile = link.cast().map_err(|_| UNAVAILABLE)?;
+        let exe = wide_path(&std::env::current_exe().map_err(|_| UNAVAILABLE)?);
         let exists = match std::fs::symlink_metadata(&path) {
             Ok(meta) if !meta.file_type().is_symlink() && meta.is_file() => {
                 let name = wide_path(&path);
@@ -167,7 +170,10 @@ mod explorer {
                 unsafe { link.GetArguments(&mut args) }
                     .map_err(|_| "explorer_shortcut_conflict")?;
                 let expected: Vec<_> = IMPORT_FLAG.encode_utf16().chain(Some(0)).collect();
-                if !args.starts_with(&expected) {
+                let mut target = vec![0; 32_768];
+                unsafe { link.GetPath(&mut target, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32) }
+                    .map_err(|_| "explorer_shortcut_conflict")?;
+                if !args.starts_with(&expected) || !target.starts_with(&exe) {
                     return Err("explorer_shortcut_conflict".into());
                 }
                 true
@@ -182,7 +188,6 @@ mod explorer {
                 Ok(false)
             }
             (Some(true), false) => {
-                let exe = wide_path(&std::env::current_exe().map_err(|_| UNAVAILABLE)?);
                 let arguments: Vec<_> = IMPORT_FLAG.encode_utf16().chain(Some(0)).collect();
                 let temporary =
                     path.with_file_name(format!(".frameleaf-{}.lnk", uuid::Uuid::new_v4()));

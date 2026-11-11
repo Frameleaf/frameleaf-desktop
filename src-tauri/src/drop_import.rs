@@ -40,14 +40,7 @@ impl Pending {
 
     #[cfg(any(target_os = "macos", windows, test))]
     fn enqueue_launch(&mut self, incoming: FileSelection) -> bool {
-        if self.launch.as_ref() == Some(&incoming)
-            || (self.launch.is_none()
-                && incoming.as_ref().is_ok_and(|paths| {
-                    self.drop
-                        .as_ref()
-                        .is_some_and(|current| current.paths == *paths)
-                }))
-        {
+        if self.launch.as_ref() == Some(&incoming) {
             return false;
         }
         self.launch = Some(incoming);
@@ -595,8 +588,15 @@ mod tests {
             id.clone(),
             preview_paths(std::slice::from_ref(&first)).unwrap(),
         ));
-        assert!(!pending.enqueue_launch(Ok(vec![first])));
-        assert_eq!(pending.preview.as_ref().unwrap().0, id);
+        std::fs::write(&first, b"updated photo").unwrap();
+        assert!(pending.enqueue_launch(Ok(vec![first.clone()])));
+        pending.apply_launch(Some([2; 32])).unwrap();
+        let repeated = pending.drop.as_ref().unwrap();
+        assert_ne!(repeated.id, id);
+        assert_eq!(repeated.paths, vec![first]);
+        assert!(pending.preview.is_none());
+        pending.discard(&id, [2; 32]);
+        assert!(pending.drop.is_some());
         assert!(pending.enqueue_launch(Ok(vec![second.clone()])));
         pending.discard(&id, [2; 32]);
         pending.apply_launch(Some([2; 32])).unwrap();
