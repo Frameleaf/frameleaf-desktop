@@ -420,8 +420,18 @@ impl CopyApproval {
         mounted_volume: &str,
         entry: &crate::photo_sources::SourceFile,
     ) -> Result<(), String> {
-        let actual = self.camera_entry_version(root, mounted_volume, entry, false)?;
-        if entry.watch_version.as_deref() != Some(actual.as_str()) {
+        let expected = entry
+            .watch_version
+            .as_deref()
+            .ok_or("source_camera_changed")?;
+        let (parent, name, meta) = self.camera_entry_metadata(root, mounted_volume, entry)?;
+        // FAT inodes can change on remount. The staging copy verifies the signed content hash.
+        if !self
+            .media()
+            .is_some_and(MediaIdentity::uses_content_fingerprint)
+            && entry.watch_version.as_deref()
+                != Some(camera_version(&parent, &name, &meta)?.as_str())
+        {
             return Err("source_camera_changed".into());
         }
         Ok(())
@@ -447,18 +457,23 @@ impl CopyApproval {
             .split_once(':')
             .ok_or("source_camera_identity_unavailable")?;
         for entry in entries {
-            entry.watch_version = Some(self.camera_entry_version(&root, volume, entry, true)?);
+            let (parent, name, meta) = self.camera_entry_metadata(&root, volume, entry)?;
+            if entry.watch_version.as_deref()
+                != Some(camera_version(&parent, &name, &meta)?.as_str())
+            {
+                return Err("source_camera_changed".into());
+            }
+            entry.watch_version = Some(fingerprint_camera_file(&parent, &name, &meta)?);
         }
         Ok(())
     }
 
-    fn camera_entry_version(
+    fn camera_entry_metadata(
         &self,
         root: &Dir,
         mounted_volume: &str,
         entry: &crate::photo_sources::SourceFile,
-        preparing: bool,
-    ) -> Result<String, String> {
+    ) -> Result<(Dir, PathBuf, Metadata), String> {
         let (parent, name) = parent_dir(root, relative_path(&entry.relative)?)?;
         let fat = self
             .media()
@@ -476,14 +491,7 @@ impl CopyApproval {
         {
             return Err("source_camera_changed".into());
         }
-        let metadata_version = camera_version(&parent, &name, &meta)?;
-        if !fat {
-            return Ok(metadata_version);
-        }
-        if preparing && entry.watch_version.as_deref() != Some(metadata_version.as_str()) {
-            return Err("source_camera_changed".into());
-        }
-        fingerprint_camera_file(&parent, &name, &meta)
+        Ok((parent, name, meta))
     }
 
     pub(crate) fn validate_current(
