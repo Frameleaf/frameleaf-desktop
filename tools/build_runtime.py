@@ -312,12 +312,18 @@ QWEN_LLAMA_REVISION = "7fe450e19305b828c199d602c23a8337aaa1f03b"
 def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path, system: str) -> Path:
     executable = "llama-server.exe" if system == "windows" else "llama-server"
     binary, license_file = (source / name for name in (executable, "LICENSE"))
+    try:
+        source_info = regular(source)
+        binary_info = regular(binary)
+        license_info = regular(license_file)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise BuildError("runtime_qwen_input_invalid") from error
     if (
-        not stat.S_ISDIR(regular(source).st_mode)
+        not stat.S_ISDIR(source_info.st_mode)
         or not re.fullmatch(r"[a-f0-9]{64}", expected)
-        or not stat.S_ISREG(regular(binary).st_mode)
-        or not stat.S_ISREG(regular(license_file).st_mode)
-        or license_file.stat().st_size not in range(1, 64 * 1024)
+        or not stat.S_ISREG(binary_info.st_mode)
+        or not stat.S_ISREG(license_info.st_mode)
+        or license_info.st_size not in range(1, 64 * 1024)
         or not (site / "frameleaf_ml/native_qwen.py").is_file()
         or (system == "windows" and not (site / "frameleaf_ml/native_qwen_windows.py").is_file())
     ):

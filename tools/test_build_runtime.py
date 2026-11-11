@@ -41,6 +41,13 @@ class RuntimeBuilderTests(unittest.TestCase):
             notices = payload / "licenses"
             notices.mkdir()
             digest = hashlib.sha256(binary).hexdigest()
+            for name in ("llama-server", "LICENSE"):
+                with self.subTest(missing=name):
+                    missing = source / name
+                    temporary_name = missing.rename(source / "omitted")
+                    with self.assertRaisesRegex(builder.BuildError, "runtime_qwen_input_invalid"):
+                        builder.stage_qwen_binary(source, digest, site, notices, "macos")
+                    temporary_name.rename(missing)
             staged = builder.stage_qwen_binary(source, digest, site, notices, "macos")
             inventory = builder.inventory(payload)
             self.assertEqual(inventory[staged.relative_to(payload).as_posix()]["sha256"], digest)
