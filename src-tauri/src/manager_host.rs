@@ -455,6 +455,9 @@ impl Programs<'_> {
             tls: crate::manager_tls::BootstrapTls<'a>,
             #[serde(skip_serializing_if = "Option::is_none")]
             installation_transition: Option<&'a Transition>,
+            #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+            #[serde(skip_serializing_if = "Option::is_none")]
+            media_move_qualification: Option<serde_json::Value>,
         }
         let bootstrap = Bootstrap {
             protocol_version: 2,
@@ -467,6 +470,11 @@ impl Programs<'_> {
             backup_key,
             tls: tls.wire(),
             installation_transition: transition,
+            #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+            media_move_qualification: crate::host_state::media_move::qualification::device_for(
+                &config.state,
+            )?
+            .map(|_| serde_json::json!({"manifestSha256": self.runtime.manifest_sha256()})),
         };
         let mut input = Zeroizing::new(
             serde_json::to_vec(&bootstrap).map_err(|_| "native_manager_config_invalid")?,

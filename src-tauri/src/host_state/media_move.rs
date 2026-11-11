@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 #[cfg(any(windows, test))]
 const CUTOVER: &str = "cutover.json";
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub(crate) mod qualification;
 const INVALID: &str = "host_media_move_invalid";
 const CHANGED: &str = "host_media_move_changed";
 const CANCELLED: &str = "host_media_move_cancelled";
@@ -741,6 +743,8 @@ impl CutoverRequest {
             },
         });
         persist(&journal, CUTOVER, &bytes(&intent)?)?;
+        #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+        qualification::interrupt_after_intent(&owner.path)?;
         if decision == Decision::Target {
             let marker = expected(&intent);
             if current != marker {

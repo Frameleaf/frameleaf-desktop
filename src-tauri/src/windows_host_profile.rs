@@ -71,6 +71,10 @@ pub(crate) fn paths() -> Result<(PathBuf, PathBuf), String> {
     Ok(profile.paths())
 }
 pub(crate) fn admit(state: &Path, data: &Path) -> Result<Vec<fs::File>, String> {
+    #[cfg(feature = "qualify-windows-media-move")]
+    if let Some(pins) = crate::host_state::media_move::qualification::pin_profile(state, data)? {
+        return Ok(pins);
+    }
     discover()?.admit(state, data)
 }
 

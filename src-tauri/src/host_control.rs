@@ -128,7 +128,7 @@ pub(crate) fn separate_paths(candidate: &Path, state: &Path) -> Result<(), Strin
     }
     Ok(())
 }
-fn verify_candidate(
+pub(crate) fn verify_candidate(
     candidate: &Path,
     expected: &str,
 ) -> Result<crate::host_runtime::VerifiedHostRuntime, String> {
@@ -219,8 +219,15 @@ pub fn media_move_owner() -> Result<(), String> {
     verify_candidate(&request.candidate, &request.manifest_sha256)?;
     let owner = crate::host_state::Owner::acquire(&request.state, true)?;
     check_secure_installation(Some(request.secure_installation_id), &owner)?;
-    let device: crate::connection::DeviceIdentity = crate::credentials::load("installation")?
-        .ok_or("host_media_move_credential_unavailable")?;
+    #[cfg(not(feature = "qualify-windows-media-move"))]
+    let fixture_device: Option<crate::connection::DeviceIdentity> = None;
+    #[cfg(feature = "qualify-windows-media-move")]
+    let fixture_device = crate::host_state::media_move::qualification::device_for(&request.state)?;
+    let device: crate::connection::DeviceIdentity = match fixture_device {
+        Some(device) => device,
+        None => crate::credentials::load("installation")?
+            .ok_or("host_media_move_credential_unavailable")?,
+    };
     emit(request.request.apply_or_inspect(
         owner,
         &request.installation_id,
@@ -229,6 +236,12 @@ pub fn media_move_owner() -> Result<(), String> {
         request.reviewed_backup,
         || false,
     )?)
+}
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub fn qualify_media_move() -> Result<(), String> {
+    let raw = line(&mut BufReader::new(std::io::stdin()), 16 * 1024)?;
+    emit(crate::host_state::media_move::qualification::run(&raw)?)
 }
 
 fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
