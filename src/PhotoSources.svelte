@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from './Icon.svelte';
+  import CameraSources from './CameraSources.svelte';
   import Sheet from './Sheet.svelte';
   import { formatBytes, percent } from './ui-state';
   type Hint = { label: string; path: string };
@@ -10,12 +11,14 @@
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
+  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean };
   type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number };
   let job = $state<CopyJob | null>(null);
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowReads = $state(false);
+  let watchFolder = $state(false);
+  let watchAvailable = $state(false);
   let alive = true;
   let busy = $state(false);
   let message = $state('');
@@ -35,6 +38,10 @@
     source_copy_budget_exceeded: 'This copy exceeds the server’s current size limits. Choose a smaller subfolder or remove unsupported large files from the selected scope.',
     source_staging_overlap: 'Choose a photo folder outside the app’s own data folder.',
     source_identity_unavailable: 'The filesystem could not provide a reliable file identity. Copying stopped; staged originals are kept. Try an ordinary local photo folder.',
+    source_root_changed: 'This is no longer the folder you approved. Remove its permission and choose the folder again.',
+    source_watch_local_required: 'Choose a local folder for automatic import.',
+    source_watch_history_full: 'This watched folder reached its import history limit. Existing verified copies are kept.',
+    source_run_terminal: 'The server stopped this copy. Remove the folder permission before starting again.',
     source_item_changed: 'A selected file changed after the scan. This copy is paused; the original and staged data are kept.',
     source_cloud_copy_pending: 'This Windows cloud folder can be previewed, but copying its placeholders is still being implemented. Export originals to an ordinary local folder for now.',
     source_capacity_unavailable: 'Available storage space could not be checked. Reconnect the photo-source and app-storage volumes, then resume.',
@@ -70,6 +77,8 @@
     source_package_requires_provider: 'Apple Photos libraries need the Photos connection. Choose an ordinary folder here.',
     source_folder_unavailable: 'This folder is unavailable. Check that its drive is connected and you have access.',
     source_account_unavailable: 'This OneDrive folder moved or is unavailable. Choose its new location.',
+    source_camera_unavailable: 'This camera or card is no longer available. Reconnect it and choose it again.',
+    source_camera_changed: 'This camera or card changed after the preview. Clear the preview and choose the folder again.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
   async function loadConsent() {
@@ -108,7 +117,7 @@
     catch (error) { message = explain(error); }
     finally { busy = false; }
   }
-  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload') {
+  async function controlCopy(action: 'resume' | 'pause' | 'cancel' | 'approve-upload' | 'watch-pause' | 'watch-resume') {
     busy = true; message = '';
     try { job = await invoke<CopyJob>('control_photo_import', { action }); }
     catch (error) { message = explain(error); }
@@ -118,8 +127,9 @@
     if (!retry && (!folder || !allowReads)) return;
     busy = true; message = '';
     try {
-      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads });
-      folder = null; allowReads = false;
+      consent = await invoke<Consent>('approve_photo_folder', { selectionId: retry ? null : folder!.selectionId, allowDownload: allowReads, watch: watchFolder });
+      if (consent.watch) job = await invoke<CopyJob | null>('photo_import_status');
+      folder = null; allowReads = false; watchFolder = false;
     } catch (error) { await loadConsent(); message = explain(error); }
     finally { busy = false; }
   }
@@ -140,18 +150,19 @@
     } catch { message = 'Could not check OneDrive locations. Choose a synced folder yourself.'; }
     finally { busy = false; }
   }
-  async function choose(oneDrive: number | null = null) {
+  async function choose(oneDrive: number | null = null, camera: string | null = null) {
     busy = true; message = '';
     try {
-      const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive });
-      if (selected) { folder = selected; allowReads = false; }
+      const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive, camera });
+      if (selected) { folder = selected; allowReads = false; watchFolder = false; watchAvailable = oneDrive === null && camera === null; }
     } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
     finally { busy = false; }
   }
-  const jobLabel = $derived(!job ? '' : job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention');
-  const jobTone = $derived(!job ? 'off' : job.state === 'complete' ? 'ok' : job.state === 'copying' ? 'wait' : job.state === 'needs-attention' ? 'bad' : 'off');
+  const jobLabel = $derived(!job ? '' : job.state === 'watching' ? (job.code ? 'Watching · waiting' : 'Watching folder') : job.state === 'watch-paused' ? 'Watching paused' : job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention');
+  const jobTone = $derived(!job ? 'off' : ['complete', 'watching'].includes(job.state) ? 'ok' : job.state === 'copying' ? 'wait' : job.state === 'needs-attention' ? 'bad' : 'off');
   const canResume = $derived(!!job && ['ready', 'paused', 'needs-attention'].includes(job.state));
-  const needsAllowance = $derived(!!job && !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
+  const watchRunning = $derived(!!job && ['watching', 'copying', 'complete'].includes(job.state));
+  const needsAllowance = $derived(!!job && job.total > 0 && !['complete', 'cancelled', 'copying'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
 </script>
 
 <section class="page" aria-labelledby="photo-sources-heading" aria-busy={busy}>
@@ -165,6 +176,9 @@
   <div class="body">
     {#if busy}<div class="inline-msg" role="status"><span class="spin" aria-hidden="true"></span><p>Waiting for the folder or server operation to finish…</p></div>{/if}
     {#if message}<div class="inline-msg" role="status"><p>{message}</p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
+    {#if native && !consent && !blockedConsent && !folder}
+      <CameraSources {busy} onchoose={(path) => choose(null, path)} />
+    {/if}
     {#if hints.length}
       <div>
         <div class="group-head"><h2 class="group-title">Known OneDrive folders</h2></div>
@@ -186,27 +200,33 @@
             <span class="ic" aria-hidden="true"><Icon name="folder" /></span>
             <span class="l">
               <b>{consent.name}</b>
-              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {job ? `${jobLabel} · ${job.completed.toLocaleString()} of ${job.total.toLocaleString()} copies confirmed${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
-              {#if job && !['complete', 'cancelled'].includes(job.state)}<span class="progress" role="progressbar" aria-valuenow={percent(job.completed, job.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(job.completed, job.total)}%"></span></span>{/if}
+              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {consent.watch && (!job || job.total === 0) ? (job ? jobLabel : 'Automatic import to your current library') : job ? `${jobLabel} · ${job.completed.toLocaleString()} of ${job.total.toLocaleString()} copies confirmed${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
+              {#if job && job.total > 0 && !['complete', 'cancelled'].includes(job.state)}<span class="progress" role="progressbar" aria-valuenow={percent(job.completed, job.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(job.completed, job.total)}%"></span></span>{/if}
             </span>
             {#if job}<span class="pill {jobTone}" role="status"><i aria-hidden="true"></i>{job.state === 'complete' ? 'Up to date' : jobLabel.replace('Copy ', '')}</span>{/if}
             {#if !consent.registered}<button class="btn" disabled={busy} onclick={() => approve(true)}>Retry Registration</button>{/if}
-            {#if consent.registered && !job}<button class="btn primary" disabled={busy} onclick={prepareCopy}>Prepare Copy</button>{/if}
+            {#if consent.registered && !consent.watch && !job}<button class="btn primary" disabled={busy} onclick={prepareCopy}>Prepare Copy</button>{/if}
             {#if needsAllowance}<button class="btn" disabled={busy} onclick={() => controlCopy('approve-upload')}>Approve {size(job!.additionalUploadAllowance)} more</button>{/if}
-            {#if canResume}<button class="btn primary" disabled={busy || job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : 'Resume'}</button>{/if}
-            {#if job?.state === 'copying'}<button class="btn" disabled={busy} onclick={() => controlCopy('pause')}><Icon name="pause" />Pause</button>{/if}
-            {#if job && !['complete', 'cancelled'].includes(job.state)}<button class="btn quiet" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel</button>{/if}
+            {#if consent.watch && consent.registered}
+              {#if watchRunning}<button class="btn" disabled={busy} onclick={() => controlCopy('watch-pause')}><Icon name="pause" />Pause Watching</button>
+              {:else if job?.code !== 'source_run_terminal'}<button class="btn primary" disabled={busy || needsAllowance} onclick={() => controlCopy('watch-resume')}>Resume Watching</button>{/if}
+            {:else if canResume}<button class="btn primary" disabled={busy || job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : 'Resume'}</button>{/if}
+            {#if !consent.watch && job?.state === 'copying'}<button class="btn" disabled={busy} onclick={() => controlCopy('pause')}><Icon name="pause" />Pause</button>{/if}
+            {#if !consent.watch && job && !['complete', 'cancelled'].includes(job.state)}<button class="btn quiet" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel</button>{/if}
             <button class="btn quiet" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove…</button>
           </div>
-          {#if consent.registered && !job}
+          {#if consent.registered && !consent.watch && !job}
             <div class="row"><span class="l"><small>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</small></span></div>
           {/if}
           {#if job?.code}<div class="row"><span class="l"><small role="status" class="danger-text">{explain(job.code)}</small></span></div>{/if}
+          {#if consent.camera && job?.state === 'complete' && job.completed === job.total && !job.code}
+            <div class="row"><span class="l"><small>All files in this copy were verified on your server. Eject the card or camera in your computer’s file manager before disconnecting it.</small></span></div>
+          {/if}
           {#if job?.state === 'cancelled'}<div class="row"><span class="l"><small>Any unconfirmed staged originals and existing server copies are kept. Remove this folder permission before preparing another copy.</small></span></div>{/if}
         {:else if blockedConsent}
           <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><span class="l"><b>A previous folder permission needs removing</b><small>It belongs to an earlier sign-in or no longer matches this connection.</small></span><button class="btn" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove Previous Permission…</button></div>
         {:else if !folder}
-          <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="folder" /></span><span class="l"><b>No folder approved</b><small>Choose where to bring photos from. Local folders are separate from this computer’s AI processing permission.</small></span></div>
+          <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="folder" /></span><span class="l"><b>No folder approved</b><small>Choose a folder or connect a memory card or a camera that appears as a drive.</small></span></div>
         {/if}
         {#if folder && !consent && !blockedConsent}
           <div class="row top" aria-label="Selected folder preview">
@@ -215,10 +235,13 @@
               <b>{folder.path}</b>
               <small>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}. {folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</small>
               {#if folder.availability}<small aria-label="Preview file availability">{availabilityText(folder.availability)}</small>{/if}
-              <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={allowReads} disabled={busy} /> Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.</label>
+              {#if watchAvailable && !folder.truncated}
+                <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={watchFolder} onchange={() => { allowReads = false; }} disabled={busy} /> Watch this folder and automatically copy photos and videos to my current Frameleaf library.</label>
+              {/if}
+              <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={allowReads} disabled={busy} /> {watchFolder ? 'Allow Frameleaf to read this folder in the background, including after I close the window. Existing files are included. Originals stay in place.' : 'Allow this folder to be read for copying. Cloud-only originals may require downloading; approval does not start a copy.'}</label>
             </span>
-            <button class="btn quiet" disabled={busy} onclick={() => { folder = null; allowReads = false; }}>Clear</button>
-            <button class="btn primary" disabled={busy || !allowReads} onclick={() => approve()}>Approve Folder</button>
+            <button class="btn quiet" disabled={busy} onclick={() => { folder = null; allowReads = false; watchFolder = false; }}>Clear</button>
+            <button class="btn primary" disabled={busy || !allowReads} onclick={() => approve()}>{watchFolder ? 'Approve and Watch' : 'Approve Folder'}</button>
           </div>
         {/if}
       </div>

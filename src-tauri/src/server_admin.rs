@@ -351,13 +351,14 @@ pub(crate) async fn test_remote_access(
         .await
 }
 
-/// Only the signed-in server's own origin (http on the local network) or https Frameleaf domains:
-/// the browser never opens an address a server reply could choose freely.
+/// Allow the signed-in server origin, HTTPS Frameleaf service domains and the fixed downloads page.
 pub(crate) fn external_url_allowed(url: &Url, server: Option<&Url>) -> bool {
     if !url.username().is_empty() || url.password().is_some() {
         return false;
     }
-    if server.is_some_and(|server| server.origin() == url.origin()) {
+    if url.as_str() == "https://github.com/Frameleaf/frameleaf-desktop/releases"
+        || server.is_some_and(|server| server.origin() == url.origin())
+    {
         return true;
     }
     let Some(host) = url.host_str().filter(|_| url.scheme() == "https") else {
@@ -416,6 +417,13 @@ mod tests {
         assert!(!on_local("http://192.168.1.21:2283/"));
         assert!(!allowed("https://frameleaf.example/servers/1"));
         assert!(allowed("https://frameleaf.cloud/store"));
+        assert!(allowed(
+            "https://github.com/Frameleaf/frameleaf-desktop/releases"
+        ));
+        assert!(!allowed(
+            "https://github.com/Frameleaf/frameleaf-desktop/releases?redirect=other"
+        ));
+        assert!(!allowed("https://github.com/other/repo/releases"));
         assert!(allowed("https://id.frameleaf.cloud/session/end"));
         assert!(allowed("https://frameleaf.net/"));
         assert!(allowed("https://abc.frameleaf.net/"));

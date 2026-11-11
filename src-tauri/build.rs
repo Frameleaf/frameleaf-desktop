@@ -30,6 +30,7 @@ fn main() {
             "worker_setup_status",
             "prepare_models",
             "control_worker",
+            "discover_camera_folders",
             "discover_onedrive",
             "choose_photo_folder",
             "approve_photo_folder",

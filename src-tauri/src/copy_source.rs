@@ -176,6 +176,21 @@ fn path_stamp(dir: &Dir, relative: &Path, expected: &Metadata) -> Result<String,
         opened_stamp(&file)
     }
 }
+/// The same metadata identity used by the staging receipt, without opening original data.
+pub(crate) fn watch_version(dir: &Dir, name: &Path, meta: &Metadata) -> Result<String, String> {
+    Ok(version(&path_stamp(dir, name, meta)?))
+}
+fn version(stamp: &str) -> String {
+    format!("{:x}", Sha256::digest(stamp.as_bytes()))
+}
+pub(crate) fn watchable(meta: &Metadata, observation: crate::source_metadata::Observation) -> bool {
+    !link(meta)
+        && !matches!(
+            observation.availability,
+            crate::source_metadata::Availability::NeedsDownload
+                | crate::source_metadata::Availability::NotReady
+        )
+}
 pub(crate) fn root_identity(dir: &Dir) -> Result<String, String> {
     #[cfg(unix)]
     {
@@ -308,6 +323,9 @@ impl CopyApproval {
     pub(crate) fn root(&self) -> &Path {
         Path::new(&self.scope.root)
     }
+    pub(crate) fn root_identity(&self) -> &str {
+        &self.scope.root_identity
+    }
     pub(crate) fn validate_current(
         &self,
         saved: &SavedConnection,
@@ -395,6 +413,7 @@ impl CopyApproval {
             destination,
             &Uuid::new_v4().to_string(),
             None,
+            None,
             cancelled,
             &|| Ok(()),
         )
@@ -408,12 +427,17 @@ impl CopyApproval {
         destination: &Path,
         stage_id: &str,
         expected_bytes: Option<u64>,
+        expected_watch_version: Option<&str>,
         cancelled: &AtomicBool,
         gate: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<StagedCopy, String> {
         if !Uuid::parse_str(stage_id).is_ok_and(|id| !id.is_nil() && id.to_string() == stage_id) {
             return Err("source_stage_invalid".into());
         }
+        #[cfg(target_os = "macos")]
+        let _no_materialization = expected_watch_version
+            .map(|_| crate::photo_sources::metadata_only::Guard::new())
+            .transpose()?;
         gate()?;
         self.validate(saved, identity)?;
         cancel(cancelled)?;
@@ -456,7 +480,13 @@ impl CopyApproval {
         {
             return Err("source_copy_budget_exceeded".into());
         }
+        if expected_watch_version.is_some() && !watchable(&before, availability) {
+            return Err("source_item_changed".into());
+        }
         let source_stamp = path_stamp(&dir, relative_path, &before)?;
+        if expected_watch_version.is_some_and(|expected| expected != version(&source_stamp)) {
+            return Err("source_item_changed".into());
+        }
         let staging = Dir::open_ambient_dir(destination, ambient_authority())
             .map_err(|_| "source_stage_unavailable")?;
         // Unknown residency reserves a full original; pinning and allocated blocks are not proof.
@@ -477,6 +507,18 @@ impl CopyApproval {
             may_download,
         )?;
         let options = no_follow_options(false);
+        #[cfg(windows)]
+        let options = {
+            use cap_std::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+            };
+            let mut options = options;
+            if expected_watch_version.is_some() {
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL);
+            }
+            options
+        };
         let mut source = dir
             .open_with(relative_path, &options)
             .map_err(|_| "source_item_unavailable")?;
@@ -605,7 +647,7 @@ impl StagedCopy {
         )
     }
     pub(crate) fn version(&self) -> String {
-        format!("{:x}", Sha256::digest(self.source_stamp.as_bytes()))
+        version(&self.source_stamp)
     }
     pub(crate) fn release(
         &self,

@@ -70,9 +70,14 @@ fn actual_native_folder_copy() {
             .select(picker.generation().unwrap(), source.clone())
             .unwrap();
         let mut consent = picker
-            .approve(&saved, &identity, &chosen.selection_id, true, |value| {
-                credentials::save(CREDENTIAL, value)
-            })
+            .approve(
+                &saved,
+                &identity,
+                &chosen.selection_id,
+                true,
+                false,
+                |value| credentials::save(CREDENTIAL, value),
+            )
             .unwrap();
         consent.register(&saved, &identity).await.unwrap();
         credentials::save(CREDENTIAL, &consent).unwrap();

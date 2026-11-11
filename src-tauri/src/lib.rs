@@ -1,3 +1,4 @@
+mod camera_sources;
 pub mod cloud_account;
 pub mod connection;
 pub mod copy_source;
@@ -364,6 +365,18 @@ async fn restore_connection(
     {
         view.state = "worker-setup-failed".into();
     }
+    if let Ok(Some(consent)) =
+        credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
+    {
+        if consent.watch && consent.registered && !consent.watch_paused {
+            if let Ok(base) = import_base(&app) {
+                let _ = app
+                    .state::<source_import::SourceJobs>()
+                    .start(app.clone(), base, saved.clone())
+                    .await;
+            }
+        }
+    }
     *current = Some(saved);
     drop(current);
     tray::refresh(&app).await;
@@ -508,6 +521,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -547,6 +561,7 @@ pub fn run() {
             worker_setup_status,
             prepare_models,
             control_worker,
+            discover_camera_folders,
             discover_onedrive,
             choose_photo_folder,
             approve_photo_folder,
@@ -584,7 +599,8 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if window.label() == "main"
-                && window.state::<host_setup::HostSetup>().background_active()
+                && (window.state::<host_setup::HostSetup>().background_active()
+                    || window.state::<source_import::SourceJobs>().watching())
             {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
@@ -620,8 +636,12 @@ pub(crate) async fn start_worker_setup(
     saved: &SavedConnection,
     allow_download: bool,
 ) -> Result<(), String> {
-    let control = worker_control::load(saved)?;
+    let preference = worker_control::load(saved)?;
+    let control = preference.effective(worker_control::now());
     if control != worker_control::WorkerControl::Running {
+        if let worker_control::Preference::Timed { until } = preference {
+            tray::schedule_worker_resume(app, worker_control::key(saved)?, until);
+        }
         let status = app.state::<worker_setup::WorkerSetup>().hold(control).await;
         publish_worker_status(app, status);
         return Ok(());
@@ -701,6 +721,14 @@ pub(crate) async fn apply_worker_control(
     let state = app.state::<DesktopState>();
     let mut current = state.0.lock().await;
     let saved = current.as_mut().ok_or("sign_in_required")?;
+    apply_connected_worker_control(app, saved, control).await
+}
+
+pub(crate) async fn apply_connected_worker_control(
+    app: &AppHandle,
+    saved: &mut SavedConnection,
+    control: worker_control::WorkerControl,
+) -> Result<worker_setup::SetupStatus, String> {
     let setup = app.state::<worker_setup::WorkerSetup>();
     match control {
         worker_control::WorkerControl::Paused => {
@@ -723,7 +751,7 @@ pub(crate) async fn apply_worker_control(
             let client = match transport::client() {
                 Ok(client) => client,
                 Err(error) => {
-                    setup.hold(previous).await;
+                    setup.hold(previous.held()).await;
                     return Err(error);
                 }
             };
@@ -731,22 +759,22 @@ pub(crate) async fn apply_worker_control(
             // a permissions problem.
             let capabilities = transport::capabilities(&client, saved).await;
             if let Err(error) = &capabilities {
-                setup.hold(previous).await;
+                setup.hold(previous.held()).await;
                 return Err(error.clone());
             }
             let view = prepare_with_capabilities(&client, saved, capabilities).await;
             if let Some(error) = resume_refusal(&view.state, view.features.worker_session) {
-                setup.hold(previous).await;
+                setup.hold(previous.held()).await;
                 return Err(error);
             }
             if let Err(error) = worker_control::save(saved, control) {
-                setup.hold(previous).await;
+                setup.hold(previous.held()).await;
                 return Err(error);
             }
             if let Err(error) = start_worker_setup(app, saved, false).await {
                 // Put the saved control back too, so a restart does not resume what failed here.
-                let rolled_back = worker_control::save(saved, previous);
-                setup.hold(previous).await;
+                let rolled_back = worker_control::save_preference(saved, previous);
+                setup.hold(previous.held()).await;
                 // If the old setting can't be saved back, say so: a restart would resume the worker.
                 return Err(match rolled_back {
                     Ok(()) => error,
@@ -800,28 +828,65 @@ async fn discover_onedrive(
         .map_err(|_| "source_discovery_failed")?
 }
 #[tauri::command]
+async fn discover_camera_folders(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<Vec<photo_sources::RootHint>, String> {
+    require_local(&window)?;
+    tauri::async_runtime::spawn_blocking(move || camera_hints(&app))
+        .await
+        .map_err(|_| "source_discovery_failed")?
+}
+
+fn camera_hints(app: &tauri::AppHandle) -> Result<Vec<photo_sources::RootHint>, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|_| "source_home_unavailable")?;
+    Ok(camera_sources::discover(&home))
+}
+
+#[tauri::command]
 async fn choose_photo_folder(
     window: WebviewWindow,
     app: tauri::AppHandle,
     one_drive: Option<usize>,
+    camera: Option<String>,
 ) -> Result<Option<source_consent::SelectedFolder>, String> {
     use tauri_plugin_dialog::DialogExt;
     require_local(&window)?;
+    if one_drive.is_some() && camera.is_some() {
+        return Err("source_folder_invalid".into());
+    }
     let generation = app.state::<source_consent::SourceConsent>().generation()?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut picker = app.dialog().file().set_title("Choose a photo folder");
+        let from_camera = camera.is_some();
         if let Some(index) = one_drive {
             let hints = source_hints(&app)?;
             let hint = hints.get(index).ok_or("source_account_unavailable")?;
             picker = picker.set_directory(&hint.path);
         }
+        if let Some(path) = camera {
+            let hint = camera_hints(&app)?
+                .into_iter()
+                .find(|hint| hint.path == path)
+                .ok_or("source_camera_unavailable")?;
+            picker = picker
+                .set_title("Choose photos from camera storage")
+                .set_directory(hint.path);
+        }
         let Some(folder) = picker.blocking_pick_folder() else {
             return Ok(None);
         };
         let path = folder.into_path().map_err(|_| "source_folder_invalid")?;
-        app.state::<source_consent::SourceConsent>()
-            .select(generation, path)
-            .map(Some)
+        let consent = app.state::<source_consent::SourceConsent>();
+        if from_camera {
+            consent.select_camera(generation, path)
+        } else {
+            consent.select(generation, path)
+        }
+        .map(Some)
     })
     .await
     .map_err(|_| "source_inventory_failed")?
@@ -849,6 +914,7 @@ async fn approve_photo_folder(
     state: State<'_, DesktopState>,
     selection_id: Option<String>,
     allow_download: bool,
+    watch: Option<bool>,
 ) -> Result<source_consent::ConsentView, String> {
     require_local(&window)?;
     let current = state.0.lock().await;
@@ -863,6 +929,7 @@ async fn approve_photo_folder(
             &identity,
             &selection,
             allow_download,
+            watch.unwrap_or(false),
             |value| credentials::save(source_consent::CREDENTIAL, value),
         )?
     } else {
@@ -871,6 +938,11 @@ async fn approve_photo_folder(
     };
     consent.register(saved, &identity).await?;
     credentials::save(source_consent::CREDENTIAL, &consent)?;
+    if consent.watch && !consent.watch_paused {
+        app.state::<source_import::SourceJobs>()
+            .start(app.clone(), import_base(&app)?, saved.clone())
+            .await?;
+    }
     Ok(consent.view())
 }
 #[tauri::command]
@@ -886,6 +958,7 @@ async fn revoke_photo_source(
     let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
     // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
     credentials::delete(source_consent::CREDENTIAL)?;
+    tray::set_import_status(&app, None);
     app.state::<source_consent::SourceConsent>().clear()?;
     match consent {
         Ok(Some(consent)) => {
@@ -934,9 +1007,12 @@ async fn prepare_photo_import(
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
-    app.state::<source_import::SourceJobs>()
+    let status = app
+        .state::<source_import::SourceJobs>()
         .prepare(&import_base(&app)?, saved)
-        .await
+        .await?;
+    tray::set_import_status(&app, Some(&status));
+    Ok(status)
 }
 #[tauri::command]
 async fn control_photo_import(
@@ -949,11 +1025,23 @@ async fn control_photo_import(
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let base = import_base(&app)?;
-    match action.as_str() {
-        "resume" => {
+    let status = match action.as_str() {
+        "watch-resume" => {
+            return app
+                .state::<source_import::SourceJobs>()
+                .resume_watch(app.clone(), base, saved.clone())
+                .await;
+        }
+        "watch-pause" => {
             app.state::<source_import::SourceJobs>()
-                .start(app.clone(), base, saved.clone())
+                .pause_watch(&base, saved)
                 .await
+        }
+        "resume" => {
+            return app
+                .state::<source_import::SourceJobs>()
+                .start(app.clone(), base, saved.clone())
+                .await;
         }
         "approve-upload" => {
             app.state::<source_import::SourceJobs>()
@@ -966,7 +1054,9 @@ async fn control_photo_import(
                 .await
         }
         _ => Err("source_control_invalid".into()),
-    }
+    }?;
+    tray::set_import_status(&app, Some(&status));
+    Ok(status)
 }
 
 #[cfg(test)]

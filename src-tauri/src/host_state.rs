@@ -321,7 +321,6 @@ impl Owner {
         Ok(())
     }
     /// Read the stopped journal without taking ownership; None means a fresh profile.
-    #[cfg(unix)]
     pub(crate) fn peek(path: &Path) -> Result<Option<Marker>, String> {
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         match root.symlink_metadata(NAME) {

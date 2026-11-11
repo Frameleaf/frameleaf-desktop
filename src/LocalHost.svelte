@@ -4,8 +4,14 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
   import Icon from './Icon.svelte';
+  import Sheet from './Sheet.svelte';
   type Installation = { manifestSha256: string; controllerSha256: string; version?: string | null; library?: boolean };
-  type View = { state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
+  const companionInstructions = {
+    mac: 'Download and open the Frameleaf Companion Server PKG for Apple silicon.',
+    windows: 'Download and run the Frameleaf Companion Server EXE for Windows x64.',
+    linux: 'On Ubuntu 24.04 for Intel or AMD, install both Frameleaf Companion Server DEBs (bootstrap and runtime) together, with pkexec.',
+  };
+  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -23,6 +29,16 @@
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
   let authorized = $state(false);
+  let packageChange = $state<Installation | null>(null);
+  const libraryPackage = $derived(installations.find(record => record.library));
+  const selectedPackage = $derived(installations.find(record => record.manifestSha256 === selected));
+  const profileRequired = $derived(view?.code === 'host_install_windows_profile_required' || view?.code === 'host_install_linux_profile_required');
+  const needsProfile = $derived(!!view?.profileSetupAvailable && !view.backgroundActive && (
+    profileRequired || (!libraryPackage && view.state === 'idle' && !view.installation) ||
+    (view.state === 'needs-attention' && (view.code === 'host_profile_prepare_failed' || view.code?.startsWith('host_profile_authorization_')))
+  ));
+  const changingPackage = $derived(!!libraryPackage && !!selectedPackage && selected !== libraryPackage.manifestSha256);
+  const canMovePackage = $derived(view?.companionPlatform === 'mac' || view?.companionPlatform === 'linux');
   const headline = $derived(profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer');
   const pill = $derived(view?.state === 'manager-ready' ? { label: authorized ? 'Authorized' : 'Ready', tone: 'ok' } : profilePending || starting || busy ? { label: 'Working', tone: 'wait' } : view?.state === 'needs-attention' ? { label: 'Needs attention', tone: 'bad' } : view?.backgroundActive ? { label: 'Active', tone: 'wait' } : { label: 'Not started', tone: 'off' });
   function explain(code: unknown): string {
@@ -60,7 +76,7 @@
     try {
       const [records, current] = await Promise.all([invoke<Installation[]>('installed_local_hosts'), invoke<View>('local_host_status')]);
       installations = records; show(current);
-      selected = current.installation?.manifestSha256 ?? records.find(record => record.library)?.manifestSha256 ?? (records.length === 1 ? records[0]!.manifestSha256 : '');
+      selected = records.find(record => record.manifestSha256 === current.installation?.manifestSha256)?.manifestSha256 ?? records.find(record => record.library)?.manifestSha256 ?? (records.length === 1 ? records[0]!.manifestSha256 : '');
       if (current.code) failure = explain(current.code);
     } catch (error) { failure = explain(error); }
     finally { busy = false; }
@@ -72,8 +88,24 @@
     void refresh();
     return () => { disposed = true; unlisten?.(); };
   });
+  async function openDownloads() {
+    failure = '';
+    try { await invoke('open_external', { url: 'https://github.com/Frameleaf/frameleaf-desktop/releases' }); }
+    catch { failure = 'The download page could not open. Try again.'; }
+  }
+  function prepareSelected() {
+    if (busy || !selectedPackage) return;
+    if (changingPackage) {
+      if (canMovePackage) packageChange = selectedPackage;
+    } else void prepare();
+  }
+  function confirmPackageChange() {
+    const target = packageChange;
+    packageChange = null;
+    if (canMovePackage && target?.manifestSha256 === selected) void prepare();
+  }
   async function prepare() {
-    if (busy || !native || !selected) return;
+    if (busy || !native || !selectedPackage) return;
     busy = true; starting = true; onactive(true); failure = ''; notice = '';
     try { show(await invoke<View>('prepare_local_host', { manifestSha256: selected })); }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
@@ -122,42 +154,59 @@
   }
 </script>
 
-<div aria-label="Local library setup" aria-busy={busy}>
+<section aria-label="Local library setup" aria-busy={busy}>
   <div class="group-head">
     <h2 class="group-title">Run Frameleaf here</h2>
     {#if starting}<button class="btn quiet" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
+    {#if canMovePackage && libraryPackage && !view?.backgroundActive}
+      <button class="btn quiet" disabled={busy || !native} onclick={openDownloads}>Find companion updates</button>
+    {/if}
     <button class="btn quiet" disabled={busy || !native} onclick={refresh}>Check installation</button>
   </div>
   <div class="group">
     <div class="row">
       <span class="ic" aria-hidden="true"><Icon name="computer" /></span>
-      <span class="l"><b>{headline}</b><small>Keep your photo library here and manage it from Frameleaf. Server management and photo-server startup are separate steps.</small></span>
+      <span class="l"><b>{headline}</b><small>Keep your photo library on this computer. Frameleaf prepares private storage for your account.</small></span>
       <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
-      {#if !view?.backgroundActive || view?.state === 'needs-attention'}<button class="btn primary" disabled={busy || !native || !selected} onclick={prepare}>Prepare local Manager</button>{/if}
       {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
     </div>
     {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
     {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
     {#if profilePending}<div class="row"><span class="spin" aria-hidden="true"></span><p role="status" style="flex:1">{profileCopy.pending}</p></div>{/if}
-    {#if view?.profileSetupAvailable && installations.length > 0 && !view.code?.startsWith('host_profile_legacy_') && (view.state === 'idle' || view.state === 'needs-attention')}
+    {#if selectedPackage && needsProfile}
       <div class="row"><span class="l"><b>Prepare my server profile</b><small>{profileCopy.preparation}</small></span><button class="btn primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare Profile</button></div>
     {/if}
-    {#if native && view && !busy && !failure && installations.length === 0}
-      <div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><span class="l"><b>Server component not installed</b><small>Install the Frameleaf server component, then check again. Your existing photo folders are kept separate.</small></span></div>
+    {#if native && view && !busy && installations.length === 0}
+      <div class="row">
+        <span class="ic dim" aria-hidden="true"><Icon name="warn" /></span>
+        <span class="l"><b>Server component not installed</b>
+          <small>{view.companionPlatform ? `${companionInstructions[view.companionPlatform]} When it finishes, return here and choose Check installation.` : 'A companion installer is unavailable for this computer. You can connect to an existing server.'}</small>
+        </span>
+        {#if view.companionPlatform}<button class="btn primary" onclick={openDownloads}><Icon name="open" />Open companion downloads</button>{/if}
+      </div>
     {/if}
     {#if installations.length > 1 && !view?.backgroundActive}
       <div class="form-row"><label for="local-package">Installed server package</label>
         <select id="local-package" bind:value={selected} disabled={busy}>
           <option value="">Choose an installed package</option>
-          {#each installations as installation (installation.manifestSha256)}<option value={installation.manifestSha256}>Library {installation.version ?? 'version unknown'}{installation.library ? ' (this library)' : ''} · {installation.manifestSha256.slice(0, 12)}</option>{/each}
+          {#each installations as installation (installation.manifestSha256)}<option value={installation.manifestSha256}>Library {installation.version ?? 'version unknown'}{installation.library ? ' (this library)' : ''}</option>{/each}
         </select>
       </div>
-      <small>Starting your library with a newer package moves it to that package. It cannot go back to an older one afterwards.</small>
+    {/if}
+    {#if changingPackage && !canMovePackage}
+      <div class="row"><span class="l"><b>Choose this library’s current package</b><small>Moving an existing library to another package is unavailable on this computer.</small></span></div>
+    {:else if selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
+      <div class="row">
+        <span class="l"><b>{changingPackage ? 'Move your library to this package' : 'Set up local management'}</b>
+          <small>{changingPackage ? 'Keep the package your library last used installed until the server starts with the new package.' : 'Prepare Manager so you can start and stop the photo server from this app.'}</small>
+        </span>
+        <button class="btn primary" disabled={busy || !native} onclick={prepareSelected}>{changingPackage ? 'Review package change' : 'Prepare local Manager'}</button>
+      </div>
     {/if}
     {#if view?.state === 'manager-ready'}
       <div class="row">
         <span class="ic" aria-hidden="true"><Icon name="server" /></span>
-        <span class="l"><b>Management is listening at {view.origin}</b><small role="status">{authorized ? 'Start your server using the controls below, then open Photos. For a new library, Photos guides you through creating your first administrator. Your Photos account is separate from your Manager password.' : 'The photo server has not been started by this setup step.'}</small></span>
+        <span class="l"><b>{authorized ? 'Start your photo library' : 'Authorize local management'}</b><small role="status">{authorized ? 'Start your server using the controls below, then open Photos. For a new library, Photos guides you through creating your first administrator. Your Photos account is separate from your Manager password.' : 'The photo server has not been started by this setup step.'}</small></span>
         {#if authorized}<button class="btn primary" disabled={busy || !native} onclick={photos}><Icon name="open" />Open local Photos</button>{/if}
       </div>
       {#if !authorized}
@@ -176,4 +225,15 @@
     {/if}
   </div>
   <p class="foot">{profilePending ? profileCopy.quit : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}{view?.state === 'manager-ready' && !authorized ? ' Keep this password for recovery. The app saves a separate management grant in your secure credential store.' : ''}</p>
-</div>
+</section>
+
+{#if packageChange}
+  <Sheet title="Move this library to another package?" kind="warning" onclose={() => { packageChange = null; }} onsubmit={confirmPackageChange}>
+    {#if libraryPackage?.version && packageChange.version}<p>Current Library {libraryPackage.version} → Library {packageChange.version}</p>{/if}
+    <p>Moving to a newer package keeps your photos and saved sign-in. Once the library starts with the new package, it cannot go back to an older one.</p>
+    {#snippet actions()}
+      <button class="btn" type="button" onclick={() => { packageChange = null; }}>Cancel</button>
+      <button class="btn primary" type="submit">Continue with this package</button>
+    {/snippet}
+  </Sheet>
+{/if}
