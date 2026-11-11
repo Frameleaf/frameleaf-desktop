@@ -196,6 +196,7 @@ pub fn media_move_owner() -> Result<(), String> {
         manifest_sha256: String,
         request: CutoverRequest,
         decision: Option<Decision>,
+        reviewed_backup: Option<serde_json::Value>,
     }
 
     let raw = line(&mut BufReader::new(std::io::stdin()), 16 * 1024)?;
@@ -209,6 +210,9 @@ pub fn media_move_owner() -> Result<(), String> {
         return Err("host_media_move_invalid".into());
     }
     native_runtime::absolute_directory(&request.state)?;
+    if request.decision.is_some() && request.reviewed_backup.is_some() {
+        return Err("host_media_move_invalid".into());
+    }
     crate::host_storage::check_cleanup(&request.state)?;
     separate_paths(&request.candidate, &request.state)?;
     let _code_lease = crate::package_lease::CodeLease::acquire(&request.candidate)?;
@@ -222,6 +226,7 @@ pub fn media_move_owner() -> Result<(), String> {
         &request.installation_id,
         &device,
         request.decision,
+        request.reviewed_backup,
         || false,
     )?)
 }

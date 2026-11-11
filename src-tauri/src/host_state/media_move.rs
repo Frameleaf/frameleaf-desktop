@@ -595,6 +595,7 @@ impl CutoverRequest {
         installation_id: &str,
         device: &DeviceIdentity,
         decision: Option<Decision>,
+        reviewed_backup: Option<serde_json::Value>,
         cancelled: impl Fn() -> bool,
     ) -> Result<serde_json::Value, String> {
         if self.protocol_version != 1
@@ -683,6 +684,9 @@ impl CutoverRequest {
             return Err(CHANGED.into());
         }
         if activation::read_record(&owner.root, MEDIA_MOVE)?.is_none() {
+            if reviewed_backup.is_some() {
+                return Err(INVALID.into());
+            }
             let previous = intent.as_ref().ok_or(INVALID)?;
             if current != expected(previous) {
                 return Err(CHANGED.into());
@@ -695,6 +699,16 @@ impl CutoverRequest {
             return Ok(complete(output, previous));
         }
         approval.require_fence(&owner)?;
+        if let Some(backup) = reviewed_backup {
+            let safety: SafetySnapshot = serde_json::from_value(backup).map_err(|_| INVALID)?;
+            if safety != review.backup
+                || intent.is_some()
+                || approval.has_rollback(&journal, device)?
+            {
+                return Err(INVALID.into());
+            }
+            verify_backup(&owner, source_marker, &review.library_id, &safety)?;
+        }
         let Some(decision) = decision else {
             output["state"] = serde_json::json!("selected-fenced");
             output["writerFence"] = serde_json::json!("held");
@@ -1137,7 +1151,34 @@ mod tests {
         let owner = Owner::acquire(&f.profile, true).unwrap();
         request
             .clone()
-            .apply_or_inspect(owner, ID, &f.device, decision, || false)
+            .apply_or_inspect(owner, ID, &f.device, decision, None, || false)
+    }
+
+    #[test]
+    fn admission_requires_the_signed_backup_and_reads_the_retained_bytes_again() {
+        let f = Fixture::new();
+        let selected = selected(&f);
+        let inspect = |backup: serde_json::Value| {
+            let owner = Owner::acquire(&f.profile, true).unwrap();
+            selected
+                .clone()
+                .apply_or_inspect(owner, ID, &f.device, None, Some(backup), || false)
+        };
+        let held = inspect(f.backup.clone()).unwrap();
+        assert_eq!(held["writerFence"], "held");
+        let mut different = f.backup.clone();
+        different["snapshotId"] = serde_json::json!("0".repeat(64));
+        assert!(inspect(different).is_err());
+        fs::write(
+            f.profile
+                .join("restore-safety")
+                .join(BACKUP)
+                .join("database.dump"),
+            b"invalid",
+        )
+        .unwrap();
+        assert!(inspect(f.backup.clone()).is_err());
+        f.assert_fenced();
     }
 
     #[test]
