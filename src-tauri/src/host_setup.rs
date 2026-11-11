@@ -26,6 +26,41 @@ pub(crate) struct View {
     profile_requires_authorization: bool,
     companion_platform: Option<&'static str>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Compatibility {
+    Verified,
+    Unknown,
+    Refused,
+}
+impl Compatibility {
+    fn from_check(result: Result<(), String>) -> Self {
+        match result.as_ref().map_err(String::as_str) {
+            Ok(()) => Self::Verified,
+            Err(
+                "host_install_record_invalid"
+                | "host_install_controller_changed"
+                | "host_install_runtime_changed"
+                | "host_signature_invalid"
+                | "host_manifest_invalid"
+                | "host_manifest_incompatible"
+                | "host_component_missing"
+                | "host_package_state_invalid"
+                | "native_manager_unprotected"
+                | "runtime_store_file_invalid"
+                | "runtime_path_invalid"
+                | "runtime_root_invalid"
+                | "runtime_link_forbidden"
+                | "runtime_size_invalid"
+                | "runtime_artifact_invalid"
+                | "runtime_inventory_mismatch"
+                | "runtime_artifact_changed",
+            ) => Self::Refused,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
 impl Default for View {
     fn default() -> Self {
         Self {
@@ -118,6 +153,35 @@ impl HostSetup {
         }
         Ok(self.snapshot())
     }
+    /// Inspect only the selected installed package. Profile and runtime startup remain separate.
+    pub(crate) async fn compatibility(
+        &self,
+        manifest: String,
+        controller: String,
+    ) -> Compatibility {
+        let Ok(_owner) = self.owner.try_lock() else {
+            return Compatibility::Unknown;
+        };
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                let record = Installation::read(&manifest)?;
+                if record.controller_sha256 != controller {
+                    return Err("host_package_selection_changed".into());
+                }
+                verify_installed_package(&record)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let _ = (manifest, controller);
+                Err("host_install_platform_unsupported".into())
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err("host_package_check_unavailable".into()));
+        Compatibility::from_check(result)
+    }
+
     pub(crate) async fn provision(&self, manifest: String) -> Result<View, String> {
         #[cfg(target_os = "linux")]
         {
@@ -128,8 +192,11 @@ impl HostSetup {
         #[cfg(windows)]
         {
             let record = Installation::read(&manifest)?;
-            self.provision_record(record, crate::windows_host_profile::prepare)
-                .await
+            self.provision_record(record, |record| {
+                verify_installed_package(record)?;
+                crate::windows_host_profile::prepare(record)
+            })
+            .await
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -500,6 +567,15 @@ fn verified(
         return Err("host_install_runtime_changed".into());
     }
     Ok((layout, runtime))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn verify_installed_package(record: &Installation) -> Result<(), String> {
+    let layout = record.layout()?;
+    let _lease = crate::package_lease::CodeLease::acquire_existing(&layout.runtime)?;
+    let (_, runtime) = verified(record)?;
+    runtime.manager_programs()?;
+    Ok(())
 }
 
 /// The Manager configuration for a verified package and this account's profile paths.
@@ -1109,6 +1185,33 @@ mod tests {
         require_leaf(&root).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
+    #[test]
+    fn compatibility_reports_unknown_without_positive_evidence() {
+        assert_eq!(Compatibility::from_check(Ok(())), Compatibility::Verified);
+        for code in [
+            "host_manifest_incompatible",
+            "host_signature_invalid",
+            "runtime_artifact_changed",
+            "native_manager_unprotected",
+        ] {
+            assert_eq!(
+                Compatibility::from_check(Err(code.into())),
+                Compatibility::Refused
+            );
+        }
+        for code in [
+            "host_package_selection_changed",
+            "host_package_busy",
+            "host_package_maintenance",
+            "runtime_store_read_failed",
+        ] {
+            assert_eq!(
+                Compatibility::from_check(Err(code.into())),
+                Compatibility::Unknown
+            );
+        }
+    }
+
     #[test]
     fn profile_setup_capability_survives_lifecycle_transitions() {
         let setup = HostSetup::default();
