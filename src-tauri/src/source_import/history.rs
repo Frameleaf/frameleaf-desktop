@@ -160,7 +160,32 @@ fn record(
     let _guard = ARCHIVE.lock().map_err(|_| "source_history_unavailable")?;
     crate::runtime_store::private_directory(&base.join("photo-import-history"))?;
     crate::runtime_store::private_directory(&journal.root)?;
-    let mut history = read(&journal, &scope, identity)?;
+    let mut history = match read(&journal, &scope, identity) {
+        Err(code)
+            if matches!(
+                code.as_str(),
+                "source_history_invalid" | "source_journal_invalid"
+            ) =>
+        {
+            let path = journal.root.join(FILE);
+            if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                return Err(code);
+            }
+            fs::rename(
+                &path,
+                journal
+                    .root
+                    .join(format!("history-invalid-{}.json", uuid::Uuid::new_v4())),
+            )
+            .map_err(|_| "source_history_unavailable")?;
+            eprintln!("Desktop preserved an unreadable import history archive");
+            Archive {
+                scope,
+                entries: Vec::new(),
+            }
+        }
+        other => other?,
+    };
     let entry = entry.retired();
     if history.entries.contains(&entry) {
         return Ok(());
@@ -178,16 +203,18 @@ pub(super) fn completed_watch(
     identity: &DeviceIdentity,
     manifest: &Manifest,
     cursor: &Cursor,
-) -> Result<(), String> {
-    if cursor.state == "complete" {
-        record(
+) {
+    if cursor.state == "complete"
+        && record(
             base,
             saved,
             identity,
             Entry::from_run(Kind::Watch, manifest, cursor, false),
-        )?;
+        )
+        .is_err()
+    {
+        eprintln!("Desktop could not retain an import history summary");
     }
-    Ok(())
 }
 
 fn current_entry(
@@ -267,7 +294,12 @@ pub(crate) async fn photo_import_history(
     let base = crate::import_base(&app)?;
     let identity = credentials::identity()?;
     let scope = scope(saved, &identity)?;
-    let mut entries = read(&archive(&base, &scope), &scope, &identity)?.entries;
+    let mut entries = read(&archive(&base, &scope), &scope, &identity)
+        .map(|history| history.entries)
+        .unwrap_or_else(|_| {
+            eprintln!("Desktop could not read archived import history");
+            Vec::new()
+        });
     let folder = app.state::<SourceJobs>();
     let drops = app.state::<crate::drop_import::DropImport>();
     for jobs in [&*folder, &drops.jobs] {
@@ -383,8 +415,8 @@ mod tests {
         let (watched, mut complete) = run();
         complete.position = 1;
         complete.state = "complete".into();
-        completed_watch(&base, &saved, &identity, &watched, &complete).unwrap();
-        completed_watch(&base, &saved, &identity, &watched, &complete).unwrap();
+        completed_watch(&base, &saved, &identity, &watched, &complete);
+        completed_watch(&base, &saved, &identity, &watched, &complete);
         let (drop, interrupted) = run();
         record(
             &base,
@@ -420,6 +452,27 @@ mod tests {
             .is_empty());
         assert!(read(&journal, &other_scope, &identity).is_err());
         assert!(read(&journal, &current_scope, &DeviceIdentity::generate()).is_err());
+        fs::write(journal.root.join(FILE), b"invalid history bytes").unwrap();
+        assert!(read(&journal, &current_scope, &identity).is_err());
+        completed_watch(&base, &saved, &identity, &watched, &complete);
+        assert_eq!(
+            read(&journal, &current_scope, &identity)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        let retained = fs::read_dir(&journal.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("history-invalid-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(retained).unwrap(), b"invalid history bytes");
         fs::remove_dir_all(base).unwrap();
     }
 }

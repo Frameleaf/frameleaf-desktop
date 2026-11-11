@@ -230,7 +230,7 @@ pub(super) async fn run(
                 if let Ok(Some((manifest, cursor))) =
                     history::snapshot(&batch, saved, consent, identity)
                 {
-                    history::completed_watch(base, saved, identity, &manifest, &cursor)?;
+                    history::completed_watch(base, saved, identity, &manifest, &cursor);
                 }
                 backfill = false;
             }
@@ -270,7 +270,7 @@ pub(super) async fn run(
             if cursor.state != "complete" {
                 return Err("source_run_terminal".into());
             }
-            history::completed_watch(base, saved, identity, &manifest, &cursor)?;
+            history::completed_watch(base, saved, identity, &manifest, &cursor);
             backfill = false;
             let keys = manifest
                 .files
