@@ -42,7 +42,7 @@ export type ServerStorage = {
 export type VersionCheck = { checkedAt?: string | null; releaseVersion?: string | null };
 export type AttentionItem = {
   id: string; kind: 'backup' | 'storage' | 'work' | 'version' | string; reason: string; level: 'now' | 'soon' | string; since?: string | null;
-  storage?: { availableBytes: number; totalBytes: number; usedPercent: number } | null;
+  storage?: { drive?: string; availableBytes: number; totalBytes: number; usedPercent: number } | null;
   backup?: { place: string | null; lastSuccessAt: string | null; days: number | null } | null;
   work?: { count: number; queues: { name: string; count: number }[] } | null;
   version?: { current: string; available: string } | null;
