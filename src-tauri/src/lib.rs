@@ -745,6 +745,8 @@ pub fn run() {
             photo_source_status,
             revoke_photo_source,
             photo_import_status,
+            source_import::history::photo_import_history,
+            source_import::history::retry_photo_import,
             prepare_photo_import,
             control_photo_import,
             drop_import::preview_photo_drop,
@@ -1235,8 +1237,12 @@ async fn revoke_photo_source(
     app.state::<source_import::SourceJobs>().stop().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
+    if let Ok(base) = import_base(&app) {
+        source_import::history::retire(&base, saved, &app.state::<source_import::SourceJobs>());
+    }
     // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
     credentials::delete(source_consent::CREDENTIAL)?;
+    let _ = app.emit_to("main", "photo-import-history", ());
     tray::set_import_status(&app, None);
     app.state::<source_consent::SourceConsent>().clear()?;
     match consent {
@@ -1291,6 +1297,7 @@ async fn prepare_photo_import(
         .prepare(&import_base(&app)?, saved)
         .await?;
     tray::set_import_status(&app, Some(&status));
+    let _ = app.emit_to("main", "photo-import-history", ());
     Ok(status)
 }
 #[tauri::command]
@@ -1335,6 +1342,7 @@ async fn control_photo_import(
         _ => Err("source_control_invalid".into()),
     }?;
     tray::set_import_status(&app, Some(&status));
+    let _ = app.emit_to("main", "photo-import-history", ());
     Ok(status)
 }
 

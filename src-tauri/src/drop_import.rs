@@ -84,7 +84,7 @@ struct Plan {
 
 pub(crate) struct DropImport {
     pending: Mutex<Pending>,
-    jobs: SourceJobs,
+    pub(crate) jobs: SourceJobs,
 }
 
 impl Default for DropImport {
@@ -467,6 +467,7 @@ pub(crate) async fn approve_photo_drop(
         consent.register(saved, &identity).await?;
         credentials::save(CREDENTIAL, &consent)?;
     }
+    let _ = app.emit_to("main", "photo-import-history", ());
     status(&app, saved, &consent)
 }
 
@@ -510,6 +511,7 @@ pub(crate) async fn control_photo_drop(
         "remove" => {
             drops.stop().await;
             let consent = credentials::load::<Consent>(CREDENTIAL)?;
+            crate::source_import::history::retire(&base, saved, &drops.jobs);
             credentials::delete(CREDENTIAL)?;
             if let Some(consent) = consent {
                 let _ = consent.revoke(saved, &credentials::identity()?).await;
@@ -519,6 +521,7 @@ pub(crate) async fn control_photo_drop(
         _ => Err("source_control_invalid".into()),
     }?;
     crate::tray::set_drop_status(&app, status.as_ref());
+    let _ = app.emit_to("main", "photo-import-history", ());
     Ok(status)
 }
 

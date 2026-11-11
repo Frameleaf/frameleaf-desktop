@@ -77,7 +77,14 @@ pub async fn capabilities(
     Ok(Some(caps))
 }
 pub async fn enroll(client: &Client, saved: &SavedConnection) -> Result<Enrollment, String> {
-    let identity = credentials::identity()?;
+    enroll_with_identity(client, saved, &credentials::identity()?).await
+}
+
+pub(crate) async fn enroll_with_identity(
+    client: &Client,
+    saved: &SavedConnection,
+    identity: &crate::connection::DeviceIdentity,
+) -> Result<Enrollment, String> {
     let dto = identity.enrollment(
         &saved.server_id,
         &saved.account_id,

@@ -1001,7 +1001,7 @@ mod tests {
 
     #[tokio::test]
     async fn verified_originals_survive_restart_offline_and_partial_downloads_never_publish() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let cache = fixture.cache();
         let library = Library::connect(&fixture.saved).await.ok().unwrap();
         let plan = library.plan(fixture.album).await.ok().unwrap();
@@ -1036,7 +1036,8 @@ mod tests {
             b"original"
         );
         drop(cache);
-        fixture.stop();
+        // Keep the port reserved so another parallel test cannot answer for this Library.
+        fixture.mode.store(4, Ordering::SeqCst);
         let restored = fixture.cache();
         let access = restored
             .authorize(&fixture.saved, fixture.album, fixture.item)
