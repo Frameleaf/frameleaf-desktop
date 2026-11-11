@@ -140,6 +140,9 @@ export function backupReviewIntent(manager: ManagerView, snapshot: string, prior
 
 export type BackupRestoreIntent = BackupReviewIntent & { reviewId: string; id?: string };
 export type BackupRestoreOperation = Omit<Operation, 'kind'> & { kind: 'restore' };
+export function databaseRecoveryReady(operation: BackupRestoreOperation | null): boolean {
+  return operation?.state === 'complete' && operation.error === null && operation.completed.includes('native-restore-started');
+}
 export function backupRestoreKey(manager: ManagerView) { return `frameleaf.manager-restore:${manager.managerId}:${manager.installationId}`; }
 export function parseBackupRestoreIntent(raw: string | null, manager: ManagerView): BackupRestoreIntent | null {
   try {

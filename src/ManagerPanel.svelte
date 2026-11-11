@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
-  import { controlIntent, restoreIntent, intentKey, managerError, type Control, type Intent, type ManagerView, type ManagerStatus, type Operation, backupReviewIntent, restoreBackupReview, backupReviewKey, type BackupEntry, type BackupReviewIntent, type BackupReview, createBackupRestoreIntent, parseBackupRestoreIntent, backupRestoreKey, type BackupRestoreIntent, type BackupRestoreOperation } from './manager-state';
+  import { controlIntent, restoreIntent, intentKey, managerError, type Control, type Intent, type ManagerView, type ManagerStatus, type Operation, backupReviewIntent, restoreBackupReview, backupReviewKey, type BackupEntry, type BackupReviewIntent, type BackupReview, createBackupRestoreIntent, parseBackupRestoreIntent, backupRestoreKey, databaseRecoveryReady, type BackupRestoreIntent, type BackupRestoreOperation } from './manager-state';
   import { countdown, formatWhen, formatDate, relativeTime, shortId, fingerprintShort, hostOf } from './ui-state';
   import Icon from './Icon.svelte';
   import Sheet from './Sheet.svelte';
@@ -51,6 +51,7 @@
   let recovery = $state<BackupReview | null>(null);
   let restorePending = $state<BackupRestoreIntent | null>(null);
   let restoreOperation = $state<BackupRestoreOperation | null>(null);
+  const databaseReady = $derived(databaseRecoveryReady(restoreOperation));
   let restoreConfirmation = $state(false);
   let restoreApproved = $state(false);
   let restoreAuthorization = $state<'send' | 'resume' | null>(null);
@@ -285,11 +286,11 @@
     await sendBackupRestore();
   }
   function finishBackupRestore() {
-    if (!manager || restoreOperation?.state !== 'complete') return;
+    if (!manager || !databaseReady) return;
     try { localStorage.removeItem(backupRestoreKey(manager)); }
     catch { throw Error('manager_local_state_unavailable'); }
     restorePending = null; restoreOperation = null;
-    clearReview(); notice = 'Database restore completed and the server reported ready. Open Photos to check your library.';
+    clearReview(); notice = 'Manager verified the database and started the server. Verify original photos and videos separately before relying on the recovered library.';
   }
   function reviewBackup(id: string) {
     selectedBackup = id;
@@ -300,7 +301,7 @@
   }
   function reviewPill(id: string): { label: string; tone: string } {
     if (operation && operation.kind === 'backup' && operation.state !== 'complete' && backups[0]?.id === id) return { label: 'In progress', tone: 'wait' };
-    if (restorePending?.snapshot === id) return { label: restoreOperation?.state === 'complete' ? 'Restored' : 'Restoring', tone: 'wait' };
+    if (restorePending?.snapshot === id) return databaseReady ? { label: 'Database restored', tone: 'ok' } : { label: restoreOperation && restoreOperation.state !== 'running' ? 'Needs attention' : 'Restoring', tone: 'wait' };
     if (recoveryIntent?.snapshot !== id) return { label: 'Not reviewed', tone: 'off' };
     if (!recovery) return { label: 'Review not checked', tone: 'wait' };
     if (recovery.state === 'preparing') return { label: 'Reviewing', tone: 'wait' };
@@ -336,6 +337,15 @@
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to pair securely with Manager.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status"><p>{notice}</p><button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
+    {#if focus === 'backups' || embedded || manager}
+      <div>
+        <div class="group-head"><h2 class="group-title">Library recovery</h2></div>
+        <div class="group">
+          <div class="row top"><span class="l"><b>Recover the database</b><small>Use Manager if your original files are intact and you need an earlier database. {manager ? 'Load backups, choose the date you want, and review that recovery point.' : 'Pair with Manager and allow backup recovery to review available recovery points.'} Manager verifies the backup and prepares a separate database before switching this installation to it.</small></span></div>
+          <div class="row top"><span class="l"><b>Recover missing photos and videos</b><small>Use a separate media backup from the matching recovery point. With your backup tool, restore to an empty folder or drive outside the live library. Compare the recovered files with the backup inventory and checksums where available. Open full-size originals and play recovered videos from that location before moving any files into service.</small></span></div>
+        </div>
+      </div>
+    {/if}
     {#if manager}
       <div>
         <div class="group">
@@ -386,7 +396,7 @@
           {#if !manager.scopes.includes('restore')}
             <div class="empty">Backup recovery permission was not granted. To review and restore backups, disconnect Manager and pair again with recovery permission.</div>
           {:else if !backupsChecked}
-            <div class="empty">Load the list to review a backup before recovery.</div>
+            <div class="empty">Load backups to select a database recovery point.</div>
           {:else if backups.length === 0}
             <div class="empty">No database backups were found.</div>
           {:else}
@@ -402,7 +412,7 @@
                     <td><span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span></td>
                     <td class="right">
                       {#if reviewing && recovery?.state === 'prepared' && !recovery.requiresRuntimeChange && !restorePending}
-                        <button class="btn" disabled={busy || expired || deviceChanged || active} onclick={openRestore}>Restore…</button>
+                        <button class="btn" disabled={busy || expired || deviceChanged || active} onclick={openRestore}>Restore database…</button>
                       {:else if reviewing && (!recovery || recovery.state === 'preparing')}
                         <button class="btn" disabled={busy || expired || deviceChanged} onclick={() => perform(checkReview, true)}>Check</button>
                       {:else if reviewing}
@@ -421,7 +431,7 @@
               <span class="ic" aria-hidden="true"><Icon name="backup" /></span>
               <span class="l">
                 <b>Review of backup <code>{shortId(recoveryIntent.snapshot)}</code></b>
-                <small role="status">{!recovery ? 'Review outcome has not been checked.' : recovery.state === 'preparing' ? 'Backup review is in progress. Check again when ready.' : recovery.state === 'prepared' ? `Backup review is ready. Created ${formatWhen(recovery.createdAt, now)}. ${recovery.requiresRuntimeChange ? `This backup requires a runtime change from ${recovery.targetRelease} to ${recovery.release}.` : `Backup metadata matches ${recovery.targetRelease}.`} Review valid until ${new Date(recovery.expires).toLocaleTimeString()}.` : recovery.state === 'expired' ? 'This review expired. Start a new review.' : recovery.state === 'interrupted' ? 'Manager restarted before the review finished. Start a new review.' : 'The backup could not be verified. Check the backup before starting another review.'}</small>
+                <small role="status">{!recovery ? 'Review outcome has not been checked.' : recovery.state === 'preparing' ? 'Backup review is in progress. Check again when ready.' : recovery.state === 'prepared' ? `Database backup verified. Created ${formatWhen(recovery.createdAt, now)}. ${recovery.requiresRuntimeChange ? `This backup requires a runtime change from ${recovery.targetRelease} to ${recovery.release}.` : `Backup metadata matches ${recovery.targetRelease}.`} Coverage is database only. Review valid until ${new Date(recovery.expires).toLocaleTimeString()}.` : recovery.state === 'expired' ? 'This review expired. Start a new review.' : recovery.state === 'interrupted' ? 'Manager restarted before the review finished. Start a new review.' : 'The backup could not be verified. Check the backup before starting another review.'}</small>
               </span>
               <button class="btn" disabled={busy || expired || deviceChanged} onclick={() => perform(checkReview, true)}>Check review</button>
               {#if recovery && recovery.state !== 'preparing'}<button class="btn quiet" disabled={busy || !!restorePending} onclick={() => perform(async () => clearReview())}>Choose another backup</button>{/if}
@@ -432,12 +442,12 @@
               <span class="ic" aria-hidden="true"><Icon name="restart" /></span>
               <span class="l">
                 <b>Database restore from <code>{shortId(restorePending.snapshot)}</code></b>
-                <small role="status">{!restoreOperation ? 'Restore outcome has not been checked. Keep this request to recover its status.' : restoreOperation.state === 'complete' ? 'Database restore completed. The server reported ready.' : restoreOperation.state === 'running' ? 'Database restore is running. Keep the computer and server connected.' : 'Database restore needs attention. Keep this request and check its state before resuming.'}{restoreOperation?.step ? ` · ${Object.hasOwn(steps, restoreOperation.step) ? steps[restoreOperation.step] : 'Checking database restore progress'}` : ''}</small>
+                <small role="status">{!restoreOperation ? 'Restore outcome has not been checked. Keep this request to recover its status.' : databaseReady ? 'Manager verified the database and started the server. Check original photos and videos separately.' : restoreOperation.state === 'running' ? 'Database restore is running. Keep the computer and server connected.' : 'Manager has yet to confirm a successful database restore. Keep this request and check Manager before proceeding.'}{restoreOperation?.state === 'running' && restoreOperation.step ? ` · ${Object.hasOwn(steps, restoreOperation.step) ? steps[restoreOperation.step] : 'Checking database restore progress'}` : ''}</small>
               </span>
-              <span class="pill {restoreOperation?.state === 'complete' ? 'ok' : restoreOperation && ['failed', 'interrupted'].includes(restoreOperation.state) ? 'bad' : 'wait'}"><i aria-hidden="true"></i>{restoreOperation?.state === 'complete' ? 'Completed' : restoreOperation?.state === 'running' ? 'Running' : restoreOperation ? 'Needs attention' : 'Unchecked'}</span>
+              <span class="pill {databaseReady ? 'ok' : restoreOperation && restoreOperation.state !== 'running' ? 'bad' : 'wait'}"><i aria-hidden="true"></i>{databaseReady ? 'Database restored' : restoreOperation?.state === 'running' ? 'Running' : restoreOperation ? 'Needs attention' : 'Unchecked'}</span>
               <button class="btn" disabled={busy || expired || deviceChanged} onclick={() => perform(sendBackupRestore, false, 'send')}>Check</button>
               {#if restoreOperation && ['failed','interrupted'].includes(restoreOperation.state)}<button class="btn" disabled={busy || expired || deviceChanged} onclick={() => perform(resumeBackupRestore, false, 'resume')}>Resume</button>{/if}
-              {#if restoreOperation?.state === 'complete'}<button class="btn primary" disabled={busy} onclick={() => perform(async () => finishBackupRestore())}>Finish</button>{/if}
+              {#if databaseReady}<button class="btn primary" disabled={busy} onclick={() => perform(async () => finishBackupRestore())}>Done with database restore</button>{/if}
             </div>
           {/if}
         </div>
@@ -508,8 +518,8 @@
 {/if}
 {#if restoreConfirmation && !restorePending && recoveryIntent}
   <Sheet title="Restore the database for “{library}”?" kind="danger" {busy} onclose={() => { restoreConfirmation = false; restoreApproved = false; }} onsubmit={() => { void perform(confirmBackupRestore, false, 'send'); }}>
-    <p>This replaces the current database with backup {shortId(recoveryIntent.snapshot)}. The server stops while the backup is restored. A verified safety backup and the original database are retained.</p>
-    <p>Photos and videos are not restored or deleted. Changes made after this database backup will no longer appear in the restored database.</p>
+    <p>Manager will prepare a separate database from backup {shortId(recoveryIntent.snapshot)}{recovery?.state === 'prepared' ? ` from ${formatWhen(recovery.createdAt, now)}` : ''}. After verification it switches “{library}” to that database. The server stops during the switch. Manager keeps the previous database and a verified safety backup.</p>
+    <p>This action covers the database only. Recover missing photos and videos separately. Changes made after this recovery point will be absent from the restored database.</p>
     <label class="check"><input type="checkbox" bind:checked={restoreApproved} required disabled={busy} />I understand and want to restore this database backup.</label>
     {#snippet actions()}
       <button class="btn" type="button" disabled={busy} onclick={() => { restoreConfirmation = false; restoreApproved = false; }}>Cancel</button>
