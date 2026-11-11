@@ -367,12 +367,14 @@ async fn restore_connection(
     else {
         // The saved sign-in is gone: drop any connection still held so the window and the
         // background agree (the jobs above already stopped).
-        let held = current.take().is_some();
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
-            .await;
+        let held = current.take();
+        let offline = app.state::<offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        if let Some(saved) = held.as_ref() {
+            let _ = offline.purge(&app, saved).await;
+        }
         drop(current);
-        if held {
+        if held.is_some() {
             tray::refresh(&app).await;
         }
         return Ok(None);
@@ -385,9 +387,9 @@ async fn restore_connection(
             error.as_str(),
             "server_http_401" | "server_http_403" | "account_identity_changed"
         ) {
-            app.state::<offline_albums::OfflineAlbums>()
-                .clear(&app)
-                .await;
+            let offline = app.state::<offline_albums::OfflineAlbums>();
+            offline.deactivate().await;
+            let _ = offline.purge(&app, &saved).await;
         }
         return Err(error);
     }
@@ -397,9 +399,9 @@ async fn restore_connection(
     credentials::migrate_source_approvals(&saved)?;
     let mut view = prepare(&mut saved).await;
     if view.state == "identity-changed" {
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
-            .await;
+        let offline = app.state::<offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        let _ = offline.purge(&app, &saved).await;
     }
     if view.state == "preparing"
         && view.features.worker_session
@@ -473,12 +475,19 @@ async fn sign_out(
             result => result?,
         },
     };
+    let offline = app.state::<offline_albums::OfflineAlbums>();
+    offline.deactivate().await;
+    let offline_cleared = match saved.as_ref() {
+        Some(saved) => offline.purge(&app, saved).await.is_ok(),
+        None => true,
+    };
     let result = lifecycle::finish_sign_out(
         async {
             let worker = credentials::delete("worker-session").is_ok();
-            let approved = saved
-                .as_ref()
-                .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
+            let approved = offline_cleared
+                && saved
+                    .as_ref()
+                    .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
             let sources = credentials::delete_source_approvals(saved.as_ref());
             let connection = approved && credentials::delete("connection").is_ok();
             worker && connection && sources
@@ -493,16 +502,9 @@ async fn sign_out(
     )
     .await;
     *current = None;
-    let offline = app
-        .state::<offline_albums::OfflineAlbums>()
-        .clear(&app)
-        .await;
     drop(current);
     tray::refresh(&app).await;
-    Ok(lifecycle::SignOutResult {
-        local_cleared: result.local_cleared && offline,
-        ..result
-    })
+    Ok(result)
 }
 
 async fn revoke_photo_connection(saved: &SavedConnection) -> bool {

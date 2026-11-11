@@ -273,13 +273,9 @@ async fn activate(
     if let Some(previous) = previous {
         credentials::migrate_source_approvals(previous)?;
     }
-    if !app
-        .state::<crate::offline_albums::OfflineAlbums>()
-        .clear(app)
-        .await
-    {
-        return Err("library_offline_clear_failed".into());
-    }
+    app.state::<crate::offline_albums::OfflineAlbums>()
+        .deactivate()
+        .await;
     let photos_open = app.get_webview_window("photos").is_some();
     app.state::<crate::source_import::SourceJobs>().park().await;
     app.state::<crate::drop_import::DropImport>().stop().await;
@@ -350,6 +346,7 @@ fn commit_activation(
 #[tauri::command]
 pub(crate) async fn remove_approved_library(
     window: WebviewWindow,
+    app: AppHandle,
     state: State<'_, DesktopState>,
     id: String,
 ) -> Result<bool, String> {
@@ -363,6 +360,9 @@ pub(crate) async fn remove_approved_library(
     }
     let mut approved = index()?;
     let saved = stored_library(&window, &approved, &id)?.ok_or("library_not_approved")?;
+    app.state::<crate::offline_albums::OfflineAlbums>()
+        .purge(&app, &saved)
+        .await?;
     credentials::delete_parked_source_approvals(&saved)?;
     forget(&id, &mut approved)?;
     let Ok(client) = crate::transport::client() else {

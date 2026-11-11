@@ -56,20 +56,23 @@ pub(crate) struct Status {
 }
 
 impl OfflineAlbums {
-    pub async fn clear(&self, app: &AppHandle) -> bool {
+    pub async fn deactivate(&self) {
         self.cancelled.send_replace(());
         self.clear_playback();
         if let Ok(mut session) = self.session.lock() {
             *session = None;
         }
         let _permit = self.operation.lock().await;
+        self.clear_playback();
         if let Ok(mut session) = self.session.lock() {
             *session = None;
         }
         self.set_progress(None);
-        app.path()
-            .app_local_data_dir()
-            .is_ok_and(|base| Cache::purge(&base).is_ok())
+    }
+
+    pub async fn purge(&self, app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
+        let _permit = self.operation.lock().await;
+        Cache::purge(&crate::import_base(app)?, saved)
     }
 
     fn clear_playback(&self) {
@@ -241,7 +244,7 @@ async fn request(
             &plan.name
         };
         let copy = format!(
-            "Keep {count} original photos or videos from “{title}” on this computer? Offline access lasts up to 24 hours after the last Library check. The cache holds up to 2 GB on this computer."
+            "Keep {count} original photos or videos from “{title}” on this computer? Offline access lasts up to 24 hours after the last Library check. Offline copies across all approved libraries share 2 GiB on this computer."
         );
         let (send, receive) = tokio::sync::oneshot::channel();
         app.dialog()
@@ -479,17 +482,19 @@ pub(crate) async fn offline_album_remove(
                 cache.remove(id)?;
             }
         }
-        None => Cache::purge(&base)?,
+        None => Cache::purge(&base, &saved)?,
     }
     native.set_progress(None);
     Ok(())
 }
 
 #[tauri::command]
-pub(crate) fn offline_album_browse_library(
+pub(crate) async fn offline_album_browse_library(
     window: WebviewWindow,
     app: AppHandle,
+    state: State<'_, DesktopState>,
 ) -> Result<(), String> {
+    let _active = state.0.lock().await;
     require_local_photos(&window)?;
     let saved = app.state::<OfflineAlbums>().saved()?;
     crate::open_photos_window(&app, &saved)

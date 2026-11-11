@@ -1,7 +1,6 @@
 // User-facing copy for the connection and cloud-account error codes the Rust side returns.
 const messages: Record<string, string> = {
   media_copy_exit_blocked: 'Finish or cancel the media copy, or wait for the update before quitting Frameleaf.',
-  library_offline_clear_failed: 'The previous library’s offline copies could not be cleared. Try switching again.',
   local_host_active: 'Stop local management before connecting to another server.',
   worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
   worker_resume_offline: 'Your server did not answer. Check that it is online, then try Resume again.',
@@ -33,6 +32,7 @@ const messages: Record<string, string> = {
   library_already_active: 'This library is already active.',
   library_already_approved: 'This library is already approved. Switch to it from the library list.',
   library_active_sign_out_required: 'Sign out to remove the active library from this computer.',
+  offline_album_storage_unavailable: 'Desktop could not access this library’s offline copies. Check local storage and try again.',
   library_not_approved: 'This library is no longer approved on this computer.',
   library_photos_clear_failed: 'Desktop could not clear the previous Photos window. Close it and try again.',
   sign_out_before_switching_servers: 'Sign out before connecting to another server.',

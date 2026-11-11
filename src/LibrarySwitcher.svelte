@@ -66,7 +66,7 @@
   {busy} onclose={onclose} onsubmit={submit}
 >
   {#if removing}
-    <p>Remove {removing.name} at {removing.server} from this computer? Its saved sign-in and import permissions will be removed.</p>
+    <p>Remove {removing.name} at {removing.server} from this computer? Desktop removes its saved sign-in, import permissions, and offline copies.</p>
   {:else if adding}
     <p>Sign in to approve this library on this computer. Switching closes Photos and stops imports and AI work for the previous library.</p>
     <div class="form">

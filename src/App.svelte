@@ -157,7 +157,7 @@
       try { localStorage.removeItem(lastPageKey); } catch { /* Sign-out still succeeds. */ }
       libraryRevision += 1;
       summaryRequest += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
-      notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
+      notice = !result.localCleared ? 'Desktop could not clear the saved sign-in or offline copies. Check local storage and the secure credential store, then try again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
       void tick().then(focusContent);
     } catch (error) { failure = explain(error); }
@@ -291,7 +291,7 @@
 {#if librariesOpen}<LibrarySwitcher onclose={() => { librariesOpen = false; }} onactivate={connected} />{/if}
 {#if signOutSheet}
   <Sheet title={connection ? `Sign out of “${hostOf(connection.server)}”?` : 'Clear the saved sign-in?'} kind="warning" {busy} onclose={() => { signOutSheet = false; }} onsubmit={signOut}>
-    <p>Desktop removes the saved sign-in for this library and asks the server to revoke this computer’s session. Photo imports and AI processing for this library stop.</p>
+    <p>Desktop removes the saved sign-in for this library and asks the server to revoke this computer’s session. Photo imports and AI processing for this library stop, and Desktop removes its offline copies.</p>
     {#snippet actions()}
       <button class="btn" type="button" disabled={busy} onclick={() => { signOutSheet = false; }}>Cancel</button>
       <button class="btn danger" type="submit" disabled={busy || !native}>{busy ? 'Signing out…' : 'Sign Out'}</button>

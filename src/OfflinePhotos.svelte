@@ -20,9 +20,10 @@
   const album = $derived(albums.find(({ id }) => id === albumId));
   const errorMessages: Record<string, string> = {
     sign_in_required: 'Sign in to Frameleaf to open offline albums.',
-    offline_album_other_library: 'Offline storage belongs to another Library account. Return to that account to open its albums, or clear offline storage to start over on this computer.',
+    offline_album_other_library: 'The offline storage key does not match this Library account. Clear this Library’s offline storage to start over.',
+    offline_album_storage_unavailable: 'Frameleaf could not open this Library’s offline storage. You can clear it here and keep the albums again from Photos.',
     offline_album_access_changed: 'Library access or album membership changed. Keep the album again from Photos if it is still available.',
-    offline_album_storage_limit: 'The download exceeds the 2 GB offline cache.',
+    offline_album_storage_limit: 'This download exceeds the 2 GiB shared by offline copies from all approved libraries.',
     offline_album_original_changed: 'An original changed during the download. Open the album in Photos and try again.',
     offline_album_cancelled: 'Download cancelled.',
     offline_library_unreachable: 'Frameleaf could not reach the Library to verify this album.',
