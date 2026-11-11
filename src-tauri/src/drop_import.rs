@@ -408,12 +408,14 @@ pub(crate) async fn control_photo_drop(
         return Ok(None);
     }
     let base = crate::import_base(&app)?;
-    match action.as_str() {
-        "resume" => drops
-            .jobs
-            .start(app.clone(), base, saved.clone())
-            .await
-            .map(Some),
+    let status = match action.as_str() {
+        "resume" => {
+            return drops
+                .jobs
+                .start(app.clone(), base, saved.clone())
+                .await
+                .map(Some)
+        }
         "pause" | "cancel" => drops
             .jobs
             .control(&base, saved, action == "cancel")
@@ -430,7 +432,9 @@ pub(crate) async fn control_photo_drop(
             Ok(None)
         }
         _ => Err("source_control_invalid".into()),
-    }
+    }?;
+    crate::tray::set_drop_status(&app, status.as_ref());
+    Ok(status)
 }
 
 #[cfg(test)]

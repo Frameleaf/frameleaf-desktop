@@ -930,6 +930,8 @@ impl SourceJobs {
         watching.store(watch, Ordering::Release);
         if ordinary {
             crate::tray::set_import_status(&app, Some(&value));
+        } else {
+            crate::tray::set_drop_status(&app, Some(&value));
         }
         // Network probes and journal I/O must not occupy an async worker.
         let task = tauri::async_runtime::spawn_blocking(move || {
@@ -940,6 +942,8 @@ impl SourceJobs {
                     }
                     if ordinary {
                         crate::tray::set_import_status(&app, Some(&value));
+                    } else {
+                        crate::tray::set_drop_status(&app, Some(&value));
                     }
                     let _ = app.emit_to(
                         "main",

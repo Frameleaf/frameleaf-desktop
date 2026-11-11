@@ -18,7 +18,8 @@ struct Items {
     server: MenuItem<Wry>,
     worker: MenuItem<Wry>,
     import: MenuItem<Wry>,
-    last_import: Option<(String, String)>,
+    last_import: Option<ImportView>,
+    last_drop: Option<ImportView>,
     photos: MenuItem<Wry>,
     toggle: MenuItem<Wry>,
     pause_hour: MenuItem<Wry>,
@@ -96,6 +97,7 @@ fn import_label(status: Option<&ImportView>) -> String {
     };
     let label = match (status.state.as_str(), status.code.as_deref()) {
         ("copying", _) => "copying",
+        ("queued", _) => "waiting for the other import",
         ("complete", _) => "finished",
         ("cancelled", _) => "cancelled",
         ("needs-attention" | "watching", Some("metered_network")) => {
@@ -145,8 +147,27 @@ fn import_notice(
     }
 }
 
-/// Reflect import progress even when the app window is hidden, and notify on terminal changes.
+/// Prefer the transfer that owns the shared upload slot, then show the pending drop.
+fn visible_import<'a>(
+    folder: Option<&'a ImportView>,
+    drop: Option<&'a ImportView>,
+) -> Option<&'a ImportView> {
+    drop.filter(|status| status.state == "copying")
+        .or_else(|| folder.filter(|status| status.state == "copying"))
+        .or(drop)
+        .or(folder)
+}
+
+/// Reflect import progress when the window is hidden and notify on terminal changes.
 pub(crate) fn set_import_status(app: &AppHandle, status: Option<&ImportView>) {
+    set_photo_status(app, status, false);
+}
+
+pub(crate) fn set_drop_status(app: &AppHandle, status: Option<&ImportView>) {
+    set_photo_status(app, status, true);
+}
+
+fn set_photo_status(app: &AppHandle, status: Option<&ImportView>, dropped: bool) {
     let Some(state) = app.try_state::<TrayState>() else {
         return;
     };
@@ -157,12 +178,28 @@ pub(crate) fn set_import_status(app: &AppHandle, status: Option<&ImportView>) {
         let Some(items) = slot.as_mut() else {
             return;
         };
-        let notice = status.and_then(|status| import_notice(items.last_import.as_ref(), status));
-        items.last_import = status.map(|status| (status.source_id.clone(), status.state.clone()));
-        let _ = items.import.set_text(import_label(status));
+        let previous = if dropped {
+            &mut items.last_drop
+        } else {
+            &mut items.last_import
+        };
+        let binding = previous
+            .as_ref()
+            .map(|value| (value.source_id.clone(), value.state.clone()));
+        let notice = status.and_then(|status| import_notice(binding.as_ref(), status));
+        *previous = status.cloned();
+        let _ = items.import.set_text(import_label(visible_import(
+            items.last_import.as_ref(),
+            items.last_drop.as_ref(),
+        )));
         notice
     };
     if let Some((title, body)) = notice {
+        let body = if dropped && title == "Photo import needs attention" {
+            "Open Frameleaf Desktop to check the dropped import.".into()
+        } else {
+            body
+        };
         let _ = app.notification().builder().title(title).body(body).show();
     }
 }
@@ -245,6 +282,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<()> {
             worker,
             import,
             last_import: None,
+            last_drop: None,
             photos,
             toggle,
             pause_hour,
@@ -448,6 +486,7 @@ pub(crate) async fn refresh(app: &AppHandle) {
     let (server, connected) = (server_label(current.as_ref()), current.is_some());
     if !connected {
         set_import_status(app, None);
+        set_drop_status(app, None);
     } else if state.items.lock().is_ok_and(|slot| {
         slot.as_ref()
             .is_some_and(|items| items.last_import.is_none())
@@ -460,8 +499,11 @@ pub(crate) async fn refresh(app: &AppHandle) {
         }) {
             let _ = state.items.lock().map(|mut slot| {
                 if let Some(items) = slot.as_mut().filter(|items| items.last_import.is_none()) {
-                    items.last_import = Some((import.source_id.clone(), import.state.clone()));
-                    let _ = items.import.set_text(import_label(Some(&import)));
+                    items.last_import = Some(import);
+                    let _ = items.import.set_text(import_label(visible_import(
+                        items.last_import.as_ref(),
+                        items.last_drop.as_ref(),
+                    )));
                 }
             });
         }
@@ -510,6 +552,31 @@ mod tests {
             device_id: None,
         };
         assert_eq!(server_label(Some(&saved)), "nas.home.arpa");
+    }
+
+    #[test]
+    fn tray_keeps_active_folder_progress_when_a_drop_is_queued() {
+        let mut folder = ImportView {
+            state: "copying".into(),
+            ..ImportView::default()
+        };
+        let drop = ImportView {
+            state: "queued".into(),
+            ..ImportView::default()
+        };
+        assert_eq!(
+            visible_import(Some(&folder), Some(&drop)).unwrap().state,
+            "copying"
+        );
+        folder.state = "watching".into();
+        assert_eq!(
+            visible_import(Some(&folder), Some(&drop)).unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            visible_import(Some(&folder), None).unwrap().state,
+            "watching"
+        );
     }
 
     #[test]
