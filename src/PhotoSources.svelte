@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from './Icon.svelte';
   import CameraSources from './CameraSources.svelte';
+  import ImportHistory from './ImportHistory.svelte';
   import Sheet from './Sheet.svelte';
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import { albumErrors, type AlbumDestination } from './import-destination';
@@ -13,9 +14,10 @@
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
-  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean; destination: AlbumDestination | null };
+  type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean; canReconnect: boolean; destination: AlbumDestination | null };
   type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
   let job = $state<CopyJob | null>(null);
+  let jobEventRevision = 0;
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowReads = $state(false);
@@ -82,8 +84,9 @@
     source_package_requires_provider: 'Apple Photos libraries need the Photos connection. Choose an ordinary folder here.',
     source_folder_unavailable: 'This folder is unavailable. Check that its drive is connected and you have access.',
     source_account_unavailable: 'This OneDrive folder moved or is unavailable. Choose its new location.',
-    source_camera_unavailable: 'This camera or card is no longer available. Reconnect it and choose it again.',
-    source_camera_changed: 'This camera or card changed after the preview. Clear the preview and choose the folder again.',
+    source_camera_unavailable: 'Reconnect the original camera or card, then choose its folder to resume.',
+    source_camera_changed: 'This folder or card does not match the approved import. Choose the original card or remove this permission to preview a new import. Verified copies stay in your library.',
+    source_camera_identity_unavailable: 'This card could not be identified safely. Remove this permission and preview it again to start a new import.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
   async function loadConsent() {
@@ -101,7 +104,12 @@
     let unlisten: UnlistenFn | undefined;
     if (native) void (async () => {
       try {
-        unlisten = await listen<CopyJob>('photo-import', event => { if (alive && event.payload.sourceId === consent?.id) job = event.payload; });
+        unlisten = await listen<CopyJob>('photo-import', event => {
+          if (alive && event.payload.sourceId === consent?.id) {
+            jobEventRevision += 1;
+            job = event.payload;
+          }
+        });
         if (!alive) { unlisten(); return; }
         await loadConsent();
         if (consent?.registered) {
@@ -126,6 +134,18 @@
     busy = true; message = '';
     try { job = await invoke<CopyJob>('control_photo_import', { action }); }
     catch (error) { message = explain(error); }
+    finally { busy = false; }
+  }
+  async function reconnectCamera() {
+    busy = true; message = '';
+    const revision = jobEventRevision;
+    try {
+      const resumed = await invoke<CopyJob | null>('reconnect_photo_camera');
+      if (resumed && jobEventRevision === revision) {
+        job = resumed;
+        message = 'Camera folder confirmed. Resuming the approved copy.';
+      }
+    } catch (error) { message = explain(error); }
     finally { busy = false; }
   }
   async function approve(retry = false) {
@@ -217,13 +237,21 @@
             {#if consent.watch && consent.registered}
               {#if watchRunning}<button class="btn" disabled={busy} onclick={() => controlCopy('watch-pause')}><Icon name="pause" />Pause Watching</button>
               {:else if job?.code !== 'source_run_terminal'}<button class="btn primary" disabled={busy || needsAllowance} onclick={() => controlCopy('watch-resume')}>Resume Watching</button>{/if}
-            {:else if canResume}<button class="btn primary" disabled={busy || (!job!.albumPending && (job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'))} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : job!.albumPending ? 'Retry Adding to Album' : 'Resume'}</button>{/if}
+            {:else if canResume}
+              <button class="btn primary" disabled={busy || (!job!.albumPending && (job!.uploadRemaining === null || job!.code === 'source_upload_budget_exhausted'))} onclick={() => controlCopy('resume')}>{job!.state === 'ready' ? `Copy ${job!.total.toLocaleString()} files` : job!.albumPending ? 'Retry Adding to Album' : 'Resume'}</button>
+              {#if consent.camera && consent.canReconnect && job!.state !== 'ready' && !job!.albumPending}
+                <button class="btn" disabled={busy || needsAllowance} onclick={reconnectCamera}>Reconnect Camera…</button>
+              {/if}
+            {/if}
             {#if !consent.watch && job?.state === 'copying'}<button class="btn" disabled={busy} onclick={() => controlCopy('pause')}><Icon name="pause" />Pause</button>{/if}
             {#if !consent.watch && job && !['complete', 'cancelled'].includes(job.state)}<button class="btn quiet" disabled={busy} onclick={() => controlCopy('cancel')}>Cancel</button>{/if}
             <button class="btn quiet" disabled={busy} onclick={() => { revokeSheet = true; }}>Remove…</button>
           </div>
           {#if consent.registered && !consent.watch && !job}
             <div class="row"><span class="l"><small>Prepare a bounded copy plan before opening any originals. You can review its file count and data size before starting.</small></span></div>
+          {/if}
+          {#if consent.camera && consent.canReconnect && job?.state === 'ready'}
+            <div class="row"><span class="l"><small>If you disconnected the camera before starting, choose the same folder to continue.</small></span><button class="btn quiet" disabled={busy || needsAllowance} onclick={reconnectCamera}>Reconnect Camera…</button></div>
           {/if}
           {#if job?.code}<div class="row"><span class="l"><small role="status" class="danger-text">{explain(job.code)}</small></span></div>{/if}
           {#if consent.camera && job?.state === 'complete' && job.completed === job.total && !job.code}
@@ -255,6 +283,7 @@
       </div>
       <p class="foot">Originals stay in their folders. A copy counts only after your server verifies its stored bytes. Copy jobs require explicit folder approval and an unmetered connection. Cloud-only files may download while staging an approved original. Selecting a OneDrive folder does not sign in to or inventory your entire cloud account.</p>
     </div>
+    <ImportHistory />
   </div>
 </section>
 

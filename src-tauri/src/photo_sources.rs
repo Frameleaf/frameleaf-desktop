@@ -1,3 +1,4 @@
+use crate::camera_identity::MediaIdentity;
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, path::Path};
 
@@ -12,6 +13,8 @@ pub struct FolderInventory {
     pub availability: crate::source_metadata::AvailabilitySummary,
     #[serde(skip)]
     pub(crate) root_identity: Option<String>,
+    #[serde(skip)]
+    pub(crate) media_identity: Option<MediaIdentity>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -33,16 +36,20 @@ pub fn inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
     scan(root, limit).map(|scan| scan.inventory)
 }
 pub(crate) fn scan(root: &Path, limit: usize) -> Result<FolderScan, String> {
-    scan_inner(root, limit, None, false)
+    scan_inner(root, limit, None, false, None)
 }
 
 /// Bind a removable-media preview to the directory that was actually scanned.
 pub(crate) fn camera_inventory(root: &Path, limit: usize) -> Result<FolderInventory, String> {
-    scan_inner(root, limit, None, true).map(|scan| scan.inventory)
+    scan_inner(root, limit, None, true, None).map(|scan| scan.inventory)
 }
 
 pub(crate) fn scan_approved(root: &Path, root_identity: &str) -> Result<FolderScan, String> {
-    scan_inner(root, 10_000, Some(root_identity), false)
+    scan_inner(root, 10_000, Some(root_identity), false, None)
+}
+
+pub(crate) fn scan_camera(root: &Path, media: &MediaIdentity) -> Result<FolderScan, String> {
+    scan_inner(root, 10_000, None, false, Some(media))
 }
 
 fn scan_inner(
@@ -50,6 +57,7 @@ fn scan_inner(
     limit: usize,
     approved_root: Option<&str>,
     bind_identity: bool,
+    media: Option<&MediaIdentity>,
 ) -> Result<FolderScan, String> {
     #[cfg(target_os = "macos")]
     let _policy = metadata_only::Guard::new()?;
@@ -84,6 +92,13 @@ fn scan_inner(
             return Err("source_watch_local_required".into());
         }
     }
+    let mounted = if let Some(media) = media {
+        media.require(&dir)?;
+        Some(crate::copy_source::root_identity(&dir)?)
+    } else {
+        None
+    };
+    let pinned_root = approved_root.or(mounted.as_deref());
     let root_meta = dir
         .dir_metadata()
         .map_err(|_| "source_folder_unavailable")?;
@@ -100,6 +115,9 @@ fn scan_inner(
         root_identity: bind_identity
             .then(|| crate::copy_source::root_identity(&dir))
             .transpose()?,
+        media_identity: bind_identity
+            .then(|| MediaIdentity::read(&dir).ok())
+            .flatten(),
     };
     let mut files = Vec::new();
     let mut unreadable = 0;
@@ -182,9 +200,12 @@ fn scan_inner(
                 }
                 match crate::source_metadata::open_preview_child(&dir, Path::new(name), true) {
                     Ok(child) => {
-                        if let Some(expected) = approved_root {
+                        if let Some(expected) = pinned_root {
                             let actual = crate::copy_source::root_identity(&child)?;
-                            if actual.split(':').next() != expected.split(':').next() {
+                            if actual.split(':').next() != expected.split(':').next()
+                                || (media.is_some_and(MediaIdentity::uses_content_fingerprint)
+                                    && !crate::camera_identity::camera_mount_matches(&dir, &child)?)
+                            {
                                 result.skipped += 1;
                                 continue;
                             }
@@ -197,16 +218,17 @@ fn scan_inner(
                     }
                 }
             } else if meta.is_file() && is_media_filename(name) {
-                let watch_version = if approved_root.is_some() {
+                let watch_version = if pinned_root.is_some() {
                     if meta.len() == 0 || !crate::copy_source::watchable(&meta, observation) {
                         result.skipped += 1;
                         continue;
                     }
-                    Some(crate::copy_source::watch_version(
-                        &dir,
-                        Path::new(name),
-                        &meta,
-                    )?)
+                    let version = if media.is_some() {
+                        crate::copy_source::camera_version
+                    } else {
+                        crate::copy_source::watch_version
+                    };
+                    Some(version(&dir, Path::new(name), &meta)?)
                 } else {
                     None
                 };

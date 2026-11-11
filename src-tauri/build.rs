@@ -3,13 +3,15 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=src/macos_keychain.m");
         println!("cargo:rerun-if-changed=src/macos_keychain.h");
+        println!("cargo:rerun-if-changed=src/finder_import.m");
         cc::Build::new()
-            .file("src/macos_keychain.m")
+            .files(["src/macos_keychain.m", "src/finder_import.m"])
             .flag("-fobjc-arc")
             .compile("frameleaf_keychain");
         println!("cargo:rustc-link-lib=framework=LocalAuthentication");
         println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=AppKit");
     }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
@@ -28,21 +30,36 @@ fn main() {
             "restore_connection",
             "sign_out",
             "open_photos",
+            "open_offline_photos",
+            "offline_album_status",
+            "offline_album_original",
+            "offline_album_save_original",
+            "offline_album_close_media",
+            "offline_album_remove",
+            "offline_album_cancel",
+            "offline_album_browse_library",
             "worker_setup_status",
             "prepare_models",
             "control_worker",
             "discover_camera_folders",
+            "reconnect_photo_camera",
             "discover_onedrive",
+            "preservation_copy_packages",
+            "save_preservation_copy",
+            "cancel_preservation_copy",
             "choose_photo_folder",
             "preview_photo_drop",
             "photo_drop_status",
             "approve_photo_drop",
             "control_photo_drop",
+            "explorer_import_shortcut",
             "approve_photo_folder",
             "list_photo_import_albums",
             "photo_source_status",
             "revoke_photo_source",
             "photo_import_status",
+            "photo_import_history",
+            "retry_photo_import",
             "prepare_photo_import",
             "control_photo_import",
             "manager_view",

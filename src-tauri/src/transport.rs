@@ -1,6 +1,6 @@
 use crate::connection::{normalize_server, Capabilities, Enrollment, SavedConnection};
 use crate::credentials;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, ClientBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
@@ -14,14 +14,21 @@ pub fn client() -> Result<Client, String> {
         return Ok(client.clone());
     }
 
+    client_builder()
+        .build()
+        .map_err(|_| "network_client_unavailable".into())
+}
+
+pub(crate) fn client_builder() -> ClientBuilder {
+    streaming_client_builder().timeout(Duration::from_secs(30))
+}
+
+pub(crate) fn streaming_client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
-        .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|_| "network_client_unavailable".into())
 }
 pub async fn json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
     json_limit(response, 65_536).await
@@ -70,7 +77,14 @@ pub async fn capabilities(
     Ok(Some(caps))
 }
 pub async fn enroll(client: &Client, saved: &SavedConnection) -> Result<Enrollment, String> {
-    let identity = credentials::identity()?;
+    enroll_with_identity(client, saved, &credentials::identity()?).await
+}
+
+pub(crate) async fn enroll_with_identity(
+    client: &Client,
+    saved: &SavedConnection,
+    identity: &crate::connection::DeviceIdentity,
+) -> Result<Enrollment, String> {
     let dto = identity.enrollment(
         &saved.server_id,
         &saved.account_id,

@@ -1349,9 +1349,11 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "sha1",
  "sha2",
  "tauri",
  "tauri-build",
@@ -1367,6 +1369,7 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

@@ -29,8 +29,10 @@ url = "2"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+sha1 = "0.10"
+ring = "0.17"
 zeroize = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "net"] }
 time = { version = "0.3", features = ["parsing"] }
 
 tauri-plugin-single-instance = "2"
@@ -40,6 +42,7 @@ tauri-plugin-dialog = "=2.8.3"
 tauri-plugin-opener = "=2.7.2"
 mdns-sd = "=0.13.11"
 cap-std = "3"
+zip = { version = "=9.3.0", default-features = false }
 tauri-plugin-updater = "2.14.1"
 tauri-plugin-notification = "=2.6.0"
 
@@ -48,7 +51,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Com", "Win32_System_IO", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_CloudFilters", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Power", "Win32_System_SystemInformation"] }
-windows = { version = "0.62", features = ["Networking_Connectivity", "Win32_System_WinRT"] }
+windows = { version = "0.62", features = ["Networking_Connectivity", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

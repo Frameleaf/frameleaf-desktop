@@ -1,3 +1,4 @@
+mod camera_identity;
 mod camera_sources;
 pub mod cloud_account;
 pub mod connection;
@@ -7,6 +8,7 @@ mod credential_lock;
 mod credentials;
 mod discovery;
 mod drop_import;
+mod file_manager_import;
 mod host_commands;
 pub mod host_control;
 mod host_database;
@@ -23,11 +25,13 @@ mod manager_commands;
 pub mod manager_host;
 mod manager_profile;
 pub mod manager_tls;
+mod media_copy;
 pub mod ml_transport;
 mod model_cache;
 pub mod model_catalogue;
 pub mod native_predictor;
 pub mod native_runtime;
+mod offline_albums;
 mod package_lease;
 pub mod photo_sources;
 mod process_tree;
@@ -319,11 +323,14 @@ async fn restore_connection(
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<media_copy::MediaCopy>().cancel();
     if app.state::<host_setup::HostSetup>().background_active() {
         return Ok(None);
     }
     app.state::<source_import::SourceJobs>().stop().await;
-    app.state::<drop_import::DropImport>().stop().await;
+    app.state::<drop_import::DropImport>()
+        .reset_for_restore()
+        .await;
     app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
         "connection",
@@ -334,6 +341,9 @@ async fn restore_connection(
         // The saved sign-in is gone: drop any connection still held so the window and the
         // background agree (the jobs above already stopped).
         let held = current.take().is_some();
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
         drop(current);
         if held {
             tray::refresh(&app).await;
@@ -355,14 +365,27 @@ async fn restore_connection(
         .send()
         .await
         .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    if matches!(response.status().as_u16(), 401 | 403) {
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
+    }
     let user: User = transport::json(response).await?;
     if user.id != saved.account_id {
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
         return Err("account_identity_changed".into());
     }
     if retry.unwrap_or(false) {
         credentials::unlock_existing_identity(&window)?;
     }
     let mut view = prepare(&mut saved).await;
+    if view.state == "identity-changed" {
+        app.state::<offline_albums::OfflineAlbums>()
+            .clear(&app)
+            .await;
+    }
     if view.state == "preparing"
         && view.features.worker_session
         && start_worker_setup(&app, &saved, false).await.is_err()
@@ -395,6 +418,7 @@ async fn sign_out(
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
+    app.state::<media_copy::MediaCopy>().cancel();
     app.state::<source_import::SourceJobs>().stop().await;
     app.state::<drop_import::DropImport>().stop().await;
     app.state::<source_consent::SourceConsent>().clear()?;
@@ -409,6 +433,10 @@ async fn sign_out(
         },
     };
     *current = None;
+    let offline = app
+        .state::<offline_albums::OfflineAlbums>()
+        .clear(&app)
+        .await;
     drop(current);
     tray::refresh(&app).await;
     Ok(lifecycle::finish_sign_out(
@@ -417,7 +445,7 @@ async fn sign_out(
             let connection = credentials::delete("connection").is_ok();
             let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
             let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
-            worker && connection && sources && drops
+            worker && connection && sources && drops && offline
         },
         async {
             if let Some(photos) = app.get_webview_window("photos") {
@@ -480,18 +508,13 @@ async fn open_photos(
 pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
     if let Some(photos) = app.get_webview_window("photos") {
-        photos.show().map_err(|_| "photo_window_unavailable")?;
-        photos.set_focus().map_err(|_| "photo_window_unavailable")?;
-        return Ok(());
+        if photos.url().is_ok_and(|url| url.origin() == base.origin()) {
+            photos.show().map_err(|_| "photo_window_unavailable")?;
+            photos.set_focus().map_err(|_| "photo_window_unavailable")?;
+            return Ok(());
+        }
     }
-    let origin = base.origin();
-    let photos =
-        tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(base.clone()))
-            .title("Frameleaf Photos")
-            .inner_size(1280.0, 850.0)
-            .on_navigation(move |url| url.origin() == origin)
-            .build()
-            .map_err(|_| "photo_window_unavailable")?;
+    let photos = photo_window(app, &base, base.clone())?;
     let domain = base.host_str().ok_or("server_address_invalid")?;
     let secure = base.scheme() == "https";
     let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
@@ -520,16 +543,55 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
     photos
         .navigate(base.join("photos").unwrap())
         .map_err(|_| "photo_window_unavailable")?;
+    photos.show().map_err(|_| "photo_window_unavailable")?;
+    photos.set_focus().map_err(|_| "photo_window_unavailable")?;
     Ok(())
+}
+
+pub(crate) fn photo_window(
+    app: &AppHandle,
+    base: &url::Url,
+    initial: url::Url,
+) -> Result<WebviewWindow, String> {
+    if connection::native_origin_allowed("main", base, cfg!(debug_assertions)) {
+        return Err("photo_window_unavailable".into());
+    }
+    if let Some(window) = app.get_webview_window("photos") {
+        return Ok(window);
+    }
+    let origin = base.origin();
+    let web_origin = serde_json::to_string(&origin.ascii_serialization())
+        .map_err(|_| "photo_window_unavailable")?;
+    let handle = app.clone();
+    tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(initial))
+        .title("Frameleaf Photos")
+        .inner_size(1280.0, 850.0)
+        .initialization_script(format!("if (window.top === window && location.origin === {web_origin}) window.__FRAMELEAF_DESKTOP_OFFLINE_ALBUMS__ = true;"))
+        .on_navigation(move |url| {
+            offline_albums::local_url(url)
+                || (url.origin() == origin && !offline_albums::intercept(&handle, url))
+        })
+        .build()
+        .map_err(|_| "photo_window_unavailable".into())
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("offline-media", offline_albums::serve)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            #[cfg(windows)]
+            if let Some(selection) =
+                file_manager_import::windows_selection(args.into_iter().map(Into::into))
+            {
+                drop_import::launch_event(app, selection);
+                return;
+            }
+            #[cfg(not(windows))]
+            let _ = args;
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -537,12 +599,14 @@ pub fn run() {
         }))
         .manage(DesktopState::default())
         .manage(window_placement::WindowPlacement::default())
+        .manage(offline_albums::OfflineAlbums::default())
         .manage(host_setup::HostSetup::default())
         .manage(worker_setup::WorkerSetup::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
         .manage(source_import::ImportTransfer::default())
         .manage(drop_import::DropImport::default())
+        .manage(media_copy::MediaCopy::default())
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
         .setup(|app| {
@@ -552,6 +616,7 @@ pub fn run() {
                 let _ = window.show();
                 placement.remember(&window);
             }
+            file_manager_import::setup(app.handle());
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
@@ -574,23 +639,38 @@ pub fn run() {
             restore_connection,
             sign_out,
             open_photos,
+            offline_albums::open_offline_photos,
+            offline_albums::offline_album_status,
+            offline_albums::offline_album_original,
+            offline_albums::offline_album_save_original,
+            offline_albums::offline_album_close_media,
+            offline_albums::offline_album_remove,
+            offline_albums::offline_album_cancel,
+            offline_albums::offline_album_browse_library,
             worker_setup_status,
             prepare_models,
             control_worker,
             discover_camera_folders,
+            reconnect_photo_camera,
             discover_onedrive,
+            media_copy::preservation_copy_packages,
+            media_copy::save_preservation_copy,
+            media_copy::cancel_preservation_copy,
             choose_photo_folder,
             approve_photo_folder,
             import_album::list_photo_import_albums,
             photo_source_status,
             revoke_photo_source,
             photo_import_status,
+            source_import::history::photo_import_history,
+            source_import::history::retry_photo_import,
             prepare_photo_import,
             control_photo_import,
             drop_import::preview_photo_drop,
             drop_import::photo_drop_status,
             drop_import::approve_photo_drop,
             drop_import::control_photo_drop,
+            file_manager_import::explorer_import_shortcut,
             manager_commands::manager_view,
             manager_commands::manager_certificate_fingerprint,
             manager_commands::pair_manager,
@@ -651,6 +731,7 @@ pub fn run() {
                     if cfg!(target_os = "macos")
                         || window.state::<host_setup::HostSetup>().background_active()
                         || window.state::<source_import::SourceJobs>().watching()
+                        || window.state::<media_copy::MediaCopy>().is_active()
                     {
                         api.prevent_close();
                         let _ = window.hide();
@@ -671,7 +752,14 @@ pub fn run() {
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 app.state::<window_placement::WindowPlacement>().save(app);
-                if app.state::<host_setup::HostSetup>().background_active() {
+                if app.state::<media_copy::MediaCopy>().is_active() {
+                    api.prevent_exit();
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.emit("tray-action-failed", "media_copy_exit_blocked");
+                    }
+                } else if app.state::<host_setup::HostSetup>().background_active() {
                     api.prevent_exit();
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
@@ -945,6 +1033,58 @@ async fn choose_photo_folder(
 }
 
 #[tauri::command]
+async fn reconnect_photo_camera(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Option<source_import::ImportView>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    require_local(&window)?;
+    let (source_id, original) = {
+        let current = state.0.lock().await;
+        let saved = current.as_ref().ok_or("sign_in_required")?;
+        let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)?
+            .ok_or("source_approval_required")?;
+        let identity = credentials::identity()?;
+        let approval = consent.approval(saved, &identity)?;
+        if !consent.camera() || approval.media().is_none() {
+            return Err("source_camera_identity_unavailable".into());
+        }
+        (
+            consent.source_id().to_string(),
+            approval.root().to_path_buf(),
+        )
+    };
+    let picker_app = app.clone();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        let mut picker = picker_app
+            .dialog()
+            .file()
+            .set_title("Choose the same camera folder to resume");
+        if original.is_dir() {
+            picker = picker.set_directory(original);
+        }
+        picker
+            .blocking_pick_folder()
+            .map(|folder| folder.into_path().map_err(|_| "source_folder_invalid"))
+            .transpose()
+    })
+    .await
+    .map_err(|_| "source_inventory_failed")??;
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    require_local(&window)?;
+    let current = state.0.lock().await;
+    let saved = current.as_ref().ok_or("sign_in_required")?;
+    let base = import_base(&app)?;
+    let jobs = app.state::<source_import::SourceJobs>();
+    jobs.reconnect_camera(base.clone(), saved.clone(), source_id, path)
+        .await?;
+    jobs.start(app.clone(), base, saved.clone()).await.map(Some)
+}
+
+#[tauri::command]
 async fn photo_source_status(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
@@ -1014,8 +1154,12 @@ async fn revoke_photo_source(
     app.state::<source_import::SourceJobs>().stop().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let consent = credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL);
+    if let Ok(base) = import_base(&app) {
+        source_import::history::retire(&base, saved, &app.state::<source_import::SourceJobs>());
+    }
     // Local authority ends before waiting on the NAS; offline revocation cannot leave it enabled here.
     credentials::delete(source_consent::CREDENTIAL)?;
+    let _ = app.emit_to("main", "photo-import-history", ());
     tray::set_import_status(&app, None);
     app.state::<source_consent::SourceConsent>().clear()?;
     match consent {
@@ -1070,6 +1214,7 @@ async fn prepare_photo_import(
         .prepare(&import_base(&app)?, saved)
         .await?;
     tray::set_import_status(&app, Some(&status));
+    let _ = app.emit_to("main", "photo-import-history", ());
     Ok(status)
 }
 #[tauri::command]
@@ -1114,6 +1259,7 @@ async fn control_photo_import(
         _ => Err("source_control_invalid".into()),
     }?;
     tray::set_import_status(&app, Some(&status));
+    let _ = app.emit_to("main", "photo-import-history", ());
     Ok(status)
 }
 

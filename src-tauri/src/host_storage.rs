@@ -44,6 +44,28 @@ pub(crate) fn is_local(directory: &std::fs::File) -> Result<bool, String> {
     Ok(inspect(directory)?.local)
 }
 
+pub(crate) fn media_destination(path: &Path, directory: &std::fs::File) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let volume = inspect(directory)?;
+    #[cfg(target_os = "linux")]
+    let volume = inspect_linux(directory, true)?;
+    #[cfg(windows)]
+    let volume = inspect_windows(directory, true)?;
+    if !volume.local || volume.read_only {
+        return Err("media_copy_destination_invalid".into());
+    }
+    #[cfg(not(windows))]
+    cloud_storage_check(path, directory)?;
+    #[cfg(windows)]
+    if !["FAT", "FAT32", "exFAT"]
+        .iter()
+        .any(|kind| volume.filesystem.eq_ignore_ascii_case(kind))
+    {
+        cloud_storage_check(path, directory)?;
+    }
+    Ok(())
+}
+
 /// Retirement may reclaim storage below the startup floor; all volume and cloud checks still apply.
 pub(crate) fn check_cleanup(path: &Path) -> Result<(), String> {
     let directory = directory(path)?;
@@ -192,6 +214,11 @@ fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
 
 #[cfg(target_os = "linux")]
 fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
+    inspect_linux(directory, false)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_linux(directory: &std::fs::File, allow_removable: bool) -> Result<Volume, String> {
     use std::os::fd::AsRawFd;
     let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     let mut capacity = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
@@ -202,12 +229,18 @@ fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
     }
     let fs = unsafe { fs.assume_init() };
     let capacity = unsafe { capacity.assume_init() };
+    const EXFAT: u64 = 0x2011_bab0;
+    const NTFS3: u64 = 0x7366_746e;
+    const FAT: u64 = libc::MSDOS_SUPER_MAGIC as u64;
     // ext2/3/4 share the same kernel filesystem identity; unknown/FUSE/network types stay refused.
     let filesystem = match fs.f_type as u64 {
         0xef53 => "ext",
         0x58465342 => "xfs",
         0x9123683e => "btrfs",
         0x2fc12fc1 => "zfs",
+        EXFAT if allow_removable => "exfat",
+        FAT if allow_removable => "fat",
+        NTFS3 if allow_removable => "ntfs3",
         _ => "unknown",
     };
     Ok(Volume {
@@ -223,6 +256,11 @@ fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
 
 #[cfg(windows)]
 fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
+    inspect_windows(directory, false)
+}
+
+#[cfg(windows)]
+fn inspect_windows(directory: &std::fs::File, allow_removable: bool) -> Result<Volume, String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetFinalPathNameByHandleW,
@@ -268,11 +306,12 @@ fn inspect(directory: &std::fs::File) -> Result<Volume, String> {
         .iter()
         .position(|v| *v == 0)
         .ok_or("host_storage_unavailable")?;
+    let drive = unsafe { GetDriveTypeW(root.as_ptr()) };
     Ok(Volume {
         filesystem: String::from_utf16(&filesystem[..end])
             .map_err(|_| "host_storage_unavailable")?,
-        local: unsafe { GetDriveTypeW(root.as_ptr()) } == 3, // DRIVE_FIXED; remote/removable/unknown are not database destinations.
-        read_only: flags & 0x00080000 != 0,                  // FILE_READ_ONLY_VOLUME.
+        local: drive == 3 || (allow_removable && drive == 2), // DRIVE_FIXED or DRIVE_REMOVABLE.
+        read_only: flags & 0x00080000 != 0,                   // FILE_READ_ONLY_VOLUME.
         available_bytes: available,
     })
 }
