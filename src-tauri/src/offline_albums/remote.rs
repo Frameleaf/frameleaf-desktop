@@ -150,7 +150,7 @@ impl<'a> Library<'a> {
             .query(query);
         let response = tokio::time::timeout(header_timeout, request.send())
             .await
-            .map_err(|_| Access::Invalid)?
+            .map_err(|_| Access::Offline)?
             .map_err(|error| classify_connection(&error))?;
         classify_status(response.status())?;
         Ok(response)
@@ -165,7 +165,7 @@ impl<'a> Library<'a> {
         let response = self.request(path, query, timeout).await?;
         tokio::time::timeout(timeout, transport::json_limit(response, 1024 * 1024))
             .await
-            .map_err(|_| Access::Invalid)?
+            .map_err(|_| Access::Offline)?
             .map_err(|_| Access::Invalid)
     }
 

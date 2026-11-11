@@ -427,6 +427,7 @@ impl Cache {
                 self.remove(manifest.plan.id)?;
                 Ok(None)
             }
+            Err(remote::Access::Offline) => Ok(manifest.valid_at(now()?).then_some(manifest)),
             Err(error) => Err(error.into()),
         }
     }
@@ -679,6 +680,10 @@ mod tests {
                             "protocolVersion":1,"serverId":"fixture-library",
                             "features":{"enrollment":false,"worker":false,"sources":false,"nativeHost":false}
                         }).to_string().into_bytes(),
+                        path if state == 5 && path == format!("/api/albums/{album}") => {
+                            status = 503;
+                            Vec::new()
+                        }
                         path if path == format!("/api/albums/{album}") => serde_json::json!({
                             "id":album,"albumName":"Trip","kind":"album","isLocked":state == 2,
                             "albumUsers":[{"user":{"id":owner},"role":"owner"}]
@@ -750,6 +755,12 @@ mod tests {
         assert_eq!(cache.album_ids().unwrap(), vec![fixture.album]);
         fixture.mode.store(4, Ordering::SeqCst);
         assert_eq!(cache.list(&fixture.saved).await.unwrap().len(), 1);
+        fixture.mode.store(5, Ordering::SeqCst);
+        let original = cache
+            .authorize(&fixture.saved, fixture.album, fixture.item)
+            .await
+            .unwrap();
+        assert!(original.current());
     }
 
     #[tokio::test]
