@@ -948,6 +948,7 @@ mod tests {
             .arg(&executable)
             .arg("-WatchedFolder")
             .arg(source.path())
+            .stdin(Stdio::piped())
             .env(
                 "FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD",
                 photo_password.as_str(),
@@ -960,24 +961,25 @@ mod tests {
             let _ = smoke.wait();
             panic!("could not own the Windows acceptance process tree");
         });
-        smoke
+        let handshake_sent = smoke
             .stdin
             .take()
-            .unwrap()
-            .write_all(b"frameleaf-watch-smoke\r\n")
-            .unwrap();
+            .is_some_and(|mut stdin| stdin.write_all(b"frameleaf-watch-smoke\r\n").is_ok());
         let deadline = Instant::now() + Duration::from_secs(900);
-        let result = loop {
-            match smoke.try_wait() {
-                Ok(Some(status)) => break status.success(),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(250))
+        let result = handshake_sent
+            && loop {
+                match smoke.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(250))
+                    }
+                    _ => break false,
                 }
-                _ => break false,
-            }
-        };
-        tree.terminate_confirmed(Duration::from_secs(20)).unwrap();
+            };
+        let terminated = tree.terminate_confirmed(Duration::from_secs(20));
         let stopped = host.stop();
+        terminated.expect("Windows acceptance process cleanup failed");
+        assert!(handshake_sent, "Windows acceptance handshake failed");
         assert!(result, "installed Desktop watcher acceptance failed");
         stopped.expect("disposable Library shutdown failed");
     }

@@ -13,9 +13,9 @@ unmetered network. Initialize the runner's cloud-files filter as in the Windows
 compiled host qualification before running the test. Do not start the app first.
 
 Set `FRAMELEAF_INSTALLED_HOST_MANIFEST` to the approved companion manifest
-SHA-256, and `FRAMELEAF_WATCH_DESKTOP_EXE` and `FRAMELEAF_WATCH_DESKTOP_SHA256`
+SHA-256 in lowercase hexadecimal, and `FRAMELEAF_WATCH_DESKTOP_EXE` and `FRAMELEAF_WATCH_DESKTOP_SHA256`
 to the installed `frameleaf-desktop.exe` path and the verified installed
-executable's SHA-256. Run the test from the repository root:
+executable's SHA-256 in lowercase hexadecimal. Run the test from the repository root:
 
 ```powershell
 cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib host_setup::tests::disposable_runner_installed_desktop_watches_while_hidden -- --ignored --exact --nocapture

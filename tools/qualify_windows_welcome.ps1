@@ -113,14 +113,14 @@ function Test-WatchedFolder {
     $photoTool = Join-Path $PSScriptRoot 'qualify_installed_photo.mjs'
     & node $photoTool watch-signup
     if ($LASTEXITCODE) { throw 'A fresh disposable Library is required' }
-    Press 'Enter Address…'
+    Press ('Enter Address' + [char]0x2026)
     Fill 'Server address' 'http://127.0.0.1:2283'
     Press 'Continue'
     Fill 'Account' 'native-photo@example.invalid'
     Fill 'Password' $env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD
     Press 'Sign In'
     Press 'Photo sources'
-    Press 'Add Folder…'
+    Press ('Add Folder' + [char]0x2026)
     Pick-WatchedFolder $WatchedFolder
     $null = Wait-Control $WatchedFolder
     Check-Box 'Watch this folder'
@@ -151,11 +151,11 @@ function Test-WatchedFolder {
     }
     Wait-WindowVisibility $handle $true
     $null = Wait-Control 'Pause Watching' -Type Button -Seconds 30
-    Press 'Remove…'
+    Press ('Remove' + [char]0x2026)
     Press 'Remove Permission'
     $null = Wait-Control 'No folder approved'
     Press 'Overview'
-    Press 'Sign Out…'
+    Press ('Sign Out' + [char]0x2026)
     Press 'Sign Out'
     $null = Wait-Control 'Welcome'
     Write-Output 'Installed Desktop watched a synthetic folder while hidden, verified the copy, and reopened with watching still active'
