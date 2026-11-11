@@ -18,6 +18,8 @@ impl Destination {
     pub(super) fn open(path: PathBuf) -> Result<Self, &'static str> {
         let directory = open(&path)?;
         crate::host_storage::media_destination(&path, &directory).map_err(|_| INVALID)?;
+        #[cfg(target_os = "macos")]
+        require_exclusive_rename(&directory)?;
         let directory = Dir::from_std_file(directory);
         let identity = crate::copy_source::root_identity(&directory).map_err(|_| INVALID)?;
         Ok(Self {
@@ -172,6 +174,45 @@ fn open(path: &Path) -> Result<std::fs::File, &'static str> {
         }
         Ok(file)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn require_exclusive_rename(directory: &std::fs::File) -> Result<(), &'static str> {
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct Capabilities {
+        length: u32,
+        flags: libc::vol_capabilities_attr_t,
+    }
+    let mut query = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut result: Capabilities = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        libc::fgetattrlist(
+            directory.as_raw_fd(),
+            (&mut query as *mut libc::attrlist).cast(),
+            (&mut result as *mut Capabilities).cast(),
+            std::mem::size_of::<Capabilities>(),
+            0,
+        )
+    };
+    let index = libc::VOL_CAPABILITIES_INTERFACES;
+    let flag = libc::VOL_CAP_INT_RENAME_EXCL;
+    if status != 0
+        || result.length as usize != std::mem::size_of::<Capabilities>()
+        || result.flags.valid[index] & result.flags.capabilities[index] & flag == 0
+    {
+        return Err("media_copy_destination_unsupported");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
