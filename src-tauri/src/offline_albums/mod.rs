@@ -337,7 +337,7 @@ pub(crate) async fn offline_album_status(
     Ok(Status {
         busy: false,
         albums,
-        progress,
+        progress: native.progress.lock().map_err(|_| BUSY)?.take(),
     })
 }
 

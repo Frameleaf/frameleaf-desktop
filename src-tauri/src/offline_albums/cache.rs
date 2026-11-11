@@ -468,7 +468,6 @@ impl Cache {
             mime: media.mime.clone(),
             name: media.name.clone(),
             expires_at: manifest.checked_at.saturating_add(GRACE_SECONDS),
-            online: library.is_some(),
         })
     }
 
@@ -570,7 +569,6 @@ pub(super) struct Authorized {
     pub mime: String,
     pub name: String,
     pub expires_at: u64,
-    pub online: bool,
 }
 impl Authorized {
     pub fn current(&self) -> bool {
@@ -676,6 +674,10 @@ mod tests {
                     let mut status = 200;
                     let body = match path {
                         "/api/users/me" => serde_json::json!({"id":owner}).to_string().into_bytes(),
+                        "/api/desktop/capabilities" if matches!(state, 3 | 4) => {
+                            status = if state == 3 { 401 } else { 503 };
+                            Vec::new()
+                        }
                         "/api/desktop/capabilities" => serde_json::json!({
                             "protocolVersion":1,"serverId":"fixture-library",
                             "features":{"enrollment":false,"worker":false,"sources":false,"nativeHost":false}
@@ -740,6 +742,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capabilities_failure_does_not_purge_the_verified_cache() {
+        let fixture = Fixture::new();
+        let cache = fixture.cache();
+        let library = Library::connect(&fixture.saved).await.ok().unwrap();
+        let plan = library.plan(fixture.album).await.ok().unwrap();
+        cache.download(&library, plan, |_, _| {}).await.unwrap();
+        fixture.mode.store(3, Ordering::SeqCst);
+        assert!(cache.list(&fixture.saved).await.is_err());
+        assert_eq!(cache.album_ids().unwrap(), vec![fixture.album]);
+        fixture.mode.store(4, Ordering::SeqCst);
+        assert_eq!(cache.list(&fixture.saved).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn verified_originals_survive_restart_offline_and_partial_downloads_never_publish() {
         let mut fixture = Fixture::new();
         let cache = fixture.cache();
@@ -782,7 +798,7 @@ mod tests {
             .authorize(&fixture.saved, fixture.album, fixture.item)
             .await
             .unwrap();
-        assert!(!access.online);
+        assert!(access.current());
         assert_eq!(
             restored
                 .range(fixture.album, fixture.item, access.size, 0, 8)

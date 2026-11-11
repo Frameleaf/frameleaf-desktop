@@ -65,10 +65,7 @@ async fn load(
     let mut playback = native.get_playback(id)?;
     let base = crate::import_base(app)?;
     let cache = Cache::open(&base, &saved, false)?.ok_or("offline_album_none")?;
-    if !playback.access.online
-        || playback.checked.elapsed() >= Duration::from_secs(15)
-        || !playback.access.current()
-    {
+    if playback.checked.elapsed() >= Duration::from_secs(15) || !playback.access.current() {
         let verified = tokio::select! {
             biased;
             _ = cancelled.changed() => return Err("offline_album_cancelled".into()),
@@ -91,6 +88,12 @@ async fn load(
         .header(header::ACCEPT_RANGES, "bytes")
         .header("X-Content-Type-Options", "nosniff");
     if request.method() == http::Method::HEAD {
+        require_local_photos(&window)?;
+        if cancelled.has_changed().unwrap_or(true) {
+            return Err("offline_album_cancelled".into());
+        }
+        playback.touched = Instant::now();
+        native.renew_playback(playback)?;
         return response
             .header(header::CONTENT_LENGTH, length)
             .body(Vec::new())

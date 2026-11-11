@@ -112,7 +112,7 @@ impl<'a> Library<'a> {
             return Err(Access::Denied);
         }
         let library = Self {
-            client: transport::client_builder()
+            client: transport::streaming_client_builder()
                 .dns_resolver(Arc::new(OfflineDns))
                 .connect_timeout(Duration::from_secs(3))
                 .build()
@@ -120,8 +120,13 @@ impl<'a> Library<'a> {
             base: crate::connection::normalize_server(&saved.server).map_err(|_| Access::Denied)?,
             saved,
         };
-        let caps: crate::connection::Capabilities =
-            library.json("api/desktop/capabilities", &[]).await?;
+        let caps: crate::connection::Capabilities = library
+            .json("api/desktop/capabilities", &[])
+            .await
+            .map_err(|access| match access {
+                Access::Denied => Access::Invalid,
+                other => other,
+            })?;
         if caps.protocol_version != 1 || caps.server_id != saved.server_id {
             return Err(Access::Denied);
         }
@@ -136,25 +141,19 @@ impl<'a> Library<'a> {
         &self,
         path: &str,
         query: &[(&str, &str)],
-        timeout: Duration,
+        header_timeout: Duration,
     ) -> Result<Response, Access> {
-        let response = self
+        let request = self
             .client
             .get(self.base.join(path).map_err(|_| Access::Invalid)?)
             .bearer_auth(&self.saved.token)
-            .query(query)
-            .timeout(timeout)
-            .send()
+            .query(query);
+        let response = tokio::time::timeout(header_timeout, request.send())
             .await
+            .map_err(|_| Access::Invalid)?
             .map_err(|error| classify_connection(&error))?;
-        match response.status() {
-            StatusCode::OK => Ok(response),
-            StatusCode::UNAUTHORIZED
-            | StatusCode::FORBIDDEN
-            | StatusCode::NOT_FOUND
-            | StatusCode::GONE => Err(Access::Denied),
-            _ => Err(Access::Invalid),
-        }
+        classify_status(response.status())?;
+        Ok(response)
     }
 
     async fn json<T: serde::de::DeserializeOwned>(
@@ -162,12 +161,12 @@ impl<'a> Library<'a> {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, Access> {
-        transport::json_limit(
-            self.request(path, query, Duration::from_secs(8)).await?,
-            1024 * 1024,
-        )
-        .await
-        .map_err(|_| Access::Invalid)
+        let timeout = Duration::from_secs(8);
+        let response = self.request(path, query, timeout).await?;
+        tokio::time::timeout(timeout, transport::json_limit(response, 1024 * 1024))
+            .await
+            .map_err(|_| Access::Invalid)?
+            .map_err(|_| Access::Invalid)
     }
 
     pub async fn plan(&self, id: Uuid) -> Result<Plan, Access> {
@@ -242,7 +241,7 @@ impl<'a> Library<'a> {
             .request(
                 &format!("api/assets/{}/original", item.id),
                 &[("edited", "false")],
-                Duration::from_secs(1800),
+                Duration::from_secs(30),
             )
             .await?;
         let expected = response.content_length();
@@ -386,6 +385,20 @@ fn dns_unreachable(error: io::Error) -> io::Error {
     io::Error::new(ErrorKind::HostUnreachable, error)
 }
 
+fn classify_status(status: StatusCode) -> Result<(), Access> {
+    match status {
+        StatusCode::OK => Ok(()),
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            Err(Access::Offline)
+        }
+        StatusCode::UNAUTHORIZED
+        | StatusCode::FORBIDDEN
+        | StatusCode::NOT_FOUND
+        | StatusCode::GONE => Err(Access::Denied),
+        _ => Err(Access::Invalid),
+    }
+}
+
 fn classify_connection(error: &reqwest::Error) -> Access {
     if error.is_timeout() && error.is_connect() {
         return Access::Offline;
@@ -417,6 +430,24 @@ mod tests {
         let mut checksum = Checksum::new(value).unwrap();
         checksum.update(bytes);
         checksum.valid()
+    }
+
+    #[test]
+    fn transient_gateway_statuses_allow_the_bounded_offline_path() {
+        for status in [502, 503, 504] {
+            assert!(matches!(
+                classify_status(StatusCode::from_u16(status).unwrap()),
+                Err(Access::Offline)
+            ));
+        }
+        assert!(matches!(
+            classify_status(StatusCode::UNAUTHORIZED),
+            Err(Access::Denied)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(Access::Invalid)
+        ));
     }
 
     #[tokio::test]

@@ -46,12 +46,10 @@
       const value = await invoke<Status>('offline_album_status');
       if (value.busy) { if (value.progress) progress = value.progress; return; }
       progress = value.progress;
-      if (!progress || progress.error) {
-        albums = value.albums;
-        if (!albums.some(({ id }) => id === albumId)) {
-          albumId = '';
-          closeMedia();
-        }
+      albums = value.albums;
+      if (albumId && !albums.some(({ id }) => id === albumId)) {
+        albumId = '';
+        closeMedia();
       }
       message = progress?.error ? explain(progress.error) : '';
     } catch (error) {
@@ -65,6 +63,7 @@
 
   onMount(() => {
     const reconnect = () => { void refresh(true); };
+    const focus = () => { void refresh(); };
     let ticks = 0;
     const timer = setInterval(() => {
       ticks += 1;
@@ -77,12 +76,12 @@
       if ((progress && !progress.error) || ticks % 30 === 0) void refresh();
     }, 1000);
     window.addEventListener('online', reconnect);
-    window.addEventListener('focus', reconnect);
+    window.addEventListener('focus', focus);
     void refresh();
     return () => {
       clearInterval(timer);
       window.removeEventListener('online', reconnect);
-      window.removeEventListener('focus', reconnect);
+      window.removeEventListener('focus', focus);
       closeMedia();
     };
   });

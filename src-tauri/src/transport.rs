@@ -20,11 +20,14 @@ pub fn client() -> Result<Client, String> {
 }
 
 pub(crate) fn client_builder() -> ClientBuilder {
+    streaming_client_builder().timeout(Duration::from_secs(30))
+}
+
+pub(crate) fn streaming_client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
-        .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
 }
 pub async fn json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
