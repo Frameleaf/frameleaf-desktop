@@ -419,17 +419,7 @@ impl VerifiedRuntime {
         absolute_directory(cache)?;
         absolute_directory(private_root)?;
         let scratch = private_root.join(format!("inference-{}", uuid::Uuid::new_v4()));
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let mut builder = builder;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&scratch)
-            .map_err(|_| "runtime_scratch_failed")?;
+        crate::runtime_store::create_private_directory(&scratch)?;
         let mut secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
         let token = zeroize::Zeroizing::new(
@@ -677,13 +667,20 @@ impl VerifiedRuntime {
         }
         let qwen_binary = if value["engine"] == "qwen-gguf" {
             let mut candidates = self.manifest.files.iter().filter(|(path, _)| {
-                path.starts_with("python/lib/python")
-                    && path.ends_with("/site-packages/frameleaf_ml/native-bin/llama-server")
+                match self.manifest.platform.as_str() {
+                    "windows" => {
+                        path.as_str()
+                            == "python/Lib/site-packages/frameleaf_ml/native-bin/llama-server.exe"
+                    }
+                    "macos" | "linux" => {
+                        path.starts_with("python/lib/python")
+                            && path.ends_with("/site-packages/frameleaf_ml/native-bin/llama-server")
+                    }
+                    _ => false,
+                }
             });
             let (_, artifact) = candidates.next().ok_or("runtime_qwen_binary_unavailable")?;
-            if candidates.next().is_some()
-                || !matches!(self.manifest.platform.as_str(), "macos" | "linux")
-            {
+            if candidates.next().is_some() {
                 return Err("runtime_qwen_binary_unavailable".into());
             }
             Some(artifact.sha256.as_str())

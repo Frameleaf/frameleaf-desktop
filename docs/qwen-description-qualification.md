@@ -48,8 +48,8 @@ required on the platforms where the provider will be offered.
 
 ## Build the candidate runtime pack
 
-On Linux or macOS, use the CPU runtime profile and a self-contained native
-`llama-server` built from the pinned source. Put it beside its `LICENSE` in a
+Use the CPU runtime profile and a self-contained native `llama-server`
+(`llama-server.exe` on Windows) built from the pinned source. Put it beside its `LICENSE` in a
 local directory. Supply the digest of that exact executable to the builder.
 
 ```sh
@@ -62,7 +62,10 @@ The builder checks the digest before running the version probe. Its manifest
 inventories the executable and license. The macOS signing step updates the
 manifest with the post-signing binary digest before runtime sealing. Desktop
 matches qualification evidence to that final signed digest. The candidate uses
-a private Unix socket on macOS and Linux. Windows has no enabled candidate transport.
+a private Unix socket on macOS and Linux. On Windows it checks the owner PID of
+the established loopback socket before sending the bearer credential or image.
+The candidate process inherits the supervisor’s Windows Job Object and its token
+file inherits the private working directory ACL.
 
 The qualification spec uses `engine: "qwen-gguf"`, the CPU provider, one image
 fixture and its exact expected result, and the two staged file digests at

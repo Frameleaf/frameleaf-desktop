@@ -309,8 +309,9 @@ def dependency_indexes(system: str, architecture: str) -> list[str]:
 QWEN_LLAMA_REVISION = "7fe450e19305b828c199d602c23a8337aaa1f03b"
 
 
-def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path) -> Path:
-    binary, license_file = (source / name for name in ("llama-server", "LICENSE"))
+def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path, system: str) -> Path:
+    executable = "llama-server.exe" if system == "windows" else "llama-server"
+    binary, license_file = (source / name for name in (executable, "LICENSE"))
     if (
         not stat.S_ISDIR(regular(source).st_mode)
         or not re.fullmatch(r"[a-f0-9]{64}", expected)
@@ -318,9 +319,10 @@ def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path) ->
         or not stat.S_ISREG(regular(license_file).st_mode)
         or license_file.stat().st_size not in range(1, 64 * 1024)
         or not (site / "frameleaf_ml/native_qwen.py").is_file()
+        or (system == "windows" and not (site / "frameleaf_ml/native_qwen_windows.py").is_file())
     ):
         raise BuildError("runtime_qwen_input_invalid")
-    destination = site / "frameleaf_ml/native-bin/llama-server"
+    destination = site / "frameleaf_ml/native-bin" / executable
     destination.parent.mkdir()
     shutil.copyfile(binary, destination)
     if sha256(destination) != expected:
@@ -356,7 +358,7 @@ def build(
     }.get(platform.machine(), "unsupported")
     if f"{system}-{architecture}" not in profile["targets"]:
         raise BuildError("runtime_target_unqualified")
-    if qwen is not None and (system not in {"linux", "macos"} or profile_name != "cpu-ort"):
+    if qwen is not None and (profile_name != "cpu-ort"):
         raise BuildError("runtime_qwen_target_unqualified")
     uv = shutil.which("uv")
     git = shutil.which("git")
@@ -589,7 +591,7 @@ def build(
         }
         qwen_relative = None
         if qwen is not None:
-            qwen_binary = stage_qwen_binary(*qwen, site, notices)
+            qwen_binary = stage_qwen_binary(*qwen, site, notices, system)
             qwen_relative = qwen_binary.relative_to(payload)
             receipt["qwenLlama"] = {"sourceRevision": QWEN_LLAMA_REVISION, "inputBinarySha256": qwen[1]}
         (payload / "provenance.json").write_text(

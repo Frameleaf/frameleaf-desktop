@@ -41,14 +41,29 @@ class RuntimeBuilderTests(unittest.TestCase):
             notices = payload / "licenses"
             notices.mkdir()
             digest = hashlib.sha256(binary).hexdigest()
-            staged = builder.stage_qwen_binary(source, digest, site, notices)
+            staged = builder.stage_qwen_binary(source, digest, site, notices, "macos")
             inventory = builder.inventory(payload)
             self.assertEqual(inventory[staged.relative_to(payload).as_posix()]["sha256"], digest)
             self.assertIn("licenses/llama.cpp-LICENSE.txt", inventory)
             staged.unlink()
             staged.parent.rmdir()
             with self.assertRaisesRegex(builder.BuildError, "digest_mismatch"):
-                builder.stage_qwen_binary(source, "0" * 64, site, notices)
+                builder.stage_qwen_binary(source, "0" * 64, site, notices, "macos")
+
+    def test_windows_qwen_pack_requires_the_owned_loopback_module(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "site/frameleaf_ml"
+            package.mkdir(parents=True)
+            (package / "native_qwen.py").touch()
+            (root / "llama-server.exe").write_bytes(b"fixture")
+            (root / "LICENSE").write_text("fixture")
+            digest = hashlib.sha256(b"fixture").hexdigest()
+            with self.assertRaisesRegex(builder.BuildError, "runtime_qwen_input_invalid"):
+                builder.stage_qwen_binary(root, digest, package.parent, root, "windows")
+            (package / "native_qwen_windows.py").touch()
+            installed = builder.stage_qwen_binary(root, digest, package.parent, root, "windows")
+            self.assertEqual(installed.name, "llama-server.exe")
 
     def test_source_build_exception_is_only_used_by_the_locked_legacy_dependency(self):
         setuptools = "setuptools==80.9.0 --hash=sha256:" + "a" * 64 + "\n"
