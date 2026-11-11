@@ -2,6 +2,19 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort, signInMethods, nearbySignIn, countryOptions, defaultCountry } from '../src/ui-state.ts';
 import type { CloudServer, DiscoveredServer } from '../src/server-types.ts';
+import { verifiedImportMilestone } from '../src/ui-state.ts';
+
+test('import milestones count distinct completed runs with verified originals and no pending album work', () => {
+  const complete = { runId: 'first', status: 'complete', verified: 2, albumPending: false };
+  const incomplete = [
+    { ...complete, runId: 'empty', verified: 0 },
+    { ...complete, runId: 'album', albumPending: true },
+    ...['ready', 'running', 'interrupted', 'cancelled'].map(status => ({ ...complete, runId: status, status })),
+  ];
+  assert.equal(verifiedImportMilestone(incomplete), 'unobserved');
+  assert.equal(verifiedImportMilestone([...incomplete, complete, complete]), 'first');
+  assert.equal(verifiedImportMilestone([...incomplete, complete, { ...complete, runId: 'repeat' }]), 'repeat');
+});
 
 test('money renders USD doubles and micro-USD integers without ever printing NaN', () => {
   assert.equal(formatUsd(31.4), '$31.40');

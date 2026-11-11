@@ -2,7 +2,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
-  import { formatWhen } from './ui-state';
+  import { formatWhen, verifiedImportMilestone } from './ui-state';
 
   type Kind = 'folder' | 'camera' | 'watch' | 'drop';
   type Status = 'ready' | 'running' | 'interrupted' | 'complete' | 'cancelled';
@@ -11,6 +11,7 @@
   const statuses: Record<Status, string> = { ready: 'Ready', running: 'In progress', interrupted: 'Interrupted', complete: 'Completed', cancelled: 'Cancelled' };
   const native = isTauri();
   let entries = $state<Entry[]>([]);
+  const completion = $derived(verifiedImportMilestone(entries));
   let loaded = $state(false);
   let error = $state('');
   let retrying = $state(false);
@@ -84,6 +85,9 @@
     <div class="group">
       {#if error}<div class="row"><span class="l"><small class="danger-text" role="status">{error}</small></span></div>{/if}
       {#if entries.length}
+        {#if !error && completion !== 'unobserved'}
+          <div class="row"><span class="l"><small>{completion === 'repeat' ? 'First and repeat verified imports observed in retained history.' : 'One verified import observed in retained history.'}</small></span></div>
+        {/if}
         {#each entries.slice(0, visible) as entry (entry.runId)}
           <div class="row top">
             <span class="l">
