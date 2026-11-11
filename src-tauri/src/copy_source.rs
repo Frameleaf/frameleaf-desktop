@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Seek, Write},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 use uuid::Uuid;
@@ -429,8 +429,7 @@ impl CopyApproval {
         if !self
             .media()
             .is_some_and(MediaIdentity::uses_content_fingerprint)
-            && entry.watch_version.as_deref()
-                != Some(camera_version(&parent, &name, &meta)?.as_str())
+            && expected != camera_version(&parent, &name, &meta)?.as_str()
         {
             return Err("source_camera_changed".into());
         }
