@@ -132,9 +132,7 @@ mod explorer {
                 CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
             },
-            UI::Shell::{
-                FOLDERID_SendTo, IShellLinkW, SHGetKnownFolderPath, ShellLink, SLGP_RAWPATH,
-            },
+            UI::Shell::{FOLDERID_SendTo, IShellLinkW, SHGetKnownFolderPath, ShellLink},
         },
     };
 
@@ -160,7 +158,7 @@ mod explorer {
         let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
             .map_err(|_| UNAVAILABLE)?;
         let file: IPersistFile = link.cast().map_err(|_| UNAVAILABLE)?;
-        let exe = wide_path(&std::env::current_exe().map_err(|_| UNAVAILABLE)?);
+        let exe = std::env::current_exe().map_err(|_| UNAVAILABLE)?;
         let exists = match std::fs::symlink_metadata(&path) {
             Ok(meta) if !meta.file_type().is_symlink() && meta.is_file() => {
                 let name = wide_path(&path);
@@ -171,9 +169,11 @@ mod explorer {
                     .map_err(|_| "explorer_shortcut_conflict")?;
                 let expected: Vec<_> = IMPORT_FLAG.encode_utf16().chain(Some(0)).collect();
                 let mut target = vec![0; 32_768];
-                unsafe { link.GetPath(&mut target, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32) }
+                unsafe { link.GetPath(&mut target, std::ptr::null_mut(), 0) }
                     .map_err(|_| "explorer_shortcut_conflict")?;
-                if !args.starts_with(&expected) || !target.starts_with(&exe) {
+                let target =
+                    OsString::from_wide(target.split(|&unit| unit == 0).next().unwrap_or_default());
+                if !args.starts_with(&expected) || Path::new(&target) != exe {
                     return Err("explorer_shortcut_conflict".into());
                 }
                 true
@@ -188,6 +188,7 @@ mod explorer {
                 Ok(false)
             }
             (Some(true), false) => {
+                let exe = wide_path(&exe);
                 let arguments: Vec<_> = IMPORT_FLAG.encode_utf16().chain(Some(0)).collect();
                 let temporary =
                     path.with_file_name(format!(".frameleaf-{}.lnk", uuid::Uuid::new_v4()));
@@ -213,6 +214,18 @@ mod explorer {
             }
             _ => Ok(exists),
         }
+    }
+
+    #[test]
+    fn shortcut_target_matches_drive_letter_case_without_aliasing_executable_names() {
+        assert_eq!(
+            Path::new(r"c:\Apps\Frameleaf.exe"),
+            Path::new(r"C:\Apps\Frameleaf.exe")
+        );
+        assert_ne!(
+            Path::new(r"C:\Apps\Frameleaf.exe"),
+            Path::new(r"C:\Apps\frameleaf.exe")
+        );
     }
 
     fn wide_path(path: &Path) -> Vec<u16> {

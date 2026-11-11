@@ -20,7 +20,7 @@
   let destination = $state<AlbumDestination | null>(null);
   let message = $state('');
   type PendingEvent = 'ready' | 'limit' | 'busy';
-  let queued = $state<PendingEvent | null>(null);
+  let queued = $state<Exclude<PendingEvent, 'busy'> | null>(null);
   let shortcut = $state<boolean | null>(null);
   let shortcutBusy = $state(false);
   let shortcutMessage = $state('');
@@ -60,12 +60,12 @@
   async function refresh() {
     status = await invoke<Status | null>('photo_drop_status');
   }
-  async function loadPreview(result: PendingEvent) {
+  async function loadPreview(result: Exclude<PendingEvent, 'busy'>) {
     if (result !== 'ready') {
       open = true;
       allowed = false;
       preview = null;
-      message = result === 'limit' ? messages.source_drop_limit! : 'Frameleaf is finishing another action. Try again when it’s ready.';
+      message = messages.source_drop_limit!;
       return;
     }
     busy = true;
@@ -101,7 +101,15 @@
     const listeners: UnlistenFn[] = [];
     void (async () => {
       const add = (stop: UnlistenFn) => { if (live) listeners.push(stop); else stop(); };
-      add(await listen<PendingEvent>('photo-drop-pending', event => { if (live) queued = event.payload; }));
+      add(await listen<PendingEvent>('photo-drop-pending', event => {
+        if (!live) return;
+        if (event.payload === 'busy') {
+          open = true;
+          message = 'Frameleaf is finishing another action. Try again when it’s ready.';
+        } else {
+          queued = event.payload;
+        }
+      }));
       add(await listen<Job>('photo-drop-import', event => {
         if (live && status?.consent.id === event.payload.sourceId) status = { ...status, job: event.payload };
       }));
