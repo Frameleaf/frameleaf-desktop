@@ -63,6 +63,45 @@ jobs:
           runtime="/opt/frameleaf/Runtimes/$manifest"
           jq -e --arg manifest "$manifest" --arg controller "$controller"             '.manifestSha256 == $manifest and .controllerSha256 == $controller' "$runtime/installation.json" >/dev/null
           echo "FRAMELEAF_TEST_RUNTIME=$runtime" >> "$GITHUB_ENV"
+      - name: Recover the approved runtime after an interrupted dpkg retry
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          runtime="$FRAMELEAF_TEST_RUNTIME"
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          test "$runtime" = "/opt/frameleaf/Runtimes/$manifest"
+          package="frameleaf-host-runtime-$manifest"
+          deb="$RUNNER_TEMP/ubuntu-host-packages/runtime.deb"
+          receipt="$runtime/installation.json"
+          fence="$runtime/.package-maintenance"
+          status() { dpkg-query --showformat='${db:Status-Status}' --show "$package"; }
+
+          test "$(status)" = installed
+          test ! -e "$fence" && test ! -L "$fence"
+          cp -- "$receipt" "$RUNNER_TEMP/installed-linux-receipt.json"
+          # Let dpkg finish unpacking the identical reviewed bytes, then stop
+          # before its separate configuration step invokes signed finalization.
+          sudo timeout 5m dpkg --unpack "$deb"
+          test "$(status)" = unpacked
+          test -f "$fence" && test ! -L "$fence" && test ! -s "$fence"
+          test ! -e "$receipt" && test ! -L "$receipt"
+
+          sudo timeout 5m dpkg --configure "$package"
+          test "$(status)" = installed
+          test ! -e "$fence" && test ! -L "$fence"
+          cmp -- "$receipt" "$RUNNER_TEMP/installed-linux-receipt.json"
+          printf '%s  %s\n' "$manifest" "$runtime/manifest.json" | sha256sum --check --status
+          helper="/opt/frameleaf/Controllers/$manifest/$controller/frameleaf-native-host"
+          printf '%s  %s\n' "$controller" "$helper" | sha256sum --check --status
+          test -z "$(find /opt/frameleaf/Profiles -mindepth 1 -print -quit)"
+          jq -nc --arg manifest "$manifest" --arg controller "$controller" '
+            {state:"interrupted-package-retry-passed",manifestSha256:$manifest,controllerSha256:$controller,
+             dpkgStateAfterUnpack:"unpacked",dpkgStateAfterRetry:"installed",
+             fenceClearedAfterRetry:true,receiptUnchanged:true}
+          '
       - name: Render with the installed Chromium sandbox under AppArmor
         run: |
           set -euo pipefail
