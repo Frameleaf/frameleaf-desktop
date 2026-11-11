@@ -111,6 +111,7 @@ fn prepare_batch(
     journal: &Journal,
     batch: &Journal,
     watch: &mut WatchState,
+    observed: &mut BTreeSet<String>,
     consent: &Consent,
     approval: &crate::copy_source::CopyApproval,
     identity: &DeviceIdentity,
@@ -123,11 +124,18 @@ fn prepare_batch(
         return Err("source_inventory_unreadable".into());
     }
     let mut new = Vec::new();
+    let mut latest = BTreeSet::new();
     for file in scan.files {
-        if !watch.verified.contains(&file_key(&file)?) {
-            new.push(file);
+        let key = file_key(&file)?;
+        if !watch.verified.contains(&key) {
+            // Wait for a second scan so a file still being written is not imported immediately.
+            if observed.contains(&key) {
+                new.push(file);
+            }
+            latest.insert(key);
         }
     }
+    *observed = latest;
     if new.is_empty() {
         return Ok(false);
     }
@@ -161,6 +169,7 @@ fn retryable(code: &str) -> bool {
             | "network_unknown"
             | "source_server_processing"
             | "source_upload_interrupted"
+            | "server_response_interrupted"
             | "source_item_changed"
             | "source_folder_unavailable"
             | "source_inventory_unreadable"
@@ -191,13 +200,22 @@ pub(super) async fn run(
 ) -> Result<(), String> {
     let approval = consent.approval(saved, identity)?;
     let batch = batch(journal)?;
+    let mut observed = BTreeSet::new();
     while !cancel.load(Ordering::Acquire) {
         let result = async {
             // Recheck the current session and pause state before inspecting any folder entries.
             gate()?;
             let mut watch = WatchState::load(journal, consent, identity)?;
             if watch.active.is_none()
-                && !prepare_batch(journal, &batch, &mut watch, consent, approval, identity)?
+                && !prepare_batch(
+                    journal,
+                    &batch,
+                    &mut watch,
+                    &mut observed,
+                    consent,
+                    approval,
+                    identity,
+                )?
             {
                 return Ok(());
             }
@@ -237,6 +255,7 @@ pub(super) async fn run(
             Ok(()) => notify(idle(consent, "watching")),
             Err(code) if cancel.load(Ordering::Acquire) => return Err(code),
             Err(code) if retryable(&code) => {
+                observed.clear();
                 let mut value = status_at(journal, saved, consent, identity)?;
                 value.state = "watching".into();
                 value.code = Some(code);
@@ -298,9 +317,27 @@ mod tests {
         let journal = Journal::new(&base, consent.source_id()).unwrap();
         let batch = batch(&journal).unwrap();
         let mut state = WatchState::load(&journal, &consent, &identity).unwrap();
-        assert!(
-            prepare_batch(&journal, &batch, &mut state, &consent, approval, &identity).unwrap()
-        );
+        let mut observed = BTreeSet::new();
+        assert!(!prepare_batch(
+            &journal,
+            &batch,
+            &mut state,
+            &mut observed,
+            &consent,
+            approval,
+            &identity
+        )
+        .unwrap());
+        assert!(prepare_batch(
+            &journal,
+            &batch,
+            &mut state,
+            &mut observed,
+            &consent,
+            approval,
+            &identity
+        )
+        .unwrap());
         let manifest: Manifest = batch.read("manifest.json", &identity).unwrap();
         let versions = manifest
             .files
@@ -312,10 +349,29 @@ mod tests {
         journal.write(STATE, &state, &identity).unwrap();
 
         fs::write(source.join("three.jpg"), b"new").unwrap();
+        observed.clear(); // In-memory observations are rebuilt after restart.
         let mut state = WatchState::load(&journal, &consent, &identity).unwrap();
-        assert!(
-            prepare_batch(&journal, &batch, &mut state, &consent, approval, &identity).unwrap()
-        );
+        let mut observed = BTreeSet::new();
+        assert!(!prepare_batch(
+            &journal,
+            &batch,
+            &mut state,
+            &mut observed,
+            &consent,
+            approval,
+            &identity
+        )
+        .unwrap());
+        assert!(prepare_batch(
+            &journal,
+            &batch,
+            &mut state,
+            &mut observed,
+            &consent,
+            approval,
+            &identity
+        )
+        .unwrap());
         let manifest: Manifest = batch.read("manifest.json", &identity).unwrap();
         assert_eq!(
             manifest

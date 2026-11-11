@@ -368,25 +368,42 @@ pub(crate) fn schedule_worker_resume(app: &AppHandle, scope: String, until: u64)
                 return;
             }
         }
-        let desktop = app.state::<crate::DesktopState>();
-        let mut current = desktop.0.lock().await;
-        let Some(saved) = current.as_mut() else {
-            return;
-        };
-        if worker_control::key(saved).as_ref() != Ok(&identity.0)
-            || !worker_control::load(saved)
-                .is_ok_and(|preference| preference.resume_due(until, worker_control::now()))
-        {
-            return;
-        }
-        match crate::apply_connected_worker_control(&app, saved, WorkerControl::Running).await {
-            Ok(status) => crate::publish_worker_status(&app, status),
-            Err(code) => {
-                let mut status = app.state::<crate::worker_setup::WorkerSetup>().status();
-                status.state = "failed".into();
-                status.code = Some(code.clone());
-                crate::publish_worker_status(&app, status);
-                let _ = app.emit_to("main", "tray-action-failed", code);
+        loop {
+            let desktop = app.state::<crate::DesktopState>();
+            let mut current = desktop.0.lock().await;
+            let Some(saved) = current.as_mut() else {
+                return;
+            };
+            if worker_control::key(saved).as_ref() != Ok(&identity.0)
+                || !worker_control::load(saved)
+                    .is_ok_and(|preference| preference.resume_due(until, worker_control::now()))
+            {
+                return;
+            }
+            match crate::apply_connected_worker_control(&app, saved, WorkerControl::Running).await {
+                Ok(status) => {
+                    crate::publish_worker_status(&app, status);
+                    return;
+                }
+                Err(code)
+                    if matches!(
+                        code.as_str(),
+                        "server_unreachable_or_certificate_invalid"
+                            | "server_response_interrupted"
+                            | "worker_resume_offline"
+                    ) =>
+                {
+                    drop(current);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                Err(code) => {
+                    let mut status = app.state::<crate::worker_setup::WorkerSetup>().status();
+                    status.state = "failed".into();
+                    status.code = Some(code.clone());
+                    crate::publish_worker_status(&app, status);
+                    let _ = app.emit_to("main", "tray-action-failed", code);
+                    return;
+                }
             }
         }
     });
