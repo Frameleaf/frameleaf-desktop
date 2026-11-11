@@ -244,7 +244,15 @@ pub fn qualify_media_move() -> Result<(), String> {
     emit(crate::host_state::media_move::qualification::run(&raw)?)
 }
 
-fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub fn qualify_media_move_manager() -> Result<(), String> {
+    let mut input = BufReader::new(std::io::stdin());
+    tauri::async_runtime::block_on(crate::host_state::media_move::qualification::serve_manager(
+        &mut input,
+    ))
+}
+
+pub(crate) fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     Read::by_ref(reader)
         .take((limit + 1) as u64)
@@ -295,7 +303,7 @@ fn candidate_file(path: &Path, maximum: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn emit(value: serde_json::Value) -> Result<(), String> {
+pub(crate) fn emit(value: serde_json::Value) -> Result<(), String> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{value}")
         .and_then(|()| output.flush())

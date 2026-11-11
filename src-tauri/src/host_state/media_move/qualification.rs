@@ -329,3 +329,143 @@ pub(crate) fn run(raw: &[u8]) -> Result<Value, String> {
     };
     Ok(json!({"protocolVersion":1,"state":"selected-fenced","binding":binding}))
 }
+
+/// Start the installed Manager with an ephemeral administrator and the real Desktop pairing flow.
+pub(crate) async fn serve_manager(input: &mut impl std::io::BufRead) -> Result<(), String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rand::RngCore;
+    use std::{sync::atomic::AtomicBool, time::Duration};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ManagerStart {
+        protocol_version: u32,
+        fixture_id: Uuid,
+        host: Host,
+        manager_port: u16,
+        database_port: u16,
+        api_port: u16,
+        release: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Command {
+        scope: crate::manager::Scope,
+        path: String,
+        body: Value,
+    }
+
+    let raw = crate::host_control::line(input, 16 * 1024)?;
+    let start: ManagerStart = serde_json::from_slice(&raw).map_err(|_| INVALID)?;
+    if start.protocol_version != 1 {
+        return Err(INVALID.into());
+    }
+    let fixture = Fixture::open(root_path(start.fixture_id)?)?;
+    let device = fixture.device()?;
+    let host = start.host;
+    let installation = crate::host_install::Installation::read(&host.manifest_sha256)?;
+    let installed = installation.layout()?;
+    if crate::windows_protection::stable_path(&host.candidate)? != installed.runtime {
+        return Err(CHANGED.into());
+    }
+    crate::host_install::verify_installed_program(
+        &host.manifest_sha256,
+        &installation.controller_sha256,
+        "controller",
+    )?;
+    let controller = crate::runtime_store::read_bounded(&installed.controller, 256 * 1024 * 1024)?;
+    if digest(&controller) != installation.controller_sha256 {
+        return Err(CHANGED.into());
+    }
+    let _lease = crate::package_lease::CodeLease::acquire(&installed.runtime)?;
+    let runtime = crate::host_control::verify_candidate(&installed.runtime, &host.manifest_sha256)?;
+    let configuration = crate::manager_host::Configuration {
+        installation_id: host.installation_id,
+        name: "Disposable media move qualification".into(),
+        release: start.release,
+        controller: installed.controller,
+        state: fixture.path.join("state"),
+        data: fixture.path.join("manager"),
+        origin: format!("https://127.0.0.1:{}", start.manager_port),
+        database_port: start.database_port,
+        api_port: start.api_port,
+    };
+    crate::manager_host::validate_configuration(&configuration)?;
+    if configuration
+        .data
+        .read_dir()
+        .map_err(|_| INVALID)?
+        .next()
+        .is_some()
+    {
+        return Err(INVALID.into());
+    }
+    let tls = crate::manager_tls::TlsIdentity::load_or_create(
+        &configuration.installation_id,
+        &configuration.origin,
+        || Ok(None),
+        |_| Ok(()),
+    )?;
+    let random_secret = || {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut *bytes);
+        Zeroizing::new(URL_SAFE_NO_PAD.encode(&*bytes))
+    };
+    let admin = random_secret();
+    let mut manager = runtime.manager_programs()?.start(
+        &configuration,
+        &random_secret(),
+        &random_secret(),
+        &tls,
+    )?;
+    manager
+        .wait_ready(Duration::from_secs(60), &AtomicBool::new(false))
+        .await?;
+    if manager.claimed().await? {
+        return Err(INVALID.into());
+    }
+    let proof = crate::host_setup::claim_proof(&configuration.data)?;
+    manager.claim_local(&admin, &proof).await?;
+    let certificate = manager.management_identity(&configuration)?;
+    let grant = crate::manager::pair_qualification_move(
+        &device,
+        &configuration.origin,
+        admin.to_string(),
+        certificate,
+    )
+    .await?;
+    crate::host_control::emit(json!({"protocolVersion":1,"state":"fixture-manager-ready"}))?;
+    let result = async {
+        while !input.fill_buf().map_err(|_| INVALID)?.is_empty() {
+            let raw = crate::host_control::line(input, 16 * 1024)?;
+            let command: Command = serde_json::from_slice(&raw).map_err(|_| INVALID)?;
+            let send = || {
+                crate::manager::send_qualification_move(
+                    &grant,
+                    &device,
+                    command.scope,
+                    &command.path,
+                    command.body.clone(),
+                )
+            };
+            let mut response = send().await;
+            if response
+                .as_ref()
+                .is_err_and(|error| error == "manager_recent_auth_required")
+            {
+                crate::manager::reauthenticate(&grant, admin.to_string()).await?;
+                response = send().await;
+            }
+            crate::host_control::emit(match response {
+                Ok(value) => json!({"result":value}),
+                Err(code) => json!({"error":code}),
+            })?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    let revoke = crate::manager::disconnect(&grant, admin.to_string()).await;
+    let shutdown = manager.shutdown(Duration::from_secs(10)).await;
+    result.and(revoke).and(shutdown)
+}

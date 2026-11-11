@@ -479,6 +479,49 @@ pub async fn pair(
     allow_recovery: bool,
     persist: impl FnOnce(&SavedManager) -> Result<(), String>,
 ) -> Result<View, String> {
+    let mut scopes = SCOPES.to_vec();
+    if allow_recovery {
+        scopes.push(Scope::Restore);
+    }
+    pair_with_scopes(identity, origin, password, certificate, scopes, persist).await
+}
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub(crate) async fn pair_qualification_move(
+    identity: &DeviceIdentity,
+    origin: &str,
+    password: String,
+    certificate: CertificateTrust,
+) -> Result<SavedManager, String> {
+    let mut scopes = SCOPES.to_vec();
+    scopes.push(Scope::MoveLibrary);
+    let mut grant = None;
+    pair_with_scopes(
+        identity,
+        origin,
+        password,
+        Some(certificate),
+        scopes,
+        |saved| {
+            let raw = Zeroizing::new(
+                serde_json::to_vec(saved).map_err(|_| "manager_credential_invalid")?,
+            );
+            grant = Some(serde_json::from_slice(&raw).map_err(|_| "manager_credential_invalid")?);
+            Ok(())
+        },
+    )
+    .await?;
+    grant.ok_or_else(|| "manager_credential_invalid".into())
+}
+
+async fn pair_with_scopes(
+    identity: &DeviceIdentity,
+    origin: &str,
+    password: String,
+    certificate: Option<CertificateTrust>,
+    scopes: Vec<Scope>,
+    persist: impl FnOnce(&SavedManager) -> Result<(), String>,
+) -> Result<View, String> {
     canonical_origin(origin)?;
     let password = Zeroizing::new(password);
     if password.is_empty() || password.len() > 256 {
@@ -490,10 +533,6 @@ pub async fn pair(
         certificate.as_ref().map(|value| value.sha256.as_str()),
     )?;
     let session = login(&client, origin, &password).await?;
-    let mut scopes = SCOPES.to_vec();
-    if allow_recovery {
-        scopes.push(Scope::Restore);
-    }
     let result=async{
         let approval:Pairing=browser(&client,origin,&session,"desktop-grants/approve",json!({"password":password.as_str(),"deviceId":identity.installation_id,"publicKey":identity.public_key(),"scopes":scopes})).await?;
         validate_pairing(&approval,identity,origin,clock()?,&scopes)?;
@@ -549,21 +588,6 @@ fn prepare(
     now: u64,
     nonce: &str,
 ) -> Result<Prepared, String> {
-    canonical_origin(&saved.origin)?;
-    saved.require_device(identity)?;
-    if saved.expires_at <= now {
-        return Err("manager_pairing_expired".into());
-    }
-    if !identifier(&saved.id)
-        || !identifier(&saved.manager_id)
-        || !hex(&saved.installation_id, 12)
-        || !hex(&saved.token, 64)
-        || !identifier(nonce)
-        || now > 9_007_199_254_740_991
-        || saved.expires_at > now.saturating_add(LIFETIME + WINDOW)
-    {
-        return Err("manager_credential_invalid".into());
-    }
     let (scope, path, body) = match command {
         Command::Status {} => (Scope::Status, "/manager-api/desktop/status", json!({})),
         Command::Backups {} => (Scope::Restore, "/manager-api/desktop/backups", json!({})),
@@ -624,6 +648,31 @@ fn prepare(
             json!({"action":action,"id":id}),
         ),
     };
+    prepare_scoped(saved, identity, (scope, path, body), now, nonce)
+}
+
+fn prepare_scoped(
+    saved: &SavedManager,
+    identity: &DeviceIdentity,
+    (scope, path, body): (Scope, &'static str, Value),
+    now: u64,
+    nonce: &str,
+) -> Result<Prepared, String> {
+    canonical_origin(&saved.origin)?;
+    saved.require_device(identity)?;
+    if saved.expires_at <= now {
+        return Err("manager_pairing_expired".into());
+    }
+    if !identifier(&saved.id)
+        || !identifier(&saved.manager_id)
+        || !hex(&saved.installation_id, 12)
+        || !hex(&saved.token, 64)
+        || !identifier(nonce)
+        || now > 9_007_199_254_740_991
+        || saved.expires_at > now.saturating_add(LIFETIME + WINDOW)
+    {
+        return Err("manager_credential_invalid".into());
+    }
     if !saved.scopes.contains(&scope) {
         return Err("manager_scope_denied".into());
     }
@@ -667,7 +716,12 @@ pub async fn send(
         clock()?,
         &Uuid::new_v4().to_string(),
     )?;
-    let value = reply(
+    let value = send_prepared(saved, request).await?;
+    validate_reply(saved, &command, value)
+}
+
+async fn send_prepared(saved: &SavedManager, request: Prepared) -> Result<Value, String> {
+    reply(
         saved_client(saved)?
             .post(format!("{}{}", saved.origin, request.path))
             .header("content-type", "application/json")
@@ -677,9 +731,57 @@ pub async fn send(
             .await
             .map_err(|_| "manager_unreachable_or_certificate_invalid")?,
     )
-    .await?;
-    validate_reply(saved, &command, value)
+    .await
 }
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub(crate) async fn send_qualification_move(
+    saved: &SavedManager,
+    identity: &DeviceIdentity,
+    scope: Scope,
+    path: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let path = match (scope, path) {
+        (Scope::Status, "/manager-api/desktop/operation") => "/manager-api/desktop/operation",
+        (
+            Scope::Start | Scope::Stop | Scope::Restart | Scope::Backup,
+            "/manager-api/desktop/control",
+        ) => {
+            let action: Action = serde_json::from_value(body["action"].clone())
+                .map_err(|_| "manager_request_invalid")?;
+            if action.scope() != scope {
+                return Err("manager_scope_denied".into());
+            }
+            "/manager-api/desktop/control"
+        }
+        (Scope::MoveLibrary, "/manager-api/desktop/media-move-safety") => {
+            "/manager-api/desktop/media-move-safety"
+        }
+        (Scope::MoveLibrary, "/manager-api/desktop/review-media-move") => {
+            "/manager-api/desktop/review-media-move"
+        }
+        (Scope::MoveLibrary, "/manager-api/desktop/confirm-media-move") => {
+            "/manager-api/desktop/confirm-media-move"
+        }
+        (Scope::MoveLibrary, "/manager-api/desktop/media-move-operation") => {
+            "/manager-api/desktop/media-move-operation"
+        }
+        (Scope::MoveLibrary, "/manager-api/desktop/resume-media-move") => {
+            "/manager-api/desktop/resume-media-move"
+        }
+        _ => return Err("manager_scope_denied".into()),
+    };
+    let request = prepare_scoped(
+        saved,
+        identity,
+        (scope, path, body),
+        clock()?,
+        &Uuid::new_v4().to_string(),
+    )?;
+    send_prepared(saved, request).await
+}
+
 async fn grant_action(
     saved: &SavedManager,
     password: String,

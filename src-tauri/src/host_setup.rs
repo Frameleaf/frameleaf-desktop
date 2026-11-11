@@ -402,7 +402,7 @@ fn require_password(password: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn claim_proof(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, String> {
+pub(crate) fn claim_proof(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, String> {
     use std::io::Read;
     let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(path)?);
     let file = directory
