@@ -101,3 +101,13 @@ test('restore intent requires a fresh compatible review and preserves one execut
  assert.equal(parseBackupRestoreIntent(JSON.stringify(intent),{...owner,deviceId:crypto.randomUUID()}),null);
  assert.notEqual(backupRestoreKey(owner),intentKey(owner));
 });
+
+test('database recovery requires an error-free Manager completion with a server readiness checkpoint', () => {
+ const operation = {id:'33333333-3333-4333-8333-333333333333',kind:'restore',state:'complete',step:'native-restore-started',completed:['native-restore-started'],error:null,createdAt:1,updatedAt:2} as const;
+ const ready: managerState.BackupRestoreOperation = {...operation, completed:[...operation.completed]};
+ assert.equal(managerState.databaseRecoveryReady(ready),true);
+ assert.equal(managerState.databaseRecoveryReady({...ready, state:'running'}),false);
+ assert.equal(managerState.databaseRecoveryReady({...ready, error:'operation_failed'}),false);
+ assert.equal(managerState.databaseRecoveryReady({...ready, completed:[]}),false);
+ assert.equal(managerState.databaseRecoveryReady(null),false);
+});
