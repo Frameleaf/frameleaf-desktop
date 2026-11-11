@@ -340,19 +340,23 @@ try {
     try {
         if (!$app.HasExited) {
             Stop-Process -Id $app.Id -Force
-            if (!$app.WaitForExit(10000)) { Write-Warning 'Desktop did not exit before recovery cleanup.' }
+            $null = $app.WaitForExit(10000)
         }
     } finally {
         if ($InstalledHost) {
             Remove-Item Env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD -ErrorAction SilentlyContinue
-            foreach ($temporaryPath in @($receipt, $recoveryRoot)) {
-                if (!$temporaryPath) { continue }
-                try {
-                    if (Test-Path -LiteralPath $temporaryPath) {
-                        Remove-Item -LiteralPath $temporaryPath -Recurse -ErrorAction Stop
+            if (!$app.HasExited) {
+                Write-Warning 'Desktop did not exit. Temporary recovery files were retained.'
+            } else {
+                foreach ($temporaryPath in @($receipt, $recoveryRoot)) {
+                    if (!$temporaryPath) { continue }
+                    try {
+                        if (Test-Path -LiteralPath $temporaryPath) {
+                            Remove-Item -LiteralPath $temporaryPath -Recurse -ErrorAction Stop
+                        }
+                    } catch {
+                        Write-Warning "Could not remove temporary recovery files at $temporaryPath."
                     }
-                } catch {
-                    Write-Warning "Could not remove temporary recovery files at $temporaryPath."
                 }
             }
         }
