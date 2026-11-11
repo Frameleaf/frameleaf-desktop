@@ -35,6 +35,13 @@ The diagnostic also accepts the exact [published GGUF and projector pair](https:
 when the conversion receipt is omitted. That export identifies its base model and license. The
 converter's input revision and build are unverified for those published bytes.
 
-Desktop activation still requires a qualified model catalogue entry, signed runtime and model
-inventory, authenticated Library claims, and installed execution, resource and cancellation checks
-on the platforms where the provider will be offered.
+The goldens exercise the same adapter that accepts the candidate native request
+`image-description-tagging.visual` for `Qwen3.5-4B` with empty options. It accepts inline
+JPEG or PNG bytes and returns the Library result schema. Desktop's bound prediction client
+has a transport test for these exact entries and the result shape.
+
+Installed execution still needs a Qwen binding in Library's signed native sidecar with an
+owned llama.cpp process, qualification for both GGUF files and the execution backend, and an
+approved model catalogue and claim route on both sides. The current inventory and runtime
+admission are unchanged. Installed resource, cancellation, and output-quality checks are
+required on the platforms where the provider will be offered.

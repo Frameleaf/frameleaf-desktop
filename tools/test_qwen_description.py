@@ -2,6 +2,7 @@ import base64
 import json
 import tempfile
 import threading
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import unittest
 from pathlib import Path
@@ -23,6 +24,16 @@ class QwenDescriptionTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(data.split(",", 1)[1]), image)
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertFalse(body["response_format"]["json_schema"]["schema"]["additionalProperties"])
+
+    def test_worker_labels_binary_jpeg_and_caps_images_before_encoding(self):
+        jpeg = bytes.fromhex("ffd8ffe0")
+        body = qwen.request_body(jpeg)
+        self.assertEqual(
+            body["messages"][0]["content"][0]["image_url"]["url"],
+            "data:image/jpeg;base64," + base64.b64encode(jpeg).decode(),
+        )
+        with patch.object(qwen, "MAX_IMAGE", len(jpeg) - 1), self.assertRaisesRegex(ValueError, "input limit"):
+            qwen.request_body(jpeg)
 
     def test_description_maps_to_worker_wire_contract(self):
         result = qwen.worker_output(response('{"description":"A red square."}'))
@@ -59,16 +70,27 @@ class QwenDescriptionTests(unittest.TestCase):
                 pass
 
         with HTTPServer(("127.0.0.1", 0), Handler) as server:
+            server.timeout = 2
             thread = threading.Thread(target=server.handle_request)
             thread.start()
-            request = qwen.request_body(qwen.synthetic_png((255, 0, 0), False))
-            connection, reply = qwen.request_local(server.server_port, "/v1/chat/completions", "fixture", body=request)
+            image = qwen.synthetic_png((255, 0, 0), False)
             try:
-                self.assertEqual(qwen.worker_output(reply.read())[qwen.DESCRIPTION_TASK]["description"], "A red square.")
+                result = qwen.predict_worker(server.server_port, "fixture", qwen.worker_entries(), image)
+                self.assertEqual(result[qwen.DESCRIPTION_TASK]["description"], "A red square.")
             finally:
-                connection.close()
                 thread.join(timeout=2)
-            self.assertEqual(observed, [("/v1/chat/completions", "Bearer fixture", request)])
+            self.assertEqual(observed, [("/v1/chat/completions", "Bearer fixture", qwen.request_body(image))])
+
+    def test_native_prediction_refuses_wrong_binding_or_image_before_transport(self):
+        image = qwen.synthetic_png((255, 0, 0), False)
+        for entries, payload in (
+            ({}, image),
+            ({qwen.DESCRIPTION_TASK: {"visual": {"modelName": "other", "options": {}}}}, image),
+            ({qwen.DESCRIPTION_TASK: {"visual": {"modelName": "Qwen3.5-4B", "options": {"external_prompt": "new instructions"}}}}, image),
+            (qwen.worker_entries(), b"file:///tmp/private.jpg"),
+        ):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                qwen.predict_worker(0, "fixture", entries, payload)
 
     def test_refuses_mismatched_candidate_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

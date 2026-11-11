@@ -43,7 +43,9 @@ SCHEMA = {
     "additionalProperties": False,
 }
 DESCRIPTION_TASK = "image-description-tagging"
+MODEL_NAME = "Qwen3.5-4B"
 LIMIT = 64 * 1024
+MAX_IMAGE = 16 * 1024 * 1024
 
 
 def artifact(path):
@@ -84,15 +86,23 @@ def synthetic_png(color, circle):
 
 def request_body(image, *, stream=False):
     prompt = (
-        "Identify the color and geometric shape in this image. Return one factual sentence."
+        "Describe the visible contents of this photo in one factual sentence. Do not infer details."
         if not stream else
         "Describe the color and shape and then explain in detail what visual evidence led to your answer."
     )
+    if len(image) > MAX_IMAGE:
+        raise ValueError("Native image exceeds the input limit")
+    if image.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    elif image.startswith(b"\xff\xd8\xff"):
+        media_type = "image/jpeg"
+    else:
+        raise ValueError("Native prediction requires PNG or JPEG bytes")
     return {
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode("ascii")}},
+                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64," + base64.b64encode(image).decode("ascii")}},
                 {"type": "text", "text": prompt},
             ],
         }],
@@ -265,6 +275,25 @@ def request_local(port, path, token, *, body=None, timeout=20):
         raise
 
 
+def worker_entries():
+    return {DESCRIPTION_TASK: {"visual": {"modelName": MODEL_NAME, "options": {}}}}
+
+
+def predict_worker(port, token, entries, image):
+    """Execute one bound Library image request against an already owned llama.cpp runtime."""
+    if entries != worker_entries():
+        raise ValueError("Native prediction does not match the Qwen binding")
+    connection, response = request_local(
+        port, "/v1/chat/completions", token, body=request_body(image), timeout=30,
+    )
+    try:
+        if response.status != 200:
+            raise ValueError(f"Qwen returned HTTP {response.status}")
+        return worker_output(response.read(LIMIT + 1))
+    finally:
+        connection.close()
+
+
 def stop(process):
     if process.poll() is None:
         try:
@@ -336,13 +365,7 @@ def qualify(binary, model, projector, backend, output, receipt=None):
             finally:
                 connection.close()
             for color, shape, image in fixtures:
-                connection, response = request_local(port, "/v1/chat/completions", token, body=request_body(image), timeout=30)
-                try:
-                    if response.status != 200:
-                        raise ValueError(f"Qwen returned HTTP {response.status}")
-                    result = worker_output(response.read(LIMIT + 1))
-                finally:
-                    connection.close()
+                result = predict_worker(port, token, worker_entries(), image)
                 text = result[DESCRIPTION_TASK]["description"]
                 if not all(re.search(rf"\b{word}\b", text, re.IGNORECASE) for word in (color, shape)):
                     raise ValueError(f"Golden photo description mismatch: {text}")
