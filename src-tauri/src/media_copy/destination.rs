@@ -1,5 +1,6 @@
 use cap_std::fs::{Dir, File, OpenOptions};
 use std::{
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
 };
@@ -18,6 +19,10 @@ impl Destination {
     pub(super) fn open(path: PathBuf) -> Result<Self, &'static str> {
         let directory = open(&path)?;
         crate::host_storage::media_destination(&path, &directory).map_err(|_| INVALID)?;
+        Self::from_directory(path, directory)
+    }
+
+    fn from_directory(path: PathBuf, directory: std::fs::File) -> Result<Self, &'static str> {
         #[cfg(target_os = "macos")]
         require_exclusive_rename(&directory)?;
         let directory = Dir::from_std_file(directory);
@@ -45,17 +50,20 @@ impl Destination {
     }
 
     pub(super) fn start(self, package: Uuid) -> Result<Partial, &'static str> {
-        let name = format!("Frameleaf-{package}.frameleaf-preservation.zip");
+        self.start_named(
+            format!("Frameleaf-{package}.frameleaf-preservation.zip").into(),
+            ".frameleaf-preservation-copy",
+        )
+    }
+
+    fn start_named(self, name: OsString, prefix: &str) -> Result<Partial, &'static str> {
         match self.directory.symlink_metadata(&name) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => return Err("media_copy_destination_exists"),
             Err(_) => return Err(INVALID),
         }
         // On FAT, renaming to a longer name can change the open file's identifier.
-        let temporary = format!(
-            ".frameleaf-preservation-copy-{}.zip.partial",
-            Uuid::new_v4()
-        );
+        let temporary = format!("{prefix}-{}.zip.partial", Uuid::new_v4());
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -76,11 +84,18 @@ impl Destination {
     }
 }
 
-pub(super) struct Partial {
+pub(crate) fn start_export(path: &Path) -> Result<Partial, &'static str> {
+    let parent = path.parent().ok_or(INVALID)?;
+    let name = path.file_name().ok_or(INVALID)?;
+    Destination::from_directory(parent.to_owned(), open(parent)?)?
+        .start_named(name.to_owned(), ".frameleaf-original")
+}
+
+pub(crate) struct Partial {
     destination: Destination,
     temporary: String,
-    name: String,
-    pub(super) file: Option<File>,
+    name: OsString,
+    pub(crate) file: Option<File>,
 }
 
 impl Partial {
@@ -88,20 +103,26 @@ impl Partial {
         self.destination.space(required)
     }
 
-    pub(super) fn publish(mut self, verified_stamp: &str) -> Result<String, &'static str> {
+    pub(crate) fn publish(mut self, verified_stamp: &str) -> Result<String, &'static str> {
         let _current = self.destination.reopen()?;
         let file = self.file.take().ok_or(WRITE)?;
         if crate::copy_source::opened_stamp(&file).map_err(|_| INVALID)? != verified_stamp {
             return Err(INVALID);
         }
-        same_file(&self.destination.directory, &self.temporary, &file)?;
-        publish_exclusive(&self.destination, &self.temporary, &self.name).map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                "media_copy_destination_exists"
-            } else {
-                WRITE
-            }
-        })?;
+        same_file(
+            &self.destination.directory,
+            OsStr::new(&self.temporary),
+            &file,
+        )?;
+        publish_exclusive(&self.destination, OsStr::new(&self.temporary), &self.name).map_err(
+            |error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    "media_copy_destination_exists"
+                } else {
+                    WRITE
+                }
+            },
+        )?;
         self.temporary.clear();
         same_file(&self.destination.directory, &self.name, &file)?;
         #[cfg(unix)]
@@ -121,7 +142,7 @@ impl Partial {
     }
 }
 
-fn same_file(directory: &Dir, name: &str, file: &File) -> Result<(), &'static str> {
+fn same_file(directory: &Dir, name: &OsStr, file: &File) -> Result<(), &'static str> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -216,10 +237,13 @@ fn require_exclusive_rename(directory: &std::fs::File) -> Result<(), &'static st
 }
 
 #[cfg(unix)]
-fn publish_exclusive(destination: &Destination, temporary: &str, name: &str) -> io::Result<()> {
-    use std::{ffi::CString, os::fd::AsRawFd};
-    let temporary = CString::new(temporary)?;
-    let name = CString::new(name)?;
+fn publish_exclusive(destination: &Destination, temporary: &OsStr, name: &OsStr) -> io::Result<()> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+    let temporary = CString::new(temporary.as_bytes())?;
+    let name = CString::new(name.as_bytes())?;
     let fd = destination.directory.as_raw_fd();
     #[cfg(target_os = "macos")]
     let result =
@@ -243,7 +267,7 @@ fn publish_exclusive(destination: &Destination, temporary: &str, name: &str) -> 
 }
 
 #[cfg(windows)]
-fn publish_exclusive(destination: &Destination, temporary: &str, name: &str) -> io::Result<()> {
+fn publish_exclusive(destination: &Destination, temporary: &OsStr, name: &OsStr) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
     let utf16 = |path: PathBuf| {

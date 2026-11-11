@@ -26,6 +26,7 @@
     offline_album_cancelled: 'Download cancelled.',
     offline_library_unreachable: 'Frameleaf could not reach the Library to verify this album.',
     offline_album_save_failed: 'Frameleaf could not save the original to that folder.',
+    offline_album_save_unsupported: 'Choose a folder on a drive that supports saving without replacing existing files.',
     offline_album_save_exists: 'Choose a new filename to save the original.',
     offline_album_busy: 'Frameleaf is finishing another offline operation. Try again in a moment.',
   };

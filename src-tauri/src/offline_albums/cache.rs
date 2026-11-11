@@ -522,13 +522,13 @@ impl Cache {
         path: &Path,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<(), String> {
-        let parent = path.parent().ok_or("offline_album_save_failed")?;
-        crate::native_runtime::absolute_directory(parent)?;
-        if path.exists() {
-            return Err("offline_album_save_exists".into());
-        }
-        let temporary = Export(parent.join(format!(".frameleaf-save-{}", Uuid::new_v4())));
-        let mut file = Self::create_file(&temporary.0)?;
+        let save_error = |error| match error {
+            "media_copy_destination_exists" => "offline_album_save_exists",
+            "media_copy_destination_unsupported" => "offline_album_save_unsupported",
+            _ => "offline_album_save_failed",
+        };
+        let mut output = crate::media_copy::start_export(path).map_err(save_error)?;
+        let file = output.file.as_mut().ok_or("offline_album_save_failed")?;
         let mut offset = 0;
         while offset < access.size {
             if cancelled() || !access.current() {
@@ -541,11 +541,15 @@ impl Cache {
             offset = end;
         }
         file.sync_all().map_err(|_| "offline_album_save_failed")?;
-        drop(file);
+        let stamp =
+            crate::copy_source::opened_stamp(file).map_err(|_| "offline_album_save_failed")?;
         if cancelled() || !access.current() {
             return Err("offline_album_cancelled".into());
         }
-        fs::hard_link(&temporary.0, path).map_err(|_| "offline_album_save_failed".into())
+        output
+            .publish(&stamp)
+            .map(|_| ())
+            .map_err(|error| save_error(error).into())
     }
 
     async fn connect<'a>(&self, saved: &'a SavedConnection) -> Result<Option<Library<'a>>, String> {
@@ -575,13 +579,6 @@ impl Authorized {
         now().is_ok_and(|now| {
             now < self.expires_at && now >= self.expires_at.saturating_sub(GRACE_SECONDS)
         })
-    }
-}
-
-struct Export(PathBuf);
-impl Drop for Export {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -806,6 +803,24 @@ mod tests {
             b"original"
         );
         let destination = fixture.base.join("saved.mp4");
+        let mut checks = 0;
+        assert_eq!(
+            restored
+                .save(fixture.album, fixture.item, &access, &destination, || {
+                    checks += 1;
+                    checks > 1
+                })
+                .unwrap_err(),
+            "offline_album_cancelled"
+        );
+        assert!(!destination.exists());
+        assert!(!fs::read_dir(&fixture.base).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".frameleaf-original")
+        }));
         restored
             .save(fixture.album, fixture.item, &access, &destination, || false)
             .unwrap();
