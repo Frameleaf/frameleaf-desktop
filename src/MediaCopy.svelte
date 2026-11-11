@@ -22,7 +22,7 @@
     media_copy_destination_invalid: 'Choose a writable folder on a local drive. Check that the drive is still connected.',
     media_copy_destination_unsupported: 'Choose a drive that can safely save a copy without replacing another file, such as an APFS drive.',
     sign_in_required: 'Sign in to your library before saving a media copy.',
-    media_copy_busy: 'Another media copy is running. Wait for it to finish or cancel it.',
+    media_copy_busy: 'Wait for the current media copy or update to finish.',
     media_copy_server_unavailable: 'Could not check whether your library supports media copies. Check your connection and refresh the list.',
     media_copy_download_failed: 'The download stopped. Check your library connection and try again.',
     media_copy_destination_exists: 'This folder already has a copy with the same package ID. Choose another folder to keep both.',

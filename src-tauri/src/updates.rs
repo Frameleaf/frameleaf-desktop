@@ -42,6 +42,9 @@ pub(crate) async fn install_desktop_update(
     require_local(&window)?;
     let host = app.state::<HostSetup>();
     let _owner = host.lock_for_update()?;
+    let media_copy = app
+        .state::<crate::media_copy::MediaCopy>()
+        .lock_for_update()?;
     let mut update = latest(&app)
         .await?
         .filter(|update| update.version == version)
@@ -63,6 +66,7 @@ pub(crate) async fn install_desktop_update(
     })?;
     let restart = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let _media_copy = media_copy;
         update.install(bytes).map_err(|error| {
             eprintln!("Desktop update installation failed: {error}");
             "update_install_failed"

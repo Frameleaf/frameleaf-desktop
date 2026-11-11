@@ -28,6 +28,17 @@ pub(crate) struct MediaCopy {
 }
 
 impl MediaCopy {
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.try_lock().is_err()
+    }
+
+    pub(crate) fn lock_for_update(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        self.active
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| "update_media_copy_active".into())
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -311,4 +322,25 @@ async fn copy(
         originals: manifest.item_count(),
         bytes: received,
     })
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::MediaCopy;
+
+    #[test]
+    fn update_and_media_copy_cannot_run_together() {
+        let copy = MediaCopy::default();
+        let active = copy.active.try_lock().unwrap();
+        assert_eq!(
+            copy.lock_for_update().err().as_deref(),
+            Some("update_media_copy_active")
+        );
+        drop(active);
+
+        let update = copy.lock_for_update().unwrap();
+        assert!(copy.active.try_lock().is_err());
+        drop(update);
+        assert!(copy.active.try_lock().is_ok());
+    }
 }

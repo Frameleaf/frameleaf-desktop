@@ -658,6 +658,7 @@ pub fn run() {
                     if cfg!(target_os = "macos")
                         || window.state::<host_setup::HostSetup>().background_active()
                         || window.state::<source_import::SourceJobs>().watching()
+                        || window.state::<media_copy::MediaCopy>().is_active()
                     {
                         api.prevent_close();
                         let _ = window.hide();
@@ -678,7 +679,14 @@ pub fn run() {
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 app.state::<window_placement::WindowPlacement>().save(app);
-                if app.state::<host_setup::HostSetup>().background_active() {
+                if app.state::<media_copy::MediaCopy>().is_active() {
+                    api.prevent_exit();
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.emit("tray-action-failed", "media_copy_exit_blocked");
+                    }
+                } else if app.state::<host_setup::HostSetup>().background_active() {
                     api.prevent_exit();
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
