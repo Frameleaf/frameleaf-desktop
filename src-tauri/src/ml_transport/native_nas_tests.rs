@@ -268,6 +268,8 @@ fn actual_native_nas_library_jobs() {
             .unwrap();
         assert_eq!(profiles.len(), if workload == "clip" { 3 } else { 1 });
         let mut prepared = Vec::new();
+        let evidence_dir = root.0.join("qualification-evidence");
+        assert!(!evidence_dir.exists());
         for profile in &profiles {
             let challenge = worker
                 .request_qualification(profile, &attestation, &Uuid::new_v4().to_string())
@@ -290,7 +292,42 @@ fn actual_native_nas_library_jobs() {
                 .read_accepted_qualification(profile, &proof, challenge.id())
                 .await
                 .unwrap();
+            accepted
+                .write_evidence(&evidence_dir, "test", profile, &installed, &proof)
+                .unwrap();
             prepared.push((proof, accepted));
+        }
+        let mut receipts = std::collections::BTreeMap::new();
+        for file in fs::read_dir(&evidence_dir).unwrap() {
+            let evidence: serde_json::Value =
+                serde_json::from_slice(&fs::read(file.unwrap().path()).unwrap()).unwrap();
+            let key = evidence["modelKey"].as_str().unwrap().to_owned();
+            assert!(receipts.insert(key, evidence).is_none());
+        }
+        assert_eq!(receipts.len(), profiles.len());
+        for (profile, (proof, accepted)) in profiles.iter().zip(&prepared) {
+            let evidence = receipts.remove(profile.model_key()).unwrap();
+            let spec: serde_json::Value = serde_json::from_slice(proof.specification()).unwrap();
+            assert_eq!(evidence["modelName"], profile.model_name());
+            assert_eq!(
+                evidence["modelSnapshotRevision"],
+                profile.model_snapshot_revision()
+            );
+            assert_eq!(evidence["provider"], installed.provider());
+            assert_eq!(evidence["manifestSha256"], installed.manifest_sha256());
+            assert_eq!(evidence["qualificationId"], accepted.id());
+            assert_eq!(evidence["inputKind"], spec["fixtureKind"]);
+            assert_eq!(
+                evidence["configSha256"],
+                canonical_hash(&spec["entries"]).unwrap()
+            );
+            assert_eq!(evidence["bindingSha256"], hash(proof.specification()));
+            assert_eq!(evidence["fixtureSha256"], spec["fixtureSha256"]);
+            assert_eq!(evidence["executionState"], proof.report()["state"]);
+            assert_eq!(
+                evidence["reportSha256"],
+                canonical_hash(proof.report()).unwrap()
+            );
         }
         let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = reservation.local_addr().unwrap().port();
@@ -485,6 +522,7 @@ fn automatic_setup_job(
             serde_json::from_slice(&std::fs::read(receipts[0].path()).unwrap()).unwrap();
         assert_eq!(evidence["kind"], "nas-accepted-native-fixture");
         assert_eq!(evidence["modelKey"], profile["modelKey"]);
+        assert_eq!(evidence["modelName"], profile["modelName"]);
         assert_eq!(
             evidence["modelSnapshotRevision"],
             profile["modelSnapshotRevision"]

@@ -305,6 +305,7 @@ impl AcceptedQualification {
             "targetArch": std::env::consts::ARCH,
             "appVersion": app_version,
             "modelKey": self.model_key,
+            "modelName": profile.model_name(),
             "modelSnapshotRevision": profile.model_snapshot_revision(),
             "provider": provider,
             "executionState": report["state"],
@@ -1008,6 +1009,7 @@ mod renewal_tests {
             manifest_sha256: "b".repeat(64),
             runtime_fingerprint: "c".repeat(64),
             report_sha256: "d".repeat(64),
+            qualified_at: AT,
             expires_at: AT + 600000,
         };
         let first = accepted("first", "c1a52b82-60da-4fa2-8814-e028a088206f");

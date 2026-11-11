@@ -39,13 +39,16 @@ Desktop writes a private JSON receipt in
 for each model key and provider replaces its previous receipt. Collect only
 receipts with qualification timestamps from the current run and the expected
 app version, target architecture and signed runtime manifest digest. Search has
-separate receipts for its text, vision and joint roles. Check the exact model
-snapshot, provider and execution state in each receipt. A mixed accelerator
+separate receipts for default text, English text and vision. Match the model key
+and configuration digest for each route. Check the model name, snapshot,
+provider and execution state in each receipt. A mixed accelerator
 result records `ready-mixed`.
 
 Keep the receipts with the matching installer digest. They record fixture
-acceptance by Library. Run a representative Library job on each installed
-combination to qualify end-to-end processing.
+acceptance by Library. Run a representative Library job for each route on the
+installed combination to qualify end-to-end processing. The opt-in NAS harness
+checks all three search receipts together and accepts separate Face and OCR
+runs. Each harness run executes one representative job.
 
 ## Build and signing boundaries
 
