@@ -7,6 +7,7 @@
   import { connectionError } from '../errors';
   import { workloadName, workloadPill, workerTone, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
+  import { backupHealth, backupWarning, libraryHeadroom, storageWarning } from '../server-health';
 
   let { connection, setup, summary, native, section = 'all', onsetup, onconnection, onrefresh, onsignout, onopen }: {
     connection: Connection; setup: SetupStatus | null; summary: ServerSummary | null; native: boolean; section?: 'all' | 'ai';
@@ -52,7 +53,12 @@
   const connectionPill = $derived(connection.state === 'offline' ? { label: 'Server unavailable', tone: 'off' } : connection.state === 'identity-changed' ? { label: 'Identity changed', tone: 'bad' } : connection.state === 'awaiting-approval' ? { label: 'Awaiting approval', tone: 'wait' } : { label: 'Connected', tone: 'ok' });
   const control = $derived(setup?.control ?? 'running');
   const canControl = $derived(connection.mode === 'client-worker' && connection.features.workerSession);
-  const attention = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)));
+  const attention = $derived(summary?.me?.isAdmin === true
+    ? (summary.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id))
+    : []);
+  const storage = $derived(libraryHeadroom(summary?.storage));
+  const backup = $derived(backupHealth(summary));
+  const healthChecked = $derived(relativeTime(summary?.attention?.checkedAt));
 
   // Photo sources summary (read-only here; the Photo sources page owns the actions).
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
@@ -107,11 +113,11 @@
   }
   function attentionText(item: AttentionItem): { title: string; detail: string; page: string } {
     switch (item.reason) {
-      case 'not-backed-up': return { title: 'Your library is not backed up', detail: 'Set up a backup so your photos survive a failed drive.', page: 'cloud' };
-      case 'backup-failed': return { title: 'The last backup failed', detail: item.backup?.lastSuccessAt ? `Last successful backup ${relativeTime(item.backup.lastSuccessAt)}.` : 'No backup has completed yet.', page: 'cloud' };
-      case 'backup-behind': return { title: 'Backup is behind', detail: item.backup?.days != null ? `${item.backup.days} days since the last successful backup.` : 'The last backup is older than expected.', page: 'cloud' };
-      case 'nearly-full': return { title: 'Storage is nearly full', detail: item.storage ? `${formatBytes(item.storage.availableBytes)} left of ${formatBytes(item.storage.totalBytes)}.` : '', page: 'manager' };
-      case 'out-of-space': return { title: 'The server is out of space', detail: item.storage ? `${formatBytes(item.storage.availableBytes)} left of ${formatBytes(item.storage.totalBytes)}.` : '', page: 'manager' };
+      case 'not-backed-up':
+      case 'backup-failed':
+      case 'backup-behind': return backupWarning(item);
+      case 'nearly-full':
+      case 'out-of-space': return { ...storageWarning(item), page: 'manager' };
       case 'work-failed': return { title: 'Some server work failed', detail: item.work ? `${item.work.count.toLocaleString()} items across ${item.work.queues.map(queue => queue.name).join(', ')}.` : '', page: 'ai' };
       case 'work-paused': return { title: 'Server work is paused', detail: item.work ? `${item.work.count.toLocaleString()} items are waiting.` : '', page: 'ai' };
       case 'new-version': return { title: `Frameleaf ${item.version?.available ?? ''} is available`, detail: item.version ? `This server runs ${item.version.current}.` : '', page: 'manager' };
@@ -147,7 +153,7 @@
                 <span class="ic" aria-hidden="true"><Icon name="warn" /></span>
                 <span class="l"><b>{text.title}</b><small>{text.detail}</small></span>
                 <span class="pill {item.level === 'now' ? 'wait' : 'off'}"><i aria-hidden="true"></i>{item.level === 'now' ? 'Now' : 'Soon'}</span>
-                <button class="btn quiet" onclick={() => onopen(text.page)}>Open</button>
+                <button class="btn quiet" disabled={text.page === 'photos' && (!native || busy || connection.state === 'identity-changed')} onclick={() => text.page === 'photos' ? void photos() : onopen(text.page)}>{text.page === 'photos' ? 'Open Photos' : 'Open'}</button>
               </div>
             {/each}
           </div>
@@ -163,13 +169,29 @@
           </div>
           {#if summary?.storage || summary?.version}
             <div class="kv">
-              <div><span>Storage</span><b>{summary?.storage?.diskAvailable ?? formatBytes(summary?.storage?.diskAvailableRaw)} free</b><small class="muted" style="display:block;font-size:12px;margin-top:3px">of {summary?.storage?.diskSize ?? formatBytes(summary?.storage?.diskSizeRaw)}</small></div>
               <div><span>Version check</span><b>{summary?.version?.releaseVersion ? `Newest ${summary.version.releaseVersion}` : 'No newer version seen'}</b><small class="muted" style="display:block;font-size:12px;margin-top:3px">checked {relativeTime(summary?.version?.checkedAt ?? null)}</small></div>
               <div><span>Connection</span><b>{connection.features.worker ? 'Desktop workers supported' : 'Desktop workers need a server update'}</b><small class="muted" style="display:block;font-size:12px;margin-top:3px">{connection.features.sources ? 'Photo sources available' : 'Photo sources need a server update'}</small></div>
             </div>
           {/if}
-          {#if summary?.storage && typeof summary.storage.diskUsagePercentage === 'number'}
-            <div class="row top"><span class="l"><small style="margin:0 0 8px">{summary.storage.diskUse ?? formatBytes(summary.storage.diskUseRaw)} used · {Math.round(summary.storage.diskUsagePercentage)}% of the library drive</small><span class="progress" class:warn={summary.storage.diskUsagePercentage > 90} role="progressbar" aria-valuenow={Math.round(summary.storage.diskUsagePercentage)} aria-valuemin="0" aria-valuemax="100" aria-label="Server storage used"><span style="width:{percent(summary.storage.diskUseRaw, summary.storage.diskSizeRaw) || Math.round(summary.storage.diskUsagePercentage)}%"></span></span></span></div>
+        </div>
+      </div>
+      <div>
+        <div class="group-head"><h2 class="group-title">Server health</h2></div>
+        <div class="group">
+          <div class="row" class:top={storage.usedPercent !== null}>
+            <span class="ic" aria-hidden="true"><Icon name="server" /></span>
+            <span class="l">
+              <b>Library drive</b>
+              <small style={storage.usedPercent !== null ? 'margin-bottom:8px' : ''}>{storage.capacity ?? 'Available space is unknown.'}{storage.usedPercent !== null ? ` · ${storage.usedPercent}% used` : ''}</small>
+              {#if storage.usedPercent !== null}<span class="progress" role="progressbar" aria-valuenow={storage.usedPercent} aria-valuemin="0" aria-valuemax="100" aria-label="Library drive used"><span style="width:{storage.usedPercent}%"></span></span>{/if}
+            </span>
+          </div>
+          {#if backup}
+            <div class="row">
+              <span class="ic" aria-hidden="true"><Icon name="backup" /></span>
+              <span class="l"><b>Backup check</b>{#if healthChecked !== 'never'}<small>Checked {healthChecked}</small>{/if}</span>
+              <span class="pill {backup.tone}"><i aria-hidden="true"></i>{backup.label}</span>
+            </div>
           {/if}
         </div>
       </div>
