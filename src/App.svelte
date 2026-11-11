@@ -5,6 +5,7 @@
   import mark from './mark.svg';
   import Icon from './Icon.svelte';
   import Sheet from './Sheet.svelte';
+  import LibrarySwitcher from './LibrarySwitcher.svelte';
   import Welcome from './pages/Welcome.svelte';
   import Overview from './pages/Overview.svelte';
   import PhotoSourcesPage from './pages/PhotoSources.svelte';
@@ -42,6 +43,8 @@
   let updateError = $state('');
   let accountMenu = $state(false);
   let signOutSheet = $state(false);
+  let librariesOpen = $state(false);
+  let libraryRevision = $state(0);
   // A sign-in left in the credential store with no connection shown (restore failed, or sign-out could not delete it):
   // native connect refuses until it is cleared, so the clear action stays reachable.
   let staleSignIn = $state(false);
@@ -139,15 +142,20 @@
     }
   }
   function connected(view: Connection) {
+    const revision = ++libraryRevision;
+    librariesOpen = false;
     summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
-    void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
+    void invoke<SetupStatus>('worker_setup_status').then(value => {
+      if (libraryRevision === revision) setup = value;
+    }).catch(() => {});
   }
   async function signOut() {
     busy = true; failure = '';
     try {
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
       try { localStorage.removeItem(lastPageKey); } catch { /* Sign-out still succeeds. */ }
+      libraryRevision += 1;
       summaryRequest += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
@@ -228,6 +236,7 @@
             <div class="acct-info">{connection.name}{summary?.me?.email ? ` · ${summary.me.email}` : ''}<br />{connection.server}{isAdmin ? ' · Administrator' : ''}</div>
             <button onclick={() => { accountMenu = false; accountButton?.focus(); void photos(); }} disabled={busy || connection.state === 'identity-changed'}>Open Photos</button>
             <button onclick={() => { accountMenu = false; accountButton?.focus(); void offlinePhotos(); }} disabled={busy || connection.state === 'identity-changed'}>Offline Albums</button>
+            <button onclick={() => { accountMenu = false; accountButton?.focus(); librariesOpen = true; }} disabled={busy || !native}>Switch library…</button>
             <button onclick={() => { accountMenu = false; accountButton?.focus(); signOutSheet = true; }} disabled={busy}>Sign out…</button>
           </div>
         </div>
@@ -248,6 +257,12 @@
     {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if staleSignIn && !connection && !failure && !notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>A saved sign-in is still on this computer. Clear it before connecting to a server.</p><button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button></div>{/if}
+    {#if !connection && native && !hostActive}
+      <div style="margin:12px 24px 0">
+        <button class="btn" disabled={busy} onclick={() => { librariesOpen = true; }}>Approved libraries…</button>
+      </div>
+    {/if}
+    {#key libraryRevision}
     {#if native && importReady}
       {#key !!connection}
         <PhotoDrop connected={!!connection} visible={!!connection && page === 'sources'} />
@@ -270,11 +285,13 @@
     {:else if page === 'remote'}
       <Remote {native} {summary} {connection} onrefresh={loadSummary} />
     {/if}
+    {/key}
   </main>
 </div>
+{#if librariesOpen}<LibrarySwitcher onclose={() => { librariesOpen = false; }} onactivate={connected} />{/if}
 {#if signOutSheet}
   <Sheet title={connection ? `Sign out of “${hostOf(connection.server)}”?` : 'Clear the saved sign-in?'} kind="warning" {busy} onclose={() => { signOutSheet = false; }} onsubmit={signOut}>
-    <p>This computer’s session and device key are removed from the secure credential store, and the server is asked to revoke them. Photo folder permissions and AI processing on this computer stop.</p>
+    <p>Desktop removes the saved sign-in for this library and asks the server to revoke this computer’s session. Photo imports and AI processing for this library stop.</p>
     {#snippet actions()}
       <button class="btn" type="button" disabled={busy} onclick={() => { signOutSheet = false; }}>Cancel</button>
       <button class="btn danger" type="submit" disabled={busy || !native}>{busy ? 'Signing out…' : 'Sign Out'}</button>

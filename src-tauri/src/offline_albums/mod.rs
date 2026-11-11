@@ -145,18 +145,19 @@ fn intent(url: &Url) -> Option<Uuid> {
     (id == value.to_string()).then_some(value)
 }
 
-pub(crate) fn intercept(app: &AppHandle, url: &Url) -> bool {
+pub(crate) fn intercept(app: &AppHandle, url: &Url, expected_scope: &str) -> bool {
     if !url.path().starts_with(INTENT) {
         return false;
     }
     if let Some(id) = intent(url) {
         let app = app.clone();
         let origin = url.origin();
+        let expected_scope = expected_scope.to_owned();
         tauri::async_runtime::spawn(async move {
             let Some(window) = app.get_webview_window("photos") else {
                 return;
             };
-            let result = request(&app, &window, origin, id).await;
+            let result = request(&app, &window, origin, &expected_scope, id).await;
             if let Err(error) = result {
                 if window.url().is_ok_and(|url| !local_url(&url)) {
                     app.dialog()
@@ -184,7 +185,15 @@ fn show(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
         return Err("photo_window_unavailable".into());
     }
     let base = crate::connection::normalize_server(&saved.server)?;
-    let photos = crate::photo_window(app, &base, url.clone())?;
+    let expected = crate::connection::photo_session_scope(saved);
+    let state = app.state::<DesktopState>();
+    let mut scope = state.1.lock().map_err(|_| "photo_window_unavailable")?;
+    let photos = match app.get_webview_window("photos") {
+        Some(window) if scope.as_ref() == Some(&expected) => window,
+        Some(_) => return Err("library_photos_clear_failed".into()),
+        None => crate::photo_window(app, &base, url.clone(), expected.clone())?,
+    };
+    *scope = Some(expected);
     if !photos.url().is_ok_and(|url| local_url(&url)) {
         photos
             .navigate(url)
@@ -200,6 +209,7 @@ async fn request(
     app: &AppHandle,
     window: &WebviewWindow,
     origin: url::Origin,
+    expected_scope: &str,
     id: Uuid,
 ) -> Result<(), String> {
     let native = app.state::<OfflineAlbums>();
@@ -211,7 +221,8 @@ async fn request(
         .await
         .clone()
         .ok_or("sign_in_required")?;
-    if crate::connection::normalize_server(&saved.server)?.origin() != origin
+    if crate::connection::photo_session_scope(&saved) != expected_scope
+        || crate::connection::normalize_server(&saved.server)?.origin() != origin
         || !window.url().is_ok_and(|url| url.origin() == origin)
     {
         return Err("native_access_denied".into());

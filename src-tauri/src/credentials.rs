@@ -1,4 +1,4 @@
-use crate::connection::DeviceIdentity;
+use crate::connection::{photo_session_scope, DeviceIdentity, SavedConnection};
 use crate::worker::{persist_checkpoint, SavedWorker};
 #[cfg(any(not(target_os = "macos"), test))]
 use keyring::{Entry, Error};
@@ -6,6 +6,7 @@ use keyring::{Entry, Error};
 #[path = "macos_keychain.rs"]
 mod macos;
 use serde::{de::DeserializeOwned, Serialize};
+use std::borrow::Cow;
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
@@ -29,7 +30,7 @@ fn worker_lock(account: &str) -> Result<Option<MutexGuard<'static, ()>>, String>
 const SERVICE: &str = "app.frameleaf.desktop";
 pub fn load<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
     let _lock = worker_lock(account)?;
-    load_record(account)
+    load_record(&source_account(account)?)
 }
 fn load_record<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
     read_record(account, Prompt::Silent)
@@ -97,7 +98,7 @@ fn read_record<T: DeserializeOwned>(account: &str, _prompt: Prompt) -> Result<Op
 }
 pub fn save<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     let _lock = worker_lock(account)?;
-    save_record(account, value)
+    save_record(&source_account(account)?, value)
 }
 fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     let data =
@@ -112,6 +113,10 @@ fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
 }
 pub fn delete(account: &str) -> Result<(), String> {
     let _lock = worker_lock(account)?;
+    delete_record(&source_account(account)?)
+}
+
+fn delete_record(account: &str) -> Result<(), String> {
     #[cfg(all(target_os = "macos", not(test)))]
     return macos::delete(account);
     #[cfg(any(not(target_os = "macos"), test))]
@@ -123,6 +128,63 @@ pub fn delete(account: &str) -> Result<(), String> {
         Err(_) => Err("credential_store_locked_or_unavailable".into()),
     }
 }
+const SOURCE_APPROVALS: [&str; 2] = [
+    crate::source_consent::CREDENTIAL,
+    crate::drop_import::CREDENTIAL,
+];
+
+fn scoped_source_account(account: &str, saved: &SavedConnection) -> String {
+    // Consent is signed for the precise photo session, even when the same account signs in again.
+    format!("{account}-{}", photo_session_scope(saved))
+}
+
+fn source_account(account: &str) -> Result<Cow<'_, str>, String> {
+    if SOURCE_APPROVALS.contains(&account) {
+        if let Some(saved) = load_record::<SavedConnection>("connection")? {
+            if !saved.server_id.is_empty() {
+                return Ok(Cow::Owned(scoped_source_account(account, &saved)));
+            }
+        }
+    }
+    Ok(Cow::Borrowed(account))
+}
+
+pub(crate) fn migrate_source_approvals(saved: &SavedConnection) -> Result<(), String> {
+    if saved.server_id.is_empty() {
+        return Ok(());
+    }
+    for account in SOURCE_APPROVALS {
+        if let Some(consent) = load_record::<crate::source_consent::Consent>(account)? {
+            if consent.require(saved, &identity()?).is_ok() {
+                let scoped = scoped_source_account(account, saved);
+                if load_record::<crate::source_consent::Consent>(&scoped)?.is_none() {
+                    save_record(&scoped, &consent)?;
+                }
+                delete_record(account)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_parked_source_approvals(saved: &SavedConnection) -> Result<(), String> {
+    for account in SOURCE_APPROVALS {
+        delete_record(&scoped_source_account(account, saved))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_source_approvals(saved: Option<&SavedConnection>) -> bool {
+    let mut cleared = true;
+    for account in SOURCE_APPROVALS {
+        if let Some(saved) = saved {
+            cleared &= delete_record(&scoped_source_account(account, saved)).is_ok();
+        }
+        cleared &= delete_record(account).is_ok();
+    }
+    cleared
+}
+
 pub fn identity() -> Result<DeviceIdentity, String> {
     identity_with_prompt(Prompt::Silent)
 }
@@ -300,5 +362,37 @@ mod epoch_enrollment_tests {
         .unwrap();
         assert_eq!(result.installation_id, id);
         assert!(finished.get());
+    }
+}
+
+#[cfg(test)]
+mod library_switch_source_scope_tests {
+    use super::*;
+
+    #[test]
+    fn source_approvals_follow_only_the_original_library_account_and_session() {
+        let original = SavedConnection {
+            server: "https://example.invalid/".into(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Fixture".into(),
+            token: "fixture".into(),
+            device_name: "Desktop".into(),
+            mode: "client-worker".into(),
+            device_id: None,
+        };
+        let account = crate::source_consent::CREDENTIAL;
+        let original_key = scoped_source_account(account, &original);
+        let mut different = original.clone();
+        different.server_id = "different-library".into();
+        assert_ne!(scoped_source_account(account, &different), original_key);
+        different.server_id = original.server_id.clone();
+        different.account_id = "different-account".into();
+        assert_ne!(scoped_source_account(account, &different), original_key);
+        different.account_id = original.account_id.clone();
+        different.token = "new-session".into();
+        assert_ne!(scoped_source_account(account, &different), original_key);
+        different.token = original.token.clone();
+        assert_eq!(scoped_source_account(account, &different), original_key);
     }
 }

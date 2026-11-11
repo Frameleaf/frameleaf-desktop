@@ -945,6 +945,13 @@ impl SourceJobs {
             let _ = running.task.await;
         }
     }
+    pub(crate) async fn park(&self) {
+        self.stop().await;
+        self.watching.store(false, Ordering::Release);
+        if let Ok(mut status) = self.status.lock() {
+            *status = ImportView::default();
+        }
+    }
     pub fn status(
         &self,
         base: &Path,

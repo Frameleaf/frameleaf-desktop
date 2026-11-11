@@ -19,6 +19,7 @@ mod host_state;
 mod host_storage;
 mod identity_anchor;
 mod import_album;
+mod library_switch;
 pub mod lifecycle;
 pub mod manager;
 mod manager_commands;
@@ -68,7 +69,10 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 #[derive(Default)]
-pub(crate) struct DesktopState(pub(crate) Mutex<Option<SavedConnection>>);
+pub(crate) struct DesktopState(
+    pub(crate) Mutex<Option<SavedConnection>>,
+    std::sync::Mutex<Option<String>>,
+);
 
 pub(crate) fn require_local(window: &WebviewWindow) -> Result<(), String> {
     let url = window.url().map_err(|_| "window_origin_invalid")?;
@@ -237,6 +241,19 @@ async fn sign_in(
     identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
     confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
 ) -> Result<(SavedConnection, ConnectionView), String> {
+    let (base, login) =
+        request_login(client, server, email, password, device_name, identity).await?;
+    keep_login(client, &base, login, device_name, confirm).await
+}
+
+async fn request_login(
+    client: &reqwest::Client,
+    server: &str,
+    email: &str,
+    password: String,
+    device_name: &str,
+    identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
+) -> Result<(url::Url, LoginResponse), String> {
     let base = normalize_server(server)?;
     let password = Zeroizing::new(password);
     let email = email.trim();
@@ -250,7 +267,7 @@ async fn sign_in(
         .json(&serde_json::json!({ "email": email, "password": password.as_str(), "rememberMe": true }))
         .send().await.map_err(|_| "server_unreachable_or_certificate_invalid")?;
     let login: LoginResponse = transport::json(response).await?;
-    keep_login(client, &base, login, device_name, confirm).await
+    Ok((base, login))
 }
 
 /// A server session from any sign-in method becomes this computer's saved connection.
@@ -261,7 +278,13 @@ pub(crate) async fn keep_login(
     device_name: &str,
     confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
 ) -> Result<(SavedConnection, ConnectionView), String> {
-    let mut saved = SavedConnection {
+    let mut saved = saved_login(base, login, device_name);
+    let view = finish_new_connection(client, &mut saved, confirm).await?;
+    Ok((saved, view))
+}
+
+fn saved_login(base: &url::Url, login: LoginResponse, device_name: &str) -> SavedConnection {
+    SavedConnection {
         server: base.to_string(),
         server_id: String::new(),
         account_id: login.user_id,
@@ -270,9 +293,7 @@ pub(crate) async fn keep_login(
         device_name: device_name.trim().into(),
         mode: "client-worker".into(),
         device_id: None,
-    };
-    let view = finish_new_connection(client, &mut saved, confirm).await?;
-    Ok((saved, view))
+    }
 }
 
 // Persist the verified identity with the very first credential so cancellation is restart-safe.
@@ -285,7 +306,13 @@ async fn finish_new_connection(
     if let Ok(Some(caps)) = &capabilities {
         saved.server_id.clone_from(&caps.server_id);
     }
-    let result = match credentials::save("connection", saved) {
+    let result = (|| {
+        if library_switch::already_approved(saved)? {
+            return Err("library_already_approved".into());
+        }
+        credentials::save("connection", saved)
+    })();
+    let result = match result {
         Err(error) => Err(error),
         Ok(()) => match confirm(saved) {
             Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
@@ -353,33 +380,21 @@ async fn restore_connection(
     if saved.server_id.is_empty() {
         return Err("server_identity_not_confirmed".into());
     }
-    let base = normalize_server(&saved.server)?;
-    let client = transport::client()?;
-    #[derive(Deserialize)]
-    struct User {
-        id: String,
-    }
-    let response = client
-        .get(base.join("api/users/me").unwrap())
-        .bearer_auth(&saved.token)
-        .send()
-        .await
-        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    if matches!(response.status().as_u16(), 401 | 403) {
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
-            .await;
-    }
-    let user: User = transport::json(response).await?;
-    if user.id != saved.account_id {
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
-            .await;
-        return Err("account_identity_changed".into());
+    if let Err(error) = verify_photo_account(&transport::client()?, &saved).await {
+        if matches!(
+            error.as_str(),
+            "server_http_401" | "server_http_403" | "account_identity_changed"
+        ) {
+            app.state::<offline_albums::OfflineAlbums>()
+                .clear(&app)
+                .await;
+        }
+        return Err(error);
     }
     if retry.unwrap_or(false) {
         credentials::unlock_existing_identity(&window)?;
     }
+    credentials::migrate_source_approvals(&saved)?;
     let mut view = prepare(&mut saved).await;
     if view.state == "identity-changed" {
         app.state::<offline_albums::OfflineAlbums>()
@@ -392,11 +407,41 @@ async fn restore_connection(
     {
         view.state = "worker-setup-failed".into();
     }
+    resume_approved_watch(&app, &saved).await;
+    *current = Some(saved);
+    drop(current);
+    tray::refresh(&app).await;
+    Ok(Some(view))
+}
+
+async fn verify_photo_account(
+    client: &reqwest::Client,
+    saved: &SavedConnection,
+) -> Result<(), String> {
+    let base = normalize_server(&saved.server)?;
+    #[derive(Deserialize)]
+    struct User {
+        id: String,
+    }
+    let response = client
+        .get(base.join("api/users/me").unwrap())
+        .bearer_auth(&saved.token)
+        .send()
+        .await
+        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    let user: User = transport::json(response).await?;
+    if user.id != saved.account_id {
+        return Err("account_identity_changed".into());
+    }
+    Ok(())
+}
+
+async fn resume_approved_watch(app: &AppHandle, saved: &SavedConnection) {
     if let Ok(Some(consent)) =
         credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
     {
         if consent.watch && consent.registered && !consent.watch_paused {
-            if let Ok(base) = import_base(&app) {
+            if let Ok(base) = import_base(app) {
                 let _ = app
                     .state::<source_import::SourceJobs>()
                     .start(app.clone(), base, saved.clone())
@@ -404,10 +449,6 @@ async fn restore_connection(
             }
         }
     }
-    *current = Some(saved);
-    drop(current);
-    tray::refresh(&app).await;
-    Ok(Some(view))
 }
 
 #[tauri::command]
@@ -432,6 +473,25 @@ async fn sign_out(
             result => result?,
         },
     };
+    let result = lifecycle::finish_sign_out(
+        async {
+            let worker = credentials::delete("worker-session").is_ok();
+            let approved = saved
+                .as_ref()
+                .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
+            let sources = credentials::delete_source_approvals(saved.as_ref());
+            let connection = approved && credentials::delete("connection").is_ok();
+            worker && connection && sources
+        },
+        async { clear_photos_window(&app).is_ok() },
+        async {
+            match saved.as_ref() {
+                Some(saved) => revoke_photo_connection(saved).await,
+                None => false,
+            }
+        },
+    )
+    .await;
     *current = None;
     let offline = app
         .state::<offline_albums::OfflineAlbums>()
@@ -439,57 +499,52 @@ async fn sign_out(
         .await;
     drop(current);
     tray::refresh(&app).await;
-    Ok(lifecycle::finish_sign_out(
-        async {
-            let worker = credentials::delete("worker-session").is_ok();
-            let connection = credentials::delete("connection").is_ok();
-            let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
-            let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
-            worker && connection && sources && drops && offline
-        },
-        async {
-            if let Some(photos) = app.get_webview_window("photos") {
-                let cleared = photos.clear_all_browsing_data().is_ok();
-                let closed = photos.close().is_ok();
-                cleared && closed
-            } else {
-                true
-            }
-        },
-        async {
-            let Some(saved) = saved else {
-                return false;
-            };
-            let Ok(base) = normalize_server(&saved.server) else {
-                return false;
-            };
-            let Ok(client) = transport::client() else {
-                return false;
-            };
-            let mut revoked = true;
-            if let Some(device) = &saved.device_id {
-                let Ok(url) = base.join(&format!("api/desktop/devices/{device}/session")) else {
-                    return false;
-                };
-                revoked &= client
-                    .delete(url)
-                    .bearer_auth(&saved.token)
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-            }
-            revoked &= client
-                .post(base.join("api/auth/logout").unwrap())
-                .bearer_auth(&saved.token)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            revoked
-        },
-    )
-    .await)
+    Ok(lifecycle::SignOutResult {
+        local_cleared: result.local_cleared && offline,
+        ..result
+    })
+}
+
+async fn revoke_photo_connection(saved: &SavedConnection) -> bool {
+    let Ok(base) = normalize_server(&saved.server) else {
+        return false;
+    };
+    let Ok(client) = transport::client() else {
+        return false;
+    };
+    let mut revoked = true;
+    if let Some(device) = &saved.device_id {
+        let Ok(url) = base.join(&format!("api/desktop/devices/{device}/session")) else {
+            return false;
+        };
+        revoked &= client
+            .delete(url)
+            .bearer_auth(&saved.token)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+    }
+    revoked &= client
+        .post(base.join("api/auth/logout").unwrap())
+        .bearer_auth(&saved.token)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    revoked
+}
+
+fn clear_photos_window(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<DesktopState>();
+    let mut scope = state.1.lock().map_err(|_| "library_photos_clear_failed")?;
+    if let Some(photos) = app.get_webview_window("photos") {
+        let cleared = photos.clear_all_browsing_data();
+        let closed = photos.destroy();
+        cleared
+            .and(closed)
+            .map_err(|_| "library_photos_clear_failed")?;
+    }
+    *scope = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -507,57 +562,74 @@ async fn open_photos(
 /// Shows the photo window for the signed-in connection, from the window or the tray alike.
 pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
-    if let Some(photos) = app.get_webview_window("photos") {
-        if photos.url().is_ok_and(|url| url.origin() == base.origin()) {
+    let expected = connection::photo_session_scope(saved);
+    let state = app.state::<DesktopState>();
+    let mut scope = state.1.lock().map_err(|_| "photo_window_unavailable")?;
+    let photos = if let Some(photos) = app.get_webview_window("photos") {
+        if scope.as_ref() != Some(&expected) {
+            return Err("library_photos_clear_failed".into());
+        }
+        if !photos
+            .url()
+            .is_ok_and(|url| offline_albums::local_url(&url))
+        {
             photos.show().map_err(|_| "photo_window_unavailable")?;
             photos.set_focus().map_err(|_| "photo_window_unavailable")?;
             return Ok(());
         }
-    }
-    let photos = photo_window(app, &base, base.clone())?;
-    let domain = base.host_str().ok_or("server_address_invalid")?;
-    let secure = base.scheme() == "https";
-    let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
-        .domain(domain)
-        .path("/")
-        .secure(secure)
-        .http_only(true)
-        .build();
-    photos
-        .set_cookie(token)
-        .map_err(|_| "photo_session_unavailable")?;
-    for (key, value) in [
-        ("immich_is_authenticated", "true"),
-        ("immich_auth_type", "password"),
-    ] {
         photos
-            .set_cookie(
-                tauri::webview::Cookie::build((key, value))
-                    .domain(domain)
-                    .path("/")
-                    .secure(secure)
-                    .build(),
-            )
+    } else {
+        photo_window(app, &base, base.clone(), expected.clone())?
+    };
+    let result = (|| {
+        let domain = base.host_str().ok_or("server_address_invalid")?;
+        let secure = base.scheme() == "https";
+        let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
+            .domain(domain)
+            .path("/")
+            .secure(secure)
+            .http_only(true)
+            .build();
+        photos
+            .set_cookie(token)
             .map_err(|_| "photo_session_unavailable")?;
+        for (key, value) in [
+            ("immich_is_authenticated", "true"),
+            ("immich_auth_type", "password"),
+        ] {
+            photos
+                .set_cookie(
+                    tauri::webview::Cookie::build((key, value))
+                        .domain(domain)
+                        .path("/")
+                        .secure(secure)
+                        .build(),
+                )
+                .map_err(|_| "photo_session_unavailable")?;
+        }
+        photos
+            .navigate(base.join("photos").unwrap())
+            .map_err(|_| "photo_window_unavailable")?;
+        photos.show().map_err(|_| "photo_window_unavailable")?;
+        Ok(())
+    })();
+    if result.is_ok() {
+        *scope = Some(expected);
+    } else {
+        *scope = None;
+        let _ = photos.destroy();
     }
-    photos
-        .navigate(base.join("photos").unwrap())
-        .map_err(|_| "photo_window_unavailable")?;
-    photos.show().map_err(|_| "photo_window_unavailable")?;
-    photos.set_focus().map_err(|_| "photo_window_unavailable")?;
-    Ok(())
+    result
 }
 
 pub(crate) fn photo_window(
     app: &AppHandle,
     base: &url::Url,
     initial: url::Url,
+    expected_scope: String,
 ) -> Result<WebviewWindow, String> {
     if connection::native_origin_allowed("main", base, cfg!(debug_assertions)) {
         return Err("photo_window_unavailable".into());
-    }
-    if let Some(window) = app.get_webview_window("photos") {
-        return Ok(window);
     }
     let origin = base.origin();
     let web_origin = serde_json::to_string(&origin.ascii_serialization())
@@ -565,11 +637,13 @@ pub(crate) fn photo_window(
     let handle = app.clone();
     tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(initial))
         .title("Frameleaf Photos")
+        .incognito(true)
+        .visible(false)
         .inner_size(1280.0, 850.0)
         .initialization_script(format!("if (window.top === window && location.origin === {web_origin}) window.__FRAMELEAF_DESKTOP_OFFLINE_ALBUMS__ = true;"))
         .on_navigation(move |url| {
             offline_albums::local_url(url)
-                || (url.origin() == origin && !offline_albums::intercept(&handle, url))
+                || (url.origin() == origin && !offline_albums::intercept(&handle, url, &expected_scope))
         })
         .build()
         .map_err(|_| "photo_window_unavailable".into())
@@ -636,6 +710,10 @@ pub fn run() {
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
             connect_server,
+            library_switch::approved_libraries,
+            library_switch::add_approved_library,
+            library_switch::activate_approved_library,
+            library_switch::remove_approved_library,
             restore_connection,
             sign_out,
             open_photos,
