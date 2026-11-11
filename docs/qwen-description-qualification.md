@@ -45,3 +45,28 @@ owned llama.cpp process, qualification for both GGUF files and the execution bac
 approved model catalogue and claim route on both sides. The current inventory and runtime
 admission are unchanged. Installed resource, cancellation, and output-quality checks are
 required on the platforms where the provider will be offered.
+
+## Build the candidate runtime pack
+
+On Linux or macOS, use the CPU runtime profile and a self-contained native
+`llama-server` built from the pinned source. Put it beside its `LICENSE` in a
+local directory. Supply the digest of that exact executable to the builder.
+
+```sh
+python3 tools/build_runtime.py --source /path/to/library --revision LIBRARY_COMMIT \
+  --epoch NEXT_EPOCH --output /path/to/new-runtime --profile cpu-ort \
+  --qwen-runtime /path/to/llama-build --qwen-sha256 BINARY_SHA256
+```
+
+The builder checks the digest before running the version probe. Its manifest
+inventories the executable and license. The macOS signing step updates the
+manifest with the post-signing binary digest before runtime sealing. Desktop
+matches qualification evidence to that final signed digest. The candidate uses
+a private Unix socket on macOS and Linux. Windows has no enabled candidate transport.
+
+The qualification spec uses `engine: "qwen-gguf"`, the CPU provider, one image
+fixture and its exact expected result, and the two staged file digests at
+`visual/model.gguf` and `visual/mmproj.gguf`. The report records two cold
+executions because each prediction owns a separate process. This pack does
+not add model inventory, approve a Library source revision for the factory, or
+enable installed worker claims.

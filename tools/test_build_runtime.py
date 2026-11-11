@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import tempfile
 import unittest
@@ -23,6 +24,31 @@ class RuntimeBuilderTests(unittest.TestCase):
                 builder.relative(name)
         for name in ["bin/COM10.dll", "COMPOSITE.json", "company/normal", "bin/normal name.txt"]:
             self.assertEqual(builder.relative(name), name)
+
+    def test_qwen_pack_binds_exact_binary_and_keeps_license_in_signed_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            binary = b"synthetic runtime"
+            (source / "llama-server").write_bytes(binary)
+            (source / "LICENSE").write_text("synthetic license")
+            payload = root / "payload"
+            site = payload / "python/lib/python3.12/site-packages"
+            package = site / "frameleaf_ml"
+            package.mkdir(parents=True)
+            (package / "native_qwen.py").write_text("# synthetic")
+            notices = payload / "licenses"
+            notices.mkdir()
+            digest = hashlib.sha256(binary).hexdigest()
+            staged = builder.stage_qwen_binary(source, digest, site, notices)
+            inventory = builder.inventory(payload)
+            self.assertEqual(inventory[staged.relative_to(payload).as_posix()]["sha256"], digest)
+            self.assertIn("licenses/llama.cpp-LICENSE.txt", inventory)
+            staged.unlink()
+            staged.parent.rmdir()
+            with self.assertRaisesRegex(builder.BuildError, "digest_mismatch"):
+                builder.stage_qwen_binary(source, "0" * 64, site, notices)
 
     def test_source_build_exception_is_only_used_by_the_locked_legacy_dependency(self):
         setuptools = "setuptools==80.9.0 --hash=sha256:" + "a" * 64 + "\n"

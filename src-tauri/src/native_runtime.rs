@@ -675,6 +675,21 @@ impl VerifiedRuntime {
         {
             return Err("runtime_qualification_input_invalid".into());
         }
+        let qwen_binary = if value["engine"] == "qwen-gguf" {
+            let mut candidates = self.manifest.files.iter().filter(|(path, _)| {
+                path.starts_with("python/lib/python")
+                    && path.ends_with("/site-packages/frameleaf_ml/native-bin/llama-server")
+            });
+            let (_, artifact) = candidates.next().ok_or("runtime_qwen_binary_unavailable")?;
+            if candidates.next().is_some()
+                || !matches!(self.manifest.platform.as_str(), "macos" | "linux")
+            {
+                return Err("runtime_qwen_binary_unavailable".into());
+            }
+            Some(artifact.sha256.as_str())
+        } else {
+            None
+        };
         let mut child = self.launch(
             cache,
             private_root,
@@ -714,7 +729,12 @@ impl VerifiedRuntime {
         }
         let report: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "runtime_qualification_report_invalid")?;
-        validate_report(&report, &value, &format!("{:x}", Sha256::digest(spec)))?;
+        validate_report(
+            &report,
+            &value,
+            &format!("{:x}", Sha256::digest(spec)),
+            qwen_binary,
+        )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
             spec: spec.to_vec(),
@@ -727,6 +747,7 @@ fn validate_report(
     report: &serde_json::Value,
     spec: &serde_json::Value,
     binding: &str,
+    qwen_binary: Option<&str>,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -746,6 +767,50 @@ fn validate_report(
             .as_str()
             .filter(|s| digest_valid(s, 64))
             .is_none()
+    {
+        return Err(invalid());
+    }
+    if spec["engine"] == "qwen-gguf" {
+        let binary = qwen_binary
+            .filter(|hash| digest_valid(hash, 64))
+            .ok_or_else(invalid)?;
+        let execution = report["qwenExecution"].as_object().ok_or_else(invalid)?;
+        let build = execution
+            .get("build")
+            .and_then(|item| item.as_str())
+            .ok_or_else(invalid)?;
+        let (number, revision) = build
+            .strip_prefix('b')
+            .and_then(|item| item.split_once('-'))
+            .ok_or_else(invalid)?;
+        if report["engine"] != "qwen-gguf"
+            || spec["provider"] != "CPUExecutionProvider"
+            || report["state"] != "ready-cpu"
+            || execution.len() != 3
+            || execution.get("binarySha256").and_then(|item| item.as_str()) != Some(binary)
+            || number.is_empty()
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || !revision.starts_with("7fe450e19")
+            || revision.len() > 40
+            || !digest_valid(revision, revision.len())
+            || !execution
+                .get("coldMilliseconds")
+                .and_then(|item| item.as_array())
+                .is_some_and(|samples| {
+                    samples.len() == 2
+                        && samples.iter().all(|sample| {
+                            sample
+                                .as_f64()
+                                .is_some_and(|value| (0.0..=600_000.0).contains(&value))
+                        })
+                })
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    if spec.get("engine").is_some_and(|engine| engine != "onnx")
+        || report.get("engine").is_some_and(|engine| engine != "onnx")
         || !["coldMilliseconds", "warmMilliseconds"].iter().all(|key| {
             report[*key]
                 .as_f64()
@@ -805,6 +870,27 @@ fn validate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qwen_report_requires_signed_binary_and_exact_cpu_candidate_evidence() {
+        let spec = serde_json::json!({"engine":"qwen-gguf","provider":"CPUExecutionProvider","modelKey":"candidate",
+            "fixtureSha256":"a".repeat(64),"preprocessingSha256":"b".repeat(64)});
+        let mut report = spec.clone();
+        report["protocolVersion"] = serde_json::json!(1);
+        report["bindingSha256"] = serde_json::json!("binding");
+        report["runtimeFingerprint"] = serde_json::json!("c".repeat(64));
+        report["state"] = serde_json::json!("ready-cpu");
+        let binary = "d".repeat(64);
+        report["qwenExecution"] = serde_json::json!({"build":"b11146-7fe450e19","binarySha256":binary,"coldMilliseconds":[100.0,120.0]});
+        assert!(validate_report(&report, &spec, "binding", Some(&binary)).is_ok());
+        assert!(validate_report(&report, &spec, "binding", None).is_err());
+        assert!(validate_report(&report, &spec, "binding", Some(&"e".repeat(64))).is_err());
+        let mut invalid = report.clone();
+        invalid["qwenExecution"]["build"] = serde_json::json!("b11146-000000000");
+        assert!(validate_report(&invalid, &spec, "binding", Some(&binary)).is_err());
+        report["qwenExecution"]["coldMilliseconds"] = serde_json::json!([100.0]);
+        assert!(validate_report(&report, &spec, "binding", Some(&binary)).is_err());
+    }
+
     #[test]
     fn qualification_cannot_start_a_different_runtime_manifest() {
         let runtime = VerifiedRuntime {
