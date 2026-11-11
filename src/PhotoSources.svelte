@@ -16,6 +16,7 @@
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean; canReconnect: boolean; destination: AlbumDestination | null };
   type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
   let job = $state<CopyJob | null>(null);
+  let jobEventRevision = 0;
   let consent = $state<Consent | null>(null);
   let blockedConsent = $state(false);
   let allowReads = $state(false);
@@ -102,7 +103,12 @@
     let unlisten: UnlistenFn | undefined;
     if (native) void (async () => {
       try {
-        unlisten = await listen<CopyJob>('photo-import', event => { if (alive && event.payload.sourceId === consent?.id) job = event.payload; });
+        unlisten = await listen<CopyJob>('photo-import', event => {
+          if (alive && event.payload.sourceId === consent?.id) {
+            jobEventRevision += 1;
+            job = event.payload;
+          }
+        });
         if (!alive) { unlisten(); return; }
         await loadConsent();
         if (consent?.registered) {
@@ -131,9 +137,10 @@
   }
   async function reconnectCamera() {
     busy = true; message = '';
+    const revision = jobEventRevision;
     try {
       const resumed = await invoke<CopyJob | null>('reconnect_photo_camera');
-      if (resumed) {
+      if (resumed && jobEventRevision === revision) {
         job = resumed;
         message = 'Camera folder confirmed. Resuming the approved copy.';
       }
