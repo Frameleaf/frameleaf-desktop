@@ -14,6 +14,10 @@ on:
         description: 'Immutable installer-candidates producer approval plus sourceRevision and runtimeRunId (signed candidates)'
         required: true
         type: string
+      watched_folder:
+        description: 'Qualify hidden-window watched folder import with the signed Desktop at this main revision'
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -180,16 +184,49 @@ jobs:
           sys.path.insert(0, 'tools')
           from windows_desktop_candidate import obtain
           obtain()
-      - name: Exercise the companion with the corrected Windows Desktop candidate
-        id: installed-desktop
+      - name: Install the reviewed Windows Desktop candidate
+        id: desktop-install
         shell: pwsh
         run: |
-          $setup = Join-Path $env:RUNNER_TEMP 'windows-compiled-host/desktop/setup.exe'
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $setup = Join-Path $root 'desktop/setup.exe'
+          if ('${{ inputs.watched_folder }}' -eq 'true') {
+            $producer = Get-Content (Join-Path $root 'desktop-producer.json') -Raw | ConvertFrom-Json
+            if ($producer.candidate.osSigned -ne $true -or $producer.candidate.sourceRevision -cne $env:GITHUB_SHA) {
+              throw 'Watcher qualification requires the signed Desktop candidate built at this main revision'
+            }
+          }
           $destination = Join-Path $env:RUNNER_TEMP 'FrameleafWelcome'
           $install = Start-Process $setup -ArgumentList '/S', "/D=$destination" -PassThru -Wait
           if ($install.ExitCode) { throw 'Desktop installation failed' }
-          powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable (Join-Path $destination 'frameleaf-desktop.exe') -InstalledHost
+          "executable=$(Join-Path $destination 'frameleaf-desktop.exe')" >> $env:GITHUB_OUTPUT
+      - name: Exercise the companion with the reviewed Windows Desktop candidate
+        if: ${{ !inputs.watched_folder }}
+        id: installed-desktop
+        shell: pwsh
+        env:
+          DESKTOP_EXE: ${{ steps.desktop-install.outputs.executable }}
+        run: |
+          powershell.exe -NoProfile -File tools/qualify_windows_welcome.ps1 -Executable $env:DESKTOP_EXE -InstalledHost
           if ($LASTEXITCODE) { throw 'Installed native host acceptance failed' }
+      - name: Verify a watched folder while the installed Desktop window is hidden
+        if: inputs.watched_folder
+        shell: pwsh
+        env:
+          FRAMELEAF_WATCH_DESKTOP_EXE: ${{ steps.desktop-install.outputs.executable }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $hostReceipt = Get-Content (Join-Path $root 'protected-install.json') -Raw | ConvertFrom-Json
+          $env:FRAMELEAF_INSTALLED_HOST_MANIFEST = $hostReceipt.manifestSha256
+          if ((Get-AuthenticodeSignature -LiteralPath $env:FRAMELEAF_WATCH_DESKTOP_EXE).Status -ne 'Valid') {
+            throw 'The installed Desktop executable signature is invalid'
+          }
+          $env:FRAMELEAF_WATCH_DESKTOP_SHA256 = (Get-FileHash -LiteralPath $env:FRAMELEAF_WATCH_DESKTOP_EXE).Hash.ToLowerInvariant()
+          $test = 'host_setup::tests::disposable_runner_installed_desktop_watches_while_hidden'
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib $test -- --ignored --exact | Tee-Object -Variable output
+          if ($LASTEXITCODE -or ($output -join '') -cnotmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Installed watched folder acceptance did not pass' }
+          @{ state = 'watcher-passed'; sourceRevision = $env:GITHUB_SHA; manifestSha256 = $env:FRAMELEAF_INSTALLED_HOST_MANIFEST
+             executableSha256 = $env:FRAMELEAF_WATCH_DESKTOP_SHA256 } | ConvertTo-Json | Set-Content (Join-Path $root 'installed-watcher.json')
       - name: Report bounded installed host operation categories
         if: failure() && steps.installed-desktop.outcome == 'failure'
         run: node tools/diagnose_windows_host.mjs
@@ -213,6 +250,7 @@ jobs:
             ${{ runner.temp }}/windows-compiled-host/candidate-producer.json
             ${{ runner.temp }}/windows-compiled-host/evidence-producer.json
             ${{ runner.temp }}/windows-compiled-host/desktop-producer.json
+            ${{ runner.temp }}/windows-compiled-host/installed-watcher.json
             ${{ runner.temp }}/windows-compiled-host/signature-evidence/
           retention-days: 7
           if-no-files-found: warn
