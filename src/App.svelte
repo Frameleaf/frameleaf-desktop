@@ -92,6 +92,10 @@
       try {
         unlisten.push(await listen<SetupStatus>('worker-setup', event => { setup = event.payload; }));
         unlisten.push(await listen<string>('tray-action-failed', event => {
+          if (event.payload === 'media_copy_exit_blocked') {
+            notice = explain(event.payload);
+            return;
+          }
           failure = explain(event.payload);
           void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
         }));
@@ -116,11 +120,13 @@
       }
       updateError = error === 'update_host_active'
         ? 'Stop the local server before installing the update.'
-        : error === 'update_changed'
-          ? updateVersion
-            ? `The latest release changed to Frameleaf ${updateVersion}.`
-            : 'That update is no longer available.'
-          : 'Frameleaf couldn’t install the update. Try again.';
+        : error === 'update_media_copy_active'
+          ? 'Finish or cancel the media copy before installing the update.'
+          : error === 'update_changed'
+            ? updateVersion
+              ? `The latest release changed to Frameleaf ${updateVersion}.`
+              : 'That update is no longer available.'
+            : 'Frameleaf couldn’t install the update. Try again.';
       installingUpdate = false;
     }
   }

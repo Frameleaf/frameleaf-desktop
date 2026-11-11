@@ -1,5 +1,6 @@
 // User-facing copy for the connection and cloud-account error codes the Rust side returns.
 const messages: Record<string, string> = {
+  media_copy_exit_blocked: 'Finish or cancel the media copy, or wait for the update before quitting Frameleaf.',
   local_host_active: 'Stop local management before connecting to another server.',
   worker_setup_unavailable: 'Your server could not authorize AI processing. Check its connection and permissions, then try Resume again.',
   worker_resume_offline: 'Your server did not answer. Check that it is online, then try Resume again.',

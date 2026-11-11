@@ -4,6 +4,7 @@
   import { controlIntent, restoreIntent, intentKey, managerError, type Control, type Intent, type ManagerView, type ManagerStatus, type Operation, backupReviewIntent, restoreBackupReview, backupReviewKey, type BackupEntry, type BackupReviewIntent, type BackupReview, createBackupRestoreIntent, parseBackupRestoreIntent, backupRestoreKey, databaseRecoveryReady, type BackupRestoreIntent, type BackupRestoreOperation } from './manager-state';
   import { countdown, formatWhen, formatDate, relativeTime, shortId, fingerprintShort, hostOf } from './ui-state';
   import Icon from './Icon.svelte';
+  import MediaCopy from './MediaCopy.svelte';
   import Sheet from './Sheet.svelte';
   let { focus = 'manager', embedded = false, onback = undefined, onstate = undefined }: { focus?: 'manager' | 'backups'; embedded?: boolean; onback?: (() => void) | undefined; onstate?: ((paired: boolean) => void) | undefined } = $props();
   const native = isTauri();
@@ -335,6 +336,7 @@
   </header>
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to pair securely with Manager.</p>{/if}
+    {#if focus === 'backups'}<MediaCopy />{/if}
     {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status"><p>{notice}</p><button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if focus === 'backups' || embedded || manager}
