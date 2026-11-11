@@ -12,15 +12,21 @@ import zipfile
 from build_runtime import BuildError
 from obtain_host_component import api, download, validate_approval, validate_producer
 
-EXE = "Frameleaf_0.1.5_x64-setup.exe"
-MSI = "Frameleaf_0.1.5_x64_en-US.msi"
+LEGACY_VERSION = "0.1.5"
+LEGACY_RUNTIME_RUN = "42717141687"
 
 
-def extract_desktop(archive: Path, output: Path, source: str, digest: str) -> dict:
-    """Accept only the exact installed-qualified package and its approved executable bytes."""
-    if not re.fullmatch(r"[a-f0-9]{40}", source) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+def extract_desktop(archive: Path, output: Path, source: str, digest: str, *,
+                    version: str = LEGACY_VERSION, runtime_run: str = LEGACY_RUNTIME_RUN,
+                    signed: bool = False) -> dict:
+    """Stage only the approved installer bytes for the downstream installation test."""
+    if (not re.fullmatch(r"[a-f0-9]{40}", source) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+            or not re.fullmatch(r"[0-9]{1,8}\.[0-9]{1,8}\.[0-9]{1,8}", version)
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", runtime_run)):
         raise BuildError("desktop_candidate_identity_invalid")
-    expected = {EXE, MSI, "candidate.json", "SHA256SUMS"}
+    exe = f"Frameleaf_{version}_x64-setup.exe"
+    msi = f"Frameleaf_{version}_x64_en-US.msi"
+    expected = {exe, msi, "candidate.json", "SHA256SUMS"}
     with tarfile.open(archive, "r:gz") as package:
         files = {}
         for member in package:
@@ -28,7 +34,7 @@ def extract_desktop(archive: Path, output: Path, source: str, digest: str) -> di
                 continue
             name = member.name.removeprefix("installers/")
             if (not member.name.startswith("installers/") or name not in expected or name in files
-                    or not member.isfile() or not 0 < member.size <= (2 * 1024**3 if name in {EXE, MSI} else 16384)):
+                    or not member.isfile() or not 0 < member.size <= (2 * 1024**3 if name in {exe, msi} else 16384)):
                 raise BuildError("desktop_candidate_archive_invalid")
             files[name] = member
         if set(files) != expected:
@@ -38,16 +44,16 @@ def extract_desktop(archive: Path, output: Path, source: str, digest: str) -> di
             raise BuildError("desktop_candidate_receipt_invalid")
         hashes = receipt.get("files")
         if (receipt.get("sourceRevision") != source or receipt.get("target") != "windows-x86_64"
-                or receipt.get("runtimeRunId") != "42717141687" or receipt.get("installedQualified") is not True
-                or receipt.get("osSigned") is not False or not isinstance(hashes, dict) or set(hashes) != {EXE, MSI}
+                or receipt.get("runtimeRunId") != runtime_run or receipt.get("installedQualified") is not (not signed)
+                or receipt.get("osSigned") is not signed or not isinstance(hashes, dict) or set(hashes) != {exe, msi}
                 or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes.values())
-                or hashes[EXE] != digest):
+                or hashes[exe] != digest):
             raise BuildError("desktop_candidate_receipt_invalid")
         lines = package.extractfile(files["SHA256SUMS"]).read().decode().splitlines()
         pairs = [line.split() for line in lines]
         if len(pairs) != 2 or any(len(pair) != 2 for pair in pairs) or {pair[1]: pair[0] for pair in pairs} != hashes:
             raise BuildError("desktop_candidate_checksums_invalid")
-        with package.extractfile(files[EXE]) as binary, output.open("xb") as target:
+        with package.extractfile(files[exe]) as binary, output.open("xb") as target:
             shutil.copyfileobj(binary, target)
     with output.open("rb") as binary:
         if hashlib.file_digest(binary, "sha256").hexdigest() != digest:
@@ -61,7 +67,11 @@ def obtain() -> None:
     if len(raw) > 16384:
         raise BuildError("desktop_candidate_identity_invalid")
     approved = json.loads(raw)
-    source = approved.pop("sourceRevision")
+    source = approved.pop("sourceRevision", None)
+    signed = "runtimeRunId" in approved
+    runtime_run = approved.pop("runtimeRunId", LEGACY_RUNTIME_RUN)
+    if not isinstance(runtime_run, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", runtime_run):
+        raise BuildError("desktop_candidate_identity_invalid")
     if not isinstance(source, str) or not re.fullmatch(r"[a-f0-9]{40}", source):
         raise BuildError("desktop_candidate_identity_invalid")
     validate_approval(approved)
@@ -71,6 +81,15 @@ def obtain() -> None:
     artifact = api(f"actions/artifacts/{approved['artifactId']}")
     run = api(f"actions/runs/{approved['runId']}/attempts/{approved['runAttempt']}")
     validate_producer(approved, artifact, run)
+    version = LEGACY_VERSION
+    if signed:
+        if source != approved["headSha"] or run.get("head_branch") != "main" or run.get("event") != "workflow_dispatch":
+            raise BuildError("desktop_candidate_producer_invalid")
+        package = json.loads(subprocess.check_output(
+            ["git", "show", f"{source}:package.json"], timeout=10))
+        version = package.get("version")
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,8}\.[0-9]{1,8}\.[0-9]{1,8}", version):
+            raise BuildError("desktop_candidate_identity_invalid")
     if artifact["name"] != "frameleaf-installer-candidates-windows-x86_64":
         raise BuildError("desktop_candidate_producer_invalid")
     root = Path(os.environ["RUNNER_TEMP"]) / "windows-compiled-host"
@@ -84,14 +103,17 @@ def obtain() -> None:
             raise BuildError("desktop_candidate_archive_invalid")
         with package.open("installer-candidates.tar.gz") as binary, tar.open("xb") as target:
             shutil.copyfileobj(binary, target)
-    receipt = extract_desktop(tar, stage / "setup.exe", source, os.environ["DESKTOP_SHA256"])
+    receipt = extract_desktop(tar, stage / "setup.exe", source, os.environ["DESKTOP_SHA256"],
+                              version=version, runtime_run=runtime_run, signed=signed)
+    if signed:
+        approved["runtimeRunId"] = runtime_run
     (root / "desktop-producer.json").write_text(json.dumps({
         "approval": {**approved, "sourceRevision": source}, "artifact": artifact,
         "candidate": receipt, "installerSha256": os.environ["DESKTOP_SHA256"],
     }, indent=2) + "\n")
     archive.unlink()
     tar.unlink()
-    print("Approved installed-qualified Windows Desktop staged for companion acceptance")
+    print("Approved Windows Desktop staged for companion acceptance")
 
 
 if __name__ == "__main__":
