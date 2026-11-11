@@ -33,12 +33,18 @@ try {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   let packages = [];
+  let compatibility = 'refused';
   let status = { state: 'idle', code: null, backgroundActive: false, installation: null, origin: null, companionPlatform: 'windows', profileSetupAvailable: true, profileRequiresAuthorization: false };
   await page.exposeFunction('hostInvoke', (command, args) => {
     calls.push({ command, args });
     if (command === 'plugin:event|listen') return 1;
     if (command === 'installed_local_hosts') return packages;
     if (command === 'local_host_status') return status;
+    if (command === 'check_local_host_package') {
+      assert.ok(packages.some(record => record.manifestSha256 === args.manifestSha256 &&
+        record.controllerSha256 === args.controllerSha256));
+      return compatibility;
+    }
     if (command === 'provision_local_host_profile') {
       assert.equal(args.manifestSha256, installed.manifestSha256);
       status = { ...status, state: 'profile-ready', installation: installed };
@@ -68,9 +74,19 @@ try {
 
   packages = [{ ...installed, library: false }];
   await setup.getByRole('button', { name: 'Check installation' }).click();
-  await setup.getByRole('button', { name: 'Prepare Profile' }).waitFor();
+  const prepareProfile = setup.getByRole('button', { name: 'Prepare Profile' });
+  await setup.getByText('Companion package refused', { exact: true }).waitFor();
+  assert.ok(await prepareProfile.isDisabled());
+  compatibility = 'unknown';
+  await setup.getByRole('button', { name: 'Check installation' }).click();
+  await setup.getByText('Compatibility unknown', { exact: true }).waitFor();
+  assert.ok(await prepareProfile.isDisabled());
+  assert.equal(calls.filter(call => ['provision_local_host_profile', 'prepare_local_host'].includes(call.command)).length, 0);
+  compatibility = 'verified';
+  await setup.getByRole('button', { name: 'Check installation' }).click();
+  await setup.getByText('Companion package verified', { exact: true }).waitFor();
   assert.equal(await setup.getByRole('button', { name: 'Prepare local Manager' }).count(), 0);
-  await setup.getByRole('button', { name: 'Prepare Profile' }).click();
+  await prepareProfile.click();
   await setup.getByRole('button', { name: 'Prepare local Manager' }).waitFor();
   assert.equal(calls.filter(call => call.command === 'prepare_local_host').length, 0);
 
@@ -83,8 +99,14 @@ try {
   assert.equal(await setup.getByRole('button', { name: 'Review package change' }).count(), 0);
   status.companionPlatform = 'linux';
   await setup.getByRole('button', { name: 'Check installation' }).click();
+  compatibility = 'refused';
   await select.selectOption(update.manifestSha256);
+  await setup.getByText('Companion package refused', { exact: true }).waitFor();
   const review = setup.getByRole('button', { name: 'Review package change' });
+  assert.ok(await review.isDisabled());
+  compatibility = 'verified';
+  await select.selectOption(installed.manifestSha256);
+  await select.selectOption(update.manifestSha256);
   await review.click();
   const dialog = page.getByRole('dialog', { name: 'Move this library to another package?' });
   await dialog.getByText('Current Library 1.2.4 → Library 1.2.5').waitFor();
@@ -95,7 +117,7 @@ try {
   await setup.getByText('Local Manager is ready', { exact: true }).waitFor();
   assert.equal(calls.filter(call => call.command === 'prepare_local_host').length, 1);
   assert.deepEqual(errors, []);
-  console.log('Missing companion discovery and explicit package move passed.');
+  console.log('Companion compatibility, profile gating and explicit package move passed.');
 } finally {
   await browser?.close();
   vite.kill();

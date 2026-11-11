@@ -549,6 +549,7 @@ pub fn run() {
             host_commands::open_local_photos,
             host_commands::authorize_local_manager,
             host_commands::installed_local_hosts,
+            host_commands::check_local_host_package,
             host_commands::local_host_status,
             host_commands::prepare_local_host,
             host_commands::provision_local_host_profile,

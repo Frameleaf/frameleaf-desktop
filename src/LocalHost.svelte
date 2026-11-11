@@ -5,6 +5,13 @@
   import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
   import Icon from './Icon.svelte';
   import Sheet from './Sheet.svelte';
+  type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused';
+  const compatibilityCopy = {
+    checking: { label: 'Checking companion package…', detail: 'This can take a moment.' },
+    verified: { label: 'Companion package verified', detail: 'This package passed the checks for this version of Frameleaf.' },
+    unknown: { label: 'Compatibility unknown', detail: 'Frameleaf could not finish checking this package. Choose Check installation to retry.' },
+    refused: { label: 'Companion package refused', detail: 'This package did not pass verification. Choose a different installed package or install a compatible companion.' },
+  };
   type Installation = { manifestSha256: string; controllerSha256: string; version?: string | null; library?: boolean };
   const companionInstructions = {
     mac: 'Download and open the Frameleaf Companion Server PKG for Apple silicon.',
@@ -30,8 +37,14 @@
   let allowRecovery = $state(false);
   let authorized = $state(false);
   let packageChange = $state<Installation | null>(null);
+  let compatibility = $state<{ manifestSha256: string; controllerSha256: string; state: Compatibility } | null>(null);
+  let checkRequest = 0;
   const libraryPackage = $derived(installations.find(record => record.library));
   const selectedPackage = $derived(installations.find(record => record.manifestSha256 === selected));
+  const packageCheck = $derived(compatibility?.manifestSha256 === selectedPackage?.manifestSha256
+    && compatibility?.controllerSha256 === selectedPackage?.controllerSha256 ? compatibility?.state : undefined);
+  const checking = $derived(packageCheck === 'checking');
+  const packageVerified = $derived(packageCheck === 'verified');
   const profileRequired = $derived(view?.code === 'host_install_windows_profile_required' || view?.code === 'host_install_linux_profile_required');
   const needsProfile = $derived(!!view?.profileSetupAvailable && !view.backgroundActive && (
     profileRequired || (!libraryPackage && view.state === 'idle' && !view.installation) ||
@@ -71,13 +84,30 @@
     view = value; onactive(value.backgroundActive);
     if (ready) onmanagerchange();
   }
+  async function checkSelected() {
+    const record = selectedPackage;
+    const request = ++checkRequest;
+    compatibility = null;
+    if (!native || !record || (view?.backgroundActive && view.state !== 'needs-attention')) return;
+    const { manifestSha256, controllerSha256 } = record;
+    compatibility = { manifestSha256, controllerSha256, state: 'checking' };
+    const result = await invoke<Compatibility>('check_local_host_package', { manifestSha256, controllerSha256 }).catch(() => 'unknown');
+    if (disposed || checkRequest !== request) return;
+    compatibility = { manifestSha256, controllerSha256, state: result === 'verified' || result === 'refused' ? result : 'unknown' };
+  }
+  function selectPackage(event: Event & { currentTarget: HTMLSelectElement }) {
+    selected = event.currentTarget.value;
+    void checkSelected();
+  }
   async function refresh() {
-    failure = ''; busy = true;
+    if (busy || checking) return;
+    failure = ''; busy = true; compatibility = null;
     try {
       const [records, current] = await Promise.all([invoke<Installation[]>('installed_local_hosts'), invoke<View>('local_host_status')]);
       installations = records; show(current);
       selected = records.find(record => record.manifestSha256 === current.installation?.manifestSha256)?.manifestSha256 ?? records.find(record => record.library)?.manifestSha256 ?? (records.length === 1 ? records[0]!.manifestSha256 : '');
       if (current.code) failure = explain(current.code);
+      await checkSelected();
     } catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
@@ -94,7 +124,7 @@
     catch { failure = 'The download page could not open. Try again.'; }
   }
   function prepareSelected() {
-    if (busy || !selectedPackage) return;
+    if (busy || !selectedPackage || !packageVerified) return;
     if (changingPackage) {
       if (canMovePackage) packageChange = selectedPackage;
     } else void prepare();
@@ -105,7 +135,7 @@
     if (canMovePackage && target?.manifestSha256 === selected) void prepare();
   }
   async function prepare() {
-    if (busy || !native || !selectedPackage) return;
+    if (busy || !native || !selectedPackage || !packageVerified) return;
     busy = true; starting = true; onactive(true); failure = ''; notice = '';
     try { show(await invoke<View>('prepare_local_host', { manifestSha256: selected })); }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
@@ -126,7 +156,7 @@
     } finally { busy = false; }
   }
   async function provisionProfile() {
-    if (busy || !native || !selected) return;
+    if (busy || !native || !selected || !packageVerified) return;
     busy = true; provisioning = true; onactive(true); failure = ''; notice = '';
     try {
       show(await invoke<View>('provision_local_host_profile', { manifestSha256: selected }));
@@ -148,20 +178,23 @@
   }
   async function stop() {
     busy = true; failure = ''; notice = '';
-    try { show(await invoke<View>('stop_local_host_manager')); }
+    try {
+      show(await invoke<View>('stop_local_host_manager'));
+      if (!packageVerified) await checkSelected();
+    }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; }
   }
 </script>
 
-<section aria-label="Local library setup" aria-busy={busy}>
+<section aria-label="Local library setup" aria-busy={busy || checking}>
   <div class="group-head">
     <h2 class="group-title">Run Frameleaf here</h2>
     {#if starting}<button class="btn quiet" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
     {#if canMovePackage && libraryPackage && !view?.backgroundActive}
       <button class="btn quiet" disabled={busy || !native} onclick={openDownloads}>Find companion updates</button>
     {/if}
-    <button class="btn quiet" disabled={busy || !native} onclick={refresh}>Check installation</button>
+    <button class="btn quiet" disabled={busy || checking || !native} onclick={refresh}>Check installation</button>
   </div>
   <div class="group">
     <div class="row">
@@ -173,8 +206,15 @@
     {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
     {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
     {#if profilePending}<div class="row"><span class="spin" aria-hidden="true"></span><p role="status" style="flex:1">{profileCopy.pending}</p></div>{/if}
+    {#if packageCheck && (!view?.backgroundActive || view?.state === 'needs-attention')}
+      {@const check = compatibilityCopy[packageCheck]}
+      <div class="row">
+        <span class="l" role="status"><b>{check.label}</b><small>{check.detail}</small></span>
+        {#if packageCheck === 'refused' && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
+      </div>
+    {/if}
     {#if selectedPackage && needsProfile}
-      <div class="row"><span class="l"><b>Prepare my server profile</b><small>{profileCopy.preparation}</small></span><button class="btn primary" disabled={busy || !native || !selected} onclick={provisionProfile}>Prepare Profile</button></div>
+      <div class="row"><span class="l"><b>Prepare my server profile</b><small>{profileCopy.preparation}</small></span><button class="btn primary" disabled={busy || !native || !packageVerified} onclick={provisionProfile}>Prepare Profile</button></div>
     {/if}
     {#if native && view && !busy && installations.length === 0}
       <div class="row">
@@ -187,7 +227,7 @@
     {/if}
     {#if installations.length > 1 && !view?.backgroundActive}
       <div class="form-row"><label for="local-package">Installed server package</label>
-        <select id="local-package" bind:value={selected} disabled={busy}>
+        <select id="local-package" value={selected} onchange={selectPackage} disabled={busy || checking}>
           <option value="">Choose an installed package</option>
           {#each installations as installation (installation.manifestSha256)}<option value={installation.manifestSha256}>Library {installation.version ?? 'version unknown'}{installation.library ? ' (this library)' : ''}</option>{/each}
         </select>
@@ -200,7 +240,7 @@
         <span class="l"><b>{changingPackage ? 'Move your library to this package' : 'Set up local management'}</b>
           <small>{changingPackage ? 'Keep the package your library last used installed until the server starts with the new package.' : 'Prepare Manager so you can start and stop the photo server from this app.'}</small>
         </span>
-        <button class="btn primary" disabled={busy || !native} onclick={prepareSelected}>{changingPackage ? 'Review package change' : 'Prepare local Manager'}</button>
+        <button class="btn primary" disabled={busy || !native || !packageVerified} onclick={prepareSelected}>{changingPackage ? 'Review package change' : 'Prepare local Manager'}</button>
       </div>
     {/if}
     {#if view?.state === 'manager-ready'}

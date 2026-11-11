@@ -1,6 +1,6 @@
 use crate::{
     host_install,
-    host_setup::{HostSetup, View},
+    host_setup::{Compatibility, HostSetup, View},
     require_local,
 };
 use tauri::{Manager, State, WebviewWindow};
@@ -33,6 +33,19 @@ pub(crate) async fn installed_local_hosts(
     .await
     .map_err(|_| "native_host_setup_failed".to_string())?
 }
+#[tauri::command]
+pub(crate) async fn check_local_host_package(
+    window: WebviewWindow,
+    setup: State<'_, HostSetup>,
+    manifest_sha256: String,
+    controller_sha256: String,
+) -> Result<Compatibility, String> {
+    require_local(&window)?;
+    Ok(setup
+        .compatibility(manifest_sha256, controller_sha256)
+        .await)
+}
+
 #[tauri::command]
 pub(crate) async fn local_host_status(
     window: WebviewWindow,

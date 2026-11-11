@@ -38,6 +38,7 @@ async function fixture(scenario,run,viewport={width:1100,height:1000},colorSchem
   if(command==='plugin:event|unlisten')return;
   if(command==='local_host_status')return local;
   if(command==='installed_local_hosts')return scenario==='localhost'?[localRecord]:[];
+  if(command==='check_local_host_package'&&scenario==='localhost'){assert.equal(args.manifestSha256,localRecord.manifestSha256);assert.equal(args.controllerSha256,localRecord.controllerSha256);return 'verified';}
   if(command==='prepare_local_host'){assert.equal(args.manifestSha256,localRecord.manifestSha256);await new Promise(resolve=>setTimeout(resolve,300));local={state:'manager-ready',code:null,backgroundActive:true,installation:localRecord,origin:'https://127.0.0.1:9443'};return local;}
   if(command==='stop_local_host_manager'){if(refuseLocalStop){refuseLocalStop=false;throw 'host_controller_already_owned';}local={...local,state:'idle',backgroundActive:false};return local;}
   if(command==='restore_connection')return null;
