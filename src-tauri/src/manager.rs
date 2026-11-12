@@ -12,6 +12,9 @@ pub const CREDENTIAL: &str = "manager-grant";
 const RECENT: u64 = 300_000;
 const LIFETIME: u64 = 30 * 86_400_000;
 const WINDOW: u64 = 60_000;
+const REPLY_LIMIT: usize = 65_536;
+/// Status and backup lists grow with history; 1,000 backup entries alone exceed 64 KiB.
+const LIST_LIMIT: usize = 1024 * 1024;
 const SCOPES: [Scope; 5] = [
     Scope::Status,
     Scope::Start,
@@ -214,6 +217,21 @@ pub fn normalize_manager(value: &str) -> Result<url::Url, String> {
     }
     Ok(url)
 }
+/// Plain HTTP would carry the Manager password unencrypted, so it is accepted only for a Manager
+/// on this computer.
+pub fn require_encrypted(origin: &str) -> Result<(), String> {
+    let url = normalize_manager(origin)?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    };
+    if url.scheme() == "http" && !loopback {
+        return Err("manager_https_required".into());
+    }
+    Ok(())
+}
 fn canonical_origin(value: &str) -> Result<String, String> {
     let url = normalize_manager(value)?;
     let origin = url.origin().ascii_serialization();
@@ -261,12 +279,14 @@ pub fn manager_client(
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")));
     match (pem, approved) {
+        // System trust: the operating system's trust store, plus the bundled public roots.
         (None, None) => {}
         (Some(pem), Some(approved)) => {
             let der = certificate_der(pem)?;
             if !hex(approved, 64) || format!("{:x}", Sha256::digest(&der)) != approved {
                 return Err("manager_certificate_approval_changed".into());
             }
+            // A pinned Manager trusts only its approved certificate: no bundled or system roots.
             builder = builder.tls_built_in_root_certs(false).add_root_certificate(
                 reqwest::Certificate::from_der(&der).map_err(|_| "manager_certificate_invalid")?,
             );
@@ -277,15 +297,45 @@ pub fn manager_client(
         .build()
         .map_err(|_| "network_client_unavailable".into())
 }
-async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String> {
+/// A short lowercase code Manager may show to people; never a path, sentence or secret.
+fn public_code(value: &str) -> bool {
+    value.len() <= 64
+        && value.starts_with(|first: char| first.is_ascii_lowercase())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+        && !(value.len() >= 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+/// Whether Manager's clock, from its `Date` header, is too far from ours for signed requests.
+fn clock_skewed(date: Option<&str>, now: u64) -> bool {
+    date.and_then(|value| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()
+    })
+    .is_some_and(|server| {
+        // `Date` has one-second resolution, so allow a margin inside Manager's window.
+        (server.unix_timestamp_nanos() / 1_000_000 - i128::from(now)).unsigned_abs()
+            > u128::from(WINDOW - 5_000)
+    })
+}
+async fn reply<T: DeserializeOwned>(response: Response) -> Result<T, String> {
+    reply_limit(response, REPLY_LIMIT).await
+}
+async fn reply_limit<T: DeserializeOwned>(
+    mut response: Response,
+    limit: usize,
+) -> Result<T, String> {
     let status = response.status();
+    let skewed = clock().is_ok_and(|now| {
+        let date = response.headers().get(reqwest::header::DATE);
+        clock_skewed(date.and_then(|value| value.to_str().ok()), now)
+    });
     let mut bytes = Zeroizing::new(Vec::new());
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| "manager_response_interrupted")?
     {
-        if bytes.len() + chunk.len() > 65_536 {
+        if bytes.len() + chunk.len() > limit {
             return Err("manager_response_too_large".into());
         }
         bytes.extend_from_slice(&chunk);
@@ -299,6 +349,9 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             .unwrap_or("");
         return Err(match code {
             "desktop_recent_auth_required" => "manager_recent_auth_required",
+            // Manager refuses a request signed outside its time window with the same code as a
+            // revoked grant; its own clock tells the two apart.
+            "desktop_grant_invalid" if skewed => "manager_clock_skew",
             "desktop_grant_invalid" => "manager_pair_again",
             "desktop_grant_scope_denied" => "manager_scope_denied",
             "desktop_grant_installation_changed" => "manager_installation_changed",
@@ -321,6 +374,8 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             "native_restore_review_expired"
             | "native_restore_review_not_ready"
             | "native_restore_runtime_change_required" => code,
+            // Manager's own code says more than a generic failure; Desktop's namespace stays ours.
+            _ if public_code(code) && !code.starts_with("manager_") => code,
             _ => "manager_request_failed",
         }
         .into());
@@ -463,11 +518,13 @@ fn validate_pairing(
         || !identifier(&value.pairing_id)
         || !hex(&value.installation_id, 12)
         || !hex(&value.secret, 64)
-        || value.approved_at > now.saturating_add(WINDOW)
-        || value.expires_at <= now
         || value.expires_at.checked_sub(value.approved_at) != Some(RECENT)
     {
         return Err("manager_pairing_binding_changed".into());
+    }
+    // Manager approved this moments ago, so a time outside the window means the clocks disagree.
+    if value.approved_at > now.saturating_add(WINDOW) || value.expires_at <= now {
+        return Err("manager_clock_skew".into());
     }
     Ok(())
 }
@@ -480,6 +537,7 @@ pub async fn pair(
     persist: impl FnOnce(&SavedManager) -> Result<(), String>,
 ) -> Result<View, String> {
     canonical_origin(origin)?;
+    require_encrypted(origin)?;
     let password = Zeroizing::new(password);
     if password.is_empty() || password.len() > 256 {
         return Err("manager_login_details_invalid".into());
@@ -667,7 +725,12 @@ pub async fn send(
         clock()?,
         &Uuid::new_v4().to_string(),
     )?;
-    let value = reply(
+    let limit = if matches!(command, Command::Status {} | Command::Backups {}) {
+        LIST_LIMIT
+    } else {
+        REPLY_LIMIT
+    };
+    let value = reply_limit(
         saved_client(saved)?
             .post(format!("{}{}", saved.origin, request.path))
             .header("content-type", "application/json")
@@ -676,6 +739,7 @@ pub async fn send(
             .send()
             .await
             .map_err(|_| "manager_unreachable_or_certificate_invalid")?,
+        limit,
     )
     .await?;
     validate_reply(saved, &command, value)
@@ -720,6 +784,19 @@ pub async fn reauthenticate(saved: &SavedManager, password: String) -> Result<()
 pub async fn disconnect(saved: &SavedManager, password: String) -> Result<(), String> {
     grant_action(saved, password, "desktop-grants/revoke", "revoked").await
 }
+/// Remove a pairing from this computer first, then try to revoke its grant in Manager.
+/// An unreachable Manager is not an error; the result says whether Manager confirmed the revoke.
+pub async fn remove(
+    saved: Option<SavedManager>,
+    password: String,
+    forget: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    forget()?;
+    match saved {
+        Some(saved) if !password.is_empty() => Ok(disconnect(&saved, password).await.is_ok()),
+        _ => Ok(false),
+    }
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Operation<K = Action, const MAX: usize = 32> {
@@ -757,6 +834,17 @@ impl<K, const MAX: usize> Operation<K, MAX> {
             && self.updated_at <= 9_007_199_254_740_991
     }
 }
+/// Operation kinds in a status list; a kind this Desktop does not know stays visible as `other`.
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum StatusKind {
+    Start,
+    Stop,
+    Restart,
+    Backup,
+    #[serde(other)]
+    Other,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum RestoreKind {
@@ -781,7 +869,7 @@ struct Installation {
 struct Status {
     manager: ManagerIdentity,
     installation: Installation,
-    operations: Vec<Operation>,
+    operations: Vec<Operation<StatusKind>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -818,25 +906,12 @@ struct ReviewState {
     requires_runtime_change: Option<bool>,
 }
 fn public_error(operation: &mut Value) {
-    if let Some(error) = operation["error"].as_str() {
-        if !matches!(
-            error,
-            "operation_failed"
-                | "operation_interrupted"
-                | "no_installation"
-                | "installation_changed"
-                | "other_media_writer_detected"
-                | "source_not_fenced"
-                | "source_changed_review_again"
-                | "previous_installation_not_fenced"
-                | "previous_autostart_enabled"
-                | "recovery_key_required"
-                | "backup_incomplete"
-                | "invalid_database_path"
-                | "database_path_not_mounted"
-        ) {
-            operation["error"] = json!("manager_operation_failed");
-        }
+    // Manager's own code passes through; anything that is not a plain code stays private.
+    if operation["error"]
+        .as_str()
+        .is_some_and(|error| !public_code(error))
+    {
+        operation["error"] = json!("manager_operation_failed");
     }
 }
 fn validate_reply(
@@ -947,7 +1022,11 @@ fn validate_reply(
             {
                 return Err(invalid());
             }
-            for operation in value["operations"].as_array_mut().ok_or_else(invalid)? {
+            let shown = value["operations"].as_array_mut().ok_or_else(invalid)?;
+            for (operation, parsed) in shown.iter_mut().zip(&status.operations) {
+                if parsed.kind == StatusKind::Other {
+                    operation["kind"] = json!("other");
+                }
                 public_error(operation);
             }
         }
