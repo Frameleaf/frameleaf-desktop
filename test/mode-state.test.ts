@@ -130,3 +130,137 @@ test('runtime history failures explain recovery without suggesting a network ret
   assert.equal(runtimeRecoveryMessage('server_unreachable'), null);
   assert.equal(runtimeRecoveryMessage('runtime_epoch_unknown'), null);
 });
+
+const card = async (setup: { state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number } | null, connectionState = 'preparing') => {
+  const { workerView } = await import('../src/mode-state.ts');
+  return workerView({ connectionState, workerSupported: true, computer: 'Mac', setup });
+};
+
+test('each worker failure family shows its own reason and the action that fixes it', async () => {
+  const families: [code: string, headline: RegExp, detail: RegExp][] = [
+    ['model_file_write_failed', /could not be saved/, /disk is full.*Free up disk space.*Retry Setup/],
+    ['runtime_store_write_failed', /could not be saved/, /Free up disk space/],
+    ['model_download_hash_mismatch', /model download failed/, /Check your connection.*Retry Setup/],
+    ['server_response_interrupted', /did not answer/, /home network.*Retry Setup/],
+    ['workload_desktop_pool_route_changed', /not shared with this computer/, /server’s owner.*machine learning settings/],
+    ['server_http_401', /no longer accepts this computer/, /removed from your server.*Signing out will not fix this/],
+    ['runtime_manifest_invalid', /runtime is missing/, /Install Frameleaf again.*Retry Setup/],
+    ['runtime_start_failed', /runtime could not start/, /Quit and reopen Frameleaf.*Retry Setup/],
+    ['worker_no_qualified_workloads', /did not pass the model checks/, /Retry Setup/],
+    ['worker_lease_invalid', /out of step/, /Update Frameleaf and your server/],
+    ['worker_session_required', /setting up again/, /Sign out and sign in again/],
+    ['credential_store_locked_or_unavailable', /Unlock your credential store/, /Unlock.*Retry Setup/],
+    ['runtime_epoch_rollback', /needs recovery/, /runtime was rejected/],
+  ];
+  const generic = await card({ state: 'setup-needs-attention', code: 'brand_new_backend_code' });
+  const seen = new Set<string>();
+  for (const [code, headline, detail] of families) {
+    const view = await card({ state: 'setup-needs-attention', code });
+    assert.match(view.headline, headline, code);
+    assert.match(view.detail, detail, code);
+    assert.equal(view.attention, 'needs-you', code);
+    assert.equal(view.action, 'retry-setup', code);
+    assert.deepEqual(view.pill, { label: 'Needs you', tone: 'bad' }, code);
+    assert.equal(view.reference, null, code);
+    assert.notEqual(view.detail, generic.detail, code);
+    seen.add(view.headline);
+  }
+  assert.equal(seen.size, 12, 'the two storage codes share a headline; every other family has its own');
+  // A build without a runtime cannot be repaired by reinstalling it, and says so.
+  assert.equal((await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' })).detail, 'This build does not include a signed AI runtime yet. Photos remain available.');
+});
+
+test('memory, power and network pauses wait by themselves and say what they wait for', async () => {
+  for (const [code, headline, detail] of [
+    ['memory_low', 'Waiting for free memory', /enough memory.*continues by itself/],
+    ['on_battery', 'Waiting for power', /Plug in this computer/],
+    ['metered_network', 'Waiting for an unmetered network', /metered networks/],
+    ['system_resumed', 'Rechecking after sleep', /Rechecking the selected models/],
+  ] as const) {
+    const view = await card({ state: 'paused', code });
+    assert.equal(view.headline, headline);
+    assert.match(view.detail, detail);
+    assert.equal(view.attention, 'waiting');
+    assert.equal(view.action, null);
+    assert.deepEqual(view.pill, { label: 'Waiting', tone: 'wait' });
+  }
+  // Paused by the person is a choice, not a wait: with the code, and after reopening without one.
+  for (const setup of [{ state: 'paused', code: 'user_paused', control: 'paused' }, { state: 'paused', code: null, control: 'paused' }]) {
+    const view = await card(setup);
+    assert.equal(view.attention, 'none');
+    assert.match(view.detail, /Paused by you/);
+    assert.deepEqual(view.pill, { label: 'Paused', tone: 'off' });
+  }
+});
+
+test('the same failure reads as waiting while the worker retries and as needs-you once it gave up', async () => {
+  for (const code of ['server_unreachable_or_certificate_invalid', 'model_download_interrupted', 'worker_lease_expired', 'runtime_process_stopped', 'server_http_503']) {
+    const waiting = await card({ state: 'reconnecting', code });
+    const stopped = await card({ state: 'setup-needs-attention', code });
+    assert.equal(waiting.attention, 'waiting', code);
+    assert.equal(waiting.action, null, code);
+    assert.match(waiting.detail, /by itself/, code);
+    assert.equal(stopped.attention, 'needs-you', code);
+    assert.equal(stopped.action, 'retry-setup', code);
+    assert.notEqual(waiting.headline, stopped.headline, code);
+    assert.notEqual(waiting.detail, stopped.detail, code);
+    assert.notDeepEqual(waiting.pill, stopped.pill, code);
+  }
+  assert.match((await card({ state: 'reconnecting', code: 'server_unreachable_or_certificate_invalid' })).detail, /home network/);
+  const unassigned = await card({ state: 'no-eligible-work', code: 'worker_no_eligible_workloads' });
+  assert.equal(unassigned.attention, 'waiting');
+  assert.match(unassigned.detail, /server administrator.*checks again every few minutes/);
+  const download = await card({ state: 'model-download-required', code: 'model_download_permission_required' });
+  assert.deepEqual([download.attention, download.action], ['needs-you', 'download-models']);
+  const approval = await card(null, 'awaiting-approval');
+  assert.deepEqual([approval.attention, approval.action], ['needs-you', 'check-approval']);
+  const offline = await card(null, 'offline');
+  assert.deepEqual([offline.headline, offline.attention, offline.action], ['Server unavailable', 'needs-you', 'check-server']);
+  assert.match(offline.detail, /home network.*Check Again/);
+});
+
+test('a worker failure with no copy shows the generic setup message and the code as a reference', async () => {
+  const view = await card({ state: 'setup-needs-attention', code: 'brand_new_backend_code' });
+  assert.equal(view.headline, 'Computer setup needs attention');
+  assert.equal(view.detail, 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.');
+  assert.equal(view.reference, 'brand_new_backend_code');
+  assert.equal(view.action, 'retry-setup');
+  // A code with copy but no family still shows that copy, with no reference.
+  const known = await card({ state: 'setup-needs-attention', code: 'model_file_changed' });
+  assert.match(known.detail, /changed or could not be read/);
+  assert.equal(known.reference, null);
+});
+
+test('the card says working only while a task runs, and counts finished tasks', async () => {
+  // The backend sets 'working' while it asks for a task; only activeWorkload means one is running.
+  for (const state of ['working', 'waiting-for-work']) {
+    const idle = await card({ state, code: null, completedTasks: 0 });
+    assert.equal(idle.headline, 'Waiting for AI work');
+    assert.deepEqual(idle.pill, { label: 'Idle', tone: 'ok' });
+    assert.equal(idle.finished, '0 tasks finished since AI processing last started');
+  }
+  const busy = await card({ state: 'working', code: null, activeWorkload: 'ocr', completedTasks: 1 });
+  assert.equal(busy.headline, 'Processing on this computer');
+  assert.deepEqual(busy.pill, { label: 'Working', tone: 'ok' });
+  assert.equal(busy.finished, '1 task finished since AI processing last started');
+  assert.equal((await card({ state: 'working', completedTasks: 1234 })).finished, `${(1234).toLocaleString()} tasks finished since AI processing last started`);
+  // An older backend, or a bad value, shows no count rather than a wrong one.
+  for (const completedTasks of [undefined, -1, 1.5, Number.NaN]) assert.equal((await card({ state: 'working', completedTasks })).finished, null);
+  assert.deepEqual((await card({ state: 'preparing-models' })).pill, { label: 'Setting up', tone: 'wait' });
+  assert.deepEqual((await card({ state: 'stopped', control: 'stopped' })).pill, { label: 'Stopped', tone: 'off' });
+});
+
+test('no worker card text shows a raw code or state name', async () => {
+  const states = ['', 'preparing', 'preparing-runtime', 'preparing-models', 'model-download-required', 'qualifying', 'qualified', 'starting-worker', 'working', 'waiting-for-work', 'reconnecting', 'pausing', 'stopped', 'paused', 'setup-needs-attention', 'no-eligible-work', 'awaiting-approval', 'worker-setup-failed', 'credential-store-unavailable', 'unsupported-server', 'incompatible'];
+  const codes = [null, 'user_paused', 'memory_low', 'server_http_401', 'server_http_503', 'model_file_write_failed', 'worker_setup_failed', 'runtime_epoch_reused', 'brand_new_backend_code'];
+  for (const connectionState of ['preparing', 'offline', 'identity-changed', 'enrollment-failed', 'awaiting-approval'])
+    for (const state of states) for (const code of codes) {
+      const view = await card(state ? { state, code } : null, connectionState);
+      for (const text of [view.headline, view.detail, view.pill.label]) {
+        assert.ok(text.length > 0);
+        assert.doesNotMatch(text, /[a-z0-9]_[a-z0-9]/, `${connectionState}/${state}/${code}: ${text}`);
+        for (const name of states) if (name.includes('-')) assert.ok(!text.includes(name), `${connectionState}/${state}/${code}: ${text}`);
+      }
+    }
+  assert.equal((await card({ state: 'unsupported-server' })).headline, 'Your server needs a desktop-worker update');
+});

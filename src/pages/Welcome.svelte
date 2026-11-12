@@ -95,8 +95,8 @@
     nearby = lan.status === 'fulfilled' ? lan.value ?? [] : [];
     loadingServers = false;
   }
-  // Accounts are created at Frameleaf Cloud: its sign-in page in the browser offers Create account,
-  // email code and passkey. (The phones' native email-code grant is for the mobile client only.)
+  // The browser path: Frameleaf Cloud's own sign-in page, which takes a Passkey and every other way to
+  // sign in. FrameleafAccount hands off here when a step needs a Passkey.
   async function cloudSignIn(create = false, stay = false): Promise<CloudAccount | null> {
     if (!native || cloudBusy) return null;
     cloudBusy = true; failure = '';
@@ -120,7 +120,12 @@
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
     try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName, server: null })); }
-    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; } }
+    catch (error) {
+      if (savedSignInNeedsRecovery(error)) onlocked();
+      // Cloud has no approval on record for this server: its own sign-in screen is the way on.
+      if (String(error) === 'cloud_exchange_interaction_required') await openServer(entry.nearby?.url ?? entry.cloud?.connections?.[0]?.uri ?? '');
+      failure = explain(error); if (String(error) === 'cloud_sign_in_required') { oncloudaccount(null); cloudServers = []; }
+    }
     finally { busy = false; connectingKey = ''; }
   }
   function signInTo(entry: ServerEntry) {

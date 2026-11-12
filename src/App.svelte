@@ -15,7 +15,8 @@
   import Wallet from './pages/Wallet.svelte';
   import Remote from './pages/Remote.svelte';
   import { initials, hostOf } from './ui-state';
-  import { connectionError, savedSignInNeedsRecovery } from './errors';
+  import { connectionError } from './errors';
+  import { reconnectDelay, savedSignInState, savedSignInView } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
   import { availablePage, pages, restoredPage, shortcutPage, type Page } from './navigation';
 
@@ -46,6 +47,11 @@
   // native connect refuses until it is cleared, so the clear action stays reachable.
   let staleSignIn = $state(false);
   let connectionLocked = $state(false);
+  // The saved sign-in is kept while the server is unreachable or wants Two-Step Verification.
+  let keptSignIn = $state<'reconnecting' | 'needs-verification' | null>(null);
+  const kept = $derived(savedSignInView(connection ? null : keptSignIn));
+  let reconnectAttempt = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   const isAdmin = $derived(summary?.me?.isAdmin === true);
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
@@ -68,12 +74,13 @@
     }
   }
 
-  async function restoreSaved(retry = false) {
-    busy = true;
+  // `background` is Frameleaf's own reconnect attempt: it leaves the buttons and messages alone.
+  async function restoreSaved(retry = false, background = false) {
+    clearTimeout(reconnectTimer);
+    if (!background) { busy = true; failure = ''; }
     try {
-      failure = '';
       connection = await invoke<Connection | null>('restore_connection', { retry });
-      connectionLocked = false; staleSignIn = false;
+      connectionLocked = false; staleSignIn = false; keptSignIn = null; reconnectAttempt = 0;
       const scope = connection?.navigationScope;
       const revision = navigationRevision;
       setup = await invoke<SetupStatus>('worker_setup_status');
@@ -83,10 +90,19 @@
         catch { /* The default page is available without storage. */ }
       }
     } catch (error) {
-      connectionLocked = savedSignInNeedsRecovery(error);
-      staleSignIn = !connection && !connectionLocked;
-      failure = explain(error);
-    } finally { busy = false; }
+      const state = savedSignInState(error);
+      connectionLocked = state === 'locked';
+      staleSignIn = !connection && state === 'stale';
+      keptSignIn = !connection && (state === 'reconnecting' || state === 'needs-verification') ? state : null;
+      if (!keptSignIn) failure = explain(error);
+      else if (savedSignInView(keptSignIn).autoRetry) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => { void restoreSaved(false, true); }, reconnectDelay(reconnectAttempt++));
+      }
+    } finally { if (!background) busy = false; }
+  }
+  function networkBack() {
+    if (!connection && keptSignIn === 'reconnecting') void restoreSaved(false, true);
   }
   onMount(() => {
     if (!native) return;
@@ -114,7 +130,7 @@
       } catch (error) { failure = explain(error); }
       finally { busy = false; importReady = !disposed; }
     })();
-    return () => { disposed = true; unlisten.forEach(stop => stop()); };
+    return () => { disposed = true; clearTimeout(reconnectTimer); unlisten.forEach(stop => stop()); };
   });
   async function installUpdate() {
     if (!updateVersion || installingUpdate) return;
@@ -139,6 +155,7 @@
     }
   }
   function connected(view: Connection) {
+    clearTimeout(reconnectTimer); keptSignIn = null;
     summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
@@ -148,6 +165,7 @@
     try {
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
       try { localStorage.removeItem(lastPageKey); } catch { /* Sign-out still succeeds. */ }
+      clearTimeout(reconnectTimer); keptSignIn = null;
       summaryRequest += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
@@ -199,7 +217,7 @@
 </script>
 
 <svelte:head><title>Frameleaf</title></svelte:head>
-<svelte:window onkeydown={keydown} onpointerdown={event => { if (accountMenu && !(event.target as Element | null)?.closest?.('.acct-wrap')) accountMenu = false; }} />
+<svelte:window onkeydown={keydown} ononline={networkBack} onpointerdown={event => { if (accountMenu && !(event.target as Element | null)?.closest?.('.acct-wrap')) accountMenu = false; }} />
 <a class="skip-link" href="#main-content" onclick={event => { event.preventDefault(); focusContent(); }}>Skip to main content</a>
 <div class="app">
   {#if connection}
@@ -253,7 +271,21 @@
         <PhotoDrop connected={!!connection} visible={!!connection && page === 'sources'} />
       {/key}
     {/if}
-    {#if !connection}
+    {#if kept.panel}
+      <div class="welcome">
+        <header class="tbar" data-tauri-drag-region><h1 data-tauri-drag-region>Frameleaf</h1></header>
+        <div class="wrap" data-saved-sign-in={keptSignIn}>
+          <div class="logo"><img src={mark} alt="" /><span>Frameleaf</span></div>
+          <h2>{kept.panel.title}</h2>
+          <p class="sub" role="status">{kept.panel.detail}</p>
+          <p>
+            <button class="btn primary" disabled={busy} onclick={() => restoreSaved(true)}>{kept.panel.retry}</button>
+            <button class="btn" disabled={busy} onclick={offlinePhotos}>Offline Albums</button>
+            <button class="btn quiet" disabled={busy} onclick={() => { signOutSheet = true; }}>Sign out…</button>
+          </p>
+        </div>
+      </div>
+    {:else if !connection}
       <Welcome {native} {hostActive} {cloudAccount} onlocked={() => { connectionLocked = true; }} onconnected={connected} oncloudaccount={account => { cloudAccount = account; }} onhostactive={active => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} {managerRevision} onmanagerstate={paired => { managerPaired = paired; }} />
     {:else if page === 'overview' || page === 'ai'}
       <Overview {connection} {setup} {summary} {native} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target, true)} />

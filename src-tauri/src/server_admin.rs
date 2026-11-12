@@ -127,23 +127,15 @@ impl Session {
             token: saved.token.clone(),
         })
     }
-    async fn get(&self, path: &str) -> Result<Value, String> {
-        let url = self.base.join(path).map_err(|_| "server_address_invalid")?;
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-        transport::json_limit(response, PASSTHROUGH_LIMIT).await
+    async fn get(&self, path: &str) -> Result<Value, Refused> {
+        self.send(reqwest::Method::GET, path, None).await
     }
     async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Refused> {
         let url = self.base.join(path).map_err(|_| "server_address_invalid")?;
         let mut request = self.client.request(method, url).bearer_auth(&self.token);
         if let Some(body) = body {
@@ -155,29 +147,83 @@ impl Session {
             .map_err(|_| "server_unreachable_or_certificate_invalid")?;
         let status = response.status();
         if status.is_success() {
-            return transport::json_limit(response, PASSTHROUGH_LIMIT).await;
+            return Ok(transport::json_limit(response, PASSTHROUGH_LIMIT).await?);
         }
-        // A refusal's `code` tells the page what to do; nothing else of the body is kept.
-        let body = response.bytes().await.unwrap_or_default();
-        let code = if body.len() <= 65_536 {
-            serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|value| value.get("code")?.as_str().map(str::to_owned))
-        } else {
-            None
-        };
-        Err(refusal(status.as_u16(), code.as_deref()))
+        // A refusal's `code` tells the page what to do; nothing else of the body is kept, apart
+        // from what answers a request for Two-Step Verification.
+        let body = crate::server_steps::refusal_body(response).await;
+        if let Some(needed) = body
+            .as_ref()
+            .and_then(|body| verification_required(status, body))
+        {
+            return Err(needed);
+        }
+        let code = body.as_ref().and_then(|value| value.get("code")?.as_str());
+        Err(refusal(status.as_u16(), code).into())
     }
-    async fn me(&self) -> Result<Me, String> {
+    async fn me(&self) -> Result<Me, Refused> {
         serde_json::from_value(self.get("api/users/me").await?)
             .map_err(|_| "server_response_invalid".into())
     }
-    async fn require_admin(&self) -> Result<Me, String> {
+    async fn require_admin(&self) -> Result<Me, Refused> {
         let me = self.me().await?;
         if !me.is_admin {
             return Err("admin_required".into());
         }
         Ok(me)
+    }
+}
+
+/// Why a page's request failed: an error code, or the server asking for Two-Step Verification
+/// first (403 `verification_required`). The page answers that with `server_step_up`, then retries.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum Refused {
+    Code(String),
+    Verification {
+        code: &'static str,
+        methods: Vec<String>,
+        transaction: String,
+    },
+}
+impl From<String> for Refused {
+    fn from(code: String) -> Self {
+        Self::Code(code)
+    }
+}
+impl From<&str> for Refused {
+    fn from(code: &str) -> Self {
+        Self::Code(code.into())
+    }
+}
+
+fn verification_required(status: reqwest::StatusCode, body: &Value) -> Option<Refused> {
+    if status != reqwest::StatusCode::FORBIDDEN || body.get("code")? != "verification_required" {
+        return None;
+    }
+    let transaction = body.get("transaction")?.as_str()?;
+    if transaction.is_empty() || transaction.len() > 4000 {
+        return None;
+    }
+    let methods = body.get("methods").and_then(Value::as_array);
+    Some(Refused::Verification {
+        code: "verification_required",
+        methods: crate::server_steps::known_methods(
+            methods
+                .into_iter()
+                .flatten()
+                .filter_map(|method| method.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        transaction: transaction.to_owned(),
+    })
+}
+
+/// An optional part of a page: its absence is fine, a request for Two-Step Verification is not.
+fn optional(part: Result<Value, Refused>) -> Result<Option<Value>, Refused> {
+    match part {
+        Err(needed @ Refused::Verification { .. }) => Err(needed),
+        part => Ok(part.ok()),
     }
 }
 
@@ -207,7 +253,7 @@ async fn session(state: &State<'_, DesktopState>) -> Result<Session, String> {
 pub(crate) async fn server_summary(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<ServerSummary, String> {
+) -> Result<ServerSummary, Refused> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
     let me = session.me().await?;
@@ -234,7 +280,7 @@ pub(crate) async fn server_summary(
 pub(crate) async fn server_ai_processing(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<AiProcessing, String> {
+) -> Result<AiProcessing, Refused> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
     session.require_admin().await?;
@@ -243,10 +289,8 @@ pub(crate) async fn server_ai_processing(
         session.get("api/ml-destinations/processing-order"),
     );
     Ok(AiProcessing {
-        queues: jobs.ok().and_then(ai_queues),
-        processing_order: order
-            .ok()
-            .and_then(|value| serde_json::from_value(value).ok()),
+        queues: optional(jobs)?.and_then(ai_queues),
+        processing_order: optional(order)?.and_then(|value| serde_json::from_value(value).ok()),
     })
 }
 
@@ -254,7 +298,7 @@ pub(crate) async fn server_ai_processing(
 pub(crate) async fn cloud_status(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<CloudStatus, String> {
+) -> Result<CloudStatus, Refused> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
     session.require_admin().await?;
@@ -274,7 +318,7 @@ pub(crate) async fn cloud_status(
 pub(crate) async fn wallet_status(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<WalletStatus, String> {
+) -> Result<WalletStatus, Refused> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
     session.require_admin().await?;
@@ -317,7 +361,7 @@ pub(crate) async fn update_wallet(
     state: State<'_, DesktopState>,
     daily_cap_usd: Option<f64>,
     auto_top_up: Option<bool>,
-) -> Result<Value, String> {
+) -> Result<Value, Refused> {
     crate::require_local(&window)?;
     let body = wallet_update(daily_cap_usd, auto_top_up)?;
     let session = session(&state).await?;
@@ -334,7 +378,7 @@ pub(crate) async fn update_wallet(
 pub(crate) async fn remote_status(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<RemoteStatus, String> {
+) -> Result<RemoteStatus, Refused> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
     session.require_admin().await?;
@@ -394,7 +438,7 @@ pub(crate) async fn update_remote(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
     settings: Value,
-) -> Result<Value, String> {
+) -> Result<Value, Refused> {
     crate::require_local(&window)?;
     let update = split_remote_settings(&settings)?;
     let session = session(&state).await?;
@@ -421,12 +465,36 @@ pub(crate) async fn update_remote(
 pub(crate) async fn test_remote_access(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<Value, String> {
+) -> Result<Value, Refused> {
     crate::require_local(&window)?;
     let session = session(&state).await?;
     session
         .send(reqwest::Method::POST, "api/admin/cloud/remote/test", None)
         .await
+}
+
+/// Answers a `verification_required` with one proof, so the refused request can be retried.
+#[tauri::command]
+pub(crate) async fn server_step_up(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    transaction: String,
+    method: String,
+    proof: String,
+) -> Result<(), String> {
+    crate::require_local(&window)?;
+    let transaction = zeroize::Zeroizing::new(transaction);
+    let proof = zeroize::Zeroizing::new(proof);
+    let session = session(&state).await?;
+    crate::server_steps::step_up(
+        &session.client,
+        &session.base,
+        &session.token,
+        &transaction,
+        &method,
+        &proof,
+    )
+    .await
 }
 
 /// Allow the signed-in server origin, HTTPS Frameleaf service domains and the fixed downloads page.
@@ -600,6 +668,85 @@ mod tests {
         assert_eq!(refusal(400, Some("Bad Request!")), "server_http_400");
         assert_eq!(refusal(500, None), "server_http_500");
         assert_eq!(refusal(401, Some(&"a".repeat(65))), "server_http_401");
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use crate::server_steps::fixture::{client, server};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn admin_request_needing_two_step_verification_keeps_its_methods_and_transaction() {
+        let (base, _) = server(|request| match request.path.as_str() {
+            "/api/admin/cloud/status" => (
+                403,
+                json!({
+                    "message": "private", "error": "Forbidden", "statusCode": 403,
+                    "code": "verification_required", "acr": "urn:frameleaf:acr:verified",
+                    "maxAge": null, "methods": ["frameleaf", "totp", "recovery_code", "sms"],
+                    "transaction": "txn",
+                }),
+            ),
+            "/api/admin/license" => (403, json!({"code": "verification_required"})),
+            "/api/admin/cloud/remote" => (403, json!({"code": "frameleaf_sign_in_required"})),
+            _ => (403, json!({"message": "private"})),
+        });
+        let session = Session {
+            client: client(),
+            base,
+            token: "session".into(),
+        };
+        // A read and a change take the same path.
+        for refused in [
+            session.get("api/admin/cloud/status").await,
+            session
+                .send(reqwest::Method::PUT, "api/admin/cloud/status", None)
+                .await,
+        ] {
+            let Err(refused) = refused else {
+                panic!("the request should be refused");
+            };
+            let Refused::Verification {
+                methods,
+                transaction,
+                ..
+            } = &refused
+            else {
+                panic!("Two-Step Verification should be asked for");
+            };
+            assert_eq!(methods, &["frameleaf", "totp", "recovery_code"]);
+            assert_eq!(transaction, "txn");
+            assert_eq!(
+                serde_json::to_value(&refused).unwrap(),
+                json!({
+                    "code": "verification_required",
+                    "methods": ["frameleaf", "totp", "recovery_code"],
+                    "transaction": "txn",
+                })
+            );
+            // An optional part of a page does not hide it.
+            assert!(matches!(
+                optional(Err(refused)),
+                Err(Refused::Verification { .. })
+            ));
+        }
+        // Other refusals stay plain codes, as the page already reads them.
+        for (path, code) in [
+            ("api/admin/license", "server_refused_verification_required"),
+            (
+                "api/admin/cloud/remote",
+                "server_refused_frameleaf_sign_in_required",
+            ),
+            ("api/admin/attention", "server_http_403"),
+        ] {
+            let Err(refused) = session.get(path).await else {
+                panic!("the request should be refused");
+            };
+            assert_eq!(serde_json::to_value(&refused).unwrap(), json!(code));
+            assert!(matches!(optional(Err(refused)), Ok(None)));
+        }
     }
 }
 

@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
   import Icon from './Icon.svelte';
+  import { explainError } from './errors';
   import Sheet from './Sheet.svelte';
   type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused' | 'outdated';
   const outdatedCompanion = 'This companion package does not match this version of Frameleaf. Install the companion for this version, then choose Check installation. Your library has not been changed.';
@@ -83,7 +84,7 @@
     if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, start the photo server in Manager again, then stop it there.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
     if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
-    return 'Local setup could not finish. Check the server installation and secure credential store, then retry.';
+    return explainError(value, 'Local setup could not finish. Check the server installation and secure credential store, then retry.');
   }
   function show(value: View) {
     if (disposed) return;

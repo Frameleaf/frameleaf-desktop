@@ -148,18 +148,14 @@ test("factory CLI never prints private-key parser input", async (t) => {
   });
 });
 
-test("factory accepts the published target-scoped Linux ARM source", async (t) => {
+test("factory builds Linux ARM from the common catalogue source, not a source without profiles", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
   const arch = Object.getOwnPropertyDescriptor(process, "arch");
   try {
     Object.defineProperty(process, "platform", { ...platform, value: "linux" });
     Object.defineProperty(process, "arch", { ...arch, value: "arm64" });
-    const profiles = JSON.parse(
-      await readFile(new URL("../runtime/profiles.json", import.meta.url)),
-    );
-    const sourceRevision =
-      profiles.profiles["cpu-ort"].additionalSources["linux-aarch64"][0];
-    assert.equal(sourceRevision, "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8");
+    const sourceRevision = factorySourceRevisionFor("linux-aarch64");
+    assert.equal(sourceRevision, factorySourceRevision);
     const f = await fixture(t, { sourceRevision });
     const receipt = await signFactoryRuntime(
       f.root,
@@ -169,7 +165,10 @@ test("factory accepts the published target-scoped Linux ARM source", async (t) =
       f.policy,
     );
     assert.equal(receipt.sourceRevision, sourceRevision);
-    const old = await fixture(t, { sourceRevision: factorySourceRevision });
+    // 94d52a82 has no catalogue profile on the server or here: a runtime built from it runs no model.
+    const old = await fixture(t, {
+      sourceRevision: "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
+    });
     await assert.rejects(
       signFactoryRuntime(old.root, old.target, 2, old.privatePem, old.policy),
       /runtime_factory_candidate_unapproved/,

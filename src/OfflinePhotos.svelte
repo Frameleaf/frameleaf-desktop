@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { formatBytes } from './ui-state';
+  import { explainError } from './errors';
 
   type Media = { id: string; name: string; mime: string };
   type Album = { id: string; name: string; bytes: number; expiresAt: number; items: Media[] };
@@ -31,7 +32,7 @@
     offline_album_save_exists: 'Choose a new filename to save the original.',
     offline_album_busy: 'Frameleaf is finishing another offline operation. Try again in a moment.',
   };
-  const explain = (error: unknown) => errorMessages[String(error)] ?? 'Frameleaf could not verify or open this offline album.';
+  const explain = (error: unknown) => errorMessages[String(error)] ?? explainError(error, 'Frameleaf could not verify or open this offline album.');
 
   function closeMedia() {
     generation += 1;
