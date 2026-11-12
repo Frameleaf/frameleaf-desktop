@@ -18,6 +18,7 @@
   import { connectionError } from './errors';
   import { reconnectDelay, savedSignInState, savedSignInView } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
+  import { noStepUp, stepUpAfterFailure, stepUpDismissed, type StepUpState } from './sign-in-steps';
   import { availablePage, pages, restoredPage, shortcutPage, type Page } from './navigation';
 
   const lastPageKey = 'frameleaf.last-page.v1';
@@ -56,13 +57,19 @@
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
   let summaryRequest = 0; // bumped per request and on every sign-in and sign-out: only the latest reply applies
+  // The server can refuse the summary until Two-Step Verification; Overview shows the Verify prompt for it.
+  let summaryStepUp = $state<StepUpState>(noStepUp);
   async function loadSummary() {
-    if (!native || !connection) { summary = null; return; }
+    if (!native || !connection) { summary = null; summaryStepUp = noStepUp; return; }
     // A superseded reply (a newer refresh, or a sign-in or sign-out since) is dropped.
     const asked = ++summaryRequest;
-    const result = await invoke<ServerSummary>('server_summary').catch(() => null);
+    let result: ServerSummary | null = null;
+    let failed: unknown;
+    try { result = await invoke<ServerSummary>('server_summary'); }
+    catch (error) { failed = error; }
     if (summaryRequest === asked) {
       summary = result;
+      summaryStepUp = result ? noStepUp : stepUpAfterFailure(summaryStepUp, failed, () => { summaryStepUp = noStepUp; void loadSummary(); });
       if (result && !availablePage(page, result.me?.isAdmin === true)) page = 'overview';
     }
     void invoke('tray_refresh').catch(() => {});
@@ -158,7 +165,7 @@
   }
   function connected(view: Connection) {
     clearTimeout(reconnectTimer); keptSignIn = null;
-    summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
+    summaryRequest += 1; connection = view; setup = null; summary = null; summaryStepUp = noStepUp; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
   }
@@ -168,7 +175,7 @@
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
       try { localStorage.removeItem(lastPageKey); } catch { /* Sign-out still succeeds. */ }
       clearTimeout(reconnectTimer); keptSignIn = null;
-      summaryRequest += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
+      summaryRequest += 1; connection = null; setup = null; summary = null; summaryStepUp = noStepUp; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
       void tick().then(focusContent);
@@ -290,7 +297,7 @@
     {:else if !connection}
       <Welcome {native} {hostActive} {cloudAccount} onlocked={() => { connectionLocked = true; }} onconnected={connected} oncloudaccount={account => { cloudAccount = account; }} onhostactive={active => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} {managerRevision} onmanagerstate={paired => { managerPaired = paired; }} />
     {:else if page === 'overview' || page === 'ai'}
-      <Overview {connection} {setup} {summary} {native} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target, true)} />
+      <Overview {connection} {setup} {summary} {native} stepUp={summaryStepUp.request} onstepupclose={() => { summaryStepUp = stepUpDismissed; }} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target, true)} />
     {:else if page === 'sources'}
       <PhotoSourcesPage />
     {:else if page === 'manager'}

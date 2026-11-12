@@ -2,26 +2,39 @@
   import { invoke } from '@tauri-apps/api/core';
   import { processingPlaces, queueNames, queueProgress, queueState, type LibraryAiProcessing } from '../ai-processing';
   import { workloadName } from '../ui-state';
+  import StepUp from '../StepUp.svelte';
+  import { noStepUp, stepUpAfterFailure, stepUpDismissed, type StepUpState } from '../sign-in-steps';
   let { native, server, accountId, admin, connected }: {
     native: boolean; server: string; accountId: string | undefined; admin: boolean; connected: boolean;
   } = $props();
 
   let library = $state<LibraryAiProcessing | null>(null);
   let checking = $state(false);
+  // The server can refuse the queues until Two-Step Verification: say so with Verify, then read them again.
+  let stepUp = $state<StepUpState>(noStepUp);
+  // The same prompt outside the effect below, which must not rerun each time the prompt changes.
+  let prompt = noStepUp;
+  function setStepUp(next: StepUpState) { prompt = next; stepUp = next; }
   $effect(() => {
     if (!native || !server || !accountId || !admin || !connected) return;
     let alive = true;
     let reading = false;
     library = null;
     checking = true;
+    setStepUp(noStepUp);
     async function refresh() {
-      if (reading || document.hidden) return;
+      // While the prompt is open nothing is asked again: the server's answer would start a new verification.
+      if (reading || document.hidden || prompt.request) return;
       reading = true;
-      const result = await invoke<LibraryAiProcessing>('server_ai_processing').catch(() => null);
+      let result: LibraryAiProcessing | null = null;
+      let failed: unknown;
+      try { result = await invoke<LibraryAiProcessing>('server_ai_processing'); }
+      catch (error) { failed = error; }
       reading = false;
       if (alive) {
         library = result;
         checking = false;
+        setStepUp(result ? noStepUp : stepUpAfterFailure(prompt, failed, () => { setStepUp(noStepUp); void refresh(); }));
       }
     }
     void refresh();
@@ -37,6 +50,7 @@
 
 <section aria-labelledby="ai-library-title">
   <div class="group-head"><h2 id="ai-library-title" class="group-title">Library AI queues</h2></div>
+  {#if stepUp.request}{#key stepUp.request}<StepUp offer={stepUp.request.offer} retry={stepUp.request.retry} onclose={() => { setStepUp(stepUpDismissed); }} />{/key}{/if}
   <div class="group">
     {#if !connected}
       <div class="row"><span class="l"><b>Queue status unknown</b><small>Connect to the Library to see live progress.</small></span></div>

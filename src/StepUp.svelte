@@ -18,8 +18,10 @@
     const secret = proof; proof = '';
     try {
       await invoke('server_step_up', { transaction: step.transaction, method: step.method, proof: secret });
+      // Closing removes this prompt, and its props with it: take the retry first or it never runs.
+      const again = retry;
       onclose();
-      retry();
+      again();
     } catch (error) { step = stepFailed(step, error); }
     finally { busy = false; }
   }

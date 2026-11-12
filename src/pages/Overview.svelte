@@ -4,14 +4,18 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from '../Icon.svelte';
   import AiLibrary from './AiLibrary.svelte';
+  import StepUp from '../StepUp.svelte';
+  import type { StepUpRequest } from '../sign-in-steps';
   import { workerView, workloadReason } from '../mode-state';
   import { describeError } from '../errors';
   import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
   import { backupHealth, backupWarning, libraryHeadroom, storageWarning } from '../server-health';
 
-  let { connection, setup, summary, native, section = 'all', onsetup, onconnection, onrefresh, onsignout, onopen }: {
+  let { connection, setup, summary, native, section = 'all', stepUp = null, onstepupclose = () => {}, onsetup, onconnection, onrefresh, onsignout, onopen }: {
     connection: Connection; setup: SetupStatus | null; summary: ServerSummary | null; native: boolean; section?: 'all' | 'ai';
+    /** The server refused this page's summary until Two-Step Verification. */
+    stepUp?: StepUpRequest | null; onstepupclose?: () => void;
     onsetup: (value: SetupStatus | null) => void; onconnection: (value: Connection) => void; onrefresh: () => Promise<void> | void; onsignout: () => void; onopen: (page: string) => void;
   } = $props();
   const computer = computerWord(platformFromUserAgent(navigator.userAgent));
@@ -113,6 +117,7 @@
   </header>
   <div class="body">
     {#if failure}<div class="inline-msg error" role="alert"><p>{failure}{#if failureReference} <small class="muted">Reference: {failureReference}</small>{/if}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={onstepupclose} />{/key}{/if}
     {#if section === 'all'}
       {#if attention.length}
         <div>
