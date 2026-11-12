@@ -102,6 +102,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'A different update was published while this one was starting. Check for updates again.', 'update_changed'],
   ['', 'The update could not be installed. Try again later.', 'update_install_failed'],
   ['', 'Stop local management before updating Frameleaf.', 'update_host_active'],
+  ['', 'Your library on this computer is still shutting down, or did not shut down cleanly. Start the photo server in Manager and stop it there, then update Frameleaf.', 'update_library_not_idle'],
   ['', 'Finish or cancel the media copy before updating Frameleaf.', 'update_media_copy_active'],
   ['', 'Choose a daily cap between $1 and $1,000.', 'wallet_daily_cap_invalid'],
   ['', 'Nothing was changed. Choose a new cap or auto-reload setting first.', 'wallet_nothing_to_change'],

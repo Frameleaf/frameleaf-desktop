@@ -19,6 +19,14 @@ pub(crate) fn windows_local_app_data() -> Result<PathBuf, String> {
 pub(crate) fn windows_profiles_root() -> Result<PathBuf, String> {
     Ok(windows::base()?.join("Profiles"))
 }
+/// Where this account's library keeps its controller state, whether or not one exists yet.
+#[cfg(unix)]
+pub(crate) fn account_state() -> PathBuf {
+    PathBuf::from(BASE)
+        .join("Profiles")
+        .join(unsafe { libc::geteuid() }.to_string())
+        .join("state")
+}
 impl Layout {
     pub fn new(manifest: &str, controller: &str) -> Result<Self, String> {
         if !crate::native_runtime::digest_valid(manifest, 64)

@@ -123,6 +123,15 @@ impl Library {
             .is_ok()
     }
 }
+/// From disk alone: no library was ever hosted at `state`, or its journal proves it idle.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn hosted_library_idle(state: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(state) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(_) => crate::host_state::Owner::package_idle(state).is_ok(),
+        Err(_) => false,
+    }
+}
 #[derive(Default)]
 pub(crate) struct HostSetup {
     owner: tokio::sync::Mutex<Option<Running>>,
@@ -151,20 +160,42 @@ impl HostSetup {
         self.active.load(Ordering::Acquire)
     }
     pub(crate) fn lock_for_update(&self) -> Result<impl Drop + '_, String> {
+        // Unit tests never consult the library really hosted on the machine that runs them.
+        #[cfg(all(unix, not(test)))]
+        let hosted = Some(crate::host_install::account_state());
+        #[cfg(not(all(unix, not(test))))]
+        let hosted: Option<std::path::PathBuf> = None;
+        self.lock_for_update_at(hosted.as_deref())
+    }
+    /// `hosted` is where this account's library keeps its controller state on disk.
+    fn lock_for_update_at(
+        &self,
+        hosted: Option<&std::path::Path>,
+    ) -> Result<impl Drop + '_, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
-        // Holding the owner proves no operation is in flight. A live Manager blocks. So does
-        // any library a Manager ran for in this session, whether or not that Manager is still
-        // owned, until its journal proves a clean stop: outside Windows the controller and
-        // database are not this app's children and can outlive Manager.
-        if live(&mut owner)
-            || self
-                .library
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_ref()
-                .is_some_and(|library| !library.proven_idle())
-        {
+        // Holding the owner proves no operation is in flight. A live Manager blocks.
+        if live(&mut owner) {
             return Err("update_host_active".into());
+        }
+        // So does a library whose journal does not prove a clean stop, whether or not its
+        // Manager is still owned: outside Windows the controller and database are not this
+        // app's children and can outlive Manager, and even this app. The library a Manager ran
+        // for in this run is checked by name; the one found on disk covers a new run, which
+        // remembers nothing while a controller left by quitting may still be closing the
+        // database. An unreadable state counts as not idle. Windows needs no disk check: its
+        // controller cannot outlive this app's job.
+        let unproven = self
+            .library
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|library| !library.proven_idle());
+        #[cfg(any(target_os = "macos", target_os = "linux", test))]
+        let unproven = unproven || hosted.is_some_and(|state| !hosted_library_idle(state));
+        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+        let _ = hosted;
+        if unproven {
+            return Err("update_library_not_idle".into());
         }
         Ok(owner)
     }
@@ -1013,13 +1044,10 @@ pub(crate) fn package_version(record: &Installation) -> Option<String> {
 /// The package this account's library last ran with, for display only.
 pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
     #[cfg(unix)]
-    let state = records
-        .first()?
-        .layout()
-        .ok()?
-        .profiles
-        .join(unsafe { libc::geteuid() }.to_string())
-        .join("state");
+    let state = {
+        records.first()?;
+        crate::host_install::account_state()
+    };
     #[cfg(windows)]
     let state = {
         records.first()?;
@@ -1985,6 +2013,53 @@ mod tests {
         assert!(setup.lock_for_update().is_err());
         drop(controller);
         assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_run_keeps_updates_closed_until_the_hosted_library_is_proven_idle() {
+        use crate::host_runtime::HostMode;
+        let fixture = OwnedFixture::new();
+        let state = fixture.state();
+        // An account that never hosted a library has nothing to wait for.
+        assert!(HostSetup::default()
+            .lock_for_update_at(Some(&fixture.0.join("never-hosted")))
+            .is_ok());
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
+        controller
+            .activate("aaaaaaaaaaaa", &"a".repeat(64), HostMode::Server)
+            .unwrap();
+        // Stop and quit: Manager is gone, its controller is still closing the database.
+        setup.stop_for_exit().await.unwrap();
+        drop(setup);
+        // The next run of the app remembers no Manager and no library.
+        let restarted = HostSetup::default();
+        assert!(restarted.owner.try_lock().unwrap().is_none());
+        assert_eq!(
+            restarted.lock_for_update_at(Some(&state)).err().unwrap(),
+            "update_library_not_idle"
+        );
+        controller.clean_stop().unwrap();
+        assert!(
+            restarted.lock_for_update_at(Some(&state)).is_err(),
+            "the controller still holds the journal"
+        );
+        drop(controller);
+        assert!(restarted.lock_for_update_at(Some(&state)).is_ok());
+        // A controller that died without a clean stop keeps a later run closed too.
+        let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
+        controller
+            .activate("aaaaaaaaaaaa", &"a".repeat(64), HostMode::Server)
+            .unwrap();
+        drop(controller);
+        assert_eq!(
+            HostSetup::default()
+                .lock_for_update_at(Some(&state))
+                .err()
+                .unwrap(),
+            "update_library_not_idle"
+        );
     }
 
     #[cfg(unix)]
