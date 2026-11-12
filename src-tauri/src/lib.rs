@@ -89,7 +89,9 @@ pub(crate) struct LoginResponse {
     name: String,
 }
 
-async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
+/// `keep_worker_session`: this is a check of the connection in use and its worker is running.
+/// Answers the view, and whether that worker's session was kept instead of a new one issued.
+async fn prepare(saved: &mut SavedConnection, keep_worker_session: bool) -> (ConnectionView, bool) {
     let unavailable = Features {
         enrollment: false,
         worker: false,
@@ -99,11 +101,43 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
     };
     let client = match transport::client() {
         Ok(c) => c,
-        Err(_) => return ConnectionView::new(saved, "offline".into(), unavailable),
+        Err(_) => {
+            return (
+                ConnectionView::new(saved, "offline".into(), unavailable),
+                false,
+            )
+        }
     };
-    prepare_with_client(&client, saved).await
+    let capabilities = transport::capabilities(&client, saved).await;
+    prepare_checked(&client, saved, capabilities, keep_worker_session).await
 }
 
+/// Whether a connection check may leave the running worker's session in place: it is the session
+/// of this server, account and device, has proofs left and has not expired. A session that is
+/// missing or can't be read is not known to be valid, so a new one is issued, as before.
+fn worker_session_reusable(
+    saved: &SavedConnection,
+    worker: &Result<Option<worker::SavedWorker>, String>,
+    now: time::OffsetDateTime,
+) -> bool {
+    let Ok(Some(worker)) = worker else {
+        return false;
+    };
+    let Ok(expires) = time::OffsetDateTime::parse(
+        &worker.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return false;
+    };
+    worker.server_id == saved.server_id
+        && worker.account_id == saved.account_id
+        && Some(&worker.device_id) == saved.device_id.as_ref()
+        && (1..=2_147_483_647).contains(&worker.next_sequence)
+        // The worker renews its own session; one about to lapse is replaced now instead.
+        && expires > now + time::Duration::minutes(1)
+}
+
+#[cfg(test)]
 pub(crate) async fn prepare_with_client(
     client: &reqwest::Client,
     saved: &mut SavedConnection,
@@ -116,6 +150,27 @@ async fn prepare_with_capabilities(
     client: &reqwest::Client,
     saved: &mut SavedConnection,
     capabilities: Result<Option<connection::Capabilities>, String>,
+) -> ConnectionView {
+    prepare_checked(client, saved, capabilities, false).await.0
+}
+
+async fn prepare_checked(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+    capabilities: Result<Option<connection::Capabilities>, String>,
+    keep_worker_session: bool,
+) -> (ConnectionView, bool) {
+    let mut kept = false;
+    let view = prepare_view(client, saved, capabilities, keep_worker_session, &mut kept).await;
+    (view, kept)
+}
+
+async fn prepare_view(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+    capabilities: Result<Option<connection::Capabilities>, String>,
+    keep_worker_session: bool,
+    kept: &mut bool,
 ) -> ConnectionView {
     let unavailable = Features {
         enrollment: false,
@@ -150,7 +205,17 @@ async fn prepare_with_capabilities(
                             caps.features,
                         );
                     }
-                    if caps.features.worker_session && enrollment.state == "preparing" {
+                    // A check of the connection in use keeps the running worker's own session
+                    // while it is still valid: a new one would only restart the worker.
+                    *kept = keep_worker_session
+                        && caps.features.worker_session
+                        && enrollment.state == "preparing"
+                        && worker_session_reusable(
+                            saved,
+                            &credentials::load("worker-session"),
+                            time::OffsetDateTime::now_utc(),
+                        );
+                    if caps.features.worker_session && enrollment.state == "preparing" && !*kept {
                         // A new photo association must never reuse an earlier worker grant.
                         if credentials::delete("worker-session").is_err() {
                             return ConnectionView::new(
@@ -480,15 +545,19 @@ async fn restore_connection(
     if retry.unwrap_or(false) {
         credentials::unlock_existing_identity(&window)?;
     }
-    let mut view = prepare(&mut saved).await;
+    let setup = app.state::<worker_setup::WorkerSetup>();
+    let (mut view, worker_kept) = prepare(&mut saved, checking && setup.running().await).await;
     if view.state == "identity-changed" {
         app.state::<offline_albums::OfflineAlbums>()
             .clear(&app)
             .await;
     }
     if view.state == "preparing" && view.features.worker_session {
-        // Starting replaces a running worker with one that holds the session just issued.
-        if start_worker_setup(&app, &saved, false).await.is_err() {
+        // Starting replaces a running worker with one that holds the session just issued. A
+        // check that kept the session leaves the worker alone, unless it ended meanwhile.
+        if !(worker_kept && setup.running().await)
+            && start_worker_setup(&app, &saved, false).await.is_err()
+        {
             view.state = "worker-setup-failed".into();
         }
     } else if checking && !matches!(view.state.as_str(), "offline" | "enrollment-failed") {
@@ -1402,5 +1471,77 @@ mod resume_tests {
             super::resume_refusal("paused", true).as_deref(),
             Some("worker_setup_unavailable")
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_session_tests {
+    use super::*;
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+    fn saved() -> SavedConnection {
+        SavedConnection {
+            server: "http://192.168.1.20:2283/".into(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Ada".into(),
+            token: "session".into(),
+            device_name: "Desk".into(),
+            mode: "client-worker".into(),
+            device_id: Some("device".into()),
+        }
+    }
+    fn worker() -> worker::SavedWorker {
+        worker::SavedWorker {
+            server_id: "server".into(),
+            account_id: "account".into(),
+            device_id: "device".into(),
+            session_id: "worker-session".into(),
+            authorization_epoch: 1,
+            worker_token: "token".into(),
+            expires_at: "2026-11-12T11:00:00Z".into(),
+            next_sequence: 7,
+        }
+    }
+
+    #[test]
+    fn a_connection_check_keeps_a_valid_worker_session() {
+        let now = OffsetDateTime::parse("2026-11-12T10:00:00Z", &Rfc3339).unwrap();
+        assert!(worker_session_reusable(&saved(), &Ok(Some(worker())), now));
+    }
+
+    #[test]
+    fn a_session_that_is_not_known_to_be_valid_is_replaced() {
+        let now = OffsetDateTime::parse("2026-11-12T10:00:00Z", &Rfc3339).unwrap();
+        let reusable = |change: fn(&mut worker::SavedWorker, &mut SavedConnection)| {
+            let (mut worker, mut saved) = (worker(), saved());
+            change(&mut worker, &mut saved);
+            worker_session_reusable(&saved, &Ok(Some(worker)), now)
+        };
+        // Expired, or about to; an expiry that can't be read says nothing.
+        assert!(!reusable(
+            |worker, _| worker.expires_at = "2020-01-01T00:00:00Z".into()
+        ));
+        assert!(!reusable(|worker, _| worker.expires_at = "soon".into()));
+        // Another server, account or device, or one this computer is no longer enrolled as.
+        assert!(!reusable(|worker, _| worker.server_id = "other".into()));
+        assert!(!reusable(|worker, _| worker.account_id = "other".into()));
+        assert!(!reusable(|worker, _| worker.device_id = "other".into()));
+        assert!(!reusable(|_, saved| saved.device_id = None));
+        // No proofs left.
+        assert!(!reusable(|worker, _| worker.next_sequence = 0));
+        // Missing or unreadable: unknown, so a new session is issued.
+        assert!(!worker_session_reusable(&saved(), &Ok(None), now));
+        assert!(!worker_session_reusable(
+            &saved(),
+            &Err("credential_store_unavailable".into()),
+            now
+        ));
+        let lapsing = {
+            let mut worker = worker();
+            worker.expires_at = "2026-11-12T10:00:20Z".into();
+            worker
+        };
+        assert!(!worker_session_reusable(&saved(), &Ok(Some(lapsing)), now));
     }
 }
