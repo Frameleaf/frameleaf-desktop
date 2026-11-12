@@ -8,8 +8,8 @@
   import Sheet from './Sheet.svelte';
   let { focus = 'manager', embedded = false, onback = undefined, onstate = undefined }: { focus?: 'manager' | 'backups'; embedded?: boolean; onback?: (() => void) | undefined; onstate?: ((paired: boolean) => void) | undefined } = $props();
   const native = isTauri();
-  const labels: Record<Control, string> = { start: 'Start server', stop: 'Stop server', restart: 'Restart server', backup: 'Create database backup' };
-  const outcomes: Record<Control, string> = { start: 'Start operation completed. Check Photos to confirm it is ready.', stop: 'Server stop completed.', restart: 'Restart operation completed. Check Photos to confirm it is ready.', backup: 'Database backup completed. Photos and videos are not included.' };
+  const labels: Record<Control | 'other', string> = { start: 'Start server', stop: 'Stop server', restart: 'Restart server', backup: 'Create database backup', other: 'Manager operation' };
+  const outcomes: Record<Control | 'other', string> = { other: 'Manager operation completed.', start: 'Start operation completed. Check Photos to confirm it is ready.', stop: 'Server stop completed.', restart: 'Restart operation completed. Check Photos to confirm it is ready.', backup: 'Database backup completed. Photos and videos are not included.' };
   const steps: Record<string, string> = {
     'native-restore-verify': 'Verifying the restored database',
     'native-restore-selection-request': 'Selecting the verified database',
@@ -34,10 +34,13 @@
   let pending = $state<Intent | null>(null);
   let operation = $state<Operation | null>(null);
   let origin = $state('');
-  const http = $derived.by(() => {
-    try { return new URL(origin.trim()).protocol === 'http:'; }
-    catch { return false; }
+  const address = $derived.by(() => {
+    try { return new URL(origin.trim()); }
+    catch { return null; }
   });
+  const http = $derived(address?.protocol === 'http:');
+  // Plain HTTP is accepted only for a Manager on this computer; the backend enforces the same rule.
+  const insecure = $derived(http && !['127.0.0.1', '[::1]', 'localhost'].includes(address?.hostname ?? ''));
   let password = $state('');
   let pem = $state('');
   let fingerprint = $state('');
@@ -58,6 +61,7 @@
   let restoreAuthorization = $state<'send' | 'resume' | null>(null);
   let busy = $state(false);
   let failure = $state('');
+  let sheetFailure = $state('');
   let notice = $state('');
   let confirmation = $state<Control | null>(null);
   let authorization = $state<'authorize' | 'disconnect' | null>(null);
@@ -71,7 +75,7 @@
   const expired = $derived(!!manager && manager.expiresAt <= Date.now());
   const library = $derived(status?.installation.name || 'your server');
   const authorized = $derived(authorizedUntil !== null && authorizedUntil > now);
-  const lastKind = $derived.by(() => { const done = status?.operations.find(value => value.state === 'complete' && !value.error && value.kind !== 'backup'); return done?.kind ?? null; });
+  const lastKind = $derived.by(() => { const done = status?.operations.find(value => value.state === 'complete' && !value.error && value.kind !== 'backup' && value.kind !== 'other'); return done?.kind ?? null; });
   const serverPill = $derived(!manager ? { label: 'Not paired', tone: 'off' } : deviceChanged ? { label: 'Device changed', tone: 'bad' } : expired ? { label: 'Access expired', tone: 'off' } : !status ? { label: checkedAt === null && busy ? 'Checking' : 'Unreachable', tone: 'wait' } : active ? { label: 'Busy', tone: 'wait' } : lastKind === 'stop' ? { label: 'Stopped', tone: 'off' } : lastKind ? { label: 'Running', tone: 'ok' } : { label: 'Paired', tone: 'ok' });
   const operationProgress = $derived.by(() => {
     if (!operation || operation.state === 'complete') return null;
@@ -124,7 +128,7 @@
     else if (!pending) {
       const unfinished = latest.operations.find(value => value.state !== 'complete');
       operation = unfinished || latest.operations[0] || null;
-      if (unfinished && manager?.scopes.includes(unfinished.kind)) {
+      if (unfinished && unfinished.kind !== 'other' && manager?.scopes.includes(unfinished.kind)) {
         saveIntent({ ...controlIntent(manager, unfinished.kind, null), id: unfinished.id });
       }
     }
@@ -201,12 +205,13 @@
     await pollOperation();
   }
   async function authorize() {
-    const secret = password; password = '';
+    const secret = password; password = ''; sheetFailure = '';
     await perform(async () => {
       if (authorization === 'disconnect') {
-        await invoke('disconnect_manager', { password: secret });
+        // The pairing is always removed from this computer; revoking it in Manager is best effort.
+        const revoked = await invoke<boolean>('disconnect_manager', { password: secret });
         manager = null; status = null; pending = null; operation = null; checkedAt = null; allowManagement = false; allowRecovery = false; backups = []; backupsChecked = false; recoveryIntent = null; recovery = null; selectedBackup = ''; restorePending = null; restoreOperation = null; restoreConfirmation = false; restoreApproved = false; restoreAuthorization = null; authorizedUntil = null;
-        notice = 'Manager access was revoked and removed from this computer.';
+        notice = revoked ? 'Manager access was revoked and removed from this computer.' : 'Manager access was removed from this computer. Manager did not confirm the revocation, so remove this computer under Desktop access in Manager when you can reach it.';
       } else {
         await invoke('reauthenticate_manager', { password: secret });
         authorizedUntil = Date.now() + 5 * 60_000; now = Date.now();
@@ -220,7 +225,10 @@
       }
       authorization = null;
     }, recoveryAuthorization, restoreAuthorization);
+    // A sheet that is still open covers the page, so its error is shown inside it.
+    if (authorization && failure) { sheetFailure = failure; failure = ''; }
   }
+  function closeAuthorization() { authorization = null; password = ''; sheetFailure = ''; }
   async function listBackups() {
     backups = await invoke<BackupEntry[]>('manager_request', { command: { kind: 'backups' } });
     backupsChecked = true;
@@ -460,10 +468,10 @@
         <div class="group-head"><h2 class="group-title">Pair with Frameleaf Manager</h2></div>
         <form class="group" onsubmit={pair}>
           <fieldset disabled={busy || !native} style="border:0;padding:0;margin:0;min-width:0">
-            <div class="form-row"><label for="manager-origin">Manager address</label><input id="manager-origin" type="url" bind:value={origin} placeholder="http://tower.local:2282" required autocomplete="url" /></div>
+            <div class="form-row"><label for="manager-origin">Manager address</label><input id="manager-origin" type="url" bind:value={origin} placeholder="https://tower.local:2282" required autocomplete="url" /></div>
             <div class="form-row"><label for="manager-password">Manager password</label><input id="manager-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" /></div>
             {#if http}
-              <div class="form-row"><span></span><p class="hint" style="margin:0">HTTP sends sign-in and management traffic without encryption. Use a trusted network.</p></div>
+              <div class="form-row"><span></span><p class="hint" style="margin:0">{insecure ? 'Use an HTTPS address. HTTP sends your Manager password without encryption, so it is accepted only for a Manager on this computer.' : 'HTTP sends sign-in and management traffic without encryption. It is accepted only for a Manager on this computer.'}</p></div>
             {:else}
               <div class="form-row"><span></span><span><label class="check"><input type="checkbox" bind:checked={showCertificate} />Use a certificate for a private Manager</label></span></div>
               {#if showCertificate}
@@ -483,7 +491,7 @@
               <label class="check" style="margin-top:8px"><input type="checkbox" bind:checked={allowRecovery} />Also allow backup recovery reviews and restore operations.</label>
             </span></div>
             <div class="form-row"><span></span><span class="actions">
-              <button class="btn primary" disabled={!allowManagement || (!http && !!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
+              <button class="btn primary" disabled={!allowManagement || insecure || (!http && !!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
               <button class="btn quiet" type="button" disabled={busy || !native} onclick={() => perform(() => restore(true))}>Restore saved Manager access</button>
             </span></div>
           </fieldset>
@@ -508,13 +516,14 @@
   </Sheet>
 {/if}
 {#if authorization}
-  <Sheet title={authorization === 'disconnect' ? 'Disconnect Manager?' : 'Authorize Manager actions'} kind={authorization === 'disconnect' ? 'danger' : 'plain'} {busy} onclose={() => { authorization = null; password = ''; }} onsubmit={authorize}>
-    <p>{authorization === 'disconnect' ? 'Revoke this computer’s Manager access? Server operations continue, and your photo sign-in stays separate.' : restoreAuthorization ? 'Enter your Manager password to continue the confirmed database restore.' : recoveryAuthorization ? 'Enter your Manager password to authorize backup review.' : pending ? 'Enter your Manager password to authorize and continue this operation.' : 'Enter your Manager password to authorize server actions for five minutes.'}</p>
+  <Sheet title={authorization === 'disconnect' ? 'Disconnect Manager?' : 'Authorize Manager actions'} kind={authorization === 'disconnect' ? 'danger' : 'plain'} {busy} onclose={closeAuthorization} onsubmit={authorize}>
+    <p>{authorization === 'disconnect' ? 'Remove this computer’s Manager access? It is always removed from this computer. With your Manager password it is also revoked in Manager; leave the password empty if Manager cannot be reached. Server operations continue, and your photo sign-in stays separate.' : restoreAuthorization ? 'Enter your Manager password to continue the confirmed database restore.' : recoveryAuthorization ? 'Enter your Manager password to authorize backup review.' : pending ? 'Enter your Manager password to authorize and continue this operation.' : 'Enter your Manager password to authorize server actions for five minutes.'}</p>
     <label for="manager-authorization-password">Manager password</label>
-    <input id="manager-authorization-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" disabled={busy} />
+    <input id="manager-authorization-password" type="password" bind:value={password} required={authorization !== 'disconnect'} maxlength="256" autocomplete="current-password" disabled={busy} />
+    {#if sheetFailure}<p class="danger-text" role="alert">{sheetFailure}</p>{/if}
     {#snippet actions()}
-      <button class="btn" type="button" disabled={busy} onclick={() => { authorization = null; password = ''; }}>Cancel</button>
-      <button class="btn {authorization === 'disconnect' ? 'danger' : 'primary'}" type="submit" disabled={busy}>{authorization === 'disconnect' ? 'Revoke and Disconnect' : restoreAuthorization ? 'Authorize Restore' : recoveryAuthorization ? 'Authorize and Review' : pending ? 'Authorize and Continue' : 'Authorize'}</button>
+      <button class="btn" type="button" disabled={busy} onclick={closeAuthorization}>Cancel</button>
+      <button class="btn {authorization === 'disconnect' ? 'danger' : 'primary'}" type="submit" disabled={busy}>{authorization === 'disconnect' ? 'Remove Pairing' : restoreAuthorization ? 'Authorize Restore' : recoveryAuthorization ? 'Authorize and Review' : pending ? 'Authorize and Continue' : 'Authorize'}</button>
     {/snippet}
   </Sheet>
 {/if}

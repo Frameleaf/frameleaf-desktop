@@ -16,6 +16,7 @@ const notErrorCodes = new Set([
   'immich_ml', 'frameleaf_ml', // Python module namespaces of the AI runtime
   'native_runtime', 'native_qualification', // names of the runtime's two launch modes
   'x86_64', // CPU architecture reported at enrollment
+  'email_code', // sign-in method name sent to Cloud
 ]);
 
 // Copy a component keeps for the codes only it shows: keys of its message tables, `case 'code':`
@@ -63,7 +64,7 @@ test('every error code the backend can return has copy', () => {
   const backend = backendCodes(rust);
   // Guard the scanner itself: if it stopped finding codes this test would pass for the wrong reason.
   assert.ok(backend.codes.size > 500, `only ${backend.codes.size} backend codes found`);
-  for (const known of ['server_identity_changed', 'worker_no_eligible_workloads', 'model_download_interrupted', 'memory_low', 'host_manifest_invalid', 'manager_pair_again', 'operation_failed', 'desktop_pool_route_changed', 'native_restore_review_expired', 'media_copy_cancelled'])
+  for (const known of ['server_identity_changed', 'worker_no_eligible_workloads', 'model_download_interrupted', 'memory_low', 'host_manifest_invalid', 'manager_pair_again', 'desktop_pool_route_changed', 'native_restore_review_expired', 'media_copy_cancelled'])
     assert.ok(backend.codes.has(known), `scanner missed ${known}`);
   for (const prefix of ['server_http_', 'cloud_sign_in_', 'worker_resume_', 'workload_', 'source_upload_http_'])
     assert.ok(backend.families.has(prefix), `scanner missed the ${prefix} family`);

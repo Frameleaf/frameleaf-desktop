@@ -54,6 +54,7 @@ pub(crate) async fn pair_manager(
     let origin = manager::normalize_manager(&origin)?
         .origin()
         .ascii_serialization();
+    manager::require_encrypted(&origin)?;
     let identity = credentials::foreground_identity(&window)?;
     // Confirm secure writes before sending a Manager password; no plaintext fallback.
     credentials::save("manager-pairing-check", &true)?;
@@ -97,18 +98,24 @@ pub(crate) async fn reauthenticate_manager(
     saved.require_device(&credentials::identity()?)?;
     manager::reauthenticate(&saved, password).await
 }
+/// Remove the pairing from this computer, then revoke it in Manager when Manager can be reached.
+/// Returns whether Manager confirmed the revocation.
 #[tauri::command]
 pub(crate) async fn disconnect_manager(
     window: WebviewWindow,
     app: tauri::AppHandle,
-    password: String,
-) -> Result<(), String> {
+    password: Option<String>,
+) -> Result<bool, String> {
     require_local(&window)?;
     let state = app.state::<DesktopState>();
     let _lock = state.0.lock().await;
-    let saved = credentials::load::<manager::SavedManager>(manager::CREDENTIAL)?
-        .ok_or("manager_pairing_required")?;
+    // A record that can no longer be read is still removed.
+    let saved = credentials::load::<manager::SavedManager>(manager::CREDENTIAL)
+        .ok()
+        .flatten();
     // Revocation requires the Manager password, not possession of the old device key.
-    manager::disconnect(&saved, password).await?;
-    credentials::delete(manager::CREDENTIAL)
+    manager::remove(saved, password.unwrap_or_default(), || {
+        credentials::delete(manager::CREDENTIAL)
+    })
+    .await
 }

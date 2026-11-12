@@ -329,8 +329,8 @@ jobs:
         run: |
           set -euo pipefail
           node --input-type=module <<'JS'
-          import { readFileSync, readdirSync, writeFileSync } from "node:fs";
-          import { updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
+          import { appendFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+          import { updateFeedSummary, updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
           const dir = "release-assets";
           const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
           const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
@@ -338,7 +338,27 @@ jobs:
           const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
           for (const name of packages) verifyUpdaterAsset(`${dir}/${name}`, signatures[name], updater.pubkey, manifest.version);
           writeFileSync(`${dir}/latest.json`, JSON.stringify(manifest, null, 2) + "\n");
+          const summary = updateFeedSummary(manifest);
+          writeFileSync(`${process.env.RUNNER_TEMP}/update-feed.md`, summary);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
           JS
+      - name: Create checksums and stamp the package manager files from them
+        if: ${{ !contains(inputs.tag, '-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum -- *) > "$RUNNER_TEMP/SHA256SUMS"
+          node tools/release_packaging.mjs "$RUNNER_TEMP/SHA256SUMS" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ !contains(inputs.tag, '-') }}
+        with:
+          name: package-manager-files
+          path: |
+            packaging/aur/
+            packaging/chocolatey/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
       - name: Create checksums and a draft release after every target succeeds
         env:
           GH_TOKEN: ${{ github.token }}
@@ -349,7 +369,12 @@ jobs:
           set -euo pipefail
           cd release-assets
           sha256sum -- * > SHA256SUMS
+          {
+            echo "Signed installer candidate from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            cat "$RUNNER_TEMP/update-feed.md"
+          } > "$RUNNER_TEMP/release-notes.md"
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
             --title "Frameleaf $RELEASE_TAG candidate" \
-            --notes "Signed installer candidate from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
             -- ./*
