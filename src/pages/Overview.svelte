@@ -184,7 +184,7 @@
           </div>
         {/if}
       </div>
-      <div class="group" aria-label="Computer processing status">
+      <div class="group" role="group" aria-label="Computer processing status">
         <div class="row">
           <span class="ic" aria-hidden="true"><Icon name="ai" /></span>
           <span class="l"><b>{worker.headline}</b><small>{worker.detail}{#if worker.reference} <span class="muted">Reference: {worker.reference}</span>{/if}</small></span>
@@ -221,6 +221,8 @@
             <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
           </div>
         {/each}
+        <!-- Read out when AI processing stops and needs the person; routine changes (working, idle) stay quiet. -->
+        <span class="visually-hidden" role="status">{worker.attention === 'needs-you' ? `${worker.headline}. ${worker.detail}` : ''}</span>
       </div>
       <p class="foot">Processing starts only after the selected models pass qualification on this {computer}. Pausing finishes the current task first. When your server’s owner marks this {computer} for the household, it may process other members’ photos (never Locked photos). Server administration uses your existing Frameleaf permissions inside Photos.</p>
     </div>

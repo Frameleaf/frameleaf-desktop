@@ -1,6 +1,7 @@
 <script lang="ts">
   // Frameleaf account sign-in and sign-up in the app (mobile onboarding screens 3, 4 and 5): an emailed
   // Verification Code, then the account's second step when it has one. A Passkey is finished in the browser.
+  import { tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Sheet from './Sheet.svelte';
   import { connectionError } from './errors';
@@ -54,6 +55,17 @@
   }
   $effect(() => { if (mode === 'create') void loadConsents(); });
   function fail(error: unknown) { failureCode = String(error); failure = connectionError(error); }
+  // Each step replaces the form, and a field is disabled while its answer is checked, so keyboard focus is
+  // dropped: after a step or its error changes, put it on the step's field, or on the heading when the
+  // step has nothing to type. The first screen is left alone.
+  let title = $state<HTMLHeadingElement>();
+  let shown = false;
+  $effect(() => {
+    void mode; void method; void failure;
+    if (busy) return;
+    if (!shown) { shown = true; return; }
+    void tick().then(() => (document.querySelector<HTMLElement>('#fa-code, #fa-second, #fa-em') ?? title)?.focus());
+  });
   function show(next: typeof mode) { mode = next; proof = ''; failure = ''; failureCode = ''; }
 
   async function send(kind: 'sign-in' | 'create') {
@@ -94,11 +106,11 @@
   function submitEmail(event: SubmitEvent) { event.preventDefault(); void send(mode === 'create' ? 'create' : 'sign-in'); }
 </script>
 
-<h2>{heading.title}</h2>
+<h2 tabindex="-1" bind:this={title}>{heading.title}</h2>
 <p class="sub">{heading.sub}</p>
 {#if failure}
   <div class="inline-msg error notice" role="alert">
-    <p>{failure}</p>
+    <p id="fa-failure">{failure}</p>
     {#if failureCode === 'cloud_email_no_account'}<button class="btn small" type="button" onclick={() => show('create')}>Create Account</button>{/if}
     {#if failureCode === 'cloud_email_expired_code'}<button class="btn small" type="button" disabled={busy} onclick={() => send(codeFor)}>Send a New Verification Code</button>{/if}
     <button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button>
@@ -109,7 +121,7 @@
   <form class="form" id="email-code" aria-label="Verification Code" onsubmit={verify}>
     <p class="sub">We sent a six-digit Verification Code to <b>{sentTo || email}</b>. It works for a few minutes.</p>
     {#if disclosure}<p class="sub">{disclosure}</p>{/if}
-    <div class="form-row"><label for="fa-code">Verification Code</label><input id="fa-code" class="code" inputmode="numeric" pattern="[0-9]{'{6}'}" autocomplete="one-time-code" value={proof} oninput={event => { const field = event.currentTarget; proof = cleanProof('email_code', field.value); field.value = proof; }} required disabled={busy} /></div>
+    <div class="form-row"><label for="fa-code">Verification Code</label><input id="fa-code" class="code" aria-describedby={failure ? 'fa-failure' : undefined} inputmode="numeric" pattern="[0-9]{'{6}'}" autocomplete="one-time-code" value={proof} oninput={event => { const field = event.currentTarget; proof = cleanProof('email_code', field.value); field.value = proof; }} required disabled={busy} /></div>
   </form>
   <div class="wfoot">
     <p>Didn’t get it? Check your spam folder, or send a new Verification Code.</p>
@@ -122,9 +134,9 @@
     {#key method}
       <div class="form-row"><label for="fa-second">{second.label}</label>
         {#if method === 'password'}
-          <input id="fa-second" type="password" autocomplete="current-password" maxlength="256" bind:value={proof} required disabled={busy} />
+          <input id="fa-second" type="password" aria-describedby={failure ? 'fa-failure' : undefined} autocomplete="current-password" maxlength="256" bind:value={proof} required disabled={busy} />
         {:else}
-          <input id="fa-second" class="code" inputmode={method === 'totp' ? 'numeric' : 'text'} autocomplete={method === 'totp' ? 'one-time-code' : 'off'} autocapitalize="characters" spellcheck="false" value={proof} oninput={event => { const field = event.currentTarget; proof = cleanProof(method, field.value); field.value = proof; }} required disabled={busy} />
+          <input id="fa-second" class="code" aria-describedby={failure ? 'fa-failure' : undefined} inputmode={method === 'totp' ? 'numeric' : 'text'} autocomplete={method === 'totp' ? 'one-time-code' : 'off'} autocapitalize="characters" spellcheck="false" value={proof} oninput={event => { const field = event.currentTarget; proof = cleanProof(method, field.value); field.value = proof; }} required disabled={busy} />
         {/if}
       </div>
     {/key}

@@ -108,6 +108,19 @@
       }
     } finally { if (!background) busy = false; }
   }
+  // The kept-sign-in screen replaces whatever was shown: its title takes focus so it is read out, again
+  // when it changes from reconnecting to needing Two-Step Verification.
+  let keptTitle = $state<HTMLHeadingElement>();
+  $effect(() => { if (keptSignIn && !connection) void tick().then(() => keptTitle?.focus()); });
+  async function retryKept(event: MouseEvent) {
+    const button = event.currentTarget as HTMLButtonElement;
+    const before = keptSignIn;
+    await restoreSaved(true);
+    // The button is disabled while Frameleaf tries, which drops keyboard focus: give it back, unless the
+    // screen changed and its new title has taken it.
+    await tick();
+    if (keptSignIn === before && button.isConnected) button.focus();
+  }
   function networkBack() {
     if (!connection && keptSignIn === 'reconnecting') void restoreSaved(false, true);
   }
@@ -285,10 +298,10 @@
         <header class="tbar" data-tauri-drag-region><h1 data-tauri-drag-region>Frameleaf</h1></header>
         <div class="wrap" data-saved-sign-in={keptSignIn}>
           <div class="logo"><img src={mark} alt="" /><span>Frameleaf</span></div>
-          <h2>{kept.panel.title}</h2>
+          <h2 tabindex="-1" bind:this={keptTitle}>{kept.panel.title}</h2>
           <p class="sub" role="status">{kept.panel.detail}</p>
           <p>
-            <button class="btn primary" disabled={busy} onclick={() => restoreSaved(true)}>{kept.panel.retry}</button>
+            <button class="btn primary" disabled={busy} onclick={retryKept}>{kept.panel.retry}</button>
             <button class="btn" disabled={busy} onclick={offlinePhotos}>Offline Albums</button>
             <button class="btn quiet" disabled={busy} onclick={() => { signOutSheet = true; }}>Sign out…</button>
           </p>
