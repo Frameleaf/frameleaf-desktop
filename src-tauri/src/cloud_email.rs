@@ -80,15 +80,27 @@ pub(crate) struct Started {
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub(crate) enum Completed {
-    Done { account: CloudAccount },
-    Next { methods: Vec<String>, recovery: bool },
-    Browser { recovery: bool },
+    Done {
+        account: CloudAccount,
+    },
+    Next {
+        methods: Vec<String>,
+        recovery: bool,
+    },
+    Browser {
+        recovery: bool,
+    },
 }
 
 enum Advanced {
     Token(TokenResponse),
-    Next { methods: Vec<String>, recovery: bool },
-    Browser { recovery: bool },
+    Next {
+        methods: Vec<String>,
+        recovery: bool,
+    },
+    Browser {
+        recovery: bool,
+    },
 }
 
 /// One answer of the sign-in in steps (Cloud's `AppSignInAnswer`).

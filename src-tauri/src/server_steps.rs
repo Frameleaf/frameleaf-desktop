@@ -872,7 +872,11 @@ mod frameleaf_tests {
                 json!({"code": "verification_required", "methods": ["frameleaf"]}),
                 "server_refused_verification_required",
             ),
-            (401, json!({"code": "frameleaf_exchange_expired"}), "server_refused_frameleaf_exchange_expired"),
+            (
+                401,
+                json!({"code": "frameleaf_exchange_expired"}),
+                "server_refused_frameleaf_exchange_expired",
+            ),
             (404, json!({}), "server_http_404"),
             (429, json!({}), "sign_in_too_many_attempts"),
             (200, json!({"userId": "user"}), "cloud_exchange_unsupported"),
