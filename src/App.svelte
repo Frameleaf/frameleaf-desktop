@@ -144,6 +144,8 @@
       }
       updateError = error === 'update_host_active'
         ? 'Stop the local server before installing the update.'
+        : error === 'update_library_not_idle'
+          ? 'Your library on this computer is still shutting down, or did not shut down cleanly. Start the photo server in Manager and stop it there, then install the update.'
         : error === 'update_media_copy_active'
           ? 'Finish or cancel the media copy before installing the update.'
           : error === 'update_changed'
