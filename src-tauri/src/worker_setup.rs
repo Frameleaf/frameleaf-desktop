@@ -974,6 +974,16 @@ async fn prepare(
         })
         .await
         .map_err(|_| "worker_cache_publish_failed")??;
+        // Best effort: reclaim superseded model revisions and abandoned staging.
+        let models = paths.data.join("models");
+        let referenced = profiles
+            .iter()
+            .map(|profile| profile.cache_identity().2.to_owned())
+            .collect();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            crate::model_cache::prune(&models, &referenced, std::time::SystemTime::now())
+        })
+        .await;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
@@ -1526,7 +1536,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn interrupted_http_acquisition_removes_partial_weights() {
+    async fn interrupted_http_acquisition_never_publishes_partial_weights() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -1582,12 +1592,17 @@ mod tests {
         .await;
         let _ = stop_tx.send(());
         server.join().unwrap();
-        let files = std::fs::read_dir(&root).unwrap().count();
+        let files: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap_err(), "model_download_permission_required");
+        // FD-39: the partial is kept for a Range resume; it is never published unverified.
         assert_eq!(
-            files, 0,
-            "interrupted model must not leave partial or published weights"
+            files,
+            [format!(".download-{}", "0".repeat(64)).as_str()],
+            "interrupted model must leave only its resumable partial"
         );
     }
     #[tokio::test]
