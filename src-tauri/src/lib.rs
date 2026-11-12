@@ -37,6 +37,7 @@ pub mod photo_sources;
 mod process_tree;
 #[cfg(any(target_os = "linux", test))]
 mod profile_elevation;
+mod reconnect;
 pub mod release_policy;
 mod resource_policy;
 pub mod runtime_epochs;
@@ -496,30 +497,46 @@ async fn restore_connection(
     retry: Option<bool>,
     window: WebviewWindow,
     app: tauri::AppHandle,
-    state: State<'_, DesktopState>,
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
+    let result = restore_saved(&app, Some(&window), retry.unwrap_or(false)).await;
+    // A server that did not answer is tried again from here, with backoff, window shown or not.
+    app.state::<reconnect::Reconnect>()
+        .after_restore(&app, &result);
+    result
+}
+
+/// Restores the saved sign-in and resumes its worker and folder watch. `window`: the window that
+/// asked, which may be prompted to unlock the credential store; the backend's own reconnect
+/// attempts have none and never prompt.
+pub(crate) async fn restore_saved(
+    app: &AppHandle,
+    window: Option<&WebviewWindow>,
+    retry: bool,
+) -> Result<Option<ConnectionView>, String> {
+    let state = app.state::<DesktopState>();
     let mut current = state.0.lock().await;
     if app.state::<host_setup::HostSetup>().background_active() {
         app.state::<media_copy::MediaCopy>().cancel();
         return Ok(None);
     }
-    let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
-        "connection",
-        &window,
-        retry.unwrap_or(false),
-    )?
-    else {
+    let loaded = match window {
+        Some(window) => {
+            credentials::load_interactive::<SavedConnection>("connection", window, retry)
+        }
+        None => credentials::load::<SavedConnection>("connection"),
+    };
+    let Some(mut saved) = loaded? else {
         // The saved sign-in is gone: drop any connection still held so the window and the
         // background agree.
-        stop_connection_work(&app).await;
+        stop_connection_work(app).await;
         let held = current.take().is_some();
         app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
+            .clear(app)
             .await;
         drop(current);
         if held {
-            tray::refresh(&app).await;
+            tray::refresh(app).await;
         }
         return Ok(None);
     };
@@ -534,29 +551,29 @@ async fn restore_connection(
         .await
         .plan();
     if !checking || plan.stop_work {
-        stop_connection_work(&app).await;
+        stop_connection_work(app).await;
     }
     if plan.purge_albums {
         app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
+            .clear(app)
             .await;
     }
     plan.resume_work?;
-    if retry.unwrap_or(false) {
-        credentials::unlock_existing_identity(&window)?;
+    if let Some(window) = window.filter(|_| retry) {
+        credentials::unlock_existing_identity(window)?;
     }
     let setup = app.state::<worker_setup::WorkerSetup>();
     let (mut view, worker_kept) = prepare(&mut saved, checking && setup.running().await).await;
     if view.state == "identity-changed" {
         app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
+            .clear(app)
             .await;
     }
     if view.state == "preparing" && view.features.worker_session {
         // Starting replaces a running worker with one that holds the session just issued. A
         // check that kept the session leaves the worker alone, unless it ended meanwhile.
         if !(worker_kept && setup.running().await)
-            && start_worker_setup(&app, &saved, false).await.is_err()
+            && start_worker_setup(app, &saved, false).await.is_err()
         {
             view.state = "worker-setup-failed".into();
         }
@@ -570,7 +587,7 @@ async fn restore_connection(
             credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
         {
             if consent.watch && consent.registered && !consent.watch_paused {
-                if let Ok(base) = import_base(&app) {
+                if let Ok(base) = import_base(app) {
                     let _ = jobs.start(app.clone(), base, saved.clone()).await;
                 }
             }
@@ -578,7 +595,7 @@ async fn restore_connection(
     }
     *current = Some(saved);
     drop(current);
-    tray::refresh(&app).await;
+    tray::refresh(app).await;
     Ok(Some(view))
 }
 
@@ -599,6 +616,7 @@ async fn sign_out(
     state: State<'_, DesktopState>,
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
+    app.state::<reconnect::Reconnect>().cancel();
     let mut current = state.0.lock().await;
     app.state::<media_copy::MediaCopy>().cancel();
     app.state::<source_import::SourceJobs>().stop().await;
@@ -792,6 +810,7 @@ pub fn run() {
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
         .manage(cloud_account::ServerStep::default())
+        .manage(reconnect::Reconnect::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let placement = app.state::<window_placement::WindowPlacement>();

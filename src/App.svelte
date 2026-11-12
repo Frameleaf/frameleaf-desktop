@@ -17,7 +17,7 @@
   import Remote from './pages/Remote.svelte';
   import { initials, hostOf } from './ui-state';
   import { connectionError, errorCopy } from './errors';
-  import { reconnectDelay, savedSignInState, savedSignInView } from './connection-state';
+  import { savedSignInState, savedSignInView, type Restored } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
   import { noStepUp, stepUpDismissed, summaryStepUpAfter, type StepUpState } from './sign-in-steps';
   import { availablePage, pages, restoredPage, shortcutPage, type Page } from './navigation';
@@ -52,8 +52,6 @@
   // The saved sign-in is kept while the server is unreachable or wants Two-Step Verification.
   let keptSignIn = $state<'reconnecting' | 'needs-verification' | null>(null);
   const kept = $derived(savedSignInView(connection ? null : keptSignIn));
-  let reconnectAttempt = 0;
-  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   const isAdmin = $derived(summary?.me?.isAdmin === true);
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
@@ -82,32 +80,34 @@
     }
   }
 
-  // `background` is Frameleaf's own reconnect attempt: it leaves the buttons and messages alone.
+  // The saved sign-in was restored, by this window or by the backend's own reconnect attempt.
+  async function showRestored(restored: Connection | null) {
+    connection = restored;
+    connectionLocked = false; staleSignIn = false; keptSignIn = null;
+    const scope = connection?.navigationScope;
+    const revision = navigationRevision;
+    setup = await invoke<SetupStatus>('worker_setup_status');
+    await loadSummary();
+    if (scope && connection?.navigationScope === scope && summary?.me && navigationRevision === revision) {
+      try { page = restoredPage(localStorage.getItem(lastPageKey), scope, isAdmin); }
+      catch { /* The default page is available without storage. */ }
+    }
+  }
+  // While the server does not answer, the backend keeps trying by itself, window shown or not;
+  // this window only shows the state and hears the outcome as `connection-restored`.
+  function showRestoreFailure(error: unknown) {
+    const state = savedSignInState(error);
+    connectionLocked = state === 'locked';
+    staleSignIn = !connection && state === 'stale';
+    keptSignIn = !connection && (state === 'reconnecting' || state === 'needs-verification') ? state : null;
+    if (!keptSignIn) failure = explain(error);
+  }
+  // `background` is an attempt nobody pressed a button for: it leaves the buttons and messages alone.
   async function restoreSaved(retry = false, background = false) {
-    clearTimeout(reconnectTimer);
     if (!background) { busy = true; failure = ''; }
-    try {
-      connection = await invoke<Connection | null>('restore_connection', { retry });
-      connectionLocked = false; staleSignIn = false; keptSignIn = null; reconnectAttempt = 0;
-      const scope = connection?.navigationScope;
-      const revision = navigationRevision;
-      setup = await invoke<SetupStatus>('worker_setup_status');
-      await loadSummary();
-      if (scope && connection?.navigationScope === scope && summary?.me && navigationRevision === revision) {
-        try { page = restoredPage(localStorage.getItem(lastPageKey), scope, isAdmin); }
-        catch { /* The default page is available without storage. */ }
-      }
-    } catch (error) {
-      const state = savedSignInState(error);
-      connectionLocked = state === 'locked';
-      staleSignIn = !connection && state === 'stale';
-      keptSignIn = !connection && (state === 'reconnecting' || state === 'needs-verification') ? state : null;
-      if (!keptSignIn) failure = explain(error);
-      else if (savedSignInView(keptSignIn).autoRetry) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => { void restoreSaved(false, true); }, reconnectDelay(reconnectAttempt++));
-      }
-    } finally { if (!background) busy = false; }
+    try { await showRestored(await invoke<Connection | null>('restore_connection', { retry })); }
+    catch (error) { showRestoreFailure(error); }
+    finally { if (!background) busy = false; }
   }
   // The kept-sign-in screen replaces whatever was shown: its title takes focus so it is read out, again
   // when it changes from reconnecting to needing Two-Step Verification.
@@ -144,6 +144,12 @@
           failure = explain(event.payload);
           void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
         }));
+        unlisten.push(await listen<Restored<Connection>>('connection-restored', event => {
+          // Signed in or out since the backend started trying: its answer is about a sign-in that is gone.
+          if (connection || keptSignIn !== 'reconnecting') return;
+          if (event.payload.error) showRestoreFailure(event.payload.error);
+          else void showRestored(event.payload.connection).catch(error => { failure = explain(error); });
+        }));
         if (disposed) { unlisten.forEach(stop => stop()); return; }
         const host = await invoke<{ backgroundActive: boolean }>('local_host_status');
         hostActive = host.backgroundActive;
@@ -151,7 +157,7 @@
       } catch (error) { failure = explain(error); }
       finally { busy = false; importReady = !disposed; }
     })();
-    return () => { disposed = true; clearTimeout(reconnectTimer); unlisten.forEach(stop => stop()); };
+    return () => { disposed = true; unlisten.forEach(stop => stop()); };
   });
   async function installUpdate() {
     if (!updateVersion || installingUpdate) return;
@@ -178,7 +184,7 @@
     }
   }
   function connected(view: Connection) {
-    clearTimeout(reconnectTimer); keptSignIn = null;
+    keptSignIn = null;
     summaryRequest += 1; connection = view; setup = null; summary = null; summaryStepUp = noStepUp; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
@@ -188,7 +194,7 @@
     try {
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
       try { localStorage.removeItem(lastPageKey); } catch { /* Sign-out still succeeds. */ }
-      clearTimeout(reconnectTimer); keptSignIn = null;
+      keptSignIn = null;
       summaryRequest += 1; connection = null; setup = null; summary = null; summaryStepUp = noStepUp; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
