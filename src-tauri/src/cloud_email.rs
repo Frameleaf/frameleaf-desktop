@@ -75,18 +75,20 @@ pub(crate) struct Started {
 }
 
 /// What a proof led to: signed in, another step, or a step only the browser can finish.
+/// `recovery`: Cloud says the person may have none of the methods to hand, so the step also
+/// offers account recovery.
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub(crate) enum Completed {
     Done { account: CloudAccount },
-    Next { methods: Vec<String> },
-    Browser,
+    Next { methods: Vec<String>, recovery: bool },
+    Browser { recovery: bool },
 }
 
 enum Advanced {
     Token(TokenResponse),
-    Next(Vec<String>),
-    Browser,
+    Next { methods: Vec<String>, recovery: bool },
+    Browser { recovery: bool },
 }
 
 /// One answer of the sign-in in steps (Cloud's `AppSignInAnswer`).
@@ -100,6 +102,9 @@ enum Answer {
         sent_to: Option<String>,
         #[serde(default)]
         exists: Option<bool>,
+        /// The person can't complete this step with what is offered: recovery is the way on.
+        #[serde(default)]
+        recovery: bool,
     },
     Done {
         code: String,
@@ -111,6 +116,13 @@ enum Answer {
 struct Refusal {
     #[serde(default)]
     detail: Option<String>,
+    #[serde(default)]
+    data: Option<RefusalData>,
+}
+#[derive(Deserialize, Default)]
+struct RefusalData {
+    #[serde(default)]
+    recovery: bool,
 }
 
 async fn refusal(response: Response) -> Refusal {
@@ -410,7 +422,9 @@ fn redeemed(result: Result<TokenResponse, String>, sign_up: bool) -> Result<Adva
     match result {
         Ok(token) => Ok(Advanced::Token(token)),
         // The account has a passkey or an authenticator this grant can't ask for.
-        Err(error) if error == "cloud_token_second_step_required" => Ok(Advanced::Browser),
+        Err(error) if error == "cloud_token_second_step_required" => {
+            Ok(Advanced::Browser { recovery: false })
+        }
         Err(error) => Err(code_refusal(&error, sign_up)),
     }
 }
@@ -469,6 +483,7 @@ async fn advance(
         Ok(Answer::Next {
             transaction: next,
             methods: offered,
+            recovery,
             ..
         }) if opaque(&next) => {
             let shown: Vec<String> = offered
@@ -477,15 +492,20 @@ async fn advance(
                 .collect();
             // Only a passkey completes this step.
             if shown.is_empty() {
-                return Ok(Advanced::Browser);
+                return Ok(Advanced::Browser { recovery });
             }
             *transaction = Zeroizing::new(next);
             *methods = shown.clone();
-            Ok(Advanced::Next(shown))
+            Ok(Advanced::Next {
+                methods: shown,
+                recovery,
+            })
         }
         Ok(_) => Err("cloud_email_unavailable".into()),
         Err((409, refused)) if refused.detail.as_deref() == Some("second-step-unavailable") => {
-            Ok(Advanced::Browser)
+            Ok(Advanced::Browser {
+                recovery: refused.data.is_some_and(|data| data.recovery),
+            })
         }
         Err((status, refused)) => Err(verify_refusal(status, refused.detail.as_deref(), method)),
     }
@@ -563,11 +583,11 @@ pub(crate) async fn cloud_email_complete(
                 .await
                 .map(|account| Completed::Done { account })
         }
-        Ok(Advanced::Next(methods)) => {
+        Ok(Advanced::Next { methods, recovery }) => {
             keep(pending);
-            Ok(Completed::Next { methods })
+            Ok(Completed::Next { methods, recovery })
         }
-        Ok(Advanced::Browser) => Ok(Completed::Browser),
+        Ok(Advanced::Browser { recovery }) => Ok(Completed::Browser { recovery }),
         Err(error) => {
             // A mistyped proof can be corrected; anything else needs a new start.
             if can_retry(&error) {
@@ -772,7 +792,16 @@ mod tests {
         let (mut pending, _) = start(&hosts).await;
         // The passkey Cloud also offers is not something this window can do.
         match give(&mut pending, "email_code", "123456").await {
-            Ok(Advanced::Next(methods)) => assert_eq!(methods, ["totp", "recovery_code"]),
+            Ok(Advanced::Next { methods, recovery }) => {
+                assert_eq!(methods, ["totp", "recovery_code"]);
+                // Cloud said the person may have none of these: the step offers recovery too.
+                assert!(recovery);
+                let shown = serde_json::to_value(Completed::Next { methods, recovery }).unwrap();
+                assert_eq!(
+                    shown,
+                    json!({ "status": "next", "methods": ["totp", "recovery_code"], "recovery": true })
+                );
+            }
             _ => panic!("a second step should be asked for"),
         }
         // A wrong code can be corrected in the same sign-in.
@@ -792,7 +821,7 @@ mod tests {
         let (mut pending, _) = start(&hosts).await;
         assert!(matches!(
             give(&mut pending, "email_code", "123456").await,
-            Ok(Advanced::Next(_))
+            Ok(Advanced::Next { .. })
         ));
         let wrong = give(&mut pending, "recovery_code", "NOPE").await;
         assert_eq!(wrong.err().unwrap(), "cloud_email_wrong_recovery_code");
@@ -818,7 +847,7 @@ mod tests {
         let (mut pending, _) = start(&hosts).await;
         assert!(matches!(
             give(&mut pending, "email_code", "123456").await,
-            Ok(Advanced::Browser)
+            Ok(Advanced::Browser { recovery: true })
         ));
         assert!(!paths(&asked).contains(&"/token".to_string()));
         // And a `next` that offers nothing but the passkey.
@@ -831,8 +860,27 @@ mod tests {
         let (mut pending, _) = start(&hosts).await;
         assert!(matches!(
             give(&mut pending, "email_code", "123456").await,
-            Ok(Advanced::Browser)
+            Ok(Advanced::Browser { recovery: true })
         ));
+        // After a Password, Cloud offers no recovery: none is shown.
+        let (hosts, _) = stepped_cloud(|_| {
+            (
+                200,
+                json!({ "status": "next", "transaction": "tx-second", "methods": ["totp"] }),
+            )
+        });
+        let (mut pending, _) = start(&hosts).await;
+        assert!(matches!(
+            give(&mut pending, "email_code", "123456").await,
+            Ok(Advanced::Next {
+                recovery: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            serde_json::to_value(Completed::Browser { recovery: false }).unwrap(),
+            json!({ "status": "browser", "recovery": false })
+        );
     }
 
     /// A Cloud from before sign-in in steps; `token` answers its email-code grant.
@@ -885,7 +933,7 @@ mod tests {
         let (mut pending, _) = start(&hosts).await;
         assert!(matches!(
             give(&mut pending, "email_code", "123456").await,
-            Ok(Advanced::Browser)
+            Ok(Advanced::Browser { recovery: false })
         ));
         // The sign-in grant, when a factor was added after the last step.
         let (hosts, _) = fake_cloud(|path, body| match path {
@@ -903,7 +951,7 @@ mod tests {
         let (mut pending, _) = start(&hosts).await;
         assert!(matches!(
             give(&mut pending, "email_code", "123456").await,
-            Ok(Advanced::Browser)
+            Ok(Advanced::Browser { recovery: false })
         ));
     }
 
