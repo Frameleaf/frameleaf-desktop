@@ -2,6 +2,7 @@
 // keeps its outcome, while the Backups page is closed. Only cancelCopy cancels it.
 import { get, writable } from 'svelte/store';
 import type { Platform } from './ui-state.ts';
+import { explainError } from './errors.ts';
 
 export type SavedCopy = { path: string; originals: number; bytes: number };
 export type CopyState = { copying: boolean; cancelling: boolean; saved: SavedCopy | null; message: string };
@@ -28,7 +29,7 @@ export function explainCopy(error: unknown, platform: Platform): string {
     server_http_404: 'This server does not provide the preservation packages needed for Desktop copies.',
   };
   const code = String(error);
-  return Object.hasOwn(errors, code) ? errors[code]! : 'The media copy could not be completed. Check your server and drive, then try again.';
+  return Object.hasOwn(errors, code) ? errors[code]! : explainError(error, 'The media copy could not be completed. Check your server and drive, then try again.');
 }
 
 export async function saveCopy(invoke: Invoke, packageId: string, platform: Platform): Promise<void> {

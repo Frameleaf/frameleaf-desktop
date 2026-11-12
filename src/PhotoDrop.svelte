@@ -6,6 +6,7 @@
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import { albumErrors, type AlbumDestination } from './import-destination';
   import { formatBytes, percent } from './ui-state';
+  import { explainError } from './errors';
 
   type Preview = { selectionId: string; path: string; count: number; bytes: number; skipped: number; folder: boolean; names: string[] };
   type Job = { sourceId: string; state: string; total: number; completed: number; code: string | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
@@ -55,7 +56,7 @@
     metered_network: 'Copying is paused until you resume on an unmetered connection.',
     network_unknown: 'Could not confirm an unmetered connection. Try again when connected.',
   };
-  const explain = (code: unknown) => messages[String(code)] ?? 'This import could not finish. Check your library connection and try again.';
+  const explain = (code: unknown) => messages[String(code)] ?? explainError(code, 'This import could not finish. Check your library connection and try again.');
 
   async function refresh() {
     status = await invoke<Status | null>('photo_drop_status');

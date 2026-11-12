@@ -22,6 +22,8 @@ pub(crate) struct SetupStatus {
     pub workloads: Vec<WorkloadStatus>,
     pub active_workload: Option<String>,
     pub models: Option<ModelProgress>,
+    /// Tasks finished since the worker last started; read-only, for the status display.
+    pub completed_tasks: u64,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +73,7 @@ impl Progress {
                 models.download = None;
                 models
             }),
+            completed_tasks: current.completed_tasks,
         };
         if *current == status {
             return;
@@ -91,6 +94,9 @@ impl Progress {
             drop(status);
             (self.notify)(snapshot);
         }
+    }
+    fn completed(&self) {
+        self.update(|status| status.completed_tasks += 1);
     }
     fn active(&self, workload: Option<&str>) {
         self.update(|status| status.active_workload = workload.map(str::to_owned));
@@ -1047,7 +1053,7 @@ async fn prepare(
                 }, &progress.cancelled).await;
                 progress.active(None);
                 match completed {
-                    Ok(true) => {}
+                    Ok(true) => progress.completed(),
                     Ok(false) => {
                         progress.set("waiting-for-work", None);
                         cancellable(
@@ -1105,6 +1111,26 @@ mod tests {
             root.join("debug/native-runtime")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn finished_tasks_are_counted_and_survive_state_changes() {
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(SetupStatus::default())),
+            notify: Arc::new(|_| {}),
+        };
+        progress.set("working", None);
+        progress.completed();
+        progress.completed();
+        progress.set("waiting-for-work", None);
+        progress.set("paused", Some("memory_low".into()));
+        let status = progress.status.lock().unwrap().clone();
+        assert_eq!(status.completed_tasks, 2);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["completedTasks"],
+            serde_json::json!(2)
+        );
     }
     #[test]
     fn global_progress_preserves_independent_workload_results() {
