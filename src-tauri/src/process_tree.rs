@@ -10,6 +10,84 @@ pub struct ProcessTree(i32);
 #[cfg(windows)]
 pub struct ProcessTree(std::os::windows::io::OwnedHandle);
 
+/// What tells one process from a later one that reuses its PID: its start time and its program.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProcessIdentity {
+    pub pid: u32,
+    pub started: String,
+    pub program: std::path::PathBuf,
+}
+#[cfg(unix)]
+impl ProcessIdentity {
+    /// None when no live process has this PID or its identity cannot be read.
+    pub(crate) fn of(pid: u32) -> Option<Self> {
+        // PID 0 and 1 and anything outside pid_t are never a child this app started.
+        let raw = i32::try_from(pid).ok().filter(|pid| *pid > 1)?;
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            if unsafe {
+                libc::proc_pidinfo(
+                    raw,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            } != size
+            {
+                return None;
+            }
+            let info = unsafe { info.assume_init() };
+            // SZOMB: an exited process that has not been reaped is not alive.
+            if info.pbi_pid != pid || info.pbi_status == 5 {
+                return None;
+            }
+            let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            let length =
+                unsafe { libc::proc_pidpath(raw, path.as_mut_ptr().cast(), path.len() as u32) };
+            if length <= 0 {
+                return None;
+            }
+            path.truncate(length as usize);
+            Some(Self {
+                pid,
+                started: format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+                program: std::ffi::OsString::from(String::from_utf8(path).ok()?).into(),
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = raw;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The command name may contain spaces and brackets; fields resume after the last ')'.
+            let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_ascii_whitespace();
+            if matches!(fields.next()?, "Z" | "X" | "x") {
+                return None;
+            }
+            // Field 22 of proc(5) stat: start time in clock ticks since this boot.
+            let ticks = fields.nth(18)?;
+            if ticks.is_empty() || !ticks.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+            Some(Self {
+                pid,
+                started: format!("{}:{ticks}", boot.trim()),
+                program: std::fs::read_link(format!("/proc/{pid}/exe")).ok()?,
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = raw;
+            None
+        }
+    }
+}
+
 pub fn configure(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -76,6 +154,30 @@ impl ProcessTree {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Whether every process in the owned job has exited.
+    #[cfg(windows)]
+    pub(crate) fn is_empty(&self) -> Result<bool, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("runtime_process_state_unavailable".to_string());
+        }
+        Ok(info.ActiveProcesses == 0)
     }
 
     pub fn attach(child: &Child) -> Result<Self, String> {

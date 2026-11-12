@@ -1009,6 +1009,13 @@ async fn choose_listed(
     normalize_server(&chosen.uri)
 }
 
+/// The error for a refused server token: Cloud's own reason (`TokenExchangeError`), so the window
+/// can say what to do. `cloud_exchange_interaction_required`: this account has not yet approved
+/// sharing its profile with that server, which only the server's own sign-in in the browser asks.
+fn exchange_refusal(code: String) -> String {
+    code.replacen("cloud_token_", "cloud_exchange_", 1)
+}
+
 /// Steps 2 and 3 of a Frameleaf connection, once `base` is known to answer as `instance`.
 #[allow(clippy::too_many_arguments)]
 async fn connect_with_token(
@@ -1036,7 +1043,7 @@ async fn connect_with_token(
         ],
     )
     .await
-    .map_err(|code| code.replacen("cloud_token_", "cloud_exchange_", 1))?;
+    .map_err(exchange_refusal)?;
 
     // 3. The server turns it into a session of its own.
     let response = client
@@ -1447,6 +1454,15 @@ mod tests {
 #[cfg(test)]
 mod address_tests {
     use super::*;
+
+    #[test]
+    fn a_refused_server_token_keeps_clouds_reason() {
+        assert_eq!(
+            exchange_refusal("cloud_token_interaction_required".into()),
+            "cloud_exchange_interaction_required"
+        );
+        assert_eq!(exchange_refusal("cloud_http_502".into()), "cloud_http_502");
+    }
 
     #[test]
     fn a_typed_address_must_be_one_the_account_lists() {

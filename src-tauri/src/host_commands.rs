@@ -106,6 +106,19 @@ pub(crate) async fn stop_local_host_manager(
     setup.stop().await
 }
 
+/// The quit path offered after a blocked exit: stop local management, then leave the app.
+#[tauri::command]
+pub(crate) async fn quit_local_host(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    setup: State<'_, HostSetup>,
+) -> Result<(), String> {
+    require_local(&window)?;
+    setup.stop_for_exit().await?;
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn authorize_local_manager(
     window: WebviewWindow,
