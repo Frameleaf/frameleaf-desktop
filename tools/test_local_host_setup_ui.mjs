@@ -16,7 +16,7 @@ const address = socket.address();
 assert.ok(address && typeof address !== 'string');
 await new Promise(resolve => socket.close(resolve));
 const origin = `http://127.0.0.1:${address.port}`;
-const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
+const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' } });
 const ended = new Promise(resolve => vite.once('close', resolve));
 let browser;
 const installed = { manifestSha256: 'a'.repeat(64), controllerSha256: 'b'.repeat(64), version: '1.2.4', library: true };

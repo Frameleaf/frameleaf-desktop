@@ -8,6 +8,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const root = fileURLToPath(new URL('..', import.meta.url));
 export const enabled = process.env.FRAMELEAF_MANAGER_UI_TEST === '1';
+// Vite colors its output when CI is set, which splits the “Local:” line these tests wait for.
+const { FORCE_COLOR: _color, ...uncolored } = process.env;
+export const plainOutput = { ...uncolored, NO_COLOR: '1' };
 
 /** Starts Vite and the browser, runs `work({ browser, origin })`, and always stops both. */
 export async function withBrowser(work) {
@@ -22,7 +25,7 @@ export async function withBrowser(work) {
   const address = socket.address();
   assert.ok(address && typeof address !== 'string');
   await new Promise(resolve => socket.close(resolve));
-  const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
+  const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'], env: plainOutput });
   const ended = new Promise(resolve => vite.once('close', resolve));
   let browser;
   try {
