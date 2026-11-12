@@ -44,6 +44,7 @@ pub mod runtime_store;
 mod server_admin;
 mod server_identity;
 mod server_login;
+mod server_steps;
 mod source_consent;
 mod source_import;
 mod source_metadata;
@@ -196,7 +197,76 @@ async fn connect_server(
     email: String,
     password: String,
     device_name: String,
-) -> Result<ConnectionView, String> {
+) -> Result<SignInOutcome, String> {
+    let step = SignInStep::Password {
+        email: &email,
+        password: Zeroizing::new(password),
+    };
+    connect_with(window, app, state, &server, step, &device_name).await
+}
+
+/// The second step of `connect_server`: one proof for the transaction it returned.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn connect_server_step(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server: String,
+    transaction: String,
+    method: String,
+    proof: String,
+    device_name: String,
+) -> Result<SignInOutcome, String> {
+    let step = SignInStep::Proof {
+        transaction: Zeroizing::new(transaction),
+        method: &method,
+        proof: Zeroizing::new(proof),
+    };
+    connect_with(window, app, state, &server, step, &device_name).await
+}
+
+/// What a sign-in command answers: the connection, or the step that would complete the sign-in.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+enum SignInOutcome {
+    Done {
+        connection: ConnectionView,
+    },
+    #[serde(rename_all = "camelCase")]
+    Next {
+        transaction: String,
+        methods: Vec<String>,
+        sent_to: Option<String>,
+    },
+}
+
+/// What one sign-in call sends: the password, or a proof for the step the password opened.
+enum SignInStep<'a> {
+    Password {
+        email: &'a str,
+        password: Zeroizing<String>,
+    },
+    Proof {
+        transaction: Zeroizing<String>,
+        method: &'a str,
+        proof: Zeroizing<String>,
+    },
+}
+
+pub(crate) enum SignIn {
+    Done(Box<SavedConnection>, ConnectionView),
+    Next(server_steps::Pending),
+}
+
+async fn connect_with(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server: &str,
+    step: SignInStep<'_>,
+    device_name: &str,
+) -> Result<SignInOutcome, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
     if app.state::<host_setup::HostSetup>().background_active() {
@@ -206,16 +276,25 @@ async fn connect_server(
         return Err("sign_out_before_switching_servers".into());
     }
     let client = transport::client()?;
-    let (saved, mut view) = sign_in(
+    let signed_in = sign_in_step(
         &client,
-        &server,
-        &email,
-        password,
-        &device_name,
+        server,
+        step,
+        device_name,
         || credentials::foreground_identity(&window),
         |saved| credentials::confirm_new_sign_in("connection", saved, &window),
     )
     .await?;
+    let (saved, mut view) = match signed_in {
+        SignIn::Done(saved, view) => (*saved, view),
+        SignIn::Next(pending) => {
+            return Ok(SignInOutcome::Next {
+                transaction: pending.transaction.as_str().to_owned(),
+                methods: pending.methods,
+                sent_to: pending.sent_to,
+            })
+        }
+    };
     if view.state == "preparing"
         && view.features.worker_session
         && start_worker_setup(&app, &saved, false).await.is_err()
@@ -225,9 +304,11 @@ async fn connect_server(
     *current = Some(saved);
     drop(current);
     tray::refresh(&app).await;
-    Ok(view)
+    Ok(SignInOutcome::Done { connection: view })
 }
 
+/// The password step alone, as the sign-in fixtures call it.
+#[cfg(test)]
 async fn sign_in(
     client: &reqwest::Client,
     server: &str,
@@ -236,21 +317,46 @@ async fn sign_in(
     device_name: &str,
     identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
     confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
-) -> Result<(SavedConnection, ConnectionView), String> {
-    let base = normalize_server(server)?;
+) -> Result<SignIn, String> {
     let password = Zeroizing::new(password);
-    let email = email.trim();
-    if email.is_empty() || email.len() > 320 || password.is_empty() || password.len() > 4096 {
-        return Err("login_details_invalid".into());
+    let step = SignInStep::Password { email, password };
+    sign_in_step(client, server, step, device_name, identity, confirm).await
+}
+
+async fn sign_in_step(
+    client: &reqwest::Client,
+    server: &str,
+    step: SignInStep<'_>,
+    device_name: &str,
+    identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
+    confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
+) -> Result<SignIn, String> {
+    let base = normalize_server(server)?;
+    if let SignInStep::Password { email, password } = &step {
+        let email = email.trim();
+        if email.is_empty() || email.len() > 320 || password.is_empty() || password.len() > 4096 {
+            return Err("login_details_invalid".into());
+        }
     }
-    // Check secure persistence and the device identity before sending a password.
+    // Check secure persistence and the device identity before sending a password or a code.
     let identity = identity()?;
     identity.enrollment("validation", "validation", device_name, "client-worker")?;
-    let response = client.post(base.join("api/auth/login").unwrap())
-        .json(&serde_json::json!({ "email": email, "password": password.as_str(), "rememberMe": true }))
-        .send().await.map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    let login: LoginResponse = transport::json(response).await?;
-    keep_login(client, &base, login, device_name, confirm).await
+    let answer = match &step {
+        SignInStep::Password { email, password } => {
+            server_steps::password(client, &base, email.trim(), password).await?
+        }
+        SignInStep::Proof {
+            transaction,
+            method,
+            proof,
+        } => server_steps::proof(client, &base, transaction, method, proof).await?,
+    };
+    match answer {
+        server_steps::Step::Done(login) => keep_login(client, &base, login, device_name, confirm)
+            .await
+            .map(|(saved, view)| SignIn::Done(Box::new(saved), view)),
+        server_steps::Step::Next(pending) => Ok(SignIn::Next(pending)),
+    }
 }
 
 /// A server session from any sign-in method becomes this computer's saved connection.
@@ -636,6 +742,7 @@ pub fn run() {
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
             connect_server,
+            connect_server_step,
             restore_connection,
             sign_out,
             open_photos,
@@ -686,6 +793,7 @@ pub fn run() {
             server_admin::remote_status,
             server_admin::update_remote,
             server_admin::test_remote_access,
+            server_admin::server_step_up,
             server_admin::open_external,
             tray::tray_refresh,
             cloud_account::cloud_sign_in,

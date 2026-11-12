@@ -5,7 +5,9 @@
   import Icon from './Icon.svelte';
   import { connectionError, savedSignInNeedsRecovery } from './errors';
   import { signInMethods } from './ui-state';
-  import type { Connection, CloudAccount, SignInOptions } from './server-types';
+  import TwoStepCode from './TwoStepCode.svelte';
+  import { beginStep, chooseMethod, proofReady, stepFailed, type Step } from './sign-in-steps';
+  import type { Connection, CloudAccount, SignInOptions, SignInOutcome } from './server-types';
 
   let { options, native, computer, cloudAccount, autostart = false, deviceName = $bindable('My computer'), onconnected, onlocked, oncloudsignin, onback }: {
     options: SignInOptions; native: boolean; computer: string; cloudAccount: CloudAccount | null; autostart?: boolean; deviceName?: string;
@@ -42,10 +44,28 @@
     if (!native || busy) return;
     busy = true; failure = '';
     const secret = password; password = '';
-    try { onconnected(await invoke<Connection>('connect_server', { server: options.server, email, password: secret, deviceName })); }
+    try { settle(await invoke<SignInOutcome>('connect_server', { server: options.server, email, password: secret, deviceName })); }
     catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = connectionError(error); }
     finally { busy = false; }
   }
+  // The Password was right and the server wants one more proof: the step replaces the form until it is done.
+  let step = $state<Step | null>(null);
+  let proof = $state('');
+  function settle(outcome: SignInOutcome) {
+    if (outcome.status === 'done') { step = null; onconnected(outcome.connection); }
+    else { proof = ''; step = beginStep(outcome); }
+  }
+  async function withProof(event: SubmitEvent) {
+    event.preventDefault();
+    const current = step;
+    if (!native || busy || !current?.method || !proofReady(current.method, proof)) return;
+    busy = true; failure = '';
+    const secret = proof; proof = '';
+    try { settle(await invoke<SignInOutcome>('connect_server_step', { server: options.server, transaction: current.transaction, method: current.method, proof: secret, deviceName })); }
+    catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); step = stepFailed(current, error); }
+    finally { busy = false; }
+  }
+  function startAgain() { step = null; proof = ''; failure = ''; }
 </script>
 
 <div class="srv-head">
@@ -58,6 +78,26 @@
 
 {#if options.needsSetup}
   <div class="inline-msg notice" role="status"><p>“{options.name}” has no administrator yet. Open it in a browser to finish its setup, then sign in here.</p></div>
+{:else if step}
+  <form class="form" id="server-step" aria-label="Two-Step Verification" onsubmit={withProof}>
+    <h3>Two-Step Verification</h3>
+    <TwoStepCode {step} bind:proof {busy} onchoose={method => { if (step) step = chooseMethod(step, method); }} />
+    {#if !step.method}
+      <!-- Nothing offered can be entered here (a Passkey needs WebAuthn): the sign-ins that open a browser still work. -->
+      {#if methods.frameleaf || methods.oauth}
+        <p class="sub">Sign in another way instead.</p>
+        {#if methods.frameleaf}<button class="btn primary" type="button" disabled={busy || !native} onclick={withFrameleaf}><Icon name="cloud" />{busy ? 'Signing in…' : 'Sign In with Frameleaf'}</button>{/if}
+        {#if methods.oauth}<button class="btn" type="button" disabled={busy || !native} onclick={withProvider}>{busy ? 'Signing in…' : methods.oauth}</button>{/if}
+      {:else}
+        <p class="sub">Ask the person who runs this server to link it to Frameleaf, or turn on Two-Step Verification for your login on the server’s web page.</p>
+      {/if}
+    {/if}
+  </form>
+  <div class="wfoot">
+    <p>Your Verification Code is used only to sign in and is never saved.</p>
+    <button class="btn" type="button" disabled={busy} onclick={startAgain}>Start Again</button>
+    {#if step.method}<button class="btn primary" type="submit" form="server-step" disabled={busy || !native || !proofReady(step.method, proof)}>{busy ? 'Signing in…' : 'Continue'}</button>{/if}
+  </div>
 {:else}
   <div class="form">
     {#if methods.frameleaf}
@@ -71,7 +111,7 @@
       {#if !methods.frameleaf && !methods.password}<p class="sub">A sign-in window opens for {methods.oauth}. It stores nothing after you finish.</p>{/if}
     {/if}
     {#if methods.password}
-      {#if methods.frameleaf || methods.oauth}<div class="or" role="separator">{methods.oauth ? 'or with email and password' : 'or use this server’s login'}</div>{:else}<h3>This server’s login</h3>{/if}
+      {#if methods.frameleaf || methods.oauth}<div class="or" role="separator">{methods.oauth ? 'or with email and Password' : 'or use this server’s login'}</div>{:else}<h3>This server’s login</h3>{/if}
       <form id="server-login" aria-label="This server’s login" onsubmit={withPassword}>
         <div class="form-row"><label for="sl-em">Account</label><span class="two"><input id="sl-em" type="email" placeholder="Email" bind:value={email} required disabled={busy} autocomplete="username" /><input id="sl-pw" type="password" placeholder="Password" aria-label="Password" bind:value={password} required disabled={busy} autocomplete="current-password" /></span></div>
       </form>
@@ -87,7 +127,7 @@
     {/if}
   </div>
   <div class="wfoot">
-    <p>No login for this server? The person who runs it adds you on the server’s web page; you can’t make one here.{methods.password ? ' Your password is used only to sign in and is never saved.' : ''}</p>
+    <p>No login for this server? The person who runs it adds you on the server’s web page; you can’t make one here.{methods.password ? ' Your Password is used only to sign in and is never saved.' : ''}</p>
     {#if methods.password}<button class="btn" class:primary={!methods.frameleaf} type="submit" form="server-login" disabled={busy || !native || !email || !password}>{busy ? 'Signing in…' : 'Sign In'}</button>{/if}
   </div>
 {/if}
