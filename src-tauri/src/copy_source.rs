@@ -346,6 +346,29 @@ fn check_capacity(
     }
     Ok(())
 }
+/// Staging always writes the copy to the staging volume. The source volume is written only when
+/// its provider still has to download the original, so only then is its free space asked for: a
+/// full camera card or disk can still be read.
+fn admit_capacity(
+    bytes: u64,
+    availability: crate::source_metadata::Availability,
+    same_volume: bool,
+    source_free: impl FnOnce() -> Result<u64, String>,
+    staging_free: impl FnOnce() -> Result<u64, String>,
+) -> Result<(), String> {
+    use crate::source_metadata::Availability;
+    let may_download = matches!(
+        availability,
+        Availability::NeedsDownload | Availability::NotReady
+    );
+    check_capacity(
+        bytes,
+        if may_download { source_free()? } else { 0 },
+        staging_free()?,
+        same_volume,
+        may_download,
+    )
+}
 fn relative_path(path: &str) -> Result<&Path, String> {
     let path = Path::new(path);
     if !path
@@ -439,6 +462,7 @@ impl CopyApproval {
     /// Called only after the persisted consent has authorized reads for this exact root.
     pub(crate) fn bind_camera_fingerprints(
         &self,
+        root: &Path,
         entries: &mut [crate::photo_sources::SourceFile],
     ) -> Result<(), String> {
         if !self
@@ -450,7 +474,7 @@ impl CopyApproval {
         if !self.scope.allow_download {
             return Err("source_download_permission_required".into());
         }
-        let root = self.open_source(self.root())?;
+        let root = self.open_source(root)?;
         let identity = root_identity(&root)?;
         let (volume, _) = identity
             .split_once(':')
@@ -736,22 +760,15 @@ impl CopyApproval {
         }
         let staging = Dir::open_ambient_dir(destination, ambient_authority())
             .map_err(|_| "source_stage_unavailable")?;
-        // Unknown residency reserves a full original; pinning and allocated blocks are not proof.
-        let may_download =
-            availability.availability != crate::source_metadata::Availability::Available;
         // shortcut: volume IDs do not reveal shared APFS pools; add pool admission before parallel imports.
         let source_volume = root_identity(&dir)?;
         let staging_volume = root_identity(&staging)?;
-        check_capacity(
+        admit_capacity(
             before.len(),
-            if may_download {
-                available_bytes(&dir)?
-            } else {
-                0
-            },
-            available_bytes(&staging)?,
+            availability.availability,
             source_volume.split(':').next() == staging_volume.split(':').next(),
-            may_download,
+            || available_bytes(&dir),
+            || available_bytes(&staging),
         )?;
         let options = no_follow_options(false);
         #[cfg(windows)]
@@ -1194,6 +1211,20 @@ pub(crate) fn release_stage(destination: &Path, id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Releases every staged copy left in a staging directory whose run can no longer use it.
+/// Only the app's own staging entries are examined; a source folder is never passed here.
+pub(crate) fn release_stages(destination: &Path) {
+    let Ok(entries) = fs::read_dir(destination) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Some(id) = entry.file_name().to_str() {
+            // Anything unexpected is kept for attention, exactly as for a single release.
+            let _ = release_stage(destination, id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,6 +1367,59 @@ mod tests {
         assert!(check_capacity(100, 0, 100 + RESERVE, false, false).is_ok());
         assert!(check_capacity(100, 0, 99 + RESERVE, false, false).is_err());
         assert!(check_capacity(u64::MAX, u64::MAX, u64::MAX, true, true).is_err());
+    }
+    #[test]
+    fn capacity_is_checked_on_the_staging_volume_so_a_full_source_can_be_imported() {
+        use crate::source_metadata::Availability;
+        const RESERVE: u64 = 256 * 1024 * 1024;
+        // A local original is only read: the source volume is not even queried.
+        for availability in [Availability::Unknown, Availability::Available] {
+            admit_capacity(
+                100,
+                availability,
+                false,
+                || panic!("the source volume is not written"),
+                || Ok(100 + RESERVE),
+            )
+            .unwrap();
+            assert_eq!(
+                admit_capacity(
+                    100,
+                    availability,
+                    false,
+                    || Ok(u64::MAX),
+                    || Ok(99 + RESERVE)
+                )
+                .unwrap_err(),
+                "source_capacity_insufficient"
+            );
+        }
+        // A cloud-only original is downloaded into its own folder before it can be copied.
+        for availability in [Availability::NeedsDownload, Availability::NotReady] {
+            assert_eq!(
+                admit_capacity(100, availability, false, || Ok(0), || Ok(u64::MAX)).unwrap_err(),
+                "source_capacity_insufficient"
+            );
+            admit_capacity(
+                100,
+                availability,
+                false,
+                || Ok(100 + RESERVE),
+                || Ok(100 + RESERVE),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            admit_capacity(
+                100,
+                Availability::Unknown,
+                false,
+                || Ok(0),
+                || Err("source_capacity_unavailable".into())
+            )
+            .unwrap_err(),
+            "source_capacity_unavailable"
+        );
     }
     #[test]
     fn capacity_uses_the_open_directory_volume() {

@@ -196,23 +196,17 @@ fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
     let directory = source_metadata::open_preview_root(&root)?;
     let identity = crate::copy_source::root_identity(&directory)?;
     let scan = if folder {
-        let scan = photo_sources::scan_approved(&root, &identity)?;
+        // A one-time drop may come from a card, USB drive or network share, as a camera import may.
+        let scan = photo_sources::scan_batch(&root, photo_sources::Pin::Dropped(&identity), None)?;
         if scan.inventory.truncated || scan.unreadable > 0 {
             return Err("source_inventory_partial".into());
         }
         scan
     } else {
-        if !crate::host_storage::is_local(
-            &directory
-                .try_clone()
-                .map_err(|_| "source_folder_unavailable")?
-                .into_std_file(),
-        )? {
-            return Err("source_watch_local_required".into());
-        }
         let mut unique = BTreeSet::new();
         let mut files = Vec::new();
         let mut logical_bytes = 0u64;
+        let mut empty = 0u64;
         let mut availability = AvailabilitySummary::default();
         for path in paths {
             if path.parent() != Some(root.as_path()) {
@@ -230,12 +224,13 @@ fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
                 .symlink_metadata(name)
                 .map_err(|_| "source_item_unavailable")?;
             let item = source_metadata::probe(&directory, Path::new(name), &meta)?;
-            if !meta.is_file()
-                || meta.len() == 0
-                || item.excluded
-                || !crate::copy_source::watchable(&meta, item)
-            {
+            if !meta.is_file() || item.excluded || !crate::copy_source::watchable(&meta, item) {
                 return Err("source_item_invalid".into());
+            }
+            // An empty file has nothing to copy; the other dropped files still import.
+            if meta.len() == 0 {
+                empty += 1;
+                continue;
             }
             let version = crate::copy_source::watch_version(&directory, Path::new(name), &meta)?;
             availability.record(item, meta.len());
@@ -253,14 +248,16 @@ fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
                 path: root.to_str().ok_or("source_folder_name_invalid")?.into(),
                 photos: files.len() as u64,
                 logical_bytes,
-                skipped: 0,
+                skipped: empty,
                 truncated: false,
                 availability,
                 root_identity: None,
                 media_identity: None,
+                empty,
             },
             files,
             unreadable: 0,
+            more: false,
         }
     };
     if scan.files.is_empty() {
@@ -293,7 +290,8 @@ pub(crate) async fn preview_photo_drop(
     state: State<'_, DesktopState>,
 ) -> Result<Option<Preview>, String> {
     crate::require_local(&window)?;
-    let current = state.0.lock().await;
+    // The folder scan below must not hold the connection lock.
+    let current = state.0.lock().await.clone();
     let saved = current.as_ref();
     let drops = app.state::<DropImport>();
     let (saved, id, paths) = {

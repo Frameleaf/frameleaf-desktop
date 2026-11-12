@@ -6,7 +6,10 @@
 
   type Kind = 'folder' | 'camera' | 'watch' | 'drop';
   type Status = 'ready' | 'running' | 'interrupted' | 'complete' | 'cancelled';
-  type Entry = { runId: string; kind: Kind; status: Status; createdAt: number | null; album: string | null; verified: number; total: number; skipped: number; albumPending: boolean; canRetry: boolean };
+  type Entry = { runId: string; kind: Kind; status: Status; createdAt: number | null; album: string | null; verified: number; total: number; skipped: number; skippedReasons?: Record<string, number>; albumPending: boolean; canRetry: boolean };
+  const skipReasons: Record<string, string> = { source_item_changed: 'changed during the import', source_item_unavailable: 'no longer in the folder', source_item_excluded: 'hidden or excluded', source_item_invalid: 'no longer a photo or video file', source_item_empty: 'empty' };
+  const skipSummary = (entry: Entry) => Object.entries(entry.skippedReasons ?? {})
+    .map(([code, count]) => `${count.toLocaleString()} ${skipReasons[code] ?? 'not copied'}`).join(', ');
   const kinds: Record<Kind, string> = { folder: 'Folder import', camera: 'Camera import', watch: 'Watched folder', drop: 'One-time drop' };
   const statuses: Record<Status, string> = { ready: 'Ready', running: 'In progress', interrupted: 'Interrupted', complete: 'Completed', cancelled: 'Cancelled' };
   const native = isTauri();
@@ -89,7 +92,7 @@
             <span class="l">
               <b>{kinds[entry.kind]}</b>
               <small>{entry.createdAt === null ? 'Earlier import' : formatWhen(entry.createdAt, Date.now())} · {entry.album ?? 'Library'}</small>
-              <small>{entry.verified.toLocaleString()} of {entry.total.toLocaleString()} verified{#if entry.skipped} · {entry.skipped.toLocaleString()} skipped{/if}{#if entry.albumPending} · Album attachment pending{/if}</small>
+              <small>{entry.verified.toLocaleString()} of {entry.total.toLocaleString()} verified{#if entry.skipped} · {entry.skipped.toLocaleString()} skipped{#if skipSummary(entry)} ({skipSummary(entry)}){/if}{/if}{#if entry.albumPending} · Album attachment pending{/if}</small>
             </span>
             <span class="pill {entry.status === 'complete' ? 'ok' : entry.status === 'interrupted' || entry.status === 'running' ? 'wait' : 'off'}"><i aria-hidden="true"></i>{statuses[entry.status]}</span>
             {#if entry.canRetry}<button class="btn" disabled={retrying} onclick={() => retry(entry)}>Retry import</button>{/if}

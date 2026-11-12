@@ -15,7 +15,7 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    fn for_consent(credential: &str, consent: &Consent) -> Self {
+    pub(super) fn for_consent(credential: &str, consent: &Consent) -> Self {
         if credential == crate::drop_import::CREDENTIAL {
             Self::Drop
         } else if consent.watch {
@@ -49,13 +49,19 @@ pub(crate) struct Entry {
     verified: usize,
     total: usize,
     skipped: u64,
+    /// How many of the skipped files have a known reason, by reason code. Never a filename.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_reasons: BTreeMap<String, u64>,
     album_pending: bool,
     can_retry: bool,
 }
 
 impl Entry {
-    fn from_run(kind: Kind, manifest: &Manifest, cursor: &Cursor, active: bool) -> Self {
+    pub(super) fn from_run(kind: Kind, manifest: &Manifest, cursor: &Cursor, active: bool) -> Self {
         let status = match cursor.state.as_str() {
+            // A finished batch of a larger folder is one step of an import that is still going.
+            "complete" if continues(manifest, cursor) && active => Status::Running,
+            "complete" if continues(manifest, cursor) => Status::Interrupted,
             "complete" => Status::Complete,
             "cancelled" => Status::Cancelled,
             _ if active => Status::Running,
@@ -75,6 +81,7 @@ impl Entry {
             verified: view.completed,
             total: view.total,
             skipped: view.skipped,
+            skipped_reasons: skipped_reasons(manifest, cursor),
             album_pending: view.album_pending,
             can_retry: status == Status::Interrupted && cursor.upload_budget.is_some(),
         }
@@ -204,15 +211,24 @@ pub(super) fn completed_watch(
     manifest: &Manifest,
     cursor: &Cursor,
 ) {
-    if cursor.state == "complete"
-        && record(
-            base,
-            saved,
-            identity,
-            Entry::from_run(Kind::Watch, manifest, cursor, false),
-        )
-        .is_err()
-    {
+    completed(base, saved, identity, Kind::Watch, manifest, cursor);
+}
+
+/// Keeps the summary of a completed run whose journal is about to hold the next one.
+pub(super) fn completed(
+    base: &Path,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    kind: Kind,
+    manifest: &Manifest,
+    cursor: &Cursor,
+) {
+    if cursor.state != "complete" {
+        return;
+    }
+    let mut entry = Entry::from_run(kind, manifest, cursor, false);
+    entry.status = Status::Complete;
+    if record(base, saved, identity, entry).is_err() {
         eprintln!("Desktop could not retain an import history summary");
     }
 }
@@ -383,6 +399,9 @@ mod tests {
             total_bytes: 10,
             skipped: 0,
             availability: None,
+            skipped_reasons: BTreeMap::new(),
+            more: false,
+            continues: None,
         };
         let mut cursor = Cursor::new(&manifest).unwrap();
         cursor.state = "paused".into();
