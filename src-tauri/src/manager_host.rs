@@ -377,9 +377,59 @@ pub(crate) fn forget_owned_process(data: &Path) {
         let _ = cap_std::fs::Dir::from_std_file(directory).remove_file(OWNED_PROCESS);
     }
 }
-/// Stop the Manager an earlier run of this app left behind. Only the exact recorded process is
-/// signalled: a PID that now belongs to anything else is forgotten, never touched.
-/// Returns whether a Manager was stopped.
+/// Send the recorded process the same exit request `shutdown` makes. Returns false, without
+/// signalling, when the process with that PID is no longer the recorded one.
+///
+/// Linux binds the signal to a process handle. The handle is opened first and the identity
+/// read afterwards, so a match proves the handle names the recorded process, and a later
+/// reuse of the PID cannot redirect the signal.
+///
+/// macOS, and a Linux kernel without pidfd, have no such handle. There the identity is read
+/// immediately before `kill`, which narrows the race but does not close it: if the process
+/// exits and its PID is reused within those few instructions, the new holder receives SIGTERM.
+#[cfg(unix)]
+fn request_exit(recorded: &crate::process_tree::ProcessIdentity) -> Result<bool, String> {
+    let same = || crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() == Some(recorded);
+    let gone = || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let flags: libc::c_uint = 0;
+        let opened =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, recorded.pid as libc::pid_t, flags) };
+        if opened >= 0 {
+            let handle = unsafe { OwnedFd::from_raw_fd(opened as libc::c_int) };
+            if !same() {
+                return Ok(false);
+            }
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    handle.as_raw_fd(),
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    flags,
+                )
+            };
+            return match sent {
+                0 => Ok(true),
+                _ if gone() => Ok(false),
+                _ => Err("native_manager_orphan_running".into()),
+            };
+        }
+    }
+    if !same() {
+        return Ok(false);
+    }
+    match unsafe { libc::kill(recorded.pid as libc::pid_t, libc::SIGTERM) } {
+        0 => Ok(true),
+        _ if gone() => Ok(false),
+        _ => Err("native_manager_orphan_running".into()),
+    }
+}
+/// Stop the Manager an earlier run of this app left behind. A PID that no longer shows the
+/// recorded start time and program is forgotten and not signalled; see `request_exit` for how
+/// firmly each platform can hold that. Returns whether a Manager was stopped.
 #[cfg(unix)]
 pub(crate) fn stop_orphaned_manager(
     data: &Path,
@@ -392,15 +442,10 @@ pub(crate) fn stop_orphaned_manager(
     };
     let same =
         || crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() == Some(&recorded);
-    if recorded.pid == std::process::id() || !same() {
+    // Manager exits on this request and its controller then stops the database.
+    if recorded.pid == std::process::id() || !request_exit(&recorded)? {
         forget_owned_process(data);
         return Ok(false);
-    }
-    // The same request `shutdown` makes: Manager exits and its controller stops the database.
-    if unsafe { libc::kill(recorded.pid as i32, libc::SIGTERM) } != 0
-        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-    {
-        return Err("native_manager_orphan_running".into());
     }
     let deadline = Instant::now() + timeout;
     while same() {
@@ -1169,12 +1214,15 @@ mod tests {
         // A record naming this app itself is never acted on.
         write(&ProcessIdentity::of(std::process::id()).unwrap());
         assert!(!stop());
-        // A record that is not private could have been written by anyone.
+        // A record that is not private could have been written by anyone. The mode is set
+        // outright so the check does not depend on the umask this test runs under.
         fs::write(
             &record,
             serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"process":live})).unwrap(),
         )
         .unwrap();
+        fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        assert!(crate::host_state::valid_file(&fs::File::open(&record).unwrap()).is_err());
         assert!(!stop());
         assert!(
             child.try_wait().unwrap().is_none(),
