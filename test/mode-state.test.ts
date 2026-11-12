@@ -38,7 +38,7 @@ test('local setup names a busy port, offers a companion update and always offers
   assert.match(ui, /String\(error\) === 'native_manager_shutdown_unconfirmed' && current\?\.leaveAvailable \?/);
   assert.match(ui, /if \(!value\.backgroundActive\) quitOffered = false;/);
   const backend = readFileSync(new URL('../src-tauri/src/host_setup.rs', import.meta.url), 'utf8');
-  assert.match(backend, /view\.leave_available = cfg!\(unix\)\s+&& view\.background_active\s+&& self\.exit_stop_failed\.load/);
+  assert.match(backend, /view\.leave_available\s*=\s*cfg!\(unix\)\s*&& view\.background_active\s*&& self\.exit_stop_failed\.load/);
   // The update message comes from the shared copy, not a second wording in App.svelte.
   const app = readFileSync(new URL('../src/App.svelte', import.meta.url), 'utf8');
   assert.doesNotMatch(app, /did not shut down cleanly/);
