@@ -20,18 +20,9 @@
           "f93c34d196955da3e2760c095c08b27ccbf53315"
         ],
         "linux-aarch64": [
-          "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
           "f93c34d196955da3e2760c095c08b27ccbf53315"
         ]
       }
-    },
-    "coreml-ort": {
-      "python": "3.12.13",
-      "uv": "0.11.2",
-      "extra": "cpu",
-      "provider": "CoreMLExecutionProvider",
-      "targets": ["macos-aarch64"],
-      "sourceRevision": "25b22c16e47a27a2eb50017d838497abce850d11"
     }
   }
 }
