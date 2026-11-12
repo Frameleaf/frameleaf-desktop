@@ -55,6 +55,7 @@ impl BoundClient {
             .ok_or("worker_model_binding_invalid")?;
         Ok(Self {
             client: Client::builder()
+                .tls_built_in_native_certs(false)
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(2))

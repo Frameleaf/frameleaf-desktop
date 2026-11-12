@@ -22,6 +22,8 @@ pub(crate) struct SetupStatus {
     pub workloads: Vec<WorkloadStatus>,
     pub active_workload: Option<String>,
     pub models: Option<ModelProgress>,
+    /// Tasks finished since the worker last started; read-only, for the status display.
+    pub completed_tasks: u64,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +73,7 @@ impl Progress {
                 models.download = None;
                 models
             }),
+            completed_tasks: current.completed_tasks,
         };
         if *current == status {
             return;
@@ -91,6 +94,9 @@ impl Progress {
             drop(status);
             (self.notify)(snapshot);
         }
+    }
+    fn completed(&self) {
+        self.update(|status| status.completed_tasks += 1);
     }
     fn active(&self, workload: Option<&str>) {
         self.update(|status| status.active_workload = workload.map(str::to_owned));
@@ -1082,6 +1088,16 @@ async fn prepare(
         })
         .await
         .map_err(|_| "worker_cache_publish_failed")??;
+        // Best effort: reclaim superseded model revisions and abandoned staging.
+        let models = paths.data.join("models");
+        let referenced = profiles
+            .iter()
+            .map(|profile| profile.cache_identity().2.to_owned())
+            .collect();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            crate::model_cache::prune(&models, &referenced, std::time::SystemTime::now())
+        })
+        .await;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
@@ -1163,7 +1179,10 @@ async fn prepare(
                 }, &progress.cancelled).await;
                 progress.active(None);
                 match completed {
-                    Ok(Step::Completed) => failures.completed(),
+                    Ok(Step::Completed) => {
+                        failures.completed();
+                        progress.completed();
+                    }
                     Ok(Step::Dropped(code)) => {
                         let delay = match failures.dropped(code) {
                             Ok(delay) => delay,
@@ -1242,6 +1261,26 @@ mod tests {
             root.join("debug/native-runtime")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn finished_tasks_are_counted_and_survive_state_changes() {
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(SetupStatus::default())),
+            notify: Arc::new(|_| {}),
+        };
+        progress.set("working", None);
+        progress.completed();
+        progress.completed();
+        progress.set("waiting-for-work", None);
+        progress.set("paused", Some("memory_low".into()));
+        let status = progress.status.lock().unwrap().clone();
+        assert_eq!(status.completed_tasks, 2);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["completedTasks"],
+            serde_json::json!(2)
+        );
     }
     #[test]
     fn global_progress_preserves_independent_workload_results() {
@@ -1659,7 +1698,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn interrupted_http_acquisition_removes_partial_weights() {
+    async fn interrupted_http_acquisition_never_publishes_partial_weights() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -1715,12 +1754,17 @@ mod tests {
         .await;
         let _ = stop_tx.send(());
         server.join().unwrap();
-        let files = std::fs::read_dir(&root).unwrap().count();
+        let files: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap_err(), "model_download_permission_required");
+        // FD-39: the partial is kept for a Range resume; it is never published unverified.
         assert_eq!(
-            files, 0,
-            "interrupted model must not leave partial or published weights"
+            files,
+            [format!(".download-{}", "0".repeat(64)).as_str()],
+            "interrupted model must leave only its resumable partial"
         );
     }
     #[tokio::test]

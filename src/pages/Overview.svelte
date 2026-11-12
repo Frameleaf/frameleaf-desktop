@@ -4,9 +4,9 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from '../Icon.svelte';
   import AiLibrary from './AiLibrary.svelte';
-  import { workerStatus, runtimeRecoveryMessage } from '../mode-state';
-  import { connectionError } from '../errors';
-  import { workloadName, workloadPill, workerTone, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
+  import { workerView, workloadReason } from '../mode-state';
+  import { describeError } from '../errors';
+  import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
   import { backupHealth, backupWarning, libraryHeadroom, storageWarning } from '../server-health';
 
@@ -17,40 +17,10 @@
   const computer = computerWord(platformFromUserAgent(navigator.userAgent));
   let busy = $state(false);
   let failure = $state('');
-  const explain = connectionError;
-  const setupState = $derived(setup?.state || connection?.state || '');
-  const headline = $derived(connection.state === 'offline' ? 'Server unavailable' : connection.state === 'identity-changed' ? 'Server identity changed' : connection.state === 'enrollment-failed' ? 'Computer setup needs attention' : setup?.activeWorkload ? 'Processing on this computer' : workerStatus({ state: setupState, workerSupported: connection.features.worker }));
-  const setupDetail = $derived(runtimeRecoveryMessage(setup?.code ?? null) ?? (setup?.code === 'runtime_pack_unavailable'
-    ? 'This build does not include a signed AI runtime yet. Photos remain available.'
-    : setup?.state === 'model-download-required'
-    ? 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks.'
-    : setup?.state === 'reconnecting'
-    ? 'Waiting to reconnect to your server. This computer will recheck its session, models and resources before processing again.'
-    : setup?.state === 'pausing'
-    ? 'The current bounded task will finish, then this computer will stop requesting work.'
-    : setup?.state === 'stopped'
-    ? 'AI processing is stopped on this computer. Resume whenever you are ready. Photos remain available.'
-    : setup?.state === 'paused'
-    ? ({ system_resumed: 'This computer resumed or its clock changed. Rechecking the selected models before more work.', user_paused: 'Paused by you. This computer will stay paused after reopening the app.', on_battery: 'Plug in this computer to continue AI processing.', power_unknown: 'Power status could not be read. AI processing is paused.', metered_network: 'AI processing pauses on metered networks. Photos remain available.', network_unknown: 'Network cost could not be determined. AI processing is paused.', memory_low: 'Waiting for enough memory for the selected model.', memory_unknown: 'Memory status could not be read. AI processing is paused.', worker_policy_required: 'Your server is not using computers for AI processing right now. This computer checks again every few minutes.', worker_lan_required: 'AI processing runs only on your server’s home network. This computer checks again every few minutes and when its network changes.' } as Record<string, string>)[setup.code ?? ''] ?? 'AI processing is paused.'
-    : setup?.state === 'qualified'
-    ? 'The selected models passed this computer’s checks.'
-    : setup?.state === 'starting-worker'
-    ? 'Starting the checked models locally before requesting work from your server.'
-    : setup?.state === 'working'
-    ? 'This computer can process one selected AI task at a time while power, network and memory allow.'
-    : setup?.state === 'waiting-for-work'
-    ? 'Connected and waiting for your server to send AI work.'
-    : setup?.state === 'qualifying'
-    ? 'Running the selected models locally and checking the results with your server.'
-    : setup?.state === 'preparing-models'
-    ? 'Verifying the selected model files. You can keep using Photos while this runs.'
-    : setup?.state === 'preparing-runtime'
-    ? 'Checking the signed runtime included with this app.'
-    : setup?.state === 'setup-needs-attention'
-    ? 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.'
-    : setup?.state === 'no-eligible-work'
-    ? 'Your server keeps every AI task on its own destination, has it turned off, or uses a model this computer doesn’t support yet. A server administrator can send a task to computers in the server’s machine learning settings.' : ''));
-  const connectionDetail = $derived(connection.state === 'identity-changed' ? 'Processing is stopped. Verify the server before signing in again.' : connection.state === 'worker-setup-failed' ? 'Photos are available, but this computer could not complete worker setup. Reopen the app to retry.' : connection.state === 'credential-store-unavailable' ? 'Unlock your computer’s credential store and reopen the app to finish setup.' : connection.state === 'enrollment-failed' ? 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.' : `Processing starts only after the selected models pass qualification on this ${computer}. Pausing finishes the current task first.`);
+  let failureReference = $state<string | null>(null);
+  function fail(error: unknown) { ({ message: failure, reference: failureReference } = describeError(error)); }
+  // The backend publishes every worker status change as the worker-setup event, which App passes down as `setup`.
+  const worker = $derived(workerView({ connectionState: connection.state, workerSupported: connection.features.worker || connection.features.workerSession, computer, setup }));
   const connectionPill = $derived(connection.state === 'offline' ? { label: 'Server unavailable', tone: 'off' } : connection.state === 'identity-changed' ? { label: 'Identity changed', tone: 'bad' } : connection.state === 'awaiting-approval' ? { label: 'Awaiting approval', tone: 'wait' } : { label: 'Connected', tone: 'ok' });
   const control = $derived(setup?.control ?? 'running');
   const canControl = $derived(connection.mode === 'client-worker' && connection.features.workerSession);
@@ -82,14 +52,14 @@
 
   async function photos() {
     failure = '';
-    try { await invoke('open_photos'); } catch (error) { failure = explain(error); }
+    try { await invoke('open_photos'); } catch (error) { fail(error); }
   }
   async function controlWorker(target: 'running' | 'paused' | 'stopped') {
     if (!native || busy) return;
     busy = true; failure = '';
     try { onsetup(await invoke<SetupStatus>('control_worker', { control: target })); }
     catch (error) {
-      failure = explain(error);
+      fail(error);
       onsetup(await invoke<SetupStatus>('worker_setup_status').catch(() => setup));
     }
     finally { busy = false; }
@@ -98,7 +68,7 @@
     if (!native || busy) return;
     busy = true; failure = '';
     try { await invoke('prepare_models', { allowDownload }); }
-    catch (error) { failure = explain(error); }
+    catch (error) { fail(error); }
     finally { busy = false; }
   }
   async function checkApproval() {
@@ -109,7 +79,7 @@
       if (restored) onconnection(restored);
       onsetup(await invoke<SetupStatus>('worker_setup_status'));
       await onrefresh();
-    } catch (error) { failure = explain(error); }
+    } catch (error) { fail(error); }
     finally { busy = false; }
   }
   function attentionText(item: AttentionItem): { title: string; detail: string; page: string } {
@@ -122,7 +92,7 @@
       case 'work-failed': return { title: 'Some server work failed', detail: item.work ? `${item.work.count.toLocaleString()} items across ${item.work.queues.map(queue => queue.name).join(', ')}.` : '', page: 'ai' };
       case 'work-paused': return { title: 'Server work is paused', detail: item.work ? `${item.work.count.toLocaleString()} items are waiting.` : '', page: 'ai' };
       case 'new-version': return { title: `Frameleaf ${item.version?.available ?? ''} is available`, detail: item.version ? `This server runs ${item.version.current}.` : '', page: 'manager' };
-      default: return { title: item.reason, detail: '', page: 'overview' };
+      default: return { title: 'Your server needs attention', detail: '', page: 'overview' };
     }
   }
 </script>
@@ -130,7 +100,7 @@
 <section class="page" aria-labelledby="page-title">
   <header class="toolbar">
     <h1 id="page-title">{section === 'ai' ? 'AI processing' : 'My computer'}</h1>
-    <span class="pill {section === 'ai' ? workerTone(setupState) : connectionPill.tone}"><i aria-hidden="true"></i>{section === 'ai' ? headline : connectionPill.label}</span>
+    <span class="pill {section === 'ai' ? worker.pill.tone : connectionPill.tone}"><i aria-hidden="true"></i>{section === 'ai' ? worker.headline : connectionPill.label}</span>
     <span class="sp"></span>
     {#if section === 'ai' && canControl}
       <div class="seg" role="group" aria-label="Worker control">
@@ -142,7 +112,7 @@
     <button class="btn primary" disabled={busy || !native || connection.state === 'identity-changed'} onclick={photos}><Icon name="open" />Open Photos</button>
   </header>
   <div class="body">
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}{#if failureReference} <small class="muted">Reference: {failureReference}</small>{/if}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if section === 'all'}
       {#if attention.length}
         <div>
@@ -212,12 +182,16 @@
       <div class="group" aria-label="Computer processing status">
         <div class="row">
           <span class="ic" aria-hidden="true"><Icon name="ai" /></span>
-          <span class="l"><b>{headline}</b><small>{setupDetail || connectionDetail}</small></span>
-          <span class="pill {workerTone(setupState)}"><i aria-hidden="true"></i>{setupState === 'working' ? 'Available' : setupState === 'pausing' ? 'Finishing' : setupState === 'waiting-for-work' ? 'Idle' : control === 'paused' ? 'Paused' : control === 'stopped' ? 'Stopped' : 'Not running'}</span>
-          {#if setup?.state === 'model-download-required'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(true)}>Download Models</button>{/if}
-          {#if connection.state === 'awaiting-approval'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Approval</button>{/if}
-          {#if setup?.state === 'setup-needs-attention'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(false)}>Retry Setup</button>{/if}
+          <span class="l"><b>{worker.headline}</b><small>{worker.detail}{#if worker.reference} <span class="muted">Reference: {worker.reference}</span>{/if}</small></span>
+          <span class="pill {worker.pill.tone}"><i aria-hidden="true"></i>{worker.pill.label}</span>
+          {#if worker.action === 'download-models'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(true)}>Download Models</button>{/if}
+          {#if worker.action === 'check-approval'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Approval</button>{/if}
+          {#if worker.action === 'check-server'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Again</button>{/if}
+          {#if worker.action === 'retry-setup'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(false)}>Retry Setup</button>{/if}
         </div>
+        {#if worker.finished}
+          <div class="row"><span class="l"><b>Tasks finished</b><small>{worker.finished}</small></span></div>
+        {/if}
         {#if section === 'ai'}
           {#if setup?.activeWorkload}
             <div class="row"><span class="l"><b>{workloadName(setup.activeWorkload)}</b><small>Processing on this computer</small></span></div>
@@ -238,12 +212,12 @@
         {#each setup?.workloads ?? [] as workload (workload.workload)}
           {@const pill = workloadPill(workload.state)}
           <div class="row">
-            <span class="l"><b>{workloadName(workload.workload)}</b><small>{workload.modelNames?.length ? workload.modelNames.join(' · ') : pill.detail}{workload.modelNames?.length && workload.state !== 'ready' ? ` · ${pill.detail}` : ''}</small></span>
+            <span class="l"><b>{workloadName(workload.workload)}</b><small>{workload.modelNames?.length ? workload.modelNames.join(' · ') : pill.detail}{workload.modelNames?.length && workload.state !== 'ready' ? ` · ${pill.detail}` : ''}{workload.state === 'unavailable' && workloadReason(workload.code) ? ` · ${workloadReason(workload.code)}` : ''}</small></span>
             <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
           </div>
         {/each}
       </div>
-      <p class="foot">{connectionDetail} When your server’s owner marks this {computer} for the household, it may process other members’ photos (never Locked photos). Server administration uses your existing Frameleaf permissions inside Photos.</p>
+      <p class="foot">Processing starts only after the selected models pass qualification on this {computer}. Pausing finishes the current task first. When your server’s owner marks this {computer} for the household, it may process other members’ photos (never Locked photos). Server administration uses your existing Frameleaf permissions inside Photos.</p>
     </div>
 
     {#if section === 'ai'}

@@ -579,3 +579,260 @@ fn manager_http_login_and_browser_calls_use_an_explicit_session_header() {
     });
     server.join().unwrap();
 }
+
+/// Answers one local HTTP connection per raw response, then stops.
+fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for response in responses {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            // A client that stops at its size limit may close before the whole body is written.
+            let _ = socket.write_all(response.as_bytes());
+        }
+    });
+    (origin, server)
+}
+fn http(status: &str, headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+async fn answer<T: DeserializeOwned>(response: String, limit: usize) -> Result<T, String> {
+    let (origin, server) = serve(vec![response]);
+    let received = manager_client(&origin, None, None)
+        .unwrap()
+        .post(&origin)
+        .send()
+        .await
+        .unwrap();
+    let result = reply_limit(received, limit).await;
+    server.join().unwrap();
+    result
+}
+
+#[test]
+fn removing_a_pairing_clears_local_state_even_when_manager_is_unreachable() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unreachable = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    tauri::async_runtime::block_on(async {
+        let forgotten = std::cell::Cell::new(0);
+        let forget = || {
+            forgotten.set(forgotten.get() + 1);
+            Ok(())
+        };
+        let mut stale = saved();
+        stale.origin = unreachable;
+        assert_eq!(
+            remove(Some(stale), "synthetic password".into(), forget).await,
+            Ok(false)
+        );
+        // Without a password, or with a record that could not be read, removal stays local.
+        assert_eq!(
+            remove(Some(saved()), String::new(), forget).await,
+            Ok(false)
+        );
+        assert_eq!(
+            remove(None, "synthetic password".into(), forget).await,
+            Ok(false)
+        );
+        assert_eq!(forgotten.get(), 3);
+
+        let session = format!("X-Frameleaf-Manager-Session: {}\r\n", "a".repeat(64));
+        let (origin, server) = serve(vec![
+            http(
+                "200 OK",
+                &session,
+                &json!({"csrf":"c".repeat(64)}).to_string(),
+            ),
+            http("200 OK", "", r#"{"revoked":true}"#),
+            http("200 OK", "", "{}"),
+        ]);
+        let mut reachable = saved();
+        reachable.origin = origin;
+        assert_eq!(
+            remove(Some(reachable), "synthetic password".into(), forget).await,
+            Ok(true)
+        );
+        server.join().unwrap();
+        assert_eq!(forgotten.get(), 4);
+
+        // Only a credential store that cannot delete the record keeps the pairing.
+        assert_eq!(
+            remove(Some(saved()), String::new(), || Err(
+                "credential_store_locked_or_unavailable".into()
+            ))
+            .await
+            .unwrap_err(),
+            "credential_store_locked_or_unavailable"
+        );
+    });
+}
+
+#[test]
+fn pairing_requires_https_unless_manager_is_on_this_computer() {
+    for origin in [
+        "http://192.168.1.10",
+        "http://192.168.1.10:2282",
+        "http://tower.local:2282",
+        "http://127.0.0.2:2282",
+        "http://localhost.example.test",
+    ] {
+        assert_eq!(
+            require_encrypted(origin).unwrap_err(),
+            "manager_https_required",
+            "{origin}"
+        );
+    }
+    for origin in [
+        "http://127.0.0.1",
+        "http://127.0.0.1:2282",
+        "http://[::1]:2282",
+        "http://localhost:2282",
+        "https://192.168.1.10",
+        "https://manager.test:9443",
+    ] {
+        assert_eq!(require_encrypted(origin), Ok(()), "{origin}");
+    }
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let loopback = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    tauri::async_runtime::block_on(async {
+        let attempt = |origin: String| async move {
+            pair(
+                &identity(),
+                &origin,
+                "synthetic password".into(),
+                None,
+                false,
+                |_| panic!("nothing is saved"),
+            )
+            .await
+            .err()
+            .unwrap()
+        };
+        // Refused before any password leaves this computer.
+        assert_eq!(
+            attempt("http://192.168.1.10".into()).await,
+            "manager_https_required"
+        );
+        assert_eq!(
+            attempt(loopback).await,
+            "manager_unreachable_or_certificate_invalid"
+        );
+    });
+}
+
+#[test]
+fn an_unknown_operation_kind_does_not_hide_the_rest_of_the_status() {
+    let saved = saved();
+    let operation = |kind: &str| json!({"id":Uuid::new_v4(),"kind":kind,"state":"running","step":null,"completed":[],"error":null,"createdAt":1700000000000u64,"updatedAt":1700000000000u64});
+    let status = json!({"manager":{"id":saved.manager_id,"origin":saved.origin},"installation":{"id":saved.installation_id,"name":"Fixture","release":"frameleaf-v3.0.0-1","port":2283},"operations":[operation("move-library"),operation("stop")]});
+    let reply = validate_reply(&saved, &Command::Status {}, status).unwrap();
+    assert_eq!(reply["operations"][0]["kind"], "other");
+    assert_eq!(reply["operations"][1]["kind"], "stop");
+    assert_eq!(reply["installation"]["name"], "Fixture");
+}
+
+#[test]
+fn manager_error_codes_pass_through_without_private_text() {
+    let id = Uuid::new_v4();
+    let failed = |error: &str| {
+        let operation = json!({"id":id,"kind":"backup","state":"failed","step":null,"completed":[],"error":error,"createdAt":1700000000000u64,"updatedAt":1700000000000u64});
+        validate_reply(&saved(), &Command::Operation { id }, operation).unwrap()["error"].clone()
+    };
+    assert_eq!(failed("repository_locked"), "repository_locked");
+    assert_eq!(failed("recovery_key_required"), "recovery_key_required");
+    assert_eq!(failed(&"c".repeat(40)), "manager_operation_failed");
+    tauri::async_runtime::block_on(async {
+        let refused = |code: &str| {
+            let body = json!({ "code": code }).to_string();
+            async move {
+                answer::<Value>(http("409 Conflict", "", &body), REPLY_LIMIT)
+                    .await
+                    .unwrap_err()
+            }
+        };
+        assert_eq!(
+            refused("desktop_operation_not_authorized").await,
+            "desktop_operation_not_authorized"
+        );
+        assert_eq!(
+            refused("operation_in_progress").await,
+            "manager_operation_in_progress"
+        );
+        // Desktop's own codes drive its interface, and free text is never shown.
+        for code in ["manager_device_changed", "Read /private/data failed", ""] {
+            assert_eq!(refused(code).await, "manager_request_failed", "{code}");
+        }
+    });
+}
+
+#[test]
+fn clock_skew_is_reported_as_clock_skew() {
+    let fixture: Value = serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+    let approval: Pairing = serde_json::from_value(fixture["pairing"].clone()).unwrap();
+    // The approval is valid from 1700000000000 for five minutes.
+    for now in [1700000000000 - WINDOW - 1, 1700000300000] {
+        assert_eq!(
+            validate_pairing(
+                &approval,
+                &identity(),
+                "https://manager.test:9443",
+                now,
+                &SCOPES
+            )
+            .unwrap_err(),
+            "manager_clock_skew"
+        );
+    }
+    let date = Some("Thu, 01 Jan 2015 00:00:00 GMT");
+    assert!(clock_skewed(date, 1420070400000 + WINDOW));
+    assert!(clock_skewed(date, 1420070400000 - WINDOW));
+    assert!(!clock_skewed(date, 1420070400000 + 30_000));
+    assert!(!clock_skewed(None, 1420070400000));
+    tauri::async_runtime::block_on(async {
+        let refused = |headers: &'static str| async move {
+            let body = r#"{"code":"desktop_grant_invalid"}"#;
+            answer::<Value>(http("401 Unauthorized", headers, body), REPLY_LIMIT)
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(
+            refused("Date: Thu, 01 Jan 2015 00:00:00 GMT\r\n").await,
+            "manager_clock_skew"
+        );
+        assert_eq!(refused("").await, "manager_pair_again");
+    });
+}
+
+#[test]
+fn list_and_status_replies_may_exceed_the_small_reply_limit() {
+    let body = json!("a".repeat(200_000)).to_string();
+    tauri::async_runtime::block_on(async {
+        assert_eq!(
+            answer::<Value>(http("200 OK", "", &body), REPLY_LIMIT)
+                .await
+                .unwrap_err(),
+            "manager_response_too_large"
+        );
+        assert!(answer::<Value>(http("200 OK", "", &body), LIST_LIMIT)
+            .await
+            .is_ok());
+        let body = json!("a".repeat(LIST_LIMIT)).to_string();
+        assert_eq!(
+            answer::<Value>(http("200 OK", "", &body), LIST_LIMIT)
+                .await
+                .unwrap_err(),
+            "manager_response_too_large"
+        );
+    });
+}

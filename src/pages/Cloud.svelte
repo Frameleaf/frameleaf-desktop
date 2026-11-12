@@ -3,6 +3,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '../Icon.svelte';
   import { connectionError } from '../errors';
+  import StepUp from '../StepUp.svelte';
+  import { verificationRequired, type StepOffer } from '../sign-in-steps';
   import { formatBytes, formatDate, relativeTime, percent, formatWhen } from '../ui-state';
   import type { CloudStatus, ServerSummary } from '../server-types';
 
@@ -14,6 +16,12 @@
   const license = $derived(data?.license ?? null);
   const backup = $derived(data?.backup ?? null);
   const explain = connectionError;
+  // A request the server refuses until Two-Step Verification is answered in place, then run again.
+  let stepUp = $state<{ offer: StepOffer; retry: () => void } | null>(null);
+  function failed(error: unknown, retry: () => void) {
+    const offer = verificationRequired(error);
+    if (offer) stepUp = { offer, retry }; else failure = explain(error);
+  }
   const linkPill = $derived(!cloud ? { label: busy ? 'Checking' : 'Unavailable', tone: 'off' } : cloud.state === 'linked' ? { label: 'Linked', tone: 'ok' } : cloud.state === 'pending' ? { label: 'Waiting for approval', tone: 'wait' } : cloud.state === 'revoked' ? { label: 'Link revoked', tone: 'bad' } : cloud.state === 'not-configured' ? { label: 'Not set up', tone: 'off' } : { label: 'Not linked', tone: 'off' });
   const planState = $derived(license?.state ?? 'none');
   const planSlot = $derived(license?.plan ?? null);
@@ -31,7 +39,7 @@
     if (!native) return;
     busy = true; failure = '';
     try { data = await invoke<CloudStatus>('cloud_status'); }
-    catch (error) { failure = explain(error); }
+    catch (error) { failed(error, () => { void load(); }); }
     finally { busy = false; }
   }
   onMount(() => { void load(); });
@@ -62,6 +70,7 @@
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s Frameleaf Cloud account and plan.</p>{/if}
     {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={() => { stepUp = null; }} />{/key}{/if}
     {#if cloud?.lastError}<div class="inline-msg" role="status"><p>There was a problem checking this server’s Cloud connection. Try refreshing.</p></div>{/if}
     <div>
       <div class="group-head"><h2 class="group-title">Account</h2></div>

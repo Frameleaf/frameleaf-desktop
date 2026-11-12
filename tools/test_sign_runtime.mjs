@@ -96,55 +96,8 @@ test("signs exact verified manifest bytes with only the configured release autho
   );
 });
 
-test("signs only the declared CoreML Apple-silicon profile and binds its provenance", async (t) => {
-  const f = await fixture(t);
-  const provenance = JSON.parse(
-    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
-  );
-  provenance.profile = "coreml-ort";
-  const authored = JSON.parse(
-    await readFile(
-      new URL("../runtime/profiles.json", import.meta.url),
-      "utf8",
-    ),
-  ).profiles["coreml-ort"];
-  provenance.sourceRevision = authored.sourceRevision;
-  const bytes = Buffer.from(JSON.stringify(provenance));
-  await writeFile(join(f.root, "payload/provenance.json"), bytes);
-  f.manifest.files["provenance.json"] = {
-    bytes: bytes.length,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-  };
-  Object.assign(f.manifest, {
-    provider: "CoreMLExecutionProvider",
-    platform: "macos",
-    architecture: "aarch64",
-    sourceRevision: authored.sourceRevision,
-  });
-  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
-  await signCandidate(
-    f.root,
-    join(f.root, "manifest.sig"),
-    f.privatePem,
-    f.policy,
-  );
-  assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
-  const { packageConfiguration } = await import("./package_desktop.mjs");
-  if (process.platform === "darwin" && process.arch === "arm64") {
-    const config = await packageConfiguration(f.root, f.policy);
-    assert.equal(
-      config.bundle.resources[join(f.root, "payload")],
-      "native-runtime/payload",
-    );
-  } else {
-    await assert.rejects(
-      packageConfiguration(f.root, f.policy),
-      /runtime_bundle_target_mismatch/,
-    );
-  }
-});
-
-test("rejects CoreML on other targets and mismatched CPU provenance", async (t) => {
+// FD-40: no CoreML profile is approved until a runtime with the signed device collector can be built.
+test("rejects CoreML on every target and mismatched CPU provenance", async (t) => {
   for (const [platform, architecture] of [
     ["windows", "x86_64"],
     ["linux", "aarch64"],
@@ -372,15 +325,9 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
   );
   assert.deepEqual(profiles["cpu-ort"].additionalSources, {
     "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
-    "linux-aarch64": [
-      "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
-      "f93c34d196955da3e2760c095c08b27ccbf53315",
-    ],
+    "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"],
   });
-  assert.equal(
-    profiles["coreml-ort"].sourceRevision,
-    "25b22c16e47a27a2eb50017d838497abce850d11",
-  );
+  assert.deepEqual(Object.keys(profiles), ["cpu-ort"]);
   const f = await fixture(t);
   const provenance = JSON.parse(
     await readFile(join(f.root, "payload/provenance.json"), "utf8"),
@@ -417,7 +364,6 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
 
 for (const [source, platforms] of [
   ["f93c34d196955da3e2760c095c08b27ccbf53315", ["linux", "darwin"]],
-  ["94d52a8244da0edfa9f680a3b357fdccbc0ad7e8", ["linux"]],
 ]) {
   test(`CPU source ${source.slice(0, 7)} packages only on its approved ARM64 targets`, async (t) => {
     const { packageConfiguration } = await import("./package_desktop.mjs");
@@ -447,7 +393,7 @@ for (const [source, platforms] of [
       )
         assert(!sources.includes(source));
     }
-    assert.equal(profiles["coreml-ort"].additionalSources, undefined);
+    assert.equal(profiles["coreml-ort"], undefined);
     const f = await fixture(t);
     const provenance = JSON.parse(
       await readFile(join(f.root, "payload/provenance.json"), "utf8"),

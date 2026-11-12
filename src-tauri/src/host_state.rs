@@ -277,7 +277,12 @@ impl Owner {
         let (database_reference, restore_pending) = match self.read()? {
             Some(marker) => {
                 self.binding(&marker, id, sha)?;
-                if marker.phase != Phase::Stopped
+                // An active journal under this exclusive lease means its controller died without
+                // a clean stop. A server start may continue from it: the database replays its own
+                // write-ahead log, and the binding, restore and storage checks still apply. Backup
+                // and restore modes keep requiring a clean stop first.
+                let interrupted = marker.phase != Phase::Stopped;
+                if (interrupted && mode != crate::host_runtime::HostMode::Server)
                     || (mode == crate::host_runtime::HostMode::Server && marker.restore_pending)
                 {
                     return Err("host_recovery_requires_manager".into());
@@ -334,6 +339,16 @@ impl Owner {
             owner.binding(marker, &marker.installation_id, &marker.manifest_sha256)?;
         }
         Ok(marker)
+    }
+    /// Whether a controller holds this profile's journal lease right now. A profile that never
+    /// started has no journal and no controller.
+    pub(crate) fn controller_running(path: &Path) -> Result<bool, String> {
+        match Self::acquire(path, false) {
+            Ok(_) => Ok(false),
+            Err(error) if error == "host_controller_already_owned" => Ok(true),
+            Err(error) if error == "host_controller_state_unavailable" => Ok(false),
+            Err(error) => Err(error),
+        }
     }
     /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
     #[cfg(unix)]
@@ -675,6 +690,68 @@ mod tests {
         let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
         assert_eq!(
             inspector.inspect(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+    }
+
+    #[test]
+    fn interrupted_server_journal_restarts_through_recovery_without_proving_a_clean_stop() {
+        use crate::host_runtime::HostMode;
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.activate(ID, &sha(), HostMode::Server).unwrap();
+        let interrupted = owner.active.clone().unwrap();
+        // The controller dies here: nothing writes the stopped phase.
+        drop(owner);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        assert_eq!(owner.read().unwrap().unwrap().phase, Phase::Active);
+        for mode in [
+            HostMode::Database,
+            HostMode::CheckpointCleanup,
+            HostMode::RestorePrepare,
+        ] {
+            assert_eq!(
+                owner.activate(ID, &sha(), mode).unwrap_err(),
+                "host_recovery_requires_manager"
+            );
+        }
+        for (id, manifest) in [("cccccccccccc", sha()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.activate(id, &manifest, HostMode::Server).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+        // Package moves and Manager shutdown still need a proven clean stop.
+        assert_eq!(
+            owner.inspect(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.activate(ID, &sha(), HostMode::Server).unwrap();
+        assert_ne!(
+            owner.active.as_ref().unwrap().generation,
+            interrupted.generation
+        );
+        owner.launch_state(&sha(), HostMode::Server).unwrap();
+        owner.clean_stop().unwrap();
+        assert_eq!(owner.inspect(ID, &sha()).unwrap().phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn interrupted_journal_with_a_pending_restore_still_refuses_a_server_start() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        let mut marker = owner.active.clone().unwrap();
+        marker.restore_pending = true;
+        owner.write(&marker).unwrap();
+        drop(owner);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        assert_eq!(
+            owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+                .unwrap_err(),
             "host_recovery_requires_manager"
         );
     }

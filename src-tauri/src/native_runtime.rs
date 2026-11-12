@@ -714,7 +714,12 @@ impl VerifiedRuntime {
         }
         let report: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "runtime_qualification_report_invalid")?;
-        validate_report(&report, &value, &format!("{:x}", Sha256::digest(spec)))?;
+        validate_report(
+            &report,
+            &value,
+            &format!("{:x}", Sha256::digest(spec)),
+            self.provider(),
+        )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
             spec: spec.to_vec(),
@@ -723,10 +728,12 @@ impl VerifiedRuntime {
         })
     }
 }
+/// `runtime_provider` is the one provider the installed runtime's signed manifest declares.
 fn validate_report(
     report: &serde_json::Value,
     spec: &serde_json::Value,
     binding: &str,
+    runtime_provider: &str,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -755,9 +762,22 @@ fn validate_report(
         return Err(invalid());
     }
     let provider = spec["provider"].as_str().ok_or_else(invalid)?;
-    if !matches!(provider, "CPUExecutionProvider" | "CUDAExecutionProvider") {
+    // The providers a runtime profile can declare (server `runtime-profiles.json`), and only the
+    // one this runtime was signed for.
+    if provider != runtime_provider
+        || !matches!(
+            provider,
+            "CPUExecutionProvider"
+                | "CUDAExecutionProvider"
+                | "CoreMLExecutionProvider"
+                | "OpenVINOExecutionProvider"
+        )
+    {
         return Err(invalid());
     }
+    // CoreML can keep work on the processor inside its own nodes, so it never reports
+    // accelerator-only execution (the runtime and the server use the same rule).
+    let always_mixed = provider == "CoreMLExecutionProvider";
     let execution = report["execution"]
         .as_array()
         .filter(|v| !v.is_empty() && v.len() <= 64)
@@ -779,7 +799,7 @@ fn validate_report(
         }
         let state = if provider == "CPUExecutionProvider" {
             "ready-cpu"
-        } else if nodes.contains_key("CPUExecutionProvider") {
+        } else if always_mixed || nodes.contains_key("CPUExecutionProvider") {
             mixed = true;
             "ready-mixed"
         } else {
@@ -805,6 +825,59 @@ fn validate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn report_for(provider: &str, state: &str, cpu_nodes: bool) -> [serde_json::Value; 2] {
+        let mut nodes = serde_json::json!({ provider: 12 });
+        if cpu_nodes {
+            nodes["CPUExecutionProvider"] = 3.into();
+        }
+        let spec = serde_json::json!({"modelKey":"clip:model","provider":provider,
+            "preprocessingSha256":"a".repeat(64),"fixtureSha256":"b".repeat(64)});
+        let report = serde_json::json!({"protocolVersion":1,"modelKey":"clip:model","provider":provider,
+            "preprocessingSha256":"a".repeat(64),"fixtureSha256":"b".repeat(64),
+            "bindingSha256":"c".repeat(64),"reason":null,"runtimeFingerprint":"d".repeat(64),
+            "coldMilliseconds":120.0,"warmMilliseconds":8.5,"state":state,
+            "execution":[{"state":state,"reason":null,"nodes":nodes}]});
+        [report, spec]
+    }
+    fn check(provider: &str, state: &str, cpu_nodes: bool, runtime: &str) -> Result<(), String> {
+        let [report, spec] = report_for(provider, state, cpu_nodes);
+        validate_report(&report, &spec, &"c".repeat(64), runtime)
+    }
+    #[test]
+    fn report_is_accepted_only_for_the_provider_the_runtime_declares() {
+        const CPU: &str = "CPUExecutionProvider";
+        const COREML: &str = "CoreMLExecutionProvider";
+        const OPENVINO: &str = "OpenVINOExecutionProvider";
+        const CUDA: &str = "CUDAExecutionProvider";
+        assert!(check(CPU, "ready-cpu", false, CPU).is_ok());
+        assert!(check(COREML, "ready-mixed", false, COREML).is_ok());
+        assert!(check(COREML, "ready-mixed", true, COREML).is_ok());
+        for provider in [OPENVINO, CUDA] {
+            assert!(check(provider, "ready-accelerator", false, provider).is_ok());
+            assert!(check(provider, "ready-mixed", true, provider).is_ok());
+            assert!(check(provider, "ready-accelerator", true, provider).is_err());
+        }
+        // CoreML never counts as accelerator-only, and a CPU runtime cannot pass as accelerated.
+        assert!(check(COREML, "ready-accelerator", false, COREML).is_err());
+        assert!(check(COREML, "ready-cpu", false, COREML).is_err());
+        // A report for another provider than the installed runtime's is refused, either way round.
+        for (provider, state, runtime) in [
+            (COREML, "ready-mixed", CPU),
+            (OPENVINO, "ready-accelerator", CPU),
+            (CUDA, "ready-accelerator", OPENVINO),
+            (CPU, "ready-cpu", COREML),
+        ] {
+            assert_eq!(
+                check(provider, state, false, runtime).unwrap_err(),
+                "runtime_qualification_report_invalid",
+                "{provider} under {runtime}"
+            );
+        }
+        // Providers no runtime profile declares are refused even when the runtime names them.
+        for provider in ["MIGraphXExecutionProvider", "TensorrtExecutionProvider", ""] {
+            assert!(check(provider, "ready-accelerator", false, provider).is_err());
+        }
+    }
     #[test]
     fn qualification_cannot_start_a_different_runtime_manifest() {
         let runtime = VerifiedRuntime {

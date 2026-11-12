@@ -954,6 +954,16 @@ impl SourceJobs {
     pub fn watching(&self) -> bool {
         self.watching.load(Ordering::Acquire)
     }
+    /// A copy is running, or queued behind the other import.
+    pub fn copying(&self) -> bool {
+        self.running
+            .try_lock()
+            .map_or(true, |running| running.is_some())
+            && self
+                .status
+                .lock()
+                .is_ok_and(|status| matches!(status.state.as_str(), "copying" | "queued"))
+    }
     pub async fn stop(&self) {
         if let Some(running) = self.running.lock().await.take() {
             running.cancel.store(true, Ordering::Release);
