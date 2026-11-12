@@ -88,11 +88,11 @@ impl SourceConsent {
         Ok(())
     }
     pub fn select(&self, generation: u64, path: PathBuf) -> Result<SelectedFolder, String> {
-        let inventory = photo_sources::inventory(&path, 10_000)?;
+        let inventory = photo_sources::inventory(&path, photo_sources::MAX_ENTRIES)?;
         self.remember(generation, path, inventory)
     }
     pub fn select_camera(&self, generation: u64, path: PathBuf) -> Result<SelectedFolder, String> {
-        let inventory = photo_sources::camera_inventory(&path, 10_000)?;
+        let inventory = photo_sources::camera_inventory(&path, photo_sources::MAX_ENTRIES)?;
         self.remember(generation, path, inventory)
     }
     fn remember(

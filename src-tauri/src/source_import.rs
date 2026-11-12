@@ -12,7 +12,7 @@ use crate::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -32,6 +32,15 @@ struct Manifest {
     skipped: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     availability: Option<crate::source_metadata::AvailabilitySummary>,
+    /// Why files counted in `skipped` were left out, where the reason is known.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_reasons: BTreeMap<String, u64>,
+    /// The folder held more files than one batch; the next batch follows this run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    more: bool,
+    /// The digest of the completed batch this manifest follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continues: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -58,9 +67,36 @@ struct Cursor {
     upload_budget: Option<UploadBudget>,
     position: usize,
     active: Option<Active>,
+    /// Files left out of this run because they changed or went away before they were staged.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     watch_skipped: BTreeSet<usize>,
+    /// The reason code for each skipped file, counted. Never a filename.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_reasons: BTreeMap<String, u64>,
+    /// A later scan found no further batch after this completed one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    exhausted: bool,
     state: String,
+}
+/// Automatic allowance renewals stop here; beyond it the person approves more upload data.
+const AUTOMATIC_ALLOWANCE_FACTOR: u64 = 4;
+impl UploadBudget {
+    /// Charges `bytes`. An exhausted allowance is renewed for the files still to copy, as an
+    /// explicit approval would, until the run has been granted `ceiling` bytes in total.
+    fn admit(&mut self, bytes: u64, renewal: u64, ceiling: u64) -> Result<(), String> {
+        let used = match crate::upload_budget::reserve(self.used, bytes, self.limit) {
+            Err(code) if self.limit < ceiling => {
+                let limit = self.limit.saturating_add(renewal).min(ceiling);
+                let used =
+                    crate::upload_budget::reserve(self.used, bytes, limit).map_err(|_| code)?;
+                self.limit = limit;
+                used
+            }
+            other => other?,
+        };
+        self.used = used;
+        Ok(())
+    }
 }
 fn digest(value: &impl Serialize) -> Result<String, String> {
     Ok(format!(
@@ -87,6 +123,8 @@ impl Cursor {
             position: 0,
             active: None,
             watch_skipped: BTreeSet::new(),
+            skipped_reasons: BTreeMap::new(),
+            exhausted: false,
             state: "ready".into(),
         })
     }
@@ -113,9 +151,12 @@ impl Cursor {
             .is_some_and(|budget| budget.used > budget.limit)
             || self.manifest_hash != digest(manifest)?
             || self.position > manifest.files.len()
-            || self.watch_skipped.iter().any(|&index| {
-                index >= self.position || manifest.files[index].watch_version.is_none()
-            })
+            || self
+                .watch_skipped
+                .iter()
+                .any(|&index| index >= self.position)
+            || self.skipped_reasons.values().sum::<u64>() > self.watch_skipped.len() as u64
+            || (self.exhausted && self.state != "complete")
             || !matches!(
                 self.state.as_str(),
                 "ready" | "open" | "paused" | "cancelled" | "complete"
@@ -262,6 +303,14 @@ pub struct ImportView {
     pub album_pending: bool,
     pub availability: Option<crate::source_metadata::AvailabilitySummary>,
 }
+/// The allowance one approval adds: twice the bytes of the files still to copy.
+fn remaining_allowance(manifest: &Manifest, cursor: &Cursor) -> u64 {
+    manifest.files[cursor.position..]
+        .iter()
+        .map(|file| file.bytes)
+        .sum::<u64>()
+        .saturating_mul(2)
+}
 fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>) -> ImportView {
     ImportView {
         state: state.into(),
@@ -273,11 +322,7 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
             .upload_budget
             .as_ref()
             .map(|budget| budget.limit - budget.used),
-        additional_upload_allowance: manifest.files[cursor.position..]
-            .iter()
-            .map(|file| file.bytes)
-            .sum::<u64>()
-            .saturating_mul(2),
+        additional_upload_allowance: remaining_allowance(manifest, cursor),
         skipped: manifest.skipped + cursor.watch_skipped.len() as u64,
         album_pending: manifest.destination.is_some()
             && cursor
@@ -287,6 +332,25 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
         availability: manifest.availability.clone(),
         code,
     }
+}
+/// Another batch of the same folder follows this completed one.
+fn continues(manifest: &Manifest, cursor: &Cursor) -> bool {
+    cursor.state == "complete" && manifest.more && !cursor.exhausted
+}
+/// The state a stored run is shown in while no job is working on it.
+fn resting<'a>(manifest: &Manifest, cursor: &'a Cursor) -> &'a str {
+    if cursor.state == "open" || continues(manifest, cursor) {
+        "paused"
+    } else {
+        &cursor.state
+    }
+}
+fn skipped_reasons(manifest: &Manifest, cursor: &Cursor) -> BTreeMap<String, u64> {
+    let mut reasons = manifest.skipped_reasons.clone();
+    for (reason, count) in &cursor.skipped_reasons {
+        *reasons.entry(reason.clone()).or_default() += count;
+    }
+    reasons
 }
 fn current(
     credential: &'static str,
@@ -308,28 +372,55 @@ fn manifest_for(
     base: &Path,
 ) -> Result<Manifest, String> {
     let approval = consent.approval(saved, identity)?;
-    if base.starts_with(approval.root()) || approval.root().starts_with(base) {
+    batch_manifest(consent, saved, identity, base, approval.root(), None)?
+        .ok_or("source_no_media".into())
+}
+/// One batch of the approved folder: the first, or the one after `previous`. `None` when a later
+/// batch has nothing left to copy.
+fn batch_manifest(
+    consent: &Consent,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    base: &Path,
+    root: &Path,
+    previous: Option<&Manifest>,
+) -> Result<Option<Manifest>, String> {
+    use crate::photo_sources::Pin;
+    let approval = consent.approval(saved, identity)?;
+    if base.starts_with(root) || root.starts_with(base) {
         return Err("source_staging_overlap".into());
     }
-    let scan = if let Some(media) = approval.media() {
-        crate::photo_sources::scan_camera(approval.root(), media)?
+    let pin = if let Some(media) = approval.media() {
+        Pin::Camera(media)
+    } else if previous.is_some_and(|run| run.files.iter().any(|file| file.watch_version.is_some()))
+    {
+        // A dropped folder stays bound to the folder that was previewed.
+        Pin::Dropped(approval.root_identity())
     } else {
-        crate::photo_sources::scan(approval.root(), 10_000)?
+        Pin::Unpinned
     };
+    let after = previous
+        .and_then(|run| run.files.last())
+        .map(|file| file.relative.as_str());
+    let scan = crate::photo_sources::scan_batch(root, pin, after)?;
     if scan.inventory.truncated {
         return Err("source_inventory_partial".into());
     }
     if scan.unreadable > 0 {
         return Err("source_inventory_unreadable".into());
     }
-    let mut manifest = make_manifest(consent, approval, scan)?;
-    approval.bind_camera_fingerprints(&mut manifest.files)?;
-    Ok(manifest)
+    if previous.is_some() && scan.files.is_empty() {
+        return Ok(None);
+    }
+    let mut manifest = make_manifest(consent, approval, scan, previous)?;
+    approval.bind_camera_fingerprints(root, &mut manifest.files)?;
+    Ok(Some(manifest))
 }
 fn make_manifest(
     consent: &Consent,
     approval: &crate::copy_source::CopyApproval,
     scan: crate::photo_sources::FolderScan,
+    previous: Option<&Manifest>,
 ) -> Result<Manifest, String> {
     if scan.files.is_empty() {
         return Err("source_no_media".into());
@@ -337,8 +428,9 @@ fn make_manifest(
     let mut total_bytes = 0u64;
     for file in &scan.files {
         // FL-1268: no per-file ceiling; the server's free-space limit and the run budget still apply.
+        // The scan leaves empty files out and counts them as skipped.
         if file.bytes == 0 {
-            return Err("source_copy_budget_exceeded".into());
+            return Err("source_item_invalid".into());
         }
         total_bytes = total_bytes
             .checked_add(file.bytes)
@@ -356,8 +448,20 @@ fn make_manifest(
         destination: consent.destination.clone(),
         files: scan.files,
         total_bytes,
-        skipped: scan.inventory.skipped,
+        // The folder-wide skips are reported once, with the first batch.
+        skipped: if previous.is_none() {
+            scan.inventory.skipped
+        } else {
+            0
+        },
         availability: Some(scan.inventory.availability),
+        skipped_reasons: if previous.is_none() && scan.inventory.empty > 0 {
+            BTreeMap::from([("source_item_empty".to_string(), scan.inventory.empty)])
+        } else {
+            BTreeMap::new()
+        },
+        more: scan.more,
+        continues: previous.map(digest).transpose()?,
     })
 }
 fn load_manifest(
@@ -400,6 +504,18 @@ fn load(
         }
         _ => journal.read("cursor.json", identity)?,
     };
+    // The next batch's manifest is written before its cursor. A stop between the two leaves the
+    // completed cursor of the batch this manifest names; nothing of the new batch was sent yet.
+    let cursor = if manifest.continues.as_deref() == Some(cursor.manifest_hash.as_str())
+        && cursor.state == "complete"
+        && cursor.active.is_none()
+    {
+        let cursor = Cursor::new(&manifest)?;
+        journal.write("cursor.json", &cursor, identity)?;
+        cursor
+    } else {
+        cursor
+    };
     cursor.validate(&manifest)?;
     Ok((manifest, cursor))
 }
@@ -414,8 +530,10 @@ fn camera_location(
         _ => {}
     }
     let location: CameraLocation = journal.read(CAMERA_LOCATION, identity)?;
+    // A reconnected camera stays reconnected for the batch that directly follows.
     if approval.media().is_none()
-        || location.manifest_hash != digest(manifest)?
+        || (location.manifest_hash != digest(manifest)?
+            && manifest.continues.as_deref() != Some(location.manifest_hash.as_str()))
         || !location.path.is_absolute()
     {
         return Err("source_journal_invalid".into());
@@ -437,7 +555,7 @@ fn reconnect_camera_at(
         return Err("source_camera_identity_unavailable".into());
     }
     let (manifest, cursor) = load(journal, identity, consent, saved)?;
-    if matches!(cursor.state.as_str(), "complete" | "cancelled") {
+    if matches!(cursor.state.as_str(), "complete" | "cancelled") && !continues(&manifest, &cursor) {
         return Err("source_run_terminal".into());
     }
     if root.starts_with(&journal.root) || journal.root.starts_with(&root) {
@@ -664,6 +782,8 @@ async fn execute(
         if state["state"] == "cancelled" {
             cursor.state = "cancelled".into();
             journal.write("cursor.json", &cursor, identity)?;
+            // A cancelled run never resumes, so its staged copies are no longer needed.
+            crate::copy_source::release_stages(&journal.root.join("stage"));
             notify(view(&manifest, &cursor, "cancelled", None));
             return Ok(());
         }
@@ -673,7 +793,10 @@ async fn execute(
             }
             cursor.state = "complete".into();
             journal.write("cursor.json", &cursor, identity)?;
-            notify(view(&manifest, &cursor, "complete", None));
+            crate::copy_source::release_stages(&journal.root.join("stage"));
+            if !manifest.more {
+                notify(view(&manifest, &cursor, "complete", None));
+            }
             return Ok(());
         }
         api.state(&manifest, "open").await?;
@@ -728,18 +851,19 @@ async fn execute(
                     );
                     match staged {
                         Err(code)
-                            if consent.watch
-                                && entry.watch_version.is_some()
-                                && matches!(
-                                    code.as_str(),
-                                    "source_item_changed"
-                                        | "source_item_unavailable"
-                                        | "source_item_excluded"
-                                        | "source_item_invalid"
-                                ) =>
+                            if matches!(
+                                code.as_str(),
+                                "source_item_changed"
+                                    | "source_item_unavailable"
+                                    | "source_item_excluded"
+                                    | "source_item_invalid"
+                            ) =>
                         {
-                            // No item was planned or uploaded. A later scan can reconsider this path.
+                            // No item was planned or uploaded, and the original is untouched. The
+                            // rest of the run continues; a watched folder reconsiders this path on
+                            // a later scan, and any other import records why it was left out.
                             cursor.watch_skipped.insert(cursor.position);
+                            *cursor.skipped_reasons.entry(code).or_default() += 1;
                             cursor.position += 1;
                             cursor.active = None;
                             journal.write("cursor.json", &cursor, identity)?;
@@ -798,36 +922,70 @@ async fn execute(
                         &cursor.active.as_ref().unwrap().item_id,
                     )?;
                     let mut upload = cursor.active.as_ref().unwrap().upload.clone();
-                    let outcome = copy_upload::transfer(
-                        client,
-                        base,
-                        saved,
-                        identity,
-                        &copy,
-                        &binding,
-                        &journal.root.join("stage"),
-                        &mut upload,
-                        |session, bytes| {
-                            let budget = cursor
-                                .upload_budget
-                                .as_mut()
-                                .ok_or("source_upload_budget_required")?;
-                            budget.used =
-                                crate::upload_budget::reserve(budget.used, bytes, budget.limit)?;
-                            cursor.active.as_mut().unwrap().upload = Some(session.clone());
-                            journal.write("cursor.json", &cursor, identity)?;
-                            notify(view(&manifest, &cursor, "copying", None));
-                            Ok(())
-                        },
-                        cancel,
-                        gate,
-                    )
-                    .await?;
+                    let (mut renewed, mut waits) = (false, 0);
+                    let asset_id = loop {
+                        let outcome = copy_upload::transfer(
+                            client,
+                            base,
+                            saved,
+                            identity,
+                            &copy,
+                            &binding,
+                            &journal.root.join("stage"),
+                            &mut upload,
+                            |session, bytes| {
+                                let renewal = remaining_allowance(&manifest, &cursor);
+                                cursor
+                                    .upload_budget
+                                    .as_mut()
+                                    .ok_or("source_upload_budget_required")?
+                                    .admit(
+                                        bytes,
+                                        renewal,
+                                        manifest
+                                            .total_bytes
+                                            .saturating_mul(AUTOMATIC_ALLOWANCE_FACTOR),
+                                    )?;
+                                cursor.active.as_mut().unwrap().upload = Some(session.clone());
+                                journal.write("cursor.json", &cursor, identity)?;
+                                notify(view(&manifest, &cursor, "copying", None));
+                                Ok(())
+                            },
+                            cancel,
+                            gate,
+                        )
+                        .await;
+                        match outcome {
+                            Ok(UploadOutcome::Ingested { asset_id, .. }) => break asset_id,
+                            // The server is still processing the bytes it has; ask again shortly.
+                            Ok(UploadOutcome::Pending) if waits < PROCESSING_WAITS => {
+                                waits += 1;
+                                wait(PROCESSING_WAIT * waits.min(6), cancel).await?;
+                            }
+                            Ok(UploadOutcome::Pending) => {
+                                return Err("source_server_processing".into())
+                            }
+                            // The server no longer has the saved upload session (it expired or
+                            // was removed). Forget it and send this original in one new session;
+                            // the server still verifies the hash before anything is recorded.
+                            Err(code)
+                                if !renewed
+                                    && upload.is_some()
+                                    && matches!(
+                                        code.as_str(),
+                                        "source_upload_http_404" | "source_upload_http_410"
+                                    ) =>
+                            {
+                                renewed = true;
+                                upload = None;
+                                cursor.active.as_mut().unwrap().upload = None;
+                                journal.write("cursor.json", &cursor, identity)?;
+                            }
+                            Err(code) => return Err(code),
+                        }
+                    };
                     cursor.active.as_mut().unwrap().upload = upload;
-                    match outcome {
-                        UploadOutcome::Pending => return Err("source_server_processing".into()),
-                        UploadOutcome::Ingested { asset_id, .. } => asset = Some(asset_id),
-                    }
+                    asset = Some(asset_id);
                 }
             }
             // A stored receipt is evidence of an earlier acknowledgement, not current NAS file health.
@@ -863,7 +1021,12 @@ async fn execute(
         api.state(&manifest, "complete").await?;
         cursor.state = "complete".into();
         journal.write("cursor.json", &cursor, identity)?;
-        notify(view(&manifest, &cursor, "complete", None));
+        // Every original of this run is verified or skipped; nothing staged is still needed.
+        crate::copy_source::release_stages(&journal.root.join("stage"));
+        // The next batch of a large folder follows without announcing a finished import.
+        if !manifest.more {
+            notify(view(&manifest, &cursor, "complete", None));
+        }
         Ok(())
     }
     .await;
@@ -884,6 +1047,92 @@ async fn execute(
         ));
     }
     result
+}
+/// How long a file the server is still processing is waited for before the run reports it.
+const PROCESSING_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(5)
+} else {
+    std::time::Duration::from_secs(10)
+};
+const PROCESSING_WAITS: u32 = 12;
+async fn wait(delay: std::time::Duration, cancel: &AtomicBool) -> Result<(), String> {
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("source_copy_cancelled".into());
+        }
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(left.min(std::time::Duration::from_millis(100))).await;
+    }
+}
+
+/// Runs the stored batch and then each following batch of the same approved folder, so a folder
+/// larger than one manifest is copied to its end without holding its whole file list.
+#[allow(clippy::too_many_arguments)]
+async fn execute_all(
+    client: &Client,
+    origin: &url::Url,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    consent: &Consent,
+    journal: &Journal,
+    base: &Path,
+    kind: history::Kind,
+    cancel: &AtomicBool,
+    gate: &(dyn Fn() -> Result<(), String> + Sync),
+    notify: &(dyn Fn(ImportView) + Sync),
+) -> Result<(), String> {
+    loop {
+        let (manifest, mut cursor) = load(journal, identity, consent, saved)?;
+        if !continues(&manifest, &cursor) {
+            execute(
+                client, origin, saved, identity, consent, journal, cancel, gate, notify,
+            )
+            .await?;
+            let (manifest, cursor) = load(journal, identity, consent, saved)?;
+            if !continues(&manifest, &cursor) {
+                return Ok(());
+            }
+            continue;
+        }
+        gate()?;
+        history::completed(base, saved, identity, kind, &manifest, &cursor);
+        let approval = consent.approval(saved, identity)?;
+        let location = if approval.media().is_some() {
+            camera_location(journal, &manifest, identity, approval)?
+        } else {
+            None
+        };
+        let root = location.as_deref().unwrap_or(approval.root());
+        // This job already runs on a blocking thread; the scan holds no application lock.
+        match batch_manifest(consent, saved, identity, base, root, Some(&manifest))? {
+            Some(next) => {
+                let first = Cursor::new(&next)?;
+                journal.write("manifest.json", &next, identity)?;
+                journal.write("cursor.json", &first, identity)?;
+                if let Some(path) = location {
+                    journal.write(
+                        CAMERA_LOCATION,
+                        &CameraLocation {
+                            manifest_hash: digest(&next)?,
+                            path,
+                        },
+                        identity,
+                    )?;
+                }
+                notify(view(&next, &first, "copying", None));
+            }
+            None => {
+                cursor.exhausted = true;
+                journal.write("cursor.json", &cursor, identity)?;
+                notify(view(&manifest, &cursor, "complete", None));
+                return Ok(());
+            }
+        }
+    }
 }
 struct Running {
     cancel: Arc<AtomicBool>,
@@ -910,6 +1159,47 @@ impl ImportTransfer {
             }
         }
     }
+}
+
+/// Imports pause only on a connection the platform reports as metered. A platform that cannot
+/// classify the connection (Linux without NetworkManager, for one) does not block every import.
+fn network_admission(unmetered: Option<bool>) -> Result<(), String> {
+    match unmetered {
+        Some(false) => Err("metered_network".into()),
+        Some(true) | None => Ok(()),
+    }
+}
+
+/// Staged copies of sources whose approval is gone can never be used again. This removes only
+/// the app's staged copies under its own data folder; journals and every source file are kept.
+fn sweep_abandoned(base: &Path, current: &[String]) {
+    let Ok(entries) = fs::read_dir(base.join("photo-imports")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(source) = name.to_str().filter(|name| uuid(name)) else {
+            continue;
+        };
+        if current.iter().any(|id| id == source) {
+            continue;
+        }
+        let root = entry.path();
+        crate::copy_source::release_stages(&root.join("stage"));
+        crate::copy_source::release_stages(&root.join("watch-batch").join("stage"));
+    }
+}
+fn sweep_abandoned_sources(base: &Path) {
+    let mut current = Vec::new();
+    for credential in [CREDENTIAL, crate::drop_import::CREDENTIAL] {
+        match credentials::load::<Consent>(credential) {
+            Ok(Some(consent)) => current.push(consent.source_id().to_string()),
+            Ok(None) => {}
+            // Without a certain answer about every approval, nothing is removed.
+            Err(_) => return,
+        }
+    }
+    sweep_abandoned(base, &current);
 }
 
 pub(crate) struct SourceJobs {
@@ -945,7 +1235,7 @@ impl SourceJobs {
         if base.starts_with(approval.root()) || approval.root().starts_with(base) {
             return Err("source_staging_overlap".into());
         }
-        let manifest = make_manifest(consent, approval, scan)?;
+        let manifest = make_manifest(consent, approval, scan, None)?;
         let journal = Journal::new(base, consent.source_id())?;
         journal.write("manifest.json", &manifest, identity)?;
         journal.write("cursor.json", &Cursor::new(&manifest)?, identity)
@@ -1004,11 +1294,7 @@ impl SourceJobs {
         Ok(Some(view(
             &manifest,
             &cursor,
-            if cursor.state == "open" {
-                "paused"
-            } else {
-                &cursor.state
-            },
+            resting(&manifest, &cursor),
             None,
         )))
     }
@@ -1028,6 +1314,7 @@ impl SourceJobs {
         if base.starts_with(approval.root()) || approval.root().starts_with(base) {
             return Err("source_staging_overlap".into());
         }
+        sweep_abandoned_sources(base);
         let journal = Journal::new(base, consent.source_id())?;
         let (manifest, cursor) = if journal.root.join("manifest.json").exists()
             || journal.root.join("cursor.json").exists()
@@ -1048,16 +1335,7 @@ impl SourceJobs {
             journal.write("cursor.json", &cursor, &identity)?;
             (manifest, cursor)
         };
-        let value = view(
-            &manifest,
-            &cursor,
-            if cursor.state == "open" {
-                "paused"
-            } else {
-                &cursor.state
-            },
-            None,
-        );
+        let value = view(&manifest, &cursor, resting(&manifest, &cursor), None);
         *self
             .status
             .lock()
@@ -1085,6 +1363,7 @@ impl SourceJobs {
         if !watch && matches!(value.state.as_str(), "complete" | "cancelled") {
             return Err("source_run_terminal".into());
         }
+        sweep_abandoned_sources(&base);
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let status = self.status.clone();
@@ -1158,11 +1437,7 @@ impl SourceJobs {
                                 crate::resource_policy::sample().unmetered,
                             );
                         }
-                        match snapshot.1 {
-                            Some(true) => Ok(()),
-                            Some(false) => Err("metered_network".into()),
-                            None => Err("network_unknown".into()),
-                        }
+                        network_admission(snapshot.1)
                     };
                     let client = transport::client()?;
                     let origin = crate::connection::normalize_server(&saved.server)?;
@@ -1183,8 +1458,17 @@ impl SourceJobs {
                             queued.state = "copying".into();
                             notify(queued);
                         }
-                        execute(
-                            &client, &origin, &saved, &identity, &source, &journal, &stop, &gate,
+                        execute_all(
+                            &client,
+                            &origin,
+                            &saved,
+                            &identity,
+                            &source,
+                            &journal,
+                            &base,
+                            history::Kind::for_consent(credential, &source),
+                            &stop,
+                            &gate,
                             &notify,
                         )
                         .await
@@ -1322,6 +1606,14 @@ impl SourceJobs {
         if !matches!(cursor.state.as_str(), "complete" | "cancelled") {
             cursor.state = if cancel { "cancelled" } else { "paused" }.into();
             journal.write("cursor.json", &cursor, &identity)?;
+            if cancel {
+                // A cancelled run never resumes, so its staged copies are no longer needed.
+                crate::copy_source::release_stages(&journal.root.join("stage"));
+            }
+        } else if cancel && continues(&manifest, &cursor) {
+            // Between batches there is no open run to cancel; the remaining batches are dropped.
+            cursor.exhausted = true;
+            journal.write("cursor.json", &cursor, &identity)?;
         }
         let client = transport::client()?;
         let base = crate::connection::normalize_server(&saved.server)?;
@@ -1368,7 +1660,11 @@ mod tests {
             for acknowledged in [true, false] {
                 let f = Fixture::new();
                 let mut cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
-                cursor.upload_budget = Some(UploadBudget { used: 0, limit: 4 });
+                // 36 of the 40 bytes this run may be granted automatically are already spent.
+                cursor.upload_budget = Some(UploadBudget {
+                    used: 36,
+                    limit: 40,
+                });
                 f.journal
                     .write("cursor.json", &cursor, &f.identity)
                     .unwrap();
@@ -1398,7 +1694,8 @@ mod tests {
                 assert_eq!(patches.len(), 1);
                 assert_eq!(patches[0].1, b"abcd");
                 let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
-                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 4);
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 40);
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().limit, 40);
                 assert_eq!(cursor.position, 0);
                 assert!(cursor.active.as_ref().unwrap().copy.is_some());
                 let mut replies = vec![
@@ -1428,10 +1725,10 @@ mod tests {
                     .iter()
                     .any(|(headers, _)| headers.starts_with("PATCH /api/assets/uploads/")));
                 let mut cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
-                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 4);
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 40);
                 cursor.approve_upload(&f.manifest).unwrap();
-                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 4);
-                assert_eq!(cursor.upload_budget.as_ref().unwrap().limit, 24);
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().used, 40);
+                assert_eq!(cursor.upload_budget.as_ref().unwrap().limit, 60);
                 f.journal
                     .write("cursor.json", &cursor, &f.identity)
                     .unwrap();
@@ -1483,7 +1780,7 @@ mod tests {
                 assert_eq!(final_cursor.state, "complete");
                 assert_eq!(
                     final_cursor.upload_budget.unwrap().used,
-                    if acknowledged { 10 } else { 14 }
+                    if acknowledged { 46 } else { 50 }
                 );
                 assert!(!f.journal.root.join("stage").join(&f.stage).exists());
             }
@@ -1535,6 +1832,9 @@ mod tests {
             total_bytes: 8,
             skipped: 0,
             availability: None,
+            skipped_reasons: BTreeMap::new(),
+            more: false,
+            continues: None,
         };
         let journal = Journal::new(&base, &manifest.source_id).unwrap();
         journal
@@ -1950,15 +2250,22 @@ mod tests {
                 f.run_ack("open"),
                 f.state_ack("open"),
                 f.run_ack("open"),
+                f.state_ack("complete"),
             ]);
-            assert_eq!(
-                f.run(&refused, &|| Ok(())).await.err().as_deref(),
-                Some("source_item_changed")
-            );
+            f.run(&refused, &|| Ok(())).await.unwrap();
             let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
-            assert_eq!(cursor.position, 0);
-            assert_eq!(cursor.state, "paused");
-            assert!(cursor.active.unwrap().copy.is_none());
+            assert_eq!(cursor.state, "complete");
+            assert_eq!(
+                cursor.skipped_reasons,
+                BTreeMap::from([("source_item_changed".to_string(), 1)])
+            );
+            assert_eq!(view(&f.manifest, &cursor, "complete", None).completed, 0);
+            assert!(
+                !refused.requests.lock().unwrap().iter().any(|(headers, _)| {
+                    headers.contains("/api/assets/uploads") || headers.contains("/items")
+                })
+            );
+            assert_eq!(fs::read(&original).unwrap(), b"0123456789");
 
             // A fresh drop can be completed by reloading the same signed journal after interruption.
             let mut f = Fixture::new();
@@ -2294,11 +2601,25 @@ mod tests {
                 std::ffi::CString::new(f.base.join("source/photo.jpg").as_os_str().as_bytes())
                     .unwrap();
             assert_eq!(unsafe { libc::chflags(path.as_ptr(), 0x8000) }, 0);
-            let server = Server::new(f.replies(f.receipt(), false, false));
+            let server = Server::new(vec![
+                preflight()[0].clone(),
+                f.run_ack("open"),
+                f.state_ack("open"),
+                f.run_ack("open"),
+                f.state_ack("complete"),
+            ]);
+            f.run(&server, &|| Ok(())).await.unwrap();
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
             assert_eq!(
-                f.run(&server, &|| Ok(())).await.err().as_deref(),
-                Some("source_item_excluded")
+                cursor.skipped_reasons,
+                BTreeMap::from([("source_item_excluded".to_string(), 1)])
             );
+            assert!(!server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(headers, _)| headers.contains("/api/assets/uploads")));
             assert!(!f.journal.root.join("stage").join(&f.stage).exists());
         });
     }
@@ -2345,6 +2666,459 @@ mod tests {
                 .iter()
                 .any(|(h, _)| h.contains("/api/assets/uploads")));
             assert!(!original.exists());
+        });
+    }
+
+    const RENEWED: &str = "22222222-2222-4222-8222-222222222222";
+    fn staged(f: &Fixture) -> Vec<String> {
+        fs::read_dir(f.journal.root.join("stage"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn an_exhausted_allowance_renews_itself_up_to_a_ceiling_without_a_manual_approval() {
+        tauri::async_runtime::block_on(async {
+            let f = Fixture::new();
+            let mut cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            cursor.upload_budget = Some(UploadBudget { used: 0, limit: 4 });
+            f.journal
+                .write("cursor.json", &cursor, &f.identity)
+                .unwrap();
+            let server = Server::new(f.replies(f.receipt(), false, false));
+            f.run(&server, &|| Ok(())).await.unwrap();
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(cursor.state, "complete");
+            let budget = cursor.upload_budget.unwrap();
+            // One renewal of twice the remaining bytes, as an approval would grant.
+            assert_eq!((budget.used, budget.limit), (10, 24));
+        });
+        let mut budget = UploadBudget { used: 0, limit: 4 };
+        budget.admit(4, 20, 40).unwrap();
+        assert_eq!((budget.used, budget.limit), (4, 4));
+        budget.admit(30, 20, 40).unwrap_err();
+        assert_eq!((budget.used, budget.limit), (4, 4));
+        budget.admit(20, 20, 40).unwrap();
+        assert_eq!((budget.used, budget.limit), (24, 24));
+        budget.admit(16, 20, 40).unwrap();
+        assert_eq!((budget.used, budget.limit), (40, 40));
+        assert_eq!(
+            budget.admit(1, 20, 40).unwrap_err(),
+            "source_upload_budget_exhausted"
+        );
+    }
+
+    #[test]
+    fn a_file_the_server_is_still_processing_is_waited_for_within_a_bound() {
+        tauri::async_runtime::block_on(async {
+            let f = Fixture::new();
+            // The first result poll answers 202; the retry finds the upload complete.
+            let mut replies = f.replies(f.receipt(), false, false);
+            let result = replies.len() - 3;
+            let finished = replies.split_off(result);
+            replies.push(protocol(202, "", ""));
+            replies.extend(preflight());
+            replies.push(protocol(
+                204,
+                "Upload-Offset: 10\r\nUpload-Complete: ?1\r\n",
+                "",
+            ));
+            replies.extend(finished);
+            let server = Server::new(replies);
+            f.run(&server, &|| Ok(())).await.unwrap();
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!(cursor.state, "complete");
+            assert_eq!(
+                server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(headers, _)| headers.starts_with("POST /api/assets/uploads "))
+                    .count(),
+                1
+            );
+
+            let g = Fixture::new();
+            let mut replies = g.replies(g.receipt(), false, false);
+            replies.truncate(result);
+            for _ in 0..=PROCESSING_WAITS {
+                replies.push(protocol(202, "", ""));
+                replies.extend(preflight());
+                replies.push(protocol(
+                    204,
+                    "Upload-Offset: 10\r\nUpload-Complete: ?1\r\n",
+                    "",
+                ));
+            }
+            let stuck = Server::new(replies);
+            assert_eq!(
+                g.run(&stuck, &|| Ok(())).await.unwrap_err(),
+                "source_server_processing"
+            );
+        });
+    }
+
+    #[test]
+    fn a_saved_upload_session_the_server_no_longer_has_is_replaced_once() {
+        tauri::async_runtime::block_on(async {
+            for gone_again in [false, true] {
+                let f = Fixture::new();
+                let mut replies = f.replies(f.receipt(), false, false);
+                replies.truncate(9);
+                replies.push(protocol(503, "", "{}"));
+                let interrupted = Server::new(replies);
+                assert_eq!(
+                    f.run(&interrupted, &|| Ok(())).await.unwrap_err(),
+                    "source_upload_http_503"
+                );
+                let saved: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                assert_eq!(
+                    saved.active.unwrap().upload.unwrap().resource_id(),
+                    RESOURCE
+                );
+
+                let mut replies = vec![
+                    preflight()[0].clone(),
+                    f.run_ack("open"),
+                    f.state_ack("open"),
+                    f.plan_ack("planned"),
+                ];
+                replies.extend(preflight());
+                // The saved session expired on the server.
+                replies.push(protocol(404, "", "{}"));
+                replies.extend(preflight());
+                replies.push(protocol(
+                    201,
+                    &format!("Location: /api/assets/uploads/{RENEWED}\r\nUpload-Offset: 0\r\nUpload-Complete: ?0\r\n"),
+                    "",
+                ));
+                if gone_again {
+                    replies.push(protocol(404, "", "{}"));
+                } else {
+                    for offset in [4, 8, 10] {
+                        replies.push(protocol(
+                            204,
+                            &format!("Upload-Offset: {offset}\r\nUpload-Complete: ?0\r\n"),
+                            "",
+                        ));
+                    }
+                    replies.push(protocol(
+                        200,
+                        "",
+                        &json!({"id":ASSET,"status":"created","sha256":f.probe.sha256}).to_string(),
+                    ));
+                    let mut receipt = f.receipt();
+                    receipt["uploadResourceId"] = json!(RENEWED);
+                    replies.push(protocol(200, "", &receipt.to_string()));
+                    replies.push(f.state_ack("complete"));
+                }
+                let server = Server::new(replies);
+                let result = f.run(&server, &|| Ok(())).await;
+                let requests = server.requests.lock().unwrap();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|(headers, _)| headers
+                            .starts_with(&format!("HEAD /api/assets/uploads/{RESOURCE} ")))
+                        .count(),
+                    1
+                );
+                // Exactly one new session: a second missing session is reported, not retried.
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|(headers, _)| headers.starts_with("POST /api/assets/uploads "))
+                        .count(),
+                    1
+                );
+                let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+                if gone_again {
+                    assert_eq!(result.unwrap_err(), "source_upload_http_404");
+                    assert_eq!(cursor.state, "paused");
+                } else {
+                    result.unwrap();
+                    assert_eq!(cursor.state, "complete");
+                    let verify = requests
+                        .iter()
+                        .find(|(headers, _)| headers.contains("/verify "))
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&verify.1).unwrap(),
+                        json!({"uploadResourceId": RENEWED})
+                    );
+                }
+                assert_eq!(
+                    fs::read(f.base.join("source/photo.jpg")).unwrap(),
+                    b"abcdefghij"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_file_changed_during_the_import_is_skipped_with_its_reason_and_the_rest_complete() {
+        tauri::async_runtime::block_on(async {
+            let mut f = Fixture::new();
+            let later = f.base.join("source/zz-later.jpg");
+            fs::write(&later, b"0123456789").unwrap();
+            f.manifest =
+                manifest_for(&f.consent, &f.saved, &f.identity, &f.base.join("data")).unwrap();
+            assert_eq!(f.manifest.files.len(), 2);
+            let mut cursor = Cursor::new(&f.manifest).unwrap();
+            cursor.active = Some(Active {
+                item_id: f.item.clone(),
+                stage_id: f.stage.clone(),
+                copy: None,
+                upload: None,
+                receipt: None,
+                album_attached: false,
+            });
+            f.journal
+                .write("manifest.json", &f.manifest, &f.identity)
+                .unwrap();
+            f.journal
+                .write("cursor.json", &cursor, &f.identity)
+                .unwrap();
+            let run = protocol(201,"",&json!({"id":f.manifest.id,"sourceId":f.manifest.source_id,"maxItems":2,"maxBytes":20,"state":"open"}).to_string());
+            let mut replies = f.replies(f.receipt(), false, false);
+            replies[1] = run.clone();
+            replies[3] = run.clone();
+            replies.insert(replies.len() - 1, run);
+            let server = Server::new(replies);
+            let requests = server.requests.clone();
+            let changed = AtomicBool::new(false);
+            // The second file is rewritten while the first is being uploaded.
+            let gate = || {
+                if requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(headers, _)| headers.starts_with("PATCH /api/assets/uploads/"))
+                    && !changed.swap(true, Ordering::AcqRel)
+                {
+                    fs::write(&later, b"edited while importing").unwrap();
+                }
+                Ok(())
+            };
+            f.run(&server, &gate).await.unwrap();
+            assert!(changed.load(Ordering::Acquire));
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!((cursor.state.as_str(), cursor.position), ("complete", 2));
+            assert_eq!(cursor.watch_skipped, BTreeSet::from([1]));
+            let shown = view(&f.manifest, &cursor, "complete", None);
+            assert_eq!((shown.completed, shown.skipped), (1, 1));
+            let entry = serde_json::to_value(history::Entry::from_run(
+                history::Kind::Folder,
+                &f.manifest,
+                &cursor,
+                false,
+            ))
+            .unwrap();
+            assert_eq!(entry["status"], "complete");
+            assert_eq!(
+                (&entry["verified"], &entry["total"]),
+                (&json!(1), &json!(2))
+            );
+            assert_eq!(entry["skipped"], 1);
+            assert_eq!(entry["skippedReasons"], json!({"source_item_changed": 1}));
+            assert!(!entry.to_string().contains("zz-later"));
+            // Neither original was modified, moved or deleted, and nothing stays staged.
+            assert_eq!(fs::read(&later).unwrap(), b"edited while importing");
+            assert_eq!(
+                fs::read(f.base.join("source/photo.jpg")).unwrap(),
+                b"abcdefghij"
+            );
+            assert!(staged(&f).is_empty());
+        });
+    }
+
+    #[test]
+    fn an_empty_file_is_left_out_with_its_reason_instead_of_failing_the_inventory() {
+        let f = Fixture::new();
+        fs::write(f.base.join("source/empty.jpg"), b"").unwrap();
+        let manifest =
+            manifest_for(&f.consent, &f.saved, &f.identity, &f.base.join("data")).unwrap();
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.relative.as_str())
+                .collect::<Vec<_>>(),
+            ["photo.jpg"]
+        );
+        assert_eq!(manifest.skipped, 1);
+        assert_eq!(
+            manifest.skipped_reasons,
+            BTreeMap::from([("source_item_empty".to_string(), 1)])
+        );
+        let cursor = Cursor::new(&manifest).unwrap();
+        cursor.validate(&manifest).unwrap();
+        assert_eq!(
+            skipped_reasons(&manifest, &cursor),
+            BTreeMap::from([("source_item_empty".to_string(), 1)])
+        );
+        fs::remove_file(f.base.join("source/photo.jpg")).unwrap();
+        assert_eq!(
+            manifest_for(&f.consent, &f.saved, &f.identity, &f.base.join("data"))
+                .err()
+                .as_deref(),
+            Some("source_no_media")
+        );
+    }
+
+    #[test]
+    fn an_unclassified_network_does_not_block_imports_but_a_metered_one_pauses_them() {
+        assert_eq!(network_admission(None), Ok(()));
+        assert_eq!(network_admission(Some(true)), Ok(()));
+        assert_eq!(
+            network_admission(Some(false)).unwrap_err(),
+            "metered_network"
+        );
+    }
+
+    #[test]
+    fn staged_copies_are_removed_when_a_run_completes_is_cancelled_or_loses_its_approval() {
+        tauri::async_runtime::block_on(async {
+            // The fixture's probe copy stands in for a staged original an earlier attempt left.
+            let f = Fixture::new();
+            assert_eq!(staged(&f), std::slice::from_ref(&f.probe.id));
+            let server = Server::new(f.replies(f.receipt(), false, false));
+            f.run(&server, &|| Ok(())).await.unwrap();
+            assert!(staged(&f).is_empty());
+
+            let f = Fixture::new();
+            let cancelled = Server::new(vec![preflight()[0].clone(), f.run_ack("cancelled")]);
+            f.run(&cancelled, &|| Ok(())).await.unwrap();
+            assert!(staged(&f).is_empty());
+
+            // A paused run with a current approval keeps its staged copy for the resume.
+            let f = Fixture::new();
+            let data = f.base.join("data");
+            fs::write(f.journal.root.join("stage").join("notes.txt"), b"kept").unwrap();
+            sweep_abandoned(&data, &[f.consent.source_id().to_string()]);
+            assert_eq!(staged(&f).len(), 2);
+            sweep_abandoned(&data, &[]);
+            assert_eq!(staged(&f), ["notes.txt"]);
+            assert!(f.journal.root.join("manifest.json").exists());
+            assert_eq!(
+                fs::read(f.base.join("source/photo.jpg")).unwrap(),
+                b"abcdefghij"
+            );
+        });
+    }
+
+    #[test]
+    fn a_folder_larger_than_one_batch_continues_with_the_next_batch_after_a_restart() {
+        tauri::async_runtime::block_on(async {
+            let f = Fixture::new();
+            let bulk = f.base.join("source/bulk");
+            fs::create_dir(&bulk).unwrap();
+            for index in 0..crate::photo_sources::BATCH_FILES {
+                fs::write(bulk.join(format!("{index:05}.jpg")), b"x").unwrap();
+            }
+            let data = f.base.join("data");
+            let first = manifest_for(&f.consent, &f.saved, &f.identity, &data).unwrap();
+            assert_eq!(first.files.len(), crate::photo_sources::BATCH_FILES);
+            assert!(first.more && first.continues.is_none());
+            let mut cursor = Cursor::new(&first).unwrap();
+            cursor.position = first.files.len();
+            cursor.state = "complete".into();
+            f.journal
+                .write("manifest.json", &first, &f.identity)
+                .unwrap();
+            f.journal
+                .write("cursor.json", &cursor, &f.identity)
+                .unwrap();
+            // A completed batch with more to copy is resumable, not a finished import.
+            assert!(continues(&first, &cursor));
+            assert_eq!(resting(&first, &cursor), "paused");
+
+            // The connection becomes metered right after the next batch is recorded.
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let gate = || {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Ok(())
+                } else {
+                    Err("metered_network".into())
+                }
+            };
+            let offline = url::Url::parse("http://127.0.0.1:9/").unwrap();
+            let result = execute_all(
+                &transport::client().unwrap(),
+                &offline,
+                &f.saved,
+                &f.identity,
+                &f.consent,
+                &f.journal,
+                &data,
+                history::Kind::Folder,
+                &AtomicBool::new(false),
+                &gate,
+                &|_| {},
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), "metered_network");
+            let (next, cursor) = load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
+            assert_eq!(
+                next.files
+                    .iter()
+                    .map(|file| file.relative.as_str())
+                    .collect::<Vec<_>>(),
+                ["photo.jpg"]
+            );
+            assert_eq!(next.continues, Some(digest(&first).unwrap()));
+            assert!(!next.more);
+            assert_eq!((cursor.position, cursor.state.as_str()), (0, "paused"));
+            assert!(cursor.upload_budget.is_some());
+
+            // A stop between writing the next manifest and its cursor leaves the finished cursor.
+            let mut finished = Cursor::new(&first).unwrap();
+            finished.position = first.files.len();
+            finished.state = "complete".into();
+            f.journal
+                .write("cursor.json", &finished, &f.identity)
+                .unwrap();
+            let (_, recovered) = load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
+            assert_eq!((recovered.position, recovered.state.as_str()), (0, "ready"));
+            // An unrelated cursor is still refused.
+            let mut foreign = Cursor::new(&first).unwrap();
+            foreign.manifest_hash = "0".repeat(64);
+            foreign.position = 0;
+            f.journal
+                .write("cursor.json", &foreign, &f.identity)
+                .unwrap();
+            assert!(load(&f.journal, &f.identity, &f.consent, &f.saved).is_err());
+
+            // When nothing follows the last batch the import is finished for good.
+            let mut claimed = next;
+            claimed.more = true;
+            let mut last = Cursor::new(&claimed).unwrap();
+            last.position = 1;
+            last.state = "complete".into();
+            f.journal
+                .write("manifest.json", &claimed, &f.identity)
+                .unwrap();
+            f.journal.write("cursor.json", &last, &f.identity).unwrap();
+            execute_all(
+                &transport::client().unwrap(),
+                &offline,
+                &f.saved,
+                &f.identity,
+                &f.consent,
+                &f.journal,
+                &data,
+                history::Kind::Folder,
+                &AtomicBool::new(false),
+                &|| Ok(()),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+            let (claimed, cursor) = load(&f.journal, &f.identity, &f.consent, &f.saved).unwrap();
+            assert!(cursor.exhausted && !continues(&claimed, &cursor));
+            assert_eq!(resting(&claimed, &cursor), "complete");
         });
     }
 }
