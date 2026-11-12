@@ -389,12 +389,20 @@ where
 }
 
 pub struct NativePredictor {
-    child: NativeSidecar,
+    /// One process per runtime in use (the processor runtime, an accelerated one, or both).
+    children: Vec<Lane>,
     roles: Vec<BoundRole>,
+    /// The process that was not serving when `ready` last failed.
+    failed: Option<usize>,
+}
+struct Lane {
+    child: NativeSidecar,
+    manifest_sha256: String,
 }
 struct BoundRole {
     client: BoundClient,
     qualification_id: String,
+    lane: usize,
 }
 struct ActiveExecution<'a> {
     predictor: &'a mut NativePredictor,
@@ -456,6 +464,16 @@ impl NativePredictor {
         private_root: &Path,
         port: u16,
     ) -> Result<Self, String> {
+        Self::start_lanes(&[(installed, port)], bindings, cache, private_root)
+    }
+    /// Start one process per runtime that has a binding; each binding runs on the runtime whose
+    /// signed manifest it was qualified with. Roles keep the order of `bindings`.
+    pub(crate) fn start_lanes(
+        runtimes: &[(&InstalledRuntime, u16)],
+        bindings: &[(&QualifiedRuntime, &AcceptedQualification)],
+        cache: &Path,
+        private_root: &Path,
+    ) -> Result<Self, String> {
         if !(1..=64).contains(&bindings.len()) {
             return Err("worker_model_binding_invalid".into());
         }
@@ -476,34 +494,102 @@ impl NativePredictor {
                 return Err("worker_model_binding_invalid".into());
             }
         }
-        let proofs: Vec<_> = bindings.iter().map(|(qualified, _)| *qualified).collect();
-        let child = installed.start_bound_sidecar(&proofs, cache, private_root, port)?;
+        if bindings.iter().any(|(qualified, _)| {
+            runtimes
+                .iter()
+                .filter(|(runtime, _)| runtime.manifest_sha256() == qualified.manifest_sha256())
+                .count()
+                != 1
+        }) {
+            return Err("runtime_qualification_binding_invalid".into());
+        }
+        let mut children: Vec<(Lane, u16)> = Vec::new();
+        for (installed, port) in runtimes {
+            let proofs: Vec<_> = bindings
+                .iter()
+                .map(|(qualified, _)| *qualified)
+                .filter(|qualified| qualified.manifest_sha256() == installed.manifest_sha256())
+                .collect();
+            if proofs.is_empty() {
+                continue;
+            }
+            // A failure here drops (and so stops) the processes already started.
+            let child = installed.start_bound_sidecar(&proofs, cache, private_root, *port)?;
+            children.push((
+                Lane {
+                    child,
+                    manifest_sha256: installed.manifest_sha256().into(),
+                },
+                *port,
+            ));
+        }
         let roles = bindings
             .iter()
             .map(|(qualified, accepted)| {
                 let spec: Value = serde_json::from_slice(qualified.specification())
                     .map_err(|_| "worker_model_binding_invalid")?;
+                let lane = children
+                    .iter()
+                    .position(|(lane, _)| lane.manifest_sha256 == qualified.manifest_sha256())
+                    .ok_or("runtime_qualification_binding_invalid")?;
+                let (owner, port) = &children[lane];
                 Ok(BoundRole {
-                    client: BoundClient::new(port, child.authorization().into(), &spec)?,
+                    client: BoundClient::new(*port, owner.child.authorization().into(), &spec)?,
                     qualification_id: accepted.id().into(),
+                    lane,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self { child, roles })
+        Ok(Self {
+            children: children.into_iter().map(|(lane, _)| lane).collect(),
+            roles,
+            failed: None,
+        })
     }
+    /// Stop every process; the first failure is reported after all were asked to stop.
     pub fn stop(&mut self) -> Result<(), String> {
-        self.child.stop()
+        let mut result = Ok(());
+        for lane in &mut self.children {
+            let stopped = lane.child.stop();
+            if result.is_ok() {
+                result = stopped;
+            }
+        }
+        result
     }
     pub(crate) fn is_running(&mut self) -> Result<bool, String> {
-        self.child.is_running()
+        for lane in &mut self.children {
+            if !lane.child.is_running()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// The signed manifest of the runtime whose process was not serving when work last failed
+    /// to start: a provider that did not initialise.
+    pub(crate) fn failed_lane(&self) -> Option<&str> {
+        self.failed
+            .map(|index| self.children[index].manifest_sha256.as_str())
     }
     async fn ready(&mut self, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
+        let (children, roles, failed) = (&mut self.children, &self.roles, &mut self.failed);
         let wait = async {
             loop {
-                if !self.child.is_running()? {
-                    return Err("runtime_process_stopped".into());
+                *failed = None;
+                for (index, lane) in children.iter_mut().enumerate() {
+                    let role = roles.iter().find(|role| role.lane == index);
+                    if !lane.child.is_running()? {
+                        *failed = Some(index);
+                        return Err("runtime_process_stopped".into());
+                    }
+                    if let Some(role) = role {
+                        if !role.client.health().await.unwrap_or(false) {
+                            *failed = Some(index);
+                            break;
+                        }
+                    }
                 }
-                if self.roles[0].client.health().await.unwrap_or(false) {
+                if failed.is_none() {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -593,7 +679,7 @@ impl NativePredictor {
         }
         let qualification = qualifications[index];
         let role = &self.roles[index];
-        let child = &mut self.child;
+        let child = &mut self.children[role.lane].child;
         let claimed = &task;
         let outcome = run_claimed(
             transport,
@@ -1132,13 +1218,18 @@ mod tests {
             .start_sidecar(&root.join("cache"), &root.join("work"), 19998)
             .unwrap();
         let mut predictor = NativePredictor {
-            child,
+            children: vec![Lane {
+                child,
+                manifest_sha256: pack.manifest_sha256().into(),
+            }],
             roles: vec![BoundRole {
                 client: client(19998),
                 qualification_id: "fixture".into(),
+                lane: 0,
             }],
+            failed: None,
         };
-        assert!(predictor.child.is_running().unwrap());
+        assert!(predictor.is_running().unwrap());
         let (_sender, mut cancel) = watch::channel(false);
         let mut future = Box::pin(worker_jobs(
             &mut predictor,
@@ -1156,7 +1247,7 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
         drop(future);
-        assert!(!predictor.child.is_running().unwrap());
+        assert!(!predictor.is_running().unwrap());
         drop(predictor);
         fs::remove_dir_all(root).unwrap();
     }

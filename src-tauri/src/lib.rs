@@ -37,6 +37,7 @@ pub mod photo_sources;
 mod process_tree;
 #[cfg(any(target_os = "linux", test))]
 mod profile_elevation;
+mod provider_selection;
 pub mod release_policy;
 mod resource_policy;
 pub mod runtime_epochs;

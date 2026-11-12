@@ -24,6 +24,8 @@ pub(crate) struct SetupStatus {
     pub models: Option<ModelProgress>,
     /// Tasks finished since the worker last started; read-only, for the status display.
     pub completed_tasks: u64,
+    /// FD-52: the provider each workload runs on, and why when the processor stands in.
+    pub providers: Vec<crate::provider_selection::WorkloadProvider>,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +76,7 @@ impl Progress {
                 models
             }),
             completed_tasks: current.completed_tasks,
+            providers: current.providers.clone(),
         };
         if *current == status {
             return;
@@ -780,7 +783,7 @@ pub(crate) fn inventory_profiles(
 /// Whether the app's bundled runtime should replace the active one. The bundle is only read here,
 /// not trusted: activation verifies its signature and refuses a reused or rolled-back epoch, so a
 /// rebuilt runtime that kept its epoch fails visibly instead of leaving the old runtime running.
-fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) -> bool {
+pub(crate) fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     if format!("{:x}", Sha256::digest(manifest)) == active_sha256 {
         return false;
@@ -807,8 +810,8 @@ async fn prepare(
     progress.update(|status| status.models = None);
     progress.set("preparing-runtime", None);
     let cancelled = progress.cancelled.clone();
-    let data = paths.data.clone();
-    let (mut installed, attestation) = tauri::async_runtime::spawn_blocking(move || {
+    let (data, bundle) = (paths.data.clone(), paths.bundle.clone());
+    let (installed, attestation) = tauri::async_runtime::spawn_blocking(move || {
         check_cancel(&cancelled)?;
         let mut missing = Vec::new();
         let mut parent = data.as_path();
@@ -823,15 +826,15 @@ async fn prepare(
         private_directory(&data)?;
         private_directory(&data.join("models"))?;
         private_directory(&data.join("scratch"))?;
-        if !paths.bundle.exists()
+        if !bundle.exists()
             && matches!(std::fs::symlink_metadata(data.join("runtimes/active.json")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
             return Err("runtime_pack_unavailable".into());
         }
         let store = open_runtime_store(&data.join("runtimes"))?;
         let active = store.load_active()?;
-        let bundled = if paths.bundle.exists() {
-            Some(read_bounded(&paths.bundle.join("manifest.json"), 8 * 1024 * 1024)?)
+        let bundled = if bundle.exists() {
+            Some(read_bounded(&bundle.join("manifest.json"), 8 * 1024 * 1024)?)
         } else {
             None
         };
@@ -847,10 +850,10 @@ async fn prepare(
             (active, Some(manifest)) => {
                 // Release the shared lease first: activation takes the store's exclusive lock.
                 drop(active);
-                let signature: [u8; 64] = read_bounded(&paths.bundle.join("manifest.sig"), 64)?
+                let signature: [u8; 64] = read_bounded(&bundle.join("manifest.sig"), 64)?
                     .try_into()
                     .map_err(|_| "runtime_signature_invalid")?;
-                store.install_and_activate(&paths.bundle.join("payload"), &manifest, &signature)?;
+                store.install_and_activate(&bundle.join("payload"), &manifest, &signature)?;
                 store.load_active()?.ok_or("runtime_activation_failed")?
             }
             (_, None) => return Err("runtime_pack_unavailable".into()),
@@ -886,6 +889,12 @@ async fn prepare(
     if groups.is_empty() {
         return Err("worker_no_eligible_workloads".into());
     }
+    // FD-52: an accelerated runtime beside the processor one, where the app ships one this
+    // computer can use. Any fault on that side leaves every workload on the processor.
+    let (accelerated, mut plan) =
+        crate::provider_selection::open(&paths, &installed, &worker, groups.clone()).await;
+    let mut installed =
+        crate::provider_selection::Runtimes::new(installed, attestation, accelerated);
     let profiles: Vec<_> = groups.iter().flatten().cloned().collect();
     let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
         .await
@@ -939,6 +948,9 @@ async fn prepare(
     }
     let mut failures = TaskFailures::default();
     'qualification: loop {
+        // The provider chosen for each workload; a failed provider is demoted and this restarts.
+        let groups = plan.groups();
+        progress.update(|status| status.providers = plan.providers());
         let mut prepared = Vec::new();
         let mut accepted_profiles = Vec::new();
         let mut accepted_caches = Vec::new();
@@ -967,7 +979,7 @@ async fn prepare(
                 let challenge = match cancellable(
                     worker.request_qualification(
                         profile,
-                        &attestation,
+                        installed.attestation(profile.provider())?,
                         &uuid::Uuid::new_v4().to_string(),
                     ),
                     &progress.cancelled,
@@ -976,6 +988,9 @@ async fn prepare(
                 {
                     Ok(value) => value,
                     Err(code) if code.starts_with("workload_desktop_") => {
+                        if plan.demote(workload, &code, false) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -984,11 +999,12 @@ async fn prepare(
                 let spec = challenge.specification().to_vec();
                 let fixture = challenge.fixture().to_vec();
                 let scratch = paths.data.join("scratch");
+                let provider = profile.provider().to_owned();
                 let clock = WakeClock::new();
                 let ((runtime, qualified), interrupted) = monitored_preparation(
                     move |cancel| {
-                        let qualified =
-                            installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
+                        let qualified = installed
+                            .qualify(&provider, &cache, &scratch, &spec, &fixture, &cancel);
                         (installed, qualified)
                     },
                     async { format!("resource_{}", resource_loss(&clock).await) },
@@ -1019,6 +1035,9 @@ async fn prepare(
                                 | "runtime_qualification_report_invalid"
                         ) =>
                     {
+                        if plan.demote(workload, &code, true) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -1032,6 +1051,9 @@ async fn prepare(
                 {
                     Ok(true) => {}
                     Ok(false) => {
+                        if plan.demote(workload, "worker_qualification_refused", false) {
+                            continue 'qualification;
+                        }
                         progress.workload(
                             workload,
                             "unavailable",
@@ -1040,6 +1062,9 @@ async fn prepare(
                         continue 'workload;
                     }
                     Err(code) if code.starts_with("workload_desktop_") => {
+                        if plan.demote(workload, &code, false) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -1053,6 +1078,9 @@ async fn prepare(
                 {
                     Ok(value) => value,
                     Err(code) if code.starts_with("workload_desktop_") => {
+                        if plan.demote(workload, &code, false) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -1094,8 +1122,19 @@ async fn prepare(
             .iter()
             .map(|profile| profile.cache_identity().2.to_owned())
             .collect();
+        // FD-52: and runtime packs, combined model sets and scratch nothing can use any more.
+        let (data, bundle, set) = (paths.data.clone(), paths.bundle.clone(), cache.clone());
+        let active_runtime = installed.cpu().manifest_sha256().to_owned();
+        let accelerated_runtime = installed
+            .accelerated()
+            .map(|runtime| runtime.manifest_sha256().to_owned());
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            crate::model_cache::prune(&models, &referenced, std::time::SystemTime::now())
+            let now = std::time::SystemTime::now();
+            let _ = crate::model_cache::prune(&models, &referenced, now);
+            if let Some(active) = accelerated_runtime {
+                crate::provider_selection::reclaim_superseded(&data, &bundle, &active);
+            }
+            crate::release_policy::reclaim_superseded(&data, &bundle, &active_runtime, &set, now)
         })
         .await;
         loop {
@@ -1124,9 +1163,7 @@ async fn prepare(
                         .iter()
                         .map(|(proof, accepted)| (proof, accepted))
                         .collect();
-                    let predictor = crate::native_predictor::NativePredictor::start_many(
-                        &installed, &bindings, &cache, &scratch, port,
-                    )?;
+                    let predictor = installed.start(&bindings, &cache, &scratch, port)?;
                     Ok::<_, String>((installed, prepared, predictor))
                 })
                 .await
@@ -1223,7 +1260,16 @@ async fn prepare(
                         }
                         break;
                     }
-                    Err(reason) => return Err(reason),
+                    Err(reason) => {
+                        // FD-52: the accelerated runtime's process did not serve: use the
+                        // processor for its workloads instead of failing the worker.
+                        let lane = predictor.failed_lane().map(str::to_owned);
+                        if lane.is_some_and(|lane| plan.demote_runtime(&lane, &reason)) {
+                            predictor.stop()?;
+                            continue 'qualification;
+                        }
+                        return Err(reason);
+                    }
                 }
             }
         }
