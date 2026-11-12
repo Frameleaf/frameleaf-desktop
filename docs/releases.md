@@ -70,6 +70,36 @@ installed bytes.
 
 ## Supported systems
 
+### macOS minimum version
+
+Frameleaf Desktop requires macOS 15.0 or later. The value is declared once, as
+`bundle.macOS.minimumSystemVersion` in `src-tauri/tauri.conf.json`, and the
+macOS build jobs in `desktop.yml` and `release.yml` set
+`MACOSX_DEPLOYMENT_TARGET` to the same value.
+
+The floor is the highest minimum recorded in the binaries the app ships, read
+with `tools/check_macos_minimum.py` from the installed 0.1.6 Apple silicon app:
+
+| Shipped binary | Minimum macOS |
+| --- | --- |
+| Rust toolchain default for `aarch64-apple-darwin` (`rustc --print deployment-target`) | 11.0 |
+| Rust toolchain default for `x86_64-apple-darwin` | 10.12 |
+| Tauri default when no minimum is declared (the 0.1.6 `LSMinimumSystemVersion`) | 10.13 |
+| AI runtime: Python interpreter and most libraries | 11.0 |
+| AI runtime: OpenCV (`cv2`) and its libraries | 13.0 |
+| AI runtime: NumPy, ONNX Runtime | 14.0 |
+| AI runtime: `orjson` | 15.0 |
+
+`python3 tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" Frameleaf.app`
+fails when any Mach-O file in the bundle, including the AI runtime under
+`Contents/Resources/native-runtime`, needs a newer macOS than declared, when a
+loaded binary records no minimum, or when the bundle's `LSMinimumSystemVersion`
+differs from the declaration. `Desktop candidate` runs it on the unsigned shell
+and `Desktop release` runs it on the app with its runtime before signing. To
+lower the floor, rebuild the runtime libraries above for an older macOS first;
+to raise it, change `tauri.conf.json` and both workflows together
+(`tools/test_check_macos_minimum.py` fails when they disagree).
+
 ### Linux tray library
 
 The tray icon loads `libayatana-appindicator3.so.1` at run time and falls back
