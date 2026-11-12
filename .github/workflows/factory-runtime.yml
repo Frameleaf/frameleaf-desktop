@@ -12,6 +12,10 @@ on:
         type: string
         default: '6'
         required: true
+      accelerated:
+        description: 'Also sign the GPU manifest where a profile is approved (CoreML on macos-aarch64)'
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -34,17 +38,21 @@ jobs:
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
           RUNTIME_EPOCH: ${{ inputs.epoch }}
+          RUNTIME_ACCELERATED: ${{ inputs.accelerated }}
         run: |
           node --input-type=module <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           import { releaseMatrix } from './tools/release_inputs.mjs';
-          import { factorySourceRevisionFor } from './tools/factory_runtime.mjs';
+          import { factoryProfileFor, factorySourceRevisionFor } from './tools/factory_runtime.mjs';
           const trust = JSON.parse(readFileSync('runtime/release-trust.json'));
           const epoch = Number(process.env.RUNTIME_EPOCH);
           if (!/^[1-9][0-9]*$/.test(process.env.RUNTIME_EPOCH) || !Number.isSafeInteger(epoch) || epoch < trust.minimumRuntimeEpoch)
             throw new Error('runtime_factory_epoch_invalid');
           const matrix = releaseMatrix(process.env.RELEASE_PLATFORMS);
-          for (const item of matrix.include) item.source_revision = factorySourceRevisionFor(item.target);
+          for (const item of matrix.include) {
+            item.source_revision = factorySourceRevisionFor(item.target);
+            item.profile = factoryProfileFor(item.target, process.env.RUNTIME_ACCELERATED === 'true');
+          }
           appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(matrix)}\n`);
           JS
   build:
@@ -92,12 +100,15 @@ jobs:
         env:
           SOURCE_REVISION: ${{ matrix.source_revision }}
           RUNTIME_EPOCH: ${{ inputs.epoch }}
+          RUNTIME_PROFILE: ${{ matrix.profile }}
         shell: bash
         run: |
           set -euo pipefail
           python -m unittest discover -s desktop/tools -p 'test_build_runtime.py'
-          python desktop/tools/build_runtime.py --source source --output candidate --revision "$SOURCE_REVISION" --epoch "$RUNTIME_EPOCH"
-          tar -cf runtime-unsigned.tar -C candidate manifest.json payload
+          python desktop/tools/build_runtime.py --source source --output candidate --revision "$SOURCE_REVISION" --epoch "$RUNTIME_EPOCH" --profile "$RUNTIME_PROFILE"
+          manifests=(manifest.json)
+          if [ -f candidate/manifest-accelerated.json ]; then manifests+=(manifest-accelerated.json); fi
+          tar -cf runtime-unsigned.tar -C candidate "${manifests[@]}" payload
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: unsigned-runtime-${{ matrix.target }}
@@ -177,7 +188,9 @@ jobs:
           set -euo pipefail
           : "${FACTORY_PRIVATE_KEY:?Missing factory signing key}"
           printf '%s\n' "$FACTORY_PRIVATE_KEY" | node tools/factory_runtime.mjs "$PWD/candidate" "$RUNTIME_TARGET" "$RUNTIME_EPOCH"
-          tar -cf runtime.tar -C candidate manifest.json manifest.sig payload
+          manifests=(manifest.json manifest.sig)
+          if [ -f candidate/manifest-accelerated.json ]; then manifests+=(manifest-accelerated.json manifest-accelerated.sig); fi
+          tar -cf runtime.tar -C candidate "${manifests[@]}" payload
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: factory-runtime-${{ matrix.target }}

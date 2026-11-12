@@ -42,6 +42,15 @@ def sign_runtime(root: Path, identity: str) -> None:
     with ThreadPoolExecutor(max_workers=4) as pool:
         manifest["files"].update(pool.map(sign, paths))
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+    # The accelerated manifest seals the same payload, so it takes the same signed inventory
+    # (the CoreML collector's identity is the hash of its signed library).
+    accelerated_path = root / "manifest-accelerated.json"
+    if accelerated_path.exists():
+        accelerated = json.loads(accelerated_path.read_bytes())
+        if accelerated["files"].keys() != manifest["files"].keys():
+            raise ValueError("accelerated manifest inventory differs")
+        accelerated["files"] = manifest["files"]
+        accelerated_path.write_text(json.dumps(accelerated, sort_keys=True, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":

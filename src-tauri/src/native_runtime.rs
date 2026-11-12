@@ -1,4 +1,5 @@
 //! Signed private runtimes; no shell, ambient Python or server-selected executable.
+mod metal;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -45,6 +46,8 @@ struct Manifest {
     source_revision: String,
     #[serde(default)]
     module_namespace: ModuleNamespace,
+    #[serde(default)]
+    device_observer: Option<metal::Descriptor>,
     files: BTreeMap<String, Artifact>,
 }
 
@@ -187,6 +190,7 @@ impl VerifiedRuntime {
         {
             return Err("runtime_manifest_incompatible".into());
         }
+        metal::validate(&manifest)?;
         relative(&manifest.python)?;
         if !manifest.files.contains_key(&manifest.python) {
             return Err("runtime_interpreter_unapproved".into());
@@ -303,7 +307,14 @@ def lost_parent():
     os._exit(125)
 threading.Thread(target=lost_parent,daemon=True).start()
 sys.argv=sys.argv[1:]
-runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
+if sys.argv[0]=='frameleaf-desktop-metal-v1':
+    parent,expected_hash,mode=sys.argv[1:4]
+    sys.argv=[mode]+sys.argv[4:]
+    sys.path.insert(0,parent)
+    from frameleaf_desktop_ml.entry import run
+    run(mode,expected_hash)
+else:
+    runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
 "#;
 
 pub struct NativeSidecar {
@@ -482,10 +493,7 @@ impl VerifiedRuntime {
             .arg("-B")
             .arg("-c")
             .arg(GATE)
-            .arg(format!(
-                "{}.{module}",
-                self.manifest.module_namespace.prefix()
-            ))
+            .args(metal::arguments(&self.manifest, &self.root, module)?)
             .arg("--cache-dir")
             .arg(cache)
             .current_dir(&scratch)
@@ -719,6 +727,7 @@ impl VerifiedRuntime {
             &value,
             &format!("{:x}", Sha256::digest(spec)),
             self.provider(),
+            metal::collector_hash(&self.manifest),
         )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
@@ -728,12 +737,14 @@ impl VerifiedRuntime {
         })
     }
 }
-/// `runtime_provider` is the one provider the installed runtime's signed manifest declares.
+/// `runtime_provider` is the one provider the installed runtime's signed manifest declares, and
+/// `expected_collector` the device collector that manifest carries (CoreML only).
 fn validate_report(
     report: &serde_json::Value,
     spec: &serde_json::Value,
     binding: &str,
     runtime_provider: &str,
+    expected_collector: Option<&str>,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -778,6 +789,13 @@ fn validate_report(
     // CoreML can keep work on the processor inside its own nodes, so it never reports
     // accelerator-only execution (the runtime and the server use the same rule).
     let always_mixed = provider == "CoreMLExecutionProvider";
+    // The server refuses a CoreML report without the signed collector's device proof, and any
+    // other report that carries one; refuse the same here instead of submitting it.
+    if always_mixed {
+        metal::validate_report(report, spec, expected_collector.ok_or_else(invalid)?)?;
+    } else if expected_collector.is_some() || !report["deviceExecution"].is_null() {
+        return Err(invalid());
+    }
     let execution = report["execution"]
         .as_array()
         .filter(|v| !v.is_empty() && v.len() <= 64)
@@ -841,7 +859,7 @@ mod tests {
     }
     fn check(provider: &str, state: &str, cpu_nodes: bool, runtime: &str) -> Result<(), String> {
         let [report, spec] = report_for(provider, state, cpu_nodes);
-        validate_report(&report, &spec, &"c".repeat(64), runtime)
+        validate_report(&report, &spec, &"c".repeat(64), runtime, None)
     }
     #[test]
     fn report_is_accepted_only_for_the_provider_the_runtime_declares() {
@@ -850,8 +868,9 @@ mod tests {
         const OPENVINO: &str = "OpenVINOExecutionProvider";
         const CUDA: &str = "CUDAExecutionProvider";
         assert!(check(CPU, "ready-cpu", false, CPU).is_ok());
-        assert!(check(COREML, "ready-mixed", false, COREML).is_ok());
-        assert!(check(COREML, "ready-mixed", true, COREML).is_ok());
+        // CoreML is accepted only with its collector's device proof (see `metal`).
+        assert!(check(COREML, "ready-mixed", false, COREML).is_err());
+        assert!(check(COREML, "ready-mixed", true, COREML).is_err());
         for provider in [OPENVINO, CUDA] {
             assert!(check(provider, "ready-accelerator", false, provider).is_ok());
             assert!(check(provider, "ready-mixed", true, provider).is_ok());

@@ -3,7 +3,12 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { verifySignedCandidate } from "./sign_runtime.mjs";
+import {
+  acceleratedManifest,
+  acceleratedSignature,
+  verifySignedAccelerated,
+  verifySignedCandidate,
+} from "./sign_runtime.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 export async function packageConfiguration(candidate, policy) {
@@ -18,7 +23,8 @@ export async function packageConfiguration(candidate, policy) {
   const profiles = JSON.parse(
     await readFile(join(root, "runtime/profiles.json"), "utf8"),
   );
-  const approved = Object.values(profiles.profiles ?? {}).filter(
+  const approvedFor = (manifest) =>
+    Object.values(profiles.profiles ?? {}).filter(
     (profile) =>
       profile.provider === manifest.provider &&
       (profile.sourceRevision === manifest.sourceRevision ||
@@ -30,8 +36,14 @@ export async function packageConfiguration(candidate, policy) {
           ))) &&
       profile.targets?.includes(`${platform}-${architecture}`),
   );
-  if (profiles.schemaVersion !== 1 || approved.length !== 1)
+  if (profiles.schemaVersion !== 1 || approvedFor(manifest).length !== 1)
     throw new Error("runtime_bundle_source_unapproved");
+  // The optional accelerated manifest shares the payload; the app uses it only when it is
+  // signed, approved for this target and qualifies on the device.
+  const accelerated = await verifySignedAccelerated(candidate, policy);
+  if (accelerated && approvedFor(accelerated.manifest).length !== 1)
+    throw new Error("runtime_bundle_source_unapproved");
+  const extra = accelerated ? [acceleratedManifest, acceleratedSignature] : [];
   if (platform === "linux") {
     // linuxdeploy rewrites ELF files under usr/lib; keep the signed runtime outside that scan.
     const files = {
@@ -39,6 +51,8 @@ export async function packageConfiguration(candidate, policy) {
       "/usr/share/Frameleaf/native-runtime/manifest.sig": join(candidate, "manifest.sig"),
       "/usr/share/Frameleaf/native-runtime/payload": join(candidate, "payload"),
     };
+    for (const name of extra)
+      files[`/usr/share/Frameleaf/native-runtime/${name}`] = join(candidate, name);
     return { bundle: { linux: { deb: { files }, appimage: { files }, rpm: { files } } } };
   }
   return {
@@ -47,6 +61,9 @@ export async function packageConfiguration(candidate, policy) {
         [join(candidate, "manifest.json")]: "native-runtime/manifest.json",
         [join(candidate, "manifest.sig")]: "native-runtime/manifest.sig",
         [join(candidate, "payload")]: "native-runtime/payload",
+        ...Object.fromEntries(
+          extra.map((name) => [join(candidate, name), `native-runtime/${name}`]),
+        ),
       },
     },
   };
