@@ -41,6 +41,94 @@ struct Manifest {
     /// The digest of the completed batch this manifest follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     continues: Option<String>,
+    /// The whole import this batch is part of, when the folder holds more than one batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import: Option<ImportTotals>,
+}
+/// One import of a folder larger than a batch: what the first scan counted in the whole folder,
+/// and what the batches before this one did. Carried from each batch to the next, so progress
+/// and history describe the import and not one batch. Counts only, never a filename.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportTotals {
+    /// The first batch's manifest id: the one history entry all batches share.
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
+    files: u64,
+    bytes: u64,
+    done_files: u64,
+    done_bytes: u64,
+    skipped: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_reasons: BTreeMap<String, u64>,
+}
+impl ImportTotals {
+    /// The totals for the batch after `manifest`, whose cursor is `cursor`.
+    fn after(&self, manifest: &Manifest, cursor: &Cursor) -> Self {
+        Self {
+            done_files: self.done_files + verified_files(cursor) as u64,
+            done_bytes: self
+                .done_bytes
+                .saturating_add(verified_bytes(manifest, cursor)),
+            skipped: self.skipped + manifest.skipped + cursor.watch_skipped.len() as u64,
+            skipped_reasons: {
+                let mut reasons = self.skipped_reasons.clone();
+                for (reason, count) in skipped_reasons_of(manifest, cursor) {
+                    *reasons.entry(reason).or_default() += count;
+                }
+                reasons
+            },
+            ..self.clone()
+        }
+    }
+}
+fn verified_files(cursor: &Cursor) -> usize {
+    cursor.position - cursor.watch_skipped.len()
+}
+/// The bytes of this batch's files that were copied and verified (skipped ones left out).
+fn verified_bytes(manifest: &Manifest, cursor: &Cursor) -> u64 {
+    manifest.files[..cursor.position]
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !cursor.watch_skipped.contains(index))
+        .map(|(_, file)| file.bytes)
+        .sum()
+}
+/// Progress of the whole import across its batches.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverallProgress {
+    pub total: u64,
+    pub completed: u64,
+    pub total_bytes: u64,
+    pub completed_bytes: u64,
+}
+fn overall(manifest: &Manifest, cursor: &Cursor) -> Option<OverallProgress> {
+    let import = manifest.import.as_ref()?;
+    let completed = import.done_files + verified_files(cursor) as u64;
+    let completed_bytes = import
+        .done_bytes
+        .saturating_add(verified_bytes(manifest, cursor));
+    // Files skipped so far are no longer expected. The folder can also have grown or shrunk
+    // since the first scan: the totals never fall below what is already known.
+    let skipped = import.skipped + manifest.skipped + cursor.watch_skipped.len() as u64;
+    let known = import.done_files + (manifest.files.len() - cursor.watch_skipped.len()) as u64;
+    let known_bytes = import.done_bytes.saturating_add(
+        manifest
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !cursor.watch_skipped.contains(index))
+            .map(|(_, file)| file.bytes)
+            .sum::<u64>(),
+    );
+    Some(OverallProgress {
+        total: import.files.saturating_sub(skipped).max(known),
+        completed,
+        total_bytes: import.bytes.max(known_bytes),
+        completed_bytes,
+    })
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -302,6 +390,10 @@ pub struct ImportView {
     pub code: Option<String>,
     pub album_pending: bool,
     pub availability: Option<crate::source_metadata::AvailabilitySummary>,
+    /// A folder imported in several batches: progress of the whole import. `total` and
+    /// `completed` above describe the current batch only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overall: Option<OverallProgress>,
 }
 /// The allowance one approval adds: twice the bytes of the files still to copy.
 fn remaining_allowance(manifest: &Manifest, cursor: &Cursor) -> u64 {
@@ -330,6 +422,7 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
                 .as_ref()
                 .is_some_and(|active| active.receipt.is_some() && !active.album_attached),
         availability: manifest.availability.clone(),
+        overall: overall(manifest, cursor),
         code,
     }
 }
@@ -345,9 +438,22 @@ fn resting<'a>(manifest: &Manifest, cursor: &'a Cursor) -> &'a str {
         &cursor.state
     }
 }
-fn skipped_reasons(manifest: &Manifest, cursor: &Cursor) -> BTreeMap<String, u64> {
+/// Why this batch's skipped files were left out, by reason code.
+fn skipped_reasons_of(manifest: &Manifest, cursor: &Cursor) -> BTreeMap<String, u64> {
     let mut reasons = manifest.skipped_reasons.clone();
     for (reason, count) in &cursor.skipped_reasons {
+        *reasons.entry(reason.clone()).or_default() += count;
+    }
+    reasons
+}
+/// The same for the whole import, earlier batches included.
+fn skipped_reasons(manifest: &Manifest, cursor: &Cursor) -> BTreeMap<String, u64> {
+    let mut reasons = skipped_reasons_of(manifest, cursor);
+    for (reason, count) in manifest
+        .import
+        .iter()
+        .flat_map(|import| &import.skipped_reasons)
+    {
         *reasons.entry(reason.clone()).or_default() += count;
     }
     reasons
@@ -437,14 +543,28 @@ fn make_manifest(
             .filter(|n| *n <= (1u64 << 41))
             .ok_or("source_copy_budget_exceeded")?;
     }
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| u64::try_from(value.as_millis()).ok());
     Ok(Manifest {
-        id: uuid::Uuid::new_v4().to_string(),
+        // The first batch of a larger folder opens the import: the scan counted the whole
+        // folder. Later batches take their totals from the batch before (`execute_all`).
+        import: (previous.is_none() && scan.more).then(|| ImportTotals {
+            id: id.clone(),
+            created_at,
+            files: scan.inventory.photos,
+            bytes: scan.inventory.logical_bytes,
+            done_files: 0,
+            done_bytes: 0,
+            skipped: 0,
+            skipped_reasons: BTreeMap::new(),
+        }),
+        id,
         source_id: consent.source_id().into(),
         scope: approval.fingerprint(),
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|value| u64::try_from(value.as_millis()).ok()),
+        created_at,
         destination: consent.destination.clone(),
         files: scan.files,
         total_bytes,
@@ -1109,7 +1229,12 @@ async fn execute_all(
         let root = location.as_deref().unwrap_or(approval.root());
         // This job already runs on a blocking thread; the scan holds no application lock.
         match batch_manifest(consent, saved, identity, base, root, Some(&manifest))? {
-            Some(next) => {
+            Some(mut next) => {
+                // The next batch carries the import's totals on, before anything is signed.
+                next.import = manifest
+                    .import
+                    .as_ref()
+                    .map(|import| import.after(&manifest, &cursor));
                 let first = Cursor::new(&next)?;
                 journal.write("manifest.json", &next, identity)?;
                 journal.write("cursor.json", &first, identity)?;
@@ -1835,6 +1960,7 @@ mod tests {
             skipped_reasons: BTreeMap::new(),
             more: false,
             continues: None,
+            import: None,
         };
         let journal = Journal::new(&base, &manifest.source_id).unwrap();
         journal
@@ -3070,6 +3196,58 @@ mod tests {
             );
             assert_eq!(next.continues, Some(digest(&first).unwrap()));
             assert!(!next.more);
+            // The import is one: the first scan counted the whole folder, and the second batch
+            // carries what the first one did.
+            let batch = crate::photo_sources::BATCH_FILES as u64;
+            let opened = first.import.clone().unwrap();
+            assert_eq!(
+                (opened.id.as_str(), opened.files, opened.bytes),
+                (first.id.as_str(), batch + 1, batch + 10)
+            );
+            assert_eq!((opened.done_files, opened.done_bytes), (0, 0));
+            let carried = next.import.clone().unwrap();
+            assert_eq!(carried.id, first.id);
+            assert_eq!(carried.created_at, first.created_at);
+            assert_eq!((carried.done_files, carried.done_bytes), (batch, batch));
+            let progress = view(&next, &cursor, "paused", None);
+            assert_eq!((progress.total, progress.completed), (1, 0));
+            assert_eq!(
+                progress.overall,
+                Some(OverallProgress {
+                    total: batch + 1,
+                    completed: batch,
+                    total_bytes: batch + 10,
+                    completed_bytes: batch,
+                })
+            );
+            // Half way through the first batch, with one file skipped along the way.
+            let mut midway = Cursor::new(&first).unwrap();
+            midway.position = 5000;
+            midway.watch_skipped.insert(7);
+            let progress = view(&first, &midway, "copying", None).overall.unwrap();
+            assert_eq!(
+                (progress.total, progress.completed, progress.completed_bytes),
+                (batch, 4999, 4999)
+            );
+            // Both batches are one history entry, under the first batch's id, with the totals of
+            // the whole import.
+            let entry = serde_json::to_value(history::Entry::from_run(
+                history::Kind::Folder,
+                &next,
+                &cursor,
+                false,
+            ))
+            .unwrap();
+            assert_eq!(entry["runId"], first.id.as_str());
+            assert_eq!(entry["createdAt"], serde_json::json!(first.created_at));
+            assert_eq!(
+                (entry["verified"].as_u64(), entry["total"].as_u64()),
+                (Some(batch), Some(batch + 1))
+            );
+            let listed = history::archived(&data, &f.saved, &f.identity);
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0]["runId"], first.id.as_str());
+            assert_eq!(listed[0]["verified"].as_u64(), Some(batch));
             assert_eq!((cursor.position, cursor.state.as_str()), (0, "paused"));
             assert!(cursor.upload_budget.is_some());
 

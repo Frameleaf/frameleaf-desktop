@@ -9,7 +9,7 @@
   import Sheet from './Sheet.svelte';
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import type { AlbumDestination } from './import-destination';
-  import { formatBytes, percent } from './ui-state';
+  import { formatBytes, percent, importProgress, importProgressText, type OverallProgress } from './ui-state';
   import { explainError } from './errors';
   type Hint = { label: string; path: string };
   type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
@@ -17,7 +17,7 @@
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean; canReconnect: boolean; destination: AlbumDestination | null };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; overall?: OverallProgress | null; additionalUploadAllowance: number; albumPending: boolean };
   let job = $state<CopyJob | null>(null);
   let jobEventRevision = 0;
   let consent = $state<Consent | null>(null);
@@ -183,8 +183,8 @@
               <b>{consent.name}</b>
               {#if consent.destination}<small>Album: {consent.destination.name}{consent.destination.shared ? ' (shared)' : ''}</small>{/if}
               {#if job?.albumPending}<small>Copy verified. Waiting to add it to the album.</small>{/if}
-              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {consent.watch && (!job || job.total === 0) ? (job ? jobLabel : 'Automatic import to your current library') : job ? `${jobLabel} · ${job.completed.toLocaleString()} of ${job.total.toLocaleString()} copies confirmed${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
-              {#if job && job.total > 0 && !['complete', 'cancelled'].includes(job.state)}<span class="progress" role="progressbar" aria-valuenow={percent(job.completed, job.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(job.completed, job.total)}%"></span></span>{/if}
+              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {consent.watch && (!job || job.total === 0) ? (job ? jobLabel : 'Automatic import to your current library') : job ? `${jobLabel} · ${importProgressText(job)}${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
+              {#if job && job.total > 0 && !['complete', 'cancelled'].includes(job.state)}{@const progress = importProgress(job)}<span class="progress" role="progressbar" aria-valuenow={percent(progress.completed, progress.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(progress.completed, progress.total)}%"></span></span>{/if}
             </span>
             {#if job}<span class="pill {jobTone}" role="status"><i aria-hidden="true"></i>{job.state === 'complete' ? 'Up to date' : jobLabel.replace('Copy ', '')}</span>{/if}
             {#if !consent.registered}<button class="btn" disabled={busy} onclick={() => approve(true)}>Retry Registration</button>{/if}

@@ -284,3 +284,27 @@ export function countryOptions(locale: string): { code: string; name: string }[]
 export function defaultCountry(locale: string): string {
   try { return new Intl.Locale(locale).maximize().region ?? 'US'; } catch { return 'US'; }
 }
+
+/** Progress of the whole import when its folder is copied in several batches (`photo-import`'s `overall`). */
+export type OverallProgress = { total: number; completed: number; totalBytes: number; completedBytes: number };
+export type ImportProgress = { completed: number; total: number; bytes: { completed: number; total: number } | null };
+
+/**
+ * What an import's progress bar and counts show. A folder over one batch (10,000 files) reports
+ * the whole import in `overall`: its files and bytes across every batch, so the bar does not start
+ * again with each batch. Any other import shows its one batch.
+ */
+export function importProgress(job: { completed: number; total: number; overall?: OverallProgress | null }): ImportProgress {
+  const overall = job.overall;
+  if (!overall || !(overall.total > 0)) return { completed: job.completed, total: job.total, bytes: null };
+  const total = Math.max(overall.total, overall.completed);
+  const totalBytes = Math.max(overall.totalBytes, overall.completedBytes);
+  return { completed: overall.completed, total, bytes: totalBytes > 0 ? { completed: overall.completedBytes, total: totalBytes } : null };
+}
+
+/** "12,000 of 25,001 copies confirmed", with the bytes done of the total when the import has several batches. */
+export function importProgressText(job: { completed: number; total: number; overall?: OverallProgress | null }): string {
+  const progress = importProgress(job);
+  const files = `${progress.completed.toLocaleString()} of ${progress.total.toLocaleString()} copies confirmed`;
+  return progress.bytes ? `${files} · ${formatBytes(progress.bytes.completed)} of ${formatBytes(progress.bytes.total)}` : files;
+}
