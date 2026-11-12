@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,11 +98,36 @@ export function verifyUpdaterAsset(file, signature, publicKey, version) {
   }
 }
 
+// Every target Desktop can update in place. A release that omits one leaves those installs on their current version.
+const updateFeedTargets = [
+  "darwin-aarch64-app", "darwin-x86_64-app",
+  "linux-aarch64-appimage", "linux-aarch64-deb", "linux-x86_64-appimage", "linux-x86_64-deb",
+  "windows-x86_64-msi", "windows-x86_64-nsis",
+];
+
+/** Markdown for the workflow summary and draft notes, so an omitted platform is visible before publication. */
+export function updateFeedSummary(manifest) {
+  const offered = Object.keys(manifest.platforms).sort();
+  const missing = updateFeedTargets.filter((target) => !manifest.platforms[target]);
+  const windows = offered.some((target) => target.startsWith("windows-"));
+  const lines = [`### Update feed for ${manifest.version}`, "", `\`latest.json\` offers ${manifest.version} to: ${offered.join(", ")}.`];
+  if (!windows) {
+    lines.push("", `**Windows was excluded from the update feed.** This release has no signed Windows installers, so Desktop on Windows will not be offered ${manifest.version} and stays on its installed version until a release includes them.`);
+  }
+  const others = windows ? missing : missing.filter((target) => !target.startsWith("windows-"));
+  if (others.length) lines.push("", `Not in the update feed: ${others.join(", ")}.`);
+  return lines.join("\n") + "\n";
+}
+
+export function applicationVersions(root = new URL("../", import.meta.url)) {
+  const read = (path) => readFileSync(new URL(path, root), "utf8");
+  return {
+    "package.json": JSON.parse(read("package.json")).version,
+    "src-tauri/tauri.conf.json": JSON.parse(read("src-tauri/tauri.conf.json")).version,
+    "src-tauri/Cargo.toml": read("src-tauri/Cargo.toml").match(/^version\s*=\s*"([^"]+)"/m)?.[1],
+  };
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const root = new URL("../", import.meta.url);
-  const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
-  const config = JSON.parse(await readFile(new URL("src-tauri/tauri.conf.json", root), "utf8"));
-  const cargo = await readFile(new URL("src-tauri/Cargo.toml", root), "utf8");
-  const version = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  console.log(validateReleaseTag(process.argv[2], [pkg.version, config.version, version]));
+  console.log(validateReleaseTag(process.argv[2], Object.values(applicationVersions())));
 }

@@ -158,7 +158,12 @@ the update.
 
 Only after every selected target passes does a separate job receive repository
 write permission and create a **draft prerelease** with installers, signed updater
-packages, `latest.json` and `SHA256SUMS`. The updater sees the manifest after the
+packages, `latest.json` and `SHA256SUMS`. The run summary and the draft notes list
+the targets in `latest.json` and state when Windows was excluded from the update
+feed; the default selection excludes it until Azure Artifact Signing is qualified,
+and Windows entries from an earlier release are not carried forward. The same job
+stamps the AUR and Chocolatey files from those checksums (see
+[`packaging/README.md`](../packaging/README.md)). The updater sees the manifest after the
 release is published as Latest. The workflow never publishes automatically or
 replaces an existing release.
 If a draft already exists for the tag, the create step fails; inspect/remove the
