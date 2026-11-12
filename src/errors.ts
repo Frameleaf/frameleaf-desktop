@@ -69,6 +69,15 @@ const messages: Record<string, string> = {
   cloud_server_address_unlisted: 'Your Frameleaf account doesn’t list this address for that server. Sign in with this server’s own login, or connect on its home network.',
   server_not_frameleaf: 'That address answered, but not as a Frameleaf server. Check the address.',
   wallet_step_up_required: 'Raising the cap or turning on auto-reload needs a fresh sign-in on frameleaf.cloud. Open your account settings to change it there.',
+  // Unified sign-in on a server: the second step of a sign-in, and a request refused until Two-Step Verification.
+  sign_in_code_wrong: 'That Verification Code didn’t work. Check it and try again. If it keeps failing, start again with your Password.',
+  sign_in_recovery_code_wrong: 'That Recovery Code didn’t work, or it was already used.',
+  sign_in_code_invalid: 'Enter the 6-digit Verification Code, or one of your Recovery Codes.',
+  sign_in_too_many_attempts: 'Too many attempts. Wait a few minutes, then try again.',
+  sign_in_two_step_unsupported: 'This login uses Two-Step Verification, and this server can’t finish that in this app yet. Update the server, or sign in another way.',
+  server_refused_verification_required: 'This needs Two-Step Verification.',
+  server_refused_two_factor_setup_required: 'This server needs Two-Step Verification on every login. Set it up on the server’s web page, then try again.',
+  server_refused_frameleaf_sign_in_required: 'Away from home, sign in with your Frameleaf account to use this server.',
 };
 
 /** Why AI processing on this computer is not running, for the codes that can stop it. */
@@ -227,7 +236,9 @@ const generic = 'This operation could not finish. Check your connection and try 
 
 /** The code a failed command or a status carries, or '' when it is not one. */
 export function errorCode(error: unknown): string {
-  const code = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  // A request refused until Two-Step Verification arrives as an object carrying its code.
+  const refused = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+  const code = error instanceof Error ? error.message : typeof error === 'string' ? error : typeof refused === 'string' ? refused : '';
   return /^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(code) && code.length <= 128 ? code : '';
 }
 
