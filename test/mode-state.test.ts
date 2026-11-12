@@ -34,6 +34,9 @@ test('local setup names a busy port, offers a companion update and always offers
   // A Manager that will not stop must not make the app unquittable again.
   assert.match(ui, /leaveOffered = !leaveRunning && String\(error\) === 'native_manager_shutdown_unconfirmed' && view\?\.companionPlatform !== 'windows'/);
   assert.match(ui, /leaveOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(true\)\}>Quit anyway</);
+  // The offer promises an attempt, and a Manager that cannot be recorded keeps the app open.
+  assert.match(ui, /Frameleaf will try to stop it the next time it opens/);
+  assert.match(ui, /value === 'native_manager_record_unavailable'\) return '[^']*Frameleaf is staying open/);
 });
 
 test('every invoke() in the Svelte front end names a registered, permitted command', () => {
