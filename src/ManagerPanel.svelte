@@ -471,7 +471,7 @@
             <div class="form-row"><label for="manager-origin">Manager address</label><input id="manager-origin" type="url" bind:value={origin} placeholder="http://192.168.1.10:2282" required autocomplete="url" /></div>
             <div class="form-row"><label for="manager-password">Manager password</label><input id="manager-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" /></div>
             {#if http}
-              <div class="form-row"><span></span><p class="hint" style="margin:0">HTTP is for a Manager on this computer or your home network. Use HTTPS for a Manager reached over the internet.</p></div>
+              <div class="form-row"><span></span><p class="hint" style="margin:0">HTTP is for a Manager on this computer or your home network. It sends your Manager password without encryption, so use HTTPS for a Manager reached over the internet.</p></div>
             {:else}
               <div class="form-row"><span></span><span><label class="check"><input type="checkbox" bind:checked={showCertificate} />Use a certificate for a private Manager</label></span></div>
               {#if showCertificate}
