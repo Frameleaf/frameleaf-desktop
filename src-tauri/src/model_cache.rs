@@ -372,7 +372,7 @@ async fn acquire_file_with_progress(
 
 /// Delete one direct child of the cache root. Links are never followed or removed, and the
 /// resolved path must still be a child of the resolved root.
-fn remove_contained(root: &Path, name: &str) -> Result<(), String> {
+pub(crate) fn remove_contained(root: &Path, name: &str) -> Result<(), String> {
     use std::path::Component;
     let failed = || "model_cache_remove_failed".to_string();
     crate::native_runtime::absolute_directory(root)?;
@@ -438,13 +438,100 @@ pub(crate) fn prune(
             continue;
         }
         let stale = if name.starts_with(".staging-") {
-            newest_change(&entry.path())
-                .and_then(|newest| now.duration_since(newest).ok())
-                .is_some_and(|age| age > STAGING_RETENTION)
+            untouched_for_retention(&entry.path(), now)
         } else {
-            name.len() == 40
-                && name.bytes().all(|b| b.is_ascii_hexdigit())
-                && !referenced.contains(&name)
+            hex_name(&name, 40) && !referenced.contains(&name)
+        };
+        if stale {
+            let _ = remove_contained(root, &name);
+        }
+    }
+    Ok(())
+}
+
+fn untouched_for_retention(path: &Path, now: SystemTime) -> bool {
+    newest_change(path)
+        .and_then(|newest| now.duration_since(newest).ok())
+        .is_some_and(|age| age > STAGING_RETENTION)
+}
+fn hex_name(name: &str, length: usize) -> bool {
+    name.len() == length && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+/// Whether a process still owns this inference scratch: `Some(true)` while its owner holds the
+/// lock, `Some(false)` once the lock is free, `None` when that cannot be told.
+fn scratch_in_use(scratch: &Path) -> Option<bool> {
+    let owner = scratch.join(crate::native_runtime::SCRATCH_OWNER);
+    let meta = match fs::symlink_metadata(&owner) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(true),
+    };
+    if !meta.is_file() {
+        return Some(true);
+    }
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&owner) else {
+        return Some(true);
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Some(false)
+        }
+        Err(_) => Some(true),
+    }
+}
+/// Remove inference scratch no running worker owns. A scratch whose owner lock is held is never
+/// touched; one without an owner record (written by an earlier version, or unreadable) is only
+/// removed once nothing in it has changed for a week.
+pub(crate) fn prune_scratch(root: &Path, now: SystemTime) -> Result<(), String> {
+    crate::native_runtime::absolute_directory(root)?;
+    for entry in fs::read_dir(root).map_err(|_| "model_cache_remove_failed")? {
+        let Ok(entry) = entry else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || name
+                .strip_prefix("inference-")
+                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+        {
+            continue;
+        }
+        let stale = match scratch_in_use(&entry.path()) {
+            Some(true) => false,
+            Some(false) => true,
+            None => untouched_for_retention(&entry.path(), now),
+        };
+        if stale {
+            let _ = remove_contained(root, &name);
+        }
+    }
+    Ok(())
+}
+/// Remove combined model sets other than the one the current selection runs from, and set
+/// staging nothing has touched for a week. `active` is the directory `shared_cache` returned; a
+/// selection served from a single model cache has no set of its own.
+pub(crate) fn prune_model_sets(root: &Path, active: &Path, now: SystemTime) -> Result<(), String> {
+    if fs::symlink_metadata(root).is_err() {
+        return Ok(());
+    }
+    crate::native_runtime::absolute_directory(root)?;
+    let active = active
+        .parent()
+        .filter(|parent| *parent == root)
+        .and_then(|_| active.file_name());
+    for entry in fs::read_dir(root).map_err(|_| "model_cache_remove_failed")? {
+        let Ok(entry) = entry else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let stale = if name.starts_with(".composition-") {
+            untouched_for_retention(&entry.path(), now)
+        } else {
+            hex_name(&name, 64) && active != Some(entry.file_name().as_os_str())
         };
         if stale {
             let _ = remove_contained(root, &name);
@@ -1302,5 +1389,102 @@ mod tests {
             assert!(remove_contained(&models, &escape).is_err());
         }
         assert!(root.0.join(&outside).join("clip/model.onnx").exists());
+    }
+
+    #[test]
+    fn scratch_prune_never_removes_scratch_a_worker_owns_or_anything_else() {
+        let root = Root::new();
+        let scratch = root.0.join("scratch");
+        let id = || format!("inference-{}", uuid::Uuid::new_v4());
+        let (owned, released, legacy, other) = (id(), id(), id(), "inference-notes".to_string());
+        for name in [&owned, &released, &legacy, &other] {
+            fs::create_dir_all(scratch.join(name).join("cache")).unwrap();
+            fs::write(scratch.join(name).join("cache/blob"), b"scratch").unwrap();
+        }
+        fs::write(scratch.join("report.json"), b"file").unwrap();
+        let outside = root.0.join(id());
+        fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        let link = id();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, scratch.join(&link)).unwrap();
+        let owner = |name: &str| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(
+                    scratch
+                        .join(name)
+                        .join(crate::native_runtime::SCRATCH_OWNER),
+                )
+                .unwrap()
+        };
+        let held = owner(&owned);
+        held.try_lock().unwrap();
+        drop(owner(&released));
+        let later = SystemTime::now() + STAGING_RETENTION + Duration::from_secs(60);
+        prune_scratch(&scratch, SystemTime::now()).unwrap();
+        // The lock is free: its worker has gone. No owner record: unknown, so it is kept for now.
+        assert!(!scratch.join(&released).exists());
+        for kept in [&owned, &legacy, &other] {
+            assert!(scratch.join(kept).join("cache/blob").exists(), "{kept}");
+        }
+        prune_scratch(&scratch, later).unwrap();
+        assert!(!scratch.join(&legacy).exists());
+        // A running worker's scratch survives however old it is; so does anything unrecognised.
+        assert!(scratch.join(&owned).join("cache/blob").exists());
+        assert!(scratch.join(&other).join("cache/blob").exists());
+        assert!(scratch.join("report.json").exists());
+        assert!(outside.exists());
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(scratch.join(&link)).is_ok());
+        drop(held);
+        prune_scratch(&scratch, SystemTime::now()).unwrap();
+        assert!(!scratch.join(&owned).exists());
+    }
+
+    #[test]
+    fn model_set_prune_keeps_the_active_set_and_everything_outside_the_set_root() {
+        let root = Root::new();
+        let sets = root.0.join("model-sets");
+        let (active, superseded) = ("a".repeat(64), "b".repeat(64));
+        let staging = format!(".composition-{}", uuid::Uuid::new_v4());
+        let outside = root.0.join("c".repeat(64));
+        for directory in [
+            sets.join(&active),
+            sets.join(&superseded),
+            sets.join(&staging),
+            sets.join("notes"),
+            outside.clone(),
+        ] {
+            fs::create_dir_all(directory.join("clip")).unwrap();
+            fs::write(directory.join("clip/model.onnx"), b"weights").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, sets.join("d".repeat(64))).unwrap();
+        prune_model_sets(&sets, &sets.join(&active), SystemTime::now()).unwrap();
+        assert!(!sets.join(&superseded).exists());
+        for kept in [
+            sets.join(&active),
+            sets.join(&staging),
+            sets.join("notes"),
+            outside.clone(),
+        ] {
+            assert!(kept.join("clip/model.onnx").exists(), "{kept:?}");
+        }
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(sets.join("d".repeat(64))).is_ok());
+        let later = SystemTime::now() + STAGING_RETENTION + Duration::from_secs(60);
+        // A selection served straight from one model cache has no set: every set is superseded,
+        // and a path that merely shares the active set's name elsewhere protects nothing here.
+        prune_model_sets(&sets, &outside, later).unwrap();
+        assert!(!sets.join(&active).exists());
+        assert!(!sets.join(&staging).exists());
+        assert!(sets.join("notes/clip/model.onnx").exists());
+        assert!(outside.join("clip/model.onnx").exists());
+        // A missing set root is nothing to prune.
+        prune_model_sets(&root.0.join("absent"), &outside, later).unwrap();
     }
 }

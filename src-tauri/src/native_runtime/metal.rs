@@ -116,7 +116,8 @@ pub(super) fn validate_report(
     spec: &serde_json::Value,
     expected_collector: &str,
 ) -> Result<(), String> {
-    let invalid = || String::from("runtime_device_execution_invalid");
+    // The same code as every other refused report: the worker falls back on it.
+    let invalid = || String::from("runtime_qualification_report_invalid");
     let proof: Proof =
         serde_json::from_value(report["deviceExecution"].clone()).map_err(|_| invalid())?;
     if proof.provider != "CoreMLExecutionProvider"

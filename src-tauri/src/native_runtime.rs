@@ -209,13 +209,28 @@ impl VerifiedRuntime {
     pub(crate) fn epoch(&self) -> u64 {
         self.manifest.epoch
     }
-    pub(crate) fn copy_payload(&self, destination: &Path) -> Result<(), String> {
+    /// `share` is the payload of an installed release with the same files (the processor and
+    /// accelerated manifests of one pack): its files are linked instead of copied again. The
+    /// caller verifies every byte of the result against this manifest either way.
+    pub(crate) fn copy_payload(
+        &self,
+        destination: &Path,
+        share: Option<&Path>,
+    ) -> Result<(), String> {
         self.check_files()?;
         for (name, artifact) in &self.manifest.files {
             let source = self.root.join(relative(name)?);
             let target = destination.join(relative(name)?);
             fs::create_dir_all(target.parent().ok_or("runtime_path_invalid")?)
                 .map_err(|_| "runtime_copy_failed")?;
+            if let Some(share) = share {
+                let shared = share.join(relative(name)?);
+                if no_link(&shared).is_ok_and(|meta| meta.is_file() && meta.len() == artifact.bytes)
+                    && fs::hard_link(&shared, &target).is_ok()
+                {
+                    continue;
+                }
+            }
             let metadata = no_link(&source)?;
             let input = File::open(source).map_err(|_| "runtime_copy_failed")?;
             let mut options = fs::OpenOptions::new();
@@ -317,6 +332,24 @@ else:
     runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
 "#;
 
+/// Held under an exclusive lock for as long as a process owns an inference scratch, so pruning
+/// can tell an abandoned scratch from one in use (also by another instance of the app).
+pub(crate) const SCRATCH_OWNER: &str = ".owner";
+fn own_scratch(scratch: &Path) -> Result<File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let owner = options
+        .open(scratch.join(SCRATCH_OWNER))
+        .map_err(|_| "runtime_scratch_failed")?;
+    owner.try_lock().map_err(|_| "runtime_scratch_failed")?;
+    Ok(owner)
+}
+
 pub struct NativeSidecar {
     child: std::process::Child,
     tree: crate::process_tree::ProcessTree,
@@ -325,6 +358,8 @@ pub struct NativeSidecar {
     stopped: bool,
     exit_status: Option<std::process::ExitStatus>,
     lease: Option<std::sync::Arc<File>>,
+    /// Released before the scratch is removed.
+    owner: Option<File>,
 }
 impl NativeSidecar {
     pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
@@ -367,6 +402,7 @@ impl NativeSidecar {
 impl Drop for NativeSidecar {
     fn drop(&mut self) {
         let _ = self.stop();
+        drop(self.owner.take());
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
@@ -441,6 +477,13 @@ impl VerifiedRuntime {
         builder
             .create(&scratch)
             .map_err(|_| "runtime_scratch_failed")?;
+        let owner = match own_scratch(&scratch) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&scratch);
+                return Err(error);
+            }
+        };
         let mut secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
         let token = zeroize::Zeroizing::new(
@@ -578,6 +621,7 @@ impl VerifiedRuntime {
             stopped: false,
             exit_status: None,
             lease: None,
+            owner: Some(owner),
         };
         owner
             .child
