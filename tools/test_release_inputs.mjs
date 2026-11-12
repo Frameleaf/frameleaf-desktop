@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { releaseMatrix, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
+import { releaseMatrix, updateFeedSummary, updateManifest, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
 
 test("release tags must match all application versions", () => {
   assert.equal(validateReleaseTag("v0.1.0", ["0.1.0", "0.1.0", "0.1.0"]), "v0.1.0");
@@ -34,6 +34,58 @@ test("release selections cover the supported architectures without adding Window
   assert.deepEqual(releaseMatrix("macos-aarch64").include, [macos[0]]);
   assert.deepEqual(releaseMatrix("linux").include, linux);
   assert.throws(() => releaseMatrix("anything"), /release_platforms_invalid/);
+});
+
+// Windows joins a release only when someone selects it: Azure Artifact Signing is not qualified yet (docs/releases.md).
+test("the release workflow defaults to the platforms that can be signed today", () => {
+  const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  const input = /\n      platforms:\n(?: {8}.*\n)*? {8}default: (\S+)\n {8}options: \[([^\]]+)\]\n/.exec(workflow);
+  assert.ok(input, "release.yml must declare the platforms choice");
+  const [, selected, options] = input;
+  assert.equal(selected, "macos-linux");
+  assert.deepEqual(releaseMatrix(selected).include.map(({ target }) => target),
+    ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"]);
+  for (const option of options.split(", ")) assert.doesNotThrow(() => releaseMatrix(option));
+  assert.ok(options.split(", ").includes(selected));
+  // The staging job must report what the default leaves out, in both the run summary and the draft notes.
+  assert.match(workflow, /appendFileSync\(process\.env\.GITHUB_STEP_SUMMARY, summary\)/);
+  assert.match(workflow, /cat "\$RUNNER_TEMP\/update-feed\.md"/);
+});
+
+test("the release summary says plainly when Windows is left out of the update feed", () => {
+  const signature = "c2lnbmF0dXJl";
+  const defaults = {
+    "Frameleaf_1.2.3_aarch64.app.tar.gz": signature,
+    "Frameleaf_1.2.3_x64.app.tar.gz": signature,
+    "Frameleaf_1.2.3_amd64.AppImage": signature,
+    "Frameleaf_1.2.3_amd64.deb": signature,
+    "Frameleaf_1.2.3_aarch64.AppImage": signature,
+    "Frameleaf_1.2.3_arm64.deb": signature,
+  };
+  const withoutWindows = updateFeedSummary(updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", defaults));
+  assert.match(withoutWindows, /^### Update feed for 1\.2\.3\n/);
+  assert.match(withoutWindows, /\*\*Windows was excluded from the update feed\.\*\* This release has no signed Windows installers, so Desktop on Windows will not be offered 1\.2\.3/);
+  assert.doesNotMatch(withoutWindows, /Not in the update feed/);
+
+  const all = updateFeedSummary(updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {
+    ...defaults,
+    "Frameleaf_1.2.3_x64-setup.exe": signature,
+    "Frameleaf_1.2.3_x64_en-US.msi": signature,
+  }));
+  assert.doesNotMatch(all, /excluded|Not in the update feed/);
+  assert.match(all, /windows-x86_64-msi, windows-x86_64-nsis\./);
+
+  const appleSilicon = updateFeedSummary(updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {
+    "Frameleaf_1.2.3_aarch64.app.tar.gz": signature,
+  }));
+  assert.match(appleSilicon, /Windows was excluded from the update feed/);
+  assert.match(appleSilicon, /\nNot in the update feed: darwin-x86_64-app, linux-aarch64-appimage, linux-aarch64-deb, linux-x86_64-appimage, linux-x86_64-deb\.\n$/);
+});
+
+test("installers published without a Windows signature can never enter the update feed", () => {
+  for (const name of ["Frameleaf_1.2.3_x64-setup-unsigned.exe", "Frameleaf_1.2.3_x64_en-US-unsigned.msi"]) {
+    assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", { [name]: "c2lnbmF0dXJl" }), /update_asset_invalid/);
+  }
 });
 
 // Runtime consumers must reject artifacts from other workflows or untrusted refs.
