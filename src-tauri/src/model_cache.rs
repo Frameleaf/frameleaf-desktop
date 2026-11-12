@@ -5,7 +5,7 @@ use reqwest::{
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime},
@@ -89,16 +89,24 @@ fn open_partial(partial: &Path) -> Result<(fs::File, u64), String> {
     };
     let existing = existing.map(|meta| meta.len());
     let mut options = OpenOptions::new();
-    options.append(true).create_new(existing.is_none());
+    // Not append mode: Windows refuses to truncate through an append-only handle.
+    options.write(true).create_new(existing.is_none());
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options
+    let mut file = options
         .open(partial)
         .map_err(|_| "model_file_create_failed")?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|_| "model_file_create_failed")?;
     Ok((file, existing.unwrap_or(0)))
+}
+/// Empty the partial and write from its start again.
+fn truncate(mut file: &fs::File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0)).map(|_| ())
 }
 fn write_pinned(path: &Path, bytes: &[u8], cancel: &AtomicBool) -> Result<(), String> {
     check_cancel(cancel)?;
@@ -161,8 +169,7 @@ fn content_range(response: &reqwest::Response) -> Option<(u64, u64)> {
     Some((range.split_once('-')?.0.parse().ok()?, total.parse().ok()?))
 }
 fn restart(file: &fs::File, offset: &mut u64) -> Result<(), Halt> {
-    file.set_len(0)
-        .map_err(|_| Halt::Fatal("model_file_write_failed".into()))?;
+    truncate(file).map_err(|_| Halt::Fatal("model_file_write_failed".into()))?;
     *offset = 0;
     Ok(())
 }
@@ -271,7 +278,7 @@ async fn download(
     let mut refetched = false;
     let mut failure = "model_download_unavailable";
     if offset > bytes {
-        file.set_len(0).map_err(|_| "model_file_write_failed")?;
+        truncate(&file).map_err(|_| "model_file_write_failed")?;
         offset = 0;
     }
     for attempt in 0..ATTEMPTS {
@@ -306,7 +313,7 @@ async fn download(
                     return Err("model_download_hash_mismatch".into());
                 }
                 refetched = true;
-                file.set_len(0).map_err(|_| "model_file_write_failed")?;
+                truncate(&file).map_err(|_| "model_file_write_failed")?;
                 offset = 0;
                 known = None;
             }
@@ -680,7 +687,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::{
         fs,
-        io::{Read, Write},
+        io::{Read, Seek, SeekFrom, Write},
         net::TcpListener,
     };
     use uuid::Uuid;
