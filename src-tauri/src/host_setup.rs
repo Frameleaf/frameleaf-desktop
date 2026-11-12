@@ -542,6 +542,12 @@ impl HostSetup {
         Ok(address)
     }
     pub(crate) async fn stop(&self) -> Result<View, String> {
+        self.stop_proven(false).await
+    }
+    /// Stop Manager, only on the journal's proof that the database is closed. With `in_order`,
+    /// a controller that still holds the journal is first closed in order through Manager; the
+    /// same proof is then required before Manager is touched.
+    async fn stop_proven(&self, in_order: bool) -> Result<View, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
         let Some(running) = owner.as_mut() else {
             return Ok(self.snapshot());
@@ -554,13 +560,30 @@ impl HostSetup {
             Ok(())
         } else {
             async {
-                let mut proof =
-                    crate::host_state::Owner::acquire(&running.configuration.state, true)?;
-                proof.admit_idle(
-                    &running.configuration.installation_id,
-                    &running.installation.manifest_sha256,
-                )?;
-                running.manager.shutdown(Duration::from_secs(10)).await?;
+                let Running {
+                    manager,
+                    configuration,
+                    installation,
+                } = running;
+                let prove = || {
+                    let mut proof = crate::host_state::Owner::acquire(&configuration.state, true)?;
+                    proof.admit_idle(
+                        &configuration.installation_id,
+                        &installation.manifest_sha256,
+                    )?;
+                    Ok::<_, String>(proof)
+                };
+                let proof = if in_order {
+                    orderly_stop_proof(
+                        prove,
+                        stop_photo_server(&mut *manager, configuration, ORDERLY_STOP),
+                        Duration::from_secs(10),
+                    )
+                    .await?
+                } else {
+                    prove()?
+                };
+                manager.shutdown(Duration::from_secs(10)).await?;
                 drop(proof);
                 Ok::<(), String>(())
             }
@@ -586,7 +609,8 @@ impl HostSetup {
     }
     /// The quit path. Unix asks Manager to exit even while the photo server runs: its controller
     /// then closes the database in order, and finishes on its own if this app exits first.
-    /// Windows keeps the idle proof, because ending Manager's job there would kill the database.
+    /// Windows keeps the idle proof, because ending Manager's job there would kill the database;
+    /// a photo server that is still running is first closed in order through Manager.
     /// The quit path as one decision. `exit_refused` is the code of whatever else would refuse
     /// the exit that follows: with one, nothing is stopped or left, because the app would
     /// stay open with its library stopped for nothing.
@@ -634,8 +658,106 @@ impl HostSetup {
         #[cfg(not(unix))]
         {
             let _ = timeout;
-            self.stop().await
+            self.stop_proven(true).await
         }
+    }
+    /// Windows is ending the session and ends this app, and with it Manager's job, when this
+    /// returns. Close the photo server and database in order first. Whatever this cannot do
+    /// (an operation in flight, no saved grant, a stop that fails) is left to the job's
+    /// kill-on-close, which the next start recovers from.
+    #[cfg(windows)]
+    pub(crate) fn stop_for_session_end(&self) {
+        let _ = tauri::async_runtime::block_on(self.stop_proven(true));
+    }
+}
+/// How long Manager may take to close the photo server and database in order. Manager gives its
+/// own controller 170 seconds before it gives up.
+const ORDERLY_STOP: Duration = Duration::from_secs(180);
+/// The proof that the database is closed, for a stop that would otherwise kill it. Only a
+/// controller known to hold the journal is worth asking to stop; any other failed proof
+/// (unreadable, interrupted, bound to something else) is refused as it is. Whatever `ask`
+/// reports, only the journal's own proof is returned: the controller may take a moment after
+/// Manager's answer to release the journal, so the proof is read again for up to `settle`.
+async fn orderly_stop_proof<P>(
+    prove: impl Fn() -> Result<P, String>,
+    ask: impl std::future::Future<Output = Result<(), String>>,
+    settle: Duration,
+) -> Result<P, String> {
+    let held = |proof: &Result<P, String>| {
+        proof
+            .as_ref()
+            .is_err_and(|code| idle_evidence(Err(code.clone())) == Evidence::Running)
+    };
+    let first = prove();
+    if !held(&first) {
+        return first;
+    }
+    ask.await?;
+    let deadline = std::time::Instant::now() + settle;
+    loop {
+        let proof = prove();
+        if !held(&proof) || std::time::Instant::now() >= deadline {
+            return proof;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// Ask the owned Manager to stop the photo server and database in order, with the grant this
+/// computer saved when it was authorized for exactly this Manager.
+async fn stop_photo_server(
+    manager: &mut NativeManager,
+    configuration: &Configuration,
+    timeout: Duration,
+) -> Result<(), String> {
+    let certificate = manager.management_identity(configuration)?;
+    let identity = crate::credentials::identity()?;
+    let saved =
+        crate::credentials::load::<crate::manager::SavedManager>(crate::manager::CREDENTIAL)?
+            .ok_or("manager_pairing_required")?;
+    local_grant(&saved, &identity, configuration, &certificate.sha256)?;
+    manager_stop(
+        |command| crate::manager::send(&saved, &identity, command),
+        timeout,
+    )
+    .await
+}
+/// Manager's stop operation, followed until Manager reports it complete. Anything else it
+/// reports, an answer that cannot be read and running out of time are all failures.
+async fn manager_stop<F>(
+    send: impl Fn(crate::manager::Command) -> F,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    use crate::manager::{Action, Command};
+    let deadline = std::time::Instant::now() + timeout;
+    let accepted = send(Command::Control {
+        action: Action::Stop,
+        key: uuid::Uuid::new_v4(),
+    })
+    .await?;
+    let id = accepted["id"]
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or("manager_response_invalid")?;
+    loop {
+        let operation = send(Command::Operation { id }).await?;
+        match operation["state"].as_str() {
+            Some("complete") => return Ok(()),
+            Some("running") => {}
+            Some("failed" | "interrupted") => {
+                return Err(operation["error"]
+                    .as_str()
+                    .unwrap_or("manager_operation_failed")
+                    .into())
+            }
+            _ => return Err("manager_response_invalid".into()),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("native_manager_shutdown_unconfirmed".into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 fn local_photos_origin(port: u16) -> Result<url::Url, String> {
@@ -2116,6 +2238,220 @@ mod tests {
         assert!(setup.lock_for_update().is_err());
         drop(controller);
         assert!(setup.lock_for_update().is_ok());
+    }
+
+    /// The Windows exit stop, whose Manager job holds the database: the decision runs on every OS.
+    #[tokio::test]
+    async fn an_orderly_stop_asks_manager_only_for_a_running_controller_and_trusts_only_the_journal(
+    ) {
+        use std::cell::Cell;
+        async fn never() -> Result<(), String> {
+            panic!("Manager is not asked")
+        }
+        let no_wait = Duration::ZERO;
+        // Already proven idle: Manager is not asked and the proof is handed on.
+        assert_eq!(
+            orderly_stop_proof(|| Ok("proof"), never(), no_wait).await,
+            Ok("proof")
+        );
+        // A proof that failed for any reason other than a running controller is refused as it
+        // is: unreadable, interrupted or changed evidence is never something to stop through.
+        for unknown in [
+            "host_recovery_requires_manager",
+            "host_controller_state_invalid",
+            "host_controller_binding_changed",
+            "host_process_state_requires_review",
+            "host_state_not_private",
+            "host_profile_identity_changed",
+        ] {
+            assert_eq!(
+                orderly_stop_proof(|| Err::<(), _>(unknown.to_string()), never(), no_wait).await,
+                Err(unknown.to_string())
+            );
+        }
+        for held in ["host_controller_already_owned", "host_already_owned"] {
+            let asked = Cell::new(false);
+            // What the journal says: a controller holds it until Manager has stopped it.
+            let journal = || {
+                if asked.get() {
+                    Ok("proof")
+                } else {
+                    Err(held.to_string())
+                }
+            };
+            // Manager could not stop it: nothing is proven, so nothing may be ended.
+            assert_eq!(
+                orderly_stop_proof(
+                    journal,
+                    async { Err("native_shutdown_unconfirmed".to_string()) },
+                    no_wait
+                )
+                .await,
+                Err("native_shutdown_unconfirmed".to_string())
+            );
+            // Manager stopped it and the journal now proves it.
+            assert_eq!(
+                orderly_stop_proof(
+                    journal,
+                    async {
+                        asked.set(true);
+                        Ok(())
+                    },
+                    no_wait
+                )
+                .await,
+                Ok("proof")
+            );
+            // Manager says stopped but the controller still holds the journal: Manager's word
+            // is not the proof.
+            assert_eq!(
+                orderly_stop_proof(|| Err::<(), _>(held.to_string()), async { Ok(()) }, no_wait)
+                    .await,
+                Err(held.to_string())
+            );
+        }
+        // The controller lets go a moment after Manager answers: the proof is read again.
+        let reads = Cell::new(0);
+        assert_eq!(
+            orderly_stop_proof(
+                || {
+                    reads.set(reads.get() + 1);
+                    if reads.get() < 4 {
+                        Err("host_controller_already_owned".to_string())
+                    } else {
+                        Ok("proof")
+                    }
+                },
+                async { Ok(()) },
+                Duration::from_secs(30)
+            )
+            .await,
+            Ok("proof")
+        );
+        // After Manager's stop the journal turns out interrupted: refused, never retried into.
+        let reads = Cell::new(0);
+        assert_eq!(
+            orderly_stop_proof(
+                || {
+                    reads.set(reads.get() + 1);
+                    Err::<(), _>(
+                        if reads.get() == 1 {
+                            "host_controller_already_owned"
+                        } else {
+                            "host_recovery_requires_manager"
+                        }
+                        .to_string(),
+                    )
+                },
+                async { Ok(()) },
+                Duration::from_secs(30)
+            )
+            .await,
+            Err("host_recovery_requires_manager".to_string())
+        );
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_manager_stop_is_done_only_when_manager_reports_it_complete() {
+        use crate::manager::{Action, Command};
+        use serde_json::json;
+        use std::cell::RefCell;
+        let id = uuid::Uuid::new_v4();
+        // Manager's answers to the stop request and then to each look at its operation.
+        let run = |accepted: Result<serde_json::Value, String>,
+                   states: Vec<serde_json::Value>,
+                   timeout: Duration| async move {
+            let states = RefCell::new(states.into_iter());
+            let accepted = RefCell::new(Some(accepted));
+            manager_stop(
+                |command| {
+                    let reply = match command {
+                        Command::Control {
+                            action: Action::Stop,
+                            key,
+                        } if !key.is_nil() => accepted.borrow_mut().take().expect("asked once"),
+                        Command::Operation { id: asked } if asked == id => Ok(states
+                            .borrow_mut()
+                            .next()
+                            .expect("not asked again after an answer that ends it")),
+                        _ => panic!("only a stop and its own operation are sent"),
+                    };
+                    async move { reply }
+                },
+                timeout,
+            )
+            .await
+        };
+        let accepted = || Ok(json!({ "id": id.to_string() }));
+        let long = Duration::from_secs(60);
+        assert_eq!(
+            run(
+                accepted(),
+                vec![
+                    json!({"state":"running"}),
+                    json!({"state":"running"}),
+                    json!({"state":"complete"})
+                ],
+                long
+            )
+            .await,
+            Ok(())
+        );
+        for (answer, code) in [
+            (
+                json!({"state":"failed","error":"native_shutdown_unconfirmed"}),
+                "native_shutdown_unconfirmed",
+            ),
+            (
+                json!({"state":"interrupted","error":null}),
+                "manager_operation_failed",
+            ),
+            (json!({"state":"stopped"}), "manager_response_invalid"),
+            (json!({}), "manager_response_invalid"),
+        ] {
+            assert_eq!(
+                run(accepted(), vec![answer], long).await,
+                Err(code.to_string())
+            );
+        }
+        // Still running when time is up is not a stop.
+        assert_eq!(
+            run(accepted(), vec![json!({"state":"running"})], Duration::ZERO).await,
+            Err("native_manager_shutdown_unconfirmed".to_string())
+        );
+        // A refused request, or an acceptance naming no operation, asks nothing further.
+        assert_eq!(
+            run(Err("manager_scope_denied".into()), vec![], long).await,
+            Err("manager_scope_denied".to_string())
+        );
+        assert_eq!(
+            run(Ok(json!({"id":"not-an-operation"})), vec![], long).await,
+            Err("manager_response_invalid".to_string())
+        );
+    }
+
+    /// The Windows quit path on a stand-in Manager: with a controller holding the journal and no
+    /// way to ask Manager to stop it, Manager is left running and the app stays protected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_orderly_stop_that_cannot_ask_manager_ends_nothing() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        let controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        // The stand-in never became a verified Manager, so there is nothing to ask.
+        assert_eq!(
+            setup.stop_proven(true).await.err().unwrap(),
+            "native_manager_not_ready"
+        );
+        assert!(setup.background_active());
+        assert!(live(&mut setup.owner.try_lock().unwrap()));
+        // Once the journal proves a clean stop, the same path stops Manager without asking.
+        drop(controller);
+        cleanly_stopped(&fixture.state());
+        let view = setup.stop_proven(true).await.unwrap();
+        assert_eq!(view.state, "idle");
+        assert!(!setup.background_active());
     }
 
     #[cfg(unix)]
