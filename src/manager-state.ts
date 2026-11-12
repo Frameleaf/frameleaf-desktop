@@ -17,8 +17,9 @@ export type ManagerView = {
   origin: string; managerId: string; deviceId: string; installationId: string;
   expiresAt: number; scopes: string[]; certificateSha256: string | null;
 };
+/** `other` is an operation kind this Desktop version does not know. */
 export type Operation = {
-  id: string; kind: Control; state: 'running' | 'interrupted' | 'failed' | 'complete';
+  id: string; kind: Control | 'other'; state: 'running' | 'interrupted' | 'failed' | 'complete';
   step: string | null; completed: string[]; error: string | null; createdAt: number; updatedAt: number;
 };
 export type ManagerStatus = {
@@ -80,6 +81,13 @@ export function managerError(error: unknown): string {
     manager_local_state_unavailable: 'The request receipt could not be saved on this computer. Keep this window open and check the existing operation.',
     manager_installation_changed: 'Manager now identifies a different installation. Verify it before pairing again.',
     manager_pairing_binding_changed: 'Manager returned different pairing details. Pairing stopped; verify the Manager installation.',
+    manager_clock_skew: 'This computer’s clock and Manager’s clock differ by more than a minute. Set the date and time automatically on both, then try again.',
+    manager_https_required: 'Use an HTTPS address for Manager. HTTP is accepted only for a Manager on this computer, such as http://localhost:2282.',
+    desktop_operation_not_authorized: 'Manager no longer lists that operation for this installation. Refresh to see its current state.',
+    desktop_transport_refused: 'Manager refused this connection. Check that the Manager address matches the one Manager is configured with.',
+    desktop_pairing_unavailable: 'Manager could not complete this pairing. Try pairing again.',
+    desktop_pairing_invalid: 'Manager could not complete this pairing. Try pairing again.',
+    manager_response_too_large: 'Manager sent more data than Desktop accepts. Update Desktop, or review this in Manager.',
     manager_device_changed: 'This computer’s device key changed. Revoke its old Manager access with your Manager password, then pair again.',
     manager_certificate_invalid: 'Enter one valid public PEM certificate for Manager.',
     manager_certificate_approval_changed: 'The certificate changed after approval. Review its fingerprint again.',

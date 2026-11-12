@@ -25,6 +25,8 @@ pub(crate) fn client_builder() -> ClientBuilder {
 
 pub(crate) fn streaming_client_builder() -> ClientBuilder {
     Client::builder()
+        // Operating-system roots are loaded only for Manager's system-trust option.
+        .tls_built_in_native_certs(false)
         .redirect(reqwest::redirect::Policy::none())
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
