@@ -687,7 +687,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::{
         fs,
-        io::{Read, Seek, SeekFrom, Write},
+        io::{Read, Write},
         net::TcpListener,
     };
     use uuid::Uuid;
