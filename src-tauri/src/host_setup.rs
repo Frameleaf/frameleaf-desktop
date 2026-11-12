@@ -1044,6 +1044,19 @@ fn configuration<U: Serialize>(
     })
 }
 
+/// Why the package a library last ran with cannot be the start of a move. A package that is
+/// correctly signed but built for another version of this app is named as that: the selected
+/// package is not what is wrong, and installing it again would not help. Such a move is not
+/// made, because its pins include the database version and nothing here migrates a database.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn previous_package_refusal(code: String) -> String {
+    if code == "host_manifest_incompatible" {
+        "host_upgrade_previous_package_incompatible".into()
+    } else {
+        code
+    }
+}
+
 /// A library keeps its first installation identity. Moving it to a newer signed package copies its
 /// saved secrets and repoints its journals while it is cleanly stopped; downgrades are refused.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1062,7 +1075,8 @@ fn carry_forward(
     }
     let previous_record = Installation::read(&marker.manifest_sha256)
         .map_err(|_| "host_upgrade_previous_package_missing")?;
-    let (previous_layout, previous_runtime) = verified(&previous_record)?;
+    let (previous_layout, previous_runtime) =
+        verified(&previous_record).map_err(previous_package_refusal)?;
     if runtime.epoch() <= previous_runtime.epoch() {
         return Err("host_upgrade_downgrade_refused".into());
     }
@@ -2448,6 +2462,30 @@ mod tests {
             run(Ok(json!({"id":"not-an-operation"})), vec![], long).await,
             Err("manager_response_invalid".to_string())
         );
+    }
+
+    #[test]
+    fn a_library_whose_last_package_was_built_for_another_version_is_named_as_that() {
+        // Not "this companion does not match": the selected package is the right one.
+        assert_eq!(
+            previous_package_refusal("host_manifest_incompatible".into()),
+            "host_upgrade_previous_package_incompatible"
+        );
+        assert_ne!(
+            Compatibility::from_check(Err(previous_package_refusal(
+                "host_manifest_incompatible".into()
+            ))),
+            Compatibility::Outdated
+        );
+        // Every other refusal of the previous package keeps its own meaning.
+        for code in [
+            "host_signature_invalid",
+            "host_manifest_invalid",
+            "host_install_runtime_changed",
+            "runtime_artifact_changed",
+        ] {
+            assert_eq!(previous_package_refusal(code.into()), code);
+        }
     }
 
     #[cfg(unix)]

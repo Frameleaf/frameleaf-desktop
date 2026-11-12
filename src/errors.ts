@@ -349,6 +349,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'Local setup was cancelled.', 'native_manager_start_cancelled'],
   ['', 'This library already uses a newer server package. Choose that package to continue.', 'host_upgrade_downgrade_refused'],
   ['', 'Keep the server package this library last used installed until it has started once with the new package, then try again.', 'host_upgrade_previous_package_missing'],
+  ['', 'This library last ran with a companion built for an earlier version of Frameleaf, and this version cannot move it to the new companion yet. Your library has not been changed. Keep that earlier companion installed. To open the library now, use the version of Frameleaf it last ran with, or contact Frameleaf support.', 'host_upgrade_previous_package_incompatible'],
   ['', 'A restore is waiting to finish with the package this library last used. Finish it in Manager with that package, then try the new package again.', 'host_restore_activation_pending'],
   ['', 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.', 'host_upgrade_operation_pending'],
   ['', 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.', 'host_update_requires_manager'],
