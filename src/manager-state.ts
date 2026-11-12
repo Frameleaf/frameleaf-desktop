@@ -54,7 +54,7 @@ export function managerError(error: unknown): string {
   // than their shared copy in errors.ts says. Every other code takes the shared copy.
   const messages: Record<string,string> = {
     server_requires_https_origin: 'Enter only Manager’s HTTP or HTTPS address, without a path or sign-in details.',
-    server_address_invalid: 'Enter a valid Manager HTTPS address.',
+    server_address_invalid: 'Enter a valid Manager address, such as http://192.168.1.10:2282.',
     manager_response_too_large: 'Manager sent more data than Desktop accepts. Update Desktop, or review this in Manager.',
     credential_store_locked_or_unavailable: 'Unlock your computer’s secure credential store, then try again.',
     credential_store_unavailable: 'Your computer’s secure credential store is unavailable. Manager access was not saved.',
