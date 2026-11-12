@@ -138,6 +138,28 @@ The runtime pack producer/upload is a separate factory-authoring prerequisite;
 the existing `Private CPU runtime candidate` workflow uploads receipts only and
 does not satisfy this artifact contract.
 
+### Model catalogue and runtime profiles
+
+`runtime/model-catalogue.json` is a copy of the server's
+`server/resources/desktop/model-catalogue.json`; both sides compile it and must
+hold the same epoch and profiles. Check it from this repository with the server
+checkout beside it:
+
+```sh
+git -C ../immich show origin/main:server/resources/desktop/model-catalogue.json | python3 tools/check_catalogue_parity.py -
+```
+
+Add `--runtime-profiles <server runtime-profiles.json>` to also check that every
+runtime in `runtime/profiles.json` is one the server approves.
+
+`runtime/profiles.json` lists only runtimes Desktop can build and the server can
+admit, and every source in it has profiles in the catalogue. Today that is the
+CPU runtime on every target. The catalogue also carries CoreML, CUDA and OpenVINO
+profiles; Desktop ignores them until a signed runtime for that provider exists.
+CUDA and OpenVINO are not buildable by `build_runtime.py`. CoreML is not listed
+because the server admits a CoreML report only from a runtime that carries its
+signed device collector, which this repository does not build.
+
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
 and native target before bundling. macOS additionally verifies that the embedded
@@ -158,7 +180,12 @@ the update.
 
 Only after every selected target passes does a separate job receive repository
 write permission and create a **draft prerelease** with installers, signed updater
-packages, `latest.json` and `SHA256SUMS`. The updater sees the manifest after the
+packages, `latest.json` and `SHA256SUMS`. The run summary and the draft notes list
+the targets in `latest.json` and state when Windows was excluded from the update
+feed; the default selection excludes it until Azure Artifact Signing is qualified,
+and Windows entries from an earlier release are not carried forward. The same job
+stamps the AUR and Chocolatey files from those checksums (see
+[`packaging/README.md`](../packaging/README.md)). The updater sees the manifest after the
 release is published as Latest. The workflow never publishes automatically or
 replaces an existing release.
 If a draft already exists for the tag, the create step fails; inspect/remove the

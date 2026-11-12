@@ -1,6 +1,6 @@
 pkgbase = frameleaf-desktop-bin
 	pkgdesc = Desktop app for Frameleaf, a self-hosted photo and video library
-	pkgver = 0.1.5
+	pkgver = 0.1.6
 	pkgrel = 1
 	url = https://frameleaf.app/download/
 	arch = x86_64
@@ -13,9 +13,9 @@ pkgbase = frameleaf-desktop-bin
 	conflicts = frameleaf-desktop
 	options = !strip
 	options = !debug
-	source_x86_64 = frameleaf-desktop-0.1.5-amd64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.5/Frameleaf_0.1.5_amd64.deb
-	sha256sums_x86_64 = a96ed2490af7bcd5ede643fd78131330096218b697f443ec9b78137eaa50e905
-	source_aarch64 = frameleaf-desktop-0.1.5-arm64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.5/Frameleaf_0.1.5_arm64.deb
-	sha256sums_aarch64 = 3bc58d3ff04dbc2864257d96b104236dd892f97404528026b228b57f00125252
+	source_x86_64 = frameleaf-desktop-0.1.6-amd64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.6/Frameleaf_0.1.6_amd64.deb
+	sha256sums_x86_64 = checksum-pending-release
+	source_aarch64 = frameleaf-desktop-0.1.6-arm64.deb::https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.6/Frameleaf_0.1.6_arm64.deb
+	sha256sums_aarch64 = checksum-pending-release
 
 pkgname = frameleaf-desktop-bin

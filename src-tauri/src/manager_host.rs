@@ -314,6 +314,108 @@ fn local_origin(origin: &str) -> Result<u16, String> {
     }
     Ok(port)
 }
+/// Refuse with the port's number when a program already accepts connections on a local port.
+pub(crate) fn foreign_listener(ports: &[u16]) -> Result<(), String> {
+    for port in ports {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], *port));
+        // Only an accepted connection proves a listener; a refusal or timeout does not.
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok() {
+            return Err(format!("local_port_in_use_{port}"));
+        }
+    }
+    Ok(())
+}
+
+/// The Manager this app started, recorded so a later launch can recognise it after a crash.
+#[cfg(unix)]
+const OWNED_PROCESS: &str = "desktop-manager-process.json";
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnedProcess {
+    schema_version: u32,
+    process: crate::process_tree::ProcessIdentity,
+}
+#[cfg(unix)]
+fn owned_process(data: &Path) -> Option<crate::process_tree::ProcessIdentity> {
+    let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(data).ok()?);
+    let file = directory
+        .open_with(OWNED_PROCESS, &crate::host_state::options(false))
+        .ok()?
+        .into_std();
+    crate::host_state::valid_file(&file).ok()?;
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes).ok()?;
+    let record: OwnedProcess = serde_json::from_slice(&bytes).ok()?;
+    (record.schema_version == 1).then_some(record.process)
+}
+/// Callers treat failure as best effort: without a record, a crash leaves Manager running
+/// until the person stops it, exactly as before.
+#[cfg(unix)]
+pub(crate) fn record_owned_process(data: &Path, pid: u32) -> Result<(), String> {
+    let process =
+        crate::process_tree::ProcessIdentity::of(pid).ok_or("native_manager_state_unavailable")?;
+    let bytes = serde_json::to_vec(&OwnedProcess {
+        schema_version: 1,
+        process,
+    })
+    .map_err(|_| "native_manager_state_unavailable")?;
+    let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(data)?);
+    let mut file = directory
+        .open_with(OWNED_PROCESS, &crate::host_state::options(true))
+        .map_err(|_| "native_manager_state_unavailable")?
+        .into_std();
+    crate::host_state::valid_file(&file).map_err(|_| "native_manager_state_unavailable")?;
+    file.set_len(0)
+        .and_then(|_| file.write_all(&bytes))
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "native_manager_state_unavailable".into())
+}
+#[cfg(unix)]
+pub(crate) fn forget_owned_process(data: &Path) {
+    if let Ok(directory) = crate::host_storage::directory(data) {
+        let _ = cap_std::fs::Dir::from_std_file(directory).remove_file(OWNED_PROCESS);
+    }
+}
+/// Stop the Manager an earlier run of this app left behind. Only the exact recorded process is
+/// signalled: a PID that now belongs to anything else is forgotten, never touched.
+/// Returns whether a Manager was stopped.
+#[cfg(unix)]
+pub(crate) fn stop_orphaned_manager(
+    data: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let Some(recorded) = owned_process(data) else {
+        forget_owned_process(data);
+        return Ok(false);
+    };
+    let same =
+        || crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() == Some(&recorded);
+    if recorded.pid == std::process::id() || !same() {
+        forget_owned_process(data);
+        return Ok(false);
+    }
+    // The same request `shutdown` makes: Manager exits and its controller stops the database.
+    if unsafe { libc::kill(recorded.pid as i32, libc::SIGTERM) } != 0
+        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err("native_manager_orphan_running".into());
+    }
+    let deadline = Instant::now() + timeout;
+    while same() {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native_manager_start_cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("native_manager_orphan_running".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    forget_owned_process(data);
+    Ok(true)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Ready {
@@ -383,6 +485,13 @@ impl Programs<'_> {
             TlsIdentity::from_keystore(&config.installation_id, &config.origin, profile.binding())?;
         profile.require_current(config)?;
         let lease = crate::host_state::Owner::acquire(&config.state, true)?;
+        // This lease proves no controller of this library is running, so a listener on any of
+        // its ports belongs to another program.
+        foreign_listener(&[
+            local_origin(&config.origin)?,
+            config.api_port,
+            config.database_port,
+        ])?;
         self.start_owned(
             config,
             &profile.password(),
@@ -834,6 +943,41 @@ impl NativeManager {
             .map(|value| value.is_some())
             .map_err(|_| "native_manager_state_unavailable".into())
     }
+    #[cfg(unix)]
+    pub(crate) fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+    /// Whether Manager and everything it started under this owner have exited.
+    pub(crate) fn tree_exited(&mut self) -> Result<bool, String> {
+        if !self.has_exited()? {
+            return Ok(false);
+        }
+        // The Windows job also holds the controller and database; they can outlive Manager.
+        #[cfg(windows)]
+        {
+            self.tree
+                .is_empty()
+                .map_err(|_| "native_manager_state_unavailable".into())
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(true)
+        }
+    }
+    /// A stand-in child for lifecycle tests; it never reports readiness.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_child(command: &mut Command) -> Self {
+        Self::spawn(
+            command,
+            Zeroizing::new(b"synthetic-private-input\n".to_vec()),
+            "aaaaaaaaaaaa",
+            &"b".repeat(64),
+            "https://127.0.0.1:9443",
+            reqwest::Client::new(),
+            Leases::default(),
+        )
+        .unwrap()
+    }
     pub fn is_running(&mut self) -> Result<bool, String> {
         Ok(self.verified_ready
             && self
@@ -973,6 +1117,80 @@ mod tests {
             .unwrap(),
             "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_manager_is_stopped_only_while_the_recorded_process_is_still_the_same_one() {
+        use crate::process_tree::ProcessIdentity;
+        use std::os::unix::{fs::OpenOptionsExt, process::ExitStatusExt};
+        let data = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-owned-manager-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&data).unwrap();
+        let record = data.join(OWNED_PROCESS);
+        let write = |process: &ProcessIdentity| {
+            let _ = fs::remove_file(&record);
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&record)
+                .unwrap()
+                .write_all(
+                    &serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"process":process}))
+                        .unwrap(),
+                )
+                .unwrap();
+        };
+        let cancel = AtomicBool::new(false);
+        let stop = || stop_orphaned_manager(&data, Duration::from_secs(10), &cancel).unwrap();
+        assert!(!stop(), "nothing was recorded");
+
+        for pid in [0, 1, u32::MAX] {
+            assert!(ProcessIdentity::of(pid).is_none());
+        }
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let live = ProcessIdentity::of(child.id()).unwrap();
+        assert_eq!(ProcessIdentity::of(child.id()).unwrap(), live);
+        assert_ne!(ProcessIdentity::of(std::process::id()).unwrap(), live);
+
+        // The recorded PID now belongs to a process that started at another time.
+        let mut reused = live.clone();
+        reused.started.push('9');
+        write(&reused);
+        assert!(!stop());
+        assert!(!record.exists(), "a stale record is forgotten");
+        // Same PID and start, but it runs a different program.
+        let mut other = live.clone();
+        other.program = "/bin/echo".into();
+        write(&other);
+        assert!(!stop());
+        // A record naming this app itself is never acted on.
+        write(&ProcessIdentity::of(std::process::id()).unwrap());
+        assert!(!stop());
+        // A record that is not private could have been written by anyone.
+        fs::write(
+            &record,
+            serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"process":live})).unwrap(),
+        )
+        .unwrap();
+        assert!(!stop());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a process that is not the recorded one must never be signalled"
+        );
+
+        // The exact process this app recorded is asked to exit, and only then forgotten.
+        record_owned_process(&data, child.id()).unwrap();
+        assert!(stop());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert!(!record.exists());
+        // Its record outliving it changes nothing.
+        write(&live);
+        assert!(!stop());
+        assert!(!record.exists());
+        fs::remove_dir_all(data).unwrap();
     }
     #[test]
     fn readiness_is_bounded_and_bound_to_this_installation_manifest_and_origin() {
