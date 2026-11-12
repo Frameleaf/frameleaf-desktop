@@ -36,6 +36,7 @@
   let failure = $state('');
   let notice = $state('');
   let quitOffered = $state(false);
+  let leaveOffered = $state(false);
   let managerPassword = $state('');
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
@@ -194,10 +195,13 @@
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; }
   }
-  async function stopAndQuit() {
+  async function stopAndQuit(leaveRunning = false) {
     busy = true; failure = ''; notice = '';
-    try { await invoke('quit_local_host'); }
-    catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
+    try { await invoke('quit_local_host', { leaveRunning }); }
+    catch (error) {
+      leaveOffered = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && view?.companionPlatform !== 'windows';
+      failure = leaveOffered ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf stops it the next time it opens.' : explain(error);
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; }
   }
 </script>
@@ -217,7 +221,8 @@
       <span class="l"><b>{headline}</b><small>Keep your photo library on this computer. Frameleaf prepares private storage for your account.</small></span>
       <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
       {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
-      {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stopAndQuit}>Stop and quit</button>{/if}
+      {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit()}>Stop and quit</button>{/if}
+      {#if leaveOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
     </div>
     {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
     {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
