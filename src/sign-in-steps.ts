@@ -18,12 +18,17 @@ export type Step = {
   sentTo: string | null;
   /** The server offered a Passkey. */
   passkey: boolean;
+  /**
+   * Sign in with Frameleaf only: the server also wants its own Password, once, before it links the
+   * account here to the Frameleaf account. It goes in the same request as the proof.
+   */
+  password: boolean;
   failure: string;
 };
 
 export function beginStep(offer: StepOffer): Step {
   const methods = [...new Set(offer.methods)].filter((method): method is StepMethod => enterable.includes(method as StepMethod));
-  return { transaction: offer.transaction, methods, method: methods[0] ?? null, sentTo: offer.sentTo?.trim() || null, passkey: offer.methods.includes('passkey'), failure: '' };
+  return { transaction: offer.transaction, methods, method: methods[0] ?? null, sentTo: offer.sentTo?.trim() || null, passkey: offer.methods.includes('passkey'), password: offer.methods.includes('password'), failure: '' };
 }
 
 /** Switch to another offered proof; a proof that was not offered changes nothing. */
@@ -47,12 +52,23 @@ export function proofReady(method: StepMethod | null, proof: string): boolean {
   return method !== null && /^\d{6}$/.test(value);
 }
 
+/** Whether the step can be sent: the proof when one is asked for, and the Password when that is. */
+export function stepReady(step: Step, proof: string, password = ''): boolean {
+  if (step.password && (password.length === 0 || password.length > 1000)) return false;
+  return step.method ? proofReady(step.method, proof) : step.password;
+}
+
+/** Why a Sign in with Frameleaf asks for this server's own Password. */
+export const linkPrompt = 'An account with your email is already on this server. Enter that account’s Password once to link it to your Frameleaf account.';
+
 export function stepPrompt(step: Step): string {
   switch (step.method) {
     case 'totp': return 'Enter the Verification Code from your authenticator app.';
     case 'email_code': return `Enter the Verification Code sent to ${step.sentTo ?? 'your email'}.`;
     case 'recovery_code': return 'Enter one of your Recovery Codes. Each one works once.';
-    default: return step.passkey ? 'This needs a Passkey, and this app can’t use a Passkey yet.' : 'This needs a step this app can’t finish yet.';
+    default:
+      if (step.password) return '';
+      return step.passkey ? 'This needs a Passkey, and this app can’t use a Passkey yet.' : 'This needs a step this app can’t finish yet.';
   }
 }
 

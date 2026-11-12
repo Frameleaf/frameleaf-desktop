@@ -92,6 +92,7 @@ fn main() {
             "cloud_email_start",
             "cloud_email_complete",
             "connect_cloud_server",
+            "connect_cloud_server_step",
         ]),
     ))
     .expect("build desktop ACL");

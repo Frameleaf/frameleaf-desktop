@@ -75,6 +75,8 @@ const messages: Record<string, string> = {
   sign_in_code_wrong: 'That Verification Code didn’t work. Check it and try again. If it keeps failing, start again with your Password.',
   sign_in_recovery_code_wrong: 'That Recovery Code didn’t work, or it was already used.',
   sign_in_code_invalid: 'Enter the 6-digit Verification Code, or one of your Recovery Codes.',
+  frameleaf_step_refused: 'That didn’t work. Check what you entered and try again. If it keeps failing, start again with Sign In with Frameleaf.',
+  frameleaf_step_expired: 'This sign-in expired. Start again with Sign In with Frameleaf.',
   sign_in_too_many_attempts: 'Too many attempts. Wait a few minutes, then try again.',
   sign_in_two_step_unsupported: 'This account uses Two-Step Verification, and this server can’t finish that in this app yet. Update the server, or sign in another way.',
   server_refused_verification_required: 'This needs Two-Step Verification.',

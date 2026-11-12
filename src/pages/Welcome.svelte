@@ -11,7 +11,7 @@
   import FrameleafAccount from '../FrameleafAccount.svelte';
   import { connectionError, savedSignInNeedsRecovery } from '../errors';
   import { mergeServers, initials, computerWord, platformFromUserAgent, nearbySignIn, type ServerEntry } from '../ui-state';
-  import type { Connection, CloudAccount, CloudServer, DiscoveredServer, SignInOptions } from '../server-types';
+  import type { Connection, CloudAccount, CloudServer, DiscoveredServer, SignInOptions, SignInOutcome } from '../server-types';
 
   let { native, hostActive, cloudAccount, managerRevision, onlocked, onconnected, oncloudaccount, onhostactive, onmanagerchange, onmanagerstate }: {
     native: boolean; hostActive: boolean; cloudAccount: CloudAccount | null; managerRevision: number;
@@ -120,7 +120,12 @@
   async function connectCloud(entry: ServerEntry) {
     if (!native || busy || !entry.instanceId) return;
     busy = true; connectingKey = entry.key; failure = ''; notice = '';
-    try { onconnected(await invoke<Connection>('connect_cloud_server', { instanceId: entry.instanceId, deviceName, server: null })); }
+    try {
+      const outcome = await invoke<SignInOutcome>('connect_cloud_server', { instanceId: entry.instanceId, deviceName, server: null });
+      if (outcome.status === 'done') onconnected(outcome.connection);
+      // The server wants its own Password or authenticator first: its sign-in screen asks for it.
+      else { resumeFrameleaf = true; await openServer(outcome.server ?? entry.nearby?.url ?? entry.cloud?.connections?.[0]?.uri ?? ''); }
+    }
     catch (error) {
       if (savedSignInNeedsRecovery(error)) onlocked();
       // Cloud has no approval on record for this server: its own sign-in screen is the way on.

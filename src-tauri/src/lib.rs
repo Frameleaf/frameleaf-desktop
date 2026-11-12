@@ -231,7 +231,7 @@ async fn connect_server_step(
 /// What a sign-in command answers: the connection, or the step that would complete the sign-in.
 #[derive(serde::Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
-enum SignInOutcome {
+pub(crate) enum SignInOutcome {
     Done {
         connection: ConnectionView,
     },
@@ -240,6 +240,9 @@ enum SignInOutcome {
         transaction: String,
         methods: Vec<String>,
         sent_to: Option<String>,
+        /// Sign in with Frameleaf only: the address of the server that asked for the step.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
     },
 }
 
@@ -294,6 +297,7 @@ async fn connect_with(
                 transaction: pending.transaction.as_str().to_owned(),
                 methods: pending.methods,
                 sent_to: pending.sent_to,
+                server: None,
             })
         }
     };
@@ -718,6 +722,7 @@ pub fn run() {
         .manage(media_copy::MediaCopy::default())
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
+        .manage(cloud_account::ServerStep::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let placement = app.state::<window_placement::WindowPlacement>();
@@ -813,7 +818,8 @@ pub fn run() {
             cloud_account::email::cloud_email_consents,
             cloud_account::email::cloud_email_start,
             cloud_account::email::cloud_email_complete,
-            cloud_account::connect_cloud_server
+            cloud_account::connect_cloud_server,
+            cloud_account::connect_cloud_server_step
         ])
         .on_webview_event(|webview, event| {
             if webview.label() == "main" {
