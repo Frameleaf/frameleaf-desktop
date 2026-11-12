@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // Browser qualification uses synthetic IPC. It never installs or starts a real companion.
 if (process.env.FRAMELEAF_MANAGER_UI_TEST !== '1') process.exit(0);
 const { FRAMELEAF_TEST_BROWSER: executablePath, FRAMELEAF_TEST_PLAYWRIGHT: playwright } = process.env;
-assert.ok(executablePath && isAbsolute(executablePath) && playwright && isAbsolute(playwright));
+assert.ok((!executablePath || isAbsolute(executablePath)) && playwright && isAbsolute(playwright));
 const { chromium } = await import(pathToFileURL(playwright));
 const root = fileURLToPath(new URL('..', import.meta.url));
 const socket = createServer();
@@ -27,7 +27,7 @@ try {
     vite.stdout.on('data', chunk => { if (chunk.includes('Local:')) { clearTimeout(timeout); resolve(); } });
     vite.once('error', reject);
   });
-  browser = await chromium.launch({ executablePath, headless: true, args: ['--disable-gpu'] });
+  browser = await chromium.launch({ ...(executablePath ? { executablePath } : {}), headless: true, args: ['--disable-gpu'] });
   const page = await browser.newPage();
   const calls = [];
   const errors = [];

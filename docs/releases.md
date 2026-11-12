@@ -117,6 +117,25 @@ containers and fails on an unmet dependency or a missing tray dependency. It
 also reports, as a warning, a distribution whose C library is too old to load
 the installed binaries. `Desktop candidate` runs it on every pull request.
 
+## Browser UI tests
+
+`tools/test_*_ui.mjs` drive the real interface in headless Chromium against a
+synthetic IPC bridge: the Manager page, navigation and local server setup. They
+need no server, credentials or saved sign-in. `npm test` skips them;
+`npm run test:ui` runs them and needs Playwright, which is not a project
+dependency:
+
+```sh
+npm install --no-save --prefix /tmp/frameleaf-playwright playwright-core@1.63.0
+node /tmp/frameleaf-playwright/node_modules/playwright-core/cli.js install chromium-headless-shell
+FRAMELEAF_TEST_PLAYWRIGHT=/tmp/frameleaf-playwright/node_modules/playwright-core/index.mjs npm run test:ui
+```
+
+Set `FRAMELEAF_TEST_BROWSER` to the absolute path of another Chromium build to
+use it instead, and `FRAMELEAF_TEST_OUTPUT` to an absolute folder to keep
+screenshots of the Manager page. `Desktop candidate` runs these tests on Linux
+for every pull request.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers
