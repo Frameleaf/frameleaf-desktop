@@ -54,6 +54,22 @@ test("the application and every packaging file state one version", () => {
   }
 });
 
+test("a prerelease application version leaves the packaging at the last stable version", () => {
+  withTree((root, read, edit) => {
+    const version = consistentVersion(root);
+    const application = {
+      "package.json": (text) => text.replace(`"version": "${version}"`, `"version": "${version}-rc.1"`),
+      "src-tauri/tauri.conf.json": (text) => text.replace(`"version": "${version}"`, `"version": "${version}-rc.1"`),
+      "src-tauri/Cargo.toml": (text) => text.replace(`version = "${version}"`, `version = "${version}-rc.1"`),
+    };
+    for (const [file, change] of Object.entries(application)) edit(file, change);
+    assert.equal(consistentVersion(root), `${version}-rc.1`);
+    assert.throws(() => stampPackaging(root, `${version}-rc.1`), /packaging_version_unsupported/);
+    edit("src-tauri/Cargo.toml", (text) => text.replace(`version = "${version}-rc.1"`, `version = "${version}-rc.2"`));
+    assert.throws(() => consistentVersion(root), /release_version_mismatch/);
+  });
+});
+
 test("Chocolatey may only name the signed installer", () => {
   withTree((root, read, edit) => {
     edit("packaging/chocolatey/tools/chocolateyinstall.ps1", (text) => text.replace("_x64_en-US.msi", "_x64_en-US-unsigned.msi"));
@@ -114,7 +130,9 @@ test("the committed packaging is exactly what the stamping script writes", () =>
       .matchAll(/(Frameleaf_[\w.]+\.deb)\n\tsha256sums_\w+ = ([a-f0-9]{64})$/gm)) checksums.set(name, sum);
     const msi = /(Frameleaf_[\w.-]+\.msi)'\n\s*checksum64\s*= '([a-f0-9]{64})'/.exec(read("packaging/chocolatey/tools/chocolateyinstall.ps1"));
     if (msi) checksums.set(msi[1], msi[2]);
-    stampPackaging(root, consistentVersion(root), checksums);
+    const version = consistentVersion(root);
+    if (version.includes("-")) return; // A prerelease tree keeps the last stable packaging; there is nothing to restamp.
+    stampPackaging(root, version, checksums);
     assert.deepEqual(packaging.map(read), committed);
   });
 });

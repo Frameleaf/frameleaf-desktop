@@ -26,6 +26,9 @@ Scoop's `autoupdate` and Homebrew's `livecheck` follow GitHub releases.
 
 ## Publishing Chocolatey
 
+Stamp the files first, from the release's `SHA256SUMS`: `node tools/release_packaging.mjs <path to SHA256SUMS>` (or use the
+workflow's `package-manager-files` artifact). Do not publish while a checksum reads `checksum-pending-release`.
+
 Needs a [community.chocolatey.org](https://community.chocolatey.org/) account and its API key, on Windows:
 
 ```powershell
@@ -38,6 +41,9 @@ choco push frameleaf.<version>.nupkg --source https://push.chocolatey.org/
 Moderation then runs automated validation and an install test before a human review.
 
 ## Publishing the AUR package
+
+Stamp the files first, from the release's `SHA256SUMS`: `node tools/release_packaging.mjs <path to SHA256SUMS>` (or use the
+workflow's `package-manager-files` artifact). Do not publish while a checksum reads `checksum-pending-release`.
 
 Needs an [AUR account](https://aur.archlinux.org/register) with an SSH public key in *My Account*, and that key
 configured for `aur.archlinux.org` in `~/.ssh/config`:

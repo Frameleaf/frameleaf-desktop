@@ -51,8 +51,10 @@ export function packagingVersions(root = new URL("../", import.meta.url)) {
 /** The single version shared by the application and its packaging, or an error naming each file that differs. */
 export function consistentVersion(root = new URL("../", import.meta.url)) {
   const application = applicationVersions(directory(root));
-  const stated = { ...Object.fromEntries(Object.entries(application).map(([file, version]) => [file, [version]])), ...packagingVersions(root) };
   const version = application["package.json"];
+  // Package managers only carry stable releases, so a prerelease leaves the packaging at the last stable version.
+  const packaging = typeof version === "string" && version.includes("-") ? {} : packagingVersions(root);
+  const stated = { ...Object.fromEntries(Object.entries(application).map(([file, version]) => [file, [version]])), ...packaging };
   const wrong = Object.entries(stated)
     .filter(([, versions]) => !versions.length || versions.some((found) => found !== version))
     .map(([file, versions]) => `${file} (${versions.join(", ") || "none"})`);
