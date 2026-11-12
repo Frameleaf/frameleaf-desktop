@@ -29,8 +29,11 @@ test('local setup names a busy port, offers a companion update and always offers
   assert.match(ui, /outdated: \{ label: 'Companion update needed'/);
   assert.match(ui, /packageCheck === 'outdated'\) && view\?\.companionPlatform\}<button[^>]*onclick=\{openDownloads\}/);
   assert.match(ui, /'native-host-exit-blocked', \(\) => \{ quitOffered = !profilePending;/);
-  assert.match(ui, /quitOffered && view\?\.backgroundActive[^\n]*onclick=\{stopAndQuit\}>Stop and quit</);
-  assert.match(ui, /invoke\('quit_local_host'\)/);
+  assert.match(ui, /quitOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(\)\}>Stop and quit</);
+  assert.match(ui, /invoke\('quit_local_host', \{ leaveRunning \}\)/);
+  // A Manager that will not stop must not make the app unquittable again.
+  assert.match(ui, /leaveOffered = !leaveRunning && String\(error\) === 'native_manager_shutdown_unconfirmed' && view\?\.companionPlatform !== 'windows'/);
+  assert.match(ui, /leaveOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(true\)\}>Quit anyway</);
 });
 
 test('every invoke() in the Svelte front end names a registered, permitted command', () => {
