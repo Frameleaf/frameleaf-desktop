@@ -661,11 +661,27 @@ pub(crate) async fn photos_owner(
 /// The photo address is opened only while this library's controller holds its journal lease.
 /// Without that controller, whatever answers on the port is another program.
 fn owned_photo_listener(state: &std::path::Path, port: u16) -> Result<(), String> {
-    if crate::host_state::Owner::controller_running(state)? {
+    photo_listener(
+        crate::host_state::Owner::controller_running(state),
+        port,
+        &|| crate::manager_host::listener(port),
+    )
+}
+/// `controller` is whether this library's controller holds its journal lease; a lease that
+/// cannot be read refuses. `listener` is asked only to name what is wrong: no answer from it
+/// opens the address.
+fn photo_listener(
+    controller: Result<bool, String>,
+    port: u16,
+    listener: &dyn Fn() -> Evidence,
+) -> Result<(), String> {
+    if controller? {
         return Ok(());
     }
-    crate::manager_host::foreign_listener(&[port])?;
-    Err("local_photos_not_running".into())
+    Err(match listener() {
+        Evidence::Running => format!("local_port_in_use_{port}"),
+        Evidence::Clear | Evidence::Unknown => "local_photos_not_running".into(),
+    })
 }
 fn require_password(password: &str) -> Result<(), String> {
     if password.chars().count() < 14
@@ -2571,26 +2587,45 @@ mod tests {
             .unwrap()
             .join(format!("frameleaf-photo-listener-{}", uuid::Uuid::new_v4()));
         crate::runtime_store::private_directory(&root).unwrap();
+        // The port stays bound for the whole test, so no other test can be given it and every
+        // probe of it has one answer.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let in_use = format!("local_port_in_use_{port}");
         // No controller of this library runs, so the program on its port is someone else's.
-        assert_eq!(
-            owned_photo_listener(&root, port).unwrap_err(),
-            format!("local_port_in_use_{port}")
-        );
+        assert_eq!(owned_photo_listener(&root, port).unwrap_err(), in_use);
         assert_eq!(
             crate::manager_host::foreign_listener(&[port]).unwrap_err(),
-            format!("local_port_in_use_{port}")
+            in_use
         );
         let controller = crate::host_state::Owner::acquire(&root, true).unwrap();
         owned_photo_listener(&root, port).unwrap();
         drop(controller);
+        // The controller is gone and the port still answers: someone else's again.
+        assert_eq!(owned_photo_listener(&root, port).unwrap_err(), in_use);
+        // Nothing listening, or a probe with no answer: the photo server is not running. The
+        // probe is supplied here because a port this test released could be bound by another.
+        for silent in [Evidence::Clear, Evidence::Unknown] {
+            assert_eq!(
+                photo_listener(
+                    crate::host_state::Owner::controller_running(&root),
+                    port,
+                    &|| silent
+                )
+                .unwrap_err(),
+                "local_photos_not_running"
+            );
+        }
+        // A lease that cannot be read never opens the address, whatever answers on the port.
+        for answer in [Evidence::Clear, Evidence::Running, Evidence::Unknown] {
+            assert_eq!(
+                photo_listener(Err("host_state_not_private".into()), port, &|| answer).unwrap_err(),
+                "host_state_not_private"
+            );
+        }
+        // A held lease opens it without asking the port.
+        photo_listener(Ok(true), port, &|| panic!("the port is not asked")).unwrap();
         drop(listener);
-        crate::manager_host::foreign_listener(&[port]).unwrap();
-        assert_eq!(
-            owned_photo_listener(&root, port).unwrap_err(),
-            "local_photos_not_running"
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
