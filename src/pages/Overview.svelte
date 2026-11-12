@@ -217,7 +217,7 @@
           </div>
         {/each}
       </div>
-      <p class="foot">Processing starts only after the selected models pass qualification on this {computer}. Pausing finishes the current task first. Server administration uses your existing Frameleaf permissions inside Photos.</p>
+      <p class="foot">Processing starts only after the selected models pass qualification on this {computer}. Pausing finishes the current task first. When your server’s owner marks this {computer} for the household, it may process other members’ photos (never Locked photos). Server administration uses your existing Frameleaf permissions inside Photos.</p>
     </div>
 
     {#if section === 'ai'}

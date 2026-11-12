@@ -146,6 +146,11 @@ impl WorkerSetup {
     pub fn status(&self) -> SetupStatus {
         self.status.lock().unwrap().clone()
     }
+    /// The worker gave up and waits for Retry Setup. The saved session may be one the server has
+    /// fenced since, so a retry starts from a newly issued session instead of replaying it.
+    fn parked(&self) -> bool {
+        self.status.lock().unwrap().state == "setup-needs-attention"
+    }
     pub fn pause(&self) -> SetupStatus {
         self.user_paused.store(true, Ordering::Release);
         let mut status = self.status.lock().unwrap();
@@ -239,9 +244,13 @@ impl WorkerSetup {
         allow_download: bool,
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
     ) {
+        let fresh = self.parked();
         self.start_work(notify, move |progress| async move {
-            loop {
-                let result = reconnect(&progress, |refresh| {
+            let server = saved.server.clone();
+            supervise(
+                &progress,
+                fresh,
+                |refresh| {
                     let saved = saved.clone();
                     let paths = paths.clone();
                     let progress = progress.clone();
@@ -252,33 +261,118 @@ impl WorkerSetup {
                         }
                         prepare(saved, paths, allow_download, progress).await
                     }
-                })
-                .await;
-                if !matches!(&result, Err(code) if code == "worker_no_eligible_workloads") {
-                    return result;
-                }
-                // An administrator can assign work at any time: ask the server again later.
-                progress.set(
-                    "no-eligible-work",
-                    Some("worker_no_eligible_workloads".into()),
-                );
-                recheck_after(&progress, NO_WORK_RECHECK).await?;
-            }
+                },
+                || {
+                    let server = server.clone();
+                    async move {
+                        tauri::async_runtime::spawn_blocking(move || network_route(&server))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                },
+                ROUTE_POLL,
+            )
+            .await
         })
         .await;
     }
 }
 
 const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
+const POLICY_RECHECK: Duration = Duration::from_secs(5 * 60);
+const ROUTE_POLL: Duration = Duration::from_secs(5);
+
+/// Keep the worker going across everything the server may change under it: lost connections and
+/// fenced sessions reconnect, and refusals an administrator or the network can lift are waited out.
+async fn supervise<F, Fut, R, RFut>(
+    progress: &Progress,
+    mut fresh: bool,
+    mut attempt: F,
+    mut route: R,
+    route_poll: Duration,
+) -> Result<(), String>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+    R: FnMut() -> RFut,
+    RFut: Future<Output = Option<std::net::IpAddr>>,
+{
+    loop {
+        let result = reconnect(progress, fresh, &mut attempt).await;
+        fresh = false;
+        match result {
+            // An administrator can assign work at any time: ask the server again later.
+            Err(code) if code == "worker_no_eligible_workloads" => {
+                progress.set("no-eligible-work", Some(code));
+                recheck_after(progress, NO_WORK_RECHECK).await?;
+            }
+            // The server will not use this computer for now: its owner turned helping off, or
+            // this computer left the home network. Either can change without anyone opening the app.
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "worker_policy_required" | "worker_lan_required"
+                ) =>
+            {
+                progress.set("paused", Some(code));
+                recheck_after_or_route_change(progress, POLICY_RECHECK, &mut route, route_poll)
+                    .await?;
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Wait out the period, and any user pause beyond it; Stop or a new start cancels the wait.
 async fn recheck_after(progress: &Progress, period: Duration) -> Result<(), String> {
+    recheck_after_or_route_change(progress, period, &mut || async { None }, Duration::MAX).await
+}
+
+/// As `recheck_after`, ended early when the route to the server changes (another network, a VPN).
+async fn recheck_after_or_route_change<R, RFut>(
+    progress: &Progress,
+    period: Duration,
+    route: &mut R,
+    poll: Duration,
+) -> Result<(), String>
+where
+    R: FnMut() -> RFut,
+    RFut: Future<Output = Option<std::net::IpAddr>>,
+{
     let started = std::time::Instant::now();
+    let initial = route().await;
+    let mut polled = std::time::Instant::now();
     while started.elapsed() < period || progress.user_paused.load(Ordering::Acquire) {
         check_cancel(&progress.cancelled)?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(250).min(poll)).await;
+        if polled.elapsed() >= poll && !progress.user_paused.load(Ordering::Acquire) {
+            polled = std::time::Instant::now();
+            if route().await != initial {
+                break;
+            }
+        }
     }
-    Ok(())
+    check_cancel(&progress.cancelled)
+}
+
+/// The local address this computer would use to reach the server. It changes when the network
+/// does; nothing is sent to find it.
+fn network_route(server: &str) -> Option<std::net::IpAddr> {
+    let target = crate::connection::normalize_server(server)
+        .ok()?
+        .socket_addrs(|| None)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .ok()?;
+    socket.connect(target).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
 }
 
 pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
@@ -375,6 +469,23 @@ impl WakeClock {
         resumed
     }
 }
+const TASK_FAILURE_LIMIT: u32 = 5;
+/// One bad task is dropped and the next is claimed; an unbroken run of them parks the worker.
+#[derive(Default)]
+struct TaskFailures(u32);
+impl TaskFailures {
+    fn completed(&mut self) {
+        self.0 = 0;
+    }
+    /// The pause before the next claim, or the code to park with once the run reaches the limit.
+    fn dropped(&mut self, code: String) -> Result<Duration, String> {
+        self.0 += 1;
+        if self.0 >= TASK_FAILURE_LIMIT {
+            return Err(code);
+        }
+        Ok(reconnect_delay(self.0, rand::random()))
+    }
+}
 fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
     let base = (1u64 << attempt.min(5)).min(30) * 1000;
     Duration::from_millis(base + entropy % (base + 1))
@@ -389,6 +500,11 @@ fn retryable(error: &str) -> bool {
             | "model_download_unavailable"
             | "model_download_interrupted"
             | "worker_session_renewal_required"
+            // The server ended this worker session (a household change fences the device) or the
+            // policy the work ran under: a newly issued session and qualification carry on. If the
+            // device itself is refused, issuing that session fails and the worker stops there.
+            | "worker_session_rejected"
+            | "worker_policy_changed"
             | "worker_lease_expired"
             | "worker_lease_lost"
             | "worker_execution_deadline"
@@ -404,10 +520,10 @@ fn retryable(error: &str) -> bool {
 }
 async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String>>>(
     progress: &Progress,
+    mut refresh: bool,
     mut attempt: F,
 ) -> Result<(), String> {
     let mut retries = 0u32;
-    let mut refresh = false;
     loop {
         wait_for_user(progress, || async { Ok(()) }).await?;
         let error = match attempt(refresh).await {
@@ -448,7 +564,8 @@ async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
     let worker = crate::transport::issue_worker_session(&client, saved).await?;
     crate::credentials::save("worker-session", &worker)
 }
-async fn resource_loss(required_memory: u64, clock: &WakeClock) -> String {
+/// Watches work whose models are already loaded: the memory floor was applied when it was admitted.
+async fn resource_loss(clock: &WakeClock) -> String {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         if clock.observe(std::time::SystemTime::now()) {
@@ -456,7 +573,7 @@ async fn resource_loss(required_memory: u64, clock: &WakeClock) -> String {
         }
         match tauri::async_runtime::spawn_blocking(crate::resource_policy::sample).await {
             Ok(status) => {
-                if let Some(reason) = status.refusal(required_memory) {
+                if let Some(reason) = status.refusal_while_loaded() {
                     return reason.into();
                 }
             }
@@ -682,6 +799,7 @@ async fn prepare(
 ) -> Result<(), String> {
     use crate::{
         ml_transport::WorkerTransport,
+        native_predictor::Step,
         release_policy::open_runtime_store,
         runtime_store::{private_directory, read_bounded},
         transport,
@@ -819,6 +937,7 @@ async fn prepare(
         .await?;
         caches.push(cache);
     }
+    let mut failures = TaskFailures::default();
     'qualification: loop {
         let mut prepared = Vec::new();
         let mut accepted_profiles = Vec::new();
@@ -872,12 +991,7 @@ async fn prepare(
                             installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
                         (installed, qualified)
                     },
-                    async {
-                        format!(
-                            "resource_{}",
-                            resource_loss(profile.minimum_memory(), &clock).await
-                        )
-                    },
+                    async { format!("resource_{}", resource_loss(&clock).await) },
                     || worker.maintain_session(),
                     &progress.cancelled,
                 )
@@ -974,6 +1088,16 @@ async fn prepare(
         })
         .await
         .map_err(|_| "worker_cache_publish_failed")??;
+        // Best effort: reclaim superseded model revisions and abandoned staging.
+        let models = paths.data.join("models");
+        let referenced = profiles
+            .iter()
+            .map(|profile| profile.cache_identity().2.to_owned())
+            .collect();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            crate::model_cache::prune(&models, &referenced, std::time::SystemTime::now())
+        })
+        .await;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
@@ -1029,7 +1153,9 @@ async fn prepare(
                     progress.set("paused", Some("user_paused".into()));
                     break;
                 }
-                if let Some(reason) = resources.refusal(required_memory) {
+                // The models are loaded: only power and network can refuse now. Memory was checked
+                // at admission, and this process's own models must not count against its floor.
+                if let Some(reason) = resources.refusal_while_loaded() {
                     // Release model memory before waiting, otherwise the warm process can prevent recovery.
                     predictor.stop()?;
                     progress.set("paused", Some(reason.into()));
@@ -1047,14 +1173,38 @@ async fn prepare(
                 let completed = cancellable(async {
                     tokio::select! {
                         biased;
-                        reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
+                        reason = resource_loss(&clock) => Err(format!("resource_{reason}")),
                         result = predictor.execute_next_with_activity(&worker, &accepted, &mut cancel, |workload| progress.active(Some(workload))) => result,
                     }
                 }, &progress.cancelled).await;
                 progress.active(None);
                 match completed {
-                    Ok(true) => progress.completed(),
-                    Ok(false) => {
+                    Ok(Step::Completed) => {
+                        failures.completed();
+                        progress.completed();
+                    }
+                    Ok(Step::Dropped(code)) => {
+                        let delay = match failures.dropped(code) {
+                            Ok(delay) => delay,
+                            Err(code) => {
+                                predictor.stop()?;
+                                return Err(code);
+                            }
+                        };
+                        cancellable(
+                            async {
+                                tokio::time::sleep(delay).await;
+                                Ok(())
+                            },
+                            &progress.cancelled,
+                        )
+                        .await?;
+                        if !predictor.is_running()? {
+                            // Inference was cut short: load the models again before the next claim.
+                            break;
+                        }
+                    }
+                    Ok(Step::Idle) => {
                         progress.set("waiting-for-work", None);
                         cancellable(
                             async {
@@ -1289,7 +1439,7 @@ mod tests {
         let client = crate::transport::client().unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
-            reconnect(&progress, |refresh| {
+            reconnect(&progress, false, |refresh| {
                 let number = attempts.fetch_add(1, Ordering::AcqRel);
                 assert_eq!(refresh, number != 0);
                 let request = client.get(&url);
@@ -1309,13 +1459,35 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Acquire), 2);
     }
     #[tokio::test]
-    async fn authorization_identity_and_binding_failures_are_not_retried() {
+    async fn a_fenced_worker_session_is_reissued_but_a_refused_device_or_identity_is_not_retried() {
         let progress = Progress {
             user_paused: Arc::default(),
             cancelled: Arc::default(),
             status: Arc::default(),
             notify: Arc::new(|_| {}),
         };
+        // The server ended the session or the policy mid-loop: issue a new session and carry on.
+        for error in ["worker_session_rejected", "worker_policy_changed"] {
+            let refreshes = std::sync::Mutex::new(Vec::new());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                reconnect(&progress, false, |refresh| {
+                    refreshes.lock().unwrap().push(refresh);
+                    async move {
+                        if refresh {
+                            Ok(())
+                        } else {
+                            Err(error.into())
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(*refreshes.lock().unwrap(), [false, true], "{error}");
+        }
+        // Issuing the session is what proves the device: when that is refused, nothing is retried.
         for error in [
             "server_http_401",
             "server_http_403",
@@ -1327,7 +1499,7 @@ mod tests {
             "server_model_not_supported",
         ] {
             let attempts = std::sync::atomic::AtomicUsize::new(0);
-            let result = reconnect(&progress, |_| {
+            let result = reconnect(&progress, false, |_| {
                 attempts.fetch_add(1, Ordering::AcqRel);
                 async { Err(error.into()) }
             })
@@ -1348,7 +1520,7 @@ mod tests {
                     let _ = tx.send(value);
                 }),
                 move |progress| async move {
-                    reconnect(&progress, |_| {
+                    reconnect(&progress, false, |_| {
                         attempts.fetch_add(1, Ordering::AcqRel);
                         async { Err("worker_request_interrupted".into()) }
                     })
@@ -1372,7 +1544,7 @@ mod tests {
                     let _ = tx.send(value);
                 }),
                 move |progress| async move {
-                    reconnect(&progress, |_| {
+                    reconnect(&progress, false, |_| {
                         attempts.fetch_add(1, Ordering::AcqRel);
                         async { Err("worker_request_interrupted".into()) }
                     })
@@ -1526,7 +1698,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn interrupted_http_acquisition_removes_partial_weights() {
+    async fn interrupted_http_acquisition_never_publishes_partial_weights() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -1582,12 +1754,17 @@ mod tests {
         .await;
         let _ = stop_tx.send(());
         server.join().unwrap();
-        let files = std::fs::read_dir(&root).unwrap().count();
+        let files: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap_err(), "model_download_permission_required");
+        // FD-39: the partial is kept for a Range resume; it is never published unverified.
         assert_eq!(
-            files, 0,
-            "interrupted model must not leave partial or published weights"
+            files,
+            [format!(".download-{}", "0".repeat(64)).as_str()],
+            "interrupted model must leave only its resumable partial"
         );
     }
     #[tokio::test]
@@ -1921,5 +2098,343 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, "setup-needs-attention");
         setup.stop().await;
+    }
+
+    // ---- FD-38: the worker against a server that fences sessions, changes policy and refuses tasks.
+    use crate::ml_transport::{
+        household_tests::{Device, FakeServer},
+        WorkerTransport,
+    };
+    use crate::native_predictor::{step_with, Step};
+    use std::sync::atomic::AtomicUsize;
+    type SavedSession = tokio::sync::Mutex<Option<WorkerTransport>>;
+
+    fn quiet() -> Progress {
+        Progress {
+            user_paused: Arc::default(),
+            cancelled: Arc::default(),
+            status: Arc::default(),
+            notify: Arc::new(|_| {}),
+        }
+    }
+    /// What `prepare` does once the runtime is ready, with the local model replaced: use the saved
+    /// session or issue a new one, qualify under it, then claim and work until `done`.
+    async fn work(
+        server: &FakeServer,
+        device: &Device,
+        saved: &SavedSession,
+        refresh: bool,
+        predicting: &dyn Fn(),
+        done: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut saved = saved.lock().await;
+        if refresh || saved.is_none() {
+            *saved = Some(server.session(device).await?);
+        }
+        let worker = saved.as_ref().unwrap();
+        let qualification = server.qualification(worker).await;
+        let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+        let mut failures = TaskFailures::default();
+        while !done() {
+            let step = step_with(worker, &[&qualification], &mut cancel, |_| async {
+                predicting();
+                Ok(serde_json::json!({}))
+            })
+            .await?;
+            match step {
+                Step::Completed => failures.completed(),
+                Step::Dropped(code) => drop(failures.dropped(code)?),
+                Step::Idle => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        Ok(())
+    }
+    /// The supervised worker for one device; returns its outcome and each attempt's `refresh`.
+    async fn run(
+        server: &FakeServer,
+        device: &Device,
+        saved: &SavedSession,
+        fresh: bool,
+        predicting: &dyn Fn(),
+        done: &dyn Fn() -> bool,
+    ) -> (Result<(), String>, Vec<bool>) {
+        let refreshes = Mutex::new(Vec::new());
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            supervise(
+                &quiet(),
+                fresh,
+                |refresh| {
+                    refreshes.lock().unwrap().push(refresh);
+                    work(server, device, saved, refresh, predicting, done)
+                },
+                || async { None },
+                ROUTE_POLL,
+            ),
+        )
+        .await
+        .expect("the worker stalled");
+        (result, refreshes.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_session_fenced_in_the_middle_of_a_task_is_reissued_and_work_continues() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 3);
+        let predictions = AtomicUsize::new(0);
+        let (result, refreshes) = run(
+            &server,
+            &device,
+            &saved,
+            false,
+            // The administrator changes this computer's household setting during its second task.
+            &|| {
+                if predictions.fetch_add(1, Ordering::AcqRel) == 1 {
+                    server.toggle_household(&device);
+                }
+            },
+            &|| server.completed(&device) == 2,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(refreshes, [false, true]);
+        assert_eq!(server.sessions_issued(&device), 2);
+        // The fenced task's result never passed the door and no failure was reported for it.
+        assert_eq!(server.reports(&device), ["result", "result"]);
+    }
+
+    #[tokio::test]
+    async fn a_household_change_on_one_computer_does_not_stop_another() {
+        let server = FakeServer::start();
+        let (a, b) = (server.enrol(), server.enrol());
+        let (saved_a, saved_b) = (SavedSession::default(), SavedSession::default());
+        for (device, saved) in [(&a, &saved_a), (&b, &saved_b)] {
+            server.queue(device, 1);
+            let done = || server.completed(device) == 1;
+            let (result, refreshes) = run(&server, device, saved, false, &|| {}, &done).await;
+            assert_eq!((result, refreshes), (Ok(()), vec![false]));
+        }
+
+        // The administrator toggles A while B is in the middle of a task.
+        server.queue(&b, 2);
+        let predictions = AtomicUsize::new(0);
+        let (result, refreshes) = run(
+            &server,
+            &b,
+            &saved_b,
+            false,
+            &|| {
+                if predictions.fetch_add(1, Ordering::AcqRel) == 0 {
+                    server.toggle_household(&a);
+                }
+            },
+            &|| server.completed(&b) == 2,
+        )
+        .await;
+        // B's task lost the policy revision it ran under: the server refused that result, B
+        // reported no failure for it, refreshed its authority and finished the next task.
+        assert_eq!(result, Ok(()));
+        assert_eq!(refreshes, [false, true]);
+        assert_eq!(server.reports(&b), ["result", "result", "result"]);
+
+        // A itself was fenced: its saved session is refused, a new one is issued and it carries on.
+        server.queue(&a, 1);
+        let done = || server.completed(&a) == 2;
+        let (result, refreshes) = run(&server, &a, &saved_a, false, &|| {}, &done).await;
+        assert_eq!((result, refreshes), (Ok(()), vec![false, true]));
+        assert_eq!(server.sessions_issued(&a), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_refused_task_is_dropped_and_the_next_one_is_claimed() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 3);
+        // The first task's input fails on the server; the second's result is refused (cancelled job).
+        server.respond_next(&device, "/input", 500, serde_json::json!({}));
+        server.respond_next(
+            &device,
+            "/result",
+            200,
+            serde_json::json!({"accepted":false}),
+        );
+        let done = || server.completed(&device) == 1;
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
+        // No reconnect and no new session: the same association claimed the third task.
+        assert_eq!(refreshes, [false]);
+        assert_eq!(server.sessions_issued(&device), 1);
+        // The held lease was failed back to the server; the refused one heard nothing more.
+        assert_eq!(server.reports(&device), ["fail", "result"]);
+    }
+
+    #[tokio::test]
+    async fn five_failed_tasks_in_a_row_park_the_worker_and_fewer_do_not() {
+        let mut failures = TaskFailures::default();
+        for _ in 0..3 {
+            for _ in 0..TASK_FAILURE_LIMIT - 1 {
+                let delay = failures.dropped("worker_result_refused".into()).unwrap();
+                assert!(delay >= Duration::from_secs(1) && delay <= Duration::from_secs(64));
+            }
+            failures.completed();
+        }
+
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 6);
+        for _ in 0..5 {
+            server.respond_next(
+                &device,
+                "/result",
+                200,
+                serde_json::json!({"accepted":false}),
+            );
+        }
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &|| false).await;
+        assert_eq!(result, Err("worker_result_refused".into()));
+        assert_eq!(refreshes, [false]);
+        assert_eq!(server.completed(&device), 0);
+
+        // Parked is the state Retry Setup is offered in.
+        let setup = WorkerSetup::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                move |_| async move { result },
+            )
+            .await;
+        let status = rx.recv().await.unwrap();
+        assert_eq!(status.state, "setup-needs-attention");
+        assert_eq!(status.code.as_deref(), Some("worker_result_refused"));
+        setup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn retry_setup_after_a_fenced_session_starts_from_a_new_one() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 1);
+        let done = || server.completed(&device) == 1;
+        let (result, _) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
+
+        // The worker parks, and the server fences its saved session while it sits there.
+        let setup = WorkerSetup::default();
+        assert!(!setup.parked());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                |_| async { Err("runtime_start_failed".into()) },
+            )
+            .await;
+        assert_eq!(rx.recv().await.unwrap().state, "setup-needs-attention");
+        assert!(setup.parked());
+        server.toggle_household(&device);
+
+        // Retry Setup, in the same process: the first attempt already asks for a new session.
+        server.queue(&device, 1);
+        let done = || server.completed(&device) == 2;
+        let (result, refreshes) =
+            run(&server, &device, &saved, setup.parked(), &|| {}, &done).await;
+        assert_eq!((result, refreshes), (Ok(()), vec![true]));
+        assert_eq!(server.sessions_issued(&device), 2);
+
+        setup.stop().await;
+        assert!(!setup.parked());
+    }
+
+    #[tokio::test]
+    async fn a_policy_or_lan_refusal_waits_and_resumes_when_the_network_changes() {
+        for (message, code) in [
+            ("desktop_pool_policy_required", "worker_policy_required"),
+            ("desktop_worker_lan_required", "worker_lan_required"),
+        ] {
+            let server = FakeServer::start();
+            let device = server.enrol();
+            let saved = SavedSession::default();
+            server.queue(&device, 1);
+            server.respond_next(
+                &device,
+                "/claim",
+                403,
+                serde_json::json!({"message":message}),
+            );
+            let statuses = Arc::new(Mutex::new(Vec::new()));
+            let seen = statuses.clone();
+            let progress = Progress {
+                notify: Arc::new(move |status: SetupStatus| {
+                    seen.lock().unwrap().push((status.state, status.code))
+                }),
+                ..quiet()
+            };
+            let attempts = AtomicUsize::new(0);
+            let routes = AtomicUsize::new(0);
+            let done = || server.completed(&device) == 1;
+            // Far sooner than the five-minute timer: the route to the server changed.
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                supervise(
+                    &progress,
+                    false,
+                    |refresh| {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        work(&server, &device, &saved, refresh, &|| {}, &done)
+                    },
+                    || {
+                        let moved = routes.fetch_add(1, Ordering::AcqRel) > 0;
+                        async move { Some(std::net::IpAddr::from([192, 168, 1, 2 + moved as u8])) }
+                    },
+                    Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("the worker stayed parked")
+            .unwrap();
+            assert_eq!(attempts.load(Ordering::Acquire), 2);
+            assert_eq!(server.sessions_issued(&device), 1);
+            assert_eq!(
+                *statuses.lock().unwrap(),
+                [("paused".to_owned(), Some(code.to_owned()))]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_refusal_wait_also_ends_on_its_timer_and_on_stop() {
+        let progress = quiet();
+        let home = || async { Some(std::net::IpAddr::from([192, 168, 1, 2])) };
+        let poll = Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let period = Duration::from_millis(400);
+        recheck_after_or_route_change(&progress, period, &mut { home }, poll)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= period);
+        progress.cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            recheck_after_or_route_change(&progress, Duration::from_secs(60), &mut { home }, poll)
+                .await,
+            Err("worker_setup_cancelled".into())
+        );
+    }
+
+    #[test]
+    fn the_route_to_a_server_is_read_without_sending_anything() {
+        assert_eq!(
+            network_route("http://127.0.0.1:2283"),
+            Some(std::net::IpAddr::from([127, 0, 0, 1]))
+        );
+        assert_eq!(network_route("not a server"), None);
     }
 }

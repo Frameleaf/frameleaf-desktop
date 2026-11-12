@@ -1318,7 +1318,8 @@ async fn prepare_photo_import(
     state: State<'_, DesktopState>,
 ) -> Result<source_import::ImportView, String> {
     require_local(&window)?;
-    let current = state.0.lock().await;
+    // The inventory scan of a large folder must not hold the connection lock.
+    let current = state.0.lock().await.clone();
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let status = app
         .state::<source_import::SourceJobs>()

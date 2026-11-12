@@ -1,4 +1,5 @@
-//! One scoped NAS job at a time; the owned qualified process is stopped on any execution failure.
+//! One scoped NAS job at a time; the owned qualified process is stopped whenever a failure may
+//! have left inference running, and on every failure that is not confined to one task.
 use crate::{
     ml_transport::{AcceptedQualification, ClaimedTask, InputKind, WorkerFailure, WorkerTransport},
     native_runtime::{NativeSidecar, QualifiedRuntime},
@@ -183,6 +184,210 @@ async fn race_prediction<T>(
     }
 }
 
+/// What one turn of the claim loop did.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Step {
+    Idle,
+    Completed,
+    /// One task was given up. The session and its qualifications stay good for the next claim.
+    Dropped(String),
+}
+struct TaskFailure {
+    code: String,
+    /// The local model may still be running this input.
+    inferring: bool,
+}
+/// Failures that end one task only.
+fn task_scoped(code: &str) -> bool {
+    matches!(
+        code,
+        "worker_result_refused"
+            | "worker_lease_refused"
+            | "worker_lease_lost"
+            | "worker_lease_expired"
+            | "worker_execution_deadline"
+            | "worker_input_interrupted"
+            | "worker_input_invalid"
+            | "worker_input_too_large"
+            | "runtime_prediction_refused"
+            | "server_http_500"
+    )
+}
+/// The server no longer honours this lease, or the credential behind it: it hears nothing more
+/// about the task, neither a result nor a failure.
+fn lease_gone(code: &str) -> bool {
+    matches!(
+        code,
+        "worker_result_refused"
+            | "worker_lease_refused"
+            | "worker_lease_lost"
+            | "worker_lease_expired"
+            | "worker_session_rejected"
+            | "worker_policy_changed"
+    )
+}
+fn heartbeat_undelivered(code: &str) -> bool {
+    matches!(
+        code,
+        "worker_request_interrupted"
+            | "server_response_interrupted"
+            | "server_http_408"
+            | "server_http_429"
+    ) || code.starts_with("server_http_5")
+}
+fn lease_expired(task: &ClaimedTask) -> bool {
+    OffsetDateTime::parse(&task.expires_at, &Rfc3339)
+        .map_or(true, |expires| expires <= OffsetDateTime::now_utc())
+}
+const HEARTBEAT: Duration = Duration::from_secs(20);
+const HEARTBEAT_RETRY: Duration = Duration::from_secs(5);
+/// Renew the lease until the prediction ends. A heartbeat that could not be delivered is retried
+/// while the last expiry the server granted is still ahead; a refusal ends the task at once.
+async fn hold_lease<F: Future<Output = Result<bool, String>>>(
+    mut heartbeat: impl FnMut() -> F,
+    expired: impl Fn() -> bool,
+    every: Duration,
+    retry: Duration,
+) -> Result<(), String> {
+    loop {
+        tokio::time::sleep(every).await;
+        loop {
+            match heartbeat().await {
+                Ok(true) => break,
+                Ok(false) => return Err("worker_lease_lost".into()),
+                Err(code) if heartbeat_undelivered(&code) && !expired() => {
+                    tokio::time::sleep(retry).await;
+                }
+                Err(code) if heartbeat_undelivered(&code) => return Err("worker_lease_lost".into()),
+                Err(code) => return Err(code),
+            }
+        }
+    }
+}
+async fn next_task(
+    transport: &WorkerTransport,
+    qualifications: &[&AcceptedQualification],
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Result<(usize, ClaimedTask), Step>, String> {
+    match race_prediction(
+        transport.claim_many(qualifications),
+        std::future::pending(),
+        cancel,
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(Some(claimed)) => Ok(Ok(claimed)),
+        Ok(None) => Ok(Err(Step::Idle)),
+        // Nothing was claimed, but a failing server counts toward the same limit as a failing task.
+        Err(code) if code == "server_http_500" => Ok(Err(Step::Dropped(code))),
+        Err(code) => Err(code),
+    }
+}
+/// One claimed task, from its input to an acknowledged result.
+async fn run_claimed<F, P>(
+    transport: &WorkerTransport,
+    task: &ClaimedTask,
+    qualification: &AcceptedQualification,
+    cancel: &mut watch::Receiver<bool>,
+    predict: F,
+) -> Result<(), TaskFailure>
+where
+    F: FnOnce(Vec<u8>) -> P,
+    P: Future<Output = Result<Value, String>>,
+{
+    let idle = |code: String| TaskFailure {
+        code,
+        inferring: false,
+    };
+    let input = race_prediction(
+        transport.input(task, qualification),
+        std::future::pending(),
+        cancel,
+        execution_duration(task).map_err(idle)?,
+    )
+    .await
+    .map_err(idle)?;
+    let duration = execution_duration(task).map_err(idle)?;
+    let lease = std::sync::Mutex::new(task.clone());
+    let value = race_prediction(
+        predict(input),
+        hold_lease(
+            || async {
+                let mut next = lease.lock().unwrap().clone();
+                let accepted = transport.heartbeat(&mut next, qualification).await?;
+                if accepted {
+                    *lease.lock().unwrap() = next;
+                }
+                Ok(accepted)
+            },
+            || lease_expired(&lease.lock().unwrap()),
+            HEARTBEAT,
+            HEARTBEAT_RETRY,
+        ),
+        cancel,
+        duration,
+    )
+    .await
+    .map_err(|code| TaskFailure {
+        code,
+        inferring: true,
+    })?;
+    // Report under the last lease the server granted; `complete` refuses one that has run out.
+    let held = lease.lock().unwrap().clone();
+    let accepted = race_prediction(
+        transport.complete(&held, &value, qualification),
+        std::future::pending(),
+        cancel,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(idle)?;
+    if !accepted {
+        return Err(idle("worker_result_refused".into()));
+    }
+    Ok(())
+}
+async fn settle(
+    transport: &WorkerTransport,
+    task: &ClaimedTask,
+    qualification: &AcceptedQualification,
+    outcome: Result<(), TaskFailure>,
+) -> Result<Step, String> {
+    let Err(failure) = outcome else {
+        return Ok(Step::Completed);
+    };
+    if !lease_gone(&failure.code) {
+        let _ = transport
+            .fail(task, WorkerFailure::InferenceFailed, qualification)
+            .await;
+    }
+    if task_scoped(&failure.code) {
+        Ok(Step::Dropped(failure.code))
+    } else {
+        Err(failure.code)
+    }
+}
+/// The claim loop's own steps with the local model replaced, for tests without a signed runtime.
+#[cfg(test)]
+pub(crate) async fn step_with<F, P>(
+    transport: &WorkerTransport,
+    qualifications: &[&AcceptedQualification],
+    cancel: &mut watch::Receiver<bool>,
+    predict: F,
+) -> Result<Step, String>
+where
+    F: FnOnce(Vec<u8>) -> P,
+    P: Future<Output = Result<Value, String>>,
+{
+    let (index, task) = match next_task(transport, qualifications, cancel).await? {
+        Ok(claimed) => claimed,
+        Err(step) => return Ok(step),
+    };
+    let outcome = run_claimed(transport, &task, qualifications[index], cancel, predict).await;
+    settle(transport, &task, qualifications[index], outcome).await
+}
+
 pub struct NativePredictor {
     child: NativeSidecar,
     roles: Vec<BoundRole>,
@@ -289,6 +494,9 @@ impl NativePredictor {
     pub fn stop(&mut self) -> Result<(), String> {
         self.child.stop()
     }
+    pub(crate) fn is_running(&mut self) -> Result<bool, String> {
+        self.child.is_running()
+    }
     async fn ready(&mut self, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
         let wait = async {
             loop {
@@ -325,8 +533,18 @@ impl NativePredictor {
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
-        self.execute_next_with_activity(transport, qualifications, cancel, |_| {})
-            .await
+        match self
+            .execute_next_with_activity(transport, qualifications, cancel, |_| {})
+            .await?
+        {
+            Step::Completed => Ok(true),
+            Step::Idle => Ok(false),
+            // This owner has no way to carry on after a dropped task: it ends with the error.
+            Step::Dropped(code) => {
+                self.stop()?;
+                Err(code)
+            }
+        }
     }
     pub(crate) async fn execute_next_with_activity(
         &mut self,
@@ -334,7 +552,7 @@ impl NativePredictor {
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
         on_claim: impl FnOnce(&str),
-    ) -> Result<bool, String> {
+    ) -> Result<Step, String> {
         let mut active = ActiveExecution {
             predictor: self,
             retain: false,
@@ -355,7 +573,7 @@ impl NativePredictor {
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
         on_claim: impl FnOnce(&str),
-    ) -> Result<bool, String> {
+    ) -> Result<Step, String> {
         if self.roles.len() != qualifications.len()
             || self
                 .roles
@@ -366,68 +584,44 @@ impl NativePredictor {
             return Err("worker_predictor_qualification_changed".into());
         }
         self.ready(cancel).await?;
-        let task = race_prediction(
-            transport.claim_many(qualifications),
-            std::future::pending(),
-            cancel,
-            Duration::from_secs(30),
-        )
-        .await?;
-        let Some((index, task)) = task else {
-            return Ok(false);
+        let (index, task) = match next_task(transport, qualifications, cancel).await? {
+            Ok(claimed) => claimed,
+            Err(step) => return Ok(step),
         };
         if let Some((workload, _)) = task.model_key.split_once(':') {
             on_claim(workload);
         }
         let qualification = qualifications[index];
-        let result = async {
-            let input = race_prediction(
-                transport.input(&task, qualification),
-                std::future::pending(),
-                cancel,
-                execution_duration(&task)?,
-            )
-            .await?;
-            let mut renewed = task.clone();
-            let lease = async {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-                    if !transport.heartbeat(&mut renewed, qualification).await? {
-                        return Err("worker_lease_lost".into());
-                    }
+        let role = &self.roles[index];
+        let child = &mut self.child;
+        let claimed = &task;
+        let outcome = run_claimed(
+            transport,
+            claimed,
+            qualification,
+            cancel,
+            |input| async move {
+                let value = role
+                    .client
+                    .predict(claimed, &input)
+                    .await
+                    // The local model refused this one input; the process itself is still serving.
+                    .map_err(|code| match code.starts_with("server_http_") {
+                        true => "runtime_prediction_refused".into(),
+                        false => code,
+                    })?;
+                if !child.is_running()? {
+                    return Err("runtime_process_stopped".into());
                 }
-            };
-            let value = race_prediction(
-                self.roles[index].client.predict(&task, &input),
-                lease,
-                cancel,
-                execution_duration(&task)?,
-            )
-            .await?;
-            if !self.child.is_running()? {
-                return Err("runtime_process_stopped".into());
-            }
-            let accepted = race_prediction(
-                transport.complete(&task, &value, qualification),
-                std::future::pending(),
-                cancel,
-                Duration::from_secs(30),
-            )
-            .await?;
-            if !accepted {
-                return Err("worker_result_refused".into());
-            }
-            Ok(true)
-        }
+                Ok(value)
+            },
+        )
         .await;
-        if result.is_err() {
+        if outcome.as_ref().is_err_and(|failure| failure.inferring) {
             // Terminate inference before waiting for a failed/cancelled lease acknowledgement.
             self.stop()?;
-            let _ = transport
-                .fail(&task, WorkerFailure::InferenceFailed, qualification)
-                .await;
         }
-        result
+        settle(transport, &task, qualification, outcome).await
     }
 }
 
@@ -567,6 +761,112 @@ mod tests {
         assert!(execution_duration(&task).unwrap() <= Duration::from_secs(5));
         task.qualification_expires_at = stamp(-1);
         assert!(execution_duration(&task).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_heartbeat_is_retried_while_the_lease_is_held_and_a_refusal_ends_it() {
+        let tick = Duration::from_millis(5);
+        // Interrupted twice, then delivered: the task is still running afterwards.
+        let replies = std::sync::Mutex::new(std::collections::VecDeque::from([
+            Err("worker_request_interrupted".to_owned()),
+            Err("server_http_503".to_owned()),
+            Ok(true),
+        ]));
+        let lease = hold_lease(
+            || {
+                let next = replies.lock().unwrap().pop_front();
+                async move {
+                    match next {
+                        Some(reply) => reply,
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            || false,
+            tick,
+            tick,
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(300), lease)
+            .await
+            .is_err());
+        assert!(replies.lock().unwrap().is_empty());
+        // Still undeliverable when the last granted expiry passes: the lease is treated as lost.
+        let lost = hold_lease(
+            || async { Err("worker_request_interrupted".into()) },
+            || true,
+            tick,
+            tick,
+        );
+        assert_eq!(lost.await, Err("worker_lease_lost".into()));
+        // The server answered and refused: no retry, whatever the local clock says.
+        for (reply, expected) in [
+            (Ok(false), "worker_lease_lost"),
+            (
+                Err("worker_session_rejected".to_owned()),
+                "worker_session_rejected",
+            ),
+            (
+                Err("worker_policy_changed".to_owned()),
+                "worker_policy_changed",
+            ),
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let refused = hold_lease(
+                || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let reply = reply.clone();
+                    async move { reply }
+                },
+                || false,
+                tick,
+                tick,
+            );
+            assert_eq!(refused.await, Err(expected.into()));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+    #[test]
+    fn only_failures_confined_to_one_task_are_dropped_and_a_lost_lease_is_never_reported() {
+        for code in [
+            "worker_result_refused",
+            "worker_lease_refused",
+            "worker_lease_lost",
+            "worker_input_interrupted",
+            "runtime_prediction_refused",
+            "server_http_500",
+        ] {
+            assert!(task_scoped(code), "{code}");
+        }
+        // These end the association or the process, not one task.
+        for code in [
+            "worker_session_rejected",
+            "worker_policy_changed",
+            "worker_cancelled",
+            "worker_claim_invalid",
+            "worker_task_qualification_changed",
+            "runtime_process_stopped",
+            "server_http_401",
+        ] {
+            assert!(!task_scoped(code), "{code}");
+        }
+        for code in [
+            "worker_result_refused",
+            "worker_lease_refused",
+            "worker_lease_lost",
+            "worker_lease_expired",
+            "worker_session_rejected",
+            "worker_policy_changed",
+        ] {
+            assert!(lease_gone(code), "{code}");
+        }
+        assert!(!lease_gone("worker_input_interrupted"));
+        assert!(!lease_gone("runtime_prediction_refused"));
+        let mut held = task();
+        assert!(!lease_expired(&held));
+        held.expires_at = stamp(-1);
+        assert!(lease_expired(&held));
+        held.expires_at = "invalid".into();
+        assert!(lease_expired(&held));
     }
 
     fn client(port: u16) -> BoundClient {
