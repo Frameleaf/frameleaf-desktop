@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 import { workerStatus, safeMode } from '../src/mode-state.ts';
+import { errorCopy } from '../src/errors.ts';
 
 test('local setup commands are registered and permitted only in the packaged main window', () => {
   const ui = readFileSync(new URL('../src/LocalHost.svelte', import.meta.url), 'utf8');
@@ -45,7 +46,18 @@ test('local setup names a busy port, offers a companion update and always offers
   assert.match(app, /error === 'update_library_not_idle'\s+\? errorCopy\('update_library_not_idle'\)/);
   // The offer promises an attempt, and a Manager that cannot be recorded keeps the app open.
   assert.match(ui, /Frameleaf will try to stop it the next time it opens/);
-  assert.match(ui, /value === 'native_manager_record_unavailable'\) return '[^']*Frameleaf is staying open/);
+  assert.match(errorCopy('native_manager_record_unavailable')!, /Frameleaf is staying open/);
+  // The screen keeps only the wording that differs here; everything else is the shared copy.
+  assert.doesNotMatch(ui, /value === 'host_upgrade_downgrade_refused'|startsWith\('host_controller_'\)/);
+  assert.match(ui, /if \(value\.startsWith\('credential_'\)\) return 'Unlock your computer’s secure credential store and try again\.';/);
+  // Failures are announced, shown with more than colour, rendered through ErrorText and tied to the quit controls.
+  assert.match(ui, /<Icon name="warn" \/><\/span><p id="local-host-failure" class="danger-text" role="alert"[^>]*><ErrorText text=\{failure\} \/>/);
+  assert.match(ui, /aria-label="Stop local management and quit Frameleaf" aria-describedby=\{describedBy\} bind:this=\{quitButton\}/);
+  assert.match(ui, /aria-label="Quit Frameleaf and leave local management running" aria-describedby=\{describedBy\} bind:this=\{leaveButton\}/);
+  // Focus follows a new state: the offered quit button, and the heading when the stopped control goes.
+  assert.match(ui, /if \(quitOffered\) focusOn\(\(\) => quitButton\);/);
+  assert.match(ui, /if \(!view\?\.backgroundActive\) focusOn\(\(\) => title\);/);
+  assert.match(ui, /<h2 class="group-title" tabindex="-1" bind:this=\{title\}>/);
 });
 
 test('every invoke() in the Svelte front end names a registered, permitted command', () => {

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
   import Icon from './Icon.svelte';
   import { explainError } from './errors';
+  import ErrorText from './ErrorText.svelte';
   import Sheet from './Sheet.svelte';
   type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused' | 'outdated';
   const outdatedCompanion = 'This companion package does not match this version of Frameleaf. Install the companion for this version, then choose Check installation. Your library has not been changed.';
@@ -36,6 +37,8 @@
   let failure = $state('');
   let notice = $state('');
   let quitOffered = $state(false);
+  // What the stop and quit controls are about, read out with them: the failure, else the notice.
+  const describedBy = $derived(failure ? 'local-host-failure' : notice ? 'local-host-notice' : undefined);
   let managerPassword = $state('');
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
@@ -61,31 +64,22 @@
   function explain(code: unknown): string {
     const value = String(code);
     if (value.startsWith('manager_') || value === 'native_manager_not_ready' || value === 'native_host_busy') return managerError(value);
-    if (value === 'host_install_platform_unsupported') return 'Native server installation is not available on this platform in this build. You can connect to an existing server.';
-    if (value === 'host_install_profile_required') return 'Run the server component installer while signed in to this computer, then try again.';
-    if (value === 'host_install_linux_profile_required' || value === 'host_install_windows_profile_required') return 'Prepare a private server profile for your account before starting local management.';
-    if (value.startsWith('host_profile_legacy_')) return 'An existing server profile must be migrated before setup can continue. Your library and saved credentials have been preserved.';
-    if (value === 'host_profile_authorization_cancelled') return 'System authorization was cancelled. You can try again.';
-    if (value === 'host_profile_authorization_unavailable') return 'System authorization is unavailable. Check your desktop’s authorization service, then try again.';
-    if (value === 'host_profile_prepare_failed') return 'The server profile could not be prepared. Check that your installed Frameleaf components are up to date. Your existing library has been preserved.';
-    if (value === 'host_package_maintenance' || value === 'host_package_busy') return 'Server component maintenance is unfinished or the component is in use. Local management is unavailable until maintenance completes.';
-    if (value.startsWith('host_package_')) return 'The server component installation could not be verified. Local management is blocked; your existing library has been preserved.';
-    if (value === 'native_manager_start_cancelled') return 'Local setup was cancelled.';
-    if (value === 'host_upgrade_downgrade_refused') return 'This library already uses a newer server package. Choose that package to continue.';
-    if (value === 'host_upgrade_previous_package_missing') return 'Keep the server package this library last used installed until it has started once with the new package, then try again.';
-    if (value === 'host_restore_activation_pending') return 'A restore is waiting to finish with the package this library last used. Finish it in Manager with that package, then try the new package again.';
-    if (value === 'host_upgrade_operation_pending') return 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.';
-    if (value === 'host_update_requires_manager') return 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.';
+    // Wording for codes that mean something narrower on this screen than their shared copy in errors.ts
+    // says: the busy port is one this library needs and the library is known to be untouched, a companion
+    // built for another version is fixed by installing the right one, and every credential-store failure
+    // here has the same remedy. Every other code takes the shared copy.
     const port = /^local_port_in_use_(\d+)$/.exec(value);
     if (port) return `Another program on this computer is using port ${port[1]}, which your library needs. Close that program or change its port, then try again. Your library has not been changed.`;
-    if (value === 'local_photos_not_running') return 'The photo server is not running. Start it in Manager, then open Photos.';
     if (value === 'host_manifest_incompatible') return outdatedCompanion;
-    if (value === 'native_manager_orphan_running') return 'Local management from an earlier session is still shutting down. Wait a moment, then try again.';
-    if (value === 'native_manager_record_unavailable') return 'Local management did not stop, and Frameleaf could not save what it needs to stop it after quitting, so Frameleaf is staying open. Stop the photo server in Manager, then choose Stop local management.';
-    if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, start the photo server in Manager again, then stop it there.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
-    if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
     return explainError(value, 'Local setup could not finish. Check the server installation and secure credential store, then retry.');
+  }
+  // Where keyboard and screen-reader focus goes when the control that had it is replaced by a new state.
+  let title = $state<HTMLElement>();
+  let quitButton = $state<HTMLButtonElement>();
+  let leaveButton = $state<HTMLButtonElement>();
+  function focusOn(target: () => HTMLElement | null | undefined) {
+    void tick().then(() => { if (!disposed) (target() ?? title)?.focus(); });
   }
   function show(value: View) {
     if (disposed) return;
@@ -125,7 +119,7 @@
   onMount(() => {
     if (!native) return;
     let unlisten: UnlistenFn | undefined;
-    void listen('native-host-exit-blocked', () => { quitOffered = !profilePending; notice = profilePending ? profileCopy.quit : 'Local management is still running. Choose Stop and quit to close it and leave Frameleaf. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
+    void listen('native-host-exit-blocked', () => { quitOffered = !profilePending; if (quitOffered) focusOn(() => quitButton); notice = profilePending ? profileCopy.quit : 'Local management is still running. Choose Stop and quit to close it and leave Frameleaf. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
     void refresh();
     return () => { disposed = true; unlisten?.(); };
   });
@@ -148,7 +142,7 @@
   async function prepare() {
     if (busy || !native || !selectedPackage || !packageVerified) return;
     busy = true; starting = true; onactive(true); failure = ''; notice = '';
-    try { show(await invoke<View>('prepare_local_host', { manifestSha256: selected })); }
+    try { show(await invoke<View>('prepare_local_host', { manifestSha256: selected })); focusOn(() => document.getElementById('local-manager-password')); }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; starting = false; }
   }
@@ -180,7 +174,7 @@
   async function photos() {
     busy = true; failure = ''; notice = '';
     try { await invoke('open_local_photos'); }
-    catch (error) { failure = String(error) === 'photo_window_unavailable' ? 'The Photos window could not open. Try again.' : explain(error); }
+    catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
   async function cancel() {
@@ -191,6 +185,8 @@
     busy = true; failure = ''; notice = '';
     try {
       show(await invoke<View>('stop_local_host_manager'));
+      // The Stop button is gone with the state it stopped.
+      if (!view?.backgroundActive) focusOn(() => title);
       if (!packageVerified) await checkSelected();
     }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
@@ -201,14 +197,16 @@
     try { await invoke('quit_local_host', { leaveRunning }); }
     catch (error) {
       const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
-      failure = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && current?.leaveAvailable ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error); }
+      failure = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && current?.leaveAvailable ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error);
+      // Quit anyway is new on screen; otherwise stay on the control that was tried, or the heading if it went.
+      focusOn(() => !leaveRunning && current?.leaveAvailable ? leaveButton : leaveRunning ? leaveButton ?? quitButton : quitButton); }
     finally { busy = false; }
   }
 </script>
 
 <section aria-label="Local library setup" aria-busy={busy || checking}>
   <div class="group-head">
-    <h2 class="group-title">Run Frameleaf here</h2>
+    <h2 class="group-title" tabindex="-1" bind:this={title}>Run Frameleaf here</h2>
     {#if starting}<button class="btn quiet" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
     {#if canMovePackage && libraryPackage && !view?.backgroundActive}
       <button class="btn quiet" disabled={busy || !native} onclick={openDownloads}>Find companion updates</button>
@@ -219,13 +217,13 @@
     <div class="row">
       <span class="ic" aria-hidden="true"><Icon name="computer" /></span>
       <span class="l"><b>{headline}</b><small>Keep your photo library on this computer. Frameleaf prepares private storage for your account.</small></span>
-      <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
-      {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
-      {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit()}>Stop and quit</button>{/if}
-      {#if view?.leaveAvailable && view.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
+      <span class="pill {pill.tone}"><i aria-hidden="true"></i><span class="visually-hidden">Local management: </span>{pill.label}</span>
+      {#if view?.backgroundActive && !profilePending}<button class="btn" aria-describedby={describedBy} disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
+      {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" aria-label="Stop local management and quit Frameleaf" aria-describedby={describedBy} bind:this={quitButton} disabled={busy || !native} onclick={() => stopAndQuit()}>Stop and quit</button>{/if}
+      {#if view?.leaveAvailable && view.backgroundActive && !profilePending}<button class="btn" aria-label="Quit Frameleaf and leave local management running" aria-describedby={describedBy} bind:this={leaveButton} disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
     </div>
-    {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
-    {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
+    {#if failure}<div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><p id="local-host-failure" class="danger-text" role="alert" style="flex:1"><ErrorText text={failure} /></p></div>{/if}
+    {#if notice}<div class="row"><p id="local-host-notice" role="status" style="flex:1">{notice}</p></div>{/if}
     {#if profilePending}<div class="row"><span class="spin" aria-hidden="true"></span><p role="status" style="flex:1">{profileCopy.pending}</p></div>{/if}
     {#if packageCheck && (!view?.backgroundActive || view?.state === 'needs-attention')}
       {@const check = compatibilityCopy[packageCheck]}

@@ -22,7 +22,7 @@ const notErrorCodes = new Set([
 // The components that still hold the only copy for some codes. Every other file's copy is in
 // src/errors.ts, so a code shown on any screen gets its words. Do not add a file here: add the copy
 // to src/errors.ts instead.
-const ownCopy = ['LocalHost.svelte']; // being changed under FD-44; its table moves once that lands
+const ownCopy: string[] = [];
 
 // Copy those components keep for the codes only they show: `=== 'code' ? 'text'` and
 // `if (… === 'code' || ….startsWith('prefix_')) return 'text'`.
@@ -149,6 +149,16 @@ test('a code one screen used to own gets its copy on every screen', () => {
     manager_clock_skew: /clock/, // manager-state.ts
     offline_album_storage_limit: /2 GB offline cache/, // OfflinePhotos.svelte
     source_capacity_insufficient: /not enough free space for this original/, // PhotoSources.svelte
+    // LocalHost.svelte
+    host_controller_already_owned: /^Stop the photo server in Manager before stopping local management\./,
+    host_recovery_requires_manager: /^Stop the photo server in Manager before stopping local management\./,
+    host_package_busy: /maintenance is unfinished or the component is in use/,
+    host_package_state_invalid: /^The server component installation could not be verified\. Local management is blocked; your existing library has been preserved\.$/,
+    host_profile_legacy_migration_required: /must be migrated before setup can continue/,
+    host_upgrade_previous_package_missing: /^Keep the server package this library last used installed/,
+    native_profile_recovery_required: /^The existing library needs recovery\./,
+    native_manager_start_cancelled: /^Local setup was cancelled\.$/,
+    local_photos_not_running: /^The photo server is not running\./,
     source_drop_existing: /current import/, // PhotoDrop.svelte
     source_album_missing: /album could not be found/, // import-destination.ts
   };
@@ -160,7 +170,7 @@ test('a code one screen used to own gets its copy on every screen', () => {
     assert.equal(explainError(Error(code), 'Some other screen could not finish.'), errorCopy(code), code);
   }
   // The files that were moved keep no copy the coverage test has to read.
-  assert.deepEqual(ownCopy, ['LocalHost.svelte']);
+  assert.deepEqual(ownCopy, []);
 });
 
 test('the reference of an unknown failure is shown one way: small secondary text after the message', () => {
@@ -186,8 +196,7 @@ test('the reference of an unknown failure is shown one way: small secondary text
   let screens = 0;
   for (const path of files) {
     const name = path.slice(ui.length + 1);
-    // LocalHost.svelte is being changed under FD-44 and still writes the reference inline.
-    if (name === 'ErrorText.svelte' || name === 'LocalHost.svelte') continue;
+    if (name === 'ErrorText.svelte') continue;
     const source = readFileSync(path, 'utf8');
     assert.doesNotMatch(source, /Reference:/, `${name} writes a reference itself; render the message with ErrorText`);
     if (!shows.test(source)) continue;
