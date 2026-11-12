@@ -31,7 +31,7 @@
     : setup?.state === 'stopped'
     ? 'AI processing is stopped on this computer. Resume whenever you are ready. Photos remain available.'
     : setup?.state === 'paused'
-    ? ({ system_resumed: 'This computer resumed or its clock changed. Rechecking the selected models before more work.', user_paused: 'Paused by you. This computer will stay paused after reopening the app.', on_battery: 'Plug in this computer to continue AI processing.', power_unknown: 'Power status could not be read. AI processing is paused.', metered_network: 'AI processing pauses on metered networks. Photos remain available.', network_unknown: 'Network cost could not be determined. AI processing is paused.', memory_low: 'Waiting for enough memory for the selected model.', memory_unknown: 'Memory status could not be read. AI processing is paused.' } as Record<string, string>)[setup.code ?? ''] ?? 'AI processing is paused.'
+    ? ({ system_resumed: 'This computer resumed or its clock changed. Rechecking the selected models before more work.', user_paused: 'Paused by you. This computer will stay paused after reopening the app.', on_battery: 'Plug in this computer to continue AI processing.', power_unknown: 'Power status could not be read. AI processing is paused.', metered_network: 'AI processing pauses on metered networks. Photos remain available.', network_unknown: 'Network cost could not be determined. AI processing is paused.', memory_low: 'Waiting for enough memory for the selected model.', memory_unknown: 'Memory status could not be read. AI processing is paused.', worker_policy_required: 'Your server is not using computers for AI processing right now. This computer checks again every few minutes.', worker_lan_required: 'AI processing runs only on your server’s home network. This computer checks again every few minutes and when its network changes.' } as Record<string, string>)[setup.code ?? ''] ?? 'AI processing is paused.'
     : setup?.state === 'qualified'
     ? 'The selected models passed this computer’s checks.'
     : setup?.state === 'starting-worker'
@@ -243,7 +243,7 @@
           </div>
         {/each}
       </div>
-      <p class="foot">{connectionDetail} Server administration uses your existing Frameleaf permissions inside Photos.</p>
+      <p class="foot">{connectionDetail} When your server’s owner marks this {computer} for the household, it may process other members’ photos (never Locked photos). Server administration uses your existing Frameleaf permissions inside Photos.</p>
     </div>
 
     {#if section === 'ai'}
