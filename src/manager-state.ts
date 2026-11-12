@@ -1,3 +1,5 @@
+import { explainError } from './errors.ts';
+
 export type Control = 'start' | 'stop' | 'restart' | 'backup';
 export function localProfilePending(state: string | undefined, requesting: boolean): boolean {
   return requesting || state === 'provisioning';
@@ -109,7 +111,7 @@ export function managerError(error: unknown): string {
     installation_changed: 'The installation changed. Review it in Manager before retrying.',
     operation_interrupted: 'This operation was interrupted. Check its state, then resume when ready.',
   };
-  return Object.hasOwn(messages, code) ? messages[code]! : 'Manager could not finish this request. Check its operation state before retrying.';
+  return Object.hasOwn(messages, code) ? messages[code]! : explainError(code, 'Manager could not finish this request. Check its operation state before retrying.');
 }
 
 export type BackupEntry = { id: string; time: string };

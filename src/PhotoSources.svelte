@@ -9,6 +9,7 @@
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import { albumErrors, type AlbumDestination } from './import-destination';
   import { formatBytes, percent } from './ui-state';
+  import { explainError } from './errors';
   type Hint = { label: string; path: string };
   type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
@@ -88,7 +89,7 @@
     source_camera_changed: 'This folder or card does not match the approved import. Choose the original card or remove this permission to preview a new import. Verified copies stay in your library.',
     source_camera_identity_unavailable: 'This card could not be identified safely. Remove this permission and preview it again to start a new import.',
   };
-  function explain(error: unknown) { return errors[String(error)] ?? 'This operation could not finish. Check the server connection and try again.'; }
+  function explain(error: unknown) { return errors[String(error)] ?? explainError(error, 'This operation could not finish. Check the server connection and try again.'); }
   async function loadConsent() {
     try {
       const current = await invoke<Consent | null>('photo_source_status');
@@ -180,7 +181,7 @@
     try {
       const selected = await invoke<Inventory | null>('choose_photo_folder', { oneDrive, camera });
       if (selected) { folder = selected; allowReads = false; watchFolder = false; albumMode = false; destination = null; watchAvailable = oneDrive === null && camera === null; }
-    } catch (error) { message = errors[String(error)] ?? 'Could not preview this folder. Choose an accessible photo folder and try again.'; }
+    } catch (error) { message = errors[String(error)] ?? explainError(error, 'Could not preview this folder. Choose an accessible photo folder and try again.'); }
     finally { busy = false; }
   }
   const jobLabel = $derived(!job ? '' : job.state === 'watching' ? (job.code ? 'Watching · waiting' : 'Watching folder') : job.state === 'watch-paused' ? 'Watching paused' : job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention');

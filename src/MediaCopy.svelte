@@ -2,6 +2,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { onDestroy } from 'svelte';
   import { formatBytes, formatWhen } from './ui-state';
+  import { explainError } from './errors';
 
   type Package = { id: string; name: string; createdAt: string; manifest: { exported: number } };
   type SavedCopy = { path: string; originals: number; bytes: number };
@@ -33,7 +34,7 @@
   };
   function explain(error: unknown) {
     const code = String(error);
-    return Object.hasOwn(errors, code) ? errors[code]! : 'The media copy could not be completed. Check your server and drive, then try again.';
+    return Object.hasOwn(errors, code) ? errors[code]! : explainError(error, 'The media copy could not be completed. Check your server and drive, then try again.');
   }
   async function load() {
     loading = true;
