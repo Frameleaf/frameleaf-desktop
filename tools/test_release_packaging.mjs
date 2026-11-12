@@ -23,7 +23,16 @@ function withTree(run) {
       cpSync(join(repository, file), join(root, file), { recursive: true });
     }
     const read = (file) => readFileSync(join(root, file), "utf8");
-    return run(root, read, (file, change) => writeFileSync(join(root, file), change(read(file))));
+    const edit = (file, change) => writeFileSync(join(root, file), change(read(file)));
+    // A prerelease tree keeps the last stable packaging, so the fixture states that stable version throughout.
+    const current = JSON.parse(read("package.json")).version;
+    const stable = /^pkgver=(.*)$/m.exec(read("packaging/aur/PKGBUILD"))[1];
+    if (current.includes("-")) {
+      edit("package.json", (text) => text.replace(`"version": "${current}"`, `"version": "${stable}"`));
+      edit("src-tauri/tauri.conf.json", (text) => text.replace(`"version": "${current}"`, `"version": "${stable}"`));
+      edit("src-tauri/Cargo.toml", (text) => text.replace(`version = "${current}"`, `version = "${stable}"`));
+    }
+    return run(root, read, edit);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -32,8 +41,8 @@ function withTree(run) {
 const digest = (text) => createHash("sha256").update(text).digest("hex");
 
 test("the application and every packaging file state one version", () => {
-  const version = consistentVersion();
-  assert.equal(version, JSON.parse(readFileSync(join(repository, "package.json"), "utf8")).version);
+  assert.equal(consistentVersion(), JSON.parse(readFileSync(join(repository, "package.json"), "utf8")).version);
+  const version = withTree((root) => consistentVersion(root));
   const changes = {
     "package.json": (text) => text.replace(`"version": "${version}"`, '"version": "9.9.9"'),
     "src-tauri/tauri.conf.json": (text) => text.replace(`"version": "${version}"`, '"version": "9.9.9"'),
@@ -130,9 +139,7 @@ test("the committed packaging is exactly what the stamping script writes", () =>
       .matchAll(/(Frameleaf_[\w.]+\.deb)\n\tsha256sums_\w+ = ([a-f0-9]{64})$/gm)) checksums.set(name, sum);
     const msi = /(Frameleaf_[\w.-]+\.msi)'\n\s*checksum64\s*= '([a-f0-9]{64})'/.exec(read("packaging/chocolatey/tools/chocolateyinstall.ps1"));
     if (msi) checksums.set(msi[1], msi[2]);
-    const version = consistentVersion(root);
-    if (version.includes("-")) return; // A prerelease tree keeps the last stable packaging; there is nothing to restamp.
-    stampPackaging(root, version, checksums);
+    stampPackaging(root, consistentVersion(root), checksums);
     assert.deepEqual(packaging.map(read), committed);
   });
 });
