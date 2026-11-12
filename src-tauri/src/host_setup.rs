@@ -93,11 +93,27 @@ fn live(owner: &mut Option<Running>) -> bool {
         .as_mut()
         .is_some_and(|running| !matches!(running.manager.tree_exited(), Ok(true)))
 }
+/// The existing stop proof, read-only: no controller holds the journal, its last stop was clean
+/// and no database process file remains. Anything short of that is not proof.
+fn proven_idle(running: &Running) -> bool {
+    crate::host_state::Owner::acquire(&running.configuration.state, false)
+        .and_then(|mut proof| {
+            proof.admit_idle(
+                &running.configuration.installation_id,
+                &running.installation.manifest_sha256,
+            )
+        })
+        .is_ok()
+}
 #[derive(Default)]
 pub(crate) struct HostSetup {
     owner: tokio::sync::Mutex<Option<Running>>,
     cancel: Arc<AtomicBool>,
     active: AtomicBool,
+    /// A stop for quitting failed, so quitting without stopping may be chosen.
+    exit_stop_failed: AtomicBool,
+    /// The person chose to quit and leave Manager running for the next launch to stop.
+    left_for_exit: AtomicBool,
     view: Mutex<View>,
 }
 impl HostSetup {
@@ -105,6 +121,9 @@ impl HostSetup {
     /// owner for their whole duration and keep the flag themselves; whenever the owner is free
     /// the flag is re-derived from the owned process, so a Manager that exited cannot hold it.
     pub(crate) fn background_active(&self) -> bool {
+        if self.left_for_exit.load(Ordering::Acquire) {
+            return false;
+        }
         if let Ok(mut owner) = self.owner.try_lock() {
             self.active.store(live(&mut owner), Ordering::Release);
         }
@@ -112,11 +131,23 @@ impl HostSetup {
     }
     pub(crate) fn lock_for_update(&self) -> Result<impl Drop + '_, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
-        // Holding the owner proves no operation is in flight; only a live Manager blocks.
-        if live(&mut owner) {
+        // Holding the owner proves no operation is in flight. A live Manager blocks, and so
+        // does a Manager that exited unless its controller and database are proven stopped:
+        // outside Windows they are not this app's children and can outlive Manager.
+        if live(&mut owner) || owner.as_ref().is_some_and(|running| !proven_idle(running)) {
             return Err("update_host_active".into());
         }
         Ok(owner)
+    }
+    /// Quit without stopping, offered only after a stop for quitting failed. Manager keeps
+    /// running and its recorded process stays, so the next launch stops it. Not on Windows:
+    /// leaving there ends Manager's job and would kill a running database.
+    pub(crate) fn leave_for_exit(&self, leave: bool) -> Result<(), String> {
+        if leave && (cfg!(not(unix)) || !self.exit_stop_failed.load(Ordering::Acquire)) {
+            return Err("native_manager_shutdown_unconfirmed".into());
+        }
+        self.left_for_exit.store(leave, Ordering::Release);
+        Ok(())
     }
     fn set(&self, state: &str, code: Option<String>, installation: Option<Installation>) {
         *self.view.lock().unwrap_or_else(|error| error.into_inner()) = View {
@@ -401,12 +432,17 @@ impl HostSetup {
         }
         *owner = None;
         self.active.store(false, Ordering::Release);
+        self.exit_stop_failed.store(false, Ordering::Release);
+        self.left_for_exit.store(false, Ordering::Release);
         self.set("idle", None, record);
     }
     /// The quit path. Unix asks Manager to exit even while the photo server runs: its controller
     /// then closes the database in order, and finishes on its own if this app exits first.
     /// Windows keeps the idle proof, because ending Manager's job there would kill the database.
     pub(crate) async fn stop_for_exit(&self) -> Result<View, String> {
+        self.stop_for_exit_within(Duration::from_secs(10)).await
+    }
+    async fn stop_for_exit_within(&self, timeout: Duration) -> Result<View, String> {
         #[cfg(unix)]
         {
             let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
@@ -415,7 +451,10 @@ impl HostSetup {
             };
             let record = Some(running.installation.clone());
             self.set("stopping", None, record.clone());
-            if let Err(error) = running.manager.shutdown(Duration::from_secs(10)).await {
+            if let Err(error) = running.manager.shutdown(timeout).await {
+                // Manager did not exit in time. Its record is kept so that quitting without
+                // stopping still lets the next launch find and stop it.
+                self.exit_stop_failed.store(true, Ordering::Release);
                 self.set("needs-attention", Some(error.clone()), record);
                 return Err(error);
             }
@@ -424,6 +463,7 @@ impl HostSetup {
         }
         #[cfg(not(unix))]
         {
+            let _ = timeout;
             self.stop().await
         }
     }
@@ -1746,6 +1786,13 @@ mod tests {
             let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
             let mut command = std::process::Command::new(program);
             command.args(arguments);
+            self.own_command(command, installation)
+        }
+        fn own_command(
+            &self,
+            mut command: std::process::Command,
+            installation: Installation,
+        ) -> HostSetup {
             let setup = HostSetup::default();
             *setup.owner.try_lock().unwrap() = Some(Running {
                 manager: NativeManager::test_child(&mut command),
@@ -1836,6 +1883,106 @@ mod tests {
         assert!(!setup.background_active());
         // The controller was left to close the database itself.
         drop(controller);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_manager_that_ignores_the_stop_can_still_be_left_running_to_quit() {
+        let fixture = OwnedFixture::new();
+        // An ignored signal stays ignored across exec: this Manager never honours the request.
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let setup = fixture.own_command(command, installation);
+        let data = fixture.0.join("data");
+        let pid = setup
+            .owner
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .manager
+            .process_id();
+        crate::manager_host::record_owned_process(&data, pid).unwrap();
+        // Leaving is not offered before a stop has been tried and has failed.
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_shutdown_unconfirmed"
+        );
+        assert_eq!(
+            setup
+                .stop_for_exit_within(Duration::from_millis(300))
+                .await
+                .err()
+                .unwrap(),
+            "native_manager_shutdown_unconfirmed"
+        );
+        assert_eq!(setup.snapshot().state, "needs-attention");
+        assert!(setup.background_active(), "exit stays protected by default");
+        setup.leave_for_exit(true).unwrap();
+        assert!(!setup.background_active(), "the chosen quit is not blocked");
+        assert!(
+            data.join("desktop-manager-process.json").exists(),
+            "the next launch must still be able to find this Manager"
+        );
+        assert!(
+            setup.lock_for_update().is_err(),
+            "leaving never unlocks updates"
+        );
+        // An exit that something else prevented restores the protection.
+        setup.leave_for_exit(false).unwrap();
+        assert!(setup.background_active());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_waits_for_proof_that_an_exited_managers_controller_and_database_stopped() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["0.2"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.background_active() {
+            assert!(std::time::Instant::now() < deadline, "Manager did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // No journal yet: nothing proves the library idle.
+        assert!(setup.lock_for_update().is_err());
+        // Manager is gone but its controller still runs the photo server.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        assert!(setup.lock_for_update().is_err());
+        // The controller died without a clean stop: still no proof.
+        drop(controller);
+        assert!(setup.lock_for_update().is_err());
+        // A clean stop that left a database process file is not proof either.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        controller.clean_stop().unwrap();
+        drop(controller);
+        let database = fixture.state().join("database");
+        crate::runtime_store::private_directory(&database).unwrap();
+        std::fs::write(database.join("postmaster.pid"), b"synthetic").unwrap();
+        assert!(setup.lock_for_update().is_err());
+        std::fs::remove_file(database.join("postmaster.pid")).unwrap();
+        assert!(setup.lock_for_update().is_ok());
     }
 
     #[test]
