@@ -117,15 +117,14 @@ pub(crate) async fn quit_local_host(
     leave_running: bool,
 ) -> Result<(), String> {
     require_local(&window)?;
-    if leave_running {
-        // Only give up exit protection when nothing else would then refuse the exit.
-        if app.state::<crate::media_copy::MediaCopy>().is_active() {
-            return Err("media_copy_exit_blocked".into());
-        }
-        setup.leave_for_exit(true)?;
-    } else {
-        setup.stop_for_exit().await?;
-    }
+    // The exit handler refuses to exit for a media copy and for a live local host. Decide the
+    // first before touching the second, so Manager is never stopped or left for an exit that
+    // will not happen.
+    let exit_refused = app
+        .state::<crate::media_copy::MediaCopy>()
+        .is_active()
+        .then_some("media_copy_exit_blocked");
+    setup.quit(exit_refused, leave_running).await?;
     app.exit(0);
     Ok(())
 }
