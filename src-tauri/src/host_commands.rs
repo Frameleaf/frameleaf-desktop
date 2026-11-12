@@ -106,6 +106,30 @@ pub(crate) async fn stop_local_host_manager(
     setup.stop().await
 }
 
+/// The quit path offered after a blocked exit: stop local management, then leave the app.
+/// `leave_running` is the fallback once that stop has failed: quit and let the next launch
+/// stop the recorded Manager.
+#[tauri::command]
+pub(crate) async fn quit_local_host(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    setup: State<'_, HostSetup>,
+    leave_running: bool,
+) -> Result<(), String> {
+    require_local(&window)?;
+    if leave_running {
+        // Only give up exit protection when nothing else would then refuse the exit.
+        if app.state::<crate::media_copy::MediaCopy>().is_active() {
+            return Err("media_copy_exit_blocked".into());
+        }
+        setup.leave_for_exit(true)?;
+    } else {
+        setup.stop_for_exit().await?;
+    }
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn authorize_local_manager(
     window: WebviewWindow,

@@ -748,6 +748,7 @@ pub fn run() {
             host_commands::provision_local_host_profile,
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
+            host_commands::quit_local_host,
             connect_server,
             connect_server_step,
             restore_connection,

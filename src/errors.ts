@@ -102,6 +102,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'A different update was published while this one was starting. Check for updates again.', 'update_changed'],
   ['', 'The update could not be installed. Try again later.', 'update_install_failed'],
   ['', 'Stop local management before updating Frameleaf.', 'update_host_active'],
+  ['', 'Your library on this computer is still shutting down, or did not shut down cleanly. Start the photo server in Manager and stop it there, then update Frameleaf.', 'update_library_not_idle'],
   ['', 'Finish or cancel the media copy before updating Frameleaf.', 'update_media_copy_active'],
   ['', 'Choose a daily cap between $1 and $1,000.', 'wallet_daily_cap_invalid'],
   ['', 'Nothing was changed. Choose a new cap or auto-reload setting first.', 'wallet_nothing_to_change'],
@@ -131,7 +132,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   // ---- AI processing: the runtime that comes with Frameleaf ----
   ['runtime', 'This build does not include a signed AI runtime yet. Photos remain available.', 'runtime_pack_unavailable'],
   ['runtime', 'The AI runtime that comes with Frameleaf is missing or could not be verified. Install Frameleaf again, then try again. Photos remain available.', 'app_resources_unavailable release_policy_invalid runtime_file_unavailable runtime_manifest_invalid runtime_manifest_incompatible runtime_signature_invalid runtime_artifact_changed runtime_artifact_invalid runtime_interpreter_unapproved runtime_inventory_failed runtime_inventory_limit runtime_inventory_mismatch runtime_link_forbidden runtime_path_invalid runtime_root_invalid runtime_size_invalid runtime_special_file_forbidden runtime_read_failed runtime_release_identity_changed'],
-  ['restart', 'The AI runtime could not start, or stopped unexpectedly, on this computer. Quit and reopen Frameleaf, then try again.', 'runtime_start_failed runtime_gate_failed runtime_port_invalid runtime_port_unavailable runtime_process_invalid runtime_process_owner_failed runtime_process_shutdown_unconfirmed runtime_process_status_failed runtime_process_stop_failed runtime_process_stopped runtime_not_ready runtime_health_invalid runtime_client_failed runtime_prediction_interrupted runtime_prediction_invalid runtime_activation_failed runtime_preparation_failed'],
+  ['restart', 'The AI runtime could not start, or stopped unexpectedly, on this computer. Quit and reopen Frameleaf, then try again.', 'runtime_start_failed runtime_gate_failed runtime_port_invalid runtime_port_unavailable runtime_process_invalid runtime_process_owner_failed runtime_process_shutdown_unconfirmed runtime_process_status_failed runtime_process_state_unavailable runtime_process_stop_failed runtime_process_stopped runtime_not_ready runtime_health_invalid runtime_client_failed runtime_prediction_interrupted runtime_prediction_invalid runtime_activation_failed runtime_preparation_failed'],
   ['restart', 'Another copy of Frameleaf is using the AI files on this computer. Close it, then try again.', 'runtime_store_busy runtime_store_lock_failed'],
   ['', 'Frameleaf’s AI folder on this computer is not private to your account, so it was not used. Photos remain available. If this keeps happening, contact Frameleaf support.', 'runtime_store_directory_not_private runtime_store_directory_exists runtime_store_path_invalid runtime_store_lock_invalid runtime_store_privacy_inventory_limit'],
   ['history', 'AI processing needs recovery because this computer’s saved runtime history could not be verified. Photos remain available.', 'runtime_epoch_credential_missing runtime_epoch_identity_changed runtime_epoch_recovery_required runtime_epoch_record_invalid runtime_epoch_binding_invalid runtime_epoch_identity_invalid runtime_epoch_invalid runtime_epoch_operation_missing runtime_active_invalid runtime_active_epoch_changed runtime_store_file_invalid runtime_store_read_failed runtime_attestation_compression_failed runtime_attestation_too_large'],
@@ -226,6 +227,7 @@ const built: readonly (readonly [string, (rest: string) => string])[] = [
   ['source_upload_http_', status => status === '429' ? 'Your server is busy. Wait a minute, then resume the copy.' : 'Your server did not accept an upload. Check its source permission and free space, then resume the copy.'],
   ['worker_resume_', () => messages.worker_setup_unavailable!],
   ['workload_', rest => errorCopy(rest) ?? 'Your server is not ready to check this AI task on this computer yet. Other tasks can continue.'],
+  ['local_port_in_use_', port => `Another program on this computer is using port ${port}, which Frameleaf needs. Close that program, then try again.`],
   ['resource_', rest => errorCopy(rest) ?? 'This computer’s power, network and memory could not be checked. AI processing is paused.'],
 ];
 

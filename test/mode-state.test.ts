@@ -22,6 +22,23 @@ test('local setup commands are registered and permitted only in the packaged mai
   assert.equal(capability.remote, undefined);
 });
 
+test('local setup names a busy port, offers a companion update and always offers a quit path', () => {
+  const ui = readFileSync(new URL('../src/LocalHost.svelte', import.meta.url), 'utf8');
+  assert.match(ui, /\/\^local_port_in_use_\(\\d\+\)\$\/[\s\S]{0,200}using port \$\{port\[1\]\}/);
+  assert.match(ui, /value === 'host_manifest_incompatible'\) return outdatedCompanion/);
+  assert.match(ui, /outdated: \{ label: 'Companion update needed'/);
+  assert.match(ui, /packageCheck === 'outdated'\) && view\?\.companionPlatform\}<button[^>]*onclick=\{openDownloads\}/);
+  assert.match(ui, /'native-host-exit-blocked', \(\) => \{ quitOffered = !profilePending;/);
+  assert.match(ui, /quitOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(\)\}>Stop and quit</);
+  assert.match(ui, /invoke\('quit_local_host', \{ leaveRunning \}\)/);
+  // A Manager that will not stop must not make the app unquittable again.
+  assert.match(ui, /leaveOffered = !leaveRunning && String\(error\) === 'native_manager_shutdown_unconfirmed' && view\?\.companionPlatform !== 'windows'/);
+  assert.match(ui, /leaveOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(true\)\}>Quit anyway</);
+  // The offer promises an attempt, and a Manager that cannot be recorded keeps the app open.
+  assert.match(ui, /Frameleaf will try to stop it the next time it opens/);
+  assert.match(ui, /value === 'native_manager_record_unavailable'\) return '[^']*Frameleaf is staying open/);
+});
+
 test('every invoke() in the Svelte front end names a registered, permitted command', () => {
   const { readdirSync, statSync } = require('node:fs');
   const { join } = require('node:path');

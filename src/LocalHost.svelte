@@ -6,12 +6,14 @@
   import Icon from './Icon.svelte';
   import { explainError } from './errors';
   import Sheet from './Sheet.svelte';
-  type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused';
+  type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused' | 'outdated';
+  const outdatedCompanion = 'This companion package does not match this version of Frameleaf. Install the companion for this version, then choose Check installation. Your library has not been changed.';
   const compatibilityCopy = {
     checking: { label: 'Checking companion package…', detail: 'This can take a moment.' },
     verified: { label: 'Companion package verified', detail: 'This package passed the checks for this version of Frameleaf.' },
     unknown: { label: 'Compatibility unknown', detail: 'Frameleaf could not finish checking this package. Choose Check installation to retry.' },
     refused: { label: 'Companion package refused', detail: 'This package did not pass verification. Choose a different installed package or install a compatible companion.' },
+    outdated: { label: 'Companion update needed', detail: outdatedCompanion },
   };
   type Installation = { manifestSha256: string; controllerSha256: string; version?: string | null; library?: boolean };
   const companionInstructions = {
@@ -33,6 +35,8 @@
   let disposed = false;
   let failure = $state('');
   let notice = $state('');
+  let quitOffered = $state(false);
+  let leaveOffered = $state(false);
   let managerPassword = $state('');
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
@@ -73,7 +77,13 @@
     if (value === 'host_restore_activation_pending') return 'A restore is waiting to finish with the package this library last used. Finish it in Manager with that package, then try the new package again.';
     if (value === 'host_upgrade_operation_pending') return 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.';
     if (value === 'host_update_requires_manager') return 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.';
-    if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, recover it in Manager first.';
+    const port = /^local_port_in_use_(\d+)$/.exec(value);
+    if (port) return `Another program on this computer is using port ${port[1]}, which your library needs. Close that program or change its port, then try again. Your library has not been changed.`;
+    if (value === 'local_photos_not_running') return 'The photo server is not running. Start it in Manager, then open Photos.';
+    if (value === 'host_manifest_incompatible') return outdatedCompanion;
+    if (value === 'native_manager_orphan_running') return 'Local management from an earlier session is still shutting down. Wait a moment, then try again.';
+    if (value === 'native_manager_record_unavailable') return 'Local management did not stop, and Frameleaf could not save what it needs to stop it after quitting, so Frameleaf is staying open. Stop the photo server in Manager, then choose Stop local management.';
+    if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, start the photo server in Manager again, then stop it there.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
     if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
     return explainError(value, 'Local setup could not finish. Check the server installation and secure credential store, then retry.');
@@ -94,7 +104,7 @@
     compatibility = { manifestSha256, controllerSha256, state: 'checking' };
     const result = await invoke<Compatibility>('check_local_host_package', { manifestSha256, controllerSha256 }).catch(() => 'unknown');
     if (disposed || checkRequest !== request) return;
-    compatibility = { manifestSha256, controllerSha256, state: result === 'verified' || result === 'refused' ? result : 'unknown' };
+    compatibility = { manifestSha256, controllerSha256, state: result === 'verified' || result === 'refused' || result === 'outdated' ? result : 'unknown' };
   }
   function selectPackage(event: Event & { currentTarget: HTMLSelectElement }) {
     selected = event.currentTarget.value;
@@ -115,7 +125,7 @@
   onMount(() => {
     if (!native) return;
     let unlisten: UnlistenFn | undefined;
-    void listen('native-host-exit-blocked', () => { notice = profilePending ? profileCopy.quit : 'Stop the photo server in Manager, then stop local management before quitting. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
+    void listen('native-host-exit-blocked', () => { quitOffered = !profilePending; notice = profilePending ? profileCopy.quit : 'Local management is still running. Choose Stop and quit to close it and leave Frameleaf. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
     void refresh();
     return () => { disposed = true; unlisten?.(); };
   });
@@ -186,6 +196,15 @@
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; }
   }
+  async function stopAndQuit(leaveRunning = false) {
+    busy = true; failure = ''; notice = '';
+    try { await invoke('quit_local_host', { leaveRunning }); }
+    catch (error) {
+      leaveOffered = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && view?.companionPlatform !== 'windows';
+      failure = leaveOffered ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error);
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
+    finally { busy = false; }
+  }
 </script>
 
 <section aria-label="Local library setup" aria-busy={busy || checking}>
@@ -203,6 +222,8 @@
       <span class="l"><b>{headline}</b><small>Keep your photo library on this computer. Frameleaf prepares private storage for your account.</small></span>
       <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
       {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
+      {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit()}>Stop and quit</button>{/if}
+      {#if leaveOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
     </div>
     {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
     {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
@@ -211,7 +232,7 @@
       {@const check = compatibilityCopy[packageCheck]}
       <div class="row">
         <span class="l" role="status"><b>{check.label}</b><small>{check.detail}</small></span>
-        {#if packageCheck === 'refused' && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
+        {#if (packageCheck === 'refused' || packageCheck === 'outdated') && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
       </div>
     {/if}
     {#if selectedPackage && needsProfile}

@@ -1,7 +1,7 @@
 //! Only installed identities cross IPC; code, state paths and secrets stay native.
 use crate::{
     host_install::Installation,
-    manager_host::{Configuration, NativeManager},
+    manager_host::{Configuration, Evidence, NativeManager},
 };
 use serde::Serialize;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -32,18 +32,20 @@ pub(crate) enum Compatibility {
     Verified,
     Unknown,
     Refused,
+    /// Correctly signed, but built for a different version of this app: update the companion.
+    Outdated,
 }
 impl Compatibility {
     fn from_check(result: Result<(), String>) -> Self {
         match result.as_ref().map_err(String::as_str) {
             Ok(()) => Self::Verified,
+            Err("host_manifest_incompatible") => Self::Outdated,
             Err(
                 "host_install_record_invalid"
                 | "host_install_controller_changed"
                 | "host_install_runtime_changed"
                 | "host_signature_invalid"
                 | "host_manifest_invalid"
-                | "host_manifest_incompatible"
                 | "host_component_missing"
                 | "host_package_state_invalid"
                 | "native_manager_unprotected"
@@ -85,23 +87,207 @@ struct Running {
     configuration: Configuration,
     installation: Installation,
 }
+/// Whether an owned Manager, or anything it started, is still alive.
+fn live(owner: &mut Option<Running>) -> bool {
+    owner
+        .as_mut()
+        .is_some_and(|running| !matches!(running.manager.tree_exited(), Ok(true)))
+}
+/// Whether this app's record names the owned Manager, writing it again if it is missing. Without
+/// it a later launch cannot find a Manager that was left running.
+fn recorded(running: &mut Running) -> bool {
+    #[cfg(unix)]
+    {
+        let (data, pid) = (&running.configuration.data, running.manager.process_id());
+        crate::manager_host::owned_process_recorded(data, pid)
+            || (crate::manager_host::record_owned_process(data, pid).is_ok()
+                && crate::manager_host::owned_process_recorded(data, pid))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = running;
+        false
+    }
+}
+/// The existing stop proof, read-only: no controller holds the journal, its last stop was clean
+/// and no database process file remains. Anything short of that is not proof.
+struct Library {
+    state: std::path::PathBuf,
+    installation_id: String,
+    manifest_sha256: String,
+}
+/// Read a failed idle proof: a held lease is something running, anything else is not proof.
+fn idle_evidence(proof: Result<(), String>) -> Evidence {
+    match proof.as_ref().map_err(String::as_str) {
+        Ok(()) => Evidence::Clear,
+        Err("host_controller_already_owned" | "host_already_owned") => Evidence::Running,
+        Err(_) => Evidence::Unknown,
+    }
+}
+impl Library {
+    fn idle(&self) -> Evidence {
+        idle_evidence(
+            crate::host_state::Owner::acquire(&self.state, false).and_then(|mut proof| {
+                proof.admit_idle(&self.installation_id, &self.manifest_sha256)
+            }),
+        )
+    }
+}
+/// The port every local Manager serves on.
+#[cfg(unix)]
+const MANAGER_PORT: u16 = 9443;
+/// Where this account's library lives on disk, and how to ask what may be running from it.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct Hosted<'a> {
+    /// The controller's state directory.
+    state: &'a std::path::Path,
+    /// Manager's data directory, which holds this app's record of the Manager it started.
+    data: &'a std::path::Path,
+    /// Whether anything answers on Manager's port.
+    listener: &'a dyn Fn() -> Evidence,
+    /// What holds a PID right now.
+    #[cfg(unix)]
+    process: &'a dyn Fn(u32) -> crate::process_tree::Presence,
+}
+/// From disk alone: `Clear` when no library was ever hosted at `state`, or when its journal
+/// proves it idle and Manager's port definitely refuses connections. The port covers a Manager
+/// that left no usable record.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn hosted_library(state: &std::path::Path, listener: &dyn Fn() -> Evidence) -> Evidence {
+    match std::fs::symlink_metadata(state) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Evidence::Clear,
+        Err(_) => Evidence::Unknown,
+        Ok(_) => match idle_evidence(crate::host_state::Owner::package_idle(state)) {
+            Evidence::Clear => listener(),
+            journal => journal,
+        },
+    }
+}
 #[derive(Default)]
 pub(crate) struct HostSetup {
     owner: tokio::sync::Mutex<Option<Running>>,
+    /// The library a Manager was started for in this run. It outlives `owner`: stopping or
+    /// losing Manager does not prove its controller and database stopped.
+    library: Mutex<Option<Library>>,
     cancel: Arc<AtomicBool>,
     active: AtomicBool,
+    /// A stop for quitting failed, so quitting without stopping may be chosen.
+    exit_stop_failed: AtomicBool,
+    /// The person chose to quit and leave Manager running for the next launch to stop.
+    left_for_exit: AtomicBool,
     view: Mutex<View>,
 }
 impl HostSetup {
+    /// Whether a local operation is in flight or an owned Manager is alive. Operations hold the
+    /// owner for their whole duration and keep the flag themselves; whenever the owner is free
+    /// the flag is re-derived from the owned process, so a Manager that exited cannot hold it.
     pub(crate) fn background_active(&self) -> bool {
+        if self.left_for_exit.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Ok(mut owner) = self.owner.try_lock() {
+            self.active.store(live(&mut owner), Ordering::Release);
+        }
         self.active.load(Ordering::Acquire)
     }
     pub(crate) fn lock_for_update(&self) -> Result<impl Drop + '_, String> {
-        let owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
-        if owner.is_some() || self.background_active() {
+        // Unit tests never consult the library really hosted on the machine that runs them.
+        #[cfg(all(unix, not(test)))]
+        {
+            let profile = crate::host_install::account_profile();
+            let (state, data) = (profile.join("state"), profile.join("manager"));
+            self.lock_for_update_at(Some(Hosted {
+                state: &state,
+                data: &data,
+                listener: &|| crate::manager_host::listener(MANAGER_PORT),
+                process: &crate::process_tree::ProcessIdentity::lookup,
+            }))
+        }
+        #[cfg(not(all(unix, not(test))))]
+        {
+            self.lock_for_update_at(None)
+        }
+    }
+    /// Every way something of this library could run, or be started, during an update, and
+    /// the evidence that must be `Clear` for it. Evidence that is missing, unreadable or
+    /// could be racing is `Unknown`, and `Unknown` blocks exactly as `Running` does.
+    /// - An operation of this app in flight: it holds the owner, which this takes and keeps.
+    /// - A Manager this run owns (on Windows, anything left in its job): `live`.
+    /// - A controller or database outliving a Manager this run stopped, lost or left: the
+    ///   remembered library's journal must prove a clean stop.
+    /// - The same after a restart of this app (Stop and quit, Quit anyway, a crash): the
+    ///   journal found on disk must prove it, with no controller holding it.
+    /// - A Manager left by an earlier run (Quit anyway, a crash), which could start the
+    ///   controller: this app's record of it. The record is written before Manager is
+    ///   spawned, so it exists even for a Manager that has not bound its port; until it names
+    ///   a process that is seen to be gone, it blocks.
+    /// - Any Manager with no usable record: Manager's port must definitely refuse.
+    ///
+    /// With all of that proven and the owner held, nothing is left that could start one.
+    /// On Windows the controller and database die with this app's job, so a new run there
+    /// has nothing on disk to check.
+    fn lock_for_update_at(&self, hosted: Option<Hosted<'_>>) -> Result<impl Drop + '_, String> {
+        let mut owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
+        // Holding the owner proves no operation is in flight. A live Manager blocks, and a
+        // Manager whose state cannot be read counts as live.
+        if live(&mut owner) {
             return Err("update_host_active".into());
         }
+        // Outside Windows the controller and database are not this app's children: they can
+        // outlive Manager, and this app.
+        let session = self
+            .library
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or(Evidence::Clear, Library::idle);
+        #[cfg(any(target_os = "macos", target_os = "linux", test))]
+        let journal = hosted.map_or(Evidence::Clear, |hosted| {
+            hosted_library(hosted.state, hosted.listener)
+        });
+        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+        let journal = Evidence::Clear;
+        #[cfg(unix)]
+        let manager = hosted.map_or(Evidence::Clear, |hosted| {
+            crate::manager_host::recorded_manager(hosted.data, hosted.process)
+        });
+        #[cfg(not(unix))]
+        let manager = Evidence::Clear;
+        #[cfg(not(any(unix, test)))]
+        let _ = hosted;
+        if [session, journal, manager] != [Evidence::Clear; 3] {
+            return Err("update_library_not_idle".into());
+        }
         Ok(owner)
+    }
+    /// Own a started Manager and remember its library for the update gate.
+    fn adopt(&self, owner: &mut Option<Running>, running: Running) {
+        *self
+            .library
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Library {
+            state: running.configuration.state.clone(),
+            installation_id: running.configuration.installation_id.clone(),
+            manifest_sha256: running.installation.manifest_sha256.clone(),
+        });
+        *owner = Some(running);
+    }
+    /// Quit without stopping, allowed only after a stop for quitting failed and only while this
+    /// app's record names the live Manager, so the next launch can attempt to stop it. Not on
+    /// Windows: leaving there ends Manager's job and would kill a running database.
+    pub(crate) fn leave_for_exit(&self, leave: bool) -> Result<(), String> {
+        if leave {
+            if cfg!(not(unix)) || !self.exit_stop_failed.load(Ordering::Acquire) {
+                return Err("native_manager_shutdown_unconfirmed".into());
+            }
+            let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
+            if owner.as_mut().is_some_and(|running| !recorded(running)) {
+                return Err("native_manager_record_unavailable".into());
+            }
+        }
+        self.left_for_exit.store(leave, Ordering::Release);
+        Ok(())
     }
     fn set(&self, state: &str, code: Option<String>, installation: Option<Installation>) {
         *self.view.lock().unwrap_or_else(|error| error.into_inner()) = View {
@@ -277,7 +463,7 @@ impl HostSetup {
         };
         match result {
             Ok(running) => {
-                *owner = Some(running);
+                self.adopt(&mut owner, running);
                 self.set("manager-ready", None, self.snapshot().installation);
             }
             Err(error) => {
@@ -337,13 +523,15 @@ impl HostSetup {
         let saved =
             crate::credentials::load::<crate::manager::SavedManager>(crate::manager::CREDENTIAL)?
                 .ok_or("manager_pairing_required")?;
-        photos_owner(
+        let address = photos_owner(
             &mut running.manager,
             &running.configuration,
             &crate::credentials::identity()?,
             &saved,
         )
-        .await
+        .await?;
+        owned_photo_listener(&running.configuration.state, running.configuration.api_port)?;
+        Ok(address)
     }
     pub(crate) async fn stop(&self) -> Result<View, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
@@ -352,25 +540,77 @@ impl HostSetup {
         };
         let record = Some(running.installation.clone());
         self.set("stopping", None, record.clone());
-        let result = async {
-            let mut proof = crate::host_state::Owner::acquire(&running.configuration.state, true)?;
-            proof.admit_idle(
-                &running.configuration.installation_id,
-                &running.installation.manifest_sha256,
-            )?;
-            running.manager.shutdown(Duration::from_secs(10)).await?;
-            drop(proof);
-            Ok::<(), String>(())
-        }
-        .await;
+        // Once Manager and everything under it has exited there is nothing to stop or to prove
+        // idle; an interrupted journal must not keep a dead Manager owned.
+        let result = if matches!(running.manager.tree_exited(), Ok(true)) {
+            Ok(())
+        } else {
+            async {
+                let mut proof =
+                    crate::host_state::Owner::acquire(&running.configuration.state, true)?;
+                proof.admit_idle(
+                    &running.configuration.installation_id,
+                    &running.installation.manifest_sha256,
+                )?;
+                running.manager.shutdown(Duration::from_secs(10)).await?;
+                drop(proof);
+                Ok::<(), String>(())
+            }
+            .await
+        };
         if let Err(error) = result {
             self.set("needs-attention", Some(error.clone()), record);
             return Err(error);
         }
+        self.stopped(&mut owner, record);
+        Ok(self.snapshot())
+    }
+    fn stopped(&self, owner: &mut Option<Running>, record: Option<Installation>) {
+        #[cfg(unix)]
+        if let Some(running) = owner.as_ref() {
+            crate::manager_host::forget_owned_process(&running.configuration.data);
+        }
         *owner = None;
         self.active.store(false, Ordering::Release);
+        self.exit_stop_failed.store(false, Ordering::Release);
+        self.left_for_exit.store(false, Ordering::Release);
         self.set("idle", None, record);
-        Ok(self.snapshot())
+    }
+    /// The quit path. Unix asks Manager to exit even while the photo server runs: its controller
+    /// then closes the database in order, and finishes on its own if this app exits first.
+    /// Windows keeps the idle proof, because ending Manager's job there would kill the database.
+    pub(crate) async fn stop_for_exit(&self) -> Result<View, String> {
+        self.stop_for_exit_within(Duration::from_secs(10)).await
+    }
+    async fn stop_for_exit_within(&self, timeout: Duration) -> Result<View, String> {
+        #[cfg(unix)]
+        {
+            let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
+            let Some(running) = owner.as_mut() else {
+                return Ok(self.snapshot());
+            };
+            let record = Some(running.installation.clone());
+            self.set("stopping", None, record.clone());
+            if let Err(error) = running.manager.shutdown(timeout).await {
+                // Manager did not exit in time. Quitting without stopping is offered only if
+                // its record is in place, so the next launch can find it and attempt the stop.
+                let error = if recorded(running) {
+                    self.exit_stop_failed.store(true, Ordering::Release);
+                    error
+                } else {
+                    "native_manager_record_unavailable".to_string()
+                };
+                self.set("needs-attention", Some(error.clone()), record);
+                return Err(error);
+            }
+            self.stopped(&mut owner, record);
+            Ok(self.snapshot())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = timeout;
+            self.stop().await
+        }
     }
 }
 fn local_photos_origin(port: u16) -> Result<url::Url, String> {
@@ -392,6 +632,15 @@ pub(crate) async fn photos_owner(
     manager.management_identity(configuration)?;
     // This selects the owned server address; only the photo UI can establish account readiness.
     local_photos_origin(configuration.api_port)
+}
+/// The photo address is opened only while this library's controller holds its journal lease.
+/// Without that controller, whatever answers on the port is another program.
+fn owned_photo_listener(state: &std::path::Path, port: u16) -> Result<(), String> {
+    if crate::host_state::Owner::controller_running(state)? {
+        return Ok(());
+    }
+    crate::manager_host::foreign_listener(&[port])?;
+    Err("local_photos_not_running".into())
 }
 fn require_password(password: &str) -> Result<(), String> {
     if password.chars().count() < 14
@@ -857,13 +1106,10 @@ pub(crate) fn package_version(record: &Installation) -> Option<String> {
 /// The package this account's library last ran with, for display only.
 pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
     #[cfg(unix)]
-    let state = records
-        .first()?
-        .layout()
-        .ok()?
-        .profiles
-        .join(unsafe { libc::geteuid() }.to_string())
-        .join("state");
+    let state = {
+        records.first()?;
+        crate::host_install::account_profile().join("state")
+    };
     #[cfg(windows)]
     let state = {
         records.first()?;
@@ -908,6 +1154,23 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];
         require_leaf(&state)?;
         require_leaf(&data)?;
+        // A Manager left running by a crashed run of this app still holds this library. Stop
+        // that exact process, then give its controller time to finish closing the database.
+        #[cfg(unix)]
+        if crate::manager_host::stop_orphaned_manager(
+            &data,
+            Duration::from_secs(15),
+            cancel,
+            &|| crate::manager_host::listener(MANAGER_PORT),
+        )? {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while crate::host_state::Owner::controller_running(&state) == Ok(true)
+                && std::time::Instant::now() < deadline
+                && !cancel.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         #[allow(unused_mut)]
         let mut configuration = configuration(record, &layout, &runtime, &uid, state, data)?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -919,6 +1182,7 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         if cancel.load(Ordering::Acquire) {
             return Err("native_manager_start_cancelled".into());
         }
+        // Records its launch before spawning, and the spawned process after.
         let manager = programs.start_from_keystore(&configuration)?;
         Ok(Running {
             manager,
@@ -1420,9 +1684,9 @@ mod tests {
         assert!(setup.owner.try_lock().is_err());
         assert!(setup.lock_for_update().is_err());
         drop(update);
+        // A live Manager's exclusion is covered where a Manager is owned; a stale flag alone
+        // can no longer block an update.
         setup.active.store(true, Ordering::Release);
-        assert!(setup.lock_for_update().is_err());
-        setup.active.store(false, Ordering::Release);
         assert!(setup.lock_for_update().is_ok());
     }
 
@@ -1475,8 +1739,12 @@ mod tests {
     #[test]
     fn compatibility_reports_unknown_without_positive_evidence() {
         assert_eq!(Compatibility::from_check(Ok(())), Compatibility::Verified);
+        // A signed package pinned to another app version needs a companion update, not a refusal.
+        assert_eq!(
+            Compatibility::from_check(Err("host_manifest_incompatible".into())),
+            Compatibility::Outdated
+        );
         for code in [
-            "host_manifest_incompatible",
             "host_signature_invalid",
             "runtime_artifact_changed",
             "native_manager_unprotected",
@@ -1549,6 +1817,8 @@ mod tests {
     fn lifecycle_management_gate_only_blocks_the_owned_origin_during_transitions() {
         let setup = HostSetup::default();
         let record: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        // A lifecycle operation holds the owner for as long as the flag is its to keep.
+        let _operation = setup.owner.try_lock().unwrap();
         setup.active.store(true, Ordering::Release);
         setup.set("starting", None, Some(record.clone()));
         assert!(setup
@@ -1637,8 +1907,590 @@ mod tests {
         std::fs::remove_file(alias).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
+    #[cfg(unix)]
+    struct OwnedFixture(std::path::PathBuf);
+    #[cfg(unix)]
+    impl OwnedFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-host-setup-{}", uuid::Uuid::new_v4()));
+            crate::runtime_store::private_directory(&root).unwrap();
+            for leaf in ["state", "data"] {
+                crate::runtime_store::private_directory(&root.join(leaf)).unwrap();
+            }
+            Self(root)
+        }
+        fn state(&self) -> std::path::PathBuf {
+            self.0.join("state")
+        }
+        /// A setup that owns `program` as its Manager, as a completed start leaves it.
+        fn own(&self, program: &str, arguments: &[&str]) -> HostSetup {
+            let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+            let mut command = std::process::Command::new(program);
+            command.args(arguments);
+            self.own_command(command, installation)
+        }
+        fn own_command(
+            &self,
+            mut command: std::process::Command,
+            installation: Installation,
+        ) -> HostSetup {
+            let setup = HostSetup::default();
+            let running = Running {
+                manager: NativeManager::test_child(&mut command),
+                configuration: Configuration {
+                    installation_id: "aaaaaaaaaaaa".into(),
+                    name: "My Frameleaf library".into(),
+                    release: "frameleaf-v1.2.3-native.aaaaaaaaaaaa-1".into(),
+                    controller: "/bin/echo".into(),
+                    state: self.state(),
+                    data: self.0.join("data"),
+                    origin: "https://127.0.0.1:9443".into(),
+                    database_port: 54329,
+                    api_port: 2283,
+                },
+                installation,
+            };
+            setup.adopt(&mut setup.owner.try_lock().unwrap(), running);
+            setup.active.store(true, Ordering::Release);
+            setup
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_activity_follows_the_owned_manager_and_ends_with_stop() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        assert!(setup.background_active());
+        assert!(setup.lock_for_update().is_err());
+        let view = setup.stop().await.unwrap();
+        assert_eq!(view.state, "idle");
+        assert!(!view.background_active);
+        assert!(!setup.background_active());
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_manager_never_keeps_the_app_unquittable_even_with_an_interrupted_journal() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["0.2"]);
+        // The library's last controller died without a clean stop.
+        let mut journal = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        drop(journal);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.background_active() {
+            assert!(std::time::Instant::now() < deadline, "Manager did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            setup.status().await.unwrap().code.as_deref(),
+            Some("native_manager_exited")
+        );
+        let view = setup.stop().await.unwrap();
+        assert_eq!(view.state, "idle");
+        assert!(!view.background_active);
+        // Quitting is free again, but nothing proved the database stopped: no update yet.
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        assert!(setup.lock_for_update().is_err());
+        // The library is started again, recovers, and this time stops cleanly.
+        let mut journal = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        journal.clean_stop().unwrap();
+        drop(journal);
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_an_exited_manager_keeps_updates_closed_while_its_controller_runs() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["0.2"]);
+        // Manager exits while its controller still holds the journal and runs the database.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.background_active() {
+            assert!(std::time::Instant::now() < deadline, "Manager did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Stopping the dead Manager needs no proof and clears the owner...
+        assert_eq!(setup.stop().await.unwrap().state, "idle");
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        // ...but that must not open the update gate.
+        assert!(setup.lock_for_update().is_err());
+        controller.clean_stop().unwrap();
+        // Stopped cleanly, yet the controller process has not released the journal.
+        assert!(setup.lock_for_update().is_err());
+        drop(controller);
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quitting_stops_manager_while_the_photo_server_runs_but_stop_still_needs_idle_proof() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        // A live controller holds the journal lease for as long as the photo server runs.
+        let controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        assert_eq!(
+            setup.stop().await.err().unwrap(),
+            "host_controller_already_owned"
+        );
+        assert!(setup.background_active());
+        let view = setup.stop_for_exit().await.unwrap();
+        assert_eq!(view.state, "idle");
+        assert!(!view.background_active);
+        assert!(!setup.background_active());
+        // The controller was left to close the database itself; until it has, no update.
+        assert!(setup.lock_for_update().is_err());
+        drop(controller);
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_run_keeps_updates_closed_until_the_hosted_library_is_proven_idle() {
+        use crate::host_runtime::HostMode;
+        let fixture = OwnedFixture::new();
+        let state = fixture.state();
+        let data = fixture.0.join("data");
+        let hosted = on_disk(&state, &data, &|| Evidence::Clear);
+        // An account that never hosted a library has nothing to wait for, whatever answers
+        // on the port.
+        let never = fixture.0.join("never-hosted");
+        assert!(HostSetup::default()
+            .lock_for_update_at(Some(on_disk(&never, &never, &|| Evidence::Running)))
+            .is_ok());
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
+        controller
+            .activate("aaaaaaaaaaaa", &"a".repeat(64), HostMode::Server)
+            .unwrap();
+        // Stop and quit: Manager is gone, its controller is still closing the database.
+        setup.stop_for_exit().await.unwrap();
+        drop(setup);
+        // The next run of the app remembers no Manager and no library.
+        let restarted = HostSetup::default();
+        assert!(restarted.owner.try_lock().unwrap().is_none());
+        assert_eq!(
+            restarted.lock_for_update_at(Some(hosted)).err().unwrap(),
+            "update_library_not_idle"
+        );
+        controller.clean_stop().unwrap();
+        assert!(
+            restarted.lock_for_update_at(Some(hosted)).is_err(),
+            "the controller still holds the journal"
+        );
+        drop(controller);
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+        // A controller that died without a clean stop keeps a later run closed too.
+        let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
+        controller
+            .activate("aaaaaaaaaaaa", &"a".repeat(64), HostMode::Server)
+            .unwrap();
+        drop(controller);
+        assert_eq!(
+            HostSetup::default()
+                .lock_for_update_at(Some(hosted))
+                .err()
+                .unwrap(),
+            "update_library_not_idle"
+        );
+    }
+
+    /// The gate's view of a library on disk, with real process lookups.
+    #[cfg(unix)]
+    fn on_disk<'a>(
+        state: &'a std::path::Path,
+        data: &'a std::path::Path,
+        listener: &'a dyn Fn() -> Evidence,
+    ) -> Hosted<'a> {
+        Hosted {
+            state,
+            data,
+            listener,
+            process: &crate::process_tree::ProcessIdentity::lookup,
+        }
+    }
+    /// A library whose journal records a clean stop and is held by nobody.
+    #[cfg(unix)]
+    fn cleanly_stopped(state: &std::path::Path) {
+        let mut journal = crate::host_state::Owner::acquire(state, true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        journal.clean_stop().unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn failed_or_cancelled_restart_retains_exit_protection_and_previous_installation() {
+    fn a_new_run_keeps_updates_closed_for_a_launch_that_left_no_process_and_no_listener() {
+        let fixture = OwnedFixture::new();
+        let (state, data) = (fixture.state(), fixture.0.join("data"));
+        cleanly_stopped(&state);
+        let hosted = on_disk(&state, &data, &|| Evidence::Clear);
+        let restarted = HostSetup::default();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+        // This app crashed after starting a Manager launch: the Manager was spawned but has
+        // not bound its port, and no process was recorded for it.
+        crate::manager_host::record_launch_intent(&data).unwrap();
+        assert_eq!(
+            restarted.lock_for_update_at(Some(hosted)).err().unwrap(),
+            "update_library_not_idle"
+        );
+        // Only a record completed with a process that is seen to be gone opens it again.
+        let mut manager = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        crate::manager_host::record_owned_process(&data, manager.id()).unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_err());
+        manager.kill().unwrap();
+        manager.wait().unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_that_cannot_be_read_never_opens_the_update_gate() {
+        use crate::process_tree::Presence;
+        let fixture = OwnedFixture::new();
+        let (state, data) = (fixture.state(), fixture.0.join("data"));
+        cleanly_stopped(&state);
+        let restarted = HostSetup::default();
+        let mut manager = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        crate::manager_host::record_owned_process(&data, manager.id()).unwrap();
+        manager.kill().unwrap();
+        manager.wait().unwrap();
+        // The recorded Manager has exited, and a readable lookup says so.
+        assert!(restarted
+            .lock_for_update_at(Some(on_disk(&state, &data, &|| Evidence::Clear)))
+            .is_ok());
+        // A lookup of the recorded process that fails is not an exit.
+        let unreadable = Hosted {
+            process: &|_| Presence::Unknown,
+            ..on_disk(&state, &data, &|| Evidence::Clear)
+        };
+        assert_eq!(
+            restarted
+                .lock_for_update_at(Some(unreadable))
+                .err()
+                .unwrap(),
+            "update_library_not_idle"
+        );
+        // A port probe that times out is not a refusal.
+        let timed_out =
+            || crate::manager_host::listener_evidence(Err(std::io::ErrorKind::TimedOut.into()));
+        assert_eq!(timed_out(), Evidence::Unknown);
+        assert_eq!(
+            restarted
+                .lock_for_update_at(Some(on_disk(&state, &data, &timed_out)))
+                .err()
+                .unwrap(),
+            "update_library_not_idle"
+        );
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                crate::manager_host::listener_evidence(Err(kind.into())),
+                Evidence::Unknown
+            );
+        }
+        assert_eq!(
+            crate::manager_host::listener_evidence(Err(
+                std::io::ErrorKind::ConnectionRefused.into()
+            )),
+            Evidence::Clear
+        );
+        // A state directory that cannot be examined is not "never hosted".
+        let blocked = state.join("controller-state.json").join("below-a-file");
+        assert!(restarted
+            .lock_for_update_at(Some(on_disk(&blocked, &data, &|| Evidence::Clear)))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_run_keeps_updates_closed_while_a_manager_left_running_is_alive() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let fixture = OwnedFixture::new();
+        let (state, data) = (fixture.state(), fixture.0.join("data"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let probe = move || crate::manager_host::listener(port);
+        let hosted = on_disk(&state, &data, &probe);
+        // The library stopped cleanly: its journal alone would allow an update.
+        cleanly_stopped(&state);
+        assert!(HostSetup::default()
+            .lock_for_update_at(Some(hosted))
+            .is_ok());
+
+        // Quit anyway, or a crash, left the recorded Manager running; it could start the
+        // controller while an update installs.
+        let mut manager = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        crate::manager_host::record_owned_process(&data, manager.id()).unwrap();
+        let restarted = HostSetup::default();
+        assert!(restarted.owner.try_lock().unwrap().is_none());
+        assert_eq!(
+            restarted.lock_for_update_at(Some(hosted)).err().unwrap(),
+            "update_library_not_idle"
+        );
+        manager.kill().unwrap();
+        manager.wait().unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+
+        // A record that cannot be read proves nothing.
+        let record = data.join("desktop-manager-process.json");
+        std::fs::remove_file(&record).unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&record)
+                .unwrap(),
+            b"not a record",
+        )
+        .unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_err());
+        std::fs::remove_file(&record).unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+
+        // A Manager that was never recorded still answers on its port.
+        let unrecorded = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_err());
+        drop(unrecorded);
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quitting_without_stopping_is_refused_when_manager_cannot_be_recorded() {
+        let fixture = OwnedFixture::new();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let setup = fixture.own_command(command, installation);
+        // The record was never written and cannot be: its directory is gone.
+        let data = fixture.0.join("data");
+        std::fs::remove_dir(&data).unwrap();
+        assert_eq!(
+            setup
+                .stop_for_exit_within(Duration::from_millis(300))
+                .await
+                .err()
+                .unwrap(),
+            "native_manager_record_unavailable"
+        );
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_shutdown_unconfirmed",
+            "leaving was never offered"
+        );
+        assert!(setup.background_active());
+        // Once the record can be written, the failed stop offers leaving and the record is there.
+        crate::runtime_store::private_directory(&data).unwrap();
+        assert_eq!(
+            setup
+                .stop_for_exit_within(Duration::from_millis(300))
+                .await
+                .err()
+                .unwrap(),
+            "native_manager_shutdown_unconfirmed"
+        );
+        assert!(data.join("desktop-manager-process.json").exists());
+        // Losing the record again after the offer still refuses the quit.
+        std::fs::remove_dir_all(&data).unwrap();
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_record_unavailable"
+        );
+        assert!(setup.background_active(), "the app stays open");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_manager_that_ignores_the_stop_can_still_be_left_running_to_quit() {
+        let fixture = OwnedFixture::new();
+        // An ignored signal stays ignored across exec: this Manager never honours the request.
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let setup = fixture.own_command(command, installation);
+        let data = fixture.0.join("data");
+        let pid = setup
+            .owner
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .manager
+            .process_id();
+        crate::manager_host::record_owned_process(&data, pid).unwrap();
+        // Leaving is not offered before a stop has been tried and has failed.
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_shutdown_unconfirmed"
+        );
+        assert_eq!(
+            setup
+                .stop_for_exit_within(Duration::from_millis(300))
+                .await
+                .err()
+                .unwrap(),
+            "native_manager_shutdown_unconfirmed"
+        );
+        assert_eq!(setup.snapshot().state, "needs-attention");
+        assert!(setup.background_active(), "exit stays protected by default");
+        setup.leave_for_exit(true).unwrap();
+        assert!(!setup.background_active(), "the chosen quit is not blocked");
+        assert!(
+            data.join("desktop-manager-process.json").exists(),
+            "the next launch must still be able to find this Manager"
+        );
+        assert!(
+            setup.lock_for_update().is_err(),
+            "leaving never unlocks updates"
+        );
+        // An exit that something else prevented restores the protection.
+        setup.leave_for_exit(false).unwrap();
+        assert!(setup.background_active());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_waits_for_proof_that_an_exited_managers_controller_and_database_stopped() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["0.2"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.background_active() {
+            assert!(std::time::Instant::now() < deadline, "Manager did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // No journal yet: nothing proves the library idle.
+        assert!(setup.lock_for_update().is_err());
+        // Manager is gone but its controller still runs the photo server.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        assert!(setup.lock_for_update().is_err());
+        // The controller died without a clean stop: still no proof.
+        drop(controller);
+        assert!(setup.lock_for_update().is_err());
+        // A clean stop that left a database process file is not proof either.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        controller.clean_stop().unwrap();
+        drop(controller);
+        let database = fixture.state().join("database");
+        crate::runtime_store::private_directory(&database).unwrap();
+        std::fs::write(database.join("postmaster.pid"), b"synthetic").unwrap();
+        assert!(setup.lock_for_update().is_err());
+        std::fs::remove_file(database.join("postmaster.pid")).unwrap();
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[test]
+    fn photos_open_only_on_this_librarys_own_listener() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-photo-listener-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // No controller of this library runs, so the program on its port is someone else's.
+        assert_eq!(
+            owned_photo_listener(&root, port).unwrap_err(),
+            format!("local_port_in_use_{port}")
+        );
+        assert_eq!(
+            crate::manager_host::foreign_listener(&[port]).unwrap_err(),
+            format!("local_port_in_use_{port}")
+        );
+        let controller = crate::host_state::Owner::acquire(&root, true).unwrap();
+        owned_photo_listener(&root, port).unwrap();
+        drop(controller);
+        drop(listener);
+        crate::manager_host::foreign_listener(&[port]).unwrap();
+        assert_eq!(
+            owned_photo_listener(&root, port).unwrap_err(),
+            "local_photos_not_running"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_or_cancelled_restart_keeps_the_previous_installation_without_a_live_manager() {
         let setup = HostSetup::default();
         let previous: Installation=serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
         let attempted: Installation=serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"c".repeat(64),"controllerSha256":"d".repeat(64)})).unwrap();
@@ -1647,7 +2499,8 @@ mod tests {
             attempted.clone(),
             "native_manager_start_cancelled".into(),
         );
-        assert!(setup.background_active());
+        // Exit protection now follows the owned process: with none alive there is none to keep.
+        assert!(!setup.background_active());
         assert_eq!(setup.snapshot().installation, Some(previous));
         setup.startup_failed(None, attempted.clone(), "native_host_setup_failed".into());
         assert!(!setup.background_active());
