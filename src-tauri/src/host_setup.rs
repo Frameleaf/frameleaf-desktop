@@ -25,6 +25,8 @@ pub(crate) struct View {
     /// A stop for quitting failed and Manager is still running, so quitting without stopping
     /// it may be chosen. The interface offers that only while this says so.
     leave_available: bool,
+    /// Days until the running Manager's TLS identity expires, once that is near.
+    certificate_expires_in_days: Option<u32>,
     profile_setup_available: bool,
     profile_requires_authorization: bool,
     companion_platform: Option<&'static str>,
@@ -75,6 +77,7 @@ impl Default for View {
             origin: None,
             background_active: false,
             leave_available: false,
+            certificate_expires_in_days: None,
             profile_setup_available: cfg!(any(target_os = "linux", windows)),
             profile_requires_authorization: cfg!(target_os = "linux"),
             companion_platform: match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -180,6 +183,8 @@ pub(crate) struct HostSetup {
     exit_stop_failed: AtomicBool,
     /// The person chose to quit and leave Manager running for the next launch to stop.
     left_for_exit: AtomicBool,
+    /// When the owned Manager's TLS identity expires, in Unix seconds; 0 with none owned.
+    certificate_expires_at: std::sync::atomic::AtomicI64,
     view: Mutex<View>,
 }
 impl HostSetup {
@@ -269,6 +274,10 @@ impl HostSetup {
     fn adopt(&self, owner: &mut Option<Running>, running: Running) {
         // A failed stop of an earlier Manager says nothing about this one.
         self.exit_stop_failed.store(false, Ordering::Release);
+        self.certificate_expires_at.store(
+            running.manager.certificate_expires_at().unwrap_or(0),
+            Ordering::Release,
+        );
         *self
             .library
             .lock()
@@ -315,6 +324,15 @@ impl HostSetup {
         view.background_active = self.background_active();
         view.leave_available =
             cfg!(unix) && view.background_active && self.exit_stop_failed.load(Ordering::Acquire);
+        // Only for a Manager that is running now; a clock that cannot be read says nothing.
+        view.certificate_expires_in_days = match self.certificate_expires_at.load(Ordering::Acquire)
+        {
+            expires if expires != 0 && view.background_active => crate::manager::clock()
+                .ok()
+                .and_then(|now| i64::try_from(now / 1000).ok())
+                .and_then(|now| crate::manager_tls::expiry_notice_days(expires, now)),
+            _ => None,
+        };
         view
     }
     pub(crate) fn require_management_origin(&self, origin: &str) -> Result<(), String> {
@@ -603,6 +621,7 @@ impl HostSetup {
         }
         *owner = None;
         self.active.store(false, Ordering::Release);
+        self.certificate_expires_at.store(0, Ordering::Release);
         self.exit_stop_failed.store(false, Ordering::Release);
         self.left_for_exit.store(false, Ordering::Release);
         self.set("idle", None, record);
@@ -2429,6 +2448,34 @@ mod tests {
             run(Ok(json!({"id":"not-an-operation"})), vec![], long).await,
             Err("manager_response_invalid".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_managers_certificate_expiry_is_reported_only_when_near_and_only_while_it_runs(
+    ) {
+        const DAY: i64 = 24 * 60 * 60;
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        cleanly_stopped(&fixture.state());
+        let now = i64::try_from(crate::manager::clock().unwrap() / 1000).unwrap();
+        // The stand-in was given no identity.
+        assert_eq!(setup.snapshot().certificate_expires_in_days, None);
+        for (expires, days) in [
+            (now + 200 * DAY, None),
+            (now + 10 * DAY - 60, Some(10)),
+            (now - DAY, None),
+        ] {
+            setup
+                .certificate_expires_at
+                .store(expires, Ordering::Release);
+            assert_eq!(setup.snapshot().certificate_expires_in_days, days);
+        }
+        setup
+            .certificate_expires_at
+            .store(now + 10 * DAY - 60, Ordering::Release);
+        setup.stop().await.unwrap();
+        assert_eq!(setup.snapshot().certificate_expires_in_days, None);
     }
 
     /// The Windows quit path on a stand-in Manager: with a controller holding the journal and no

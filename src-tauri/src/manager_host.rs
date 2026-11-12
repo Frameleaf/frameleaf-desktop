@@ -668,6 +668,8 @@ pub struct NativeManager {
     verified_ready: bool,
     startup_lease: Option<crate::host_state::Owner>,
     certificate_pem: String,
+    /// When the TLS identity this Manager serves runs out; None for a Manager given none.
+    certificate_expires_at: Option<i64>,
     _code_lease: Option<crate::package_lease::CodeLease>,
     _profile_pins: Vec<fs::File>,
 }
@@ -842,6 +844,7 @@ impl Programs<'_> {
             },
         )?;
         manager.certificate_pem = tls.certificate().into();
+        manager.certificate_expires_at = Some(tls.expires_at());
         Ok(manager)
     }
 }
@@ -901,6 +904,7 @@ impl NativeManager {
             verified_ready: false,
             startup_lease: leases.startup,
             certificate_pem: String::new(),
+            certificate_expires_at: None,
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
         };
@@ -1175,6 +1179,9 @@ impl NativeManager {
     #[cfg(unix)]
     pub(crate) fn process_id(&self) -> u32 {
         self.child.id()
+    }
+    pub(crate) fn certificate_expires_at(&self) -> Option<i64> {
+        self.certificate_expires_at
     }
     /// Whether Manager and everything it started under this owner have exited.
     pub(crate) fn tree_exited(&mut self) -> Result<bool, String> {

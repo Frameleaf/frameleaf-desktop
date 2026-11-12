@@ -56,6 +56,22 @@ fn hostname(id: &str, origin: &str) -> Result<String, String> {
         .trim_end_matches(']')
         .to_owned())
 }
+/// The identity is not renewed: the released Manager stores the certificate's hash in its
+/// installation descriptor and refuses to start when it changes, so replacing it here would
+/// leave the library unstartable. Until a Manager accepts a rotated certificate, the person is
+/// told this many days ahead that it runs out.
+const EXPIRY_NOTICE_DAYS: i64 = 30;
+/// Whole days left (rounded up, so the last day reads 1) once expiry is within the notice
+/// period. None while it is further away, and once it has passed: an expired identity already
+/// refuses the start with its own error.
+pub(crate) fn expiry_notice_days(expires_at: i64, now: i64) -> Option<u32> {
+    const DAY: i64 = 24 * 60 * 60;
+    let left = expires_at.checked_sub(now)?;
+    if left <= 0 || left > EXPIRY_NOTICE_DAYS * DAY {
+        return None;
+    }
+    u32::try_from((left + DAY - 1) / DAY).ok()
+}
 impl TlsIdentity {
     /// The certificate Manager last served for a profile binding, if it ever started.
     #[cfg(unix)]
@@ -166,6 +182,10 @@ impl TlsIdentity {
     pub fn certificate(&self) -> &str {
         &self.certificate_pem
     }
+    /// When this identity stops being accepted, in seconds since the Unix epoch.
+    pub(crate) fn expires_at(&self) -> i64 {
+        self.expires_at
+    }
     /// This wire record is for the private native bootstrap pipe only, never a Tauri response.
     pub fn wire(&self) -> BootstrapTls<'_> {
         BootstrapTls {
@@ -226,6 +246,42 @@ mod tests {
         .unwrap();
         TlsIdentity::carry_forward_with(&old, &new, |_| Ok(None), |_, _| panic!("nothing to copy"))
             .unwrap();
+    }
+    #[test]
+    fn expiry_is_announced_only_in_its_last_thirty_days_and_never_after() {
+        const DAY: i64 = 24 * 60 * 60;
+        let expires = 1_800_000_000;
+        // A new identity lasts a year: nothing to say.
+        let identity = TlsIdentity::load_or_create(
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9443",
+            || Ok(None),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        assert_eq!(expiry_notice_days(identity.expires_at(), now), None);
+        assert_eq!(
+            expiry_notice_days(identity.expires_at(), now + 340 * DAY),
+            Some(25)
+        );
+        for (before, days) in [
+            (31 * DAY, None),
+            (30 * DAY + 1, None),
+            (30 * DAY, Some(30)),
+            (29 * DAY + 1, Some(30)),
+            (DAY + 1, Some(2)),
+            (DAY, Some(1)),
+            (1, Some(1)),
+            // Expired: the start itself refuses, so there is no countdown to show.
+            (0, None),
+            (-DAY, None),
+        ] {
+            assert_eq!(expiry_notice_days(expires, expires - before), days);
+        }
+        // A clock or record that makes no sense announces nothing rather than a wrong number.
+        assert_eq!(expiry_notice_days(i64::MAX, i64::MIN), None);
+        assert_eq!(expiry_notice_days(i64::MIN, i64::MAX), None);
     }
     #[test]
     fn tls_keystore_account_is_scoped_to_the_full_profile_binding() {

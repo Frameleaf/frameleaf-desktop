@@ -54,6 +54,9 @@ test('local setup names a busy port, offers a companion update and always offers
   assert.match(ui, /<Icon name="warn" \/><\/span><p id="local-host-failure" class="danger-text" role="alert"[^>]*><ErrorText text=\{failure\} \/>/);
   assert.match(ui, /aria-label="Stop local management and quit Frameleaf" aria-describedby=\{describedBy\} bind:this=\{quitButton\}/);
   assert.match(ui, /aria-label="Quit Frameleaf and leave local management running" aria-describedby=\{describedBy\} bind:this=\{leaveButton\}/);
+  // A certificate about to expire is announced with its days, and an expired one says so.
+  assert.match(ui, /\{#if view\?\.certificateExpiresInDays\}[\s\S]{0,200}role="status"><b>Local Manager’s security certificate expires in \{view\.certificateExpiresInDays\}/);
+  assert.match(errorCopy('native_tls_identity_expired')!, /certificate on this computer has expired/);
   // Focus follows a new state: the offered quit button, and the heading when the stopped control goes.
   assert.match(ui, /if \(quitOffered\) focusOn\(\(\) => quitButton\);/);
   assert.match(ui, /if \(!view\?\.backgroundActive\) focusOn\(\(\) => title\);/);
