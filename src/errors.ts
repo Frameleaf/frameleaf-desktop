@@ -22,6 +22,7 @@ const messages: Record<string, string> = {
   server_unreachable_or_certificate_invalid: 'Could not securely connect. Check the server address, network and certificate.',
   server_http_401: 'Your server did not accept this sign-in. Check your email and password, or sign in again if your session ended.',
   server_http_403: 'Your server did not permit this sign-in.',
+  verification_required: 'Your server needs Two-Step Verification before this computer can continue.',
   credential_confirmation_unavailable: 'Your Mac could not confirm the saved sign-in. Restore it when the credential store is available.',
   credential_confirmation_changed: 'The stored sign-in changed. Restore the sign-in currently saved on this Mac.',
   credential_record_invalid: 'The saved sign-in could not be read. Clear it and sign in again.',

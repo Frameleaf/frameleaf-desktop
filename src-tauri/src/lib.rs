@@ -41,6 +41,7 @@ pub mod release_policy;
 mod resource_policy;
 pub mod runtime_epochs;
 pub mod runtime_store;
+mod saved_sign_in;
 mod server_admin;
 mod server_identity;
 mod server_login;
@@ -52,6 +53,7 @@ mod tray;
 mod updates;
 mod upload_budget;
 mod upload_parts;
+mod window_close;
 mod window_placement;
 #[cfg(windows)]
 mod windows_host_profile;
@@ -323,15 +325,10 @@ async fn restore_connection(
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
-    app.state::<media_copy::MediaCopy>().cancel();
     if app.state::<host_setup::HostSetup>().background_active() {
+        app.state::<media_copy::MediaCopy>().cancel();
         return Ok(None);
     }
-    app.state::<source_import::SourceJobs>().stop().await;
-    app.state::<drop_import::DropImport>()
-        .reset_for_restore()
-        .await;
-    app.state::<worker_setup::WorkerSetup>().stop().await;
     let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
         "connection",
         &window,
@@ -339,7 +336,8 @@ async fn restore_connection(
     )?
     else {
         // The saved sign-in is gone: drop any connection still held so the window and the
-        // background agree (the jobs above already stopped).
+        // background agree.
+        stop_connection_work(&app).await;
         let held = current.take().is_some();
         app.state::<offline_albums::OfflineAlbums>()
             .clear(&app)
@@ -353,30 +351,22 @@ async fn restore_connection(
     if saved.server_id.is_empty() {
         return Err("server_identity_not_confirmed".into());
     }
-    let base = normalize_server(&saved.server)?;
-    let client = transport::client()?;
-    #[derive(Deserialize)]
-    struct User {
-        id: String,
-    }
-    let response = client
-        .get(base.join("api/users/me").unwrap())
-        .bearer_auth(&saved.token)
-        .send()
+    // Restoring the connection already in use is only a check: it must not interrupt its work.
+    let checking = current
+        .as_ref()
+        .is_some_and(|held| saved_sign_in::same_session(held, &saved));
+    let plan = saved_sign_in::check(&transport::client()?, &saved)
         .await
-        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    if matches!(response.status().as_u16(), 401 | 403) {
+        .plan();
+    if !checking || plan.stop_work {
+        stop_connection_work(&app).await;
+    }
+    if plan.purge_albums {
         app.state::<offline_albums::OfflineAlbums>()
             .clear(&app)
             .await;
     }
-    let user: User = transport::json(response).await?;
-    if user.id != saved.account_id {
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(&app)
-            .await;
-        return Err("account_identity_changed".into());
-    }
+    plan.resume_work?;
     if retry.unwrap_or(false) {
         credentials::unlock_existing_identity(&window)?;
     }
@@ -386,21 +376,24 @@ async fn restore_connection(
             .clear(&app)
             .await;
     }
-    if view.state == "preparing"
-        && view.features.worker_session
-        && start_worker_setup(&app, &saved, false).await.is_err()
-    {
-        view.state = "worker-setup-failed".into();
+    if view.state == "preparing" && view.features.worker_session {
+        // Starting replaces a running worker with one that holds the session just issued.
+        if start_worker_setup(&app, &saved, false).await.is_err() {
+            view.state = "worker-setup-failed".into();
+        }
+    } else if checking && !matches!(view.state.as_str(), "offline" | "enrollment-failed") {
+        // The server answered that this computer has no AI work now; a lost reply says nothing.
+        app.state::<worker_setup::WorkerSetup>().stop().await;
     }
-    if let Ok(Some(consent)) =
-        credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
-    {
-        if consent.watch && consent.registered && !consent.watch_paused {
-            if let Ok(base) = import_base(&app) {
-                let _ = app
-                    .state::<source_import::SourceJobs>()
-                    .start(app.clone(), base, saved.clone())
-                    .await;
+    let jobs = app.state::<source_import::SourceJobs>();
+    if !(checking && (jobs.watching() || jobs.copying())) {
+        if let Ok(Some(consent)) =
+            credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
+        {
+            if consent.watch && consent.registered && !consent.watch_paused {
+                if let Ok(base) = import_base(&app) {
+                    let _ = jobs.start(app.clone(), base, saved.clone()).await;
+                }
             }
         }
     }
@@ -408,6 +401,16 @@ async fn restore_connection(
     drop(current);
     tray::refresh(&app).await;
     Ok(Some(view))
+}
+
+/// Ends the imports, media copy and worker that belong to a connection no longer in use.
+async fn stop_connection_work(app: &AppHandle) {
+    app.state::<media_copy::MediaCopy>().cancel();
+    app.state::<source_import::SourceJobs>().stop().await;
+    app.state::<drop_import::DropImport>()
+        .reset_for_restore()
+        .await;
+    app.state::<worker_setup::WorkerSetup>().stop().await;
 }
 
 #[tauri::command]
@@ -621,6 +624,10 @@ pub fn run() {
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
             }
+            #[cfg(target_os = "macos")]
+            if let Err(error) = window_close::guard_app_quit(app.handle()) {
+                eprintln!("app menu unavailable: {error}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -728,13 +735,8 @@ pub fn run() {
                 }
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     placement.save(window.app_handle());
-                    if cfg!(target_os = "macos")
-                        || window.state::<host_setup::HostSetup>().background_active()
-                        || window.state::<source_import::SourceJobs>().watching()
-                        || window.state::<media_copy::MediaCopy>().is_active()
-                    {
+                    if window_close::on_close_requested(window) {
                         api.prevent_close();
-                        let _ = window.hide();
                     }
                 }
                 _ => {}
