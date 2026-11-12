@@ -82,6 +82,7 @@
     if (value === 'local_photos_not_running') return 'The photo server is not running. Start it in Manager, then open Photos.';
     if (value === 'host_manifest_incompatible') return outdatedCompanion;
     if (value === 'native_manager_orphan_running') return 'Local management from an earlier session is still shutting down. Wait a moment, then try again.';
+    if (value === 'native_manager_record_unavailable') return 'Local management did not stop, and Frameleaf could not save what it needs to stop it after quitting, so Frameleaf is staying open. Stop the photo server in Manager, then choose Stop local management.';
     if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, start the photo server in Manager again, then stop it there.';
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
     if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
@@ -200,7 +201,7 @@
     try { await invoke('quit_local_host', { leaveRunning }); }
     catch (error) {
       leaveOffered = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && view?.companionPlatform !== 'windows';
-      failure = leaveOffered ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf stops it the next time it opens.' : explain(error);
+      failure = leaveOffered ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error);
       const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; }
   }
