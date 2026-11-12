@@ -21,7 +21,7 @@
     windows: 'Download and run the Frameleaf Companion Server EXE for Windows x64.',
     linux: 'On Ubuntu 24.04 for Intel or AMD, install both Frameleaf Companion Server DEBs (bootstrap and runtime) together, with pkexec.',
   };
-  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
+  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -36,7 +36,6 @@
   let failure = $state('');
   let notice = $state('');
   let quitOffered = $state(false);
-  let leaveOffered = $state(false);
   let managerPassword = $state('');
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
@@ -93,6 +92,7 @@
     const ready = value.state === 'manager-ready' && view?.state !== 'manager-ready';
     if (value.state !== 'manager-ready') authorized = false;
     view = value; onactive(value.backgroundActive);
+    if (!value.backgroundActive) quitOffered = false;
     if (ready) onmanagerchange();
   }
   async function checkSelected() {
@@ -200,9 +200,8 @@
     busy = true; failure = ''; notice = '';
     try { await invoke('quit_local_host', { leaveRunning }); }
     catch (error) {
-      leaveOffered = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && view?.companionPlatform !== 'windows';
-      failure = leaveOffered ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error);
-      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
+      failure = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && current?.leaveAvailable ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error); }
     finally { busy = false; }
   }
 </script>
@@ -223,7 +222,7 @@
       <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
       {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
       {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit()}>Stop and quit</button>{/if}
-      {#if leaveOffered && view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
+      {#if view?.leaveAvailable && view.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
     </div>
     {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
     {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}

@@ -22,6 +22,9 @@ pub(crate) struct View {
     installation: Option<Installation>,
     origin: Option<String>,
     pub background_active: bool,
+    /// A stop for quitting failed and Manager is still running, so quitting without stopping
+    /// it may be chosen. The interface offers that only while this says so.
+    leave_available: bool,
     profile_setup_available: bool,
     profile_requires_authorization: bool,
     companion_platform: Option<&'static str>,
@@ -71,6 +74,7 @@ impl Default for View {
             installation: None,
             origin: None,
             background_active: false,
+            leave_available: false,
             profile_setup_available: cfg!(any(target_os = "linux", windows)),
             profile_requires_authorization: cfg!(target_os = "linux"),
             companion_platform: match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -263,6 +267,8 @@ impl HostSetup {
     }
     /// Own a started Manager and remember its library for the update gate.
     fn adopt(&self, owner: &mut Option<Running>, running: Running) {
+        // A failed stop of an earlier Manager says nothing about this one.
+        self.exit_stop_failed.store(false, Ordering::Release);
         *self
             .library
             .lock()
@@ -307,6 +313,8 @@ impl HostSetup {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         view.background_active = self.background_active();
+        view.leave_available =
+            cfg!(unix) && view.background_active && self.exit_stop_failed.load(Ordering::Acquire);
         view
     }
     pub(crate) fn require_management_origin(&self, origin: &str) -> Result<(), String> {
@@ -579,6 +587,23 @@ impl HostSetup {
     /// The quit path. Unix asks Manager to exit even while the photo server runs: its controller
     /// then closes the database in order, and finishes on its own if this app exits first.
     /// Windows keeps the idle proof, because ending Manager's job there would kill the database.
+    /// The quit path as one decision. `exit_refused` is the code of whatever else would refuse
+    /// the exit that follows: with one, nothing is stopped or left, because the app would
+    /// stay open with its library stopped for nothing.
+    pub(crate) async fn quit(
+        &self,
+        exit_refused: Option<&'static str>,
+        leave_running: bool,
+    ) -> Result<(), String> {
+        if let Some(code) = exit_refused {
+            return Err(code.into());
+        }
+        if leave_running {
+            self.leave_for_exit(true)
+        } else {
+            self.stop_for_exit().await.map(|_| ())
+        }
+    }
     pub(crate) async fn stop_for_exit(&self) -> Result<View, String> {
         self.stop_for_exit_within(Duration::from_secs(10)).await
     }
@@ -2309,6 +2334,75 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn stop_and_quit_stops_nothing_when_the_exit_would_be_refused() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        setup.set("manager-ready", None, setup.snapshot().installation);
+        assert!(!setup.snapshot().leave_available);
+        // A media copy is running: the exit that follows would be refused.
+        assert_eq!(
+            setup
+                .quit(Some("media_copy_exit_blocked"), false)
+                .await
+                .unwrap_err(),
+            "media_copy_exit_blocked"
+        );
+        let view = setup.snapshot();
+        assert_eq!(view.state, "manager-ready", "Manager was not asked to stop");
+        assert!(view.background_active);
+        assert!(setup.owner.try_lock().unwrap().is_some());
+        // With nothing refusing the exit, the same request stops it.
+        setup.quit(None, false).await.unwrap();
+        let view = setup.snapshot();
+        assert_eq!(view.state, "idle");
+        assert!(!view.background_active && !view.leave_available);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leaving_is_offered_only_for_the_manager_whose_stop_failed() {
+        let fixture = OwnedFixture::new();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let setup = fixture.own_command(command, installation.clone());
+        assert!(setup
+            .stop_for_exit_within(Duration::from_millis(300))
+            .await
+            .is_err());
+        assert!(setup.snapshot().leave_available);
+        // A later Manager in the same run starts with no such offer.
+        let mut next = std::process::Command::new("/bin/sleep");
+        next.arg("30");
+        let running = Running {
+            manager: NativeManager::test_child(&mut next),
+            configuration: setup
+                .owner
+                .try_lock()
+                .unwrap()
+                .take()
+                .map(|running| running.configuration)
+                .unwrap(),
+            installation,
+        };
+        setup.adopt(&mut setup.owner.try_lock().unwrap(), running);
+        assert!(setup.background_active());
+        assert!(!setup.snapshot().leave_available);
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_shutdown_unconfirmed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn quitting_without_stopping_is_refused_when_manager_cannot_be_recorded() {
         let fixture = OwnedFixture::new();
         let mut command = std::process::Command::new("/bin/sleep");
@@ -2400,6 +2494,17 @@ mod tests {
         );
         assert_eq!(setup.snapshot().state, "needs-attention");
         assert!(setup.background_active(), "exit stays protected by default");
+        // The interface offers leaving exactly while the backend allows it.
+        assert!(setup.snapshot().leave_available);
+        // Something else would refuse the exit: Manager is neither left nor stopped.
+        assert_eq!(
+            setup
+                .quit(Some("media_copy_exit_blocked"), true)
+                .await
+                .unwrap_err(),
+            "media_copy_exit_blocked"
+        );
+        assert!(setup.background_active());
         setup.leave_for_exit(true).unwrap();
         assert!(!setup.background_active(), "the chosen quit is not blocked");
         assert!(

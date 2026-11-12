@@ -32,8 +32,17 @@ test('local setup names a busy port, offers a companion update and always offers
   assert.match(ui, /quitOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(\)\}>Stop and quit</);
   assert.match(ui, /invoke\('quit_local_host', \{ leaveRunning \}\)/);
   // A Manager that will not stop must not make the app unquittable again.
-  assert.match(ui, /leaveOffered = !leaveRunning && String\(error\) === 'native_manager_shutdown_unconfirmed' && view\?\.companionPlatform !== 'windows'/);
-  assert.match(ui, /leaveOffered && view\?\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(true\)\}>Quit anyway</);
+  // Both quit buttons follow the backend: no local flag can outlive what it allows.
+  assert.doesNotMatch(ui, /leaveOffered/);
+  assert.match(ui, /view\?\.leaveAvailable && view\.backgroundActive[^\n]*onclick=\{\(\) => stopAndQuit\(true\)\}>Quit anyway</);
+  assert.match(ui, /String\(error\) === 'native_manager_shutdown_unconfirmed' && current\?\.leaveAvailable \?/);
+  assert.match(ui, /if \(!value\.backgroundActive\) quitOffered = false;/);
+  const backend = readFileSync(new URL('../src-tauri/src/host_setup.rs', import.meta.url), 'utf8');
+  assert.match(backend, /view\.leave_available\s*=\s*cfg!\(unix\)\s*&& view\.background_active\s*&& self\.exit_stop_failed\.load/);
+  // The update message comes from the shared copy, not a second wording in App.svelte.
+  const app = readFileSync(new URL('../src/App.svelte', import.meta.url), 'utf8');
+  assert.doesNotMatch(app, /did not shut down cleanly/);
+  assert.match(app, /error === 'update_library_not_idle'\s+\? errorCopy\('update_library_not_idle'\)/);
   // The offer promises an attempt, and a Manager that cannot be recorded keeps the app open.
   assert.match(ui, /Frameleaf will try to stop it the next time it opens/);
   assert.match(ui, /value === 'native_manager_record_unavailable'\) return '[^']*Frameleaf is staying open/);
