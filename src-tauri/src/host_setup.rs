@@ -93,21 +93,42 @@ fn live(owner: &mut Option<Running>) -> bool {
         .as_mut()
         .is_some_and(|running| !matches!(running.manager.tree_exited(), Ok(true)))
 }
+/// Whether this app's record names the owned Manager, writing it again if it is missing. Without
+/// it a later launch cannot find a Manager that was left running.
+fn recorded(running: &mut Running) -> bool {
+    #[cfg(unix)]
+    {
+        let (data, pid) = (&running.configuration.data, running.manager.process_id());
+        crate::manager_host::owned_process_recorded(data, pid)
+            || (crate::manager_host::record_owned_process(data, pid).is_ok()
+                && crate::manager_host::owned_process_recorded(data, pid))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = running;
+        false
+    }
+}
 /// The existing stop proof, read-only: no controller holds the journal, its last stop was clean
 /// and no database process file remains. Anything short of that is not proof.
-fn proven_idle(running: &Running) -> bool {
-    crate::host_state::Owner::acquire(&running.configuration.state, false)
-        .and_then(|mut proof| {
-            proof.admit_idle(
-                &running.configuration.installation_id,
-                &running.installation.manifest_sha256,
-            )
-        })
-        .is_ok()
+struct Library {
+    state: std::path::PathBuf,
+    installation_id: String,
+    manifest_sha256: String,
+}
+impl Library {
+    fn proven_idle(&self) -> bool {
+        crate::host_state::Owner::acquire(&self.state, false)
+            .and_then(|mut proof| proof.admit_idle(&self.installation_id, &self.manifest_sha256))
+            .is_ok()
+    }
 }
 #[derive(Default)]
 pub(crate) struct HostSetup {
     owner: tokio::sync::Mutex<Option<Running>>,
+    /// The library a Manager was started for in this run. It outlives `owner`: stopping or
+    /// losing Manager does not prove its controller and database stopped.
+    library: Mutex<Option<Library>>,
     cancel: Arc<AtomicBool>,
     active: AtomicBool,
     /// A stop for quitting failed, so quitting without stopping may be chosen.
@@ -131,20 +152,46 @@ impl HostSetup {
     }
     pub(crate) fn lock_for_update(&self) -> Result<impl Drop + '_, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
-        // Holding the owner proves no operation is in flight. A live Manager blocks, and so
-        // does a Manager that exited unless its controller and database are proven stopped:
-        // outside Windows they are not this app's children and can outlive Manager.
-        if live(&mut owner) || owner.as_ref().is_some_and(|running| !proven_idle(running)) {
+        // Holding the owner proves no operation is in flight. A live Manager blocks. So does
+        // any library a Manager ran for in this session, whether or not that Manager is still
+        // owned, until its journal proves a clean stop: outside Windows the controller and
+        // database are not this app's children and can outlive Manager.
+        if live(&mut owner)
+            || self
+                .library
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|library| !library.proven_idle())
+        {
             return Err("update_host_active".into());
         }
         Ok(owner)
     }
-    /// Quit without stopping, offered only after a stop for quitting failed. Manager keeps
-    /// running and its recorded process stays, so the next launch stops it. Not on Windows:
-    /// leaving there ends Manager's job and would kill a running database.
+    /// Own a started Manager and remember its library for the update gate.
+    fn adopt(&self, owner: &mut Option<Running>, running: Running) {
+        *self
+            .library
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Library {
+            state: running.configuration.state.clone(),
+            installation_id: running.configuration.installation_id.clone(),
+            manifest_sha256: running.installation.manifest_sha256.clone(),
+        });
+        *owner = Some(running);
+    }
+    /// Quit without stopping, allowed only after a stop for quitting failed and only while this
+    /// app's record names the live Manager, so the next launch can attempt to stop it. Not on
+    /// Windows: leaving there ends Manager's job and would kill a running database.
     pub(crate) fn leave_for_exit(&self, leave: bool) -> Result<(), String> {
-        if leave && (cfg!(not(unix)) || !self.exit_stop_failed.load(Ordering::Acquire)) {
-            return Err("native_manager_shutdown_unconfirmed".into());
+        if leave {
+            if cfg!(not(unix)) || !self.exit_stop_failed.load(Ordering::Acquire) {
+                return Err("native_manager_shutdown_unconfirmed".into());
+            }
+            let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
+            if owner.as_mut().is_some_and(|running| !recorded(running)) {
+                return Err("native_manager_record_unavailable".into());
+            }
         }
         self.left_for_exit.store(leave, Ordering::Release);
         Ok(())
@@ -323,7 +370,7 @@ impl HostSetup {
         };
         match result {
             Ok(running) => {
-                *owner = Some(running);
+                self.adopt(&mut owner, running);
                 self.set("manager-ready", None, self.snapshot().installation);
             }
             Err(error) => {
@@ -452,9 +499,14 @@ impl HostSetup {
             let record = Some(running.installation.clone());
             self.set("stopping", None, record.clone());
             if let Err(error) = running.manager.shutdown(timeout).await {
-                // Manager did not exit in time. Its record is kept so that quitting without
-                // stopping still lets the next launch find and stop it.
-                self.exit_stop_failed.store(true, Ordering::Release);
+                // Manager did not exit in time. Quitting without stopping is offered only if
+                // its record is in place, so the next launch can find it and attempt the stop.
+                let error = if recorded(running) {
+                    self.exit_stop_failed.store(true, Ordering::Release);
+                    error
+                } else {
+                    "native_manager_record_unavailable".to_string()
+                };
                 self.set("needs-attention", Some(error.clone()), record);
                 return Err(error);
             }
@@ -1036,7 +1088,9 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
             return Err("native_manager_start_cancelled".into());
         }
         let manager = programs.start_from_keystore(&configuration)?;
-        // Best effort: without this record a crash leaves Manager for the person to stop.
+        // A failed write must not refuse a healthy library its Manager, so it is not an error
+        // here. The record is checked, and written again, before quitting may leave Manager
+        // running; without it that quit is refused.
         #[cfg(unix)]
         let _ =
             crate::manager_host::record_owned_process(&configuration.data, manager.process_id());
@@ -1794,7 +1848,7 @@ mod tests {
             installation: Installation,
         ) -> HostSetup {
             let setup = HostSetup::default();
-            *setup.owner.try_lock().unwrap() = Some(Running {
+            let running = Running {
                 manager: NativeManager::test_child(&mut command),
                 configuration: Configuration {
                     installation_id: "aaaaaaaaaaaa".into(),
@@ -1808,7 +1862,8 @@ mod tests {
                     api_port: 2283,
                 },
                 installation,
-            });
+            };
+            setup.adopt(&mut setup.owner.try_lock().unwrap(), running);
             setup.active.store(true, Ordering::Release);
             setup
         }
@@ -1862,6 +1917,51 @@ mod tests {
         let view = setup.stop().await.unwrap();
         assert_eq!(view.state, "idle");
         assert!(!view.background_active);
+        // Quitting is free again, but nothing proved the database stopped: no update yet.
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        assert!(setup.lock_for_update().is_err());
+        // The library is started again, recovers, and this time stops cleanly.
+        let mut journal = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        journal.clean_stop().unwrap();
+        drop(journal);
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_an_exited_manager_keeps_updates_closed_while_its_controller_runs() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["0.2"]);
+        // Manager exits while its controller still holds the journal and runs the database.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.background_active() {
+            assert!(std::time::Instant::now() < deadline, "Manager did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Stopping the dead Manager needs no proof and clears the owner...
+        assert_eq!(setup.stop().await.unwrap().state, "idle");
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        // ...but that must not open the update gate.
+        assert!(setup.lock_for_update().is_err());
+        controller.clean_stop().unwrap();
+        // Stopped cleanly, yet the controller process has not released the journal.
+        assert!(setup.lock_for_update().is_err());
+        drop(controller);
         assert!(setup.lock_for_update().is_ok());
     }
 
@@ -1881,8 +1981,62 @@ mod tests {
         assert_eq!(view.state, "idle");
         assert!(!view.background_active);
         assert!(!setup.background_active());
-        // The controller was left to close the database itself.
+        // The controller was left to close the database itself; until it has, no update.
+        assert!(setup.lock_for_update().is_err());
         drop(controller);
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quitting_without_stopping_is_refused_when_manager_cannot_be_recorded() {
+        let fixture = OwnedFixture::new();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let installation: Installation = serde_json::from_value(serde_json::json!({"schemaVersion":1,"manifestSha256":"a".repeat(64),"controllerSha256":"b".repeat(64)})).unwrap();
+        let setup = fixture.own_command(command, installation);
+        // The record was never written and cannot be: its directory is gone.
+        let data = fixture.0.join("data");
+        std::fs::remove_dir(&data).unwrap();
+        assert_eq!(
+            setup
+                .stop_for_exit_within(Duration::from_millis(300))
+                .await
+                .err()
+                .unwrap(),
+            "native_manager_record_unavailable"
+        );
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_shutdown_unconfirmed",
+            "leaving was never offered"
+        );
+        assert!(setup.background_active());
+        // Once the record can be written, the failed stop offers leaving and the record is there.
+        crate::runtime_store::private_directory(&data).unwrap();
+        assert_eq!(
+            setup
+                .stop_for_exit_within(Duration::from_millis(300))
+                .await
+                .err()
+                .unwrap(),
+            "native_manager_shutdown_unconfirmed"
+        );
+        assert!(data.join("desktop-manager-process.json").exists());
+        // Losing the record again after the offer still refuses the quit.
+        std::fs::remove_dir_all(&data).unwrap();
+        assert_eq!(
+            setup.leave_for_exit(true).unwrap_err(),
+            "native_manager_record_unavailable"
+        );
+        assert!(setup.background_active(), "the app stays open");
     }
 
     #[cfg(unix)]

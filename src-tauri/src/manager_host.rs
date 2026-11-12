@@ -377,53 +377,89 @@ pub(crate) fn forget_owned_process(data: &Path) {
         let _ = cap_std::fs::Dir::from_std_file(directory).remove_file(OWNED_PROCESS);
     }
 }
+/// Whether this app's record names exactly the live process `pid`.
+#[cfg(unix)]
+pub(crate) fn owned_process_recorded(data: &Path, pid: u32) -> bool {
+    let live = crate::process_tree::ProcessIdentity::of(pid);
+    live.is_some() && owned_process(data) == live
+}
 /// Send the recorded process the same exit request `shutdown` makes. Returns false, without
 /// signalling, when the process with that PID is no longer the recorded one.
 ///
-/// Linux binds the signal to a process handle. The handle is opened first and the identity
-/// read afterwards, so a match proves the handle names the recorded process, and a later
-/// reuse of the PID cannot redirect the signal.
-///
-/// macOS, and a Linux kernel without pidfd, have no such handle. There the identity is read
-/// immediately before `kill`, which narrows the race but does not close it: if the process
-/// exits and its PID is reused within those few instructions, the new holder receives SIGTERM.
+/// Linux binds the signal to a process handle; see `request_exit_through`. Everywhere else
+/// there is no such handle and `signal_after_recheck` is all the platform allows.
 #[cfg(unix)]
 fn request_exit(recorded: &crate::process_tree::ProcessIdentity) -> Result<bool, String> {
-    let same = || crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() == Some(recorded);
-    let gone = || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let flags: libc::c_uint = 0;
-        let opened =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, recorded.pid as libc::pid_t, flags) };
-        if opened >= 0 {
-            let handle = unsafe { OwnedFd::from_raw_fd(opened as libc::c_int) };
-            if !same() {
-                return Ok(false);
-            }
-            let sent = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    handle.as_raw_fd(),
-                    libc::SIGTERM,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    flags,
-                )
-            };
-            return match sent {
-                0 => Ok(true),
-                _ if gone() => Ok(false),
-                _ => Err("native_manager_orphan_running".into()),
-            };
-        }
+        request_exit_through(recorded, open_process_handle)
     }
-    if !same() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        signal_after_recheck(recorded)
+    }
+}
+/// PID-based signal for platforms without a process handle. The identity is read immediately
+/// before `kill`, which narrows the race but does not close it: if the process exits and its
+/// PID is reused within those few instructions, the new holder receives SIGTERM.
+#[cfg(unix)]
+fn signal_after_recheck(recorded: &crate::process_tree::ProcessIdentity) -> Result<bool, String> {
+    if crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() != Some(recorded) {
         return Ok(false);
     }
     match unsafe { libc::kill(recorded.pid as libc::pid_t, libc::SIGTERM) } {
         0 => Ok(true),
-        _ if gone() => Ok(false),
+        _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        _ => Err("native_manager_orphan_running".into()),
+    }
+}
+/// A pidfd for `pid`, or the errno that refused it.
+#[cfg(target_os = "linux")]
+fn open_process_handle(pid: libc::pid_t) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::FromRawFd;
+    let flags: libc::c_uint = 0;
+    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL));
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(opened as libc::c_int) })
+}
+/// The handle is opened first and the identity read afterwards, so a match proves the handle
+/// names the recorded process and a later reuse of the PID cannot redirect the signal.
+///
+/// When no handle can be opened this fails closed, with one intentional exception: ENOSYS
+/// means the kernel has no pidfd at all, and only then is the weaker `signal_after_recheck`
+/// used. ESRCH means the process is already gone. Any other refusal sends no signal.
+#[cfg(target_os = "linux")]
+fn request_exit_through(
+    recorded: &crate::process_tree::ProcessIdentity,
+    open: impl FnOnce(libc::pid_t) -> Result<std::os::fd::OwnedFd, i32>,
+) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+    let handle = match open(recorded.pid as libc::pid_t) {
+        Ok(handle) => handle,
+        Err(libc::ESRCH) => return Ok(false),
+        Err(libc::ENOSYS) => return signal_after_recheck(recorded),
+        Err(_) => return Err("native_manager_orphan_running".into()),
+    };
+    if crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() != Some(recorded) {
+        return Ok(false);
+    }
+    let flags: libc::c_uint = 0;
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.as_raw_fd(),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            flags,
+        )
+    };
+    match sent {
+        0 => Ok(true),
+        _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => Ok(false),
         _ => Err("native_manager_orphan_running".into()),
     }
 }
@@ -1162,6 +1198,47 @@ mod tests {
             .unwrap(),
             "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_process_handle_fails_closed_except_on_a_kernel_without_one() {
+        use crate::process_tree::ProcessIdentity;
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let live = ProcessIdentity::of(child.id()).unwrap();
+        // Unexpected refusals must not fall back to signalling a bare PID.
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EINVAL,
+            libc::EPERM,
+        ] {
+            assert_eq!(
+                request_exit_through(&live, |_| Err(errno)).unwrap_err(),
+                "native_manager_orphan_running"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "errno {errno} signalled"
+            );
+        }
+        // The process is already gone: nothing to signal, and that is not an error.
+        assert!(!request_exit_through(&live, |_| Err(libc::ESRCH)).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        // Even the one permitted fallback re-reads the identity first.
+        let mut reused = live.clone();
+        reused.started.push('9');
+        assert!(!request_exit_through(&reused, |_| Err(libc::ENOSYS)).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        // A kernel without process handles is the only case that signals by PID.
+        assert!(request_exit_through(&live, |_| Err(libc::ENOSYS)).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        // A real handle reaches the recorded process.
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let live = ProcessIdentity::of(child.id()).unwrap();
+        assert!(request_exit_through(&live, open_process_handle).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
     #[cfg(unix)]
     #[test]
