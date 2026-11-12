@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { formatBytes, formatWhen, platformFromUserAgent } from './ui-state';
   import { cancelCopy, explainCopy, mediaCopy, saveCopy } from './media-copy';
@@ -51,7 +52,7 @@
     {#if copying}
       <div class="row" role="status"><span class="l"><small>{$mediaCopy.cancelling ? 'Cancelling the copy…' : 'Waiting for a destination or downloading and verifying the archive. Keep the drive connected. The copy continues if you leave this page.'}</small></span><button class="btn quiet" disabled={$mediaCopy.cancelling} onclick={() => cancelCopy(invoke, platform)}>Cancel copy</button></div>
     {/if}
-    {#if message || $mediaCopy.message}<div class="row"><span class="l"><small role="status">{message || $mediaCopy.message}</small></span></div>{/if}
+    {#if message || $mediaCopy.message}<div class="row"><span class="l"><small role="status"><ErrorText text={message || $mediaCopy.message} /></small></span></div>{/if}
     {#if $mediaCopy.saved}
       {@const saved = $mediaCopy.saved}
       <div class="row top"><span class="l"><b>Verified copy saved</b><small role="status">{saved.originals.toLocaleString()} originals · {formatBytes(saved.bytes)} · {saved.path}</small><small>Before relying on this backup for recovery, open originals and play videos from a separate recovery location.</small></span></div>

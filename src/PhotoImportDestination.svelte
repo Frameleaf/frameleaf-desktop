@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import type { AlbumDestination } from './import-destination';
   import { explainError } from './errors';
@@ -54,7 +55,7 @@
       <button class="btn small" type="button" onclick={search} disabled={disabled || loading}>Search Albums</button>
     </div>
     {#if loading}<small role="status">Loading albums…</small>
-    {:else if error}<small role="status" class="danger-text">{error}</small>
+    {:else if error}<small role="status" class="danger-text"><ErrorText text={error} /></small>
     {:else if loaded && !albums.length}<small role="status">No writable albums found. Try another name.</small>{/if}
     {#if albums.length || destination}
       <label>

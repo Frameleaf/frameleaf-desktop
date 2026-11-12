@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -116,7 +117,7 @@
     <button class="btn primary" disabled={busy || !native || connection.state === 'identity-changed'} onclick={photos}><Icon name="open" />Open Photos</button>
   </header>
   <div class="body">
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}{#if failureReference} <small class="muted">Reference: {failureReference}</small>{/if}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} reference={failureReference} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={onstepupclose} />{/key}{/if}
     {#if section === 'all'}
       {#if attention.length}
@@ -187,7 +188,7 @@
       <div class="group" role="group" aria-label="Computer processing status">
         <div class="row">
           <span class="ic" aria-hidden="true"><Icon name="ai" /></span>
-          <span class="l"><b>{worker.headline}</b><small>{worker.detail}{#if worker.reference} <span class="muted">Reference: {worker.reference}</span>{/if}</small></span>
+          <span class="l"><b>{worker.headline}</b><small><ErrorText text={worker.detail} reference={worker.reference} /></small></span>
           <span class="pill {worker.pill.tone}"><i aria-hidden="true"></i>{worker.pill.label}</span>
           {#if worker.action === 'download-models'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(true)}>Download Models</button>{/if}
           {#if worker.action === 'check-approval'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Approval</button>{/if}

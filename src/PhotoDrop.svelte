@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -184,7 +185,7 @@
 
 {#if open}
   <Sheet title={preview ? (preview.folder ? 'Review selected folder' : 'Review selected files') : 'File import'} {busy} onclose={close} onsubmit={preview ? approve : undefined}>
-    {#if message}<p role="status">{message}</p>{/if}
+    {#if message}<p role="status"><ErrorText text={message} /></p>{/if}
     {#if preview}
       <p><strong>{preview.path}</strong></p>
       <p>{preview.count.toLocaleString()} photos or videos · {formatBytes(preview.bytes)}{preview.skipped ? ` · ${preview.skipped} unavailable or excluded entries skipped` : ''}</p>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -155,7 +156,7 @@
   </header>
   <div class="body">
     {#if busy}<div class="inline-msg" role="status"><span class="spin" aria-hidden="true"></span><p>Waiting for the folder or server operation to finish…</p></div>{/if}
-    {#if message}<div class="inline-msg" role="status"><p>{message}</p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
+    {#if message}<div class="inline-msg" role="status"><p><ErrorText text={message} /></p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
     {#if native && !consent && !blockedConsent && !folder}
       <CameraSources {busy} onchoose={(path) => choose(null, path)} />
     {/if}

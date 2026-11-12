@@ -1,6 +1,7 @@
 <script lang="ts">
   // Frameleaf account sign-in and sign-up in the app (mobile onboarding screens 3, 4 and 5): an emailed
   // Verification Code, then the account's second step when it has one. A Passkey is finished in the browser.
+  import ErrorText from './ErrorText.svelte';
   import { tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Sheet from './Sheet.svelte';
@@ -110,7 +111,7 @@
 <p class="sub">{heading.sub}</p>
 {#if failure}
   <div class="inline-msg error notice" role="alert">
-    <p id="fa-failure">{failure}</p>
+    <p id="fa-failure"><ErrorText text={failure} /></p>
     {#if failureCode === 'cloud_email_no_account'}<button class="btn small" type="button" onclick={() => show('create')}>Create Account</button>{/if}
     {#if failureCode === 'cloud_email_expired_code'}<button class="btn small" type="button" disabled={busy} onclick={() => send(codeFor)}>Send a New Verification Code</button>{/if}
     <button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button>

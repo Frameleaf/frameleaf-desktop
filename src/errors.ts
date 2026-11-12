@@ -396,8 +396,8 @@ export function errorCopy(code: string): string | null {
 }
 
 /**
- * What to show for a failure: the copy for its code, or `fallback` with the code as a small-text
- * reference so support can identify a failure this app has no words for yet.
+ * What to show for a failure: the copy for its code, or `fallback` with the code as a reference so
+ * support can identify a failure this app has no words for yet. ErrorText.svelte renders both.
  */
 export function describeError(error: unknown, fallback = generic): { message: string; reference: string | null } {
   const code = errorCode(error);
@@ -409,6 +409,15 @@ export function describeError(error: unknown, fallback = generic): { message: st
 export function explainError(error: unknown, fallback = generic): string {
   const { message, reference } = describeError(error, fallback);
   return reference ? `${message} (Reference: ${reference})` : message;
+}
+
+/**
+ * The two parts of an explainError line, so ErrorText.svelte can show the reference as small secondary
+ * text. Any other text comes back whole, with no reference.
+ */
+export function splitReference(text: string): { message: string; reference: string | null } {
+  const match = /^([\s\S]*) \(Reference: ([a-z0-9]+(?:_[a-z0-9]+)*)\)$/.exec(text);
+  return match ? { message: match[1]!, reference: match[2]! } : { message: text, reference: null };
 }
 
 export function connectionError(error: unknown): string {

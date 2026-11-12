@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { formatBytes } from './ui-state';
@@ -159,7 +160,7 @@
       <button class="btn" onclick={cancel}>Cancel Download</button>
     </section>
   {/if}
-  {#if message}<p role="status" class="notice">{message}</p>{/if}
+  {#if message}<p role="status" class="notice"><ErrorText text={message} /></p>{/if}
   {#if album}
     <div class="album-heading">
       <button class="btn quiet" onclick={() => { albumId = ''; closeMedia(); }}>All Offline Albums</button>

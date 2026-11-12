@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { controlIntent, restoreIntent, intentKey, managerError, type Control, type Intent, type ManagerView, type ManagerStatus, type Operation, backupReviewIntent, restoreBackupReview, backupReviewKey, type BackupEntry, type BackupReviewIntent, type BackupReview, createBackupRestoreIntent, parseBackupRestoreIntent, backupRestoreKey, databaseRecoveryReady, type BackupRestoreIntent, type BackupRestoreOperation } from './manager-state';
@@ -345,7 +346,7 @@
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to pair securely with Manager.</p>{/if}
     {#if focus === 'backups'}<MediaCopy />{/if}
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg" role="status"><p>{notice}</p><button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if focus === 'backups' || embedded || manager}
       <div>
@@ -384,7 +385,7 @@
                 <b>{labels[pending?.action || operation!.kind]}</b>
                 <small style={operationProgress ? 'margin-bottom:8px' : ''}>{operation?.step ? (Object.hasOwn(steps, operation.step) ? steps[operation.step] : 'Manager is processing this operation.') : operation ? operation.state === 'complete' ? operation.error ? 'Finished with a condition that needs review.' : 'Completed' : 'In progress' : pending?.id ? 'Waiting for operation state' : 'Request outcome has not been confirmed'}{operationProgress ? ` · step ${operationProgress.step} of ${operationProgress.total}` : ''}</small>
                 {#if operationProgress}<span class="progress" role="progressbar" aria-valuenow={operationProgress.percent} aria-valuemin="0" aria-valuemax="100" aria-label="Backup progress"><span style="width:{operationProgress.percent}%"></span></span>{/if}
-                {#if operation?.error}<small class="danger-text" style="margin-top:8px">{managerError(operation.error)}</small>{/if}
+                {#if operation?.error}<small class="danger-text" style="margin-top:8px"><ErrorText text={managerError(operation.error)} /></small>{/if}
                 {#if pending?.id || operation?.id}<small style="margin-top:8px">Operation <code>{shortId(pending?.id || operation?.id, 8)}</code>{operation?.createdAt ? ` · started ${formatWhen(operation.createdAt, now)}` : ''}{pending ? ' · an accepted request can still be in progress; retrying keeps its original identity' : ''}</small>{/if}
               </span>
               <span class="pill {operation ? operation.state === 'complete' ? operation.error ? 'bad' : 'ok' : operation.state === 'failed' ? 'bad' : operation.state === 'interrupted' ? 'off' : 'wait' : 'wait'}" role="status"><i aria-hidden="true"></i>{operation ? operation.state === 'complete' ? operation.error ? 'Needs review' : 'Completed' : operation.state === 'failed' ? 'Needs attention' : operation.state === 'interrupted' ? 'Interrupted' : 'In progress' : pending?.id ? 'Checking' : 'Unconfirmed'}</span>
@@ -520,7 +521,7 @@
     <p>{authorization === 'disconnect' ? 'Remove this computer’s Manager access? It is always removed from this computer. With your Manager password it is also revoked in Manager; leave the password empty if Manager cannot be reached. Server operations continue, and your photo sign-in stays separate.' : restoreAuthorization ? 'Enter your Manager password to continue the confirmed database restore.' : recoveryAuthorization ? 'Enter your Manager password to authorize backup review.' : pending ? 'Enter your Manager password to authorize and continue this operation.' : 'Enter your Manager password to authorize server actions for five minutes.'}</p>
     <label for="manager-authorization-password">Manager password</label>
     <input id="manager-authorization-password" type="password" bind:value={password} required={authorization !== 'disconnect'} maxlength="256" autocomplete="current-password" disabled={busy} />
-    {#if sheetFailure}<p class="danger-text" role="alert">{sheetFailure}</p>{/if}
+    {#if sheetFailure}<p class="danger-text" role="alert"><ErrorText text={sheetFailure} /></p>{/if}
     {#snippet actions()}
       <button class="btn" type="button" disabled={busy} onclick={closeAuthorization}>Cancel</button>
       <button class="btn {authorization === 'disconnect' ? 'danger' : 'primary'}" type="submit" disabled={busy}>{authorization === 'disconnect' ? 'Remove Pairing' : restoreAuthorization ? 'Authorize Restore' : recoveryAuthorization ? 'Authorize and Review' : pending ? 'Authorize and Continue' : 'Authorize'}</button>

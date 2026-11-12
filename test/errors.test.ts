@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connectionError, describeError, errorCode, errorCopy, explainError, workerReason } from '../src/errors.ts';
+import { connectionError, describeError, errorCode, errorCopy, explainError, splitReference, workerReason } from '../src/errors.ts';
 import { backendCodes, codesInSource, type BackendCodes } from './backend-error-codes.ts';
 
 const rust = fileURLToPath(new URL('../src-tauri/src', import.meta.url));
@@ -161,6 +161,40 @@ test('a code one screen used to own gets its copy on every screen', () => {
   }
   // The files that were moved keep no copy the coverage test has to read.
   assert.deepEqual(ownCopy, ['LocalHost.svelte']);
+});
+
+test('the reference of an unknown failure is shown one way: small secondary text after the message', () => {
+  // The line explainError writes splits back into exactly what describeError gave.
+  for (const [error, fallback] of [['brand_new_backend_code', undefined], ['x9', 'This import could not finish.'], ['server_identity_changed', undefined], ['free text', 'Could not save (again).']] as const)
+    assert.deepEqual(splitReference(explainError(error, fallback)), describeError(error, fallback));
+  // Only that exact ending is a reference; a message that merely mentions one stays whole.
+  for (const text of ['', 'Saved.', 'See (Reference: abc_def) above.', 'Wrong (Reference: Not A Code)', 'x (Reference: a_b) '])
+    assert.deepEqual(splitReference(text), { message: text, reference: null });
+
+  const files: string[] = [];
+  const walk = (directory: string) => {
+    for (const entry of readdirSync(directory)) {
+      const path = join(directory, entry);
+      if (statSync(path).isDirectory()) walk(path); else if (path.endsWith('.svelte')) files.push(path);
+    }
+  };
+  walk(ui);
+  const renderer = readFileSync(join(ui, 'ErrorText.svelte'), 'utf8');
+  assert.match(renderer, /\{parts\.message\}\{#if parts\.reference\}\{' '\}<span class="reference">Reference: \{parts\.reference\}<\/span>\{\/if\}/);
+  assert.match(readFileSync(join(ui, 'style.css'), 'utf8'), /\.reference \{ color: var\(--muted\); font-size: 11px;/);
+  const shows = /\b(?:explainError|connectionError|describeError|managerError|explainCopy|stepPrompt)\b/;
+  let screens = 0;
+  for (const path of files) {
+    const name = path.slice(ui.length + 1);
+    // LocalHost.svelte is being changed under FD-44 and still writes the reference inline.
+    if (name === 'ErrorText.svelte' || name === 'LocalHost.svelte') continue;
+    const source = readFileSync(path, 'utf8');
+    assert.doesNotMatch(source, /Reference:/, `${name} writes a reference itself; render the message with ErrorText`);
+    if (!shows.test(source)) continue;
+    screens += 1;
+    assert.match(source, /<ErrorText text=\{/, `${name} shows a failure without ErrorText`);
+  }
+  assert.ok(screens >= 14, `only ${screens} screens found that show a failure`);
 });
 
 test('no copy shows a raw error code', () => {

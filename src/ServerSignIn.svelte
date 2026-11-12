@@ -1,5 +1,6 @@
 <script lang="ts">
   // One server's sign-in (mobile onboarding screens 6 and 8): every method the server offers, on one screen.
+  import ErrorText from './ErrorText.svelte';
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Icon from './Icon.svelte';
@@ -83,7 +84,7 @@
   <span class="l"><b>{options.name}</b><small><i class="route" class:local={options.local} aria-hidden="true"></i>{route}</small></span>
   <button class="btn quiet small" type="button" disabled={busy} onclick={onback}>Use a Different Server</button>
 </div>
-{#if failure}<div class="inline-msg error notice" role="alert"><p>{failure}</p><button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+{#if failure}<div class="inline-msg error notice" role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
 {#if options.loginMessage}<p class="sub">{options.loginMessage}</p>{/if}
 
 {#if options.needsSetup}
