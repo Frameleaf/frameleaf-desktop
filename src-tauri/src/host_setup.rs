@@ -123,12 +123,19 @@ impl Library {
             .is_ok()
     }
 }
-/// From disk alone: no library was ever hosted at `state`, or its journal proves it idle.
+/// The port every local Manager serves on.
+const MANAGER_PORT: u16 = 9443;
+/// From disk alone: no library was ever hosted at `state`, or its journal proves it idle and
+/// nothing answers on Manager's port. The port covers a Manager this app could not record: it
+/// could start the controller while an update installs.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn hosted_library_idle(state: &std::path::Path) -> bool {
+fn hosted_library_idle(state: &std::path::Path, manager_port: u16) -> bool {
     match std::fs::symlink_metadata(state) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Ok(_) => crate::host_state::Owner::package_idle(state).is_ok(),
+        Ok(_) => {
+            crate::host_state::Owner::package_idle(state).is_ok()
+                && crate::manager_host::foreign_listener(&[manager_port]).is_ok()
+        }
         Err(_) => false,
     }
 }
@@ -162,28 +169,45 @@ impl HostSetup {
     pub(crate) fn lock_for_update(&self) -> Result<impl Drop + '_, String> {
         // Unit tests never consult the library really hosted on the machine that runs them.
         #[cfg(all(unix, not(test)))]
-        let hosted = Some(crate::host_install::account_state());
+        let profile = Some(crate::host_install::account_profile());
         #[cfg(not(all(unix, not(test))))]
-        let hosted: Option<std::path::PathBuf> = None;
-        self.lock_for_update_at(hosted.as_deref())
+        let profile: Option<std::path::PathBuf> = None;
+        let hosted = profile.map(|profile| (profile.join("state"), profile.join("manager")));
+        self.lock_for_update_at(
+            hosted
+                .as_ref()
+                .map(|(state, data)| (state.as_path(), data.as_path(), MANAGER_PORT)),
+        )
     }
-    /// `hosted` is where this account's library keeps its controller state on disk.
+    /// `hosted` is where this account's library keeps its controller state and its Manager
+    /// data on disk, and the port its Manager serves on.
+    ///
+    /// Every way something of this library could run, or be started, during an update:
+    /// - an operation of this app in flight: it holds the owner, which this takes and keeps;
+    /// - a Manager this run owns (on Windows, anything left in its job): `live`;
+    /// - a controller or database outliving a Manager this run stopped, lost or left: the
+    ///   remembered library's journal must prove a clean stop;
+    /// - the same after a restart of this app (Stop and quit, Quit anyway, a crash): the
+    ///   journal found on disk must prove it, with no controller holding it;
+    /// - a Manager left running by an earlier run (Quit anyway, a crash), which could start
+    ///   the controller: its recorded process must have exited, and an unreadable record
+    ///   blocks;
+    /// - such a Manager with no record at all: nothing may answer on Manager's port.
+    ///
+    /// With all of that proven and the owner held, nothing is left that could start one.
+    /// On Windows the controller and database die with this app's job, so a new run there
+    /// has nothing on disk to check.
     fn lock_for_update_at(
         &self,
-        hosted: Option<&std::path::Path>,
+        hosted: Option<(&std::path::Path, &std::path::Path, u16)>,
     ) -> Result<impl Drop + '_, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
         // Holding the owner proves no operation is in flight. A live Manager blocks.
         if live(&mut owner) {
             return Err("update_host_active".into());
         }
-        // So does a library whose journal does not prove a clean stop, whether or not its
-        // Manager is still owned: outside Windows the controller and database are not this
-        // app's children and can outlive Manager, and even this app. The library a Manager ran
-        // for in this run is checked by name; the one found on disk covers a new run, which
-        // remembers nothing while a controller left by quitting may still be closing the
-        // database. An unreadable state counts as not idle. Windows needs no disk check: its
-        // controller cannot outlive this app's job.
+        // Outside Windows the controller and database are not this app's children: they can
+        // outlive Manager, and this app. Anything unreadable counts as not idle.
         let unproven = self
             .library
             .lock()
@@ -191,8 +215,12 @@ impl HostSetup {
             .as_ref()
             .is_some_and(|library| !library.proven_idle());
         #[cfg(any(target_os = "macos", target_os = "linux", test))]
-        let unproven = unproven || hosted.is_some_and(|state| !hosted_library_idle(state));
-        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+        let unproven =
+            unproven || hosted.is_some_and(|(state, _, port)| !hosted_library_idle(state, port));
+        #[cfg(unix)]
+        let unproven = unproven
+            || hosted.is_some_and(|(_, data, _)| !crate::manager_host::no_recorded_manager(data));
+        #[cfg(not(any(unix, test)))]
         let _ = hosted;
         if unproven {
             return Err("update_library_not_idle".into());
@@ -1046,7 +1074,7 @@ pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
     #[cfg(unix)]
     let state = {
         records.first()?;
-        crate::host_install::account_state()
+        crate::host_install::account_profile().join("state")
     };
     #[cfg(windows)]
     let state = {
@@ -2021,9 +2049,12 @@ mod tests {
         use crate::host_runtime::HostMode;
         let fixture = OwnedFixture::new();
         let state = fixture.state();
+        let data = fixture.0.join("data");
+        let hosted = (state.as_path(), data.as_path(), free_port());
         // An account that never hosted a library has nothing to wait for.
+        let never = fixture.0.join("never-hosted");
         assert!(HostSetup::default()
-            .lock_for_update_at(Some(&fixture.0.join("never-hosted")))
+            .lock_for_update_at(Some((&never, &never, free_port())))
             .is_ok());
         let setup = fixture.own("/bin/sleep", &["30"]);
         let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
@@ -2037,16 +2068,16 @@ mod tests {
         let restarted = HostSetup::default();
         assert!(restarted.owner.try_lock().unwrap().is_none());
         assert_eq!(
-            restarted.lock_for_update_at(Some(&state)).err().unwrap(),
+            restarted.lock_for_update_at(Some(hosted)).err().unwrap(),
             "update_library_not_idle"
         );
         controller.clean_stop().unwrap();
         assert!(
-            restarted.lock_for_update_at(Some(&state)).is_err(),
+            restarted.lock_for_update_at(Some(hosted)).is_err(),
             "the controller still holds the journal"
         );
         drop(controller);
-        assert!(restarted.lock_for_update_at(Some(&state)).is_ok());
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
         // A controller that died without a clean stop keeps a later run closed too.
         let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
         controller
@@ -2055,11 +2086,87 @@ mod tests {
         drop(controller);
         assert_eq!(
             HostSetup::default()
-                .lock_for_update_at(Some(&state))
+                .lock_for_update_at(Some(hosted))
                 .err()
                 .unwrap(),
             "update_library_not_idle"
         );
+    }
+
+    /// A local port nothing listens on.
+    #[cfg(unix)]
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_run_keeps_updates_closed_while_a_manager_left_running_is_alive() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let fixture = OwnedFixture::new();
+        let (state, data) = (fixture.state(), fixture.0.join("data"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let hosted = (state.as_path(), data.as_path(), port);
+        // The library stopped cleanly: its journal alone would allow an update.
+        let mut journal = crate::host_state::Owner::acquire(&state, true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        journal.clean_stop().unwrap();
+        drop(journal);
+        assert!(HostSetup::default()
+            .lock_for_update_at(Some(hosted))
+            .is_ok());
+
+        // Quit anyway, or a crash, left the recorded Manager running; it could start the
+        // controller while an update installs.
+        let mut manager = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        crate::manager_host::record_owned_process(&data, manager.id()).unwrap();
+        let restarted = HostSetup::default();
+        assert!(restarted.owner.try_lock().unwrap().is_none());
+        assert_eq!(
+            restarted.lock_for_update_at(Some(hosted)).err().unwrap(),
+            "update_library_not_idle"
+        );
+        manager.kill().unwrap();
+        manager.wait().unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+
+        // A record that cannot be read proves nothing.
+        let record = data.join("desktop-manager-process.json");
+        std::fs::remove_file(&record).unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&record)
+                .unwrap(),
+            b"not a record",
+        )
+        .unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_err());
+        std::fs::remove_file(&record).unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
+
+        // A Manager that was never recorded still answers on its port.
+        let unrecorded = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_err());
+        drop(unrecorded);
+        assert!(restarted.lock_for_update_at(Some(hosted)).is_ok());
     }
 
     #[cfg(unix)]

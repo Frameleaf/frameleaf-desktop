@@ -383,6 +383,19 @@ pub(crate) fn owned_process_recorded(data: &Path, pid: u32) -> bool {
     let live = crate::process_tree::ProcessIdentity::of(pid);
     live.is_some() && owned_process(data) == live
 }
+/// For the update gate: true only when no Manager recorded in `data` can still be running.
+/// No record, or a record whose exact process has exited, is true. A record that exists but
+/// cannot be read, or cannot be looked for, is not proof and is false.
+#[cfg(unix)]
+pub(crate) fn no_recorded_manager(data: &Path) -> bool {
+    match fs::symlink_metadata(data.join(OWNED_PROCESS)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(_) => owned_process(data).is_some_and(|recorded| {
+            crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() != Some(&recorded)
+        }),
+    }
+}
 /// Send the recorded process the same exit request `shutdown` makes. Returns false, without
 /// signalling, when the process with that PID is no longer the recorded one.
 ///
