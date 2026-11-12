@@ -93,3 +93,13 @@ export function stepUpAfterFailure(state: StepUpState, error: unknown, retry: ()
   const offer = verificationRequired(error);
   return offer ? { request: { offer, retry }, dismissed: false } : state;
 }
+
+/**
+ * Overview's prompt after its summary was asked for. The summary can load while the server refuses
+ * only its attention list until Two-Step Verification (`attentionVerification`): the prompt opens for
+ * that too, and a summary with nothing refused closes it.
+ */
+export function summaryStepUpAfter(state: StepUpState, summary: { attentionVerification?: unknown } | null, error: unknown, retry: () => void): StepUpState {
+  if (!summary) return stepUpAfterFailure(state, error, retry);
+  return summary.attentionVerification ? stepUpAfterFailure(state, summary.attentionVerification, retry) : noStepUp;
+}

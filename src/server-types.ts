@@ -53,6 +53,8 @@ export type AttentionItem = {
 export type Attention = { checkedAt?: string; items?: AttentionItem[]; checks?: { kind: string; state: string }[]; dismissed?: string[] };
 export type ServerSummary = {
   me: Me; connections: ServerConnections | null; storage: ServerStorage | null; version: VersionCheck | null; attention: Attention | null;
+  /** The server refused the attention list until Two-Step Verification (a `verification_required` refusal). */
+  attentionVerification?: { code: string; methods: string[]; transaction: string };
 };
 
 // ---- cloud_status -----------------------------------------------------------------------------------

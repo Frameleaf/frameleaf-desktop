@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { beginStep, chooseMethod, methodChoice, noStepUp, otherMethods, proofLabel, proofReady, stepFailed, stepPrompt, stepUpAfterFailure, stepUpDismissed, verificationRequired } from '../src/sign-in-steps.ts';
+import { beginStep, chooseMethod, methodChoice, noStepUp, otherMethods, proofLabel, proofReady, stepFailed, stepPrompt, stepUpAfterFailure, stepUpDismissed, summaryStepUpAfter, verificationRequired } from '../src/sign-in-steps.ts';
 import { connectionError } from '../src/errors.ts';
 
 test('a step opens on the server’s preferred proof and offers the others', () => {
@@ -112,7 +112,7 @@ test('Overview and the AI library panel show the shared Verify prompt for their 
   const overview = read('../src/pages/Overview.svelte');
   const library = read('../src/pages/AiLibrary.svelte');
   // Overview's summary is loaded by the app shell, which hands the refused request to the page.
-  assert.match(app, /await invoke<ServerSummary>\('server_summary'\)[\s\S]{0,200}stepUpAfterFailure\(summaryStepUp, failed/);
+  assert.match(app, /await invoke<ServerSummary>\('server_summary'\)[\s\S]{0,200}summaryStepUpAfter\(summaryStepUp, result, failed/);
   assert.match(app, /<Overview [^>]*stepUp=\{summaryStepUp\.request\}[^>]*onstepupclose=\{\(\) => \{ summaryStepUp = stepUpDismissed; \}\}/);
   assert.match(overview, /\{#if stepUp\}\{#key stepUp\}<StepUp offer=\{stepUp\.offer\} retry=\{stepUp\.retry\} onclose=\{onstepupclose\} \/>/);
   assert.match(library, /await invoke<LibraryAiProcessing>\('server_ai_processing'\)[\s\S]{0,300}stepUpAfterFailure\(prompt, failed/);
@@ -125,4 +125,22 @@ test('Overview and the AI library panel show the shared Verify prompt for their 
     assert.match(page, /import StepUp from '\.\.\/StepUp\.svelte';/);
     assert.doesNotMatch(page, /server_step_up|<Sheet|This needs/);
   }
+});
+
+test('a summary whose attention list needs Two-Step Verification still loads and opens the Verify prompt', () => {
+  const retry = () => {};
+  const needed = { code: 'verification_required', methods: ['frameleaf', 'totp'], transaction: 'txn' };
+  const asked = summaryStepUpAfter(noStepUp, { attentionVerification: needed }, undefined, retry);
+  assert.deepEqual(asked, { request: { offer: { transaction: 'txn', methods: ['frameleaf', 'totp'] }, retry }, dismissed: false });
+  // The next refresh is refused again: the open prompt stays, and a dismissed one stays away.
+  assert.equal(summaryStepUpAfter(asked, { attentionVerification: { ...needed, transaction: 'next' } }, undefined, retry), asked);
+  assert.equal(summaryStepUpAfter(stepUpDismissed, { attentionVerification: needed }, undefined, retry), stepUpDismissed);
+  // Once nothing is refused the prompt goes; a summary that failed outright is judged by its error.
+  assert.equal(summaryStepUpAfter(asked, {}, undefined, retry), noStepUp);
+  assert.equal(summaryStepUpAfter(noStepUp, null, 'server_http_500', retry), noStepUp);
+  assert.equal(summaryStepUpAfter(noStepUp, null, needed, retry).request?.offer.transaction, 'txn');
+  // The backend hands the refusal on instead of dropping it (rustfmt may wrap the call).
+  const rust = readFileSync(new URL('../src-tauri/src/server_admin.rs', import.meta.url), 'utf8');
+  assert.match(rust, /optional\(\s*session\s*\.get\("api\/admin\/attention"\)\s*\.await\s*\)/);
+  assert.doesNotMatch(rust, /"api\/admin\/attention"\)\s*\.await\s*\.ok\(\)/);
 });

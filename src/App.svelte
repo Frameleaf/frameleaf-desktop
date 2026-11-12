@@ -19,7 +19,7 @@
   import { connectionError, errorCopy } from './errors';
   import { reconnectDelay, savedSignInState, savedSignInView } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
-  import { noStepUp, stepUpAfterFailure, stepUpDismissed, type StepUpState } from './sign-in-steps';
+  import { noStepUp, stepUpDismissed, summaryStepUpAfter, type StepUpState } from './sign-in-steps';
   import { availablePage, pages, restoredPage, shortcutPage, type Page } from './navigation';
 
   const lastPageKey = 'frameleaf.last-page.v1';
@@ -70,7 +70,7 @@
     catch (error) { failed = error; }
     if (summaryRequest === asked) {
       summary = result;
-      summaryStepUp = result ? noStepUp : stepUpAfterFailure(summaryStepUp, failed, () => { summaryStepUp = noStepUp; void loadSummary(); });
+      summaryStepUp = summaryStepUpAfter(summaryStepUp, result, failed, () => { summaryStepUp = noStepUp; void loadSummary(); });
       if (result && !availablePage(page, result.me?.isAdmin === true)) page = 'overview';
     }
     void invoke('tray_refresh').catch(() => {});
