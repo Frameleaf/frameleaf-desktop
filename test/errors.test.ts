@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectionError, describeError, errorCode, errorCopy, explainError, workerReason } from '../src/errors.ts';
@@ -16,33 +16,30 @@ const notErrorCodes = new Set([
   'immich_ml', 'frameleaf_ml', // Python module namespaces of the AI runtime
   'native_runtime', 'native_qualification', // names of the runtime's two launch modes
   'x86_64', // CPU architecture reported at enrollment
-  'email_code', // sign-in method name sent to Cloud
+  'email_code', 'recovery_code', // sign-in method names
 ]);
 
-// Copy a component keeps for the codes only it shows: keys of its message tables, `case 'code':`
-// labels, `=== 'code' ? 'text'` and `if (… === 'code' || ….startsWith('prefix_')) return 'text'`.
+// The components that still hold the only copy for some codes. Every other file's copy is in
+// src/errors.ts, so a code shown on any screen gets its words. Do not add a file here: add the copy
+// to src/errors.ts instead.
+const ownCopy = ['LocalHost.svelte']; // being changed under FD-44; its table moves once that lands
+
+// Copy those components keep for the codes only they show: `=== 'code' ? 'text'` and
+// `if (… === 'code' || ….startsWith('prefix_')) return 'text'`.
 function componentCopy(): { codes: Set<string>; prefixes: string[] } {
   const codes = new Set<string>();
   const prefixes: string[] = [];
   const shape = '[a-z][a-z0-9]*(?:_[a-z0-9]+)+';
-  const walk = (directory: string) => {
-    for (const entry of readdirSync(directory)) {
-      const path = join(directory, entry);
-      if (statSync(path).isDirectory()) { walk(path); continue; }
-      if (!/\.(?:svelte|ts)$/.test(path) || path === join(ui, 'errors.ts')) continue;
-      for (const line of readFileSync(path, 'utf8').split('\n')) {
-        for (const match of line.matchAll(new RegExp(`(?<![\\w.'"])(${shape}):\\s*['"\`]`, 'g'))) codes.add(match[1]!);
-        for (const match of line.matchAll(new RegExp(`['"](${shape})['"]\\s*\\?\\s*['"\`]`, 'g'))) codes.add(match[1]!);
-        for (const match of line.matchAll(new RegExp(`case ['"](${shape})['"]:`, 'g'))) codes.add(match[1]!);
-        const answer = line.search(/return ['"`]/);
-        if (answer < 0) continue;
-        const condition = line.slice(0, answer);
-        for (const match of condition.matchAll(new RegExp(`=== ['"](${shape})['"]`, 'g'))) codes.add(match[1]!);
-        for (const match of condition.matchAll(new RegExp(`startsWith\\(['"](${shape}_)['"]\\)`, 'g'))) prefixes.push(match[1]!);
-      }
+  for (const file of ownCopy) {
+    for (const line of readFileSync(join(ui, file), 'utf8').split('\n')) {
+      for (const match of line.matchAll(new RegExp(`['"](${shape})['"]\\s*\\?\\s*['"\`]`, 'g'))) codes.add(match[1]!);
+      const answer = line.search(/return ['"`]/);
+      if (answer < 0) continue;
+      const condition = line.slice(0, answer);
+      for (const match of condition.matchAll(new RegExp(`=== ['"](${shape})['"]`, 'g'))) codes.add(match[1]!);
+      for (const match of condition.matchAll(new RegExp(`startsWith\\(['"](${shape}_)['"]\\)`, 'g'))) prefixes.push(match[1]!);
     }
-  };
-  walk(ui);
+  }
   return { codes, prefixes };
 }
 
@@ -68,7 +65,7 @@ test('every error code the backend can return has copy', () => {
     assert.ok(backend.codes.has(known), `scanner missed ${known}`);
   for (const prefix of ['server_http_', 'cloud_sign_in_', 'worker_resume_', 'workload_', 'source_upload_http_'])
     assert.ok(backend.families.has(prefix), `scanner missed the ${prefix} family`);
-  assert.deepEqual(withoutCopy(backend), [], 'add copy to src/errors.ts (or to the component that shows the code)');
+  assert.deepEqual(withoutCopy(backend), [], 'add copy to src/errors.ts');
   for (const name of notErrorCodes) assert.ok(backend.codes.has(name), `${name} is no longer produced; remove it from notErrorCodes`);
 });
 
@@ -143,6 +140,27 @@ test('an unknown code shows the generic message with the code as its reference',
     assert.deepEqual(describeError(other), { message: generic, reference: null });
   }
   assert.deepEqual(describeError('server_identity_changed'), { message: 'Your server’s identity changed. Sign out and sign in again to confirm it.', reference: null });
+});
+
+test('a code one screen used to own gets its copy on every screen', () => {
+  // Each of these had its words only in one component's table, so any other screen showed the generic message.
+  const moved: Record<string, RegExp> = {
+    media_copy_space_insufficient: /enough free space for this archive/, // media-copy.ts
+    manager_clock_skew: /clock/, // manager-state.ts
+    offline_album_storage_limit: /2 GB offline cache/, // OfflinePhotos.svelte
+    source_capacity_insufficient: /not enough free space for this original/, // PhotoSources.svelte
+    source_drop_existing: /current import/, // PhotoDrop.svelte
+    source_album_missing: /album could not be found/, // import-destination.ts
+  };
+  for (const [code, words] of Object.entries(moved)) {
+    assert.match(errorCopy(code)!, words, code);
+    // The helpers every screen uses (the app banner, Overview, sign-in) now find it too.
+    assert.deepEqual(describeError(code), { message: errorCopy(code), reference: null }, code);
+    assert.equal(connectionError(code), errorCopy(code), code);
+    assert.equal(explainError(Error(code), 'Some other screen could not finish.'), errorCopy(code), code);
+  }
+  // The files that were moved keep no copy the coverage test has to read.
+  assert.deepEqual(ownCopy, ['LocalHost.svelte']);
 });
 
 test('no copy shows a raw error code', () => {

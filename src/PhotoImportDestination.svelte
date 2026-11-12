@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { albumErrors, type AlbumDestination } from './import-destination';
+  import type { AlbumDestination } from './import-destination';
+  import { explainError } from './errors';
 
   let {
     albumMode = $bindable(false),
@@ -24,7 +25,7 @@
       albums = await invoke<AlbumDestination[]>('list_photo_import_albums', { search: query });
       loaded = true;
     } catch (reason) {
-      error = albumErrors[String(reason)] ?? 'Albums could not be loaded. Check the library connection and try again.';
+      error = explainError(reason, 'Albums could not be loaded. Check the library connection and try again.');
     } finally { loading = false; }
   }
 
