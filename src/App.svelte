@@ -16,7 +16,7 @@
   import Wallet from './pages/Wallet.svelte';
   import Remote from './pages/Remote.svelte';
   import { initials, hostOf } from './ui-state';
-  import { connectionError } from './errors';
+  import { connectionError, errorCopy } from './errors';
   import { reconnectDelay, savedSignInState, savedSignInView } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
   import { noStepUp, stepUpAfterFailure, stepUpDismissed, type StepUpState } from './sign-in-steps';
@@ -166,7 +166,7 @@
       updateError = error === 'update_host_active'
         ? 'Stop the local server before installing the update.'
         : error === 'update_library_not_idle'
-          ? 'Your library on this computer is still shutting down, or did not shut down cleanly. Start the photo server in Manager and stop it there, then install the update.'
+          ? errorCopy('update_library_not_idle') ?? 'Frameleaf couldn’t install the update. Try again.'
         : error === 'update_media_copy_active'
           ? 'Finish or cancel the media copy before installing the update.'
           : error === 'update_changed'
