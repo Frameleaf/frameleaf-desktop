@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { onMount, tick } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -18,6 +19,7 @@
   import { connectionError, errorCopy } from './errors';
   import { reconnectDelay, savedSignInState, savedSignInView } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
+  import { noStepUp, stepUpAfterFailure, stepUpDismissed, type StepUpState } from './sign-in-steps';
   import { availablePage, pages, restoredPage, shortcutPage, type Page } from './navigation';
 
   const lastPageKey = 'frameleaf.last-page.v1';
@@ -56,13 +58,19 @@
   const attentionCount = $derived((summary?.attention?.items ?? []).filter(item => !(summary?.attention?.dismissed ?? []).includes(item.id)).length);
   const explain = connectionError;
   let summaryRequest = 0; // bumped per request and on every sign-in and sign-out: only the latest reply applies
+  // The server can refuse the summary until Two-Step Verification; Overview shows the Verify prompt for it.
+  let summaryStepUp = $state<StepUpState>(noStepUp);
   async function loadSummary() {
-    if (!native || !connection) { summary = null; return; }
+    if (!native || !connection) { summary = null; summaryStepUp = noStepUp; return; }
     // A superseded reply (a newer refresh, or a sign-in or sign-out since) is dropped.
     const asked = ++summaryRequest;
-    const result = await invoke<ServerSummary>('server_summary').catch(() => null);
+    let result: ServerSummary | null = null;
+    let failed: unknown;
+    try { result = await invoke<ServerSummary>('server_summary'); }
+    catch (error) { failed = error; }
     if (summaryRequest === asked) {
       summary = result;
+      summaryStepUp = result ? noStepUp : stepUpAfterFailure(summaryStepUp, failed, () => { summaryStepUp = noStepUp; void loadSummary(); });
       if (result && !availablePage(page, result.me?.isAdmin === true)) page = 'overview';
     }
     void invoke('tray_refresh').catch(() => {});
@@ -100,6 +108,19 @@
         reconnectTimer = setTimeout(() => { void restoreSaved(false, true); }, reconnectDelay(reconnectAttempt++));
       }
     } finally { if (!background) busy = false; }
+  }
+  // The kept-sign-in screen replaces whatever was shown: its title takes focus so it is read out, again
+  // when it changes from reconnecting to needing Two-Step Verification.
+  let keptTitle = $state<HTMLHeadingElement>();
+  $effect(() => { if (keptSignIn && !connection) void tick().then(() => keptTitle?.focus()); });
+  async function retryKept(event: MouseEvent) {
+    const button = event.currentTarget as HTMLButtonElement;
+    const before = keptSignIn;
+    await restoreSaved(true);
+    // The button is disabled while Frameleaf tries, which drops keyboard focus: give it back, unless the
+    // screen changed and its new title has taken it.
+    await tick();
+    if (keptSignIn === before && button.isConnected) button.focus();
   }
   function networkBack() {
     if (!connection && keptSignIn === 'reconnecting') void restoreSaved(false, true);
@@ -158,7 +179,7 @@
   }
   function connected(view: Connection) {
     clearTimeout(reconnectTimer); keptSignIn = null;
-    summaryRequest += 1; connection = view; setup = null; summary = null; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
+    summaryRequest += 1; connection = view; setup = null; summary = null; summaryStepUp = noStepUp; failure = ''; notice = ''; page = 'overview'; staleSignIn = false; connectionLocked = false;
     void loadSummary();
     void invoke<SetupStatus>('worker_setup_status').then(value => { setup = value; }).catch(() => {});
   }
@@ -168,7 +189,7 @@
       const result = await invoke<{ remoteRevoked: boolean; localCleared: boolean; photosCleared: boolean }>('sign_out');
       try { localStorage.removeItem(lastPageKey); } catch { /* Sign-out still succeeds. */ }
       clearTimeout(reconnectTimer); keptSignIn = null;
-      summaryRequest += 1; connection = null; setup = null; summary = null; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
+      summaryRequest += 1; connection = null; setup = null; summary = null; summaryStepUp = noStepUp; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
       notice = !result.localCleared ? 'The secure credential store could not remove your saved sign-in. Unlock it and clear the saved sign-in again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
       void tick().then(focusContent);
@@ -265,8 +286,8 @@
     {#if (connectionLocked || staleSignIn) && !connection}<button class="btn" disabled={busy} onclick={() => restoreSaved(true)}>Restore saved server sign-in</button>{/if}
     {#if (connectionLocked || staleSignIn) && !connection}<button class="btn" disabled={busy} onclick={offlinePhotos}>Offline Albums</button>{/if}
     {#if !native}<p class="preview" role="status">Desktop setup preview. Open the installed app to connect securely.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p>{failure}</p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
-    {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>{notice}</p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert" style="margin:12px 24px 0"><p><ErrorText text={failure} /></p>{#if connection || staleSignIn}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p><ErrorText text={notice} /></p>{#if staleSignIn && !connection && !failure}<button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if staleSignIn && !connection && !failure && !notice}<div class="inline-msg" role="status" style="margin:12px 24px 0"><p>A saved sign-in is still on this computer. Clear it before connecting to a server.</p><button class="btn small" disabled={busy || !native} onclick={() => { signOutSheet = true; }}>Clear saved sign-in</button></div>{/if}
     {#if native && importReady}
       {#key !!connection}
@@ -278,10 +299,10 @@
         <header class="tbar" data-tauri-drag-region><h1 data-tauri-drag-region>Frameleaf</h1></header>
         <div class="wrap" data-saved-sign-in={keptSignIn}>
           <div class="logo"><img src={mark} alt="" /><span>Frameleaf</span></div>
-          <h2>{kept.panel.title}</h2>
+          <h2 tabindex="-1" bind:this={keptTitle}>{kept.panel.title}</h2>
           <p class="sub" role="status">{kept.panel.detail}</p>
           <p>
-            <button class="btn primary" disabled={busy} onclick={() => restoreSaved(true)}>{kept.panel.retry}</button>
+            <button class="btn primary" disabled={busy} onclick={retryKept}>{kept.panel.retry}</button>
             <button class="btn" disabled={busy} onclick={offlinePhotos}>Offline Albums</button>
             <button class="btn quiet" disabled={busy} onclick={() => { signOutSheet = true; }}>Sign out…</button>
           </p>
@@ -290,7 +311,7 @@
     {:else if !connection}
       <Welcome {native} {hostActive} {cloudAccount} onlocked={() => { connectionLocked = true; }} onconnected={connected} oncloudaccount={account => { cloudAccount = account; }} onhostactive={active => { hostActive = active; }} onmanagerchange={() => { managerRevision += 1; }} {managerRevision} onmanagerstate={paired => { managerPaired = paired; }} />
     {:else if page === 'overview' || page === 'ai'}
-      <Overview {connection} {setup} {summary} {native} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target, true)} />
+      <Overview {connection} {setup} {summary} {native} stepUp={summaryStepUp.request} onstepupclose={() => { summaryStepUp = stepUpDismissed; }} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target, true)} />
     {:else if page === 'sources'}
       <PhotoSourcesPage />
     {:else if page === 'manager'}

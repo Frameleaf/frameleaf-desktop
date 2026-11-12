@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '../Icon.svelte';
@@ -99,7 +100,7 @@
   </header>
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s remote access addresses.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={() => { stepUp = null; }} />{/key}{/if}
     {#if notice}<div class="inline-msg" role="status"><p>{notice}</p><button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if remote?.unavailableReason}<div class="inline-msg" role="status"><p>{remote.unavailableReason}</p></div>{:else if remote?.reason && remote.status !== 'ready'}<div class="inline-msg" role="status"><p>{remote.reason}</p></div>{/if}

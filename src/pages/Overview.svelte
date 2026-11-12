@@ -1,17 +1,22 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Icon from '../Icon.svelte';
   import AiLibrary from './AiLibrary.svelte';
+  import StepUp from '../StepUp.svelte';
+  import type { StepUpRequest } from '../sign-in-steps';
   import { workerView, workloadReason } from '../mode-state';
   import { describeError } from '../errors';
   import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
   import { backupHealth, backupWarning, libraryHeadroom, storageWarning } from '../server-health';
 
-  let { connection, setup, summary, native, section = 'all', onsetup, onconnection, onrefresh, onsignout, onopen }: {
+  let { connection, setup, summary, native, section = 'all', stepUp = null, onstepupclose = () => {}, onsetup, onconnection, onrefresh, onsignout, onopen }: {
     connection: Connection; setup: SetupStatus | null; summary: ServerSummary | null; native: boolean; section?: 'all' | 'ai';
+    /** The server refused this page's summary until Two-Step Verification. */
+    stepUp?: StepUpRequest | null; onstepupclose?: () => void;
     onsetup: (value: SetupStatus | null) => void; onconnection: (value: Connection) => void; onrefresh: () => Promise<void> | void; onsignout: () => void; onopen: (page: string) => void;
   } = $props();
   const computer = computerWord(platformFromUserAgent(navigator.userAgent));
@@ -112,7 +117,8 @@
     <button class="btn primary" disabled={busy || !native || connection.state === 'identity-changed'} onclick={photos}><Icon name="open" />Open Photos</button>
   </header>
   <div class="body">
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}{#if failureReference} <small class="muted">Reference: {failureReference}</small>{/if}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} reference={failureReference} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={onstepupclose} />{/key}{/if}
     {#if section === 'all'}
       {#if attention.length}
         <div>
@@ -179,10 +185,10 @@
           </div>
         {/if}
       </div>
-      <div class="group" aria-label="Computer processing status">
+      <div class="group" role="group" aria-label="Computer processing status">
         <div class="row">
           <span class="ic" aria-hidden="true"><Icon name="ai" /></span>
-          <span class="l"><b>{worker.headline}</b><small>{worker.detail}{#if worker.reference} <span class="muted">Reference: {worker.reference}</span>{/if}</small></span>
+          <span class="l"><b>{worker.headline}</b><small><ErrorText text={worker.detail} reference={worker.reference} /></small></span>
           <span class="pill {worker.pill.tone}"><i aria-hidden="true"></i>{worker.pill.label}</span>
           {#if worker.action === 'download-models'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(true)}>Download Models</button>{/if}
           {#if worker.action === 'check-approval'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Approval</button>{/if}
@@ -216,6 +222,8 @@
             <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
           </div>
         {/each}
+        <!-- Read out when AI processing stops and needs the person; routine changes (working, idle) stay quiet. -->
+        <span class="visually-hidden" role="status">{worker.attention === 'needs-you' ? `${worker.headline}. ${worker.detail}` : ''}</span>
       </div>
       <p class="foot">Processing starts only after the selected models pass qualification on this {computer}. Pausing finishes the current task first. When your server’s owner marks this {computer} for the household, it may process other members’ photos (never Locked photos). Server administration uses your existing Frameleaf permissions inside Photos.</p>
     </div>

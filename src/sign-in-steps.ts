@@ -75,3 +75,21 @@ export function verificationRequired(error: unknown): StepOffer | null {
   if (typeof transaction !== 'string' || !transaction) return null;
   return { transaction, methods: Array.isArray(methods) ? methods.filter((method): method is string => typeof method === 'string') : [] };
 }
+
+/** A request the server refused until Two-Step Verification, and how to run it again once verified. */
+export type StepUpRequest = { offer: StepOffer; retry: () => void };
+/** The Verify prompt of a page that loads in the background: the request it answers, or that it was dismissed. */
+export type StepUpState = { request: StepUpRequest | null; dismissed: boolean };
+export const noStepUp: StepUpState = { request: null, dismissed: false };
+export const stepUpDismissed: StepUpState = { request: null, dismissed: true };
+
+/**
+ * The prompt after a background request failed. A refusal that needs Two-Step Verification opens it;
+ * an open prompt is kept as it is (a later refusal carries a new transaction, and replacing the prompt
+ * would discard what is being typed), and a dismissed one stays away until the page is loaded again.
+ */
+export function stepUpAfterFailure(state: StepUpState, error: unknown, retry: () => void): StepUpState {
+  if (state.request || state.dismissed) return state;
+  const offer = verificationRequired(error);
+  return offer ? { request: { offer, retry }, dismissed: false } : state;
+}

@@ -261,8 +261,8 @@ export function signInMethods(options: Pick<SignInOptions, 'frameleafSignIn' | '
 
 /** How one signs in to a server found on this network, as the Welcome list says it. */
 export function nearbySignIn(server: Pick<DiscoveredServer, 'linked' | 'setup'>): string {
-  if (server.linked) return 'Frameleaf or its own login';
-  return server.setup === 'needed' ? 'New server' : 'Its own login';
+  if (server.linked) return 'Frameleaf or its own sign-in';
+  return server.setup === 'needed' ? 'New server' : 'Its own sign-in';
 }
 
 // Region codes Intl names that are not places a person lives (the EU, the UN, "Unknown Region", pseudo-locales).

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import mark from '../mark.svg';
@@ -177,7 +178,7 @@
         </button>
       </div>
     {/if}
-    {#if failure}<div class="inline-msg error notice" class:wide={showServers} role="alert"><p>{failure}</p><button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error notice" class:wide={showServers} role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" type="button" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if notice}<div class="inline-msg notice" class:wide={showServers} role="status"><p>{notice}</p><button class="btn small quiet" type="button" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
 
     {#if mode === 'local-server'}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '../Icon.svelte';
@@ -69,7 +70,7 @@
   </header>
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s Frameleaf Cloud account and plan.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
     {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={() => { stepUp = null; }} />{/key}{/if}
     {#if cloud?.lastError}<div class="inline-msg" role="status"><p>There was a problem checking this server’s Cloud connection. Try refreshing.</p></div>{/if}
     <div>

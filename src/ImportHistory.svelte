@@ -7,6 +7,7 @@
   type Kind = 'folder' | 'camera' | 'watch' | 'drop';
   type Status = 'ready' | 'running' | 'interrupted' | 'complete' | 'cancelled';
   type Entry = { runId: string; kind: Kind; status: Status; createdAt: number | null; album: string | null; verified: number; total: number; skipped: number; skippedReasons?: Record<string, number>; albumPending: boolean; canRetry: boolean };
+  // Sentence fragments for the skipped-file summary below; the full sentence for each code is in errors.ts.
   const skipReasons: Record<string, string> = { source_item_changed: 'changed during the import', source_item_unavailable: 'no longer in the folder', source_item_excluded: 'hidden or excluded', source_item_invalid: 'no longer a photo or video file', source_item_empty: 'empty' };
   const skipSummary = (entry: Entry) => Object.entries(entry.skippedReasons ?? {})
     .map(([code, count]) => `${count.toLocaleString()} ${skipReasons[code] ?? 'not copied'}`).join(', ');

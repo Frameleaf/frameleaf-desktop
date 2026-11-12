@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -7,7 +8,7 @@
   import ImportHistory from './ImportHistory.svelte';
   import Sheet from './Sheet.svelte';
   import PhotoImportDestination from './PhotoImportDestination.svelte';
-  import { albumErrors, type AlbumDestination } from './import-destination';
+  import type { AlbumDestination } from './import-destination';
   import { formatBytes, percent } from './ui-state';
   import { explainError } from './errors';
   type Hint = { label: string; path: string };
@@ -32,62 +33,16 @@
   let revokeSheet = $state(false);
   let detailsOpen = $state(false);
   const native = isTauri();
+  // Wording for codes that mean something narrower on this page (a folder copy, a saved folder permission)
+  // than their shared copy in errors.ts says. Every other code takes the shared copy.
   const errors: Record<string, string> = {
-    ...albumErrors,
-    source_metadata_unavailable: 'File metadata could not be checked safely. Check folder access before resuming; staged data is kept.',
-    source_folder_excluded: 'This folder is hidden or excluded. Choose an ordinary visible photo folder.',
-    source_item_excluded: 'A file or folder became hidden or excluded. Copying stopped before reading it; existing staged data is kept.',
-    source_item_invalid: 'This file is unsupported or linked. Some Windows cloud placeholders cannot be copied yet; export selected photos to an ordinary folder and try there.',
-
-    source_preview_policy_unavailable: 'A download-free folder preview could not be enabled. No preview was started. Try again after restarting the app.',
-    source_inventory_partial: 'The scan reached its safety limit. Choose a smaller photo subfolder for this copy.',
-    source_inventory_unreadable: 'Some entries could not be inspected. Check folder and drive access before preparing the copy again.',
-    source_no_media: 'No supported photo or video files were found in this folder.',
-    source_copy_budget_exceeded: 'This copy exceeds the server’s current size limits. Choose a smaller subfolder or remove unsupported large files from the selected scope.',
-    source_staging_overlap: 'Choose a photo folder outside the app’s own data folder.',
-    source_identity_unavailable: 'The filesystem could not provide a reliable file identity. Copying stopped; staged originals are kept. Try an ordinary local photo folder.',
-    source_root_changed: 'This is no longer the folder you approved. Remove its permission and choose the folder again.',
-    source_watch_local_required: 'Choose a local folder for automatic import.',
-    source_watch_history_full: 'This watched folder reached its import history limit. Existing verified copies are kept.',
-    source_run_terminal: 'The server stopped this copy. Remove the folder permission before starting again.',
-    source_item_changed: 'A selected file changed after the scan. This copy is paused; the original and staged data are kept.',
-    source_cloud_copy_pending: 'This Windows cloud folder can be previewed, but copying its placeholders is still being implemented. Export originals to an ordinary local folder for now.',
-    source_capacity_unavailable: 'Available storage space could not be checked. Reconnect the photo-source and app-storage volumes, then resume.',
-    source_capacity_insufficient: 'There is not enough free space for this original and its staged copy. Free space on the photo-source and app-storage volumes, then resume.',
-    source_run_paused: 'Your server paused this copy before another original was staged. Resume explicitly when ready.',
-    source_server_processing: 'Your server is still finishing this photo. Its staged original is retained; resume the copy when the server is ready.',
-    source_receipt_invalid: 'The server did not confirm the expected healthy original. Copying stopped and the staged original was retained.',
-    source_journal_invalid: 'Saved copy progress could not be verified. Staged originals are retained; do not remove them while investigating.',
-    source_journal_write_failed: 'Copy progress could not be saved. Check local disk space and access before resuming; staged originals are retained.',
-    source_stop_confirmation_pending: 'Copying stopped on this computer. The server could not confirm its stop yet; existing server copies are kept.',
-    source_cache_cleanup_pending: 'The verified copy is on your server, but its local staging cache could not be cleared. Check local file access before resuming.',
-    source_upload_budget_required: 'This saved copy needs an upload allowance before it can send original data. Approve the displayed amount, then resume.',
-    source_upload_budget_exhausted: 'This copy reached its upload allowance. Staged originals are kept. Approve more upload data to retry.',
-    source_copy_cancelled: 'Copying is paused. Resume when you are ready.',
     metered_network: 'Copying is paused on this metered connection. Resume on an unmetered network.',
     network_unknown: 'Network cost could not be determined. Resume when an unmetered connection is available.',
     server_http_409: 'The server refused this copy. Check its source permission and original-file health before resuming; staged data is kept.',
-
-    source_selection_changed: 'The folder selection expired. Choose the folder again.',
-    source_remove_previous_approval: 'Remove the existing folder permission before choosing another folder.',
-    source_photo_session_changed: 'This folder permission belongs to an earlier sign-in. Remove it and approve the folder again.',
-    source_approval_invalid: 'The saved folder permission no longer matches this connection. Remove it before continuing.',
-    credential_store_locked_or_unavailable: 'Unlock your computer’s credential store, then try again.',
     credential_store_unavailable: 'Your computer’s secure credential store is unavailable.',
     credential_record_invalid: 'The saved folder permission could not be read. Remove it before continuing.',
     server_http_404: 'Your server needs the desktop photo-source update before this folder can be registered.',
-    source_server_update_required: 'Your server needs the desktop photo-source update.',
-    source_registration_unavailable: 'The server could not be reached. The local permission is saved; retry registration when connected.',
-    source_registration_response_invalid: 'The server did not confirm this exact folder permission. Copying remains stopped.',
     server_identity_changed: 'The server identity changed. Sign out before reconnecting.',
-
-    source_choose_photo_subfolder: 'Choose a photo folder inside your home folder, rather than your entire home folder.',
-    source_package_requires_provider: 'Apple Photos libraries need the Photos connection. Choose an ordinary folder here.',
-    source_folder_unavailable: 'This folder is unavailable. Check that its drive is connected and you have access.',
-    source_account_unavailable: 'This OneDrive folder moved or is unavailable. Choose its new location.',
-    source_camera_unavailable: 'Reconnect the original camera or card, then choose its folder to resume.',
-    source_camera_changed: 'This folder or card does not match the approved import. Choose the original card or remove this permission to preview a new import. Verified copies stay in your library.',
-    source_camera_identity_unavailable: 'This card could not be identified safely. Remove this permission and preview it again to start a new import.',
   };
   function explain(error: unknown) { return errors[String(error)] ?? explainError(error, 'This operation could not finish. Check the server connection and try again.'); }
   async function loadConsent() {
@@ -201,7 +156,7 @@
   </header>
   <div class="body">
     {#if busy}<div class="inline-msg" role="status"><span class="spin" aria-hidden="true"></span><p>Waiting for the folder or server operation to finish…</p></div>{/if}
-    {#if message}<div class="inline-msg" role="status"><p>{message}</p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
+    {#if message}<div class="inline-msg" role="status"><p><ErrorText text={message} /></p><button class="btn small quiet" onclick={() => { message = ''; }}>Dismiss</button></div>{/if}
     {#if native && !consent && !blockedConsent && !folder}
       <CameraSources {busy} onchoose={(path) => choose(null, path)} />
     {/if}
