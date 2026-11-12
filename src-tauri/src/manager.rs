@@ -217,17 +217,13 @@ pub fn normalize_manager(value: &str) -> Result<url::Url, String> {
     }
     Ok(url)
 }
-/// Plain HTTP would carry the Manager password unencrypted, so it is accepted only for a Manager
-/// on this computer.
+/// A Manager on this computer or the home network is reached over plain HTTP: nobody can get a
+/// certificate for a local host. Only a Manager reached over the internet must use HTTPS, because
+/// HTTP would carry its password across networks the owner does not control.
 pub fn require_encrypted(origin: &str) -> Result<(), String> {
     let url = normalize_manager(origin)?;
-    let loopback = match url.host() {
-        Some(url::Host::Domain(name)) => name == "localhost",
-        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
-        Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
-        None => false,
-    };
-    if url.scheme() == "http" && !loopback {
+    let local = url.host().is_some_and(crate::connection::is_local_network);
+    if url.scheme() == "http" && !local {
         return Err("manager_https_required".into());
     }
     Ok(())

@@ -40,8 +40,7 @@
     catch { return null; }
   });
   const http = $derived(address?.protocol === 'http:');
-  // Plain HTTP is accepted only for a Manager on this computer; the backend enforces the same rule.
-  const insecure = $derived(http && !['127.0.0.1', '[::1]', 'localhost'].includes(address?.hostname ?? ''));
+  // Plain HTTP is accepted for a Manager on this computer or the home network; the backend enforces the rule.
   let password = $state('');
   let pem = $state('');
   let fingerprint = $state('');
@@ -469,10 +468,10 @@
         <div class="group-head"><h2 class="group-title">Pair with Frameleaf Manager</h2></div>
         <form class="group" onsubmit={pair}>
           <fieldset disabled={busy || !native} style="border:0;padding:0;margin:0;min-width:0">
-            <div class="form-row"><label for="manager-origin">Manager address</label><input id="manager-origin" type="url" bind:value={origin} placeholder="https://tower.local:2282" required autocomplete="url" /></div>
+            <div class="form-row"><label for="manager-origin">Manager address</label><input id="manager-origin" type="url" bind:value={origin} placeholder="http://192.168.1.10:2282" required autocomplete="url" /></div>
             <div class="form-row"><label for="manager-password">Manager password</label><input id="manager-password" type="password" bind:value={password} required maxlength="256" autocomplete="current-password" /></div>
             {#if http}
-              <div class="form-row"><span></span><p class="hint" style="margin:0">{insecure ? 'Use an HTTPS address. HTTP sends your Manager password without encryption, so it is accepted only for a Manager on this computer.' : 'HTTP sends sign-in and management traffic without encryption. It is accepted only for a Manager on this computer.'}</p></div>
+              <div class="form-row"><span></span><p class="hint" style="margin:0">HTTP is for a Manager on this computer or your home network. Use HTTPS for a Manager reached over the internet.</p></div>
             {:else}
               <div class="form-row"><span></span><span><label class="check"><input type="checkbox" bind:checked={showCertificate} />Use a certificate for a private Manager</label></span></div>
               {#if showCertificate}
@@ -492,7 +491,7 @@
               <label class="check" style="margin-top:8px"><input type="checkbox" bind:checked={allowRecovery} />Also allow backup recovery reviews and restore operations.</label>
             </span></div>
             <div class="form-row"><span></span><span class="actions">
-              <button class="btn primary" disabled={!allowManagement || insecure || (!http && !!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
+              <button class="btn primary" disabled={!allowManagement || (!http && !!pem.trim() && (!fingerprint || !certificateApproved))}>{busy ? 'Pairing…' : 'Pair with Manager'}</button>
               <button class="btn quiet" type="button" disabled={busy || !native} onclick={() => perform(() => restore(true))}>Restore saved Manager access</button>
             </span></div>
           </fieldset>
