@@ -145,8 +145,8 @@ test('sign-in methods follow the server: Frameleaf only when linked, OAuth by it
   assert.deepEqual(signInMethods({ ...base, linked: false }), { frameleaf: false, password: true, oauth: '' });
   assert.deepEqual(signInMethods({ ...base, passwordLogin: false, oauth: true, oauthButtonText: ' Authentik ' }), { frameleaf: true, password: false, oauth: 'Authentik' });
   assert.equal(signInMethods({ ...base, oauth: true }).oauth, 'Sign In with Single Sign-On');
-  assert.equal(nearbySignIn({ linked: true, setup: 'needed' }), 'Frameleaf or its own login');
-  assert.equal(nearbySignIn({ linked: false, setup: 'complete' }), 'Its own login');
+  assert.equal(nearbySignIn({ linked: true, setup: 'needed' }), 'Frameleaf or its own sign-in');
+  assert.equal(nearbySignIn({ linked: false, setup: 'complete' }), 'Its own sign-in');
   assert.equal(nearbySignIn({ linked: false, setup: 'needed' }), 'New server');
 });
 

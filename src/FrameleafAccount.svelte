@@ -182,7 +182,7 @@
     {#if mode === 'create'}
       <p>Already have an account? <button class="link" type="button" onclick={() => { mode = 'sign-in'; failure = ''; }}>Sign in</button></p>
     {:else}
-      <p>New to Frameleaf? <button class="link" type="button" onclick={() => { mode = 'create'; failure = ''; }}>Create an account</button>. <button class="link" type="button" onclick={onownlogin}>Use my server’s own login instead</button>.</p>
+      <p>New to Frameleaf? <button class="link" type="button" onclick={() => { mode = 'create'; failure = ''; }}>Create an account</button>. <button class="link" type="button" onclick={onownlogin}>Use my server’s own sign-in instead</button>.</p>
       <button class="btn quiet" type="button" disabled={busy || !native} onclick={onbrowser}>Use a Passkey in My Browser</button>
     {/if}
     <button class="btn quiet" type="button" disabled={busy} onclick={onback}>Back</button>

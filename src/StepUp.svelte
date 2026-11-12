@@ -28,7 +28,7 @@
 </script>
 
 <div class="inline-msg" role="alert">
-  <p>This needs Two-Step Verification.{step.method ? '' : ' Set it up for your login on the server’s web page, or sign out and sign in again with a Passkey.'}</p>
+  <p>This needs Two-Step Verification.{step.method ? '' : ' Set it up for your account on the server’s web page, or sign out and sign in again with a Passkey.'}</p>
   {#if step.method}<button class="btn small" type="button" onclick={() => { open = true; }}>Verify</button>{/if}
   <button class="btn small quiet" type="button" onclick={onclose}>Dismiss</button>
 </div>

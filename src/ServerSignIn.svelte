@@ -99,7 +99,7 @@
         {#if methods.frameleaf}<button class="btn primary" type="button" disabled={busy || !native} onclick={withFrameleaf}><Icon name="cloud" />{busy ? 'Signing in…' : 'Sign In with Frameleaf'}</button>{/if}
         {#if methods.oauth}<button class="btn" type="button" disabled={busy || !native} onclick={withProvider}>{busy ? 'Signing in…' : methods.oauth}</button>{/if}
       {:else}
-        <p class="sub">Ask the person who runs this server to link it to Frameleaf, or turn on Two-Step Verification for your login on the server’s web page.</p>
+        <p class="sub">Ask the person who runs this server to link it to Frameleaf, or turn on Two-Step Verification for your account on the server’s web page.</p>
       {/if}
     {/if}
   </form>
@@ -115,14 +115,14 @@
       <button class="btn primary" type="button" disabled={busy || !native} onclick={withFrameleaf}><Icon name="cloud" />{busy ? 'Signing in…' : 'Sign In with Frameleaf'}</button>
     {/if}
     {#if methods.oauth}
-      {#if methods.frameleaf}<div class="or" role="separator">or use this server’s login</div>{/if}
+      {#if methods.frameleaf}<div class="or" role="separator">or use this server’s sign-in</div>{/if}
       <!-- The administrator's own label; primary only when it is the server's sole method. -->
       <button class="btn" class:primary={!methods.frameleaf && !methods.password} type="button" disabled={busy || !native} onclick={withProvider}>{busy ? 'Signing in…' : methods.oauth}</button>
       {#if !methods.frameleaf && !methods.password}<p class="sub">A sign-in window opens for {methods.oauth}. It stores nothing after you finish.</p>{/if}
     {/if}
     {#if methods.password}
-      {#if methods.frameleaf || methods.oauth}<div class="or" role="separator">{methods.oauth ? 'or with email and Password' : 'or use this server’s login'}</div>{:else}<h3>This server’s login</h3>{/if}
-      <form id="server-login" aria-label="This server’s login" onsubmit={withPassword}>
+      {#if methods.frameleaf || methods.oauth}<div class="or" role="separator">{methods.oauth ? 'or with email and Password' : 'or use this server’s sign-in'}</div>{:else}<h3>This server’s sign-in</h3>{/if}
+      <form id="server-login" aria-label="This server’s sign-in" onsubmit={withPassword}>
         <div class="form-row"><label for="sl-em">Account</label><span class="two"><input id="sl-em" type="email" placeholder="Email" bind:value={email} required disabled={busy} autocomplete="username" /><input id="sl-pw" type="password" placeholder="Password" aria-label="Password" bind:this={passwordField} bind:value={password} required disabled={busy} autocomplete="current-password" /></span></div>
       </form>
     {/if}
@@ -130,14 +130,14 @@
       <div class="inline-msg" role="note"><p>This server isn’t linked to Frameleaf, so Sign in with Frameleaf doesn’t work here yet. If you run it, you can link it after you sign in.</p></div>
     {/if}
     {#if !methods.oauth && !methods.password && !methods.frameleaf}
-      <div class="inline-msg error" role="alert"><p>This server doesn’t offer a way to sign in from this app. Ask the person who runs it to turn on password login or link it to Frameleaf.</p></div>
+      <div class="inline-msg error" role="alert"><p>This server doesn’t offer a way to sign in from this app. Ask the person who runs it to turn on Password sign-in or link it to Frameleaf.</p></div>
     {/if}
     {#if methods.password || methods.frameleaf || methods.oauth}
       <div class="form-row"><label for="sl-nm">This {computer}’s name</label><input id="sl-nm" type="text" bind:value={deviceName} required maxlength="128" disabled={busy} autocomplete="off" /></div>
     {/if}
   </div>
   <div class="wfoot">
-    <p>No login for this server? The person who runs it adds you on the server’s web page; you can’t make one here.{methods.password ? ' Your Password is used only to sign in and is never saved.' : ''}</p>
+    <p>No account on this server? The person who runs it adds you on the server’s web page; you can’t make one here.{methods.password ? ' Your Password is used only to sign in and is never saved.' : ''}</p>
     {#if methods.password}<button class="btn" class:primary={!methods.frameleaf} type="submit" form="server-login" disabled={busy || !native || !email || !password}>{busy ? 'Signing in…' : 'Sign In'}</button>{/if}
   </div>
 {/if}
