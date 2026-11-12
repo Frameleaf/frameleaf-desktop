@@ -20,6 +20,7 @@ mod host_storage;
 mod identity_anchor;
 mod import_album;
 pub mod lifecycle;
+mod macos_quit;
 pub mod manager;
 mod manager_commands;
 pub mod manager_host;
@@ -826,6 +827,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let Err(error) = window_close::guard_app_quit(app.handle()) {
                 eprintln!("app menu unavailable: {error}");
+            }
+            // Dock Quit and a logout, restart or shutdown go through the exit guard too.
+            #[cfg(target_os = "macos")]
+            if let Err(error) = macos_quit::install(app.handle()) {
+                eprintln!("quit guard unavailable: {error}");
             }
             Ok(())
         })
