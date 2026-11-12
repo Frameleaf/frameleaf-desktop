@@ -75,10 +75,6 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -93,7 +89,7 @@ jobs:
           python-version: '3.12'
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - run: npm ci
@@ -248,6 +244,15 @@ jobs:
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
+      - name: Install the Linux package in clean Ubuntu and Debian containers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
       - name: Collect installers
         shell: python
         run: |

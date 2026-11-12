@@ -68,6 +68,25 @@ Keep the final result and hashes, and discard the account and its terminal
 transcript after the run. This is a manual qualification on the identified
 installed bytes.
 
+## Supported systems
+
+### Linux tray library
+
+The tray icon loads `libayatana-appindicator3.so.1` at run time and falls back
+to `libappindicator3.so.1`; it is not a link-time dependency of the binary. The
+package dependency is chosen by the Tauri bundler from the development package
+present at build time, so every Linux build job installs
+`libayatana-appindicator3-dev`. The `.deb` then depends on
+`libayatana-appindicator3-1`, which Ubuntu 22.04, Ubuntu 24.04 and Debian 12
+ship; `libappindicator3-1` is not in Debian 12. The AUR package depends on
+`libayatana-appindicator`.
+
+`tools/qualify_linux_deb_install.sh PACKAGE.deb` installs the package with
+`apt-get install` in clean `ubuntu:24.04`, `ubuntu:22.04` and `debian:12`
+containers and fails on an unmet dependency or a missing tray dependency. It
+also reports, as a warning, a distribution whose C library is too old to load
+the installed binaries. `Desktop candidate` runs it on every pull request.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers
