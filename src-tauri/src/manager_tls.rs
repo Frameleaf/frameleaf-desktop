@@ -478,8 +478,8 @@ impl TlsIdentity {
         let key = KeyPair::generate().map_err(|_| "native_tls_generation_failed")?;
         let mut params =
             CertificateParams::new(vec![host]).map_err(|_| "native_tls_generation_failed")?;
-        let now = OffsetDateTime::from_unix_timestamp(now)
-            .map_err(|_| "native_tls_generation_failed")?;
+        let now =
+            OffsetDateTime::from_unix_timestamp(now).map_err(|_| "native_tls_generation_failed")?;
         params.not_before = now - Duration::minutes(5);
         params.not_after = now + Duration::days(365);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -884,16 +884,22 @@ mod tests {
                 let attempt = start_signed_by(vault, signer, at).unwrap();
                 attempt.identity.expires_at > at
                     && (attempt.identity.certificate_pem == held.certificate_pem
-                        || attempt.handover.as_ref().is_some_and(|handover| {
-                            handed_over(handover, held, &attempt.identity)
-                        }))
+                        || attempt
+                            .handover
+                            .as_ref()
+                            .is_some_and(|handover| handed_over(handover, held, &attempt.identity)))
             })
         };
         let saved = |vault: &Memory| -> TlsIdentity {
-            vault.load(&format!("native-manager-tls-{}", binding())).unwrap().unwrap()
+            vault
+                .load(&format!("native-manager-tls-{}", binding()))
+                .unwrap()
+                .unwrap()
         };
         let waiting = |vault: &Memory| -> Option<Pending> {
-            vault.load(&format!("native-manager-tls-next-{}", binding())).unwrap()
+            vault
+                .load(&format!("native-manager-tls-next-{}", binding()))
+                .unwrap()
         };
         // C valid or expired, no P: Manager can only hold C.
         for at in [now + 10 * DAY, now + 340 * DAY, now + 400 * DAY] {
@@ -944,7 +950,8 @@ mod tests {
                     &Pending {
                         schema_version: 1,
                         operation_id: uuid::Uuid::new_v4(),
-                        identity: serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap(),
+                        identity: serde_json::from_value(serde_json::to_value(&p).unwrap())
+                            .unwrap(),
                         earlier: Vec::new(),
                     },
                 )
@@ -953,7 +960,10 @@ mod tests {
             assert!(startable(&vault, held, now + DAY), "C valid, P expired");
             // And the start that does not renew still presents C.
             assert_eq!(
-                start(&vault, false, now + DAY).unwrap().identity.certificate_pem,
+                start(&vault, false, now + DAY)
+                    .unwrap()
+                    .identity
+                    .certificate_pem,
                 c.certificate_pem
             );
         }
@@ -968,11 +978,22 @@ mod tests {
         let recovered = start_signed_by(&vault, 0, now + 720 * DAY).unwrap();
         assert_eq!(recovered.signers, 2);
         assert!(recovered.identity.expires_at > now + 720 * DAY);
-        assert!(handed_over(recovered.handover.as_ref().unwrap(), &c, &recovered.identity));
+        assert!(handed_over(
+            recovered.handover.as_ref().unwrap(),
+            &c,
+            &recovered.identity
+        ));
         // The second attempt of the same start hands over from the renewal that ran out.
         let second = start_signed_by(&vault, 1, now + 720 * DAY).unwrap();
-        assert_eq!(second.identity.certificate_pem, recovered.identity.certificate_pem);
-        assert!(handed_over(second.handover.as_ref().unwrap(), &p, &second.identity));
+        assert_eq!(
+            second.identity.certificate_pem,
+            recovered.identity.certificate_pem
+        );
+        assert!(handed_over(
+            second.handover.as_ref().unwrap(),
+            &p,
+            &second.identity
+        ));
         assert_eq!(
             second.certificates,
             [
@@ -985,7 +1006,10 @@ mod tests {
         // Once Manager is seen with the new identity, it is the identity and the rest goes.
         TlsIdentity::promote_in(&vault, &binding()).unwrap();
         let settled = start(&vault, true, now + 721 * DAY).unwrap();
-        assert_eq!(settled.identity.certificate_pem, recovered.identity.certificate_pem);
+        assert_eq!(
+            settled.identity.certificate_pem,
+            recovered.identity.certificate_pem
+        );
         assert!(settled.handover.is_none() && settled.signers == 0);
         // An older Manager is still never renewed, and says the identity has expired.
         let vault = Memory::default();
@@ -1000,9 +1024,16 @@ mod tests {
         let vault = Memory::default();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let first = start(&vault, false, now).unwrap();
-        let moved =
-            TlsIdentity::for_start_in(&vault, ID, "https://127.0.0.1:9444", &binding(), false, 0, now)
-                .unwrap();
+        let moved = TlsIdentity::for_start_in(
+            &vault,
+            ID,
+            "https://127.0.0.1:9444",
+            &binding(),
+            false,
+            0,
+            now,
+        )
+        .unwrap();
         assert_eq!(
             moved.identity.certificate_pem,
             first.identity.certificate_pem
@@ -1020,7 +1051,9 @@ mod tests {
             );
         }
         for origin in ["http://127.0.0.1:9444", "https://127.0.0.1:9444/"] {
-            assert!(TlsIdentity::for_start_in(&vault, ID, origin, &binding(), true, 0, now).is_err());
+            assert!(
+                TlsIdentity::for_start_in(&vault, ID, origin, &binding(), true, 0, now).is_err()
+            );
         }
     }
     #[test]

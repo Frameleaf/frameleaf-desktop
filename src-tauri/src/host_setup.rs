@@ -1723,27 +1723,45 @@ mod tests {
         };
         let failed = |code: &str| Err::<&'static str, String>(code.to_string());
         // Nothing to renew: one attempt, whatever it returns.
-        assert_eq!(run(0, vec![Ok("started")], false), (Ok("started"), vec![Some(0)]));
+        assert_eq!(
+            run(0, vec![Ok("started")], false),
+            (Ok("started"), vec![Some(0)])
+        );
         assert_eq!(
             run(0, vec![failed("local_port_in_use_2283")], false),
             (failed("local_port_in_use_2283"), vec![Some(0)])
         );
         // A renewal that succeeds needs no second attempt.
-        assert_eq!(run(1, vec![Ok("renewed")], false), (Ok("renewed"), vec![Some(0)]));
+        assert_eq!(
+            run(1, vec![Ok("renewed")], false),
+            (Ok("renewed"), vec![Some(0)])
+        );
         // A renewal that fails: the earlier identity is tried, without renewing.
         assert_eq!(
-            run(1, vec![failed("native_manager_exited"), Ok("rolled back")], false),
+            run(
+                1,
+                vec![failed("native_manager_exited"), Ok("rolled back")],
+                false
+            ),
             (Ok("rolled back"), vec![Some(0), None])
         );
         // Manager may hold either of two identities: the second signer is tried before that.
         assert_eq!(
-            run(2, vec![failed("native_manager_exited"), Ok("renewed")], false),
+            run(
+                2,
+                vec![failed("native_manager_exited"), Ok("renewed")],
+                false
+            ),
             (Ok("renewed"), vec![Some(0), Some(1)])
         );
         assert_eq!(
             run(
                 2,
-                vec![failed("native_manager_exited"), failed("other"), Ok("rolled back")],
+                vec![
+                    failed("native_manager_exited"),
+                    failed("other"),
+                    Ok("rolled back")
+                ],
                 false
             ),
             (Ok("rolled back"), vec![Some(0), Some(1), None])
@@ -1759,7 +1777,10 @@ mod tests {
                 ],
                 false
             ),
-            (failed("native_manager_exited"), vec![Some(0), Some(1), None])
+            (
+                failed("native_manager_exited"),
+                vec![Some(0), Some(1), None]
+            )
         );
         // A start the person cancelled is not started again.
         assert_eq!(
@@ -1837,11 +1858,17 @@ mod tests {
         }
         // No grant, or one already in step: nothing to save, and the identity is settled.
         let unsaved = |_: &SavedManager| -> Result<(), String> { panic!("nothing to save") };
-        assert!(settled(follow_grant(&configuration, &renewed, &[old.clone()], || Ok(None), unsaved)));
         assert!(settled(follow_grant(
             &configuration,
             &renewed,
-            &[old.clone()],
+            std::slice::from_ref(&old),
+            || Ok(None),
+            unsaved
+        )));
+        assert!(settled(follow_grant(
+            &configuration,
+            &renewed,
+            std::slice::from_ref(&old),
             || Ok(Some(grant(&renewed))),
             unsaved
         )));
@@ -1850,7 +1877,7 @@ mod tests {
         let unread = follow_grant(
             &configuration,
             &renewed,
-            &[old.clone()],
+            std::slice::from_ref(&old),
             || Err("credential_store_unavailable".into()),
             unsaved,
         );
@@ -1859,7 +1886,7 @@ mod tests {
         let unwritten = follow_grant(
             &configuration,
             &renewed,
-            &[old.clone()],
+            std::slice::from_ref(&old),
             || Ok(Some(grant(&old))),
             |_| Err("credential_store_unavailable".into()),
         );
