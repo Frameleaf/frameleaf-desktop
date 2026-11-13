@@ -128,8 +128,8 @@ test("an export that does not verify, or is not this permit's, is refused before
   }
   // With no export at all there is nothing to restore.
   const f = await fixture(t);
-  await assert.rejects(carryHostRestore(f.restoring(), never), /host_carry_/);
-  assert.equal((await readdir(f.state)).includes("restore-targets"), false);
+  await assert.rejects(carryHostRestore(f.restoring(), never), /host_carry_export_invalid/);
+  assert.deepEqual(await readdir(f.state), []);
 });
 
 test("a step that is told to stop before it starts changes nothing", { skip }, async t => {

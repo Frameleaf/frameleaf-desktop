@@ -870,9 +870,12 @@ mod tests {
             .carry_forward_database(ID, &sha(), &next, &permit, &reference)
             .unwrap();
         // Once: the journal no longer names the previous package.
-        assert!(owner
-            .carry_forward_database(ID, &sha(), &next, &permit, &reference)
-            .is_err());
+        assert_eq!(
+            owner
+                .carry_forward_database(ID, &sha(), &next, &permit, &reference)
+                .unwrap_err(),
+            "host_controller_binding_changed"
+        );
         drop(owner);
         let after = Owner::peek(&fixture.0).unwrap().unwrap();
         assert_eq!(after.manifest_sha256, next);
@@ -915,7 +918,7 @@ mod tests {
             }),
             // One in the new directory.
             (
-                "host_database_reference_invalid",
+                "host_process_state_requires_review",
                 |fixture, _, reference| {
                     let database = reference.resolve(&fixture.0).unwrap();
                     fs::write(database.join("postmaster.pid"), b"1").unwrap()
@@ -959,16 +962,7 @@ mod tests {
             let refusal = owner
                 .carry_forward_database(ID, &sha(), &next, &permit, &reference)
                 .unwrap_err();
-            // The second case is refused either way: by the reference, which never names a
-            // directory holding a process file, or by the explicit check behind it.
-            if index == 1 {
-                assert!(
-                    refusal == code || refusal == "host_process_state_requires_review",
-                    "{refusal}"
-                );
-            } else {
-                assert_eq!(refusal, code, "case {index}");
-            }
+            assert_eq!(refusal, code, "case {index}");
             assert_eq!(owner.read().unwrap(), Some(before), "case {index}");
         }
         // A library that did not stop cleanly is not carried at all, not even for its export.

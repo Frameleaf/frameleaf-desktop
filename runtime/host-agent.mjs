@@ -1968,7 +1968,9 @@ export async function carryHostRestore(configuration, stopping) {
   try {
     validateConfig(c);
     if (c.mode !== "carry-restore") fail("host_carry_config_invalid");
-    const carry = carryConfig(c), paths = await carryPaths(c, carry.permitId, false);
+    const carry = carryConfig(c);
+    // Without this permit's records there is no export to restore.
+    const paths = await carryPaths(c, carry.permitId, false).catch(() => fail("host_carry_export_invalid"));
     const exported = await readCarryExport(c, carry, paths, check) ?? fail("host_carry_export_invalid");
     const prior = await readCarryRestore(c, carry, paths, exported);
     if (prior) return prior;
