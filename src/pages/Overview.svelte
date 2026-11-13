@@ -42,7 +42,8 @@
   type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; uploadRemaining: number | null; overall?: OverallProgress | null };
   let consent = $state<Consent | null>(null);
   let job = $state<CopyJob | null>(null);
-  // FD-60: the GPU runtime pack this computer can download. Nothing is fetched until Download.
+  // FD-60: the GPU runtime pack this computer can download, shown where this computer does AI
+  // processing. Nothing is fetched until Download.
   let pack = $state<AcceleratedPack | null>(null);
   let packBusy = $state(false);
   const packView = $derived(acceleratedPackView(pack, setup?.providers, formatBytes, code => explainError(code)));
@@ -246,7 +247,7 @@
             </span>
           </div>
         {/if}
-        {#if section === 'ai' && packView}
+        {#if section === 'ai' && packView && canControl}
           <div class="row top">
             <span class="l">
               <b>{packView.title}</b>
