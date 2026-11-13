@@ -1021,6 +1021,7 @@ pub fn run() {
 
 fn worker_paths(app: &tauri::AppHandle) -> Result<worker_setup::SetupPaths, String> {
     Ok(worker_setup::SetupPaths {
+        app_version: app.package_info().version.to_string(),
         data: app
             .path()
             .app_local_data_dir()
