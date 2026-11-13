@@ -13,8 +13,9 @@ use std::{
 };
 
 const DAY: i64 = 24 * 60 * 60;
-/// How often an operation is asked about. Manager allows one address 120 paired requests in
-/// ten minutes, and refuses the rest of those ten minutes once that is spent.
+/// How often an operation is asked about: every five seconds, and every fifteen while its
+/// states are sampled, because a sampled poll asks more than once. Manager allows one address
+/// 120 paired requests in ten minutes, and refuses the rest of those ten minutes once spent.
 const POLL: Duration = Duration::from_secs(5);
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()

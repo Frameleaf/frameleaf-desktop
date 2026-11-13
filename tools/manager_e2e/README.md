@@ -48,7 +48,7 @@ about 25 GB in Docker's disk, and network access to GitHub, nodejs.org, crates.i
 - Only Linux x86_64 runs; macOS and Windows differ in how the controller is protected and owned.
 
 Manager allows one address 120 paired requests in ten minutes, so the tests ask about a running
-operation every five seconds. Every start verifies the whole package, which takes a minute or
+operation every five seconds, and every fifteen while they sample its states. Every start verifies the whole package, which takes a minute or
 more under emulation.
 
 ## Cleaning up
