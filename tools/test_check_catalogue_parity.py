@@ -120,6 +120,29 @@ class CatalogueParity(unittest.TestCase):
             ["runtime profile cpu-ort: no catalogue profile for CPUExecutionProvider @bbbbbbbb"],
         )
 
+    def test_accelerated_runtime_needs_processor_profiles_for_its_own_source(self):
+        # The pack's processor manifest is the fallback and names the accelerated source.
+        runtime = copy.deepcopy(RUNTIME)
+        runtime["profiles"]["coreml-ort"] = {
+            "provider": "CoreMLExecutionProvider",
+            "sourceRevision": "c" * 40,
+        }
+        cpu = runtime["profiles"]["cpu-ort"]["sourceRevision"]
+        accelerated = profile(provider="CoreMLExecutionProvider")
+        accelerated["runtimeSourceRevision"] = "c" * 40
+        base = profile()
+        base["runtimeSourceRevision"] = cpu
+        self.assertEqual(
+            source_differences(runtime, catalogue(base, accelerated)),
+            [
+                "runtime profile coreml-ort: no catalogue profile for the processor manifest "
+                "of its pack @cccccccc"
+            ],
+        )
+        twin = profile()
+        twin["runtimeSourceRevision"] = "c" * 40
+        self.assertEqual(source_differences(runtime, catalogue(base, accelerated, twin)), [])
+
 
 if __name__ == "__main__":
     unittest.main()
