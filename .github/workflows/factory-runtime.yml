@@ -1,4 +1,5 @@
 name: Factory desktop runtime
+run-name: Factory desktop runtime epoch ${{ inputs.epoch }} (${{ inputs.platforms }}, ${{ inputs.accelerated }})
 on:
   workflow_dispatch:
     inputs:
@@ -6,11 +7,11 @@ on:
         description: 'Runtime targets (Windows can be built independently)'
         type: choice
         default: macos-linux
-        options: [macos-linux, all, linux, windows, macos-aarch64]
+        options: [macos-linux, all, macos, linux, windows, macos-aarch64, macos-x86_64, linux-x86_64, linux-aarch64]
       epoch:
-        description: 'Runtime epoch admitted by the release policy'
+        # No default: a remembered number below one already used is refused by installed apps.
+        description: 'Runtime epoch: above highestUsedEpoch in runtime/factory-epochs.json (see docs/releases.md)'
         type: string
-        default: '7'
         required: true
       accelerated:
         description: 'GPU manifest: default = CoreML on macos-aarch64; none = processor only; cuda-ort / openvino-ort = that pack on Windows and Linux x86_64 (unverified on hardware)'
@@ -41,14 +42,11 @@ jobs:
           RUNTIME_EPOCH: ${{ inputs.epoch }}
           RUNTIME_ACCELERATED: ${{ inputs.accelerated }}
         run: |
+          node tools/release_prerequisites.mjs factory-epoch "$RUNTIME_EPOCH"
           node --input-type=module <<'JS'
-          import { appendFileSync, readFileSync } from 'node:fs';
+          import { appendFileSync } from 'node:fs';
           import { releaseMatrix } from './tools/release_inputs.mjs';
           import { factoryProfileFor, factorySourceRevisionFor } from './tools/factory_runtime.mjs';
-          const trust = JSON.parse(readFileSync('runtime/release-trust.json'));
-          const epoch = Number(process.env.RUNTIME_EPOCH);
-          if (!/^[1-9][0-9]*$/.test(process.env.RUNTIME_EPOCH) || !Number.isSafeInteger(epoch) || epoch < trust.minimumRuntimeEpoch)
-            throw new Error('runtime_factory_epoch_invalid');
           const matrix = releaseMatrix(process.env.RELEASE_PLATFORMS);
           for (const item of matrix.include) {
             item.profile = factoryProfileFor(item.target, process.env.RUNTIME_ACCELERATED);
