@@ -22,7 +22,8 @@ class PortableExecutableTests(unittest.TestCase):
         self.assertIn("LoadLibraryW", kernel.exports())
         # The interpreter's own library: everything it imports is in its folder or the system's.
         home = Path(sys.base_prefix)
-        library = next(home.glob("python3*.dll"))
+        # python312.dll, not python3.dll (which only forwards to it).
+        library = home / f"python{sys.version_info.major}{sys.version_info.minor}.dll"
         imports = PortableExecutable(library).imports()
         self.assertTrue(any(name.lower() == "kernel32.dll" for name in imports))
         self.assertEqual(unsatisfied(library, [home, system]), {})
