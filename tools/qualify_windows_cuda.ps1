@@ -31,7 +31,9 @@ A git checkout of Frameleaf/frameleaf-app. It is switched to the pack's source r
 it the repository is cloned into -Work.
 
 .PARAMETER Work
-Where the pack, models and build go. Default: %LOCALAPPDATA%\frameleaf-cuda-hardware.
+Where the pack, models and build go. Default: %LOCALAPPDATA%\frameleaf-cuda-hardware. It must be
+a folder only this user can write to (under the user's profile): the app refuses to keep models
+anywhere else.
 
 .PARAMETER Output
 Where the evidence goes. Default: <Work>\evidence.

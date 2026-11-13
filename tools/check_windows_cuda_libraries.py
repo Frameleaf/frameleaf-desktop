@@ -112,8 +112,12 @@ def over_budget(names: list[str]) -> list[str]:
     return sorted(name for name in names if len(name) > PATH_BUDGET)
 
 
-def child(site: Path, session: bool) -> dict:
-    """Inside the interpreter started the way the app starts it."""
+def child(site: Path, stage: str) -> dict:
+    """Inside the interpreter started the way the app starts it.
+
+    One stage per process, so one does not load what the next is looking for: `cudnn` has cuDNN
+    load its own parts, `names` opens each library by name and imports the runtime, `session`
+    is `names` and then a CUDA session."""
     import contextlib
     import ctypes
     import io
@@ -150,20 +154,10 @@ def child(site: Path, session: bool) -> dict:
     carried = sorted({row["needs"].lower() for row in rows if not row["pack"].startswith(("absent", "MISSING"))})
     result["afterPreload"] = {name: loaded(name) for name in carried}
 
-    # cuDNN opens its parts by name the first time each is used; these calls need no card.
-    result["cudnn"] = {}
-    try:
-        cudnn = ctypes.WinDLL("cudnn64_9.dll", winmode=0)
-        cudnn.cudnnGetVersion.restype = ctypes.c_size_t
-        result["cudnn"]["version"] = cudnn.cudnnGetVersion()
-        for part in ("Ops", "Cnn", "Adv", "Graph"):
-            status = getattr(cudnn, f"cudnn{part}VersionCheck")()
-            result["cudnn"][part] = status
-            if status != 0:
-                problems.append(f"cuDNN could not use its {part} library (status {status})")
-    except (OSError, AttributeError) as error:
-        problems.append(f"cuDNN could not be opened by name: {error}")
-    result["afterCudnn"] = {name: loaded(name) for name in carried}
+    if stage == "cudnn":
+        result["cudnn"] = cudnn_parts(problems)
+        result["afterCudnn"] = {name: loaded(name) for name in carried}
+        return result
 
     # What native code gets from LoadLibrary("<name>"): the standard search, as NVIDIA's libraries use.
     result["byName"] = {}
@@ -193,9 +187,12 @@ def child(site: Path, session: bool) -> dict:
             if len(name) > PATH_BUDGET:
                 deep.append(name)
     result["importedOverBudget"] = sorted(deep)
-    problems += [f"imported from a path too deep for Windows without long-path support: {name}" for name in sorted(deep)]
+    problems += [
+        f"imported from a path too deep for Windows without long-path support ({len(name)} > {PATH_BUDGET}): {name}"
+        for name in sorted(deep)
+    ]
 
-    if session:
+    if stage == "session":
         import numpy as np
         import onnx
         import psutil
@@ -227,25 +224,61 @@ def child(site: Path, session: bool) -> dict:
     return result
 
 
+def cudnn_parts(problems: list[str]) -> dict:
+    """cuDNN opens its parts by name the first time each is used. These calls need no card; when
+    a part is not found cuDNN ends the process, which the caller reports."""
+    import ctypes
+
+    parts: dict = {}
+    try:
+        cudnn = ctypes.WinDLL("cudnn64_9.dll", winmode=0)
+        cudnn.cudnnGetVersion.restype = ctypes.c_size_t
+        parts["version"] = cudnn.cudnnGetVersion()
+        for part in ("Ops", "Cnn", "Adv", "Graph"):
+            status = getattr(cudnn, f"cudnn{part}VersionCheck")()
+            parts[part] = status
+            if status != 0:
+                problems.append(f"cuDNN could not use its {part} library (status {status})")
+    except (OSError, AttributeError) as error:
+        problems.append(f"cuDNN could not be opened by name: {error}")
+    return parts
+
+
 def start_libraries(ort) -> list[str]:
     """The provider library and what onnxruntime's own list preloads on Windows."""
     return [PROVIDER_LIBRARY] + [parts[-1] for parts in ort._get_nvidia_dll_paths(True, True, True)]
 
 
-def run_child(pack: Path, folders: list[Path], session: bool) -> dict:
-    """Start the pack's interpreter as `VerifiedRuntime::launch` does on Windows."""
+def run_child(pack: Path, folders: list[Path], stage: str, home: bool = True) -> dict:
+    """Start the pack's interpreter with the environment `VerifiedRuntime::launch` gives it on
+    Windows (src-tauri/src/native_runtime.rs): nothing inherited. `folders` and `home` are what
+    FD-63 added to it."""
     system = Path(os.environ["SystemRoot"]) / "System32"
     with tempfile.TemporaryDirectory() as scratch:
         environment = {
             "SystemRoot": os.environ["SystemRoot"],
             "PATH": os.pathsep.join(str(folder) for folder in [system, *folders]),
+            "FRAMELEAF_ML_AUTH_TOKEN": "0" * 64,
             "TMP": scratch,
             "TEMP": scratch,
             "TMPDIR": scratch,
+            "XDG_CACHE_HOME": str(Path(scratch) / "cache"),
+            "HF_HOME": str(Path(scratch) / "huggingface"),
+            "TORCH_HOME": str(Path(scratch) / "torch"),
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "MACHINE_LEARNING_MODEL_INTRA_OP_THREADS": "4",
+            "MACHINE_LEARNING_MODEL_INTER_OP_THREADS": "1",
+            "MACHINE_LEARNING_REQUEST_THREADS": "1",
         }
-        arguments = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--child", "--pack", str(pack)]
+        if home:
+            environment["USERPROFILE"] = scratch
+        arguments = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--child", stage, "--pack", str(pack)]
         done = subprocess.run(
-            arguments + (["--session"] if session else []),
+            arguments,
             cwd=scratch,
             env=environment,
             capture_output=True,
@@ -256,8 +289,14 @@ def run_child(pack: Path, folders: list[Path], session: bool) -> dict:
         )
     lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
     if done.returncode != 0 or not lines:
-        return {"problems": [f"the interpreter failed ({done.returncode}): {done.stderr[-2000:]}"]}
+        return {"problems": [f"the runtime process ended ({done.returncode:#x}) at stage {stage}: {done.stderr[-2000:].strip()}"]}
     return json.loads(lines[-1][len("RESULT ") :])
+
+
+def run_stages(pack: Path, folders: list[Path], last: str, home: bool = True) -> dict:
+    """The cuDNN stage, then `names` or `session`, each in its own process; problems of both."""
+    first, second = run_child(pack, folders, "cudnn", home), run_child(pack, folders, last, home)
+    return {**first, **second, "problems": first["problems"] + second["problems"]}
 
 
 def markdown(report: dict) -> str:
@@ -277,13 +316,13 @@ def main() -> None:
     parser.add_argument("--pack", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--session", action="store_true")
-    parser.add_argument("--child", action="store_true")
+    parser.add_argument("--child", choices=("cudnn", "names", "session"))
     args = parser.parse_args()
     pack = args.pack.resolve()
     site = pack / "payload" / "python" / "Lib" / "site-packages"
     if args.child:
         sys.stdout.reconfigure(encoding="utf-8")
-        print("RESULT " + json.dumps(child(site, args.session)))
+        print("RESULT " + json.dumps(child(site, args.child)))
         return
     if os.name != "nt" or not args.output:
         parser.error("run on Windows with --output")
@@ -307,9 +346,9 @@ def main() -> None:
         "pathBudget": PATH_BUDGET,
         "overBudget": over_budget(names),
         "payloadBytes": sum(item["bytes"] for item in manifest["files"].values()),
-        # What the app did before FD-63: evidence only, nothing is required of it.
-        "loaderBefore": run_child(pack, [], False),
-        "loader": run_child(pack, folders, args.session),
+        # What the app did before FD-63 (OS directory only, no home): evidence, nothing is required of it.
+        "loaderBefore": run_stages(pack, [], "names", home=False),
+        "loader": run_stages(pack, folders, "session" if args.session else "names"),
     }
     report["problems"] = problems + report["loader"]["problems"]
     args.output.mkdir(parents=True, exist_ok=True)
@@ -317,7 +356,8 @@ def main() -> None:
     (args.output / "cuda-libraries.md").write_text(markdown(report), encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
     print(markdown(report))
-    print("before FD-63 (OS directory only):", json.dumps(report["loaderBefore"]["problems"], indent=2))
+    print("before FD-63 (OS directory only, no home directory):", json.dumps(report["loaderBefore"]["problems"], indent=2))
+    print("preload seconds:", report["loader"].get("preloadSeconds"), "cuDNN:", report["loader"].get("cudnn"))
     print("payload bytes:", report["payloadBytes"], "files over the path budget:", len(report["overBudget"]))
     if report["problems"]:
         raise SystemExit("the CUDA pack's libraries do not all resolve")

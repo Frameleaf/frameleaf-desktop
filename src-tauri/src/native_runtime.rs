@@ -601,20 +601,14 @@ impl VerifiedRuntime {
         {
             // Windows needs its OS directory for platform DLL discovery, never an inherited PATH.
             if let Some(root) = std::env::var_os("SystemRoot") {
-                // FD-63: after the OS directory, the folders of the pack's own NVIDIA libraries
-                // (signed and verified above), which those libraries load each other from by name.
-                let mut search = vec![Path::new(&root).join("System32")];
+                let mut folders = Vec::new();
                 for folder in device_library_folders(
                     self.provider(),
                     self.manifest.files.keys().map(String::as_str),
                 ) {
-                    search.push(self.root.join(relative(&folder)?));
+                    folders.push(self.root.join(relative(&folder)?));
                 }
-                command.env(
-                    "PATH",
-                    std::env::join_paths(search).map_err(|_| "runtime_path_invalid")?,
-                );
-                command.env("SystemRoot", root);
+                command.envs(windows_environment(&root, &scratch, &folders)?);
             }
         }
         crate::process_tree::configure(&mut command);
@@ -685,6 +679,31 @@ fn device_library_folders<'a>(
         }
     }
     folders
+}
+
+/// What a runtime process gets on Windows besides the variables every platform sets.
+///
+/// `PATH`: the OS directory, then (FD-63) the pack's own NVIDIA library folders, signed and
+/// verified before this point; never an inherited `PATH`. `USERPROFILE` (FD-63): the runtime's
+/// settings name a default folder under the home directory when they are imported, and Python on
+/// Windows has no home directory without this variable, so the import failed and nothing
+/// qualified. The process's own scratch stands in; the user's profile stays out of reach.
+#[cfg(any(windows, test))]
+fn windows_environment(
+    system_root: &std::ffi::OsStr,
+    scratch: &Path,
+    library_folders: &[PathBuf],
+) -> Result<[(&'static str, std::ffi::OsString); 3], String> {
+    let mut search = vec![Path::new(system_root).join("System32")];
+    search.extend(library_folders.iter().cloned());
+    Ok([
+        (
+            "PATH",
+            std::env::join_paths(search).map_err(|_| "runtime_path_invalid")?,
+        ),
+        ("SystemRoot", system_root.to_owned()),
+        ("USERPROFILE", scratch.as_os_str().to_owned()),
+    ])
 }
 
 enum Invocation<'a> {
@@ -1032,6 +1051,52 @@ mod tests {
         for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"] {
             assert!(folders(provider).is_empty(), "{provider}");
         }
+    }
+    #[test]
+    fn a_windows_runtime_searches_the_os_directory_then_the_pack_and_has_a_home() {
+        let scratch = Path::new("scratch folder");
+        let folders = [PathBuf::from("pack").join("cudnn"), PathBuf::from("nvrtc")];
+        let environment =
+            windows_environment(std::ffi::OsStr::new("root"), scratch, &folders).unwrap();
+        let search: Vec<PathBuf> = std::env::split_paths(&environment[0].1).collect();
+        assert_eq!(environment[0].0, "PATH");
+        assert_eq!(
+            search,
+            [
+                Path::new("root").join("System32"),
+                folders[0].clone(),
+                folders[1].clone()
+            ]
+        );
+        assert_eq!(environment[1], ("SystemRoot", "root".into()));
+        assert_eq!(environment[2], ("USERPROFILE", scratch.into()));
+    }
+    /// Python on Windows finds no home directory in an emptied environment; the runtime's
+    /// settings ask for one when they are imported.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_runtime_process_can_name_its_home_directory() {
+        use std::process::Command;
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        let home = |with: bool| {
+            let mut command = Command::new("python");
+            command
+                .env_clear()
+                .args(["-I", "-B", "-c"])
+                .arg("from pathlib import Path; Path.home()");
+            for (name, value) in windows_environment(&root, &scratch, &[]).unwrap() {
+                if with || name != "USERPROFILE" {
+                    command.env(name, value);
+                }
+            }
+            // The hosted Python is found through the inherited PATH, which a pack never needs.
+            let python = std::env::var_os("PATH").unwrap();
+            command.env("PATH", python);
+            command.output().unwrap().status.success()
+        };
+        assert!(!home(false), "the environment before FD-63 had a home");
+        assert!(home(true));
     }
     fn report_for(provider: &str, state: &str, cpu_nodes: bool) -> [serde_json::Value; 2] {
         let mut nodes = serde_json::json!({ provider: 12 });

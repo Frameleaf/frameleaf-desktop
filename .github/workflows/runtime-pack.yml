@@ -213,7 +213,7 @@ jobs:
           if ($errors.Count) { $errors | Out-Host; exit 1 }
       - name: Rehearse the hardware run without a card (libraries, paths, processor qualification, CUDA refusal)
         shell: pwsh
-        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "C:\fl" -Output "$env:GITHUB_WORKSPACE\evidence" -WithoutGpuRehearsal
+        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "$env:LOCALAPPDATA\fl" -Output "$env:GITHUB_WORKSPACE\evidence" -WithoutGpuRehearsal
       - name: Keep the evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

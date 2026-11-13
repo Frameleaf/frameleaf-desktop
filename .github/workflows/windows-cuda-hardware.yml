@@ -67,7 +67,7 @@ jobs:
         run: rustup update stable; if ($LASTEXITCODE -ne 0) { exit 1 }; rustup default stable; exit $LASTEXITCODE
       - name: Qualify every profile on CUDA and on the processor
         shell: pwsh
-        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "$env:RUNNER_TEMP\cuda" -Output "$env:GITHUB_WORKSPACE\evidence"
+        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Output "$env:GITHUB_WORKSPACE\evidence"
       - name: Keep the evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
