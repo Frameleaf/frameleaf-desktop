@@ -7,7 +7,7 @@
   import Sheet from './Sheet.svelte';
   import { connectionError } from './errors';
   import { countryOptions, defaultCountry } from './ui-state';
-  import { cleanProof, proofReady, screenAfter, secondStepCopy, type Completed, type SecondStep } from './cloud-sign-in';
+  import { cleanProof, proofReady, recoveryUrl, screenAfter, secondStepCopy, type Completed, type SecondStep } from './cloud-sign-in';
   import type { CloudAccount } from './server-types';
 
   type Consent = { version: string; text: string; content: string };
@@ -28,6 +28,8 @@
   let sentTo = $state('');
   let methods = $state<SecondStep[]>([]);
   let method = $state<SecondStep>('totp');
+  // Cloud said this step may be one the person can't complete: offer account recovery on it.
+  let recovery = $state(false);
   let consents = $state<Consents | null>(null);
   let reading = $state<{ title: string; content: string } | null>(null);
   let disclosure = $state('');
@@ -98,11 +100,17 @@
       if (answer.status === 'done') { onsignedin(answer.account); return; }
       const next = screenAfter(answer);
       if (next.mode === 'second') { methods = next.methods; method = next.methods[0]!; }
+      recovery = next.recovery;
       show(next.mode);
     } catch (error) {
       fail(error);
       if (String(error) === 'cloud_email_consent_changed') { mode = 'create'; consents = null; agreed = false; }
     } finally { busy = false; }
+  }
+  async function recover() {
+    if (!native) return;
+    try { await invoke('open_external', { url: recoveryUrl }); }
+    catch (error) { fail(error); }
   }
   function submitEmail(event: SubmitEvent) { event.preventDefault(); void send(mode === 'create' ? 'create' : 'sign-in'); }
 </script>
@@ -143,18 +151,20 @@
     {/key}
   </form>
   <div class="wfoot">
-    <p>Can’t use this? Choose another way, or finish with a Passkey in your browser.</p>
+    <p>Can’t use this? Choose another way, or finish with a Passkey in your browser.{recovery ? ' If you have none of these, recover your account.' : ''}</p>
     {#each methods.filter(other => other !== method) as other (other)}
       <button class="btn quiet" type="button" disabled={busy} onclick={() => { method = other; show('second'); }}>{secondStepCopy(other).choose}</button>
     {/each}
     <button class="btn quiet" type="button" disabled={busy || !native} onclick={onbrowser}>Use a Passkey in My Browser</button>
+    {#if recovery}<button class="btn quiet" type="button" disabled={busy || !native} onclick={recover}>Recover My Account</button>{/if}
     <button class="btn quiet" type="button" disabled={busy} onclick={() => show('sign-in')}>Start Over</button>
     <button class="btn primary" type="submit" form="second-step" disabled={busy || !native || !proofReady(method, proof)}>{busy ? 'Verifying…' : 'Verify'}</button>
   </div>
 {:else if mode === 'browser'}
   <div class="inline-msg notice" role="status"><p>Your Verification Code was right. Continue in your browser to finish signing in to <b>{email}</b>; Frameleaf comes back here when you’re done.</p></div>
   <div class="wfoot">
-    <p>No Passkey to hand? Your browser’s sign-in page also offers account recovery.</p>
+    <p>{recovery ? 'No Passkey to hand? Recover your account instead; that opens in your browser.' : 'No Passkey to hand? Your browser’s sign-in page also offers account recovery.'}</p>
+    {#if recovery}<button class="btn quiet" type="button" disabled={busy || !native} onclick={recover}>Recover My Account</button>{/if}
     <button class="btn quiet" type="button" disabled={busy} onclick={() => show('sign-in')}>Start Over</button>
     <button class="btn primary" type="button" disabled={busy || !native} onclick={onbrowser}>Continue in My Browser</button>
   </div>

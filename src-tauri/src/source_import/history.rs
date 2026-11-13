@@ -69,18 +69,28 @@ impl Entry {
             _ => Status::Interrupted,
         };
         let view = view(manifest, cursor, "", None);
+        // The batches of one import share its entry: the import's id and start, and the counts
+        // of every batch so far. A later batch replaces the entry an earlier one left.
+        let import = manifest.import.as_ref();
+        let (verified, total) = match &view.overall {
+            Some(overall) => (
+                usize::try_from(overall.completed).unwrap_or(usize::MAX),
+                usize::try_from(overall.total.max(overall.completed)).unwrap_or(usize::MAX),
+            ),
+            None => (view.completed, view.total),
+        };
         Self {
-            run_id: manifest.id.clone(),
+            run_id: import.map_or_else(|| manifest.id.clone(), |import| import.id.clone()),
             kind,
             status,
-            created_at: manifest.created_at,
+            created_at: import.map_or(manifest.created_at, |import| import.created_at),
             album: manifest
                 .destination
                 .as_ref()
                 .map(|album| album.name.clone()),
-            verified: view.completed,
-            total: view.total,
-            skipped: view.skipped,
+            verified,
+            total,
+            skipped: view.skipped + import.map_or(0, |import| import.skipped),
             skipped_reasons: skipped_reasons(manifest, cursor),
             album_pending: view.album_pending,
             can_retry: status == Status::Interrupted && cursor.upload_budget.is_some(),
@@ -363,6 +373,22 @@ pub(crate) async fn retry_photo_import(
     }
 }
 
+/// The archived entries of this sign-in, as the window receives them.
+#[cfg(test)]
+pub(super) fn archived(
+    base: &Path,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+) -> Vec<serde_json::Value> {
+    let scope = scope(saved, identity).unwrap();
+    read(&archive(base, &scope), &scope, identity)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| serde_json::to_value(entry).unwrap())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +428,7 @@ mod tests {
             skipped_reasons: BTreeMap::new(),
             more: false,
             continues: None,
+            import: None,
         };
         let mut cursor = Cursor::new(&manifest).unwrap();
         cursor.state = "paused".into();

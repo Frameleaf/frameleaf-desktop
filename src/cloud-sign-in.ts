@@ -5,7 +5,10 @@ import type { CloudAccount } from './server-types';
 /** A second step this window can show. A Passkey is finished in the browser. */
 export type SecondStep = 'totp' | 'recovery_code' | 'password';
 export type StepMethod = 'email_code' | SecondStep;
-export type Completed = { status: 'done'; account: CloudAccount } | { status: 'next'; methods: string[] } | { status: 'browser' };
+/** `recovery`: Cloud says the person may have none of the offered methods to hand. */
+export type Completed = { status: 'done'; account: CloudAccount } | { status: 'next'; methods: string[]; recovery?: boolean } | { status: 'browser'; recovery?: boolean };
+/** Account recovery on the account site (Cloud's docs/app-sign-in.md), opened in the browser. */
+export const recoveryUrl = 'https://frameleaf.cloud/recover';
 
 const copy: Record<SecondStep, { title: string; sub: string; label: string; choose: string }> = {
   totp: { title: 'Two-Step Verification', sub: 'Enter the Verification Code from your authenticator app.', label: 'Verification Code', choose: 'Use My Authenticator App' },
@@ -20,9 +23,11 @@ export function secondSteps(methods: readonly string[]): SecondStep[] {
 }
 
 /** The screen after a proof Cloud accepted without finishing the sign-in. */
-export function screenAfter(answer: Exclude<Completed, { status: 'done' }>): { mode: 'second'; methods: SecondStep[] } | { mode: 'browser' } {
+export function screenAfter(answer: Exclude<Completed, { status: 'done' }>): { mode: 'second'; methods: SecondStep[]; recovery: boolean } | { mode: 'browser'; recovery: boolean } {
   const methods = answer.status === 'next' ? secondSteps(answer.methods) : [];
-  return methods.length ? { mode: 'second', methods } : { mode: 'browser' };
+  // Recovery is offered only when Cloud said so: after a Password it never is.
+  const recovery = answer.recovery === true;
+  return methods.length ? { mode: 'second', methods, recovery } : { mode: 'browser', recovery };
 }
 
 /** What a field keeps of what was typed: six digits for a Verification Code, no spaces in a Recovery Code. */

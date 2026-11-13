@@ -19,7 +19,7 @@ pub(crate) struct Activity {
 }
 
 impl Activity {
-    fn any(self) -> bool {
+    pub(crate) fn any(self) -> bool {
         self.worker || self.import || self.watch || self.local_host || self.media_copy
     }
 }
@@ -57,7 +57,7 @@ pub(crate) fn worker_active(status: &crate::worker_setup::SetupStatus) -> bool {
         )
 }
 
-fn activity(app: &AppHandle) -> Activity {
+pub(crate) fn activity(app: &AppHandle) -> Activity {
     let imports = app.state::<crate::source_import::SourceJobs>();
     let drops = app.state::<crate::drop_import::DropImport>();
     Activity {

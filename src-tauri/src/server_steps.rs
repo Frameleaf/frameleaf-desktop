@@ -1,7 +1,8 @@
 //! Unified sign-in on a server: its login answered in steps (`POST auth/login` with `steps`, then
-//! `POST auth/login/two-factor`), and the answer to a later `verification_required`
-//! (`POST auth/step-up`). Transactions and codes pass through memory only; nothing here stores or
-//! logs them.
+//! `POST auth/login/two-factor`), Sign in with Frameleaf (`POST oauth/frameleaf/exchange`, then
+//! `POST oauth/frameleaf/step-up` when the server asks for a local proof), and the answer to a
+//! later `verification_required` (`POST auth/step-up`). Transactions, passwords and codes pass
+//! through memory only; nothing here stores or logs them.
 use crate::{transport, LoginResponse};
 use reqwest::{Client, Response};
 use serde::Deserialize;
@@ -10,7 +11,8 @@ use url::Url;
 use zeroize::Zeroizing;
 
 /// Declared on every request that creates a session: this app can answer `verification_required`.
-const CAPABILITIES: [&str; 1] = ["verification"];
+/// A server older than unified sign-in ignores it and answers as it always did.
+pub(crate) const CAPABILITIES: [&str; 1] = ["verification"];
 const TRANSACTION_LIMIT: usize = 4000;
 
 /// The second step of a sign-in: what would complete it, most preferred first.
@@ -193,6 +195,114 @@ pub(crate) async fn proof(
         .await
         .map_err(|_| "server_unreachable_or_certificate_invalid")?;
     answer(response, Some(wrong)).await
+}
+
+/// The `verification_required` a sign-in was refused with (403), as the step that completes it.
+fn verification_step(status: u16, body: Option<&Value>) -> Option<Pending> {
+    let body = body.filter(|_| status == 403)?;
+    if body.get("code")?.as_str()? != "verification_required" {
+        return None;
+    }
+    let transaction = body.get("transaction")?.as_str()?;
+    if transaction.is_empty() || transaction.len() > TRANSACTION_LIMIT {
+        return None;
+    }
+    let methods = body.get("methods").and_then(Value::as_array);
+    Some(Pending {
+        transaction: Zeroizing::new(transaction.to_owned()),
+        methods: known_methods(
+            methods
+                .into_iter()
+                .flatten()
+                .filter_map(|method| method.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        sent_to: None,
+    })
+}
+
+/// A Sign in with Frameleaf answer: the session, the local proof the server asks for first, or
+/// the server's own refusal code.
+async fn frameleaf_answer(response: Response, wrong_proof: Option<&str>) -> Result<Step, String> {
+    let status = response.status().as_u16();
+    if response.status().is_success() {
+        // A server that answers without a session does not have this sign-in.
+        return step(transport::json(response).await?).map_err(|code| {
+            if code == "server_response_invalid" {
+                "cloud_exchange_unsupported".into()
+            } else {
+                code
+            }
+        });
+    }
+    let body = refusal_body(response).await;
+    if let Some(pending) = verification_step(status, body.as_ref()) {
+        return Ok(Step::Next(pending));
+    }
+    let code = body.as_ref().and_then(|value| value.get("code")?.as_str());
+    Err(match (status, wrong_proof) {
+        // A wrong proof and an expired transaction are both 401 with no code.
+        (401, Some(wrong)) if code.is_none() => wrong.into(),
+        (400, Some(_)) if code.is_none() => "sign_in_code_invalid".into(),
+        (429, _) => "sign_in_too_many_attempts".into(),
+        _ => crate::server_admin::refusal(status, code),
+    })
+}
+
+/// Sign in with Frameleaf: a server-audience token for a session. A server that wants the local
+/// Password (a first link) or authenticator first answers with the step that completes it.
+pub(crate) async fn frameleaf_exchange(
+    client: &Client,
+    base: &Url,
+    token: &str,
+) -> Result<Step, String> {
+    let response = client
+        .post(base.join("api/oauth/frameleaf/exchange").unwrap())
+        .json(&json!({ "token": token, "rememberMe": true, "capabilities": CAPABILITIES }))
+        .send()
+        .await
+        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    frameleaf_answer(response, None).await
+}
+
+/// Finishes a Sign in with Frameleaf that asked for more: the local Password when the server
+/// listed it, and one authenticator proof when it listed those. Both go in the same request.
+pub(crate) async fn frameleaf_step_up(
+    client: &Client,
+    base: &Url,
+    transaction: &str,
+    password: Option<&str>,
+    proof: Option<(&str, &str)>,
+) -> Result<Step, String> {
+    let mut body = json!({
+        "transaction": checked_transaction(transaction)?,
+        "rememberMe": true,
+        "capabilities": CAPABILITIES,
+    });
+    if let Some(password) = password {
+        if password.is_empty() || password.len() > 1000 {
+            return Err("frameleaf_step_refused".into());
+        }
+        body["password"] = password.into();
+    }
+    if let Some((method, proof)) = proof {
+        // The server has no emailed code of its own for this step.
+        if method == "email_code" {
+            return Err("sign_in_code_invalid".into());
+        }
+        let (field, value, _) = proof_field(method, proof)?;
+        body[field] = value.into();
+    }
+    if password.is_none() && proof.is_none() {
+        return Err("sign_in_code_invalid".into());
+    }
+    let response = client
+        .post(base.join("api/oauth/frameleaf/step-up").unwrap())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    frameleaf_answer(response, Some("frameleaf_step_refused")).await
 }
 
 /// Answers a `verification_required` for the signed-in session; it then counts as verified.
@@ -598,5 +708,187 @@ mod tests {
             seen[1].body,
             json!({"transaction": "txn", "recoveryCode": "abcd-efgh"})
         );
+    }
+}
+
+#[cfg(test)]
+mod frameleaf_tests {
+    use super::fixture::{client, server, Request};
+    use super::*;
+
+    fn session() -> (u16, Value) {
+        (
+            200,
+            json!({"accessToken": "session", "userId": "user", "name": "Ada", "isAdmin": true}),
+        )
+    }
+    fn needs(methods: Value) -> (u16, Value) {
+        (
+            403,
+            json!({
+                "message": "private", "error": "Forbidden", "statusCode": 403,
+                "code": "verification_required", "acr": "urn:frameleaf:acr:verified",
+                "maxAge": null, "methods": methods, "transaction": "pending",
+            }),
+        )
+    }
+    /// The server's exchange for a person with a local authenticator and a Basic Frameleaf sign-in,
+    /// or (with `password`) an account here that is linked for the first time.
+    fn asks(password: bool) -> impl Fn(&Request) -> (u16, Value) + Send + 'static {
+        move |request| match request.path.as_str() {
+            "/api/oauth/frameleaf/exchange" if password => {
+                needs(json!(["frameleaf", "password", "totp", "recovery_code"]))
+            }
+            "/api/oauth/frameleaf/exchange" => needs(json!(["frameleaf", "totp", "recovery_code"])),
+            "/api/oauth/frameleaf/step-up"
+                if request.body["transaction"] == "pending"
+                    && (!password || request.body["password"] == "right")
+                    && (request.body["code"] == "123456"
+                        || request.body["recoveryCode"] == "abcd-efgh") =>
+            {
+                session()
+            }
+            "/api/oauth/frameleaf/step-up" => (
+                401,
+                json!({"message": "private", "error": "Unauthorized", "statusCode": 401}),
+            ),
+            _ => (404, Value::Null),
+        }
+    }
+    fn pending(step: Result<Step, String>) -> Pending {
+        match step {
+            Ok(Step::Next(pending)) => pending,
+            Ok(Step::Done(_)) => panic!("a step was expected"),
+            Err(code) => panic!("{code}"),
+        }
+    }
+    fn token(step: Result<Step, String>) -> String {
+        match step {
+            Ok(Step::Done(login)) => login.access_token,
+            Ok(Step::Next(_)) => panic!("the sign-in should be done"),
+            Err(code) => panic!("{code}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_declares_the_capability_and_signs_in_on_any_server() {
+        // A server older than unified sign-in ignores `capabilities`; a newer one that needs
+        // nothing more answers the same way. Plain http on the home network, as the fixture is.
+        let (base, seen) = server(|_| session());
+        assert_eq!(base.scheme(), "http");
+        assert_eq!(
+            token(frameleaf_exchange(&client(), &base, "exchange-token").await),
+            "session"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].path, "/api/oauth/frameleaf/exchange");
+        assert_eq!(
+            seen[0].body,
+            json!({"token": "exchange-token", "rememberMe": true, "capabilities": ["verification"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_that_needs_the_authenticator_finishes_with_one_code() {
+        let (base, seen) = server(asks(false));
+        let client = client();
+        let step = pending(frameleaf_exchange(&client, &base, "exchange-token").await);
+        assert_eq!(step.methods, ["frameleaf", "totp", "recovery_code"]);
+        assert_eq!(step.transaction.as_str(), "pending");
+        let proof = Some(("totp", "123456"));
+        assert_eq!(
+            token(frameleaf_step_up(&client, &base, &step.transaction, None, proof).await),
+            "session"
+        );
+        let recovery = Some(("recovery_code", " abcd-efgh "));
+        assert_eq!(
+            token(frameleaf_step_up(&client, &base, &step.transaction, None, recovery).await),
+            "session"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[1].body,
+            json!({
+                "transaction": "pending", "code": "123456",
+                "rememberMe": true, "capabilities": ["verification"],
+            })
+        );
+        assert_eq!(seen[2].body["recoveryCode"], "abcd-efgh");
+        assert!(seen[2].body.get("code").is_none());
+    }
+
+    #[tokio::test]
+    async fn first_link_sends_the_password_and_the_code_together() {
+        let (base, seen) = server(asks(true));
+        let client = client();
+        let step = pending(frameleaf_exchange(&client, &base, "exchange-token").await);
+        assert_eq!(
+            step.methods,
+            ["frameleaf", "password", "totp", "recovery_code"]
+        );
+        let transaction = step.transaction.as_str();
+        let code = Some(("totp", "123456"));
+        // A wrong Password keeps the step open with its own error.
+        assert_eq!(
+            frameleaf_step_up(&client, &base, transaction, Some("wrong"), code)
+                .await
+                .err()
+                .unwrap(),
+            "frameleaf_step_refused"
+        );
+        assert_eq!(
+            token(frameleaf_step_up(&client, &base, transaction, Some("right"), code).await),
+            "session"
+        );
+        let sent = seen.lock().unwrap().len();
+        assert_eq!(seen.lock().unwrap()[2].body["password"], "right");
+        // Nothing malformed reaches the server: no proof at all, an emailed code, a bad code.
+        for (password, proof) in [
+            (None, None),
+            (Some(""), code),
+            (None, Some(("email_code", "123456"))),
+            (None, Some(("totp", "12ab56"))),
+        ] {
+            assert!(
+                frameleaf_step_up(&client, &base, transaction, password, proof)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(seen.lock().unwrap().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn exchange_refusals_keep_the_servers_code() {
+        for (status, body, expected) in [
+            (
+                403,
+                json!({"code": "frameleaf_exchange_no_access"}),
+                "server_refused_frameleaf_exchange_no_access",
+            ),
+            // Asked for, but with nothing to answer it with: a plain refusal, never a dead step.
+            (
+                403,
+                json!({"code": "verification_required", "methods": ["frameleaf"]}),
+                "server_refused_verification_required",
+            ),
+            (
+                401,
+                json!({"code": "frameleaf_exchange_expired"}),
+                "server_refused_frameleaf_exchange_expired",
+            ),
+            (404, json!({}), "server_http_404"),
+            (429, json!({}), "sign_in_too_many_attempts"),
+            (200, json!({"userId": "user"}), "cloud_exchange_unsupported"),
+        ] {
+            let (base, _) = server(move |_| (status, body.clone()));
+            assert_eq!(
+                frameleaf_exchange(&client(), &base, "exchange-token")
+                    .await
+                    .err()
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }

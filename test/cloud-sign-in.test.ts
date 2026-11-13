@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { cleanProof, proofReady, screenAfter, secondStepCopy, secondSteps } from '../src/cloud-sign-in.ts';
+import { cleanProof, proofReady, recoveryUrl, screenAfter, secondStepCopy, secondSteps } from '../src/cloud-sign-in.ts';
 import { connectionError } from '../src/errors.ts';
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -9,13 +9,13 @@ const generic = connectionError('not_a_known_code');
 
 test('the screen after an emailed Verification Code follows what Cloud offers', () => {
   // An authenticator, with Recovery Codes left: Cloud's preferred method first; the Passkey it also lists is the browser's.
-  assert.deepEqual(screenAfter({ status: 'next', methods: ['totp', 'recovery_code', 'passkey'] }), { mode: 'second', methods: ['totp', 'recovery_code'] });
-  assert.deepEqual(screenAfter({ status: 'next', methods: ['recovery_code'] }), { mode: 'second', methods: ['recovery_code'] });
-  assert.deepEqual(screenAfter({ status: 'next', methods: ['password', 'passkey'] }), { mode: 'second', methods: ['password'] });
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['totp', 'recovery_code', 'passkey'] }), { mode: 'second', methods: ['totp', 'recovery_code'], recovery: false });
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['recovery_code'] }), { mode: 'second', methods: ['recovery_code'], recovery: false });
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['password', 'passkey'] }), { mode: 'second', methods: ['password'], recovery: false });
   // Only a Passkey, or a method this app does not know: the browser finishes, never a dead end.
-  assert.deepEqual(screenAfter({ status: 'next', methods: ['passkey'] }), { mode: 'browser' });
-  assert.deepEqual(screenAfter({ status: 'next', methods: ['toString', 'something_new'] }), { mode: 'browser' });
-  assert.deepEqual(screenAfter({ status: 'browser' }), { mode: 'browser' });
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['passkey'] }), { mode: 'browser', recovery: false });
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['toString', 'something_new'] }), { mode: 'browser', recovery: false });
+  assert.deepEqual(screenAfter({ status: 'browser' }), { mode: 'browser', recovery: false });
   assert.deepEqual(secondSteps([]), []);
 });
 
@@ -62,4 +62,19 @@ test('the account screen has every step state and none of the old wording', () =
   }
   // Nothing typed for a step is kept in browser storage.
   assert.doesNotMatch(screen, /localStorage|sessionStorage/);
+});
+
+test('a step Cloud marks for recovery offers the recovery link directly, and no other step does', () => {
+  // After an emailed Verification Code on an account with a Passkey or an authenticator.
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['totp', 'passkey'], recovery: true }), { mode: 'second', methods: ['totp'], recovery: true });
+  assert.deepEqual(screenAfter({ status: 'next', methods: ['passkey'], recovery: true }), { mode: 'browser', recovery: true });
+  assert.deepEqual(screenAfter({ status: 'browser', recovery: true }), { mode: 'browser', recovery: true });
+  // Only Cloud's own `true` counts.
+  assert.equal(screenAfter({ status: 'next', methods: ['totp'], recovery: 'yes' as unknown as boolean }).recovery, false);
+  assert.equal(recoveryUrl, 'https://frameleaf.cloud/recover');
+  const screen = read('../src/FrameleafAccount.svelte');
+  // Both the second step and the browser hand-off show the link when recovery is offered, opened by the backend.
+  assert.equal(screen.match(/\{#if recovery\}<button [^>]*onclick=\{recover\}>Recover My Account<\/button>\{\/if\}/g)?.length, 2);
+  assert.match(screen, /invoke\('open_external', \{ url: recoveryUrl \}\)/);
+  assert.match(screen, /recovery = next\.recovery;/);
 });

@@ -4,8 +4,13 @@ fn main() {
         println!("cargo:rerun-if-changed=src/macos_keychain.m");
         println!("cargo:rerun-if-changed=src/macos_keychain.h");
         println!("cargo:rerun-if-changed=src/finder_import.m");
+        println!("cargo:rerun-if-changed=src/macos_quit.m");
         cc::Build::new()
-            .files(["src/macos_keychain.m", "src/finder_import.m"])
+            .files([
+                "src/macos_keychain.m",
+                "src/finder_import.m",
+                "src/macos_quit.m",
+            ])
             .flag("-fobjc-arc")
             .compile("frameleaf_keychain");
         println!("cargo:rustc-link-lib=framework=LocalAuthentication");
@@ -92,6 +97,7 @@ fn main() {
             "cloud_email_start",
             "cloud_email_complete",
             "connect_cloud_server",
+            "connect_cloud_server_step",
         ]),
     ))
     .expect("build desktop ACL");
