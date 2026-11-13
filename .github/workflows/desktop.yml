@@ -24,7 +24,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-24.04]
+        # Linux builds on Ubuntu 22.04 (glibc 2.35) so the binaries also load on Debian 12.
+        os: [macos-latest, windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -205,7 +206,16 @@ jobs:
       - name: Check no app binary needs a newer macOS than declared
         if: runner.os == 'macOS'
         run: python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" src-tauri/target/debug/bundle/macos/Frameleaf.app
-      - name: Install the unsigned Linux package in clean Ubuntu and Debian containers
+      - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/debug/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          python tools/check_linux_glibc.py --max 2.35 "${packages[0]}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install and run the unsigned Linux package in clean Ubuntu and Debian containers
         if: runner.os == 'Linux'
         shell: bash
         run: |
