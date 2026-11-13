@@ -678,13 +678,13 @@ fn removing_a_pairing_clears_local_state_even_when_manager_is_unreachable() {
 }
 
 #[test]
-fn pairing_requires_https_unless_manager_is_on_this_computer() {
+fn pairing_requires_https_only_for_a_manager_beyond_the_home_network() {
     for origin in [
-        "http://192.168.1.10",
-        "http://192.168.1.10:2282",
-        "http://tower.local:2282",
-        "http://127.0.0.2:2282",
+        "http://203.0.113.10",
+        "http://203.0.113.10:2282",
+        "http://manager.example.com:2282",
         "http://localhost.example.test",
+        "http://[2001:db8::1]:2282",
     ] {
         assert_eq!(
             require_encrypted(origin).unwrap_err(),
@@ -697,6 +697,20 @@ fn pairing_requires_https_unless_manager_is_on_this_computer() {
         "http://127.0.0.1:2282",
         "http://[::1]:2282",
         "http://localhost:2282",
+        // The home network: no certificate can be issued for these.
+        "http://192.168.1.10",
+        "http://192.168.1.10:2282",
+        "http://10.0.0.5:2282",
+        "http://172.16.4.2:2282",
+        "http://169.254.10.20:2282",
+        "http://100.100.20.30:2282",
+        "http://tower.local:2282",
+        "http://tower:2282",
+        "http://nas.lan:2282",
+        "http://nas.home.arpa:2282",
+        "http://tower.tailnet.ts.net:2282",
+        "http://[fd12:3456::1]:2282",
+        "http://127.0.0.2:2282",
         "https://192.168.1.10",
         "https://manager.test:9443",
     ] {
@@ -721,7 +735,7 @@ fn pairing_requires_https_unless_manager_is_on_this_computer() {
         };
         // Refused before any password leaves this computer.
         assert_eq!(
-            attempt("http://192.168.1.10".into()).await,
+            attempt("http://203.0.113.10".into()).await,
             "manager_https_required"
         );
         assert_eq!(
