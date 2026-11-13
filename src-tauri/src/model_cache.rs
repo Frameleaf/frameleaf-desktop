@@ -593,9 +593,13 @@ async fn prepare_from(
     .await;
     let code = match first {
         Err(code)
+            // FD-64: a file or a folder that is gone is repaired like one that changed.
             if matches!(
                 code.as_str(),
-                "model_file_changed" | "model_inventory_invalid"
+                "model_file_changed"
+                    | "model_inventory_invalid"
+                    | "model_file_unavailable"
+                    | "runtime_file_unavailable"
             ) =>
         {
             code
@@ -1341,6 +1345,58 @@ mod tests {
                 staged.revision
             ))
             .exists());
+    }
+
+    #[tokio::test]
+    async fn a_missing_model_file_or_folder_is_downloaded_again_instead_of_failing_for_ever() {
+        let root = Root::new();
+        let staged = Staged::new(&root.0);
+        let client = crate::transport::client().unwrap();
+        let cancel = AtomicBool::new(false);
+        let cache = prepare(staged.plan(), &root.0, &client, &cancel, false, |_| {})
+            .await
+            .unwrap();
+        let model = cache.join("clip/test/visual/model.onnx");
+        for (folder, code) in [
+            (false, "model_file_unavailable"),
+            (true, "runtime_file_unavailable"),
+        ] {
+            if folder {
+                fs::remove_dir_all(model.parent().unwrap()).unwrap();
+            } else {
+                fs::remove_file(&model).unwrap();
+            }
+            // The check alone reports what is missing; the repair acquires it again.
+            assert_eq!(
+                prepare_once(
+                    "http://127.0.0.1:1",
+                    staged.plan(),
+                    &root.0,
+                    &client,
+                    &cancel,
+                    false,
+                    |_| {}
+                )
+                .await
+                .unwrap_err(),
+                code
+            );
+            let (mirror, server) = serve(vec![reply("200 OK", "", 7, b"weights")]);
+            let repaired = prepare_from(
+                &mirror,
+                staged.plan(),
+                &root.0,
+                &client,
+                &cancel,
+                true,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(server.join().unwrap().len(), 1, "{code}");
+            assert_eq!(repaired, cache);
+            assert_eq!(fs::read(&model).unwrap(), b"weights");
+        }
     }
 
     #[test]

@@ -258,6 +258,10 @@ impl WorkerSetup {
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
     ) {
         let fresh = self.parked();
+        if fresh {
+            // FD-64: Retry Setup also tries a GPU provider that was remembered as failed.
+            crate::provider_selection::forget(&paths.data);
+        }
         self.start_work(notify, move |progress| async move {
             let server = saved.server.clone();
             supervise(
@@ -503,7 +507,7 @@ fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
     let base = (1u64 << attempt.min(5)).min(30) * 1000;
     Duration::from_millis(base + entropy % (base + 1))
 }
-fn retryable(error: &str) -> bool {
+pub(crate) fn retryable(error: &str) -> bool {
     matches!(
         error,
         "worker_request_interrupted"
@@ -576,6 +580,18 @@ async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
     // Issue rechecks the existing device and photo session; recovery must never re-enroll a revoked device.
     let worker = crate::transport::issue_worker_session(&client, saved).await?;
     crate::credentials::save("worker-session", &worker)
+}
+/// FD-64: what stopped a qualification or a measurement, if anything. `Ok` is a pause for power,
+/// memory or sleep, to wait out and qualify again; `Err` ends the preparation with that code.
+fn interruption(resumed: bool, interrupted: Option<String>) -> Option<Result<String, String>> {
+    if resumed {
+        return Some(Ok("system_resumed".into()));
+    }
+    let reason = interrupted?;
+    Some(match reason.strip_prefix("resource_") {
+        Some(pause) => Ok(pause.into()),
+        None => Err(reason),
+    })
 }
 /// Watches work whose models are already loaded: the memory floor was applied when it was admitted.
 async fn resource_loss(clock: &WakeClock) -> String {
@@ -845,14 +861,20 @@ fn running_macos() -> Option<(u64, u64)> {
     }
 }
 /// Refuse AI processing on a macOS older than the runtime pack needs, where the runtime would
-/// only fail to load. A version that cannot be read refuses nothing.
+/// only fail to load. FD-64: on macOS a version or a floor that cannot be read is not known to
+/// be supported, so nothing is installed or downloaded; other systems have no such floor.
 fn runtime_os_supported(
+    os: &str,
     running: Option<(u64, u64)>,
     floor: Option<(u64, u64)>,
 ) -> Result<(), String> {
+    if os != "macos" {
+        return Ok(());
+    }
     match (running, floor) {
-        (Some(running), Some(floor)) if running < floor => Err("runtime_os_unsupported".into()),
-        _ => Ok(()),
+        (Some(running), Some(floor)) if running >= floor => Ok(()),
+        (Some(_), Some(_)) => Err("runtime_os_unsupported".into()),
+        _ => Err("runtime_os_unknown".into()),
     }
 }
 
@@ -862,10 +884,15 @@ async fn prepare(
     allow_download: bool,
     progress: Progress,
 ) -> Result<(), String> {
-    prepare_on(running_macos(), saved, paths, allow_download, progress).await
+    let os_supported = runtime_os_supported(
+        std::env::consts::OS,
+        running_macos(),
+        ai_runtime_macos_floor(),
+    );
+    prepare_on(os_supported, saved, paths, allow_download, progress).await
 }
 async fn prepare_on(
-    macos: Option<(u64, u64)>,
+    os_supported: Result<(), String>,
     saved: SavedConnection,
     paths: SetupPaths,
     allow_download: bool,
@@ -879,7 +906,7 @@ async fn prepare_on(
         transport,
     };
     // Before anything is created, installed, downloaded or started.
-    runtime_os_supported(macos, ai_runtime_macos_floor())?;
+    os_supported?;
     progress.update(|status| status.models = None);
     progress.set("preparing-runtime", None);
     let cancelled = progress.cancelled.clone();
@@ -965,7 +992,7 @@ async fn prepare_on(
     // FD-52: an accelerated runtime beside the processor one, where the app ships one this
     // computer can use. Any fault on that side leaves every workload on the processor.
     let (accelerated, mut plan) =
-        crate::provider_selection::open(&paths, &installed, &worker, groups.clone()).await;
+        crate::provider_selection::open(&paths, &installed, &worker, groups.clone()).await?;
     let mut installed =
         crate::provider_selection::Runtimes::new(installed, attestation, accelerated);
     let profiles: Vec<_> = groups.iter().flatten().cloned().collect();
@@ -1216,9 +1243,14 @@ async fn prepare_on(
                 .await?;
                 installed = runtime;
                 check_cancel(&progress.cancelled)?;
-                let interrupted =
-                    interrupted.is_some() || clock.observe(std::time::SystemTime::now());
-                let cpu_ms = if interrupted { None } else { cpu_ms };
+                // FD-64: a pause for power, memory or sleep measured nothing. Wait it out and
+                // qualify again, as above, instead of giving the workload to the processor.
+                if let Some(stopped) =
+                    interruption(clock.observe(std::time::SystemTime::now()), interrupted)
+                {
+                    progress.set("paused", Some(stopped?));
+                    continue 'qualification;
+                }
                 if plan.measured(workload, accelerated_ms, cpu_ms) {
                     continue 'qualification;
                 }
@@ -2142,18 +2174,40 @@ mod tests {
         assert_eq!(os_version("fifteen"), None);
         let refused = Err("runtime_os_unsupported".to_string());
         assert_eq!(
-            runtime_os_supported(Some((floor.0 - 1, 9)), Some(floor)),
+            runtime_os_supported("macos", Some((floor.0 - 1, 9)), Some(floor)),
             refused
         );
-        assert_eq!(runtime_os_supported(Some((11, 0)), Some(floor)), refused);
-        assert_eq!(runtime_os_supported(Some(floor), Some(floor)), Ok(()));
         assert_eq!(
-            runtime_os_supported(Some((floor.0 + 1, 0)), Some(floor)),
+            runtime_os_supported("macos", Some((11, 0)), Some(floor)),
+            refused
+        );
+        assert_eq!(
+            runtime_os_supported("macos", Some(floor), Some(floor)),
             Ok(())
         );
-        // Not macOS, or a version that could not be read: nothing is refused on a guess.
-        assert_eq!(runtime_os_supported(None, Some(floor)), Ok(()));
-        assert_eq!(runtime_os_supported(Some((11, 0)), None), Ok(()));
+        assert_eq!(
+            runtime_os_supported("macos", Some((floor.0 + 1, 0)), Some(floor)),
+            Ok(())
+        );
+        // FD-64: on macOS a version or a floor that could not be read is not known to be
+        // supported, so setup stops with its own code instead of installing on a guess.
+        let unknown = Err("runtime_os_unknown".to_string());
+        assert_eq!(runtime_os_supported("macos", None, Some(floor)), unknown);
+        assert_eq!(runtime_os_supported("macos", Some((26, 0)), None), unknown);
+        assert_eq!(runtime_os_supported("macos", None, None), unknown);
+        // Other systems have no such floor, whatever is or is not read there.
+        for os in ["windows", "linux"] {
+            assert_eq!(runtime_os_supported(os, None, Some(floor)), Ok(()));
+            assert_eq!(runtime_os_supported(os, None, None), Ok(()));
+            assert_eq!(runtime_os_supported(os, Some((11, 0)), Some(floor)), Ok(()));
+        }
+        // The Mac this suite runs on is read and decided, never unknown.
+        #[cfg(target_os = "macos")]
+        assert_ne!(
+            runtime_os_supported("macos", running_macos(), ai_runtime_macos_floor()),
+            unknown
+        );
+        assert!(!retryable("runtime_os_unknown"));
         #[cfg(target_os = "macos")]
         assert!(running_macos().is_some_and(|version| version >= (11, 0)));
         #[cfg(not(target_os = "macos"))]
@@ -2186,22 +2240,27 @@ mod tests {
             mode: "client-worker".into(),
             device_id: Some(uuid::Uuid::new_v4().to_string()),
         };
-        let result = prepare_on(
-            Some((11, 0)),
-            saved,
-            SetupPaths {
-                data: data.clone(),
-                bundle: root.join("absent"),
-            },
-            true,
-            progress,
-        )
-        .await;
-        let created = data.exists();
+        // An older macOS, and (FD-64) one whose version could not be read.
+        for (running, code) in [
+            (Some((11, 0)), "runtime_os_unsupported"),
+            (None, "runtime_os_unknown"),
+        ] {
+            let result = prepare_on(
+                runtime_os_supported("macos", running, ai_runtime_macos_floor()),
+                saved.clone(),
+                SetupPaths {
+                    data: data.clone(),
+                    bundle: root.join("absent"),
+                },
+                true,
+                progress.clone(),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), code);
+            assert!(!data.exists(), "nothing is prepared on such a macOS");
+            assert_eq!(*status.lock().unwrap(), SetupStatus::default());
+        }
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(result.unwrap_err(), "runtime_os_unsupported");
-        assert!(!created, "nothing is prepared on an unsupported macOS");
-        assert_eq!(*status.lock().unwrap(), SetupStatus::default());
         // The worker reports it as a state that waits for the person, with its own code.
         let setup = WorkerSetup::default();
         setup
@@ -2217,6 +2276,80 @@ mod tests {
         let status = setup.status();
         assert_eq!(status.state, "setup-needs-attention");
         assert_eq!(status.code.as_deref(), Some("runtime_os_unsupported"));
+    }
+    #[test]
+    fn a_pause_during_qualification_or_timing_is_waited_out_and_never_decides_the_provider() {
+        // Nothing stopped it: the measurement stands.
+        assert_eq!(interruption(false, None), None);
+        // Battery, memory or sleep: pause with that reason and qualify again.
+        for reason in [
+            "on_battery",
+            "memory_low",
+            "system_resumed",
+            "status_unavailable",
+        ] {
+            assert_eq!(
+                interruption(false, Some(format!("resource_{reason}"))),
+                Some(Ok(reason.to_owned()))
+            );
+        }
+        // The computer slept, whether or not the watcher saw it first.
+        assert_eq!(interruption(true, None), Some(Ok("system_resumed".into())));
+        assert_eq!(
+            interruption(true, Some("resource_on_battery".into())),
+            Some(Ok("system_resumed".into()))
+        );
+        // Anything else (the session could not be kept current) ends the preparation with its
+        // own code, which the worker reconnects after where it can.
+        assert_eq!(
+            interruption(false, Some("worker_request_interrupted".into())),
+            Some(Err("worker_request_interrupted".into()))
+        );
+        // The timing uses it: an interrupted measurement is no longer "speed unknown".
+        let source = include_str!("worker_setup.rs");
+        let production = &source[..source.find("mod tests {").unwrap()];
+        let timing = &production[production.find("if plan.unmeasured(workload)").unwrap()..];
+        let settled = timing.find("plan.measured(workload").unwrap();
+        assert!(timing[..settled].contains("interruption("));
+        assert!(timing[..settled].contains("continue 'qualification"));
+    }
+    #[tokio::test]
+    async fn retry_setup_forgets_remembered_provider_failures_and_an_ordinary_start_keeps_them() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let record = root.join("provider-failures.json");
+        let saved = SavedConnection {
+            server: "https://127.0.0.1:1".into(),
+            server_id: "test".into(),
+            account_id: uuid::Uuid::new_v4().to_string(),
+            name: "Test".into(),
+            token: "synthetic".into(),
+            device_name: "Test".into(),
+            mode: "client-worker".into(),
+            device_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let paths = SetupPaths {
+            data: root.clone(),
+            bundle: root.join("absent"),
+        };
+        let setup = WorkerSetup::default();
+        // The worker starting by itself keeps what it remembered.
+        std::fs::write(&record, b"{}").unwrap();
+        setup
+            .start(saved.clone(), paths.clone(), false, Arc::new(|_| {}))
+            .await;
+        setup.stop().await;
+        assert!(record.exists());
+        // Parked, waiting for the person: Retry Setup forgets it before anything else runs.
+        setup.status.lock().unwrap().state = "setup-needs-attention".into();
+        setup.start(saved, paths, false, Arc::new(|_| {})).await;
+        let forgotten = !record.exists();
+        setup.stop().await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(forgotten);
     }
     #[tokio::test]
     async fn fresh_nested_app_directory_reports_missing_pack_without_touching_server_credentials() {
@@ -2244,7 +2377,7 @@ mod tests {
         };
         // Not the macOS this suite happens to run on: an older one is refused before the pack.
         let result = prepare_on(
-            None,
+            Ok(()),
             saved,
             SetupPaths {
                 data: data.clone(),

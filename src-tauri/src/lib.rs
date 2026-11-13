@@ -914,6 +914,7 @@ pub fn run() {
             server_admin::update_remote,
             server_admin::test_remote_access,
             server_admin::server_step_up,
+            server_admin::saved_sign_in_verification,
             server_admin::open_external,
             tray::tray_refresh,
             cloud_account::cloud_sign_in,
@@ -1136,7 +1137,7 @@ async fn retry_accelerated_provider(
 ) -> Result<(), String> {
     require_local(&window)?;
     let paths = worker_paths(&app)?;
-    provider_selection::forget_failures(&paths.data);
+    provider_selection::forget(&paths.data);
     restart_running_worker(&app, &state).await;
     Ok(())
 }

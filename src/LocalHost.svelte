@@ -26,7 +26,7 @@
   type Carry = { available: boolean; code: string | null; stage: 'permitted' | 'exported' | 'restored' | 'switched' | 'confirmed' | null; previousPostgres: string | null; nextPostgres: string | null; requiredBytes: number | null; availableBytes: number | null; room: 'enough' | 'short' | 'unknown' | null; previousDatabase: string | null; keepUntil: number | null };
   const carrySteps = [['export', 'Copying the database with the earlier companion'], ['restore', 'Building the new database'], ['verify', 'Checking the new database against the original'], ['switch', 'Switching your library to the new database']] as const;
   const gigabytes = (bytes: number | null) => bytes === null ? 'an unknown amount' : `${(bytes / 1e9).toFixed(1)} GB`;
-  type View = { carryStep?: string | null; companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; certificateRenewable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
+  type View = { carryStep?: string | null; packageChangeAvailable?: boolean | null; companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; certificateRenewable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -66,7 +66,19 @@
     (view.state === 'needs-attention' && (view.code === 'host_profile_prepare_failed' || view.code?.startsWith('host_profile_authorization_')))
   ));
   const changingPackage = $derived(!!libraryPackage && !!selectedPackage && selected !== libraryPackage.manifestSha256);
-  const canMovePackage = $derived(view?.companionPlatform === 'mac' || view?.companionPlatform === 'linux');
+  // Whether this computer can move an existing library to another package. The backend says so when it
+  // knows (`packageChangeAvailable`); one that does not say can only do it on macOS and Linux.
+  const canMovePackage = $derived(view?.packageChangeAvailable ?? (view?.companionPlatform === 'mac' || view?.companionPlatform === 'linux'));
+  const packageMoveUnavailable = 'This version of Frameleaf can’t move an existing library to another companion package on this computer. Your library has not been changed. Keep the companion your library last used installed, and choose Use My Library’s Package to go back to it. If that package says Companion update needed, open your library with the version of Frameleaf it last ran with until a Frameleaf update can move it.';
+  // The library's own package was built for another version of Frameleaf, and this computer cannot move
+  // the library to a newer one: installing the companion for this version would lead nowhere.
+  const libraryStranded = $derived(packageCheck === 'outdated' && !canMovePackage && !!libraryPackage && selected === libraryPackage.manifestSha256);
+  const libraryStrandedCopy = 'Your library last ran with a companion made for another version of Frameleaf, and this version can’t move it to a newer companion on this computer. Your library has not been changed. Keep that companion installed, and open your library with the version of Frameleaf it last ran with until a Frameleaf update can move it.';
+  function useLibraryPackage() {
+    if (busy || checking || !libraryPackage) return;
+    selected = libraryPackage.manifestSha256;
+    void checkSelected();
+  }
   // Offered only when the backend names both database versions: otherwise the ordinary package change applies.
   const carryOffered = $derived(!!carry?.previousPostgres && !!carry.nextPostgres && !carry.previousDatabase && canMovePackage && changingPackage);
   const carryStepIndex = $derived(carrySteps.findIndex(([name]) => name === view?.carryStep));
@@ -277,8 +289,11 @@
     {#if packageCheck && (!view?.backgroundActive || view?.state === 'needs-attention')}
       {@const check = compatibilityCopy[packageCheck]}
       <div class="row">
-        <span class="l" role="status"><b>{check.label}</b><small>{check.detail}</small></span>
-        {#if (packageCheck === 'refused' || packageCheck === 'outdated') && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
+        <span class="l" role="status"><b>{libraryStranded ? 'This version of Frameleaf can’t open your library' : check.label}</b><small>{libraryStranded ? libraryStrandedCopy : check.detail}</small></span>
+        <!-- A newer companion is no help to a library this computer cannot move to it. -->
+        {#if !libraryStranded}
+          {#if (packageCheck === 'refused' || packageCheck === 'outdated') && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
+        {/if}
       </div>
     {/if}
     {#if selectedPackage && needsProfile}
@@ -301,17 +316,19 @@
         </select>
       </div>
     {/if}
+    <!-- Its own row, outside the chain below: the library still has to be started, with Prepare, before anyone can look. -->
+    {#if !carrying && carry?.previousDatabase && carry.stage === 'switched'}
+      <div class="row">
+        <span class="l" role="status"><b>Your library now uses a new database</b><small>It was moved from Postgres {carry.previousPostgres} to Postgres {carry.nextPostgres}. The earlier database folder was not changed and is kept at {carry.previousDatabase}{carry.keepUntil ? ` until at least ${new Date(carry.keepUntil * 1000).toLocaleDateString()}` : ''}, together with the earlier companion, so the move can be undone with help from Frameleaf support. Frameleaf does not delete it. Start your library and check that your photos, albums and people are all here, then choose My library is all here.</small></span>
+        <button class="btn" disabled={busy || !native} onclick={confirmCarry}>My library is all here</button>
+      </div>
+    {/if}
     {#if carrying}
       <div class="row"><span class="spin" aria-hidden="true"></span>
         <ol role="status" aria-label="Moving your library" style="flex:1;margin:0;padding-left:18px">
           {#each carrySteps as [name, label], index (name)}<li aria-current={index === carryStepIndex ? 'step' : undefined}>{#if index === carryStepIndex}<b>{label}…</b>{:else}{label}{index < carryStepIndex ? ' (done)' : ''}{/if}</li>{/each}
         </ol>
         <button class="btn quiet" disabled={!native} onclick={cancel}>Stop the move</button>
-      </div>
-    {:else if carry?.previousDatabase && carry.stage === 'switched'}
-      <div class="row">
-        <span class="l" role="status"><b>Your library now uses a new database</b><small>It was moved from Postgres {carry.previousPostgres} to Postgres {carry.nextPostgres}. The earlier database folder was not changed and is kept at {carry.previousDatabase}{carry.keepUntil ? ` until at least ${new Date(carry.keepUntil * 1000).toLocaleDateString()}` : ''}, together with the earlier companion, so the move can be undone with help from Frameleaf support. Frameleaf does not delete it. When you have checked that your photos, albums and people are all here, confirm below.</small></span>
-        <button class="btn" disabled={busy || !native} onclick={confirmCarry}>My library is all here</button>
       </div>
     {:else if carryOffered && carry && selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
       <div class="row">
@@ -321,7 +338,10 @@
         <button class="btn primary" disabled={busy || !native || !packageVerified || !carry.available} onclick={() => { carryReview = true; }}>Review the move</button>
       </div>
     {:else if changingPackage && !canMovePackage}
-      <div class="row"><span class="l"><b>Choose this library’s current package</b><small>Moving an existing library to another package is unavailable on this computer.</small></span></div>
+      <div class="row">
+        <span class="l" role="status"><b>Your library can’t move to this package yet</b><small>{packageMoveUnavailable}</small></span>
+        <button class="btn" disabled={busy || checking || !native} onclick={useLibraryPackage}>Use My Library’s Package</button>
+      </div>
     {:else if selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
       <div class="row">
         <span class="l"><b>{changingPackage ? 'Move your library to this package' : 'Set up local management'}</b>

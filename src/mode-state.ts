@@ -149,9 +149,10 @@ export function workerView({ connectionState, workerSupported, computer, setup }
       if (history) return needs('AI processing needs recovery', history, 'retry-setup');
       // Only a newer macOS changes this, so there is nothing to retry.
       if (code === 'runtime_os_unsupported') return needs('This Mac’s macOS is too old for AI processing', errorCopy(code)!);
+      // This build ships without a runtime: retrying, or installing it again, would not change that.
+      if (code === 'runtime_pack_unavailable') return needs('AI processing is not included in this version', errorCopy(code)!);
       const reason = workerReason(code);
-      // This build ships without a runtime: installing it again would not change that.
-      const known = code === 'runtime_pack_unavailable' ? null : reason && needsYou[reason];
+      const known = reason && needsYou[reason];
       if (known) return needs(known[0], known[1], 'retry-setup');
       const { message, reference } = describeError(code ?? '', 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.');
       return needs(label, message, 'retry-setup', reference);

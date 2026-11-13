@@ -93,6 +93,7 @@ fn main() {
             "update_remote",
             "test_remote_access",
             "server_step_up",
+            "saved_sign_in_verification",
             "open_external",
             "tray_refresh",
             "cloud_sign_in",
