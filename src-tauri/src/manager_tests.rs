@@ -1040,3 +1040,28 @@ fn a_saved_grant_follows_only_its_own_local_manager_to_a_new_port_or_certificate
         assert_eq!(serde_json::to_value(&grant).unwrap(), before);
     }
 }
+#[test]
+fn polling_is_sized_from_managers_request_allowance() {
+    // Polling that never ends spends half of what Manager allows in one of its windows.
+    assert_eq!(POLL_STEADY, Duration::from_secs(10));
+    let steady = PAIRED_WINDOW.as_millis() / POLL_STEADY.as_millis();
+    assert_eq!(steady as u64 * 2, PAIRED_REQUESTS);
+    assert_eq!(poll_delay(0), POLL_FIRST);
+    assert_eq!(poll_delay(2), Duration::from_secs(1));
+    assert!([3, 16, 17, 64, u32::MAX]
+        .into_iter()
+        .all(|asked| poll_delay(asked) <= POLL_STEADY));
+}
+#[test]
+fn a_retry_after_is_read_only_as_whole_seconds() {
+    let headers = |value: &str| {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+        headers
+    };
+    assert_eq!(retry_after(&headers("30")), Some(Duration::from_secs(30)));
+    for unread in ["soon", "-1", "1.5", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+        assert_eq!(retry_after(&headers(unread)), None);
+    }
+    assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+}
