@@ -76,7 +76,6 @@ impl Reference {
         Ok(reference)
     }
     /// The operation whose restore target this names.
-    #[cfg(unix)]
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }
