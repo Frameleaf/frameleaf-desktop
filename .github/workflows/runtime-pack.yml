@@ -6,6 +6,10 @@ on:
       - 'tools/test_build_runtime.py'
       - 'tools/build_coreml_observer.py'
       - 'tools/smoke_accelerated_runtime.py'
+      - 'tools/smoke_cpu_runtime.py'
+      - 'tools/qualify_runtime_models.py'
+      - 'tools/check_macos_minimum.py'
+      - 'packaging/macos/minimum-versions.json'
       - 'tools/linked_libraries.py'
       - 'tools/pe_imports.py'
       - 'native/**'
@@ -103,6 +107,92 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: cpu-runtime-failure-${{ runner.os }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3
+  # FD-6: the Intel macOS processor pack must build on the factory's Intel image from the source
+  # the factory builds, with the one wheel `targetPins` names in place of the locked onnxruntime
+  # (which publishes no Intel macOS wheel), and run a model. Nothing is signed or published here.
+  intel-macos:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - id: source
+        name: The source the factory builds the processor pack from
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(python -c "import json; print(json.load(open('desktop/runtime/profiles.json'))['profiles']['cpu-ort']['sourceRevision'])")"
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ steps.source.outputs.revision }}
+          path: server
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Construct the Intel pack and run a model with it
+        shell: bash
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          python -m unittest discover -s desktop/tools -p 'test_build_runtime.py'
+          python desktop/tools/build_runtime.py --source server --output candidate --revision "$SOURCE_REVISION" --epoch 6
+          python - <<'PY'
+          import json
+          manifest = json.load(open("candidate/manifest.json"))
+          assert (manifest["platform"], manifest["architecture"], manifest["provider"]) == ("macos", "x86_64", "CPUExecutionProvider"), manifest
+          print(json.dumps(json.load(open("candidate/payload/provenance.json")), indent=2))
+          PY
+          grep -A1 '^onnxruntime==' candidate/payload/requirements.txt
+          candidate/payload/python/bin/python3.12 -I -B desktop/tools/smoke_cpu_runtime.py x86_64 | tee -a "$GITHUB_STEP_SUMMARY"
+      # The older onnxruntime must still give the catalogue's expected output for real models:
+      # the smallest of each kind (text recognition, faces, search) is staged and qualified as the app does.
+      - name: Qualify catalogue models with the Intel pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/qualify_runtime_models.py candidate "$RUNNER_TEMP/qualification" PP-OCRv5_mobile buffalo_s ViT-B-32__openai | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check no Intel runtime binary needs a newer macOS than the AI runtime minimum
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The checker reads a `native-runtime` folder as the AI runtime pack.
+          mkdir native-runtime
+          cp -R candidate/payload native-runtime/payload
+          python desktop/tools/check_macos_minimum.py --report macos-minimum.json native-runtime | tee -a "$GITHUB_STEP_SUMMARY"
+          cat macos-minimum.json
+      - name: Retain private validation receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-receipts-macOS-x86_64
+          path: |
+            candidate/manifest.json
+            candidate/payload/provenance.json
+            candidate/payload/requirements.txt
+            candidate/payload/build-requirements.txt
+            macos-minimum.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-failure-macOS-x86_64
           path: .candidate.error.log
           include-hidden-files: true
           if-no-files-found: ignore
