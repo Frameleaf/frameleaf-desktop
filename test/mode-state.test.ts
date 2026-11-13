@@ -200,6 +200,23 @@ test('each worker failure family shows its own reason and the action that fixes 
   assert.equal((await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' })).detail, 'This build does not include a signed AI runtime yet. Photos remain available.');
 });
 
+test('a Windows update stops the library itself, and says why when that cannot be proven', () => {
+  const updates = readFileSync(new URL('../src-tauri/src/updates.rs', import.meta.url), 'utf8');
+  const install = updates.slice(updates.indexOf('async fn install_desktop_update'));
+  // Windows: download, stop in order, take the gate, install. Elsewhere the gate comes first, as before.
+  assert.match(install, /#\[cfg\(not\(windows\)\)\]\s*let _owner = host\.lock_for_update\(\)\?;[\s\S]*\.download\([\s\S]*#\[cfg\(windows\)\]\s*let _owner = \{\s*host\s*\.stop_for_update\(\)\s*\.await\s*\.map_err\(stop_refused\)\?;\s*host\.lock_for_update\(\)\?\s*\};[\s\S]*update\.install\(bytes\)/);
+  // The stop is the orderly one, which needs the journal's idle proof, and it opens no gate by itself.
+  const host = readFileSync(new URL('../src-tauri/src/host_setup.rs', import.meta.url), 'utf8');
+  assert.match(host, /pub\(crate\) async fn stop_for_update\(&self\) -> Result<\(\), String> \{\s*self\.stop_proven\(true\)\.await\.map\(\|_\| \(\)\)\s*\}/);
+  // The reason is shown with what it prevented, in the shared copy.
+  const copy = errorCopy('update_library_stop_manager_pairing_required')!;
+  assert.match(copy, /^Frameleaf did not install the update, because your library on this computer could not be stopped first\. /);
+  assert.ok(copy.endsWith(errorCopy('manager_pairing_required')!));
+  assert.match(errorCopy('update_library_stop_brand_new_reason')!, /Stop the photo server in Manager, then update Frameleaf\.$/);
+  const app = readFileSync(new URL('../src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /error\.startsWith\('update_library_stop_'\)\s+\? errorCopy\(error\)/);
+});
+
 test('a macOS older than the AI runtime needs is a needs-you state with the declared version and no retry', async () => {
   const declared = JSON.parse(readFileSync(new URL('../packaging/macos/minimum-versions.json', import.meta.url), 'utf8')) as { app: string; aiRuntime: string };
   const version = declared.aiRuntime.replace(/\.0$/, '');

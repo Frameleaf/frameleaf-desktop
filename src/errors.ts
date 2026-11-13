@@ -399,6 +399,8 @@ const built: readonly (readonly [string, (rest: string) => string])[] = [
   ['worker_resume_', () => messages.worker_setup_unavailable!],
   ['workload_', rest => errorCopy(rest) ?? 'Your server is not ready to check this AI task on this computer yet. Other tasks can continue.'],
   ['local_port_in_use_', port => `Another program on this computer is using port ${port}, which Frameleaf needs. Close that program, then try again.`],
+  // Windows stops the library on this computer before an update; the rest is why that did not work.
+  ['update_library_stop_', rest => `Frameleaf did not install the update, because your library on this computer could not be stopped first. ${errorCopy(rest) ?? 'Stop the photo server in Manager, then update Frameleaf.'}`],
   ['resource_', rest => errorCopy(rest) ?? 'This computer’s power, network and memory could not be checked. AI processing is paused.'],
 ];
 

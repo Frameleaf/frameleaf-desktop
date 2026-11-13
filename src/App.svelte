@@ -173,6 +173,8 @@
         ? 'Stop the local server before installing the update.'
         : error === 'update_library_not_idle'
           ? errorCopy('update_library_not_idle') ?? 'Frameleaf couldn’t install the update. Try again.'
+        : typeof error === 'string' && error.startsWith('update_library_stop_')
+          ? errorCopy(error) ?? 'Frameleaf couldn’t install the update. Try again.'
         : error === 'update_media_copy_active'
           ? 'Finish or cancel the media copy before installing the update.'
           : error === 'update_changed'
