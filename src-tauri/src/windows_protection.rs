@@ -143,48 +143,73 @@ fn private_acl(owner: &[u8], acl: &[u8], expected_owner: &[u8], trusted: &[Vec<u
     }
     true
 }
-/// The photo library: originals, thumbnails and encoded video, several files per photo, so its
-/// size has no bound. The host agent names it `media`; nothing else it keeps (database,
-/// credentials, journals, checkpoints) is stored under that name.
-fn library_directory(name: Option<&std::ffi::OsStr>) -> bool {
-    name.and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("media"))
+/// The host's state directory, as admission meets it: the admitted directory itself, or the
+/// one directly inside an admitted profile root. Nowhere deeper.
+fn state_directory(depth: usize, name: Option<&std::ffi::OsStr>) -> bool {
+    depth <= 1
+        && name
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("state"))
 }
-/// How many entries admission always inspects: everything else, and separately a library.
+/// The photo library: originals, thumbnails and encoded video, several files per photo, so its
+/// size has no bound. It is the `media` directory directly inside the state directory, and
+/// only that one: a `media` anywhere else is state like any other.
+fn library_directory(parent_is_state: bool, name: Option<&std::ffi::OsStr>) -> bool {
+    parent_is_state
+        && name
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("media"))
+}
+/// How many entries admission opens and inspects in full: everything outside the library,
+/// and separately the library's first entries.
 const INVENTORY_LIMIT: usize = 100_000;
-/// How long admission keeps inspecting a library past that many of its entries.
-const LIBRARY_OVERTIME: std::time::Duration = std::time::Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walk {
-    /// Inspect this entry; anything but private refuses admission.
+    /// Open this entry and inspect its owner and ACL; anything but private refuses.
     Inspect,
-    /// Stop looking inside library directories. What was not reached is neither verified nor
-    /// refused: the protected, verified root above it already keeps every other account out.
-    LeaveLibrary,
-    /// More state outside a library than this app writes: refuse, as before.
+    /// A library entry past the limit: decide from its directory listing. See `listed_entry`.
+    Listed,
+    /// More state outside the library than this app writes: refuse, as before.
     Refuse,
 }
-/// What admission does with the `count`th entry (from one) of its kind. Up to the limit every
-/// entry is inspected, inside a library or not, exactly as when the limit refused everything
-/// larger. Past it only a library goes on, and only for as long as `overtime` allows: its
-/// size alone must never leave a library unstartable.
-fn walk_step(library: bool, count: usize, overtime: impl FnOnce() -> std::time::Duration) -> Walk {
+/// What admission does with the `count`th entry (from one) of its kind. Enumeration never
+/// stops and does not depend on the clock or the disk: a library's size alone must never
+/// leave it unstartable, and no part of it is skipped.
+fn walk_step(library: bool, count: usize) -> Walk {
     if count <= INVENTORY_LIMIT {
         Walk::Inspect
-    } else if !library {
-        Walk::Refuse
-    } else if overtime() < LIBRARY_OVERTIME {
-        Walk::Inspect
+    } else if library {
+        Walk::Listed
     } else {
-        Walk::LeaveLibrary
+        Walk::Refuse
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listed {
+    /// A reparse point, or neither file nor directory: refuse, without opening it.
+    Refuse,
+    /// Open and inspect it like any entry, then look inside: a loose directory would expose
+    /// everything in it and let another account replace what is inside.
+    Directory,
+    /// An ordinary file: its own ACL is the one thing left unread past the limit.
+    File,
+}
+/// A library entry past the limit, from the attributes its directory listing already holds.
+fn listed_entry(reparse: bool, directory: bool, file: bool) -> Listed {
+    if reparse || directory == file {
+        Listed::Refuse
+    } else if directory {
+        Listed::Directory
+    } else {
+        Listed::File
     }
 }
 #[cfg(windows)]
 mod user;
 #[cfg(windows)]
 pub(crate) use user::{
-    create_private_directory, pin_private_directory, private_directory, process_user_sid,
-    require_private_directory,
+    create_private_directory, pin_private_child, pin_private_directory, private_directory,
+    private_directory_pinned, process_user_sid, require_private_directory,
 };
 
 #[cfg(windows)]
@@ -1023,47 +1048,60 @@ mod tests {
         }
     }
     #[test]
-    fn only_the_library_directory_is_unbounded() {
+    fn only_media_directly_inside_the_state_directory_is_the_library() {
         use std::ffi::OsStr;
-        for name in ["media", "Media", "MEDIA"] {
-            assert!(library_directory(Some(OsStr::new(name))));
+        let name = |name: &'static str| Some(OsStr::new(name));
+        // The admitted directory itself, or the one directly inside an admitted profile root.
+        for depth in [0, 1] {
+            for spelling in ["state", "State", "STATE"] {
+                assert!(state_directory(depth, name(spelling)));
+            }
+            for other in ["manager", "media", "state2", "home", ""] {
+                assert!(!state_directory(depth, name(other)), "{other}");
+            }
+            assert!(!state_directory(depth, None));
         }
-        for name in [
+        for depth in [2, 3, 40] {
+            assert!(!state_directory(depth, name("state")));
+        }
+        for spelling in ["media", "Media", "MEDIA"] {
+            assert!(library_directory(true, name(spelling)));
+            // Under `home`, `studio-work`, `database`, a restore target or Manager's folder.
+            assert!(!library_directory(false, name(spelling)));
+        }
+        for other in [
             "database",
             "checkpoints",
             "secrets",
-            "manager",
-            "state",
             "home",
             "media2",
             "medi",
             "media.json",
             "",
         ] {
-            assert!(!library_directory(Some(OsStr::new(name))), "{name}");
+            assert!(!library_directory(true, name(other)), "{other}");
         }
-        assert!(!library_directory(None));
+        assert!(!library_directory(true, None));
     }
     #[test]
-    fn size_refuses_only_outside_a_library_and_never_skips_what_was_inspected_before() {
-        use std::time::Duration;
-        let unread = || -> Duration { panic!("the clock matters only past the limit") };
+    fn size_refuses_only_outside_the_library_and_nothing_in_it_is_skipped() {
         for library in [false, true] {
             for count in [1, 2, INVENTORY_LIMIT - 1, INVENTORY_LIMIT] {
-                assert_eq!(walk_step(library, count, unread), Walk::Inspect);
+                assert_eq!(walk_step(library, count), Walk::Inspect);
             }
         }
-        for count in [INVENTORY_LIMIT + 1, INVENTORY_LIMIT * 50] {
-            // Outside a library the clock is not consulted: more is always refused.
-            assert_eq!(walk_step(false, count, unread), Walk::Refuse);
-            assert_eq!(walk_step(true, count, || Duration::ZERO), Walk::Inspect);
-            assert_eq!(
-                walk_step(true, count, || LIBRARY_OVERTIME - Duration::from_millis(1)),
-                Walk::Inspect
-            );
-            for late in [LIBRARY_OVERTIME, LIBRARY_OVERTIME * 100] {
-                assert_eq!(walk_step(true, count, || late), Walk::LeaveLibrary);
-            }
+        for count in [INVENTORY_LIMIT + 1, INVENTORY_LIMIT * 50, usize::MAX] {
+            assert_eq!(walk_step(false, count), Walk::Refuse);
+            assert_eq!(walk_step(true, count), Walk::Listed);
         }
+        // Past the limit: a junction or link always refuses, a directory is always opened
+        // and inspected, and only an ordinary file's own ACL goes unread.
+        for (directory, file) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(listed_entry(true, directory, file), Listed::Refuse);
+        }
+        assert_eq!(listed_entry(false, false, false), Listed::Refuse);
+        assert_eq!(listed_entry(false, true, true), Listed::Refuse);
+        assert_eq!(listed_entry(false, true, false), Listed::Directory);
+        assert_eq!(listed_entry(false, false, true), Listed::File);
     }
 }

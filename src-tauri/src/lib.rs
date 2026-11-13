@@ -42,6 +42,7 @@ pub mod native_predictor;
 pub mod native_runtime;
 mod offline_albums;
 mod package_lease;
+mod package_move;
 mod photo_session;
 pub mod photo_sources;
 mod process_tree;

@@ -52,6 +52,16 @@ pub(crate) struct Marker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     media_reference: Option<media_move::MediaReference>,
 }
+impl Marker {
+    /// The library's media was moved, which only a running Manager of the journal's package
+    /// can have done.
+    pub(crate) fn media_moved(&self) -> bool {
+        #[cfg(any(windows, test))]
+        return self.media_reference.is_some();
+        #[cfg(not(any(windows, test)))]
+        false
+    }
+}
 pub(crate) struct Owner {
     #[cfg(windows)]
     _profile_pins: Vec<File>,
@@ -159,11 +169,17 @@ impl Owner {
     }
 
     pub fn acquire(path: &Path, writable: bool) -> Result<Self, String> {
+        #[cfg(not(windows))]
         if writable {
             crate::runtime_store::private_directory(path)?;
         }
+        // One admission that also pins: admitting and then pinning walked the tree twice.
         #[cfg(windows)]
-        let profile_pins = crate::windows_protection::pin_private_directory(path)?;
+        let profile_pins = if writable {
+            crate::windows_protection::private_directory_pinned(path)?
+        } else {
+            crate::windows_protection::pin_private_directory(path)?
+        };
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         #[cfg(unix)]
         {
@@ -380,6 +396,13 @@ impl Owner {
             Err(error) if error == "host_controller_state_unavailable" => Ok(false),
             Err(error) => Err(error),
         }
+    }
+    /// `check_movable` for a package move: a library move that is pending (its fence is held)
+    /// also refuses, here before the move's first change and not only at the journal write
+    /// that commits it. The library move itself checks with `check_movable` under its fence.
+    pub(crate) fn check_package_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
+        no_media_move(&self.root)?;
+        self.check_movable(id, previous)
     }
     /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
     pub(crate) fn check_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
@@ -849,6 +872,18 @@ mod tests {
             fs::remove_file(operation).unwrap();
         }
 
+        // A library move that is pending refuses a package move before anything is changed;
+        // the library move's own checks, made under that fence, are not affected.
+        let pending = fixture.0.join(MEDIA_MOVE);
+        fs::write(&pending, b"synthetic").unwrap();
+        assert_eq!(
+            owner.check_package_movable(ID, &manifest).unwrap_err(),
+            "host_media_move_pending"
+        );
+        owner.check_movable(ID, &manifest).unwrap();
+        fs::remove_file(pending).unwrap();
+
+        owner.check_package_movable(ID, &manifest).unwrap();
         owner.check_movable(ID, &manifest).unwrap();
         assert_eq!(owner.read().unwrap(), stopped);
     }
