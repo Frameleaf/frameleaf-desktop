@@ -107,6 +107,28 @@ async function checkedHost(candidate, trust, signature) {
     join(candidate, "manifest.json"),
     16 * 1024 * 1024,
   );
+  const { manifest, keyId } = await checkHostManifest(raw, trust, signature);
+  await verifyPayload(join(candidate, "payload"), manifest.files, 100000);
+  if (basename(manifest.entryPoints.mlManifest) !== "manifest.json")
+    fail("host_ml_manifest_invalid");
+  const ml = await verifySignedCandidate(
+    join(candidate, "payload", dirname(manifest.entryPoints.mlManifest)),
+    trust,
+  );
+  if (
+    ml.manifest.platform !== manifest.platform ||
+    ml.manifest.architecture !== manifest.architecture
+  )
+    fail("host_ml_target_mismatch");
+  return { raw, manifest, keyId };
+}
+
+/**
+ * Everything the manifest alone decides: its signature (when given) and whether this commit's
+ * trust and pins accept it. The payload is not read, so a release can check a package's manifest
+ * without the package.
+ */
+export async function checkHostManifest(raw, trust, signature) {
   let authority;
   if (signature) {
     authority = trust.keys.find(
@@ -166,19 +188,7 @@ async function checkedHost(candidate, trust, signature) {
       fail("host_component_missing");
   if (Object.hasOwn(manifest.files, "host-agent.mjs"))
     fail("host_fixture_agent_forbidden");
-  await verifyPayload(join(candidate, "payload"), manifest.files, 100000);
-  if (basename(manifest.entryPoints.mlManifest) !== "manifest.json")
-    fail("host_ml_manifest_invalid");
-  const ml = await verifySignedCandidate(
-    join(candidate, "payload", dirname(manifest.entryPoints.mlManifest)),
-    trust,
-  );
-  if (
-    ml.manifest.platform !== manifest.platform ||
-    ml.manifest.architecture !== manifest.architecture
-  )
-    fail("host_ml_target_mismatch");
-  return { raw, manifest, keyId: authority?.id };
+  return { manifest, keyId: authority?.id };
 }
 
 export async function signHostCandidate(candidate, privatePem, policy) {
