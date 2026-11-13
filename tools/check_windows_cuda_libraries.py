@@ -315,6 +315,25 @@ def run_stages(pack: Path, folders: list[Path], last: str, home: bool = True) ->
     return {**first, **second, "problems": first["problems"] + second["problems"]}
 
 
+def changed(pack: Path, manifest: dict) -> list[str]:
+    """Files of the payload whose size or SHA-256 no longer match the manifest."""
+    import hashlib
+
+    names = []
+    for name, artifact in sorted(manifest["files"].items()):
+        path = pack / "payload" / name
+        if not path.is_file() or path.stat().st_size != artifact["bytes"]:
+            names.append(name)
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(block)
+        if digest.hexdigest() != artifact["sha256"]:
+            names.append(name)
+    return names
+
+
 def markdown(report: dict) -> str:
     lines = ["| Library | How | Needs | In the pack |", "| --- | --- | --- | --- |"]
     lines += [f"| `{row['library']}` | {row['reference']} | `{row['needs']}` | {row['pack']} |" for row in report["table"]]
@@ -369,6 +388,8 @@ def main() -> None:
     }
     report["problems"] = problems + report["loader"]["problems"]
     report["problems"] += check_runtime_gate.problems(report["gate"])
+    # Nothing these checks start may change the signed pack (the app refuses a changed file).
+    report["problems"] += [f"the checks changed a file of the signed pack: {name}" for name in changed(pack, manifest)]
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "cuda-libraries.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (args.output / "cuda-libraries.md").write_text(markdown(report), encoding="utf-8")

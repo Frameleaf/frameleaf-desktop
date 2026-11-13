@@ -24,8 +24,9 @@ PROBES = {
     "onnxruntime": "import onnxruntime",
     # The C runtime's lock on descriptor 0, which a pending read held (lseek takes it).
     "standard input": "import os, time\ntime.sleep(1)\ntry: os.lseek(0, 0, 1)\nexcept OSError: pass\nos.fstat(0)",
-    # A child inherits the standard input; Python asks what it is as it starts.
-    "child process": "import subprocess, sys; subprocess.run([sys.executable, '-I', '-c', 'pass'], check=True)",
+    # A child inherits the standard input; Python asks what it is as it starts. `-B`, as the app
+    # starts it: the pack's files are signed, and a compiled module rewritten breaks them.
+    "child process": "import subprocess, sys; subprocess.run([sys.executable, '-I', '-B', '-c', 'pass'], check=True)",
 }
 SECONDS = 120
 

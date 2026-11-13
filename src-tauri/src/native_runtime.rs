@@ -1341,7 +1341,7 @@ mod tests {
             .args(["-I", "-B", "-c", GATE, "timeit", "-n", "1", "-r", "1"])
             // The gate's watch is started before this runs; give it time to be waiting.
             // `lseek` takes the C runtime's lock on the descriptor, which a pending read held.
-            .arg("import os, subprocess, sys, time\ntime.sleep(1)\ntry: os.lseek(0, 0, 1)\nexcept OSError: pass\nos.fstat(0)\nsubprocess.run([sys.executable, '-I', '-c', 'pass'], check=True)")
+            .arg("import os, subprocess, sys, time\ntime.sleep(1)\ntry: os.lseek(0, 0, 1)\nexcept OSError: pass\nos.fstat(0)\nsubprocess.run([sys.executable, '-I', '-B', '-c', 'pass'], check=True)")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
