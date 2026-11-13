@@ -355,9 +355,48 @@ python tools/build_runtime.py --source <frameleaf-app checkout at the profile's 
 candidate/payload/python/python.exe -I -B tools/smoke_accelerated_runtime.py CUDAExecutionProvider   # Linux: candidate/payload/python/bin/python3.12
 ```
 
-Neither provider has run on NVIDIA or Intel hardware. A CUDA pack is about 3 GB
-and no installer carries either: the factory builds one only when `accelerated`
-names it.
+Neither provider has run on NVIDIA or Intel hardware.
+
+#### Delivery of the CUDA and OpenVINO packs (FD-60)
+
+A CUDA pack is about 3 GB, too large for an installer and for one release file
+(GitHub: "Each file included in a release must be under 2 GiB"). Installers keep
+carrying the processor pack. The CUDA and OpenVINO packs for `windows-x86_64` and
+`linux-x86_64` are release files the app downloads only when the person chooses
+Download on the AI processing page, and only on a computer with the device.
+
+- Factory: a `default` run (or one naming `cuda-ort` / `openvino-ort`) builds
+  those packs beside each installer pack. The `deliver` job signs only the
+  pack's accelerated manifest, cuts the pack into 1 GiB parts
+  (`tools/deliver_runtime.mjs`: the manifest, its signature, then the payload
+  files in the byte order of their names) and signs a delivery manifest naming
+  every part by size and SHA-256 and the runtime manifest by SHA-256, and
+  listing the payload files that are executable where the pack was built (the
+  app makes exactly those executable, as a bundled pack keeps its files' modes).
+  Artifacts:
+  `factory-accelerated-manifest-<target>-<profile>` and
+  `factory-accelerated-parts-<target>-<profile>`. The installer pack
+  (`factory-runtime-<target>`) carries the delivery manifests in `accelerated/`;
+  packaging refuses one that is unsigned, for another target or of another epoch.
+- Release: the `stage` job verifies every part against its signed delivery
+  manifest and uploads the parts beside the installers. The app fetches them
+  from `releases/download/v<its own version>/`, so they are reachable once the
+  release is published, and a release must be staged from the same factory run
+  as its installers.
+- App (`src-tauri/src/accelerated_pack.rs`): HTTPS only, resumable, each part
+  checked against the delivery manifest the installer carried, then the pack is
+  installed by the runtime store like a bundled one (signature, every file's
+  digest, epoch rules) and qualified. A downloaded pack is admitted only at the
+  processor runtime's own epoch. Any failure leaves the processor in charge and
+  shows the reason with a retry.
+
+To rebuild a pack from factory artifacts on a computer with the device (for the
+hardware check above): `node tools/deliver_runtime.mjs --reassemble <profile>.json
+<profile>.sig <parts folder> <output folder>`.
+
+The processor manifest of a CUDA or OpenVINO pack is never signed (the signer
+refuses it: another dependency set than the processor profile), so such a pack
+cannot become an installer's own runtime.
 
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
@@ -403,27 +442,148 @@ settings page to set it on.
 
 ### Companion packages
 
-The app sends people to the releases page for the Library companion package, so
-a release carries it. `companion_run_ids` names the successful
-`macos-host-package.yml` run (manual, on `main`, from a commit in this commit's
-history) whose `frameleaf-macos-arm64-companion-installed` artifact holds the
-notarized `FrameleafCompanion_<version>_arm64.pkg`. That workflow has already
-checked the installer signature, notarization and Gatekeeper; the release checks
-the package against the checksum the run recorded and adds it to the draft. A
-tagged release that includes `macos-aarch64` needs this input, or `none` to
-stage the draft without it.
+The app sends people to the releases page for the Library companion package
+("Run Frameleaf here"), so a release carries it for Apple Silicon, Linux x64 and
+Windows x64. Intel Macs and Linux ARM have none.
 
-No workflow retains a signed, final Linux or Windows companion package: the
-Linux packages are built and signed across `linux-host-signing.yml` and the
-Ubuntu qualification without being uploaded, and the Windows installer is only
-produced unsigned (`-setup-unsigned.exe`). Those, and the `SOURCES` files, are
-still added to the draft by hand. The run summary and the draft notes name each
-selected platform whose companion package was not attached.
+For each of those platforms one workflow installs the final package on a clean
+runner, qualifies it, and only then retains two artifacts (for 90 days):
 
-`macos-host-package.yml` reads its input from the draft with release id
-`419477762`, which no longer exists: producing a new Apple Silicon companion
-package needs that workflow pointed at a current draft first. The run that
-produced 1.2.4 is `42148037724`; its artifact expires on February 4, 2027.
+| Platform | Workflow | Package artifact | Release assets |
+| --- | --- | --- | --- |
+| Apple Silicon | `macos-host-package.yml` | `frameleaf-macos-arm64-companion-installed` | `FrameleafCompanion_<version>_arm64.pkg` |
+| Linux x64 | `ubuntu-host-qualification.yml` | `frameleaf-linux-x64-companion-installed` | `FrameleafCompanion_<version>_amd64_bootstrap.deb`, `FrameleafCompanion_<version>_amd64_runtime.deb` |
+| Windows x64 | `windows-compiled-host.yml` with `release_package=true` | `frameleaf-windows-x64-companion-installed` | `FrameleafCompanion_<version>_x64-setup.exe` |
+
+`<version>` is the Library version in the package (`payload/server/package.json`),
+the one the app shows as "Library 1.2.4". Beside the package artifact each run
+uploads `<package artifact>-identity`: the signed host manifest from inside the
+package (`manifest.json`, `manifest.sig`) and `companion.json`, which names the
+package files by SHA-256 with the manifest and controller digests.
+
+`companion_run_ids` on `release.yml` takes those run ids, comma-separated, one
+per selected platform that has a companion package. `prepare` stops the release
+before anything is built when:
+
+- a run is not a successful manual run of its workflow on `main`, from a commit
+  in this commit's history (`companion_run_untrusted`), a selected platform has
+  no run (`companion_run_missing`), or a run is for a platform not being
+  released (`companion_run_unselected`);
+- the run has no unexpired package artifact, or no identity artifact
+  (`companion_identity_missing`): for Windows that is a run without
+  `release_package=true`;
+- the manifest in the identity artifact is one the Desktop built from this
+  commit refuses once installed (`companion_incompatible`): not signed by a key
+  in `runtime/release-trust.json`, or not matching this commit's host pins
+  (`runtime/host-database.json`, host protocol, Node version, minimum epoch).
+  This is the check the app makes before local setup
+  ([FD-19](https://heroit.atlassian.net/browse/FD-19)), made on the manifest
+  alone, so a stale or wrong package never reaches a draft;
+- the manifest is for another platform (`companion_target_mismatch`), or
+  `companion.json` does not name exactly that workflow's files
+  (`companion_identity_invalid`).
+
+`stage` then downloads the package artifact and adds exactly the files
+`companion.json` named, each checked against its SHA-256
+(`companion_artifact_changed`). `companion_run_ids=none` stages the draft
+without companion packages; the run summary and the draft notes then name each
+platform whose package has to be added by hand before publishing.
+
+The `SOURCES` files (`FrameleafCompanion_<version>_<arch>_SOURCES.md` or `.zip`)
+are not produced by a workflow and are still added to the draft by hand.
+
+#### Producing a companion package
+
+Each chain starts from a host candidate uploaded as an asset of a **private
+draft release kept for this purpose** (any tag that is not a version tag; never
+the draft of the release itself, whose assets are rebuilt by `release.yml`).
+Every workflow takes that draft's id in its approval; none names a draft.
+All run on `main` with `gh workflow run <file> --repo Frameleaf/frameleaf-desktop
+--ref main -f approval='<json>'`. Dispatch them in this order, each after the
+one before has succeeded.
+
+Apple Silicon:
+
+1. `macos-host-signing.yml`, approval
+   `{"archiveSha256","assetId","controllerSha256","manifestSha256","releaseId"}`
+   for the unsigned host archive on the draft. It signs the native code with the
+   Developer ID Application certificate, notarizes Chromium, seals the manifest
+   and uploads an unsigned installer wrapper
+   (`FrameleafCompanion-<version>-macOS-arm64-unsigned-<run>.pkg`) to the draft.
+2. By hand, on a Mac with the Developer ID Installer certificate:
+   `productsign` that wrapper and upload the signed package to the same draft.
+   No workflow holds that certificate.
+3. `macos-host-package.yml`, approval
+   `{"assetId","controllerSha256","manifestSha256","packageSha256","releaseId"}`
+   for the signed package. It checks the Developer ID Installer signature,
+   notarizes and staples, installs on a fresh Mac, and retains the package.
+   **This run id goes in `companion_run_ids`.**
+
+Linux x64:
+
+1. `linux-host-signing.yml`, approval
+   `{"archiveSha256","assetId","manifestSha256","releaseId"}` for the unsigned
+   host archive. It seals the manifest and retains `manifest.sig`
+   (`frameleaf-linux-x64-host-signature`, 7 days).
+2. By hand, on Ubuntu 24.04 x64: add that `manifest.sig` to the candidate, build
+   the controller (`cargo build --release --locked --bin frameleaf-native-host`)
+   and run `python tools/build_host_linux_deb.py --candidate <candidate>
+   --controller <controller> --output <directory>`. Rename the two packages to
+   `bootstrap.deb` and `runtime.deb` and upload a `tar.gz` holding exactly those
+   to the draft.
+3. `ubuntu-host-qualification.yml`, approval
+   `{"archiveSha256","assetId","controllerSha256","manifestSha256","releaseId"}`
+   for that archive. It installs both packages on a clean runner, recovers an
+   interrupted `dpkg` retry, renders under AppArmor, and retains the packages.
+   **This run id goes in `companion_run_ids`.**
+
+Windows x64 (needs the Azure Artifact Signing variables,
+[step 1 of the checklist](#publishing-a-release-owner-checklist)):
+
+1. The nine component workflows and `windows-host-assembly.yml`
+   (`approvals`, `epoch`), then `windows-host-signing.yml` (`approval` for the
+   assembly run). These retain their artifacts for 7 days.
+2. `installer-candidates.yml` with `platforms=windows` for the signed Desktop the
+   next step installs.
+3. `windows-compiled-host.yml` with `approvals` (the signing run),
+   `desktop_sha256`, `desktop_approval` and **`release_package=true`**. It first
+   checks the signing variables and stops with `windows_signing_unconfigured`,
+   naming each one that is not set, before anything is built. It then signs the
+   controller, builds the installer around it, signs the installer, installs it
+   twice, checks the publisher signature on the installer and the installed
+   controller, and retains the installer. **This run id goes in
+   `companion_run_ids`.** Without `release_package` the workflow behaves as
+   before: an unsigned `-setup-unsigned.exe` kept for 7 days, which a release
+   never accepts.
+
+#### Reusing a companion package
+
+When the Library companion has not changed since the last release, do not
+rebuild it: pass the same run ids again. A run stays usable while its two
+artifacts are unexpired (90 days from the run; the run page shows the date), its
+commit is in the history of the commit being released, and its manifest still
+passes the check above. `prepare` says which of those failed.
+
+Once the artifacts have expired, dispatch only the last workflow of that
+platform's chain again with the same approval, the package still being on the
+private draft: `macos-host-package.yml` (Apple's ticket is already stapled, so
+it does not wait for Apple again) or `ubuntu-host-qualification.yml`. Windows
+needs its chain from `windows-host-assembly.yml`, because those inputs are kept
+for 7 days only.
+
+The Library 1.2.4 packages were made before this:
+
+- Apple Silicon: run `42148037724` holds the notarized 1.2.4 package until
+  February 4, 2027. It has no identity artifact; `release.yml` accepts that one
+  run on the checksum it recorded, without the manifest check.
+- Linux x64: no run holds the 1.2.4 packages. Upload a `tar.gz` of
+  `bootstrap.deb` and `runtime.deb` (the two packages on the 0.1.5 release,
+  renamed) to a private draft and run `ubuntu-host-qualification.yml` once, with
+  controller `045568dc0bbbe5a582516e83b2d4f11b4122a381cb91a6d29c778aff128b5cc7`
+  and manifest `b3ce270798e290f89505e554dee9be0fd3006a49af11fe3bf5d0025dde5d7a74`.
+- Windows x64: only the unsigned 1.2.4 installer exists. A signed one needs the
+  Windows chain above once signing is configured; until then release Windows
+  with `companion_run_ids=none` or leave Windows out.
 
 ### Staging: one draft per tag
 
@@ -582,10 +742,22 @@ validation; macOS and Linux ship without it.
    gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
      -f platforms=<platforms> -f epoch=9 -f accelerated=default
    ```
-5. **Have the companion packages ready** ([Companion packages](#companion-packages)):
-   the run id of the notarized Apple Silicon package (`42148037724` for 1.2.4),
-   and the Linux, Windows and `SOURCES` files to add by hand (the same 1.2.4
-   files are on the 0.1.5 release).
+
+   With `accelerated=default` a `windows` or `linux` run also builds the CUDA and
+   OpenVINO packs the app downloads on request
+   ([Delivery of the CUDA and OpenVINO packs](#delivery-of-the-cuda-and-openvino-packs-fd-60)):
+   its `deliver` jobs must succeed, or no installer pack is signed. No factory
+   run has built those packs yet, so expect to iterate on the first one.
+5. **Have the companion package runs ready** ([Companion packages](#companion-packages)):
+   one run id per platform, from `macos-host-package.yml`,
+   `ubuntu-host-qualification.yml` and (with step 1 done)
+   `windows-compiled-host.yml` with `release_package=true`. Unchanged since the
+   last release: pass the same run ids again
+   ([Reusing a companion package](#reusing-a-companion-package); Apple Silicon
+   1.2.4 is `42148037724`). Changed: dispatch that platform's chain in the order
+   under [Producing a companion package](#producing-a-companion-package). Also
+   have the `SOURCES` files to add by hand (the 1.2.4 ones are on the 0.1.5
+   release).
 6. **Tag the commit and push the tag.** A pushed tag is never moved.
 
    ```sh
@@ -600,10 +772,21 @@ validation; macOS and Linux ship without it.
      -f tag=v<version> -f platforms=macos-aarch64 \
      -f runtime_run_id=<factory run> -f companion_run_ids=<macos-host-package run>
    gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
-     -f tag=v<version> -f platforms=linux -f runtime_run_id=<factory run>
+     -f tag=v<version> -f platforms=linux -f runtime_run_id=<factory run> \
+     -f companion_run_ids=<ubuntu-host-qualification run>
    gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
-     -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run>   # needs step 1
+     -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run> \
+     -f companion_run_ids=<windows-compiled-host run>   # needs step 1
    ```
+
+   A run that selects several platforms takes their run ids comma-separated.
+   `companion_run_ids=none` stages a platform without its companion package,
+   which then has to be added to the draft by hand.
+
+   Each run also verifies the CUDA and OpenVINO pack parts of its factory run
+   (`frameleaf-accelerated-*.partNN`) and adds them to the draft. Use the same
+   factory run for a platform's installers and its parts: the installer carries
+   the signed list of exactly those parts.
 
    Intel Macs: the Intel runtime now builds with onnxruntime 1.23.2
    ([FD-6](https://heroit.atlassian.net/browse/FD-6)), but no signed factory run
@@ -612,12 +795,17 @@ validation; macOS and Linux ship without it.
    Linux. Once one has, `platforms=macos-linux` (or `all` with step 1 done) in
    steps 4 and 7 replaces the separate macOS and Linux runs. A platform left out
    stays on its installed version; the draft notes say which.
-8. **Add the hand-attached files to the draft** (step 5) before the last run of
+8. **Add the `SOURCES` files to the draft** (step 5), and any companion package
+   left out with `none`, before the last run of
    step 7, so the final `SHA256SUMS` lists them; or re-run the `stage` job of the
    last run afterwards.
 9. **Review the draft**: one draft for the tag, the commit, the targets listed
-   under "Update feed" in its notes, `SHA256SUMS`, the companion packages, and
-   installed-device acceptance on each platform.
+   under "Update feed" in its notes, `SHA256SUMS`, the companion packages, the
+   `frameleaf-accelerated-*` parts for Windows and Linux x86_64, and
+   installed-device acceptance on each platform. The app can download the parts
+   only once the release is published, so a GPU pack is accepted on a device
+   after step 10 (or from the factory artifacts with
+   `tools/deliver_runtime.mjs --reassemble` before it).
 10. **Publish**: clear "pre-release", set it as the latest release and publish.
     From then the updater offers it to every target in `latest.json`.
 11. **Afterwards**: publish the AUR files, and Chocolatey only when the release

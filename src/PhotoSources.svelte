@@ -10,13 +10,13 @@
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import type { AlbumDestination } from './import-destination';
   import { availabilityText, formatBytes, oneDriveDiscovery, percent, importProgress, importProgressText, platformFromUserAgent, type Availability, type OverallProgress } from './ui-state';
-  import { explainError } from './errors';
+  import { explainError, skipSummary } from './errors';
   type Hint = { label: string; path: string };
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean; watch: boolean; camera: boolean; canReconnect: boolean; destination: AlbumDestination | null };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; availability: Availability | null; uploadRemaining: number | null; overall?: OverallProgress | null; additionalUploadAllowance: number; albumPending: boolean };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; skippedReasons?: Record<string, number>; code: string | null; availability: Availability | null; uploadRemaining: number | null; overall?: OverallProgress | null; additionalUploadAllowance: number; albumPending: boolean };
   let job = $state<CopyJob | null>(null);
   let jobEventRevision = 0;
   let consent = $state<Consent | null>(null);
@@ -180,7 +180,7 @@
               <b>{consent.name}</b>
               {#if consent.destination}<small>Album: {consent.destination.name}{consent.destination.shared ? ' (shared)' : ''}</small>{/if}
               {#if job?.albumPending}<small>Copy verified. Waiting to add it to the album.</small>{/if}
-              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {consent.watch && (!job || job.total === 0) ? (job ? jobLabel : 'Automatic import to your current library') : job ? `${jobLabel} · ${importProgressText(job)}${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
+              <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path} · {consent.watch && (!job || job.total === 0) ? (job ? jobLabel : 'Automatic import to your current library') : job ? `${jobLabel} · ${importProgressText(job)}${job.skipped ? ` · ${job.skipped.toLocaleString()} skipped` : ''}${job.uploadRemaining !== null ? ` · ${size(job.uploadRemaining)} upload allowance left` : ' · no upload allowance approved'}` : consent.registered ? 'Folder permission saved and registered with your server.' : 'Folder permission saved locally. Server registration still needs to finish.'}</small>
               {#if job && job.total > 0 && !['complete', 'cancelled'].includes(job.state)}{@const progress = importProgress(job)}<span class="progress" role="progressbar" aria-valuenow={percent(progress.completed, progress.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copies verified on your server"><span style="width:{percent(progress.completed, progress.total)}%"></span></span>{/if}
             </span>
             {#if job}<span class="pill {jobTone}" role="status"><i aria-hidden="true"></i>{job.state === 'complete' ? 'Up to date' : jobLabel.replace('Copy ', '')}</span>{/if}
@@ -251,7 +251,7 @@
 {/if}
 {#if detailsOpen && job}
   <Sheet title="Copy details" wide onclose={() => { detailsOpen = false; }}>
-    <p>Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} linked or excluded entries were skipped. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
+    <p>Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} ${job.skipped === 1 ? 'item was' : 'items were'} skipped and not imported${skipSummary(job.skippedReasons) ? ` (${skipSummary(job.skippedReasons)})` : ''}. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
     <p>{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
     {#if job.availability && availabilityText(job.availability)}<p aria-label="Where these files are">{availabilityText(job.availability)}</p>{/if}
     {#snippet actions()}<button class="btn" type="button" onclick={() => { detailsOpen = false; }}>Done</button>{/snippet}

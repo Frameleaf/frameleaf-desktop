@@ -94,3 +94,74 @@ export function workloadProvider(providers: WorkloadProvider[] | null | undefine
   if (!name) return '';
   return chosen.fallback ? `Runs on ${name} (GPU acceleration is not used: ${fallbackReason(chosen.fallback)})` : `Runs on ${name}`;
 }
+
+/** FD-60: the GPU runtime pack this computer can download, as the backend reports it. */
+export type AcceleratedPack = {
+  state: 'none' | 'available' | 'downloading' | 'unpacking' | 'ready' | 'failed' | string;
+  provider: string | null; bytes: number; receivedBytes: number; code: string | null; declined: boolean; metered: boolean;
+};
+export type AcceleratedPackAction = 'download' | 'decline' | 'cancel' | 'retry-provider';
+export type AcceleratedPackView = {
+  title: string; detail: string;
+  /** Percent of the download received, while one runs. */
+  progress: number | null;
+  /** The first action is the main one. */
+  actions: AcceleratedPackAction[];
+  tone: 'ok' | 'wait' | 'bad' | 'off';
+};
+
+const deviceNames: Readonly<Record<string, string>> = {
+  CUDAExecutionProvider: 'NVIDIA graphics card',
+  OpenVINOExecutionProvider: 'Intel graphics',
+};
+const deviceShortNames: Readonly<Record<string, string>> = {
+  CUDAExecutionProvider: 'NVIDIA graphics',
+  OpenVINOExecutionProvider: 'Intel graphics',
+};
+
+/**
+ * What the AI page says about the downloadable GPU pack, or null when this computer has none to
+ * offer. Nothing is downloaded until the person chooses Download. `size` formats a byte count and
+ * `reason` gives the words for a failure code; `providers` is what the worker chose for each workload.
+ */
+export function acceleratedPackView(
+  pack: AcceleratedPack | null | undefined, providers: WorkloadProvider[] | null | undefined,
+  size: (bytes: number) => string, reason: (code: string) => string,
+): AcceleratedPackView | null {
+  if (!pack || !pack.provider || !deviceNames[pack.provider]) return null;
+  const device = deviceNames[pack.provider]!;
+  const short = deviceShortNames[pack.provider]!;
+  switch (pack.state) {
+    case 'available':
+      return pack.declined
+        ? { title: `Faster processing with your ${device}`, detail: `Not downloaded (${size(pack.bytes)}). AI processing uses the processor.`, progress: null, actions: ['download'], tone: 'off' }
+        : {
+            title: `Faster processing available for your ${device}`,
+            detail: `Download ${size(pack.bytes)} to use it for AI processing on this computer. Until then, AI processing uses the processor.${pack.metered ? ' This connection may be metered.' : ''}`,
+            progress: null, actions: ['download', 'decline'], tone: 'wait',
+          };
+    case 'downloading': {
+      const percent = pack.bytes > 0 ? Math.min(100, Math.floor(pack.receivedBytes / pack.bytes * 100)) : 0;
+      return { title: `Downloading support for your ${device}`, detail: `${size(pack.receivedBytes)} of ${size(pack.bytes)}. AI processing continues on the processor.`, progress: percent, actions: ['cancel'], tone: 'wait' };
+    }
+    case 'unpacking':
+      return { title: `Checking the download for your ${device}`, detail: 'Every file is verified before it is used. This can take a few minutes.', progress: null, actions: [], tone: 'wait' };
+    case 'failed':
+      return {
+        title: `Faster processing for your ${device} could not be set up`,
+        detail: `${reason(pack.code ?? '')} AI processing continues on the processor.`,
+        progress: null, actions: ['download'], tone: 'bad',
+      };
+    case 'ready': {
+      const chosen = providers ?? [];
+      if (chosen.some(item => item.provider === pack.provider))
+        return { title: `Using ${short}`, detail: `AI processing on this computer runs on your ${device} where it is faster than the processor.`, progress: null, actions: [], tone: 'ok' };
+      const fallback = chosen.find(item => item.fallback)?.fallback;
+      if (fallback)
+        return { title: `${short} not in use`, detail: `AI processing uses the processor: ${fallbackReason(fallback)}.`, progress: null, actions: ['retry-provider'], tone: 'off' };
+      return { title: `Support for your ${device} is downloaded`, detail: 'It is checked on this computer when AI processing next starts.', progress: null, actions: [], tone: 'wait' };
+    }
+    default:
+      return null;
+  }
+}

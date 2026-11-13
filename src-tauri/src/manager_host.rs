@@ -216,7 +216,6 @@ fn binding<'a>(
     })
 }
 /// Same fields and order as Manager's native descriptor, whose fingerprint is sha256(JSON).
-#[cfg(unix)]
 pub(crate) fn descriptor_fingerprint(
     config: &Configuration,
     candidate: &Path,
@@ -233,16 +232,30 @@ pub(crate) fn descriptor_fingerprint(
         format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
     )
 }
+/// Manager on Windows rewrites the one mixed separator this app sends in the backup engine's
+/// path when it reads the bootstrap, and its stored descriptor has the rewritten path.
+#[cfg(any(windows, test))]
+fn manager_backup_path(path: &str) -> Option<String> {
+    path.strip_suffix("\\backup/restic.exe")
+        .map(|head| format!("{head}\\backup\\restic.exe"))
+}
 /// sha256 of the compact JSON Manager computes for its stored descriptor.
-#[cfg(unix)]
 fn fingerprint(
     installation: Binding,
     controller_sha256: &str,
-    backup_engine: crate::host_runtime::BackupEngine,
+    #[allow(unused_mut)] mut backup_engine: crate::host_runtime::BackupEngine,
     name: &str,
     release: &str,
     tls_certificate_pem_sha256: String,
 ) -> Result<String, String> {
+    #[cfg(windows)]
+    if let Some(path) = backup_engine
+        .executable
+        .to_str()
+        .and_then(manager_backup_path)
+    {
+        backup_engine.executable = path.into();
+    }
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Descriptor<'a> {
@@ -1653,6 +1666,95 @@ mod tests {
             )
             .unwrap(),
             "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
+        );
+    }
+    #[test]
+    fn only_the_mixed_separator_manager_rewrites_is_rewritten() {
+        assert_eq!(
+            manager_backup_path(
+                r"\\.\GLOBALROOT\Device\HarddiskVolume3\Host\payload\backup/restic.exe"
+            )
+            .as_deref(),
+            Some(r"\\.\GLOBALROOT\Device\HarddiskVolume3\Host\payload\backup\restic.exe")
+        );
+        for unchanged in [
+            r"C:\Host\payload\backup\restic.exe",
+            r"C:\Host\payload/backup/restic.exe",
+            r"C:\Host\payload\backup/restic.exe.old",
+            "/opt/frameleaf/payload/backup/restic",
+        ] {
+            assert_eq!(manager_backup_path(unchanged), None, "{unchanged}");
+        }
+    }
+    /// What Manager stores on Windows, written out as its `JSON.stringify` does: the fields in
+    /// its schema's order, and the backup engine's path with the separator it rewrote.
+    #[cfg(windows)]
+    #[test]
+    fn windows_descriptor_fingerprint_is_of_the_path_manager_rewrote() {
+        let m = "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435";
+        let c = "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b";
+        let root = r"\\.\GLOBALROOT\Device\HarddiskVolume3\Program Files\Frameleaf Desktop Host";
+        let controller = format!(r"{root}\Controllers\{m}\{c}\frameleaf-native-host.exe");
+        let candidate = format!(r"{root}\Runtimes\{m}");
+        let state = r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\Zoë\AppData\Local\Frameleaf Desktop Host\state";
+        let engine = "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6";
+        let certificate = "9fdf3df9908cdfa7823ee232f00c28e749bd4a5f04cdec60429c3c232b496ec2";
+        let text = |value: &str| serde_json::to_string(value).unwrap();
+        let stored = format!(
+            concat!(
+                r#"{{"protocolVersion":2,"installation":{{"runtime":"native","id":"1d0ea3c5161e","#,
+                r#""secureInstallationId":"c6c6b19e-000f-88a2-9241-7571029303a6","controller":{},"#,
+                r#""candidate":{},"state":{},"manifestSha256":"{}","#,
+                r#""sourceRevision":"c64039743af7bb0d68b602ff842683906019de52","certified":false,"#,
+                r#""databasePort":54329,"apiPort":2283}},"controllerSha256":"{}","#,
+                r#""backupEngine":{{"executable":{},"sha256":"{}"}},"name":"My Frameleaf library","#,
+                r#""release":"frameleaf-v1.2.3-native.c64039743af7-1","tlsCertificatePemSha256":"{}"}}"#,
+            ),
+            text(&controller),
+            text(&candidate),
+            text(state),
+            m,
+            c,
+            text(&format!(r"{candidate}\payload\backup\restic.exe")),
+            engine,
+            certificate,
+        );
+        let installation = Binding {
+            runtime: "native",
+            id: "1d0ea3c5161e",
+            secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
+            controller: Path::new(&controller),
+            candidate: Path::new(&candidate),
+            state: Path::new(state),
+            manifest_sha256: m,
+            source_revision: "c64039743af7bb0d68b602ff842683906019de52",
+            certified: false,
+            database_port: 54329,
+            api_port: 2283,
+        };
+        // As this app builds it: the payload directory joined to the manifest's role.
+        let backup = crate::host_runtime::BackupEngine {
+            executable: Path::new(&candidate)
+                .join("payload")
+                .join("backup/restic.exe"),
+            sha256: engine.into(),
+        };
+        assert!(backup
+            .executable
+            .to_str()
+            .unwrap()
+            .ends_with(r"\backup/restic.exe"));
+        assert_eq!(
+            fingerprint(
+                installation,
+                c,
+                backup,
+                "My Frameleaf library",
+                "frameleaf-v1.2.3-native.c64039743af7-1",
+                certificate.into(),
+            )
+            .unwrap(),
+            format!("{:x}", Sha256::digest(stored.as_bytes()))
         );
     }
     /// A start cancelled while its port move was still unconfirmed: the move is taken back,

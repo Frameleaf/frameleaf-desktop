@@ -386,7 +386,11 @@ pub struct ImportView {
     pub logical_bytes: u64,
     pub upload_remaining: Option<u64>,
     pub additional_upload_allowance: u64,
+    /// Items left out of the whole import so far; none of them is counted as imported.
     pub skipped: u64,
+    /// Why, by reason code, for the skipped items whose reason is known. Never a filename.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped_reasons: BTreeMap<String, u64>,
     pub code: Option<String>,
     pub album_pending: bool,
     pub availability: Option<crate::source_metadata::AvailabilitySummary>,
@@ -415,7 +419,10 @@ fn view(manifest: &Manifest, cursor: &Cursor, state: &str, code: Option<String>)
             .as_ref()
             .map(|budget| budget.limit - budget.used),
         additional_upload_allowance: remaining_allowance(manifest, cursor),
-        skipped: manifest.skipped + cursor.watch_skipped.len() as u64,
+        skipped: manifest.skipped
+            + cursor.watch_skipped.len() as u64
+            + manifest.import.as_ref().map_or(0, |import| import.skipped),
+        skipped_reasons: skipped_reasons(manifest, cursor),
         album_pending: manifest.destination.is_some()
             && cursor
                 .active
@@ -512,9 +519,6 @@ fn batch_manifest(
     if scan.inventory.truncated {
         return Err("source_inventory_partial".into());
     }
-    if scan.unreadable > 0 {
-        return Err("source_inventory_unreadable".into());
-    }
     if previous.is_some() && scan.files.is_empty() {
         return Ok(None);
     }
@@ -575,8 +579,15 @@ fn make_manifest(
             0
         },
         availability: Some(scan.inventory.availability),
-        skipped_reasons: if previous.is_none() && scan.inventory.empty > 0 {
-            BTreeMap::from([("source_item_empty".to_string(), scan.inventory.empty)])
+        skipped_reasons: if previous.is_none() {
+            // Entries the scan could not read or name are left out with their reason, never
+            // counted as imported.
+            (scan.inventory.empty > 0)
+                .then_some(("source_item_empty", scan.inventory.empty))
+                .into_iter()
+                .chain(scan.unreadable)
+                .map(|(reason, count)| (reason.to_string(), count))
+                .collect()
         } else {
             BTreeMap::new()
         },
@@ -3092,6 +3103,97 @@ mod tests {
                 .as_deref(),
             Some("source_no_media")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entries_that_cannot_be_read_or_named_are_skipped_with_reasons_and_the_rest_imports() {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+        tauri::async_runtime::block_on(async {
+            let mut f = Fixture::new();
+            let source = f.base.join("source");
+            let locked = source.join("lost+found");
+            fs::create_dir(&locked).unwrap();
+            fs::write(locked.join("inside.jpg"), b"0123456789").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            // Root may open anything: then no folder here is unreadable.
+            let folders = u64::from(fs::read_dir(&locked).is_err());
+            // APFS refuses a name that is not Unicode; ext4 and most card filesystems keep it.
+            let name = |bytes: &'static [u8]| source.join(std::ffi::OsStr::from_bytes(bytes));
+            let names = u64::from(fs::write(name(b"shot-\xff.jpg"), b"0123456789").is_ok());
+            let _ = fs::write(name(b"notes-\xff.txt"), b"not a photo");
+            if folders + names == 0 {
+                return;
+            }
+            let data = f.base.join("data");
+            let prepared = manifest_for(&f.consent, &f.saved, &f.identity, &data);
+            let after = prepared.as_ref().ok().map(|first| {
+                batch_manifest(
+                    &f.consent,
+                    &f.saved,
+                    &f.identity,
+                    &data,
+                    &source,
+                    Some(first),
+                )
+            });
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            f.manifest = prepared.unwrap();
+            // A later batch of the same folder is not refused either: nothing is left to copy.
+            assert!(matches!(after, Some(Ok(None))));
+            let expected: BTreeMap<String, u64> = [
+                (crate::photo_sources::FOLDER_UNREADABLE, folders),
+                (crate::photo_sources::NAME_UNSUPPORTED, names),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(reason, count)| (reason.to_string(), count))
+            .collect();
+            assert_eq!(f.manifest.files.len(), 1);
+            assert_eq!(f.manifest.files[0].relative, "photo.jpg");
+            assert_eq!(f.manifest.skipped, folders + names);
+            assert_eq!(f.manifest.skipped_reasons, expected);
+
+            let mut cursor = Cursor::new(&f.manifest).unwrap();
+            cursor.active = Some(Active {
+                item_id: f.item.clone(),
+                stage_id: f.stage.clone(),
+                copy: None,
+                upload: None,
+                receipt: None,
+                album_attached: false,
+            });
+            f.journal
+                .write("manifest.json", &f.manifest, &f.identity)
+                .unwrap();
+            f.journal
+                .write("cursor.json", &cursor, &f.identity)
+                .unwrap();
+            let server = Server::new(f.replies(f.receipt(), false, false));
+            f.run(&server, &|| Ok(())).await.unwrap();
+            let cursor: Cursor = f.journal.read("cursor.json", &f.identity).unwrap();
+            assert_eq!((cursor.state.as_str(), cursor.position), ("complete", 1));
+            // The result and the history count the skipped items apart from the verified one.
+            let shown = view(&f.manifest, &cursor, "complete", None);
+            assert_eq!((shown.completed, shown.total), (1, 1));
+            assert_eq!(shown.skipped, folders + names);
+            assert_eq!(shown.skipped_reasons, expected);
+            let entry = serde_json::to_value(history::Entry::from_run(
+                history::Kind::Folder,
+                &f.manifest,
+                &cursor,
+                false,
+            ))
+            .unwrap();
+            assert_eq!(entry["status"], "complete");
+            assert_eq!(
+                (&entry["verified"], &entry["total"]),
+                (&json!(1), &json!(1))
+            );
+            assert_eq!(entry["skipped"], folders + names);
+            assert_eq!(entry["skippedReasons"], json!(expected));
+            assert!(!entry.to_string().contains("lost+found"));
+        });
     }
 
     #[test]

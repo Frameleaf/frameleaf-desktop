@@ -244,9 +244,6 @@ fn prepare_batch(
     if scan.inventory.truncated {
         return Err("source_inventory_partial".into());
     }
-    if scan.unreadable > 0 {
-        return Err("source_inventory_unreadable".into());
-    }
     *observed = latest;
     if new.is_empty() {
         return Ok(false);

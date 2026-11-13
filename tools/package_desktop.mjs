@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { deliveryDirectory, verifyDeliveries } from "./deliver_runtime.mjs";
 import {
   acceleratedManifest,
   acceleratedSignature,
@@ -51,6 +52,10 @@ export async function packageConfiguration(candidate, policy) {
   )
     throw new Error("runtime_bundle_source_unapproved");
   const extra = accelerated ? [acceleratedManifest, acceleratedSignature] : [];
+  // FD-60: the signed delivery manifests of the packs the app downloads on demand (CUDA,
+  // OpenVINO). Each is a few kilobytes; the packs themselves are release assets.
+  for (const name of await verifyDeliveries(candidate, manifest, policy))
+    extra.push(`${deliveryDirectory}/${name}`);
   if (platform === "linux") {
     // linuxdeploy rewrites ELF files under usr/lib; keep the signed runtime outside that scan.
     const files = {

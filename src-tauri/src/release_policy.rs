@@ -56,6 +56,10 @@ fn parse_policy(raw: &str) -> Result<(u64, Vec<VerifyingKey>), String> {
     }
     Ok((policy.minimum_runtime_epoch, keys))
 }
+/// The release floor and keys every signed runtime artifact is checked against.
+pub(crate) fn trust() -> Result<(u64, Vec<VerifyingKey>), String> {
+    parse_policy(POLICY)
+}
 pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
     let (floor, keys) = parse_policy(POLICY)?;
     RuntimeStore::new(
