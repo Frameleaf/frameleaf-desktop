@@ -24,6 +24,7 @@ mod macos_quit;
 pub mod manager;
 mod manager_commands;
 pub mod manager_host;
+mod manager_local;
 mod manager_profile;
 pub mod manager_tls;
 mod media_copy;

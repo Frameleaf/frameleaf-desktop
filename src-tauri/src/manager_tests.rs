@@ -850,3 +850,193 @@ fn list_and_status_replies_may_exceed_the_small_reply_limit() {
         );
     });
 }
+
+#[test]
+fn the_runtime_request_is_bound_to_its_nonce_and_never_comes_from_the_interface() {
+    let nonce = uuid::Uuid::parse_str("66666666-6666-4666-8666-666666666666").unwrap();
+    let prepared = prepare(
+        &saved(),
+        &identity(),
+        &Command::Runtime { nonce },
+        1700000000000,
+        "55555555-5555-4555-8555-555555555555",
+    )
+    .unwrap();
+    assert_eq!(prepared.path, "/manager-api/desktop/runtime");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prepared.body).unwrap(),
+        json!({"nonce":"66666666-6666-4666-8666-666666666666"})
+    );
+    assert_eq!(
+        prepare(
+            &saved(),
+            &identity(),
+            &Command::Runtime {
+                nonce: uuid::Uuid::nil()
+            },
+            1700000000000,
+            "55555555-5555-4555-8555-555555555555",
+        )
+        .err()
+        .unwrap(),
+        "manager_request_invalid"
+    );
+    assert!(serde_json::from_value::<Command>(
+        json!({"kind":"runtime","nonce":"66666666-6666-4666-8666-666666666666"})
+    )
+    .is_err());
+
+    let command = Command::Runtime { nonce };
+    let reply = |patch: &dyn Fn(&mut Value)| {
+        let mut value = json!({
+            "protocolVersion":1,"nonce":nonce.to_string(),"installationId":"aaaaaaaaaaaa",
+            "capabilities":["runtime-status","ports","tls-rotation"],
+            "ports":{"manager":9443,"api":2283,"database":54329},
+            "photoServer":{"state":"running"}
+        });
+        patch(&mut value);
+        validate_reply(&saved(), &command, value)
+    };
+    assert!(reply(&|_| {}).is_ok());
+    // A later Manager may say more; what is read stays exact.
+    assert!(reply(&|value| value["later"] = json!({"anything":true})).is_ok());
+    assert!(reply(&|value| value["photoServer"] =
+        json!({"state":"unknown","code":"native_database_maintenance"}))
+    .is_ok());
+    for patch in [
+        (&|value: &mut Value| value["nonce"] = json!("77777777-7777-4777-8777-777777777777"))
+            as &dyn Fn(&mut Value),
+        &|value| value["installationId"] = json!("bbbbbbbbbbbb"),
+        &|value| value["protocolVersion"] = json!(2),
+        &|value| value["photoServer"]["state"] = json!("serving"),
+        &|value| value["photoServer"] = json!({"state":"unknown","code":"A sentence, not a code."}),
+        &|value| value["ports"]["api"] = json!(0),
+        &|value| value["ports"]["api"] = json!(70000),
+        &|value| {
+            value.as_object_mut().unwrap().remove("photoServer");
+        },
+        &|value| {
+            value.as_object_mut().unwrap().remove("ports");
+        },
+        &|value| {
+            value.as_object_mut().unwrap().remove("nonce");
+        },
+        &|value| value["capabilities"] = json!("ports"),
+    ] {
+        assert_eq!(reply(patch).err().unwrap(), "manager_response_invalid");
+    }
+}
+
+#[test]
+fn a_saved_grant_follows_only_its_own_local_manager_to_a_new_port_or_certificate() {
+    let fixture: Value = serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+    let pem = fixture["certificatePem"].as_str().unwrap();
+    let mint = || {
+        crate::manager_tls::TlsIdentity::load_or_create(
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9443",
+            || Ok(None),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .certificate()
+        .to_owned()
+    };
+    let (renewed, stranger) = (mint(), mint());
+    let local = |origin: &str, certificate: Option<&str>| -> SavedManager {
+        let mut value = serde_json::to_value(saved()).unwrap();
+        value["origin"] = json!(origin);
+        value["certificatePem"] = json!(certificate);
+        serde_json::from_value(value).unwrap()
+    };
+    let default = "https://127.0.0.1:9443";
+    // A moved port, same certificate.
+    let mut grant = local(default, Some(pem));
+    assert!(grant.follow_local("aaaaaaaaaaaa", "https://127.0.0.1:9444", pem, None));
+    assert_eq!(grant.view().origin, "https://127.0.0.1:9444");
+    assert_eq!(
+        grant.view().certificate_sha256,
+        Some(certificate_fingerprint(pem).unwrap())
+    );
+    // A renewed certificate, only when it replaced the pinned one.
+    let mut grant = local(default, Some(pem));
+    assert!(grant.follow_local("aaaaaaaaaaaa", default, &renewed, Some(pem)));
+    assert_eq!(
+        grant.view().certificate_sha256,
+        Some(certificate_fingerprint(&renewed).unwrap())
+    );
+    // Already in step: nothing to write.
+    assert!(!grant.follow_local("aaaaaaaaaaaa", default, &renewed, Some(pem)));
+    assert!(!grant.follow_local("aaaaaaaaaaaa", default, &renewed, None));
+    // Never: another installation, a certificate that did not replace the pinned one, a
+    // grant with no pinned certificate, or an origin that is not this computer's loopback.
+    for (mut grant, installation, origin, certificate, replaced) in [
+        (
+            local(default, Some(pem)),
+            "bbbbbbbbbbbb",
+            "https://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            default,
+            renewed.as_str(),
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            default,
+            renewed.as_str(),
+            Some(stranger.as_str()),
+        ),
+        (
+            local(default, None),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local("https://manager.test:9443", Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local("https://192.168.1.20:9443", Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9443",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://[::1]:9443",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            "http://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9444",
+            "not a certificate",
+            None,
+        ),
+    ] {
+        let before = serde_json::to_value(&grant).unwrap();
+        assert!(!grant.follow_local(installation, origin, certificate, replaced));
+        assert_eq!(serde_json::to_value(&grant).unwrap(), before);
+    }
+}

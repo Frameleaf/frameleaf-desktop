@@ -27,6 +27,8 @@ pub(crate) struct View {
     leave_available: bool,
     /// Days until the running Manager's TLS identity expires, once that is near.
     certificate_expires_in_days: Option<u32>,
+    /// That identity is renewed the next time local management starts.
+    certificate_renewable: bool,
     profile_setup_available: bool,
     profile_requires_authorization: bool,
     companion_platform: Option<&'static str>,
@@ -78,6 +80,7 @@ impl Default for View {
             background_active: false,
             leave_available: false,
             certificate_expires_in_days: None,
+            certificate_renewable: false,
             profile_setup_available: cfg!(any(target_os = "linux", windows)),
             profile_requires_authorization: cfg!(target_os = "linux"),
             companion_platform: match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -93,6 +96,8 @@ struct Running {
     manager: NativeManager,
     configuration: Configuration,
     installation: Installation,
+    /// What this package's Manager declares; none for the first released Manager.
+    features: crate::manager_local::Features,
 }
 /// Whether an owned Manager, or anything it started, is still alive.
 fn live(owner: &mut Option<Running>) -> bool {
@@ -140,9 +145,6 @@ impl Library {
         )
     }
 }
-/// The port every local Manager serves on.
-#[cfg(unix)]
-const MANAGER_PORT: u16 = 9443;
 /// Where this account's library lives on disk, and how to ask what may be running from it.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
@@ -151,15 +153,16 @@ struct Hosted<'a> {
     state: &'a std::path::Path,
     /// Manager's data directory, which holds this app's record of the Manager it started.
     data: &'a std::path::Path,
-    /// Whether anything answers on Manager's port.
+    /// Whether this library's Manager may be answering on the port this library records for
+    /// it. A listener proven to be another program's is `Clear`.
     listener: &'a dyn Fn() -> Evidence,
     /// What holds a PID right now.
     #[cfg(unix)]
     process: &'a dyn Fn(u32) -> crate::process_tree::Presence,
 }
 /// From disk alone: `Clear` when no library was ever hosted at `state`, or when its journal
-/// proves it idle and Manager's port definitely refuses connections. The port covers a Manager
-/// that left no usable record.
+/// proves it idle and nothing that could be its Manager answers on Manager's port. The port
+/// covers a Manager that left no usable record.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn hosted_library(state: &std::path::Path, listener: &dyn Fn() -> Evidence) -> Evidence {
     match std::fs::symlink_metadata(state) {
@@ -185,6 +188,10 @@ pub(crate) struct HostSetup {
     left_for_exit: AtomicBool,
     /// When the owned Manager's TLS identity expires, in Unix seconds; 0 with none owned.
     certificate_expires_at: std::sync::atomic::AtomicI64,
+    /// Whether the owned Manager accepts a renewed identity at its next start.
+    certificate_renewable: AtomicBool,
+    /// Manager's origin for this library when it is not the default.
+    origin: Mutex<Option<String>>,
     view: Mutex<View>,
 }
 impl HostSetup {
@@ -209,7 +216,7 @@ impl HostSetup {
             self.lock_for_update_at(Some(Hosted {
                 state: &state,
                 data: &data,
-                listener: &|| crate::manager_host::listener(MANAGER_PORT),
+                listener: &|| crate::manager_local::recorded_manager_listener(&data),
                 process: &crate::process_tree::ProcessIdentity::lookup,
             }))
         }
@@ -231,7 +238,10 @@ impl HostSetup {
     ///   controller: this app's record of it. The record is written before Manager is
     ///   spawned, so it exists even for a Manager that has not bound its port; until it names
     ///   a process that is seen to be gone, it blocks.
-    /// - Any Manager with no usable record: Manager's port must definitely refuse.
+    /// - Any Manager with no usable record: the port this library records for its Manager
+    ///   must definitely refuse, or what answers there must be proven to be another program
+    ///   (it presents a certificate that is not this library's, or does not speak TLS). A
+    ///   record of that port that cannot be read blocks.
     ///
     /// With all of that proven and the owner held, nothing is left that could start one.
     /// On Windows the controller and database die with this app's job, so a new run there
@@ -278,6 +288,13 @@ impl HostSetup {
             running.manager.certificate_expires_at().unwrap_or(0),
             Ordering::Release,
         );
+        self.certificate_renewable
+            .store(running.features.tls_rotation, Ordering::Release);
+        *self
+            .origin
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(running.configuration.origin.clone());
         *self
             .library
             .lock()
@@ -308,9 +325,13 @@ impl HostSetup {
         *self.view.lock().unwrap_or_else(|error| error.into_inner()) = View {
             state: state.into(),
             code,
-            origin: installation
-                .as_ref()
-                .map(|_| "https://127.0.0.1:9443".into()),
+            origin: installation.as_ref().map(|_| {
+                self.origin
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| crate::manager_local::Ports::default().origin())
+            }),
             installation,
             ..View::default()
         };
@@ -333,6 +354,8 @@ impl HostSetup {
                 .and_then(|now| crate::manager_tls::expiry_notice_days(expires, now)),
             _ => None,
         };
+        view.certificate_renewable = view.certificate_expires_in_days.is_some()
+            && self.certificate_renewable.load(Ordering::Acquire);
         view
     }
     pub(crate) fn require_management_origin(&self, origin: &str) -> Result<(), String> {
@@ -470,23 +493,41 @@ impl HostSetup {
         let attempted = installation.clone();
         self.cancel.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
+        // Unit tests never consult the library really hosted on the machine that runs them.
+        #[cfg(not(test))]
+        {
+            *self
+                .origin
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = profile_data()
+                .and_then(|data| crate::manager_local::recorded(&data).ok())
+                .map(|record| record.ports.origin());
+        }
         self.set("starting", None, Some(installation.clone()));
-        let cancel = self.cancel.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || launch(&installation, &cancel))
-            .await
-            .map_err(|_| "native_host_setup_failed".to_string())
-            .and_then(|value| value);
-        let result = match result {
-            Ok(mut running) => match running
-                .manager
-                .wait_ready(Duration::from_secs(20), &self.cancel)
-                .await
-            {
-                Ok(()) => Ok(running),
-                Err(error) => Err(error),
+        let result = started_with_renewal(
+            |renew, signers| {
+                let (installation, cancel) = (installation.clone(), self.cancel.clone());
+                async move {
+                    let mut running = tauri::async_runtime::spawn_blocking(move || {
+                        launch(&installation, &cancel, renew, &signers)
+                    })
+                    .await
+                    .map_err(|_| "native_host_setup_failed".to_string())
+                    .and_then(|value| value)?;
+                    running
+                        .manager
+                        .wait_ready(Duration::from_secs(20), &self.cancel)
+                        .await?;
+                    Ok(running)
+                }
             },
-            Err(error) => Err(error),
-        };
+            &self.cancel,
+        )
+        .await
+        .map(|mut running| {
+            settle_identity(&mut running);
+            running
+        });
         match result {
             Ok(running) => {
                 self.adopt(&mut owner, running);
@@ -556,6 +597,16 @@ impl HostSetup {
             &saved,
         )
         .await?;
+        let identity = crate::credentials::identity()?;
+        photo_server_proof(
+            running.features,
+            |command| crate::manager::send(&saved, &identity, command),
+            running.configuration.api_port,
+        )
+        .await?;
+        running
+            .manager
+            .management_identity(&running.configuration)?;
         owned_photo_listener(&running.configuration.state, running.configuration.api_port)?;
         Ok(address)
     }
@@ -582,6 +633,7 @@ impl HostSetup {
                     manager,
                     configuration,
                     installation,
+                    ..
                 } = running;
                 let prove = || {
                     let mut proof = crate::host_state::Owner::acquire(&configuration.state, true)?;
@@ -786,6 +838,147 @@ where
             return Err("native_manager_shutdown_unconfirmed".into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+/// Start local management, renewing Manager's TLS identity when that is due. `attempt` is
+/// given which handover signer to use (None: do not renew), and a counter it sets, once it
+/// presents a renewed identity, to how many identities could sign the handover.
+///
+/// Which identity Manager holds is not always known (the saved one, or a renewal it accepted
+/// before this app last stopped), so a failed attempt is repeated with each further signer.
+/// After those, one more is made with the identity the renewal would have replaced: a Manager
+/// that had already accepted the new one takes the old one back during its grace period. If
+/// every attempt fails, the first failure is reported and everything stays saved for the next
+/// start: no key is discarded on a failure.
+async fn started_with_renewal<T, F>(
+    attempt: impl Fn(Option<usize>, Arc<std::sync::atomic::AtomicUsize>) -> F,
+    cancel: &AtomicBool,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    use std::sync::atomic::AtomicUsize;
+    let signers = Arc::new(AtomicUsize::new(0));
+    let first = match attempt(Some(0), signers.clone()).await {
+        Ok(started) => return Ok(started),
+        Err(error) => error,
+    };
+    let signers = signers.load(Ordering::Acquire);
+    if signers == 0 {
+        return Err(first);
+    }
+    for next in (1..signers).map(Some).chain([None]) {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        if let Ok(started) = attempt(next, Arc::new(AtomicUsize::new(0))).await {
+            return Ok(started);
+        }
+    }
+    Err(first)
+}
+/// After Manager is verified ready: let this computer's saved grant follow it to a moved port
+/// or a renewed certificate, then settle its TLS identity in the keystore. A failure never
+/// stops a running library; the next start does both again.
+fn settle_identity(running: &mut Running) {
+    let followed = if running.features.ports || running.features.tls_rotation {
+        let replaced = running.manager.replaced_certificates().to_vec();
+        follow_grant(
+            &running.configuration,
+            running.manager.certificate(),
+            &replaced,
+            || crate::credentials::load(crate::manager::CREDENTIAL),
+            |saved| crate::credentials::save(crate::manager::CREDENTIAL, saved),
+        )
+    } else {
+        Ok(())
+    };
+    settle_after(followed, || running.manager.settle_identity());
+}
+/// The grant first, and the identity only once the grant is known to be in step. Settling
+/// drops the record of which certificates were replaced; if the grant could not be read or
+/// saved, that record is the only way the next start can still re-pin it.
+fn settle_after(followed: Result<(), String>, settle: impl FnOnce() -> Result<(), String>) {
+    if followed.is_ok() {
+        let _ = settle();
+    }
+}
+fn follow_grant(
+    configuration: &Configuration,
+    certificate: &str,
+    replaced: &[String],
+    load: impl FnOnce() -> Result<Option<crate::manager::SavedManager>, String>,
+    save: impl FnOnce(&crate::manager::SavedManager) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(mut saved) = load()? else {
+        return Ok(());
+    };
+    // With no renewal in progress there is no replaced certificate; the port may still move.
+    let candidates = replaced.iter().map(|pem| Some(pem.as_str())).chain([None]);
+    for candidate in candidates {
+        if saved.follow_local(
+            &configuration.installation_id,
+            &configuration.origin,
+            certificate,
+            candidate,
+        ) {
+            return save(&saved);
+        }
+    }
+    Ok(())
+}
+/// For a Manager that declares `runtime-status`: Manager says, over the pinned channel and
+/// bound to this request, what its own controller is doing, and Photos opens only while that
+/// is serving photos on `port`. A Manager that does not declare it is not asked, and the
+/// journal-lease check that follows is all there is, as before.
+async fn photo_server_proof<F>(
+    features: crate::manager_local::Features,
+    send: impl FnOnce(crate::manager::Command) -> F,
+    port: u16,
+) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    if !features.runtime_status {
+        return Ok(());
+    }
+    let reply = send(crate::manager::Command::Runtime {
+        nonce: uuid::Uuid::new_v4(),
+    })
+    .await?;
+    photo_server_running(&reply, port)
+}
+/// Whether Manager reports its controller serving photos on `port`. Only `running` opens the
+/// address; every other state, and a reply that does not say, refuses with what it means.
+fn photo_server_running(reply: &serde_json::Value, port: u16) -> Result<(), String> {
+    let server = &reply["photoServer"];
+    let maintenance = server["code"]
+        .as_str()
+        .is_some_and(|code| code.ends_with("_maintenance"));
+    match server["state"].as_str() {
+        Some("running") if reply["ports"]["api"].as_u64() == Some(port.into()) => Ok(()),
+        Some("starting") => Err("local_photos_starting".into()),
+        Some("unknown") if maintenance => Err("local_photos_maintenance".into()),
+        Some("stopping" | "stopped" | "unknown") => Err("local_photos_not_running".into()),
+        _ => Err("manager_response_invalid".into()),
+    }
+}
+/// This account's Manager data directory, where the library's own records are kept.
+#[cfg(not(test))]
+fn profile_data() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(crate::host_install::account_profile().join("manager"))
+    }
+    #[cfg(windows)]
+    {
+        crate::windows_host_profile::paths()
+            .ok()
+            .map(|paths| paths.1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
     }
 }
 fn local_photos_origin(port: u16) -> Result<url::Url, String> {
@@ -1027,6 +1220,7 @@ fn configuration<U: Serialize>(
     uid: &U,
     state: std::path::PathBuf,
     data: std::path::PathBuf,
+    ports: crate::manager_local::Ports,
 ) -> Result<Configuration, String> {
     let package: serde_json::Value = serde_json::from_slice(&crate::runtime_store::read_bounded(
         &layout.runtime.join("payload/server/package.json"),
@@ -1047,9 +1241,9 @@ fn configuration<U: Serialize>(
         controller: layout.controller.clone(),
         state,
         data,
-        origin: "https://127.0.0.1:9443".into(),
-        database_port: 54329,
-        api_port: 2283,
+        origin: ports.origin(),
+        database_port: ports.database,
+        api_port: ports.api,
     })
 }
 
@@ -1096,6 +1290,8 @@ fn carry_forward(
         &uid,
         next.state.clone(),
         next.data.clone(),
+        // The ports Manager last ran with: its descriptor, and so the transition, names them.
+        next.ports()?,
     )?;
     previous.installation_id = marker.installation_id.clone();
     let layout = record.layout()?;
@@ -1326,10 +1522,15 @@ pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
         .map(|marker| marker.manifest_sha256)
 }
 
-fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String> {
+fn launch(
+    record: &Installation,
+    cancel: &AtomicBool,
+    renew_identity: Option<usize>,
+    signers: &std::sync::atomic::AtomicUsize,
+) -> Result<Running, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
-        let _ = (record, cancel);
+        let _ = (record, cancel, renew_identity, signers);
         Err("host_install_platform_unsupported".into())
     }
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -1359,6 +1560,8 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];
         require_leaf(&state)?;
         require_leaf(&data)?;
+        // Where this library last listened. A record that cannot be read refuses the start.
+        let recorded = crate::manager_local::recorded(&data)?;
         // A Manager left running by a crashed run of this app still holds this library. Stop
         // that exact process, then give its controller time to finish closing the database.
         #[cfg(unix)]
@@ -1366,7 +1569,7 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
             &data,
             Duration::from_secs(15),
             cancel,
-            &|| crate::manager_host::listener(MANAGER_PORT),
+            &|| crate::manager_local::recorded_manager_listener(&data),
         )? {
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while crate::host_state::Owner::controller_running(&state) == Ok(true)
@@ -1377,7 +1580,8 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
             }
         }
         #[allow(unused_mut)]
-        let mut configuration = configuration(record, &layout, &runtime, &uid, state, data)?;
+        let mut configuration =
+            configuration(record, &layout, &runtime, &uid, state, data, recorded.ports)?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         carry_forward(record, &runtime, &mut configuration, uid)?;
         if cancel.load(Ordering::Acquire) {
@@ -1387,12 +1591,22 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
         if cancel.load(Ordering::Acquire) {
             return Err("native_manager_start_cancelled".into());
         }
+        // Only what this package's Manager declares is used: anything else stays as it was.
+        let features = crate::manager_local::Features::of_package(&layout.runtime);
         // Records its launch before spawning, and the spawned process after.
-        let manager = programs.start_from_keystore(&configuration)?;
+        let manager = programs.start_from_keystore(
+            &mut configuration,
+            &crate::manager_host::LocalStart {
+                features,
+                renew_identity,
+                signers,
+            },
+        )?;
         Ok(Running {
             manager,
             configuration,
             installation: record.clone(),
+            features,
         })
     }
 }
@@ -1400,6 +1614,284 @@ fn launch(record: &Installation, cancel: &AtomicBool) -> Result<Running, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn photos_ask_manager_for_its_state_only_when_it_declares_that_and_open_only_on_running()
+    {
+        use crate::manager::Command;
+        use crate::manager_local::Features;
+        use serde_json::json;
+        // Today's released Manager declares nothing: it is not asked, and nothing changes.
+        for features in [
+            Features::default(),
+            Features {
+                ports: true,
+                tls_rotation: true,
+                runtime_status: false,
+            },
+        ] {
+            let never = |_: Command| async { panic!("a Manager that does not declare it") };
+            assert_eq!(photo_server_proof(features, never, 2283).await, Ok(()));
+        }
+        let capable = Features {
+            runtime_status: true,
+            ..Features::default()
+        };
+        let asked = |reply: Result<serde_json::Value, String>| async move {
+            photo_server_proof(
+                capable,
+                |command| {
+                    assert!(matches!(command, Command::Runtime { nonce } if !nonce.is_nil()));
+                    async move { reply }
+                },
+                2283,
+            )
+            .await
+        };
+        let state = |server: serde_json::Value| json!({"ports":{"manager":9443,"api":2283,"database":54329},"photoServer":server});
+        assert_eq!(asked(Ok(state(json!({"state":"running"})))).await, Ok(()));
+        for (server, code) in [
+            (json!({"state":"starting"}), "local_photos_starting"),
+            (json!({"state":"stopping"}), "local_photos_not_running"),
+            (json!({"state":"stopped"}), "local_photos_not_running"),
+            // A backup or restore holds the controller: whatever answers on the port is not
+            // this library's photo server.
+            (
+                json!({"state":"unknown","code":"native_database_maintenance"}),
+                "local_photos_maintenance",
+            ),
+            (
+                json!({"state":"unknown","code":"native_restore_maintenance"}),
+                "local_photos_maintenance",
+            ),
+            (
+                json!({"state":"unknown","code":"native_checkpoint_cleanup_maintenance"}),
+                "local_photos_maintenance",
+            ),
+            (
+                json!({"state":"unknown","code":"native_owner_not_attached"}),
+                "local_photos_not_running",
+            ),
+            (json!({"state":"unknown"}), "local_photos_not_running"),
+            (json!({"state":"serving"}), "manager_response_invalid"),
+            (json!({}), "manager_response_invalid"),
+            (json!(null), "manager_response_invalid"),
+        ] {
+            assert_eq!(asked(Ok(state(server))).await, Err(code.to_string()));
+        }
+        // Running, but not on the port this library's photos are opened on.
+        for reply in [
+            json!({"ports":{"manager":9443,"api":2284,"database":54329},"photoServer":{"state":"running"}}),
+            json!({"photoServer":{"state":"running"}}),
+        ] {
+            assert_eq!(
+                asked(Ok(reply)).await,
+                Err("manager_response_invalid".to_string())
+            );
+        }
+        // No answer, or one that could not be read, never opens the address.
+        for failure in [
+            "manager_unreachable_or_certificate_invalid",
+            "manager_response_invalid",
+            "desktop_route_unavailable",
+        ] {
+            assert_eq!(asked(Err(failure.into())).await, Err(failure.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_failed_renewal_is_retried_with_each_signer_and_then_the_identity_it_would_replace() {
+        use std::cell::RefCell;
+        // `signers`: how many identities could sign the handover; 0 when nothing is renewed.
+        let run = |signers: usize, outcomes: Vec<Result<&'static str, String>>, cancelled: bool| {
+            let cancel = AtomicBool::new(false);
+            let attempts = RefCell::new(Vec::new());
+            let outcomes = RefCell::new(outcomes.into_iter());
+            let result = tauri::async_runtime::block_on(started_with_renewal(
+                |renew, reported| {
+                    attempts.borrow_mut().push(renew);
+                    if renew.is_some() {
+                        reported.store(signers, Ordering::Release);
+                    }
+                    cancel.store(cancelled, Ordering::Release);
+                    let outcome = outcomes.borrow_mut().next().expect("no further attempt");
+                    async move { outcome }
+                },
+                &cancel,
+            ));
+            (result, attempts.into_inner())
+        };
+        let failed = |code: &str| Err::<&'static str, String>(code.to_string());
+        // Nothing to renew: one attempt, whatever it returns.
+        assert_eq!(
+            run(0, vec![Ok("started")], false),
+            (Ok("started"), vec![Some(0)])
+        );
+        assert_eq!(
+            run(0, vec![failed("local_port_in_use_2283")], false),
+            (failed("local_port_in_use_2283"), vec![Some(0)])
+        );
+        // A renewal that succeeds needs no second attempt.
+        assert_eq!(
+            run(1, vec![Ok("renewed")], false),
+            (Ok("renewed"), vec![Some(0)])
+        );
+        // A renewal that fails: the earlier identity is tried, without renewing.
+        assert_eq!(
+            run(
+                1,
+                vec![failed("native_manager_exited"), Ok("rolled back")],
+                false
+            ),
+            (Ok("rolled back"), vec![Some(0), None])
+        );
+        // Manager may hold either of two identities: the second signer is tried before that.
+        assert_eq!(
+            run(
+                2,
+                vec![failed("native_manager_exited"), Ok("renewed")],
+                false
+            ),
+            (Ok("renewed"), vec![Some(0), Some(1)])
+        );
+        assert_eq!(
+            run(
+                2,
+                vec![
+                    failed("native_manager_exited"),
+                    failed("other"),
+                    Ok("rolled back")
+                ],
+                false
+            ),
+            (Ok("rolled back"), vec![Some(0), Some(1), None])
+        );
+        // If everything fails, the first failure is the one that is reported.
+        assert_eq!(
+            run(
+                2,
+                vec![
+                    failed("native_manager_exited"),
+                    failed("native_manager_start_timeout"),
+                    failed("native_tls_identity_expired")
+                ],
+                false
+            ),
+            (
+                failed("native_manager_exited"),
+                vec![Some(0), Some(1), None]
+            )
+        );
+        // A start the person cancelled is not started again.
+        assert_eq!(
+            run(2, vec![failed("native_manager_start_cancelled")], true),
+            (failed("native_manager_start_cancelled"), vec![Some(0)])
+        );
+    }
+
+    #[test]
+    fn the_identity_is_settled_only_after_the_grant_is_known_to_be_in_step() {
+        use crate::manager::SavedManager;
+        use std::cell::Cell;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+        let old = fixture["certificatePem"].as_str().unwrap().to_owned();
+        let mint = || {
+            crate::manager_tls::TlsIdentity::load_or_create(
+                "aaaaaaaaaaaa",
+                "https://127.0.0.1:9443",
+                || Ok(None),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .certificate()
+            .to_owned()
+        };
+        let (renewed, lapsed) = (mint(), mint());
+        let grant = |certificate: &str| -> SavedManager {
+            serde_json::from_value(serde_json::json!({
+                "origin":"https://127.0.0.1:9443","managerId":"22222222-2222-4222-8222-222222222222",
+                "deviceId":"11111111-1111-4111-8111-111111111111","installationId":"aaaaaaaaaaaa",
+                "publicKey":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+                "id":"33333333-3333-4333-8333-333333333333","token":"b".repeat(64),
+                "scopes":["status"],"expiresAt":1702592000000u64,"recentUntil":1700000300000u64,
+                "certificatePem":certificate
+            }))
+            .unwrap()
+        };
+        let configuration = Configuration {
+            installation_id: "aaaaaaaaaaaa".into(),
+            name: "My Frameleaf library".into(),
+            release: "frameleaf-v1.2.3-native.aaaaaaaaaaaa-1".into(),
+            controller: "/bin/echo".into(),
+            state: "/nonexistent/state".into(),
+            data: "/nonexistent/data".into(),
+            origin: "https://127.0.0.1:9443".into(),
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let settled = |followed: Result<(), String>| {
+            let done = Cell::new(false);
+            settle_after(followed, || {
+                done.set(true);
+                Ok(())
+            });
+            done.get()
+        };
+        let fingerprint = |pem: &str| crate::manager::certificate_fingerprint(pem).ok();
+        // The grant pinned the replaced certificate, whichever of the replaced ones that is.
+        for replaced in [vec![old.clone()], vec![lapsed.clone(), old.clone()]] {
+            let saved = Cell::new(None);
+            let followed = follow_grant(
+                &configuration,
+                &renewed,
+                &replaced,
+                || Ok(Some(grant(&old))),
+                |grant| {
+                    saved.set(grant.view().certificate_sha256);
+                    Ok(())
+                },
+            );
+            assert_eq!(followed, Ok(()));
+            assert_eq!(saved.take(), fingerprint(&renewed));
+            assert!(settled(followed));
+        }
+        // No grant, or one already in step: nothing to save, and the identity is settled.
+        let unsaved = |_: &SavedManager| -> Result<(), String> { panic!("nothing to save") };
+        assert!(settled(follow_grant(
+            &configuration,
+            &renewed,
+            std::slice::from_ref(&old),
+            || Ok(None),
+            unsaved
+        )));
+        assert!(settled(follow_grant(
+            &configuration,
+            &renewed,
+            std::slice::from_ref(&old),
+            || Ok(Some(grant(&renewed))),
+            unsaved
+        )));
+        // The grant could not be read, or could not be saved: Manager keeps running, and the
+        // identity is not settled, so the next start still knows what was replaced.
+        let unread = follow_grant(
+            &configuration,
+            &renewed,
+            std::slice::from_ref(&old),
+            || Err("credential_store_unavailable".into()),
+            unsaved,
+        );
+        assert_eq!(unread, Err("credential_store_unavailable".into()));
+        assert!(!settled(unread));
+        let unwritten = follow_grant(
+            &configuration,
+            &renewed,
+            std::slice::from_ref(&old),
+            || Ok(Some(grant(&old))),
+            |_| Err("credential_store_unavailable".into()),
+        );
+        assert!(!settled(unwritten));
+    }
 
     /// Deny replacement of the executable and of its path while either Desktop launch is possible.
     #[cfg(windows)]
@@ -2157,6 +2649,7 @@ mod tests {
                     api_port: 2283,
                 },
                 installation,
+                features: Default::default(),
             };
             setup.adopt(&mut setup.owner.try_lock().unwrap(), running);
             setup.active.store(true, Ordering::Release);
@@ -2917,6 +3410,7 @@ mod tests {
                 .map(|running| running.configuration)
                 .unwrap(),
             installation,
+            features: Default::default(),
         };
         setup.adopt(&mut setup.owner.try_lock().unwrap(), running);
         assert!(setup.background_active());

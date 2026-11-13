@@ -57,6 +57,13 @@ test('local setup names a busy port, offers a companion update and always offers
   // A certificate about to expire is announced with its days, and an expired one says so.
   assert.match(ui, /\{#if view\?\.certificateExpiresInDays\}[\s\S]{0,200}role="status"><b>Local Manager’s security certificate expires in \{view\.certificateExpiresInDays\}/);
   assert.match(errorCopy('native_tls_identity_expired')!, /certificate on this computer has expired/);
+  // A Manager that accepts a renewed certificate is renewed at the next start: the notice says that, not "update".
+  assert.match(ui, /\{view\.certificateRenewable \? 'Frameleaf renews it the next time local management starts[^']*' : 'After that, local management on this computer will not start until the certificate is renewed/);
+  // Photos say why they did not open: still starting, paused for a backup or restore, or not running.
+  assert.match(errorCopy('local_photos_starting')!, /still starting/);
+  assert.match(errorCopy('local_photos_maintenance')!, /paused while a backup or restore finishes/);
+  for (const code of ['local_manager_record_unreadable', 'local_manager_record_unavailable'])
+    assert.match(errorCopy(code)!, /where this library’s local Manager listens[\s\S]*have not been changed/, code);
   // Focus follows a new state: the offered quit button, and the heading when the stopped control goes.
   assert.match(ui, /if \(quitOffered\) focusOn\(\(\) => quitButton\);/);
   assert.match(ui, /if \(!view\?\.backgroundActive\) focusOn\(\(\) => title\);/);
