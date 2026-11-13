@@ -16,13 +16,21 @@ from pathlib import Path
 from threading import Lock
 
 
-def file_hash(path: Path, limit: int) -> str:
+def checked_parents(path: Path) -> None:
+    """An absolute path none of whose directories is a link."""
+    if not path.is_absolute():
+        raise ValueError("metal_path_invalid")
     try:
-        if not path.is_absolute():
-            raise ValueError("metal_path_invalid")
         for parent in path.parents:
             if not stat.S_ISDIR(parent.lstat().st_mode):
                 raise ValueError("metal_path_invalid")
+    except OSError as error:
+        raise ValueError("metal_file_unavailable") from error
+
+
+def file_hash(path: Path, limit: int) -> str:
+    try:
+        checked_parents(path)
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
             raise ValueError("metal_file_invalid")
@@ -137,7 +145,13 @@ class MetalObserver:
     def check_model(self, model: Path, expected_sha256: str) -> None:
         """Every byte is hashed the first time and again whenever the file's identity (device,
         inode, size, modification and change time) differs from the one that was hashed, so a
-        changed model still stops the run without reading the whole file around every call."""
+        changed model still stops the run without reading the whole file around every call.
+
+        Only the digest is remembered: the path is checked for links on every call, and a digest
+        is remembered only for a file whose timestamps were already settled when it was hashed
+        (see SETTLED_NANOSECONDS). A file inside that window, with a timestamp in the future, or
+        on a clock that went backwards is hashed every time."""
+        checked_parents(model)
         identity = file_identity(model)
         if self.verified.get(model) == (expected_sha256, identity):
             return
@@ -150,6 +164,11 @@ class MetalObserver:
             raise ValueError("metal_model_changed")
         if started - max(identity[3], identity[4]) > SETTLED_NANOSECONDS:
             self.verified[model] = (expected_sha256, identity)
+
+    def verify(self, model: Path, expected_sha256: str) -> None:
+        """Hash every byte now, whatever was remembered (used when a session is bound)."""
+        self.verified.pop(model, None)
+        self.check_model(model, expected_sha256)
 
     def device_facts(self) -> dict:
         self.check_library()

@@ -365,6 +365,79 @@ class MetalObserverTests(unittest.TestCase):
         with self.assertRaises(ValueError), other.observe(model, "f" * 64):
             pass
 
+    def settled(self):
+        return patch.object(
+            self.module.time,
+            "time_ns",
+            return_value=self.module.time.time_ns() + 60_000_000_000,
+        )
+
+    @unittest.skipIf(os.name == "nt", "the collector runs on macOS; POSIX links")
+    def test_a_parent_replaced_by_a_link_is_refused_even_when_the_digest_is_remembered(self):
+        real = self.root / "real"
+        real.mkdir()
+        model = real / "model.onnx"
+        model.write_bytes(b"fixture")
+        digest = hashlib.sha256(model.read_bytes()).hexdigest()
+        observer = self.observer()
+        with self.settled():
+            with observer.observe(model, digest):
+                pass
+            self.assertIn(model, observer.verified)
+            # The same file (device, inode, times) now reached through a link.
+            real.rename(self.root / "moved")
+            real.symlink_to(self.root / "moved")
+            self.assertEqual(model.read_bytes(), b"fixture")
+            with self.assertRaises(ValueError), observer.observe(model, digest):
+                pass
+        self.assertEqual(self.native.fl_gpu_begin.call_count, 1)
+
+    def test_a_rewrite_that_leaves_every_timestamp_alone_cannot_hide_inside_the_settle_window(self):
+        model = self.root / "model.onnx"
+        model.write_bytes(b"fixture")
+        digest = hashlib.sha256(model.read_bytes()).hexdigest()
+        observer = self.observer()
+        # A filesystem (or clock) on which a rewrite moves no timestamp at all.
+        frozen = self.module.file_identity(model)
+        patch.object(self.module, "file_identity", return_value=frozen).start()
+        with observer.observe(model, digest):
+            pass
+        # Hashed inside the window: nothing was remembered, so the next call reads the bytes.
+        self.assertEqual(observer.verified, {})
+        model.write_bytes(b"changed")
+        with self.assertRaises(ValueError), observer.observe(model, digest):
+            pass
+        # Timestamps in the future, or a clock that went backwards, are never settled either.
+        model.write_bytes(b"fixture")
+        other = self.observer()
+        with patch.object(self.module.time, "time_ns", return_value=frozen[3] - 10**12):
+            with other.observe(model, digest):
+                pass
+        self.assertEqual(other.verified, {})
+
+    def test_verify_reads_every_byte_whatever_is_remembered(self):
+        model = self.root / "model.onnx"
+        model.write_bytes(b"fixture")
+        digest = hashlib.sha256(model.read_bytes()).hexdigest()
+        observer = self.observer()
+        with self.settled():
+            observer.verify(model, digest)
+            self.assertIn(model, observer.verified)
+            hashed = []
+            real = self.module.file_hash
+            patch.object(
+                self.module,
+                "file_hash",
+                side_effect=lambda path, limit: hashed.append(path) or real(path, limit),
+            ).start()
+            observer.check_model(model, digest)
+            self.assertEqual(hashed, [])
+            observer.verify(model, digest)
+            self.assertEqual(hashed, [model])
+            with self.assertRaises(ValueError):
+                observer.verify(model, "f" * 64)
+            self.assertNotIn(model, observer.verified)
+
 
 if __name__ == "__main__":
     unittest.main()

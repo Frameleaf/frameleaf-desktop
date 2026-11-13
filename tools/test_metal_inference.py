@@ -10,6 +10,8 @@ class Collector:
         self.identifier = 0
         self.expected = None
         self.spoof = False
+        self.verified = []
+        self.changed = False
 
     def facts(self):
         return {
@@ -18,6 +20,11 @@ class Collector:
             "osBuild": "OS build",
             "devices": [{"name": "GPU", "identitySha256": "b" * 64}],
         }
+
+    def verify(self, path, digest):
+        if self.changed:
+            raise ValueError("metal_model_changed")
+        self.verified.append((path, digest))
 
     @contextmanager
     def observe(self, path, digest):
@@ -103,6 +110,20 @@ class MetalInferenceTests(unittest.TestCase):
         ):
             pass
         self.assertEqual(self.collector.identifier, 1)
+
+    def test_binding_hashes_every_model_and_a_changed_model_is_never_bound(self):
+        self.adapter.bind({self.model: "c" * 64})
+        self.assertEqual(self.collector.verified, [(self.model, "c" * 64)])
+        # Binding again reads the bytes again; nothing remembered stands in for it.
+        self.adapter.bind({self.model: "c" * 64})
+        self.assertEqual(len(self.collector.verified), 2)
+        other = self.model.with_name("other.onnx")
+        self.collector.changed = True
+        with self.assertRaises(ValueError):
+            self.adapter.bind({other: "d" * 64})
+        self.assertNotIn(other, self.adapter.bindings)
+        with self.assertRaises(ValueError), self.adapter.observe(self.model):
+            pass
 
 
 if __name__ == "__main__":
