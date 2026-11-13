@@ -109,6 +109,19 @@ after an interrupted run. This optional path does not change the existing
 installed restart qualification. Package installation, supported upgrades, and
 interrupted upgrade recovery require their own installed evidence.
 
+## Staged rollout evidence
+
+Desktop provides local status for these checks. This view does not aggregate
+results across devices or accounts.
+
+| Signal | Available evidence |
+| --- | --- |
+| First and repeat imports | Use the verified import count next to **Photo sources → Import history**. One distinct completed run with at least one verified original and no pending album attachment shows a first observed import, and two or more show repeat imports. The count uses the current sign-in's signed history, including up to 100 archived runs. If Desktop reports `Desktop could not read archived import history`, the count may reflect only the current run. Verify archive readback before recording a first observed import. |
+| Update success | The signed updater checks, installs, and requests a restart. Confirm that the expected version opens after restart for installed evidence. The updater does not retain a success count. |
+| Restore drill | Manager's completed restore with `native-restore-started` confirms the database and server start. Record original photo and video readback separately using a media recovery drill. |
+| Local job completion | The worker accepts a completion when Library acknowledges the result for its lease. A ready or active worker status alone does not establish a completed job. |
+| Cloud routing failures | Desktop reports a missing usable address, failed probes, and identity mismatches during connection. These outcomes are per attempt, with no retained failure count or rate. |
+
 ## Supported systems
 
 ### macOS minimum versions
