@@ -130,7 +130,7 @@ pub(crate) fn separate_paths(candidate: &Path, state: &Path) -> Result<(), Strin
     }
     Ok(())
 }
-fn verify_candidate(
+pub(crate) fn verify_candidate(
     candidate: &Path,
     expected: &str,
 ) -> Result<crate::host_runtime::VerifiedHostRuntime, String> {
@@ -184,7 +184,77 @@ pub fn inspect_owner() -> Result<(), String> {
     emit(receipt)
 }
 
-fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
+#[cfg(windows)]
+pub fn media_move_owner() -> Result<(), String> {
+    use crate::host_state::media_move::{CutoverRequest, Decision};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        installation_id: String,
+        secure_installation_id: uuid::Uuid,
+        candidate: PathBuf,
+        state: PathBuf,
+        manifest_sha256: String,
+        request: CutoverRequest,
+        decision: Option<Decision>,
+        reviewed_backup: Option<serde_json::Value>,
+    }
+
+    let raw = line(&mut BufReader::new(std::io::stdin()), 16 * 1024)?;
+    let request: Request = serde_json::from_slice(&raw).map_err(|_| "host_media_move_invalid")?;
+    if !native_runtime::digest_valid(&request.installation_id, 12)
+        || !native_runtime::digest_valid(&request.manifest_sha256, 64)
+        || !request
+            .request
+            .matches_host(request.secure_installation_id, &request.manifest_sha256)
+    {
+        return Err("host_media_move_invalid".into());
+    }
+    native_runtime::absolute_directory(&request.state)?;
+    if request.decision.is_some() && request.reviewed_backup.is_some() {
+        return Err("host_media_move_invalid".into());
+    }
+    crate::host_storage::check_cleanup(&request.state)?;
+    separate_paths(&request.candidate, &request.state)?;
+    let _code_lease = crate::package_lease::CodeLease::acquire(&request.candidate)?;
+    verify_candidate(&request.candidate, &request.manifest_sha256)?;
+    let owner = crate::host_state::Owner::acquire(&request.state, true)?;
+    check_secure_installation(Some(request.secure_installation_id), &owner)?;
+    #[cfg(not(feature = "qualify-windows-media-move"))]
+    let fixture_device: Option<crate::connection::DeviceIdentity> = None;
+    #[cfg(feature = "qualify-windows-media-move")]
+    let fixture_device = crate::host_state::media_move::qualification::device_for(&request.state)?;
+    let device: crate::connection::DeviceIdentity = match fixture_device {
+        Some(device) => device,
+        None => crate::credentials::load("installation")?
+            .ok_or("host_media_move_credential_unavailable")?,
+    };
+    emit(request.request.apply_or_inspect(
+        owner,
+        &request.installation_id,
+        &device,
+        request.decision,
+        request.reviewed_backup,
+        || false,
+    )?)
+}
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub fn qualify_media_move() -> Result<(), String> {
+    let raw = line(&mut BufReader::new(std::io::stdin()), 16 * 1024)?;
+    emit(crate::host_state::media_move::qualification::run(&raw)?)
+}
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub fn qualify_media_move_manager() -> Result<(), String> {
+    let mut input = BufReader::new(std::io::stdin());
+    tauri::async_runtime::block_on(crate::host_state::media_move::qualification::serve_manager(
+        &mut input,
+    ))
+}
+
+pub(crate) fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     Read::by_ref(reader)
         .take((limit + 1) as u64)
@@ -235,7 +305,7 @@ fn candidate_file(path: &Path, maximum: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn emit(value: serde_json::Value) -> Result<(), String> {
+pub(crate) fn emit(value: serde_json::Value) -> Result<(), String> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{value}")
         .and_then(|()| output.flush())
@@ -471,6 +541,10 @@ fn serve(
         "sourceRevision":runtime.source_revision(),"certified":runtime.certified()});
     if let Some(id) = config.secure_installation_id {
         receipt["secureInstallationId"] = json!(id);
+    }
+    #[cfg(windows)]
+    if let Some(reference) = owner.media_reference() {
+        receipt["activeMediaIdentity"] = json!(reference.identity);
     }
     if emit(receipt).is_err() {
         process.stop()?;

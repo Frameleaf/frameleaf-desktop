@@ -299,6 +299,8 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['history', 'This AI runtime was rejected because it does not match this computer’s accepted runtime history. Photos remain available.', 'runtime_epoch_rollback runtime_epoch_reused'],
   // ---- AI processing: checks and tasks ----
   ['checks', 'This computer did not pass the checks for the selected AI models. Try again. If it keeps failing, this computer may not be able to run them.', 'worker_no_qualified_workloads worker_qualification_refused worker_qualification_invalid worker_predictor_qualification_changed runtime_qualification_binding_invalid runtime_qualification_failed runtime_qualification_input_invalid runtime_qualification_report_invalid runtime_qualification_timeout'],
+  // FD-37: only logged; setup continues without the receipt.
+  ['', 'Frameleaf could not save the record of this computer’s AI checks. AI processing continues.', 'worker_qualification_evidence_mismatch worker_qualification_evidence_encode_failed worker_qualification_evidence_write_failed'],
   ['renewing', 'This computer’s approval for AI work ran out or changed. Try again to renew it.', 'worker_qualification_changed_or_expired worker_qualification_association_changed_or_expired worker_qualified_runtime_changed_or_expired worker_task_qualification_changed worker_challenge_association_changed worker_session_renewal_required worker_lease_expired worker_lease_lost worker_lease_refused worker_session_rejected worker_policy_changed worker_execution_deadline'],
   ['update', 'Your server and this computer could not agree on an AI task. Update Frameleaf and your server, then try again.', 'worker_challenge_invalid worker_challenge_request_invalid worker_claim_invalid worker_config_invalid worker_deadline_invalid worker_input_invalid worker_input_too_large worker_lease_invalid worker_path_invalid worker_payload_invalid worker_proof_invalid worker_result_invalid worker_result_refused worker_result_too_large worker_session_response_invalid worker_text_invalid'],
   ['', 'AI setup was stopped before it finished. Try again when you are ready.', 'worker_setup_cancelled worker_cancelled runtime_cancelled'],
@@ -390,6 +392,16 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'This library does not need to be moved to this companion.', 'host_carry_not_needed'],
   ['', 'A restore is waiting to finish with the package this library last used. Finish it in Manager with that package, then try the new package again.', 'host_restore_activation_pending'],
   ['', 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.', 'host_upgrade_operation_pending'],
+  // ---- Media moves (Windows server libraries) ----
+  ['', 'A move of this library’s photos to another location is unfinished. Open Manager to finish it or return the photos to where they were. Your photos have been preserved.', 'host_media_move_pending'],
+  ['', 'This library keeps its photos in a separate location, so backup and restore must be run from Manager while the photo server is running.', 'host_external_media_maintenance_unavailable'],
+  ['', 'The photo move could not continue because the request was not valid. Your photos have not been changed. Start the move again from Manager.', 'host_media_move_invalid'],
+  ['', 'The library or the new location changed while the move was being prepared. Your photos have not been moved. Review the move in Manager, then try again.', 'host_media_move_changed'],
+  ['', 'The photo move was cancelled. Your photos stay in their original location.', 'host_media_move_cancelled'],
+  ['', 'Frameleaf could not read this computer’s saved device identity, so the photo move did not start. Pair this computer with Manager again, then try again.', 'host_media_move_credential_unavailable'],
+  ['', 'The new location does not have enough free space for this library’s photos. Free some space or choose another location, then try again.', 'host_media_move_space_insufficient'],
+  ['', 'A file in this library has extra Windows data attached that Frameleaf cannot move safely, so the move did not start. Your photos have not been changed.', 'host_media_move_stream_unsupported'],
+  ['', 'The photo move test stopped at its planned interruption point. Run recovery from Manager to finish or roll back the move.', 'host_media_move_qualification_interrupted'],
   ['', 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.', 'host_update_requires_manager'],
   ['', 'The photo server is not running. Start it in Manager, then open Photos.', 'local_photos_not_running'],
   ['', 'The photo server is still starting. Wait a moment, then open Photos again.', 'local_photos_starting'],

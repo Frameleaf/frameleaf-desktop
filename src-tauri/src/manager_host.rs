@@ -373,6 +373,49 @@ pub(crate) enum Evidence {
     Running,
     Unknown,
 }
+/// Whether a job holds its leader and nothing that matters besides, from the job's members
+/// (process ID and program). The leader is known by its ID, which cannot be reused while its
+/// process handle is held. Windows also puts the console host of a console program in that
+/// program's job: `console` is that system program, and it holds nothing of a library. Any
+/// other program is `Running`; a member whose program could not be read, or members that
+/// could not be listed, are `Unknown`.
+#[cfg(any(windows, test))]
+pub(crate) fn sole_member(
+    members: Result<Vec<(u32, Option<String>)>, String>,
+    leader: u32,
+    console: &str,
+) -> Evidence {
+    let Ok(members) = members else {
+        return Evidence::Unknown;
+    };
+    let mut evidence = Evidence::Clear;
+    for (id, program) in members {
+        match program {
+            _ if id == leader => {}
+            Some(program) if program.eq_ignore_ascii_case(console) => {}
+            Some(_) => return Evidence::Running,
+            None => evidence = Evidence::Unknown,
+        }
+    }
+    evidence
+}
+/// The console host Windows starts for a console program, by its full path.
+#[cfg(windows)]
+fn console_host() -> Result<String, String> {
+    let mut buffer = vec![0u16; 32768];
+    let size = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    } as usize;
+    if size == 0 || size >= buffer.len() {
+        return Err("native_manager_state_unavailable".into());
+    }
+    let directory =
+        String::from_utf16(&buffer[..size]).map_err(|_| "native_manager_state_unavailable")?;
+    Ok(format!("{directory}\\conhost.exe"))
+}
 /// Only an accepted connection proves a listener and only a refusal proves there is none; a
 /// timeout or any other failure proves neither.
 pub(crate) fn listener_evidence(attempt: std::io::Result<std::net::TcpStream>) -> Evidence {
@@ -971,6 +1014,9 @@ impl Programs<'_> {
             tls: crate::manager_tls::BootstrapTls<'a>,
             #[serde(skip_serializing_if = "Option::is_none")]
             installation_transition: Option<&'a Transition>,
+            #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+            #[serde(skip_serializing_if = "Option::is_none")]
+            media_move_qualification: Option<serde_json::Value>,
             /// Only for a Manager that declares `tls-rotation`: any other refuses the field.
             #[serde(skip_serializing_if = "Option::is_none")]
             tls_rotation: Option<&'a crate::manager_tls::Handover>,
@@ -986,6 +1032,11 @@ impl Programs<'_> {
             backup_key,
             tls: tls.wire(),
             installation_transition: transition,
+            #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+            media_move_qualification: crate::host_state::media_move::qualification::device_for(
+                &config.state,
+            )?
+            .map(|_| serde_json::json!({"manifestSha256": self.runtime.manifest_sha256()})),
             tls_rotation: handover,
         };
         let mut input = Zeroizing::new(
@@ -1425,8 +1476,35 @@ impl NativeManager {
             Ok(true)
         }
     }
+    /// Whether stopping this Manager can end anything besides Manager. Outside Windows the
+    /// stop signals Manager's own process and nothing else. On Windows it ends Manager's job,
+    /// and with it whatever Manager started: `Clear` only while that job holds Manager and, at /// most, the console host Windows gives it.
+    pub(crate) fn stops_alone(&mut self) -> Evidence {
+        #[cfg(windows)]
+        {
+            match console_host() {
+                Ok(console) => sole_member(self.tree.members(), self.child.id(), &console),
+                Err(_) => Evidence::Unknown,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Evidence::Clear
+        }
+    }
+    /// For a failed test: what Manager's job holds and whether Manager has exited.
+    #[cfg(all(test, windows))]
+    pub(crate) fn job_report(&mut self) -> String {
+        format!(
+            "manager={} exited={:?} console={:?} members={:?}",
+            self.child.id(),
+            self.has_exited(),
+            console_host(),
+            self.tree.members()
+        )
+    }
     /// A stand-in child for lifecycle tests; it never reports readiness.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn test_child(command: &mut Command) -> Self {
         Self::spawn(
             command,
@@ -1542,6 +1620,47 @@ impl Drop for NativeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_holds_its_leader_alone_only_when_every_other_member_is_a_console_host() {
+        const CONSOLE: &str = r"C:\Windows\System32\conhost.exe";
+        let leader = (7, Some(r"C:\Frameleaf\node.exe".to_string()));
+        let console = (8, Some(r"c:\windows\system32\CONHOST.EXE".to_string()));
+        let named = |id: u32, program: &str| (id, Some(program.to_string()));
+        let alone = |members: Vec<(u32, Option<String>)>| sole_member(Ok(members), 7, CONSOLE);
+        // Manager, with or without its console host, and nothing left at all.
+        assert_eq!(alone(vec![leader.clone()]), Evidence::Clear);
+        assert_eq!(
+            alone(vec![leader.clone(), console.clone()]),
+            Evidence::Clear
+        );
+        assert_eq!(alone(vec![]), Evidence::Clear);
+        // The leader is known by its ID alone, even when its program could not be read.
+        assert_eq!(alone(vec![(7, None), console.clone()]), Evidence::Clear);
+        // Anything else: a controller, a database, a second node, or a console host that is
+        // not the system's.
+        for other in [
+            named(9, r"C:\Frameleaf\frameleaf-native-host.exe"),
+            named(9, r"C:\Frameleaf\postgres.exe"),
+            named(9, r"C:\Frameleaf\node.exe"),
+            named(9, r"C:\Frameleaf\conhost.exe"),
+            named(9, "conhost.exe"),
+        ] {
+            assert_eq!(
+                alone(vec![leader.clone(), console.clone(), other.clone()]),
+                Evidence::Running
+            );
+            // Also once Manager itself has exited, and beside a member that cannot be read.
+            assert_eq!(alone(vec![other.clone()]), Evidence::Running);
+            assert_eq!(alone(vec![(10, None), other]), Evidence::Running);
+        }
+        // A member whose program cannot be read, and members that cannot be listed.
+        assert_eq!(alone(vec![leader, (9, None)]), Evidence::Unknown);
+        assert_eq!(
+            sole_member(Err("runtime_process_state_unavailable".into()), 7, CONSOLE),
+            Evidence::Unknown
+        );
+    }
     /// Captured from a Library 1.2.3 Manager's stored native-installation binding (synthetic fixture).
     #[cfg(unix)]
     #[test]

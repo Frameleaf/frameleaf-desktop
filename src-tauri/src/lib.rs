@@ -20,6 +20,8 @@ pub mod host_install;
 pub mod host_runtime;
 mod host_setup;
 mod host_state;
+#[cfg(windows)]
+pub use host_state::media_move as windows_library_move;
 mod host_storage;
 mod identity_anchor;
 mod import_album;
@@ -1022,6 +1024,7 @@ pub fn run() {
 
 fn worker_paths(app: &tauri::AppHandle) -> Result<worker_setup::SetupPaths, String> {
     Ok(worker_setup::SetupPaths {
+        app_version: app.package_info().version.to_string(),
         data: app
             .path()
             .app_local_data_dir()
