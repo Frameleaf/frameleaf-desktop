@@ -203,8 +203,10 @@ test('each worker failure family shows its own reason and the action that fixes 
     seen.add(view.headline);
   }
   assert.equal(seen.size, 12, 'the two storage codes share a headline; every other family has its own');
-  // A build without a runtime cannot be repaired by reinstalling it, and says so.
-  assert.equal((await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' })).detail, 'This build does not include a signed AI runtime yet. Photos remain available.');
+  // A build without a runtime cannot be repaired by reinstalling it or by retrying, and says so.
+  const absent = await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' });
+  assert.equal(absent.detail, errorCopy('runtime_pack_unavailable'));
+  assert.equal(absent.action, null);
 });
 
 test('a Windows update stops the library itself, and says why when that cannot be proven', () => {
@@ -240,7 +242,14 @@ test('a macOS older than the AI runtime needs is a needs-you state with the decl
   const backend = readFileSync(new URL('../src-tauri/src/worker_setup.rs', import.meta.url), 'utf8');
   assert.match(backend, /include_str!\(\s*"\.\.\/\.\.\/packaging\/macos\/minimum-versions\.json"\s*\)/);
   assert.doesNotMatch(backend.slice(0, backend.indexOf('#[cfg(test)]')), /\(15,\s*0\)|"15(?:\.0)?"/);
-  assert.match(backend, /runtime_os_supported\(macos, ai_runtime_macos_floor\(\)\)\?;\s*progress\.update\(\|status\| status\.models = None\);\s*progress\.set\(\s*"preparing-runtime"/);
+  assert.match(backend, /\n\s*os_supported\?;\s*progress\.update\(\|status\| status\.models = None\);\s*progress\.set\(\s*"preparing-runtime"/);
+  assert.match(backend, /let os_supported = runtime_os_supported\(\s*std::env::consts::OS,\s*running_macos\(\),\s*ai_runtime_macos_floor\(\),?\s*\);\s*prepare_on\(os_supported,/);
+  // A macOS version that could not be read is not assumed to be new enough: setup stops, says so, and can be retried.
+  assert.match(errorCopy('runtime_os_unknown') ?? '', /could not tell which macOS version/);
+  const unknown = await card({ state: 'setup-needs-attention', code: 'runtime_os_unknown' });
+  assert.equal(unknown.attention, 'needs-you');
+  assert.equal(unknown.action, 'retry-setup');
+  assert.equal(unknown.detail, errorCopy('runtime_os_unknown'));
 });
 
 test('memory, power and network pauses wait by themselves and say what they wait for', async () => {

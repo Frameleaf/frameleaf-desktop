@@ -69,6 +69,7 @@
     "allow-update-remote",
     "allow-test-remote-access",
     "allow-server-step-up",
+    "allow-saved-sign-in-verification",
     "allow-open-external",
     "allow-tray-refresh",
     "allow-cloud-sign-in",

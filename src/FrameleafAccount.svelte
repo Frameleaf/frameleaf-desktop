@@ -48,14 +48,18 @@
 
   // Only the latest load may set the terms: a slower, older answer must not replace what the person read and accepted.
   let consentRequest = 0;
+  // The terms did not load: nothing loads them again by itself, so the form offers Try Again.
+  let termsLoad = $state<'idle' | 'loading' | 'failed'>('idle');
   async function loadConsents() {
     if (!native || consents) return;
     const asked = ++consentRequest;
+    termsLoad = 'loading';
     try {
       const loaded = await invoke<Consents>('cloud_email_consents');
-      if (asked === consentRequest) consents = loaded;
-    } catch (error) { if (asked === consentRequest) fail(error); }
+      if (asked === consentRequest) { consents = loaded; termsLoad = 'idle'; }
+    } catch (error) { if (asked === consentRequest) { termsLoad = 'failed'; fail(error); } }
   }
+  function retryConsents() { failure = ''; failureCode = ''; void loadConsents(); }
   $effect(() => { if (mode === 'create') void loadConsents(); });
   function fail(error: unknown) { failureCode = String(error); failure = connectionError(error); }
   // Each step replaces the form, and a field is disabled while its answer is checked, so keyboard focus is
@@ -186,6 +190,9 @@
           <button class="link" type="button" disabled={!consents} onclick={() => { if (consents) reading = { title: 'Terms of Service', content: consents.tos.content }; }}>Terms of Service</button> and
           <button class="link" type="button" disabled={!consents} onclick={() => { if (consents) reading = { title: 'Privacy Notice', content: consents.privacy.content }; }}>Privacy Notice</button>.</label>
       </div>
+      {#if termsLoad === 'failed' && !consents}
+        <div class="inline-msg notice" role="status"><p>The Terms of Service and Privacy Notice did not load, so an account can’t be created yet.</p><button class="btn small" type="button" onclick={retryConsents}>Try Again</button></div>
+      {/if}
       <div class="inline-msg" role="note"><p>Joining someone else’s server? Its owner adds you on the server’s web page. If that server uses Frameleaf accounts, this account works there too.</p></div>
     {/if}
   </form>

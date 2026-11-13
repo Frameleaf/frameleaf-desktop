@@ -924,6 +924,7 @@ pub fn run() {
             server_admin::update_remote,
             server_admin::test_remote_access,
             server_admin::server_step_up,
+            server_admin::saved_sign_in_verification,
             server_admin::open_external,
             tray::tray_refresh,
             cloud_account::cloud_sign_in,
