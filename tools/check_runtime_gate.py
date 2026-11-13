@@ -38,7 +38,7 @@ def gate_program() -> str:
 
 def app_environment(scratch: str, folders: list[Path] = ()) -> dict[str, str]:
     """What `VerifiedRuntime::launch` gives a runtime (src-tauri/src/native_runtime.rs): nothing
-    inherited; on Windows the OS directory (and the pack's library folders, if given)."""
+    inherited; on Windows the OS directory, the pack's library folders and a home directory."""
     environment = {
         "FRAMELEAF_ML_AUTH_TOKEN": "0" * 64,
         "TMP": scratch,
@@ -60,6 +60,7 @@ def app_environment(scratch: str, folders: list[Path] = ()) -> dict[str, str]:
         system = Path(os.environ["SystemRoot"]) / "System32"
         environment["SystemRoot"] = os.environ["SystemRoot"]
         environment["PATH"] = os.pathsep.join(str(folder) for folder in [system, *folders])
+        environment["USERPROFILE"] = scratch
     else:
         environment["PATH"] = "/usr/bin:/bin"
     return environment

@@ -1140,10 +1140,12 @@ fn a_downloaded_pack_reaches_the_runtime_store_only_at_the_processor_runtimes_ep
         move |path: &Path| crate::runtime_store::RuntimeStore::new(path, keys(), 2, opened.clone());
     let with = Installer {
         eligible: &|provider| provider == CUDA,
+        outdated: &|_| false,
         store: &store,
     };
     let absent = Installer {
         eligible: &|_| false,
+        outdated: &|_| false,
         store: &store,
     };
     // A pack for this computer, so the real store accepts its target.
@@ -1160,7 +1162,7 @@ fn a_downloaded_pack_reaches_the_runtime_store_only_at_the_processor_runtimes_ep
         unpack(&delivery, &data, &keys(), &cancel).unwrap();
         ready(&data)
     };
-    let accelerated_store = data.join("runtimes-accelerated");
+    let accelerated_store = data.join(crate::provider_selection::ACCELERATED_STORE);
 
     // The processor runtime is one epoch newer or older than the pack (epoch 7): refused before
     // the store is touched, and the pack is discarded with that reason.
