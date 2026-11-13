@@ -11,6 +11,15 @@ export function platformFromUserAgent(userAgent: string): Platform {
 export function platformClass(userAgent: string): string { return `platform-${platformFromUserAgent(userAgent)}`; }
 export function computerWord(platform: Platform): string { return platform === 'mac' ? 'Mac' : platform === 'windows' ? 'PC' : 'computer'; }
 
+/** Count distinct verified completions in the current sign-in's retained import history. */
+export function verifiedImportCount(entries: readonly {
+  runId: string; status: string; verified: number; albumPending: boolean;
+}[]): number {
+  return new Set(entries
+    .filter(entry => entry.status === 'complete' && entry.verified > 0 && !entry.albumPending)
+    .map(entry => entry.runId)).size;
+}
+
 // ---- money ------------------------------------------------------------------------------------
 const usdFormat = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 /** USD as the server sends it (a double). Unknown values render as an em dash, never as "$NaN". */
