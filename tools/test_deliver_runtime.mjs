@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
 import {
+  chmod,
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -60,6 +62,11 @@ function bytes(name, length) {
   return Buffer.concat(parts).subarray(0, length);
 }
 
+const executableFiles = ["bin/helper", "python/python.exe"];
+const committedLinux = fileURLToPath(
+  new URL("../src-tauri/src/accelerated_pack/fixture-linux/", import.meta.url),
+);
+
 /** A small signed accelerated pack. The default is the committed one: CUDA for Windows. */
 async function pack(t, { platform = "windows", architecture = "x86_64", profile = "cuda-ort", provider = "CUDAExecutionProvider", epoch = 7, sourceRevision = "c".repeat(40), signed = true } = {}) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "frameleaf-deliver-"));
@@ -82,6 +89,7 @@ async function pack(t, { platform = "windows", architecture = "x86_64", profile 
     "Lib/a.py": bytes("lower", 65),
     "Lib/empty.py": Buffer.alloc(0),
     "lib-b/cudnn.dll": bytes("cudnn", 411),
+    "bin/helper": bytes("helper", 57),
   };
   const manifest = {
     schemaVersion: 1,
@@ -99,6 +107,9 @@ async function pack(t, { platform = "windows", architecture = "x86_64", profile 
     await writeFile(join(candidate, "payload", name), content);
     manifest.files[name] = { bytes: content.length, sha256: sha256(content).toString("hex") };
   }
+  // Where the pack is built its interpreter and one helper are executable; nothing else is.
+  if (platform !== "windows" && process.platform !== "win32")
+    for (const name of executableFiles) await chmod(join(candidate, "payload", name), 0o755);
   for (const [name, value] of [
     ["manifest", manifest],
     ["manifest-accelerated", { ...manifest, provider }],
@@ -355,4 +366,54 @@ test("one factory run builds the installer pack and every downloadable pack of a
   assert.deepEqual(factoryPacksFor("macos-aarch64", "default"), [{ profile: "coreml-ort", delivered: false }]);
   assert.deepEqual(factoryPacksFor("linux-aarch64", "default"), [{ profile: "cpu-ort", delivered: false }]);
   assert.throws(() => factoryPacksFor("windows-aarch64", "default"), /runtime_factory_source_invalid/);
+});
+
+// The executable bit travels in the signed delivery manifest: a pack unpacked by the app has
+// exactly the executable files it had where it was built, never more.
+test("the files executable where a pack was built are the only ones executable when it is rebuilt", { skip: process.platform === "win32" }, async (t) => {
+  const f = await pack(t, { platform: "linux" });
+  const { delivery } = await deliverRuntime(f.candidate, f.output, privatePem, policy, { partBytes: 512 });
+  assert.deepEqual(delivery.executable, executableFiles);
+  const rebuilt = join(f.root, "rebuilt");
+  await reassemble(join(f.output, "cuda-ort.json"), join(f.output, "cuda-ort.sig"), join(f.output, "parts"), rebuilt, policy);
+  for (const name of Object.keys(f.files))
+    assert.equal(
+      (await lstat(join(rebuilt, "payload", name))).mode & 0o777,
+      executableFiles.includes(name) ? 0o700 : 0o600,
+      name,
+    );
+  // The Rust tests rebuild this committed pack and check the same modes.
+  if (process.env.FRAMELEAF_WRITE_FIXTURE) {
+    await rm(committedLinux, { recursive: true, force: true });
+    await cp(f.output, committedLinux, { recursive: true });
+  }
+  assert.deepEqual(await tree(f.output), await tree(committedLinux.replace(/[\\/]$/, "")));
+  // A Windows pack lists none: Windows has no such bit.
+  const windows = await pack(t);
+  assert.deepEqual((await deliverRuntime(windows.candidate, windows.output, privatePem, policy)).delivery.executable, []);
+  // A pack whose interpreter could not be run is not cut.
+  const broken = await pack(t, { platform: "linux" });
+  await chmod(join(broken.candidate, "payload/python/python.exe"), 0o644);
+  await assert.rejects(deliverRuntime(broken.candidate, broken.output, privatePem, policy), /accelerated_pack_interpreter_not_executable/);
+});
+
+test("a delivery manifest whose executable list is not plain sorted payload paths is refused", async (t) => {
+  const f = await pack(t);
+  await deliverRuntime(f.candidate, f.output, privatePem, policy, { partBytes: 512 });
+  const paths = [join(f.output, "cuda-ort.json"), join(f.output, "cuda-ort.sig"), join(f.output, "parts")];
+  const body = JSON.parse(await readFile(paths[0], "utf8"));
+  const resign = async (executable) => {
+    const raw = Buffer.from(JSON.stringify({ ...body, executable }));
+    await writeFile(paths[0], raw);
+    await writeFile(paths[1], sign(null, raw, privateKey));
+  };
+  await resign(["Lib/a.py"]);
+  await verifyDelivery(...paths, policy);
+  for (const executable of [["../x"], ["/abs"], ["a\\b"], ["c:x"], ["Lib/a.py", "Lib/a.py"], ["b", "a"], [7], "Lib/a.py"]) {
+    await resign(executable);
+    await assert.rejects(verifyDelivery(...paths, policy), /accelerated_pack_manifest_invalid/, JSON.stringify(executable));
+  }
+  // Signed and well formed, but naming a file the pack does not have.
+  await resign(["Lib/absent.py"]);
+  await assert.rejects(reassemble(...paths, join(f.root, "out"), policy), /accelerated_pack_archive_invalid/);
 });

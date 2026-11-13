@@ -709,6 +709,14 @@ impl Runtimes {
     }
 }
 
+/// What installing an accelerated runtime asks of this computer. Tests answer for it.
+pub(crate) struct Installer<'a> {
+    /// Whether this computer has the device a provider needs.
+    pub eligible: &'a dyn Fn(&str) -> bool,
+    /// Open the runtime store at a path with the app's release authority.
+    pub store: &'a dyn Fn(&Path) -> Result<crate::runtime_store::RuntimeStore, String>,
+}
+
 /// Install (or keep) the accelerated runtime and load it: the one the app bundles, or (FD-60)
 /// the pack the person downloaded for this computer's device. `Ok(None)` when there is neither.
 /// Errors are reasons the processor is used instead, never fatal to the worker.
@@ -719,30 +727,50 @@ fn install_accelerated(
     cpu_epoch: u64,
     probe: &dyn Probe,
 ) -> Result<Option<Lane>, String> {
-    let downloaded = match std::fs::symlink_metadata(bundle.join(ACCELERATED_MANIFEST)) {
+    let with = Installer {
+        eligible: &|provider| {
+            device_eligible(
+                provider,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                probe,
+            )
+        },
+        store: &|path| crate::release_policy::open_runtime_store(path),
+    };
+    match std::fs::symlink_metadata(bundle.join(ACCELERATED_MANIFEST)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match crate::accelerated_pack::installable(bundle, data, probe) {
-                Some(directory) => Some(directory),
-                None => return Ok(None),
+                Some(directory) => {
+                    install_downloaded(&directory, data, cpu_release, cpu_epoch, &with).map(Some)
+                }
+                None => Ok(None),
             }
         }
-        Err(_) => return Err("runtime_store_read_failed".into()),
-        Ok(_) => None,
-    };
-    let Some(directory) = downloaded else {
-        return install_from(bundle, data, cpu_release, None, probe).map(Some);
-    };
-    match install_from(&directory, data, cpu_release, Some(cpu_epoch), probe) {
+        Err(_) => Err("runtime_store_read_failed".into()),
+        Ok(_) => install_from(bundle, data, cpu_release, None, &with).map(Some),
+    }
+}
+
+/// Install the pack unpacked in `directory` at the processor runtime's epoch. Once the store
+/// holds it the unpacked payload is released. A failure that says the pack can never be
+/// installed here discards it with its reason, so it is not tried again at every start and the
+/// person can download it again; any other failure leaves it for the next start.
+pub(crate) fn install_downloaded(
+    directory: &Path,
+    data: &Path,
+    cpu_release: &str,
+    cpu_epoch: u64,
+    with: &Installer,
+) -> Result<Lane, String> {
+    match install_from(directory, data, cpu_release, Some(cpu_epoch), with) {
         Ok(lane) => {
-            crate::accelerated_pack::installed(&directory);
-            Ok(Some(lane))
+            crate::accelerated_pack::installed(directory);
+            Ok(lane)
         }
         Err(code) => {
-            // Another copy of the app holding the store says nothing about the pack. Anything
-            // else discards the downloaded pack with its reason, so it is not tried again at
-            // every start and the person can download it again.
             if crate::accelerated_pack::install_failure_is_final(&code) {
-                crate::accelerated_pack::discard(data, &directory, &code);
+                crate::accelerated_pack::discard(data, directory, &code);
             }
             Err(code)
         }
@@ -756,9 +784,8 @@ fn install_from(
     data: &Path,
     cpu_release: &str,
     downloaded: Option<u64>,
-    probe: &dyn Probe,
+    with: &Installer,
 ) -> Result<Lane, String> {
-    use crate::release_policy::open_runtime_store;
     let manifest = read_bounded(&source.join(ACCELERATED_MANIFEST), 8 * 1024 * 1024)?;
     // Read before trust only to skip a runtime this computer has no device for; the store
     // verifies the signature and every byte before anything runs.
@@ -766,20 +793,13 @@ fn install_from(
         .ok()
         .and_then(|value| value.get("provider")?.as_str().map(str::to_owned))
         .ok_or("runtime_manifest_invalid")?;
-    if provider == CPU
-        || !device_eligible(
-            &provider,
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            probe,
-        )
-    {
+    if provider == CPU || !(with.eligible)(&provider) {
         return Err("provider_device_ineligible".into());
     }
     if let Some(cpu_epoch) = downloaded {
         crate::accelerated_pack::epoch_admissible(&manifest, cpu_epoch)?;
     }
-    let store = open_runtime_store(&data.join(ACCELERATED_STORE))?;
+    let store = (with.store)(&data.join(ACCELERATED_STORE))?;
     // A stale release (older epoch than the processor runtime) cannot load; the bundle replaces it.
     let loaded = store.load_active();
     let unreadable = loaded.as_ref().err().cloned();
@@ -807,7 +827,7 @@ fn install_from(
             // store checks every byte of the result either way.
             let shared = match downloaded {
                 Some(_) => source.join("payload"),
-                None => open_runtime_store(&data.join("runtimes"))?.release_payload(cpu_release),
+                None => (with.store)(&data.join("runtimes"))?.release_payload(cpu_release),
             };
             store.install_and_activate_sharing(
                 &source.join("payload"),
