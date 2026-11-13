@@ -74,10 +74,19 @@ struct Built {
     signature: [u8; 64],
     parts: Vec<(String, Vec<u8>)>,
     files: Vec<(String, Vec<u8>)>,
+    platform: &'static str,
+    architecture: &'static str,
 }
 impl Built {
     fn delivery(&self) -> Result<Delivery, String> {
-        Delivery::verify(&self.raw, &self.signature, &keys(), 2, "windows", "x86_64")
+        Delivery::verify(
+            &self.raw,
+            &self.signature,
+            &keys(),
+            2,
+            self.platform,
+            self.architecture,
+        )
     }
     fn place(&self, data: &Path) {
         private_directory(&root(data)).unwrap();
@@ -97,6 +106,10 @@ struct Recipe {
     stranger: bool,
     /// Change the delivery manifest before it is signed.
     change: fn(&mut serde_json::Value),
+    platform: &'static str,
+    architecture: &'static str,
+    /// One more payload file, named as given, in the signed runtime manifest.
+    extra_file: Option<&'static str>,
 }
 impl Default for Recipe {
     fn default() -> Self {
@@ -106,6 +119,9 @@ impl Default for Recipe {
             trailing: Vec::new(),
             stranger: false,
             change: |_| {},
+            platform: "windows",
+            architecture: "x86_64",
+            extra_file: None,
         }
     }
 }
@@ -117,6 +133,9 @@ fn build(recipe: Recipe) -> Built {
         ("Lib/empty.py".into(), Vec::new()),
         ("lib-b/cudnn.dll".into(), vec![3; 500]),
     ];
+    if let Some(name) = recipe.extra_file {
+        files.push((name.into(), b"extra".to_vec()));
+    }
     files.sort();
     let listed: serde_json::Map<String, serde_json::Value> = files
         .iter()
@@ -129,7 +148,7 @@ fn build(recipe: Recipe) -> Built {
         .collect();
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 1, "protocolVersion": 1, "epoch": recipe.manifest_epoch,
-        "platform": "windows", "architecture": "x86_64", "provider": CUDA,
+        "platform": recipe.platform, "architecture": recipe.architecture, "provider": CUDA,
         "python": "python/python.exe", "sourceRevision": "c".repeat(40), "files": listed,
     }))
     .unwrap();
@@ -150,10 +169,10 @@ fn build(recipe: Recipe) -> Built {
         .map(|(index, chunk)| (format!("pack.part{:02}", index + 1), chunk.to_vec()))
         .collect();
     let mut delivery = serde_json::json!({
-        "schemaVersion": 1, "profile": "cuda-ort", "platform": "windows",
-        "architecture": "x86_64", "provider": CUDA, "epoch": recipe.epoch,
+        "schemaVersion": 1, "profile": "cuda-ort", "platform": recipe.platform,
+        "architecture": recipe.architecture, "provider": CUDA, "epoch": recipe.epoch,
         "manifestSha256": sha(&manifest), "manifestBytes": manifest.len(),
-        "bytes": archive.len(),
+        "bytes": archive.len(), "executable": [],
         "parts": parts.iter().map(|(name, bytes)| serde_json::json!({
             "name": name, "bytes": bytes.len(), "sha256": sha(bytes),
         })).collect::<Vec<_>>(),
@@ -165,6 +184,8 @@ fn build(recipe: Recipe) -> Built {
         raw,
         parts,
         files,
+        platform: recipe.platform,
+        architecture: recipe.architecture,
     }
 }
 
@@ -230,7 +251,8 @@ fn the_pack_the_factory_tool_cut_is_rebuilt_from_its_signed_manifests() {
                 .mode()
                 & 0o777
         };
-        assert_eq!(mode(&manifest.python), 0o700);
+        // A Windows pack lists no executable file, so none is made executable.
+        assert_eq!(mode("python/python.exe"), 0o600);
         assert_eq!(mode("Lib/a.py"), 0o600);
     }
     // The parts are gone once the pack is rebuilt, and installing it releases the payload while
@@ -860,5 +882,404 @@ async fn a_part_with_the_wrong_bytes_is_refused_and_nothing_is_installable() {
         "worker_setup_cancelled"
     );
     assert_eq!(status_of(&data, Some(&delivery)).state, "available");
+    let _ = fs::remove_dir_all(data);
+}
+
+/// The Linux pack `tools/deliver_runtime.mjs` cut where two of its files were executable.
+const LINUX_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/accelerated_pack/fixture-linux"
+);
+
+#[test]
+fn only_the_files_executable_where_the_pack_was_built_are_executable_once_rebuilt() {
+    let raw = fs::read(Path::new(LINUX_FIXTURE).join("cuda-ort.json")).unwrap();
+    let signature: [u8; 64] = fs::read(Path::new(LINUX_FIXTURE).join("cuda-ort.sig"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let delivery = Delivery::verify(&raw, &signature, &keys(), 2, "linux", "x86_64").unwrap();
+    assert_eq!(delivery.0.executable, ["bin/helper", "python/python.exe"]);
+    let data = scratch();
+    place_parts(&data, &Path::new(LINUX_FIXTURE).join("parts"));
+    unpack(&delivery, &data, &keys(), &AtomicBool::new(false)).unwrap();
+    let payload = ready(&data).join("payload");
+    let files = files_under(&payload);
+    assert!(files.len() > delivery.0.executable.len());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in &files {
+            let mode = fs::metadata(payload.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let expected = if delivery.0.executable.contains(name) {
+                0o700
+            } else {
+                0o600
+            };
+            assert_eq!(mode, expected, "{name}");
+        }
+    }
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn an_executable_list_that_is_not_sorted_payload_paths_of_the_pack_is_refused() {
+    let changes: [fn(&mut serde_json::Value); 6] = [
+        |value| value["executable"] = serde_json::json!(["../x"]),
+        |value| value["executable"] = serde_json::json!(["/abs"]),
+        |value| value["executable"] = serde_json::json!(["a\\b"]),
+        |value| value["executable"] = serde_json::json!(["c:x"]),
+        |value| value["executable"] = serde_json::json!(["Lib/a.py", "Lib/a.py"]),
+        |value| value["executable"] = serde_json::json!(["Lib/a.py", "Lib/Z.py"]),
+    ];
+    for (index, change) in changes.into_iter().enumerate() {
+        let built = build(Recipe {
+            change,
+            ..Recipe::default()
+        });
+        assert_eq!(
+            built.delivery().unwrap_err(),
+            "accelerated_pack_manifest_invalid",
+            "change {index}"
+        );
+    }
+    // Well formed and signed, but naming a file the pack does not have: refused at unpack.
+    let data = scratch();
+    let built = build(Recipe {
+        change: |value| value["executable"] = serde_json::json!(["Lib/absent.py"]),
+        ..Recipe::default()
+    });
+    built.place(&data);
+    assert_eq!(
+        unpack(
+            &built.delivery().unwrap(),
+            &data,
+            &keys(),
+            &AtomicBool::new(false)
+        )
+        .unwrap_err(),
+        "accelerated_pack_archive_invalid"
+    );
+    assert!(!ready(&data).exists());
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn a_signed_runtime_manifest_cannot_name_a_file_outside_the_pack() {
+    // The release key signed both manifests; the names are still refused before anything is
+    // written for them.
+    for name in [
+        "../x",
+        "Lib/../../x",
+        "/abs",
+        "a\\b",
+        "c:x",
+        "Lib//x",
+        "CON",
+    ] {
+        let data = scratch();
+        let built = build(Recipe {
+            extra_file: Some(name),
+            ..Recipe::default()
+        });
+        built.place(&data);
+        assert_eq!(
+            unpack(
+                &built.delivery().unwrap(),
+                &data,
+                &keys(),
+                &AtomicBool::new(false)
+            )
+            .unwrap_err(),
+            "accelerated_pack_archive_invalid",
+            "{name}"
+        );
+        // Nothing unpacked stays, inside the app's folder or beside it.
+        assert_eq!(fs::read_dir(root(&data)).unwrap().count(), 0, "{name}");
+        assert_eq!(fs::read_dir(&data).unwrap().count(), 1, "{name}");
+        assert!(!data.parent().unwrap().join("x").exists(), "{name}");
+        let _ = fs::remove_dir_all(data);
+    }
+}
+
+/// A TLS server on loopback that answers its one request with a redirect to `location`.
+fn redirecting_tls_server(location: String) -> (u16, std::thread::JoinHandle<()>) {
+    use rustls::pki_types::pem::PemObject;
+    use std::io::{Read as _, Write as _};
+    let identity = crate::manager_tls::TlsIdentity::load_or_create(
+        "aaaaaaaaaaaa",
+        "https://127.0.0.1:9443",
+        || Ok(None),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let certificate =
+        rustls::pki_types::CertificateDer::from_pem_slice(identity.certificate().as_bytes())
+            .unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.private_key().as_bytes())
+        .unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .unwrap(),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut connection = rustls::ServerConnection::new(config).unwrap();
+        let mut tls = rustls::Stream::new(&mut connection, &mut stream);
+        let mut request = [0u8; 4096];
+        if tls.read(&mut request).is_ok_and(|read| read > 0) {
+            let _ = tls.write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            let _ = tls.flush();
+        }
+    });
+    (port, handle)
+}
+
+#[tokio::test]
+async fn a_redirect_from_https_to_plain_http_is_refused() {
+    // The plain listener the redirect points at must never hear from the client.
+    let plain = TcpListener::bind("127.0.0.1:0").unwrap();
+    plain.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/pack.part01", plain.local_addr().unwrap());
+    let (port, server) = redirecting_tls_server(target);
+    // The test server's certificate is its own; only that check is relaxed here.
+    let client = release_client_builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let result = client
+        .get(format!("https://127.0.0.1:{port}/pack.part01"))
+        .send()
+        .await;
+    server.join().unwrap();
+    let error = result.expect_err("the redirect to http was followed");
+    assert!(error.is_redirect() || error.is_builder(), "{error:?}");
+    assert!(
+        matches!(plain.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the client connected to the plain http address"
+    );
+    // The same redirect to an https address is followed, so the refusal above is about http.
+    let second = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (port, server) = redirecting_tls_server(format!(
+        "https://{}/pack.part01",
+        second.local_addr().unwrap()
+    ));
+    second.set_nonblocking(true).unwrap();
+    let follow = tokio::spawn(async move {
+        client
+            .get(format!("https://127.0.0.1:{port}/pack.part01"))
+            .send()
+            .await
+    });
+    let mut contacted = false;
+    for _ in 0..100 {
+        if second.accept().is_ok() {
+            contacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    follow.abort();
+    server.join().unwrap();
+    assert!(contacted, "an https redirect target was not contacted");
+}
+
+/// An epoch authority that lives in memory, in place of the credential store.
+struct Epochs(Mutex<crate::runtime_epochs::RuntimeEpochs>);
+impl crate::runtime_epochs::EpochAuthority for Epochs {
+    fn installation_id(&self) -> Result<String, String> {
+        Ok("7b0d3c1e-5a4f-4e6b-9c2d-1f0e8a7b6c5d".into())
+    }
+    fn with_current(
+        &self,
+        _: &str,
+        runtime: &crate::native_runtime::VerifiedRuntime,
+        operation: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.0.lock().unwrap().check(runtime)?;
+        operation()
+    }
+    fn activate(
+        &self,
+        _: &str,
+        runtime: &crate::native_runtime::VerifiedRuntime,
+        publish: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.0.lock().unwrap().admit(runtime)?;
+        publish()
+    }
+}
+
+#[test]
+fn a_downloaded_pack_reaches_the_runtime_store_only_at_the_processor_runtimes_epoch() {
+    use crate::provider_selection::{install_downloaded, Installer};
+    let data = scratch();
+    let authority = Arc::new(Epochs(Mutex::new(Default::default())));
+    let opened = authority.clone();
+    let store =
+        move |path: &Path| crate::runtime_store::RuntimeStore::new(path, keys(), 2, opened.clone());
+    let with = Installer {
+        eligible: &|provider| provider == CUDA,
+        store: &store,
+    };
+    let absent = Installer {
+        eligible: &|_| false,
+        store: &store,
+    };
+    // A pack for this computer, so the real store accepts its target.
+    let recipe = Recipe {
+        platform: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        ..Recipe::default()
+    };
+    let built = build(recipe.clone());
+    let delivery = built.delivery().unwrap();
+    let cancel = AtomicBool::new(false);
+    let unpacked = || {
+        built.place(&data);
+        unpack(&delivery, &data, &keys(), &cancel).unwrap();
+        ready(&data)
+    };
+    let accelerated_store = data.join("runtimes-accelerated");
+
+    // The processor runtime is one epoch newer or older than the pack (epoch 7): refused before
+    // the store is touched, and the pack is discarded with that reason.
+    for processor in [8, 6] {
+        let directory = unpacked();
+        assert_eq!(
+            install_downloaded(&directory, &data, "unused", processor, &with)
+                .err()
+                .as_deref(),
+            Some("accelerated_pack_epoch_mismatch"),
+            "processor epoch {processor}"
+        );
+        assert!(!directory.exists());
+        assert!(!accelerated_store.join("active.json").exists());
+        let status = status_of(&data, Some(&delivery));
+        assert_eq!(
+            (status.state.as_str(), status.code.as_deref()),
+            ("failed", Some("accelerated_pack_epoch_mismatch"))
+        );
+    }
+
+    // No device right now: nothing is installed and the pack stays for the next start.
+    let directory = unpacked();
+    assert_eq!(
+        install_downloaded(&directory, &data, "unused", 7, &absent)
+            .err()
+            .as_deref(),
+        Some("provider_device_ineligible")
+    );
+    assert!(directory.join("payload").exists());
+
+    // At the processor runtime's epoch the store verifies and activates it, and the unpacked
+    // payload is released while the signed manifest keeps naming the installed runtime.
+    let lane = install_downloaded(&directory, &data, "unused", 7, &with).unwrap();
+    assert_eq!(lane.installed.provider(), CUDA);
+    assert_eq!(lane.installed.epoch(), 7);
+    assert_eq!(lane.installed.manifest_sha256(), delivery.0.manifest_sha256);
+    drop(lane);
+    assert!(!directory.join("payload").exists());
+    assert!(ready_matches(&data, &delivery));
+    // The next start loads it from the store without the payload.
+    let lane = install_downloaded(&directory, &data, "unused", 7, &with).unwrap();
+    assert_eq!(lane.installed.manifest_sha256(), delivery.0.manifest_sha256);
+    drop(lane);
+
+    // An older pack beside an older processor runtime never replaces the newer one the store
+    // already holds.
+    let older = build(Recipe {
+        epoch: 6,
+        manifest_epoch: 6,
+        ..recipe.clone()
+    });
+    older.place(&data);
+    unpack(&older.delivery().unwrap(), &data, &keys(), &cancel).unwrap();
+    let lane = install_downloaded(&ready(&data), &data, "unused", 6, &with).unwrap();
+    assert_eq!(lane.installed.epoch(), 7);
+    assert_eq!(lane.installed.manifest_sha256(), delivery.0.manifest_sha256);
+    drop(lane);
+
+    // The store no longer holds the pack and its payload is gone: it must be downloaded again.
+    let directory = unpacked();
+    installed(&directory);
+    fs::remove_dir_all(&accelerated_store).unwrap();
+    assert_eq!(
+        install_downloaded(&directory, &data, "unused", 7, &with)
+            .err()
+            .as_deref(),
+        Some("accelerated_pack_missing")
+    );
+    assert!(!directory.exists());
+    let status = status_of(&data, Some(&delivery));
+    assert_eq!(
+        (status.state.as_str(), status.code.as_deref()),
+        ("failed", Some("accelerated_pack_missing"))
+    );
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn a_pack_from_an_older_installer_is_not_installable_after_an_update() {
+    let (bundle, data) = (scratch(), scratch());
+    fs::create_dir(bundle.join(DELIVERIES)).unwrap();
+    let carry = |built: &Built| {
+        fs::write(bundle.join(DELIVERIES).join("cuda-ort.json"), &built.raw).unwrap();
+        fs::write(
+            bundle.join(DELIVERIES).join("cuda-ort.sig"),
+            built.signature,
+        )
+        .unwrap();
+    };
+    let installable =
+        |device: &Device| installable_with(&bundle, &data, &keys(), 2, "windows", "x86_64", device);
+    let old = build(Recipe::default());
+    carry(&old);
+    assert_eq!(installable(&nvidia()), None);
+    old.place(&data);
+    unpack(
+        &old.delivery().unwrap(),
+        &data,
+        &keys(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(installable(&nvidia()), Some(ready(&data)));
+    assert_eq!(installable(&Device::default()), None);
+    // The app was updated: its installer now describes the pack of the next runtime epoch. The
+    // old pack is still on disk but is no longer handed to the worker; the new one is offered.
+    let new = build(Recipe {
+        epoch: 8,
+        manifest_epoch: 8,
+        ..Recipe::default()
+    });
+    carry(&new);
+    assert_eq!(installable(&nvidia()), None);
+    assert!(ready(&data).exists());
+    assert_eq!(
+        status_of(&data, Some(&new.delivery().unwrap())).state,
+        "available"
+    );
+    let _ = fs::remove_dir_all(bundle);
     let _ = fs::remove_dir_all(data);
 }
