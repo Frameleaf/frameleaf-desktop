@@ -35,7 +35,10 @@ ACCELERATED_MANIFEST = "manifest-accelerated.json"
 # approves it.
 ACCELERATED_TARGETS = {
     "CoreMLExecutionProvider": {("macos", "aarch64")},
-    "CUDAExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+    # Not Windows: with the locked CUDA and cuDNN wheels, onnxruntime-gpu 1.29.0's provider
+    # library does not load there (Windows error 127, an entry point missing from a library it
+    # depends on; seen in pull-request CI). The cause is not identified.
+    "CUDAExecutionProvider": {("linux", "x86_64")},
     # Not Windows: its onnxruntime-openvino 1.24.1 wheel needs the OpenVINO 2025.4 libraries it
     # was built with, and the server's lock has only openvino 2026.4.1, with which the provider
     # library does not load (Windows error 127, a missing entry point; seen in pull-request CI).
@@ -49,7 +52,7 @@ CUDA_FEED = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onn
 # The CUDA 12 and cuDNN 9 libraries onnxruntime-gpu 1.29.0 loads (its `cuda` and `cudnn` extras
 # and its own `preload_dlls` list, plus what those libraries need themselves). A container has
 # them in its image; a desktop has no CUDA installation, so the pack carries them. The lock pins
-# each one for the Linux torch build; the same pinned wheels exist for Windows.
+# each one for the Linux torch build.
 CUDA_LIBRARIES = (
     "nvidia-cublas-cu12",
     "nvidia-cuda-nvrtc-cu12",
@@ -407,7 +410,6 @@ def device_requirements(provider: str, system: str, locked: str) -> str:
     # The Linux onnxruntime-openvino wheel contains OpenVINO itself.
     names = {
         ("CUDAExecutionProvider", "linux"): CUDA_LIBRARIES,
-        ("CUDAExecutionProvider", "windows"): CUDA_LIBRARIES,
     }.get((provider, system), ())
     return "".join(unmarked(requirement_block(locked, name)) for name in names)
 

@@ -40,7 +40,6 @@
       "extra": "cuda",
       "provider": "CUDAExecutionProvider",
       "targets": [
-        "windows-x86_64",
         "linux-x86_64"
       ],
       "sourceRevision": "c2203495fa2400e369604347557473d81f0b9b6b"

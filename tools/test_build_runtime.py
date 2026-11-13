@@ -160,8 +160,9 @@ class RuntimeBuilderTests(unittest.TestCase):
             (root / "python").write_bytes(b"fixture")
             arguments = (root, "python", "a" * 40, 7)
             for provider, systems in [
-                ("CUDAExecutionProvider", ["windows", "linux"]),
-                # The locked Windows OpenVINO libraries do not match the provider: no recipe.
+                # Windows has no recipe for either: with the locked libraries neither provider
+                # library loads there (pull-request CI, Windows error 127).
+                ("CUDAExecutionProvider", ["linux"]),
                 ("OpenVINOExecutionProvider", ["linux"]),
             ]:
                 for system in systems:
@@ -175,6 +176,7 @@ class RuntimeBuilderTests(unittest.TestCase):
                     ("macos", "aarch64"),
                     ("macos", "x86_64"),
                     ("linux", "aarch64"),
+                    ("windows", "x86_64"),
                 ]:
                     with self.assertRaises(builder.BuildError):
                         builder.manifest(*arguments, system, architecture, provider)
@@ -208,7 +210,7 @@ class RuntimeBuilderTests(unittest.TestCase):
             + block("nvidia-cublas", linux)
             + block("onnxruntime-gpu")
         )
-        for system in ["linux", "windows"]:
+        for system in ["linux"]:
             value = builder.device_requirements("CUDAExecutionProvider", system, locked)
             # Every library the provider loads, each with both locked hashes and no marker: the
             # builder has already chosen the platform, and the lock's marker names Linux only.
@@ -232,6 +234,7 @@ class RuntimeBuilderTests(unittest.TestCase):
         for provider, system in [
             ("OpenVINOExecutionProvider", "linux"),
             ("OpenVINOExecutionProvider", "windows"),
+            ("CUDAExecutionProvider", "windows"),
             ("CPUExecutionProvider", "linux"),
             ("CoreMLExecutionProvider", "macos"),
         ]:

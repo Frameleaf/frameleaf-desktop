@@ -111,13 +111,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-24.04]
+        # Linux only. On Windows neither provider library loads with the locked libraries
+        # (Windows error 127 in both cases), so Desktop builds no Windows GPU pack.
+        os: [ubuntu-24.04]
         profile: [cuda-ort, openvino-ort]
-        exclude:
-          # No Windows OpenVINO pack: the locked openvino 2026.4.1 libraries do not match
-          # onnxruntime-openvino 1.24.1 (built for 2025.4), so its provider library does not load.
-          - os: windows-latest
-            profile: openvino-ort
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:

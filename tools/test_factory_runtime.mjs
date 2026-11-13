@@ -208,7 +208,7 @@ test("factory picks the accelerated profile only where one is approved or named"
     for (const choice of [true, "default", false, "none"])
       assert.equal(factoryProfileFor(target, choice), "cpu-ort");
   for (const [name, targets] of [
-    ["cuda-ort", ["linux-x86_64", "windows-x86_64"]],
+    ["cuda-ort", ["linux-x86_64"]],
     ["openvino-ort", ["linux-x86_64"]],
   ]) {
     for (const target of targets)
@@ -235,6 +235,7 @@ test("an accelerated pack builds its own profile's source and the processor pack
   assert.equal(factorySourceRevisionFor("linux-x86_64", "openvino-ort"), coreml);
   // FD-56: no Windows OpenVINO pack (its locked libraries do not match the provider).
   assert.equal(factoryProfileFor("windows-x86_64", "openvino-ort"), "cpu-ort");
+  assert.equal(factoryProfileFor("windows-x86_64", "cuda-ort"), "cpu-ort");
   assert.equal(factorySourceRevisionFor("macos-aarch64"), factorySourceRevision);
   // A profile is never built for a target that does not approve it.
   for (const [target, name] of [

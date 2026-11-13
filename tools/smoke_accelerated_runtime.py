@@ -6,13 +6,13 @@ OpenVINO also runs on a processor, so a session on its CPU device proves the pro
 libraries initialise. That is not an accelerator qualification: the runtime refuses to qualify
 OpenVINO without one of its graphics devices.
 
-CUDA cannot create a session without an NVIDIA card. What is checked without one: every CUDA
-library onnxruntime itself lists is in the pack and loads, cuDNN's main library is in the pack,
-and every cuDNN library the pack has loads. onnxruntime's CUDA provider library also needs the
-NVIDIA driver's own library, which only a computer with the driver has: without a device its
-load may fail for that one reason and no other. A session is then attempted; its failure is
-accepted only when this computer has no NVIDIA device and the error is not another library that
-failed to load. Nothing here shows the provider library loading or inference running on a card.
+CUDA (Linux) cannot create a session without an NVIDIA card. What is checked without one: every
+CUDA and cuDNN library onnxruntime lists is in the pack and opens on its own; onnxruntime's CUDA
+provider library is in the pack and the dynamic linker resolves everything it links against
+from the pack except the NVIDIA driver library `libcuda.so.1`, which only a computer with the
+driver has. Any other unresolved library fails. With a device the session must be on CUDA;
+without one, the only accepted outcome is that the driver library is the one thing missing.
+Nothing here shows a CUDA session or inference on a card.
 """
 
 import ctypes
@@ -74,10 +74,13 @@ with tempfile.TemporaryDirectory() as temporary:
         # A hosted runner has no Intel graphics device: this is not an accelerator.
         print("accelerator present:", accelerator_present(provider, facts))
     else:
-        windows = platform.system() == "Windows"
+        if platform.system() != "Linux":
+            raise SystemExit("Desktop builds a CUDA pack for Linux only")
+        import os
+        import subprocess
+
         site = Path(ort.__file__).resolve().parent.parent
-        # No NVIDIA device: neither the driver's own tool nor the driver library is here.
-        driver = "nvcuda.dll" if windows else "libcuda.so.1"
+        driver = "libcuda.so.1"
         try:
             ctypes.CDLL(driver)
             driver_present = True
@@ -85,51 +88,44 @@ with tempfile.TemporaryDirectory() as temporary:
             driver_present = False
         device = bool(facts["gpus"]) or driver_present or shutil.which("nvidia-smi") is not None
         print("NVIDIA device or driver present:", device)
-        # onnxruntime's own lists of what it preloads from the wheels. It requires the CUDA
-        # libraries and treats a cuDNN library that is absent as optional.
-        cuda = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, True, False)]
-        cudnn = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, False, True)]
-        assert len(cuda) >= 4 and cudnn, (cuda, cudnn)
-        for library in cuda:
+        # onnxruntime's own lists of what it preloads from the wheels: every one must be in the
+        # pack and open on its own.
+        libraries = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(False, True, True)]
+        assert len(libraries) >= 7, libraries
+        for library in libraries:
             assert library.is_file(), f"missing from the pack: {library}"
-        main = "cudnn64_9.dll" if windows else "libcudnn.so.9"
-        assert any(library.name == main and library.is_file() for library in cudnn), f"{main} is not in the pack"
-        loaded = [library for library in cuda + cudnn if library.is_file()]
-        for library in loaded:
             ctypes.CDLL(str(library))  # raises when it or one of its dependencies does not load
-        print(f"CUDA: {len(cuda)} CUDA and {len(loaded) - len(cuda)} of {len(cudnn)} cuDNN libraries loaded from the pack")
+        print(f"CUDA: {len(libraries)} bundled CUDA and cuDNN libraries are in the pack and load")
+        # The provider library and what it links against: with the pack's own library folders on
+        # the search path, the dynamic linker may fail to find the NVIDIA driver library and
+        # nothing else. That one library belongs to the driver, which a computer without a card
+        # does not have.
         capi = site / "onnxruntime" / "capi"
-        shared, cuda_provider = (
-            ("onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll")
-            if windows
-            else ("libonnxruntime_providers_shared.so", "libonnxruntime_providers_cuda.so")
-        )
-        ctypes.CDLL(str(capi / shared))
-        try:
-            ctypes.CDLL(str(capi / cuda_provider))
-            print("CUDA provider library loaded")
-        except OSError as error:
-            # Only the driver's library may be what is missing, and only where there is no device.
-            # Windows does not name the missing module, so there the absent driver is the evidence.
-            if device or (not windows and driver not in str(error)):
-                raise
-            print("CUDA provider library NOT loaded; it needs the NVIDIA driver library:", str(error)[:200])
-        try:
-            session = ort.InferenceSession(path.as_posix(), providers=[provider, "CPUExecutionProvider"])
-            session.disable_fallback()
-        except Exception as error:
-            text = str(error)
-            loading = any(
-                marker in text.lower()
-                for marker in ("failed to load", "error loading", "cannot open shared object", "loadlibrary", "dlopen")
-            )
-            if device or loading:
-                raise
-            print("CUDA session not created; no NVIDIA device here:", text[:300])
+        provider_library = capi / "libonnxruntime_providers_cuda.so"
+        assert provider_library.is_file() and (capi / "libonnxruntime_providers_shared.so").is_file()
+        folders = sorted({str(library.parent) for library in libraries} | {str(capi)})
+        listing = subprocess.run(
+            ["ldd", str(provider_library)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "LD_LIBRARY_PATH": ":".join(folders)},
+        ).stdout
+        unresolved = sorted(line.split()[0] for line in listing.splitlines() if "not found" in line)
+        resolved = [line.split()[0] for line in listing.splitlines() if "=>" in line and "not found" not in line]
+        print("CUDA provider library resolves", len(resolved), "libraries; unresolved:", unresolved)
+        for needed in ("libcublas", "libcudnn", "libcufft", "libcudart"):
+            assert any(name.startswith(needed) for name in resolved), f"{needed} is not resolved from the pack"
+        assert unresolved == ([] if driver_present else [driver]), unresolved
+        session = ort.InferenceSession(path.as_posix(), providers=[provider, "CPUExecutionProvider"])
+        used = session.get_providers()
+        print("session providers:", used)
+        if device:
+            # With a card the session must really be on CUDA, not quietly on the processor.
+            assert provider in used, used
         else:
-            used = session.get_providers()
-            print("CUDA session providers:", used)
-            # Without a device the provider must not claim the session.
-            assert device or provider not in used, used
+            # Without the driver onnxruntime leaves CUDA out; that is the only reason accepted.
+            assert unresolved == [driver] and provider not in used, (unresolved, used)
+            print("CUDA session not created: the NVIDIA driver library is absent (no card here)")
         assert not accelerator_present(provider, facts) or facts["gpus"]
 print("smoke ok")
