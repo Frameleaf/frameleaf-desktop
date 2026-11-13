@@ -217,7 +217,11 @@ point to that exact workflow commit and match the version in `package.json`,
 (`node tools/release_inputs.mjs v<version>` checks all five). An empty tag retains
 installer artifacts and skips draft staging.
 The default selection requests macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage.
-Intel macOS runtime dependencies are tracked in [FD-6](https://heroit.atlassian.net/browse/FD-6).
+The Intel macOS runtime ([FD-6](https://heroit.atlassian.net/browse/FD-6)) installs onnxruntime 1.23.2,
+the last release with an Intel macOS wheel, in place of the version the runtime source locks: the
+one wheel is named by version and SHA-256 under `targetPins` in `runtime/profiles.json`, recorded
+in the pack's `provenance.json`, and built and run on the Intel image by the `intel-macos` job of
+`runtime-pack.yml`. Every other dependency and every other target keeps the source lock.
 
 Every platform can be released by itself, so one that cannot build or be signed
 does not hold back the others. `platforms` is one of:
@@ -564,13 +568,17 @@ validation; macOS and Linux ship without it.
    on it prints the tag.
 4. **Build the runtime packs** on `main`, at or before `<commit>`, with the next
    epoch ([Runtime epoch](#runtime-epoch): 9), for every platform being
-   released. Separate runs per platform are fine; note each run id.
+   released. Separate runs per platform are fine; note each run id. A run is
+   only accepted by the release when every platform in it succeeded, so build
+   Intel by itself until it has succeeded once.
+
+   Run it once each for `macos-aarch64`, `linux`, `macos-x86_64` and (with step 1
+   done) `windows`. Factory runs also go one at a time with only one waiting:
+   dispatch the next when no other is waiting.
 
    ```sh
    gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
-     -f platforms=macos-linux -f epoch=9 -f accelerated=default
-   gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
-     -f platforms=windows -f epoch=9 -f accelerated=default   # Windows only
+     -f platforms=<platforms> -f epoch=9 -f accelerated=default
    ```
 5. **Have the companion packages ready** ([Companion packages](#companion-packages)):
    the run id of the notarized Apple Silicon package (`42148037724` for 1.2.4),
@@ -595,9 +603,13 @@ validation; macOS and Linux ship without it.
      -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run>   # needs step 1
    ```
 
-   Add `-f platforms=macos-x86_64` as its own run once the Intel runtime builds
-   ([FD-6](https://heroit.atlassian.net/browse/FD-6)). A platform left out stays
-   on its installed version; the draft notes say which.
+   Intel Macs: the Intel runtime now builds with onnxruntime 1.23.2
+   ([FD-6](https://heroit.atlassian.net/browse/FD-6)), but no signed factory run
+   has produced an Intel pack yet. Until one succeeds, build and release it as
+   its own `macos-x86_64` runs so a failure there does not stop Apple Silicon or
+   Linux. Once one has, `platforms=macos-linux` (or `all` with step 1 done) in
+   steps 4 and 7 replaces the separate macOS and Linux runs. A platform left out
+   stays on its installed version; the draft notes say which.
 8. **Add the hand-attached files to the draft** (step 5) before the last run of
    step 7, so the final `SHA256SUMS` lists them; or re-run the `stage` job of the
    last run afterwards.
