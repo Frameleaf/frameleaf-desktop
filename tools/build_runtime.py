@@ -387,6 +387,35 @@ def feed_requirements(provider: str, text: str) -> tuple[str, str, str | None]:
     return text.replace(block, ""), block, index
 
 
+def target_pins(profile: dict, target: str) -> dict[str, dict[str, str]]:
+    """The packages a target takes at another exact version than the runtime source locks,
+    because the locked version publishes no wheel for it (FD-6: onnxruntime on Intel macOS)."""
+    pins = profile.get("targetPins", {}).get(target, {})
+    if not isinstance(pins, dict) or any(
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+        or not isinstance(pin, dict)
+        or set(pin) != {"version", "sha256"}
+        or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", str(pin["version"]))
+        or not re.fullmatch(r"[a-f0-9]{64}", str(pin["sha256"]))
+        for name, pin in pins.items()
+    ):
+        raise BuildError("runtime_target_pin_invalid")
+    return pins
+
+
+def pinned_requirements(text: str, pins: dict[str, dict[str, str]]) -> str:
+    """Replace each pinned package's locked requirement with the one wheel the pin names. The
+    package must be locked exactly once: a pin never adds a package the source does not use."""
+    for name, pin in sorted(pins.items()):
+        block = requirement_block(text, name)
+        if text.count(block) != 1:
+            raise BuildError("runtime_build_tool_not_pinned")
+        text = text.replace(
+            block, f"{name}=={pin['version']} \\\n    --hash=sha256:{pin['sha256']}\n"
+        )
+    return text
+
+
 def dependency_indexes(system: str, architecture: str) -> list[str]:
     # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
@@ -542,6 +571,8 @@ def build(
             cwd=ml,
             env=env,
         )
+        pins = target_pins(profile, f"{system}-{architecture}")
+        requirements.write_text(pinned_requirements(requirements.read_text(), pins))
         validate_requirements(requirements.read_text())
         downloads = work / "python-downloads"
         run(
@@ -724,6 +755,8 @@ def build(
             "sourceBuildAllowlist": ["antlr4-python3-runtime==4.9.3"]
             if build_tools.stat().st_size
             else [],
+            # What this target installs instead of the version the source locks.
+            **({"targetPins": pins} if pins else {}),
         }
         (payload / "provenance.json").write_text(
             json.dumps(receipt, sort_keys=True) + "\n"
