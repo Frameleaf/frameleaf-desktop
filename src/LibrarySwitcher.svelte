@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import ErrorText from './ErrorText.svelte';
   import Sheet from './Sheet.svelte';
   import { connectionError } from './errors';
   import type { Connection } from './server-types';
@@ -96,7 +97,7 @@
     {/if}
   {/if}
   {#if failure}
-    <div class="inline-msg error" role="alert"><p>{failure}</p></div>
+    <div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p></div>
   {/if}
   {#if notice}<p role="status">{notice}</p>{/if}
   {#snippet actions()}

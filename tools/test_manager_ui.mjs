@@ -1,329 +1,406 @@
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
-import {createServer} from 'node:net';
-import {readFile,mkdir} from 'node:fs/promises';
-import {join,isAbsolute} from 'node:path';
-import {fileURLToPath,pathToFileURL} from 'node:url';
+import { readFile, mkdir } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
+import { enabled, root, withBrowser } from './ui_test_support.mjs';
+import { managerError } from '../src/manager-state.ts';
 
-// Opt-in browser qualification: only a synthetic IPC bridge, never real Manager credentials or commands.
-if(process.env.FRAMELEAF_MANAGER_UI_TEST!=='1') {process.stdout.write('Manager UI browser qualification is opt-in.\n');process.exit(0);}
-const executablePath=process.env.FRAMELEAF_TEST_BROWSER;
-const playwright=process.env.FRAMELEAF_TEST_PLAYWRIGHT;
-const output=process.env.FRAMELEAF_TEST_OUTPUT;
-assert.ok(executablePath&&isAbsolute(executablePath)&&playwright&&isAbsolute(playwright)&&output&&isAbsolute(output));
-const {chromium}=await import(pathToFileURL(playwright));
-const root=fileURLToPath(new URL('..',import.meta.url));
-const listener=createServer();await new Promise(resolve=>listener.listen(0,'127.0.0.1',resolve));const address=listener.address();assert.ok(address&&typeof address!=='string');await new Promise(resolve=>listener.close(resolve));
-const origin=`http://127.0.0.1:${address.port}`;
-const vite=spawn(process.execPath,[join(root,'node_modules/vite/bin/vite.js'),'--host','127.0.0.1','--port',String(address.port),'--strictPort'],{cwd:root,stdio:['ignore','pipe','pipe']});
-const ended=new Promise(resolve=>vite.once('close',resolve));
-let browser;
-const view={origin:'https://manager.test:9443',managerId:'11111111-1111-4111-8111-111111111111',deviceId:'22222222-2222-4222-8222-222222222222',installationId:'aaaaaaaaaaaa',expiresAt:Date.now()+86400000,scopes:['status','start','stop','restart','backup'],certificateSha256:null};
-const operationId='33333333-3333-4333-8333-333333333333';
-const password='synthetic Manager UI password';
-const wire=JSON.parse(await readFile(join(root,'src-tauri/src/manager_wire.json'),'utf8'));
-const makeOperation=(action,state='running')=>({id:operationId,kind:action,state,step:action==='backup'?'database-backup':action,completed:state==='complete'?[action]:[],error:null,createdAt:Date.now(),updatedAt:Date.now()});
-async function fixture(scenario,run,viewport={width:1100,height:1000},colorScheme='light'){
- const context=await browser.newContext({viewport,colorScheme});
- const calls=[],keys=new Map(),errors=[];
- let paired=!['pair','pair-http','localhost'].includes(scenario),authorized=!['reauth','recovery-reauth'].includes(scenario),lost=scenario==='lost',current=['resume','recovery-reauth'].includes(scenario)?makeOperation('stop','interrupted'):null;
- const localRecord={schemaVersion:1,manifestSha256:'a'.repeat(64),controllerSha256:'b'.repeat(64)};
- let local={state:'idle',code:null,backgroundActive:false,installation:null,origin:null};
- let refuseLocalStop=true;
- let reviewLost=scenario==='recovery',reviewReady=false;const reviews=new Map(),restores=new Map();let restoreLost=scenario==='recovery-restore',restored=null;
- const manager={...view,...(scenario==='pair-http'?{origin:'http://tower.local:2282'}:{}),...(scenario==='localhost'?{origin:'https://127.0.0.1:9443',certificateSha256:wire.certificateSha256}:{}),scopes:scenario==='readonly'?['status']:scenario.startsWith('recovery')?[...view.scopes,'restore']:view.scopes};
- await context.exposeBinding('__managerInvoke',async(_source,command,args={})=>{
-  calls.push({command,args:structuredClone(args)});
-  if(command==='plugin:event|listen')return 1;
-  if(command==='plugin:event|unlisten')return;
-  if(command==='local_host_status')return local;
-  if(command==='installed_local_hosts')return scenario==='localhost'?[localRecord]:[];
-  if(command==='check_local_host_package'&&scenario==='localhost'){assert.equal(args.manifestSha256,localRecord.manifestSha256);assert.equal(args.controllerSha256,localRecord.controllerSha256);return 'verified';}
-  if(command==='prepare_local_host'){assert.equal(args.manifestSha256,localRecord.manifestSha256);await new Promise(resolve=>setTimeout(resolve,300));local={state:'manager-ready',code:null,backgroundActive:true,installation:localRecord,origin:'https://127.0.0.1:9443'};return local;}
-  if(command==='stop_local_host_manager'){if(refuseLocalStop){refuseLocalStop=false;throw 'host_controller_already_owned';}local={...local,state:'idle',backgroundActive:false};return local;}
-  if(command==='restore_connection')return null;
-  if(command==='worker_setup_status')return {state:'stopped',code:null,control:'stopped',workloads:[]};
-  if(command==='authorize_local_manager'){assert.deepEqual(Object.keys(args).sort(),['allowManagement','allowRecovery','password']);assert.equal(args.password,password);assert.equal(args.allowManagement,true);assert.equal(typeof args.allowRecovery,'boolean');if(args.allowRecovery)manager.scopes=[...view.scopes,'restore'];await new Promise(resolve=>setTimeout(resolve,300));paired=true;return manager;}
-  if(command==='open_local_photos'){assert.equal(scenario,'localhost');assert.ok(paired&&local.backgroundActive);assert.deepEqual(args,{});return;}
-  if(command==='manager_view')return paired?manager:null;
-  if(command==='manager_certificate_fingerprint')return wire.certificateSha256;
-  if(command==='pair_manager'){assert.equal(args.password,password);assert.equal(args.allowManagement,true);assert.equal(typeof args.allowRecovery,'boolean');if(args.allowRecovery)manager.scopes=[...view.scopes,'restore'];paired=true;return {...manager,certificateSha256:args.certificate?.sha256||null};}
-  if(command==='reauthenticate_manager'){assert.equal(args.password,password);authorized=true;return;}
-  if(command==='disconnect_manager'){assert.equal(args.password,password);paired=false;return;}
-  if(command==='manager_request'){
-   const request=args.command;
-   if(scenario==='devicechanged'&&paired)throw 'manager_device_changed';
-   if(request.kind==='status')return {manager:{id:manager.managerId,origin:manager.origin},installation:{id:manager.installationId,name:scenario==='localhost'?'My local library':'Example NAS',release:'frameleaf-v3.0.0-1',port:2283},operations:current?[current]:[]};
-   if(request.kind==='backups'){if(!authorized)throw 'manager_recent_auth_required';assert.ok(manager.scopes.includes('restore'));return [{id:'a'.repeat(64),time:new Date().toISOString()}];}
-   if(request.kind==='review-restore'){
-    assert.ok(manager.scopes.includes('restore'));assert.equal(request.snapshot,'a'.repeat(64));
-    if(!reviews.has(request.key))reviews.set(request.key,{snapshot:request.snapshot});
-    if(reviewLost){reviewLost=false;throw 'manager_response_interrupted';}
-    return {id:request.key,snapshot:request.snapshot,installationId:manager.installationId,state:'preparing'};
-   }
-   if(request.kind==='restore-review'){
-    assert.ok(reviews.has(request.id));assert.equal(request.snapshot,reviews.get(request.id).snapshot);
-    return {id:request.id,snapshot:request.snapshot,installationId:manager.installationId,expires:Date.now()+900000,state:reviewReady?'prepared':'preparing',...(reviewReady?{libraryId:manager.installationId,release:'frameleaf-v3.0.0-1',targetRelease:'frameleaf-v3.0.0-1',createdAt:Date.now()-86400000,mediaIncluded:false,requiresRuntimeChange:false}:{})};
-   }
-   if(request.kind==='restore'){
-    if(!authorized)throw 'manager_recent_auth_required';assert.ok(reviews.has(request.reviewId));
-    if(scenario==='recovery-restore-expired')throw 'native_restore_review_expired';
-    if(!restores.has(request.key)){restored=makeOperation('restore');restores.set(request.key,restored);}
-    if(restoreLost){restoreLost=false;throw 'manager_response_interrupted';}
-    return {id:restored.id};
-   }
-   if(request.kind==='restore-operation'){if(!authorized)throw 'manager_recent_auth_required';assert.equal(request.id,restored.id);return restored;}
-   if(request.kind==='resume-restore'){if(!authorized)throw 'manager_recent_auth_required';assert.equal(request.id,restored.id);restored={...restored,state:'running',error:null};return {id:restored.id};}
-   if(request.kind==='control'){
-    if(!authorized)throw 'manager_recent_auth_required';
-    if(!keys.has(request.key)){current=makeOperation(request.action);keys.set(request.key,current);}
-    if(lost){lost=false;throw 'manager_unreachable_or_certificate_invalid';}
-    return {id:keys.get(request.key).id};
-   }
-   if(request.kind==='operation'){assert.equal(request.id,operationId);return current;}
-   if(request.kind==='resume'){assert.equal(request.id,operationId);current={...current,state:'running'};return {id:operationId};}
+// Opt-in browser qualification of the Manager page: only a synthetic IPC bridge, never real Manager
+// credentials or commands. Run it with `npm run test:ui`.
+if (!enabled) { process.stdout.write('Manager UI browser qualification is opt-in.\n'); process.exit(0); }
+// Optional: a folder that receives screenshots of the main states.
+const output = process.env.FRAMELEAF_TEST_OUTPUT;
+assert.ok(!output || isAbsolute(output));
+
+const view = {
+  origin: 'https://manager.test:9443', managerId: '11111111-1111-4111-8111-111111111111', deviceId: '22222222-2222-4222-8222-222222222222',
+  installationId: 'aaaaaaaaaaaa', expiresAt: Date.now() + 86400000, scopes: ['status', 'start', 'stop', 'restart', 'backup'], certificateSha256: null,
+};
+const operationId = '33333333-3333-4333-8333-333333333333';
+const snapshot = 'a'.repeat(64);
+const password = 'synthetic Manager UI password';
+const publicHttp = 'http://manager.example.com:2282';
+const wire = JSON.parse(await readFile(join(root, 'src-tauri/src/manager_wire.json'), 'utf8'));
+const makeOperation = (action, state = 'running') => ({ id: operationId, kind: action, state, step: action === 'backup' ? 'database-backup' : action, completed: state === 'complete' ? [action] : [], error: null, createdAt: Date.now(), updatedAt: Date.now() });
+const allowControl = 'Allow this computer to start, stop and restart this server, and create database backups.';
+const allowRecovery = 'Also allow backup recovery reviews and restore operations.';
+const understandRestore = 'I understand and want to restore this database backup.';
+// The hint under an http:// address: allowed at home, HTTPS for a Manager reached over the internet.
+const httpHint = /^HTTP is for a Manager on this computer or your home network\..*HTTPS/;
+
+await withBrowser(async ({ browser, origin }) => {
+  if (output) await mkdir(output, { recursive: true });
+  const shot = async (target, name) => { if (output) await target.screenshot({ path: join(output, name) }); };
+
+  /** One signed-in app with a synthetic Manager behind the IPC bridge, opened on the Manager page. */
+  async function fixture(scenario, run, viewport = { width: 1100, height: 1000 }, colorScheme = 'light') {
+    const context = await browser.newContext({ viewport, colorScheme });
+    const calls = [], keys = new Map(), errors = [];
+    const unpaired = ['pair', 'pair-http', 'pair-public-http'].includes(scenario);
+    let paired = !unpaired, authorized = !['reauth', 'recovery-reauth'].includes(scenario), lost = scenario === 'lost';
+    let current = ['resume', 'recovery-reauth'].includes(scenario) ? makeOperation('stop', 'interrupted') : null;
+    let reviewLost = scenario === 'recovery', reviewReady = false;
+    const reviews = new Map(), restores = new Map();
+    let restoreLost = scenario === 'recovery-restore', restored = null;
+    const manager = { ...view, scopes: scenario === 'readonly' ? ['status'] : scenario.startsWith('recovery') ? [...view.scopes, 'restore'] : view.scopes };
+    await context.exposeBinding('__managerInvoke', async (_source, command, args = {}) => {
+      calls.push({ command, args: structuredClone(args) });
+      if (command === 'plugin:event|listen') return 1;
+      if (command === 'local_host_status') return { backgroundActive: false };
+      if (command === 'restore_connection') return {
+        navigationScope: 'server-account-a', server: 'https://photos.test', name: 'Pat', mode: 'client', state: 'ready',
+        features: { worker: false, workerSession: false, enrollment: true, nativeHost: false, sources: false },
+      };
+      if (command === 'worker_setup_status') return { state: 'stopped', code: null, control: 'stopped', workloads: [] };
+      if (command === 'server_summary') return { me: { isAdmin: false } };
+      // The rest of the app shell stays idle; only Manager's own commands are scripted below.
+      if (!/manager/.test(command)) return null;
+      if (command === 'manager_view') return paired ? manager : null;
+      if (command === 'manager_certificate_fingerprint') return wire.certificateSha256;
+      if (command === 'pair_manager') {
+        assert.deepEqual(Object.keys(args).sort(), ['allowManagement', 'allowRecovery', 'certificate', 'origin', 'password']);
+        assert.equal(args.password, password); assert.equal(args.allowManagement, true); assert.equal(typeof args.allowRecovery, 'boolean');
+        // The backend refuses plain HTTP only for a host outside this computer and the home network.
+        if (args.origin === publicHttp) throw 'manager_https_required';
+        if (args.allowRecovery) manager.scopes = [...view.scopes, 'restore'];
+        manager.origin = new URL(args.origin).origin;
+        manager.certificateSha256 = args.certificate?.sha256 || null;
+        paired = true;
+        return manager;
+      }
+      if (command === 'reauthenticate_manager') { assert.equal(args.password, password); authorized = true; return null; }
+      if (command === 'disconnect_manager') { assert.equal(args.password, password); paired = false; return true; }
+      if (command === 'manager_request') {
+        const request = args.command;
+        if (scenario === 'devicechanged' && paired) throw 'manager_device_changed';
+        if (request.kind === 'status') return { manager: { id: manager.managerId, origin: manager.origin }, installation: { id: manager.installationId, name: 'Example NAS', release: 'frameleaf-v3.0.0-1', port: 2283 }, operations: current ? [current] : [] };
+        if (request.kind === 'backups') { if (!authorized) throw 'manager_recent_auth_required'; assert.ok(manager.scopes.includes('restore')); return [{ id: snapshot, time: new Date().toISOString() }]; }
+        if (request.kind === 'review-restore') {
+          assert.ok(manager.scopes.includes('restore')); assert.equal(request.snapshot, snapshot);
+          if (!reviews.has(request.key)) reviews.set(request.key, { snapshot: request.snapshot });
+          if (reviewLost) { reviewLost = false; throw 'manager_response_interrupted'; }
+          return { id: request.key, snapshot: request.snapshot, installationId: manager.installationId, state: 'preparing' };
+        }
+        if (request.kind === 'restore-review') {
+          assert.ok(reviews.has(request.id)); assert.equal(request.snapshot, reviews.get(request.id).snapshot);
+          return { id: request.id, snapshot: request.snapshot, installationId: manager.installationId, expires: Date.now() + 900000, state: reviewReady ? 'prepared' : 'preparing', ...(reviewReady ? { libraryId: manager.installationId, release: 'frameleaf-v3.0.0-1', targetRelease: 'frameleaf-v3.0.0-1', createdAt: Date.now() - 86400000, mediaIncluded: false, requiresRuntimeChange: false } : {}) };
+        }
+        if (request.kind === 'restore') {
+          if (!authorized) throw 'manager_recent_auth_required'; assert.ok(reviews.has(request.reviewId));
+          if (scenario === 'recovery-restore-expired') throw 'native_restore_review_expired';
+          if (!restores.has(request.key)) { restored = { ...makeOperation('restore'), step: 'native-restore-verify' }; restores.set(request.key, restored); }
+          if (restoreLost) { restoreLost = false; throw 'manager_response_interrupted'; }
+          return { id: restored.id };
+        }
+        if (request.kind === 'restore-operation') { if (!authorized) throw 'manager_recent_auth_required'; assert.equal(request.id, restored.id); return restored; }
+        if (request.kind === 'resume-restore') { if (!authorized) throw 'manager_recent_auth_required'; assert.equal(request.id, restored.id); restored = { ...restored, state: 'running', error: null }; return { id: restored.id }; }
+        if (request.kind === 'control') {
+          if (!authorized) throw 'manager_recent_auth_required';
+          if (!keys.has(request.key)) { current = makeOperation(request.action); keys.set(request.key, current); }
+          if (lost) { lost = false; throw 'manager_unreachable_or_certificate_invalid'; }
+          return { id: keys.get(request.key).id };
+        }
+        if (request.kind === 'operation') { assert.equal(request.id, operationId); return current; }
+        if (request.kind === 'resume') { assert.equal(request.id, operationId); current = { ...current, state: 'running' }; return { id: operationId }; }
+      }
+      throw Error(`Unexpected fixture command: ${command} ${JSON.stringify(args)}`);
+    });
+    await context.addInitScript(() => {
+      globalThis.isTauri = true;
+      globalThis.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+      globalThis.__TAURI_INTERNALS__ = { invoke: (command, args) => globalThis.__managerInvoke(command, args), transformCallback: () => 1 };
+    });
+    const page = await context.newPage();
+    page.on('pageerror', error => errors.push(error.message));
+    try {
+      await page.goto(origin, { waitUntil: 'networkidle' });
+      await page.getByRole('navigation', { name: 'Sidebar' }).getByRole('button', { name: 'Manager' }).click();
+      // The page is a landmark named by its title: the library once Manager answers, else a fixed title.
+      const title = unpaired ? 'Server management' : scenario === 'devicechanged' ? 'Manager' : 'Example NAS';
+      const ui = page.getByRole('region', { name: title });
+      await ui.getByRole('heading', { name: title, exact: true, level: 1 }).waitFor();
+      await run({
+        page, ui, calls, keys, reviews, restores, dialog: page.getByRole('dialog'),
+        operation: ui.locator('[aria-label="Manager operation"]'),
+        restoreProgress: ui.locator('[aria-label="Database restore progress"]'),
+        stored: () => page.evaluate(() => JSON.stringify(localStorage)),
+        finishRestore: () => { restored = { ...restored, state: 'complete', step: 'native-restore-started', completed: ['native-restore-started'], updatedAt: Date.now() }; },
+        interruptRestore: () => { restored = { ...restored, state: 'interrupted' }; authorized = false; },
+        finishReview: () => { reviewReady = true; },
+        loseNext: () => { lost = true; },
+        finish: () => { current = { ...current, state: 'complete', completed: [current.kind], updatedAt: Date.now() }; },
+      });
+      assert.deepEqual(errors, []);
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'horizontal overflow');
+    } catch (error) {
+      error.message = `Manager UI scenario “${scenario}”: ${error.message}`;
+      throw error;
+    } finally { await context.close(); }
   }
-  throw Error(`Unexpected fixture command: ${command}`);
- });
- await context.addInitScript(()=>{
-  globalThis.isTauri=true;
-  globalThis.__TAURI_INTERNALS__={invoke:(command,args)=>globalThis.__managerInvoke(command,args),transformCallback:()=>1};
- });
- const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
- try{
-  await page.goto(origin,{waitUntil:'networkidle'});
-  const ui=page.getByRole('region',{name:'Server management'});
-  await ui.getByRole('heading',{name:'Server management'}).waitFor();
-  if(!['pair','pair-http','localhost','devicechanged'].includes(scenario))await ui.getByText('Example NAS',{exact:true}).waitFor();
-  await run({page,ui,calls,keys,reviews,restores,finishRestore:()=>{restored={...restored,state:'complete',step:'native-restore-started',completed:['native-restore-started'],updatedAt:Date.now()};},interruptRestore:()=>{restored={...restored,state:'interrupted'};authorized=false;},finishReview:()=>{reviewReady=true;},loseNext:()=>{lost=true;},finish:()=>{current={...current,state:'complete',completed:[current.kind],updatedAt:Date.now()};}});
-  assert.deepEqual(errors,[]);
-  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'horizontal overflow');
- }finally{await context.close();}
-}
-try{
- await new Promise((resolve,reject)=>{
-  let text='';const timer=setTimeout(()=>reject(Error('Vite startup timeout')),10000);
-  vite.stdout.on('data',chunk=>{text+=chunk;if(text.includes('Local:')){clearTimeout(timer);resolve();}});
-  vite.once('error',reject);vite.once('exit',code=>{if(code)reject(Error('Vite exited before ready'));});
- });
- browser=await chromium.launch({executablePath,headless:true,args:['--disable-gpu']});
- await mkdir(output,{recursive:true});
- await fixture('localhost',async({page,calls})=>{
-  await page.getByRole('radio',{name:/Run Frameleaf here/}).check();
-  const local=page.getByRole('region',{name:'Local library setup'});
-  const prepare=local.getByRole('button',{name:'Prepare local Manager'});
-  await prepare.waitFor();await prepare.click();
-  await local.getByRole('heading',{name:'Preparing local management…'}).waitFor();
-  assert.ok(await page.getByRole('radio',{name:/Connect to my server/}).isDisabled());
-  await local.getByRole('heading',{name:'Local Manager is ready'}).waitFor();
-  assert.ok(await page.getByRole('radio',{name:/Connect to my server/}).isDisabled());
-  await local.getByText('The photo server has not been started by this setup step.',{exact:false}).waitFor();
-  const authorize=local.getByRole('button',{name:'Authorize local management'});
-  const input=local.getByLabel('Local Manager password',{exact:true});
-  await input.fill(password);assert.ok(await authorize.isDisabled());
-  await local.getByLabel('Allow this computer to manage this local server.').check();
-  await local.getByLabel('Also allow backup recovery reviews and restore operations.').check();
-  assert.ok(await authorize.isEnabled());await authorize.click();
-  assert.equal(await input.inputValue(),'');
-  await local.getByText('Local management is authorized.',{exact:false}).waitFor();
-  await page.getByRole('region',{name:'Server management'}).getByText('My local library',{exact:true}).waitFor();
-  assert.equal(calls.filter(value=>value.command==='authorize_local_manager').length,1);
-  await local.getByText('Your Photos account is separate from your Manager password.',{exact:false}).waitFor();
-  await local.getByRole('button',{name:'Open local Photos',exact:true}).click();
-  assert.equal(calls.filter(value=>value.command==='open_local_photos').length,1);
-  await local.screenshot({path:join(output,'local-manager-authorized.png')});
-  const stop=local.getByRole('button',{name:'Stop local management'});
-  await stop.click();await local.getByRole('alert').waitFor();
-  assert.match(await local.getByRole('alert').innerText(),/Stop the photo server in Manager/);
-  assert.ok(await page.getByRole('radio',{name:/Connect to my server/}).isDisabled());
-  await local.screenshot({path:join(output,'local-host-stop-refused.png')});
-  await stop.click();await page.getByRole('radio',{name:/Connect to my server/}).waitFor();
-  assert.ok(await page.getByRole('radio',{name:/Connect to my server/}).isEnabled());
-  assert.equal(await local.getByRole('button',{name:'Open local Photos',exact:true}).count(),0);
-  assert.equal(calls.filter(value=>value.command==='prepare_local_host').length,1);
- });
- await fixture('devicechanged',async({ui,calls})=>{
-  await ui.getByRole('alert').waitFor();
-  assert.ok(await ui.getByRole('button',{name:'Start server',exact:true}).isDisabled());
-  assert.ok(await ui.getByRole('button',{name:'Authorize actions',exact:true}).isDisabled());
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);
-  await ui.getByRole('button',{name:'Revoke and disconnect',exact:true}).click();
-  await ui.getByRole('button',{name:'Pair with Manager',exact:true}).waitFor();
-  assert.equal(calls.filter(value=>value.command==='disconnect_manager').length,1);
-  assert.equal(calls.filter(value=>value.command==='reauthenticate_manager').length,0);
- });
- await fixture('pair',async({page,ui,calls})=>{
-  await ui.getByLabel('Manager address').fill(view.origin);
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);
-  const pair=ui.getByRole('button',{name:'Pair with Manager',exact:true});assert.ok(await pair.isDisabled());
-  await ui.getByLabel('Allow this computer to start, stop and restart this server, and create database backups.').check();
-  await ui.getByLabel('Also allow backup recovery reviews and restore operations.').check();
-  await ui.getByText('Use a certificate for a private Manager',{exact:true}).click();
-  await ui.getByLabel('Public certificate',{exact:true}).fill(wire.certificatePem);
-  assert.ok(await pair.isDisabled());
-  await ui.getByRole('button',{name:'Review certificate fingerprint'}).click();
-  await ui.getByText(wire.certificateSha256,{exact:true}).waitFor();
-  await ui.getByLabel('I verified this certificate fingerprint.').check();assert.ok(await pair.isEnabled());
-  await ui.getByLabel('Public certificate',{exact:true}).fill(wire.certificatePem+'\n');assert.ok(await pair.isDisabled());
-  await ui.getByRole('button',{name:'Review certificate fingerprint'}).click();
-  await ui.getByLabel('I verified this certificate fingerprint.').check();
-  await ui.screenshot({path:join(output,'manager-pair-certificate.png')});
-  await pair.click();await ui.getByText('Example NAS',{exact:true}).waitFor();
-  const request=calls.find(value=>value.command==='pair_manager');assert.equal(request.args.certificate.sha256,wire.certificateSha256);assert.equal(request.args.allowRecovery,true);
-  assert.ok(!(await page.textContent('body')).includes(password));
-  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(password));
- });
- for (const address of ['http://tower.local:2282','http:tower.local:2282','http:/tower.local:2282']) await fixture('pair-http',async({ui,calls})=>{
-  await ui.getByLabel('Manager address').fill(view.origin);
-  await ui.getByText('Use a certificate for a private Manager',{exact:true}).click();
-  await ui.getByLabel('Public certificate',{exact:true}).fill(wire.certificatePem);
-  await ui.getByLabel('Manager address').fill(address);
-  await ui.getByText('HTTP sends sign-in and management traffic without encryption. Use a trusted network.',{exact:true}).waitFor();
-  assert.equal(await ui.getByLabel('Public certificate',{exact:true}).count(),0);
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);
-  await ui.getByLabel('Allow this computer to start, stop and restart this server, and create database backups.').check();
-  await ui.getByRole('button',{name:'Pair with Manager',exact:true}).click();
-  await ui.getByText('Example NAS',{exact:true}).waitFor();
-  const request=calls.find(value=>value.command==='pair_manager');
-  assert.equal(request.args.origin,address);
-  assert.equal(request.args.certificate,null);
- });
- await fixture('lost',async({page,ui,calls,keys,finish,loseNext})=>{
-  await ui.getByRole('button',{name:'Start server',exact:true}).click();
-  await ui.getByRole('button',{name:'Retry existing request'}).waitFor();
-  const original=calls.find(value=>value.args?.command?.kind==='control').args.command.key;
-  await page.reload({waitUntil:'networkidle'});
-  await ui.getByRole('button',{name:'Retry existing request'}).click();
-  await ui.getByText('In progress',{exact:true}).waitFor();
-  const retried=calls.filter(value=>value.args?.command?.kind==='control');assert.equal(retried.length,2);assert.equal(retried[1].args.command.key,original);assert.equal(keys.size,1);
-  assert.ok(await ui.getByRole('button',{name:'Start server',exact:true}).isDisabled());
-  await ui.screenshot({path:join(output,'manager-operation.png')});
-  finish();await ui.getByRole('button',{name:'Check operation'}).click();await ui.getByText('Completed',{exact:true}).waitFor();
-  assert.ok(await ui.getByRole('button',{name:'Start server',exact:true}).isEnabled());
-  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(original));
-  loseNext();
-  await ui.getByRole('button',{name:'Stop server',exact:true}).click();
-  await ui.getByRole('button',{name:'Confirm stop'}).click();
-  await ui.getByRole('button',{name:'Retry existing request'}).waitFor();
-  await ui.getByText('Request outcome has not been confirmed',{exact:true}).waitFor();
-  assert.equal(await ui.getByText('Completed',{exact:true}).count(),0);
- });
- await fixture('reauth',async({page,ui,calls})=>{
-  await ui.getByRole('button',{name:'Stop server',exact:true}).click();
-  assert.equal(calls.filter(value=>value.args?.command?.kind==='control').length,0);
-  await ui.getByRole('button',{name:'Cancel',exact:true}).click();
-  await ui.getByRole('button',{name:'Stop server',exact:true}).click();await ui.getByRole('button',{name:'Confirm stop'}).click();
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);
-  await ui.getByRole('button',{name:'Authorize and continue'}).click();await ui.getByText('In progress',{exact:true}).waitFor();
-  const requests=calls.filter(value=>value.args?.command?.kind==='control');assert.equal(requests.length,2);assert.equal(requests[0].args.command.key,requests[1].args.command.key);
-  assert.ok(!(await page.textContent('body')).includes(password));
- });
- await fixture('resume',async({ui,calls,finish})=>{
-  await ui.getByText('Interrupted',{exact:true}).waitFor();await ui.getByRole('button',{name:'Resume operation'}).click();
-  await ui.getByText('In progress',{exact:true}).waitFor();assert.equal(calls.filter(value=>value.args?.command?.kind==='resume').length,1);
-  finish();await ui.getByRole('button',{name:'Check operation'}).click();await ui.getByText('Completed',{exact:true}).waitFor();
-  await ui.getByRole('button',{name:'Disconnect Manager',exact:true}).click();
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);await ui.getByRole('button',{name:'Revoke and disconnect'}).click();
-  await ui.getByRole('button',{name:'Pair with Manager',exact:true}).waitFor();assert.equal(calls.filter(value=>value.command==='disconnect_manager').length,1);
- });
- await fixture('readonly',async({ui})=>{
-  for(const name of ['Start server','Stop server','Restart server','Create database backup'])assert.ok(await ui.getByRole('button',{name,exact:true}).isDisabled());
-  await ui.screenshot({path:join(output,'manager-narrow-dark.png')});
- },{width:390,height:900},'dark');
- await fixture('paired',async({page,ui,calls})=>{
-  await page.evaluate(()=>{Storage.prototype.setItem=function(){throw new DOMException('synthetic storage failure','QuotaExceededError');};});
-  await ui.getByRole('button',{name:'Start server',exact:true}).click();
-  await ui.getByRole('alert').waitFor();assert.equal(calls.filter(value=>value.args?.command?.kind==='control').length,0);
- });
- await fixture('recovery',async({page,ui,calls,reviews,finishReview})=>{
-  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
-  await ui.getByRole('button',{name:'Review selected backup',exact:true}).click();
-  await ui.getByRole('button',{name:'Check backup review',exact:true}).waitFor();
-  const original=calls.find(value=>value.args?.command?.kind==='review-restore').args.command.key;
-  assert.ok((await page.evaluate(()=>JSON.stringify(localStorage))).includes(original));
-  await page.reload({waitUntil:'networkidle'});
-  await ui.getByRole('button',{name:'Check backup review',exact:true}).click();
-  await ui.getByText('Backup review is in progress. Check again when ready.',{exact:true}).waitFor();
-  const retries=calls.filter(value=>value.args?.command?.kind==='review-restore');assert.equal(retries.length,2);assert.equal(retries[1].args.command.key,original);assert.equal(reviews.size,1);
-  finishReview();await ui.getByRole('button',{name:'Check backup review',exact:true}).click();
-  await ui.getByText('Backup review is ready.',{exact:true}).waitFor();
-  await ui.getByRole('button',{name:'Restore this backup',exact:true}).waitFor();
-  assert.equal(calls.filter(value=>value.args?.command?.kind==='control').length,0);
-  await ui.screenshot({path:join(output,'manager-backup-review.png')});
-  await ui.getByRole('button',{name:'Choose another backup',exact:true}).click();
-  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(original));
- });
- await fixture('recovery-reauth',async({ui,calls})=>{
-  await ui.getByText('Interrupted',{exact:true}).waitFor();
-  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);
-  await ui.getByRole('button',{name:'Authorize and review',exact:true}).click();
-  await ui.getByRole('button',{name:'Review selected backup',exact:true}).waitFor();
-  assert.equal(calls.filter(value=>['resume','control'].includes(value.args?.command?.kind)).length,0);
- });
- await fixture('recovery-storage',async({page,ui,calls})=>{
-  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
-  await page.evaluate(()=>{Storage.prototype.setItem=function(){throw new DOMException('synthetic storage failure','QuotaExceededError');};});
-  await ui.getByRole('button',{name:'Review selected backup',exact:true}).click();
-  await ui.getByRole('alert').waitFor();
-  assert.equal(calls.filter(value=>value.args?.command?.kind==='review-restore').length,0);
- });
- async function reviewed(ui,finishReview){
-  await ui.getByRole('button',{name:'Load database backups',exact:true}).click();
-  await ui.getByRole('button',{name:'Review selected backup',exact:true}).click();
-  finishReview();await ui.getByRole('button',{name:'Check backup review',exact:true}).click();
-  await ui.getByRole('button',{name:'Restore this backup',exact:true}).click();
-  assert.equal(await ui.getByRole('button',{name:'Restore database',exact:true}).isDisabled(),true);
- }
- await fixture('recovery-restore',async({page,ui,calls,restores,finishReview,finishRestore})=>{
-  await reviewed(ui,finishReview);
-  assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,0);
-  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
-  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
-  await ui.getByRole('button',{name:'Check database restore',exact:true}).waitFor();
-  const first=calls.find(v=>v.args?.command?.kind==='restore').args.command;
-  assert.notEqual(first.key,first.reviewId);assert.equal(restores.size,1);
-  await page.reload({waitUntil:'networkidle'});
-  await ui.getByRole('button',{name:'Check database restore',exact:true}).click();
-  await ui.getByText('Database restore is running. Keep the computer and server connected.',{exact:true}).waitFor();
-  const requests=calls.filter(v=>v.args?.command?.kind==='restore');assert.equal(requests.length,2);assert.equal(requests[1].args.command.key,first.key);assert.equal(restores.size,1);
-  assert.equal(await ui.getByRole('button',{name:'Start server',exact:true}).isDisabled(),true);
-  finishRestore();await ui.getByRole('button',{name:'Check database restore',exact:true}).click();
-  await ui.getByText('Database restore completed. The server reported ready.',{exact:true}).waitFor();
-  await ui.screenshot({path:join(output,'manager-database-restore.png')});
-  await ui.getByRole('button',{name:'Finish restore',exact:true}).click();
-  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes(first.key));
-  assert.equal(calls.filter(v=>['control','resume'].includes(v.args?.command?.kind)).length,0);
- });
- await fixture('recovery-restore-resume',async({ui,calls,finishReview,interruptRestore})=>{
-  await reviewed(ui,finishReview);
-  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
-  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
-  interruptRestore();await ui.getByRole('button',{name:'Check database restore',exact:true}).click();
-  await ui.getByLabel('Manager password',{exact:true}).fill(password);
-  await ui.getByRole('button',{name:'Authorize database restore',exact:true}).click();
-  await ui.getByRole('button',{name:'Resume database restore',exact:true}).click();
-  await ui.getByText('Database restore is running. Keep the computer and server connected.',{exact:true}).waitFor();
-  assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,1);
-  assert.equal(calls.filter(v=>v.args?.command?.kind==='resume-restore').length,1);
-  assert.equal(calls.filter(v=>['control','resume'].includes(v.args?.command?.kind)).length,0);
- });
- await fixture('recovery-restore-storage',async({page,ui,calls,finishReview})=>{
-  await reviewed(ui,finishReview);
-  await page.evaluate(()=>{Storage.prototype.setItem=function(){throw new DOMException('synthetic storage failure','QuotaExceededError');};});
-  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
-  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
-  await ui.getByRole('alert').waitFor();assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,0);
- });
- await fixture('recovery-restore-expired',async({page,ui,calls,finishReview})=>{
-  await reviewed(ui,finishReview);
-  await ui.getByLabel('I understand and want to restore this database backup.',{exact:true}).check();
-  await ui.getByRole('button',{name:'Restore database',exact:true}).click();
-  await ui.getByText('The backup review expired before this restore was accepted. Review the backup again.',{exact:true}).waitFor();
-  assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes('frameleaf.manager-restore:'));
-  assert.equal(calls.filter(v=>v.args?.command?.kind==='restore').length,1);
- });
- process.stdout.write('Manager UI browser flows passed: pairing/certificate consent, lost reply+reload, recent auth+confirmation, resume+disconnect, readonly/narrow/dark, storage failure, backup review/reload/consent/isolated recent auth.\n');
-}finally{
- await browser?.close();if(vite.exitCode===null) vite.kill('SIGTERM');await ended;
-}
+  const button = (scope, name) => scope.getByRole('button', { name, exact: true });
+  const controls = scope => scope.filter(value => value.command === 'manager_request' && value.args.command.kind === 'control');
+  const requests = (calls, ...kinds) => calls.filter(value => value.command === 'manager_request' && kinds.includes(value.args.command.kind));
+
+  // A changed device key blocks every action and offers only removing the pairing.
+  await fixture('devicechanged', async ({ page, ui, dialog, calls }) => {
+    await dialog.getByRole('heading', { name: 'Disconnect Manager?' }).waitFor();
+    assert.equal(await ui.getByRole('alert').innerText().then(text => text.includes(managerError('manager_device_changed'))), true);
+    for (const name of ['Start', 'Stop', 'Restart', 'Back up', 'Authorize…']) assert.ok(await button(ui, name).isDisabled(), name);
+    await dialog.getByLabel('Manager password', { exact: true }).fill(password);
+    await button(dialog, 'Remove Pairing').click();
+    await button(page.getByRole('region', { name: 'Server management' }), 'Pair with Manager').waitFor();
+    assert.equal(calls.filter(value => value.command === 'disconnect_manager').length, 1);
+    assert.equal(calls.filter(value => value.command === 'reauthenticate_manager').length, 0);
+  });
+
+  // HTTPS with a private certificate: pairing waits for the fingerprint of exactly the pasted certificate.
+  await fixture('pair', async ({ page, ui, calls, stored }) => {
+    await ui.getByLabel('Manager address').fill(view.origin);
+    await ui.getByLabel('Manager password', { exact: true }).fill(password);
+    const pair = button(ui, 'Pair with Manager'); assert.ok(await pair.isDisabled());
+    await ui.getByLabel(allowControl).check();
+    await ui.getByLabel(allowRecovery).check();
+    await ui.getByLabel('Use a certificate for a private Manager').check();
+    await ui.getByLabel('Public certificate', { exact: true }).fill(wire.certificatePem);
+    assert.ok(await pair.isDisabled());
+    await button(ui, 'Review certificate fingerprint').click();
+    await ui.getByText(wire.certificateSha256, { exact: true }).waitFor();
+    await ui.getByLabel('I verified this certificate fingerprint.').check(); assert.ok(await pair.isEnabled());
+    await ui.getByLabel('Public certificate', { exact: true }).fill(wire.certificatePem + '\n'); assert.ok(await pair.isDisabled());
+    await button(ui, 'Review certificate fingerprint').click();
+    await ui.getByLabel('I verified this certificate fingerprint.').check();
+    await shot(ui, 'manager-pair-certificate.png');
+    await pair.click();
+    const paired = page.getByRole('region', { name: 'Example NAS' });
+    await paired.getByText('Manager access', { exact: true }).waitFor();
+    const request = calls.find(value => value.command === 'pair_manager');
+    assert.equal(request.args.certificate.sha256, wire.certificateSha256); assert.equal(request.args.allowRecovery, true);
+    assert.ok(!(await page.textContent('body')).includes(password));
+    assert.ok(!(await stored()).includes(password));
+  });
+
+  // Plain HTTP pairs with a Manager on this computer or the home network, without a certificate step.
+  for (const address of ['http://tower.local:2282', 'http://192.168.1.10:2282', 'http://nas:2282', 'http://127.0.0.1:2282']) await fixture('pair-http', async ({ page, ui, calls }) => {
+    await ui.getByLabel('Manager address').fill(view.origin);
+    await ui.getByLabel('Use a certificate for a private Manager').check();
+    await ui.getByLabel('Public certificate', { exact: true }).fill(wire.certificatePem);
+    await ui.getByLabel('Manager address').fill(address);
+    await ui.getByText(httpHint).waitFor();
+    assert.equal(await ui.getByLabel('Public certificate', { exact: true }).count(), 0);
+    await ui.getByLabel('Manager password', { exact: true }).fill(password);
+    const pair = button(ui, 'Pair with Manager'); assert.ok(await pair.isDisabled());
+    await ui.getByLabel(allowControl).check();
+    assert.ok(await pair.isEnabled(), `${address} must be allowed to pair over HTTP`);
+    await pair.click();
+    await page.getByRole('region', { name: 'Example NAS' }).getByText('HTTP · unencrypted', { exact: true }).waitFor();
+    const request = calls.find(value => value.command === 'pair_manager');
+    assert.equal(request.args.origin, address);
+    assert.equal(request.args.certificate, null);
+  });
+
+  // Plain HTTP to a public host: the backend refuses it and the form says to use HTTPS.
+  await fixture('pair-public-http', async ({ page, ui, calls }) => {
+    await ui.getByLabel('Manager address').fill(publicHttp);
+    await ui.getByText(httpHint).waitFor();
+    await ui.getByLabel('Manager password', { exact: true }).fill(password);
+    await ui.getByLabel(allowControl).check();
+    await button(ui, 'Pair with Manager').click();
+    const alert = ui.getByRole('alert');
+    await alert.waitFor();
+    assert.ok((await alert.innerText()).includes(managerError('manager_https_required')));
+    assert.match(managerError('manager_https_required'), /HTTPS/);
+    await button(ui, 'Pair with Manager').waitFor();
+    assert.equal(await page.getByRole('region', { name: 'Example NAS' }).count(), 0);
+    assert.equal(calls.filter(value => value.command === 'pair_manager').length, 1);
+    assert.equal(await ui.getByLabel('Manager password', { exact: true }).inputValue(), '');
+    assert.ok(!(await page.textContent('body')).includes(password));
+  });
+
+  // A lost reply keeps the request and retries it with its original key, across a reload.
+  await fixture('lost', async ({ page, ui, dialog, operation, calls, keys, finish, loseNext, stored }) => {
+    await button(ui, 'Start').click();
+    await button(operation, 'Retry').waitFor();
+    const original = controls(calls)[0].args.command.key;
+    await page.reload({ waitUntil: 'networkidle' });
+    await button(operation, 'Retry').click();
+    await operation.getByRole('status').getByText('In progress', { exact: true }).waitFor();
+    const retried = controls(calls); assert.equal(retried.length, 2); assert.equal(retried[1].args.command.key, original); assert.equal(keys.size, 1);
+    assert.ok(await button(ui, 'Start').isDisabled());
+    await shot(ui, 'manager-operation.png');
+    finish(); await button(operation, 'Check').click();
+    await operation.getByRole('status').getByText('Completed', { exact: true }).waitFor();
+    assert.ok(await button(ui, 'Start').isEnabled());
+    assert.ok(!(await stored()).includes(original));
+    loseNext();
+    await button(ui, 'Stop').click();
+    await button(dialog, 'Stop Server').click();
+    await button(operation, 'Retry').waitFor();
+    await operation.getByText('Request outcome has not been confirmed', { exact: true }).waitFor();
+    assert.equal(await operation.getByText('Completed', { exact: true }).count(), 0);
+  });
+
+  // Stop asks for confirmation first; a Manager that wants a recent sign-in gets the same request again.
+  await fixture('reauth', async ({ page, ui, dialog, operation, calls }) => {
+    await button(ui, 'Stop').click();
+    await dialog.getByRole('heading', { name: 'Stop “Example NAS”?' }).waitFor();
+    assert.equal(controls(calls).length, 0);
+    await button(dialog, 'Cancel').click();
+    await dialog.waitFor({ state: 'hidden' });
+    assert.equal(controls(calls).length, 0);
+    await button(ui, 'Stop').click(); await button(dialog, 'Stop Server').click();
+    await dialog.getByRole('heading', { name: 'Authorize Manager actions' }).waitFor();
+    await dialog.getByLabel('Manager password', { exact: true }).fill(password);
+    await button(dialog, 'Authorize and Continue').click();
+    await operation.getByRole('status').getByText('In progress', { exact: true }).waitFor();
+    const sent = controls(calls); assert.equal(sent.length, 2); assert.equal(sent[0].args.command.key, sent[1].args.command.key);
+    assert.equal(sent[0].args.command.action, 'stop');
+    assert.ok(!(await page.textContent('body')).includes(password));
+  });
+
+  // An interrupted operation resumes; disconnecting revokes the pairing and returns to the pairing form.
+  await fixture('resume', async ({ page, ui, dialog, operation, calls, finish }) => {
+    await operation.getByRole('status').getByText('Interrupted', { exact: true }).waitFor();
+    await button(operation, 'Resume').click();
+    await operation.getByRole('status').getByText('In progress', { exact: true }).waitFor();
+    assert.equal(requests(calls, 'resume').length, 1);
+    finish(); await button(operation, 'Check').click();
+    await operation.getByRole('status').getByText('Completed', { exact: true }).waitFor();
+    await button(ui, 'Disconnect…').click();
+    await dialog.getByLabel('Manager password', { exact: true }).fill(password);
+    await button(dialog, 'Remove Pairing').click();
+    await button(page.getByRole('region', { name: 'Server management' }), 'Pair with Manager').waitFor();
+    assert.equal(calls.filter(value => value.command === 'disconnect_manager').length, 1);
+  });
+
+  // Status-only access disables every action, at the smallest window size and in dark mode.
+  await fixture('readonly', async ({ ui }) => {
+    for (const name of ['Start', 'Stop', 'Restart', 'Back up']) assert.ok(await button(ui, name).isDisabled(), name);
+    await ui.getByText('Status only', { exact: true }).waitFor();
+    await shot(ui, 'manager-narrow-dark.png');
+  }, { width: 900, height: 640 }, 'dark');
+
+  // Nothing is sent when the request receipt cannot be saved first.
+  await fixture('paired', async ({ page, ui, calls }) => {
+    await page.evaluate(() => { Storage.prototype.setItem = function () { throw new DOMException('synthetic storage failure', 'QuotaExceededError'); }; });
+    await button(ui, 'Start').click();
+    assert.ok((await ui.getByRole('alert').innerText()).includes(managerError('manager_local_state_unavailable')));
+    assert.equal(controls(calls).length, 0);
+  });
+
+  const reviewsTable = ui => ui.locator('[aria-label="Database backup reviews"]');
+  // A backup review keeps its request key across a lost reply and a reload, and can be abandoned.
+  await fixture('recovery', async ({ page, ui, calls, reviews, finishReview, stored }) => {
+    const table = reviewsTable(ui);
+    await button(ui, 'Load backups').click();
+    await button(table, 'Review').click();
+    await button(table, 'Check review').waitFor();
+    const original = requests(calls, 'review-restore')[0].args.command.key;
+    assert.ok((await stored()).includes(original));
+    await page.reload({ waitUntil: 'networkidle' });
+    await button(table, 'Check review').click();
+    await table.getByText('Backup review is in progress. Check again when ready.', { exact: true }).waitFor();
+    const retries = requests(calls, 'review-restore'); assert.equal(retries.length, 2); assert.equal(retries[1].args.command.key, original); assert.equal(reviews.size, 1);
+    finishReview(); await button(table, 'Check review').click();
+    await table.getByText(/^Database backup verified\./).waitFor();
+    assert.equal(controls(calls).length, 0);
+    await shot(ui, 'manager-backup-review.png');
+    await button(table, 'Choose another backup').click();
+    await table.getByText('Review of backup', { exact: false }).waitFor({ state: 'detached' });
+    assert.ok(!(await stored()).includes(original));
+  });
+
+  // Authorizing to load backups never resumes or repeats the interrupted server operation.
+  await fixture('recovery-reauth', async ({ ui, dialog, operation, calls }) => {
+    await operation.getByRole('status').getByText('Interrupted', { exact: true }).waitFor();
+    await button(ui, 'Load backups').click();
+    await dialog.getByLabel('Manager password', { exact: true }).fill(password);
+    await button(dialog, 'Authorize and Review').click();
+    await button(reviewsTable(ui), 'Review').waitFor();
+    assert.equal(requests(calls, 'resume', 'control').length, 0);
+  });
+
+  await fixture('recovery-storage', async ({ page, ui, calls }) => {
+    await button(ui, 'Load backups').click();
+    await button(reviewsTable(ui), 'Review').waitFor();
+    await page.evaluate(() => { Storage.prototype.setItem = function () { throw new DOMException('synthetic storage failure', 'QuotaExceededError'); }; });
+    await button(reviewsTable(ui), 'Review').click();
+    await ui.getByRole('alert').waitFor();
+    assert.equal(requests(calls, 'review-restore').length, 0);
+  });
+
+  /** Loads backups, reviews the first and opens the restore confirmation, which starts unconfirmed. */
+  async function reviewed({ ui, dialog, finishReview }) {
+    const table = reviewsTable(ui);
+    await button(ui, 'Load backups').click();
+    await button(table, 'Review').click();
+    await button(table, 'Check review').waitFor();
+    finishReview(); await button(table, 'Check review').click();
+    await button(table, 'Restore database…').click();
+    await dialog.getByRole('heading', { name: 'Restore the database for “Example NAS”?' }).waitFor();
+    assert.equal(await button(dialog, 'Restore Database').isDisabled(), true);
+  }
+  const running = 'Database restore is running. Keep the computer and server connected.';
+
+  // A confirmed restore keeps its own request key across a lost reply and a reload until it is finished.
+  await fixture('recovery-restore', async (state) => {
+    const { page, ui, dialog, restoreProgress, calls, restores, finishRestore, stored } = state;
+    await reviewed(state);
+    assert.equal(requests(calls, 'restore').length, 0);
+    await dialog.getByLabel(understandRestore, { exact: true }).check();
+    await button(dialog, 'Restore Database').click();
+    await button(restoreProgress, 'Check').waitFor();
+    const first = requests(calls, 'restore')[0].args.command;
+    assert.notEqual(first.key, first.reviewId); assert.equal(restores.size, 1);
+    await page.reload({ waitUntil: 'networkidle' });
+    await button(restoreProgress, 'Check').click();
+    await restoreProgress.getByText(running, { exact: false }).waitFor();
+    const sent = requests(calls, 'restore'); assert.equal(sent.length, 2); assert.equal(sent[1].args.command.key, first.key); assert.equal(restores.size, 1);
+    assert.equal(await button(ui, 'Start').isDisabled(), true);
+    finishRestore(); await button(restoreProgress, 'Check').click();
+    await restoreProgress.getByText('Manager verified the database and started the server. Check original photos and videos separately.', { exact: true }).waitFor();
+    await shot(ui, 'manager-database-restore.png');
+    await button(restoreProgress, 'Done with database restore').click();
+    await restoreProgress.waitFor({ state: 'detached' });
+    assert.ok(!(await stored()).includes(first.key));
+    assert.equal(requests(calls, 'control', 'resume').length, 0);
+  });
+
+  // An interrupted restore asks for the Manager password again and resumes the same restore.
+  await fixture('recovery-restore-resume', async (state) => {
+    const { dialog, restoreProgress, calls, interruptRestore } = state;
+    await reviewed(state);
+    await dialog.getByLabel(understandRestore, { exact: true }).check();
+    await button(dialog, 'Restore Database').click();
+    await button(restoreProgress, 'Check').waitFor();
+    interruptRestore(); await button(restoreProgress, 'Check').click();
+    await dialog.getByLabel('Manager password', { exact: true }).fill(password);
+    await button(dialog, 'Authorize Restore').click();
+    await button(restoreProgress, 'Resume').click();
+    await restoreProgress.getByText(running, { exact: false }).waitFor();
+    assert.equal(requests(calls, 'restore').length, 1);
+    assert.equal(requests(calls, 'resume-restore').length, 1);
+    assert.equal(requests(calls, 'control', 'resume').length, 0);
+  });
+
+  await fixture('recovery-restore-storage', async (state) => {
+    const { page, ui, dialog, calls } = state;
+    await reviewed(state);
+    await page.evaluate(() => { Storage.prototype.setItem = function () { throw new DOMException('synthetic storage failure', 'QuotaExceededError'); }; });
+    await dialog.getByLabel(understandRestore, { exact: true }).check();
+    await button(dialog, 'Restore Database').click();
+    await ui.getByRole('alert').waitFor({ state: 'attached' });
+    assert.equal(requests(calls, 'restore').length, 0);
+  });
+
+  // A review that expired before Manager accepted the restore leaves no pending restore behind.
+  await fixture('recovery-restore-expired', async (state) => {
+    const { ui, dialog, calls, stored } = state;
+    await reviewed(state);
+    await dialog.getByLabel(understandRestore, { exact: true }).check();
+    await button(dialog, 'Restore Database').click();
+    await ui.getByText(managerError('native_restore_review_expired'), { exact: true }).waitFor({ state: 'attached' });
+    assert.ok(!(await stored()).includes('frameleaf.manager-restore:'));
+    assert.equal(requests(calls, 'restore').length, 1);
+  });
+
+  process.stdout.write('Manager UI browser flows passed: device change, certificate and home-network HTTP pairing, public HTTP refusal, lost reply and reload, recent sign-in, resume and disconnect, status-only access, storage failure, backup review and database restore.\n');
+});

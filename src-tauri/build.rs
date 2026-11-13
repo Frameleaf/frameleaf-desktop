@@ -4,8 +4,13 @@ fn main() {
         println!("cargo:rerun-if-changed=src/macos_keychain.m");
         println!("cargo:rerun-if-changed=src/macos_keychain.h");
         println!("cargo:rerun-if-changed=src/finder_import.m");
+        println!("cargo:rerun-if-changed=src/macos_quit.m");
         cc::Build::new()
-            .files(["src/macos_keychain.m", "src/finder_import.m"])
+            .files([
+                "src/macos_keychain.m",
+                "src/finder_import.m",
+                "src/macos_quit.m",
+            ])
             .flag("-fobjc-arc")
             .compile("frameleaf_keychain");
         println!("cargo:rustc-link-lib=framework=LocalAuthentication");
@@ -24,13 +29,18 @@ fn main() {
             "local_host_status",
             "prepare_local_host",
             "provision_local_host_profile",
+            "local_host_carry_status",
+            "carry_local_host_library",
+            "confirm_local_host_carry",
             "cancel_local_host_start",
             "stop_local_host_manager",
+            "quit_local_host",
             "connect_server",
             "approved_libraries",
             "add_approved_library",
             "activate_approved_library",
             "remove_approved_library",
+            "connect_server_step",
             "restore_connection",
             "sign_out",
             "open_photos",
@@ -43,6 +53,11 @@ fn main() {
             "offline_album_cancel",
             "offline_album_browse_library",
             "worker_setup_status",
+            "accelerated_pack_status",
+            "download_accelerated_pack",
+            "decline_accelerated_pack",
+            "cancel_accelerated_pack_download",
+            "retry_accelerated_provider",
             "prepare_models",
             "control_worker",
             "discover_camera_folders",
@@ -81,6 +96,8 @@ fn main() {
             "remote_status",
             "update_remote",
             "test_remote_access",
+            "server_step_up",
+            "saved_sign_in_verification",
             "open_external",
             "tray_refresh",
             "cloud_sign_in",
@@ -93,6 +110,7 @@ fn main() {
             "cloud_email_start",
             "cloud_email_complete",
             "connect_cloud_server",
+            "connect_cloud_server_step",
         ]),
     ))
     .expect("build desktop ACL");

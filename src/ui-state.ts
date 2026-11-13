@@ -261,8 +261,8 @@ export function signInMethods(options: Pick<SignInOptions, 'frameleafSignIn' | '
 
 /** How one signs in to a server found on this network, as the Welcome list says it. */
 export function nearbySignIn(server: Pick<DiscoveredServer, 'linked' | 'setup'>): string {
-  if (server.linked) return 'Frameleaf or its own login';
-  return server.setup === 'needed' ? 'New server' : 'Its own login';
+  if (server.linked) return 'Frameleaf or its own sign-in';
+  return server.setup === 'needed' ? 'New server' : 'Its own sign-in';
 }
 
 // Region codes Intl names that are not places a person lives (the EU, the UN, "Unknown Region", pseudo-locales).
@@ -284,3 +284,74 @@ export function countryOptions(locale: string): { code: string; name: string }[]
 export function defaultCountry(locale: string): string {
   try { return new Intl.Locale(locale).maximize().region ?? 'US'; } catch { return 'US'; }
 }
+
+/** Progress of the whole import when its folder is copied in several batches (`photo-import`'s `overall`). */
+export type OverallProgress = { total: number; completed: number; totalBytes: number; completedBytes: number };
+export type ImportProgress = { completed: number; total: number; bytes: { completed: number; total: number } | null };
+
+/**
+ * What an import's progress bar and counts show. A folder over one batch (10,000 files) reports
+ * the whole import in `overall`: its files and bytes across every batch, so the bar does not start
+ * again with each batch. Any other import shows its one batch.
+ */
+export function importProgress(job: { completed: number; total: number; overall?: OverallProgress | null }): ImportProgress {
+  const overall = job.overall;
+  if (!overall || !(overall.total > 0)) return { completed: job.completed, total: job.total, bytes: null };
+  const total = Math.max(overall.total, overall.completed);
+  const totalBytes = Math.max(overall.totalBytes, overall.completedBytes);
+  return { completed: overall.completed, total, bytes: totalBytes > 0 ? { completed: overall.completedBytes, total: totalBytes } : null };
+}
+
+/** "12,000 of 25,001 copies confirmed", with the bytes done of the total when the import has several batches. */
+export function importProgressText(job: { completed: number; total: number; overall?: OverallProgress | null }): string {
+  const progress = importProgress(job);
+  const files = `${progress.completed.toLocaleString()} of ${progress.total.toLocaleString()} copies confirmed`;
+  return progress.bytes ? `${files} · ${formatBytes(progress.bytes.completed)} of ${formatBytes(progress.bytes.total)}` : files;
+}
+
+// ---- where a chosen folder's files are (photo sources) ---------------------------------------------
+/** The backend's snapshot of a chosen folder, from file metadata: how many files are where. */
+export type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
+/**
+ * That snapshot in plain words, leaving out whatever there is none of; empty when there is nothing to say.
+ * The counts come from file metadata, not from reading the files, so the wording stays cautious.
+ */
+export function availabilityText(value: Availability): string {
+  const files = (count: number, one: string, many: string) => `${count.toLocaleString()} ${count === 1 ? one : many}`;
+  const parts = [
+    value.available > 0 && `${files(value.available, 'file is', 'files are')} on this computer`,
+    value.needsDownload > 0 && `${files(value.needsDownload, 'file is stored online and needs', 'files are stored online and need')} downloading first${value.downloadBytes > 0 ? ` (${formatBytes(value.downloadBytes)})` : ''}`,
+    value.notReady > 0 && `${files(value.notReady, 'file', 'files')} can’t be opened until your cloud storage app finishes syncing`,
+    value.unknown > 0 && `${files(value.unknown, 'file', 'files')} could not be checked and may also need downloading`,
+    value.pinned > 0 && `${files(value.pinned, 'file is', 'files are')} set to always stay on this computer`,
+  ].filter((part): part is string => !!part);
+  return parts.length ? `${parts.join('. ')}. This can change before a copy starts.` : '';
+}
+
+// ---- cloud backup (Frameleaf Cloud page) -----------------------------------------------------------
+/**
+ * How the last cloud backup ended, in words. The server's status and error are tokens
+ * (`waiting-for-key`, an error code): a status this app does not know reads "Not finished", and an
+ * error is shown only when `explain` has words for it.
+ */
+export function backupRunText(run: { status: string; error?: string | null }, explain: (code: string) => string | null): string {
+  switch (run.status) {
+    case 'completed': return 'Done';
+    case 'failed': { const reason = run.error ? explain(run.error) : null; return reason ? `Failed · ${reason}` : 'Failed'; }
+    case 'waiting-for-key': return 'Waiting for your backup key';
+    case 'cancelled': case 'canceled': return 'Cancelled';
+    default: return 'Not finished';
+  }
+}
+/** Where the key that encrypts cloud backups is kept, or '' for a mode this app does not know. */
+export function backupKeyText(keyMode: string | null | undefined): string {
+  switch (keyMode) {
+    case 'server': return 'backup key kept on your server';
+    case 'own-stored': return 'your own backup key, saved on your server';
+    case 'own-memory': return 'your own backup key, entered again after each server restart';
+    default: return '';
+  }
+}
+
+/** Find OneDrive Folders looks where OneDrive keeps its folders on Windows and macOS. Linux has no such place. */
+export function oneDriveDiscovery(platform: Platform): boolean { return platform !== 'linux'; }

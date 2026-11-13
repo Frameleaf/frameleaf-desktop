@@ -137,7 +137,8 @@ pub(crate) async fn server_sign_in_options(
     server: String,
 ) -> Result<SignInOptions, String> {
     crate::require_local(&window)?;
-    let base = normalize_server(&server)?;
+    // The one place an address is typed: every later step is given the origin this returns.
+    let base = crate::connection::typed_server(&server)?;
     let client = transport::client()?;
     let ping: Ping = get(&client, &base, "api/server/ping")
         .await
@@ -266,27 +267,7 @@ pub(crate) async fn server_oauth_sign_in(
 
     let callback = provider_window(&app, &base, page).await?;
     oauth_outcome(&callback, &oauth_state)?;
-    let response = client
-        .post(
-            base.join("api/oauth/callback")
-                .map_err(|_| "server_address_invalid")?,
-        )
-        .json(&serde_json::json!({
-            "url": callback.as_str(),
-            "state": oauth_state,
-            "codeVerifier": verifier.as_str(),
-            "rememberMe": true,
-        }))
-        .send()
-        .await
-        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    if matches!(
-        response.status(),
-        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
-    ) {
-        return Err("server_oauth_failed".into());
-    }
-    let login: crate::LoginResponse = transport::json(response).await?;
+    let login = oauth_session(&client, &base, &callback, &oauth_state, &verifier).await?;
 
     let mut current = state.0.lock().await;
     ready(&current)?;
@@ -306,6 +287,40 @@ pub(crate) async fn server_oauth_sign_in(
     drop(current);
     crate::tray::refresh(&app).await;
     Ok(view)
+}
+
+/// Hands the provider's callback to the server for a session. The session is declared as one
+/// that can answer `verification_required`, like the Password sign-in; a server older than
+/// unified sign-in ignores that and answers as it always did.
+async fn oauth_session(
+    client: &reqwest::Client,
+    base: &Url,
+    callback: &Url,
+    state: &str,
+    verifier: &str,
+) -> Result<crate::LoginResponse, String> {
+    let response = client
+        .post(
+            base.join("api/oauth/callback")
+                .map_err(|_| "server_address_invalid")?,
+        )
+        .json(&serde_json::json!({
+            "url": callback.as_str(),
+            "state": state,
+            "codeVerifier": verifier,
+            "rememberMe": true,
+            "capabilities": crate::server_steps::CAPABILITIES,
+        }))
+        .send()
+        .await
+        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
+    ) {
+        return Err("server_oauth_failed".into());
+    }
+    transport::json(response).await
 }
 
 const PROVIDER_WINDOW: &str = "server-sign-in";
@@ -469,5 +484,50 @@ mod tests {
         assert!(!ok("http://auth.example.com/authorize"));
         assert!(!ok("https://user:pw@auth.example.com/"));
         assert!(!ok("javascript:alert(1)"));
+    }
+}
+
+#[cfg(test)]
+mod oauth_session_tests {
+    use super::*;
+    use crate::server_steps::fixture::{client, server};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn the_callback_declares_the_capability_and_any_server_signs_in() {
+        // The fixture is a plain-http server on this computer; an older server ignores the field.
+        let (base, seen) = server(|request| match request.path.as_str() {
+            "/api/oauth/callback" => (
+                200,
+                json!({"accessToken": "session", "userId": "user", "name": "Ada"}),
+            ),
+            _ => (404, json!({})),
+        });
+        let callback = base.join("auth/login?code=c0de&state=st").unwrap();
+        let login = oauth_session(&client(), &base, &callback, "st", "verifier")
+            .await
+            .unwrap();
+        assert_eq!(login.access_token, "session");
+        assert_eq!(
+            seen.lock().unwrap()[0].body,
+            json!({
+                "url": callback.as_str(), "state": "st", "codeVerifier": "verifier",
+                "rememberMe": true, "capabilities": ["verification"],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_callback_is_a_failed_sign_in() {
+        for (status, expected) in [
+            (400, "server_oauth_failed"),
+            (401, "server_oauth_failed"),
+            (500, "server_http_500"),
+        ] {
+            let (base, _) = server(move |_| (status, json!({"message": "private"})));
+            let callback = base.join("auth/login?code=c0de&state=st").unwrap();
+            let refused = oauth_session(&client(), &base, &callback, "st", "verifier").await;
+            assert_eq!(refused.err().unwrap(), expected);
+        }
     }
 }

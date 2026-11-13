@@ -461,6 +461,8 @@ struct Connection {
     base: Url,
     worker: SavedWorker,
     identity: DeviceIdentity,
+    /// Durable sequence and token checkpoints; tests keep them out of the OS credential store.
+    checkpoint: fn(&SavedWorker, &SavedWorker) -> Result<(), String>,
 }
 impl Connection {
     async fn ensure_current(&mut self) -> Result<(), String> {
@@ -473,9 +475,9 @@ impl Connection {
         let response = self
             .request(Method::POST, "api/desktop/worker/session", "renew", "{}")
             .await?;
-        let session: SessionResponse = transport::json(response).await?;
+        let session: SessionResponse = worker_json(response, 65_536).await?;
         let worker = renewed_worker(&self.worker, &session, now()?)?;
-        credentials::save_worker_checkpoint(&self.worker, &worker)?;
+        (self.checkpoint)(&self.worker, &worker)?;
         self.worker = worker;
         Ok(())
     }
@@ -487,12 +489,13 @@ impl Connection {
         payload: &str,
     ) -> Result<Response, String> {
         let expected = self.worker.clone();
+        let checkpoint = self.checkpoint;
         let proof = reserve_proof(
             &mut self.worker,
             &self.identity,
             operation,
             payload,
-            |value| credentials::save_worker_checkpoint(&expected, value),
+            |value| checkpoint(&expected, value),
         )?;
         let header =
             STANDARD.encode(serde_json::to_vec(&proof).map_err(|_| "worker_proof_invalid")?);
@@ -564,28 +567,53 @@ fn scopes_only_explicit_model_refusals_to_one_workload() {
         assert!(qualification_refusal(status, message).is_none());
     }
 }
-async fn qualification_json<T: serde::de::DeserializeOwned>(
-    mut response: Response,
+/// Refusals the worker loop acts on by name. A 401 here is about the worker session or one lease,
+/// never the device: only issuing a new session can show that the device itself is refused.
+fn worker_refusal(status: u16, message: &str) -> String {
+    match (status, message) {
+        (401, "desktop_worker_credential_invalid") => "worker_session_rejected".into(),
+        (401, "desktop_lease_invalid") => "worker_lease_refused".into(),
+        (403, "desktop_pool_policy_required") => "worker_policy_required".into(),
+        (403, "desktop_worker_lan_required") => "worker_lan_required".into(),
+        (409, "desktop_pool_policy_changed") => "worker_policy_changed".into(),
+        _ => format!("server_http_{status}"),
+    }
+}
+/// The status and named reason of a refused request. Anything but a small JSON error (a proxy's
+/// page, a cut connection) has no name and stays an opaque `server_http_*`.
+async fn refused(mut response: Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len() + chunk.len() > 4096 {
+            return (status, String::new());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    (status, message)
+}
+async fn worker_json<T: serde::de::DeserializeOwned>(
+    response: Response,
     limit: usize,
 ) -> Result<T, String> {
-    if response.status().as_u16() == 409 {
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "server_response_interrupted")?
-        {
-            if bytes.len() + chunk.len() > 4096 {
-                return Err("server_response_too_large".into());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| "server_response_invalid")?;
-        return Err(
-            qualification_refusal(409, value["message"].as_str().unwrap_or(""))
-                .unwrap_or("server_http_409".into()),
-        );
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        return Err(worker_refusal(status, &message));
+    }
+    transport::json_limit(response, limit).await
+}
+async fn qualification_json<T: serde::de::DeserializeOwned>(
+    response: Response,
+    limit: usize,
+) -> Result<T, String> {
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        return Err(qualification_refusal(status, &message)
+            .unwrap_or_else(|| worker_refusal(status, &message)));
     }
     transport::json_limit(response, limit).await
 }
@@ -640,7 +668,7 @@ impl WorkerTransport {
                 &payload,
             )
             .await?;
-        transport::json_limit(response, 65_536).await
+        worker_json(response, 65_536).await
     }
     pub(crate) async fn maintain_session(&self) -> Result<(), String> {
         self.0.lock().await.ensure_current().await
@@ -661,6 +689,7 @@ impl WorkerTransport {
             base: normalize_server(&saved.server)?,
             worker,
             identity,
+            checkpoint: credentials::save_worker_checkpoint,
         })))
     }
     pub async fn request_qualification(
@@ -708,7 +737,7 @@ impl WorkerTransport {
                 "",
             )
             .await?;
-        let value: serde_json::Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
+        let value: serde_json::Value = worker_json(response, 4 * 1024 * 1024).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
         let challenge =
             QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)?;
@@ -787,7 +816,7 @@ impl WorkerTransport {
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
             .await?;
-        let claim: ClaimResponse = transport::json_limit(response, 256 * 1024).await?;
+        let claim: ClaimResponse = worker_json(response, 256 * 1024).await?;
         claim
             .task
             .map(|task| {
@@ -819,7 +848,8 @@ impl WorkerTransport {
             )
             .await?;
         if !response.status().is_success() {
-            return Err(format!("server_http_{}", response.status().as_u16()));
+            let (status, message) = refused(response).await;
+            return Err(worker_refusal(status, &message));
         }
         if response
             .content_length()
@@ -862,7 +892,7 @@ impl WorkerTransport {
         let response = connection
             .request(Method::POST, path, operation, &payload)
             .await?;
-        transport::json::<Ack>(response).await
+        worker_json::<Ack>(response, 65_536).await
     }
     pub async fn heartbeat(
         &self,
@@ -894,6 +924,10 @@ impl WorkerTransport {
     ) -> Result<bool, String> {
         if !result.is_object() {
             return Err("worker_result_invalid".into());
+        }
+        // A result is only for a lease still held: the last expiry the server granted must be ahead.
+        if millis(&task.expires_at)? <= now()? {
+            return Err("worker_lease_expired".into());
         }
         self.acknowledge(
             task,
@@ -929,7 +963,7 @@ impl WorkerTransport {
         let response = connection
             .request(Method::DELETE, "api/desktop/worker/session", "revoke", "")
             .await?;
-        Ok(transport::json::<Ack>(response).await?.accepted)
+        Ok(worker_json::<Ack>(response, 65_536).await?.accepted)
     }
 }
 
@@ -1035,3 +1069,6 @@ mod renewal_tests {
 
 #[cfg(test)]
 pub(crate) mod native_nas_tests;
+
+#[cfg(test)]
+pub(crate) mod household_tests;

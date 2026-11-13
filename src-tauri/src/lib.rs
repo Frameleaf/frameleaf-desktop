@@ -1,3 +1,4 @@
+mod accelerated_pack;
 mod camera_identity;
 mod camera_sources;
 pub mod cloud_account;
@@ -5,10 +6,13 @@ pub mod connection;
 pub mod copy_source;
 pub mod copy_upload;
 mod credential_lock;
+#[cfg(any(not(target_os = "macos"), test))]
+mod credential_parts;
 mod credentials;
 mod discovery;
 mod drop_import;
 mod file_manager_import;
+mod host_carry;
 mod host_commands;
 pub mod host_control;
 mod host_database;
@@ -21,9 +25,11 @@ mod identity_anchor;
 mod import_album;
 mod library_switch;
 pub mod lifecycle;
+mod macos_quit;
 pub mod manager;
 mod manager_commands;
 pub mod manager_host;
+mod manager_local;
 mod manager_profile;
 pub mod manager_tls;
 mod media_copy;
@@ -34,17 +40,22 @@ pub mod native_predictor;
 pub mod native_runtime;
 mod offline_albums;
 mod package_lease;
+mod photo_session;
 pub mod photo_sources;
 mod process_tree;
 #[cfg(any(target_os = "linux", test))]
 mod profile_elevation;
+mod provider_selection;
+mod reconnect;
 pub mod release_policy;
 mod resource_policy;
 pub mod runtime_epochs;
 pub mod runtime_store;
+mod saved_sign_in;
 mod server_admin;
 mod server_identity;
 mod server_login;
+mod server_steps;
 mod source_consent;
 mod source_import;
 mod source_metadata;
@@ -53,6 +64,7 @@ mod tray;
 mod updates;
 mod upload_budget;
 mod upload_parts;
+mod window_close;
 mod window_placement;
 #[cfg(windows)]
 mod windows_host_profile;
@@ -90,7 +102,9 @@ pub(crate) struct LoginResponse {
     name: String,
 }
 
-async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
+/// `keep_worker_session`: this is a check of the connection in use and its worker is running.
+/// Answers the view, and whether that worker's session was kept instead of a new one issued.
+async fn prepare(saved: &mut SavedConnection, keep_worker_session: bool) -> (ConnectionView, bool) {
     let unavailable = Features {
         enrollment: false,
         worker: false,
@@ -100,11 +114,43 @@ async fn prepare(saved: &mut SavedConnection) -> ConnectionView {
     };
     let client = match transport::client() {
         Ok(c) => c,
-        Err(_) => return ConnectionView::new(saved, "offline".into(), unavailable),
+        Err(_) => {
+            return (
+                ConnectionView::new(saved, "offline".into(), unavailable),
+                false,
+            )
+        }
     };
-    prepare_with_client(&client, saved).await
+    let capabilities = transport::capabilities(&client, saved).await;
+    prepare_checked(&client, saved, capabilities, keep_worker_session).await
 }
 
+/// Whether a connection check may leave the running worker's session in place: it is the session
+/// of this server, account and device, has proofs left and has not expired. A session that is
+/// missing or can't be read is not known to be valid, so a new one is issued, as before.
+fn worker_session_reusable(
+    saved: &SavedConnection,
+    worker: &Result<Option<worker::SavedWorker>, String>,
+    now: time::OffsetDateTime,
+) -> bool {
+    let Ok(Some(worker)) = worker else {
+        return false;
+    };
+    let Ok(expires) = time::OffsetDateTime::parse(
+        &worker.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return false;
+    };
+    worker.server_id == saved.server_id
+        && worker.account_id == saved.account_id
+        && Some(&worker.device_id) == saved.device_id.as_ref()
+        && (1..=2_147_483_647).contains(&worker.next_sequence)
+        // The worker renews its own session; one about to lapse is replaced now instead.
+        && expires > now + time::Duration::minutes(1)
+}
+
+#[cfg(test)]
 pub(crate) async fn prepare_with_client(
     client: &reqwest::Client,
     saved: &mut SavedConnection,
@@ -117,6 +163,27 @@ async fn prepare_with_capabilities(
     client: &reqwest::Client,
     saved: &mut SavedConnection,
     capabilities: Result<Option<connection::Capabilities>, String>,
+) -> ConnectionView {
+    prepare_checked(client, saved, capabilities, false).await.0
+}
+
+async fn prepare_checked(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+    capabilities: Result<Option<connection::Capabilities>, String>,
+    keep_worker_session: bool,
+) -> (ConnectionView, bool) {
+    let mut kept = false;
+    let view = prepare_view(client, saved, capabilities, keep_worker_session, &mut kept).await;
+    (view, kept)
+}
+
+async fn prepare_view(
+    client: &reqwest::Client,
+    saved: &mut SavedConnection,
+    capabilities: Result<Option<connection::Capabilities>, String>,
+    keep_worker_session: bool,
+    kept: &mut bool,
 ) -> ConnectionView {
     let unavailable = Features {
         enrollment: false,
@@ -151,7 +218,17 @@ async fn prepare_with_capabilities(
                             caps.features,
                         );
                     }
-                    if caps.features.worker_session && enrollment.state == "preparing" {
+                    // A check of the connection in use keeps the running worker's own session
+                    // while it is still valid: a new one would only restart the worker.
+                    *kept = keep_worker_session
+                        && caps.features.worker_session
+                        && enrollment.state == "preparing"
+                        && worker_session_reusable(
+                            saved,
+                            &credentials::load("worker-session"),
+                            time::OffsetDateTime::now_utc(),
+                        );
+                    if caps.features.worker_session && enrollment.state == "preparing" && !*kept {
                         // A new photo association must never reuse an earlier worker grant.
                         if credentials::delete("worker-session").is_err() {
                             return ConnectionView::new(
@@ -200,7 +277,79 @@ async fn connect_server(
     email: String,
     password: String,
     device_name: String,
-) -> Result<ConnectionView, String> {
+) -> Result<SignInOutcome, String> {
+    let step = SignInStep::Password {
+        email: &email,
+        password: Zeroizing::new(password),
+    };
+    connect_with(window, app, state, &server, step, &device_name).await
+}
+
+/// The second step of `connect_server`: one proof for the transaction it returned.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn connect_server_step(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server: String,
+    transaction: String,
+    method: String,
+    proof: String,
+    device_name: String,
+) -> Result<SignInOutcome, String> {
+    let step = SignInStep::Proof {
+        transaction: Zeroizing::new(transaction),
+        method: &method,
+        proof: Zeroizing::new(proof),
+    };
+    connect_with(window, app, state, &server, step, &device_name).await
+}
+
+/// What a sign-in command answers: the connection, or the step that would complete the sign-in.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub(crate) enum SignInOutcome {
+    Done {
+        connection: ConnectionView,
+    },
+    #[serde(rename_all = "camelCase")]
+    Next {
+        transaction: String,
+        methods: Vec<String>,
+        sent_to: Option<String>,
+        /// Sign in with Frameleaf only: the address of the server that asked for the step.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
+}
+
+/// What one sign-in call sends: the password, or a proof for the step the password opened.
+enum SignInStep<'a> {
+    Password {
+        email: &'a str,
+        password: Zeroizing<String>,
+    },
+    Proof {
+        transaction: Zeroizing<String>,
+        method: &'a str,
+        proof: Zeroizing<String>,
+    },
+}
+
+pub(crate) enum SignIn {
+    Done(Box<SavedConnection>, ConnectionView),
+    Next(server_steps::Pending),
+}
+
+async fn connect_with(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server: &str,
+    step: SignInStep<'_>,
+    device_name: &str,
+) -> Result<SignInOutcome, String> {
     require_local(&window)?;
     let mut current = state.0.lock().await;
     if app.state::<host_setup::HostSetup>().background_active() {
@@ -210,16 +359,26 @@ async fn connect_server(
         return Err("sign_out_before_switching_servers".into());
     }
     let client = transport::client()?;
-    let (saved, mut view) = sign_in(
+    let signed_in = sign_in_step(
         &client,
-        &server,
-        &email,
-        password,
-        &device_name,
+        server,
+        step,
+        device_name,
         || credentials::foreground_identity(&window),
         |saved| credentials::confirm_new_sign_in("connection", saved, &window),
     )
     .await?;
+    let (saved, mut view) = match signed_in {
+        SignIn::Done(saved, view) => (*saved, view),
+        SignIn::Next(pending) => {
+            return Ok(SignInOutcome::Next {
+                transaction: pending.transaction.as_str().to_owned(),
+                methods: pending.methods,
+                sent_to: pending.sent_to,
+                server: None,
+            })
+        }
+    };
     if view.state == "preparing"
         && view.features.worker_session
         && start_worker_setup(&app, &saved, false).await.is_err()
@@ -229,9 +388,11 @@ async fn connect_server(
     *current = Some(saved);
     drop(current);
     tray::refresh(&app).await;
-    Ok(view)
+    Ok(SignInOutcome::Done { connection: view })
 }
 
+/// The password step alone, as the sign-in fixtures call it.
+#[cfg(test)]
 async fn sign_in(
     client: &reqwest::Client,
     server: &str,
@@ -240,12 +401,50 @@ async fn sign_in(
     device_name: &str,
     identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
     confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
-) -> Result<(SavedConnection, ConnectionView), String> {
-    let (base, login) =
-        request_login(client, server, email, password, device_name, identity).await?;
-    keep_login(client, &base, login, device_name, confirm).await
+) -> Result<SignIn, String> {
+    let password = Zeroizing::new(password);
+    let step = SignInStep::Password { email, password };
+    sign_in_step(client, server, step, device_name, identity, confirm).await
 }
 
+async fn sign_in_step(
+    client: &reqwest::Client,
+    server: &str,
+    step: SignInStep<'_>,
+    device_name: &str,
+    identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
+    confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
+) -> Result<SignIn, String> {
+    let base = normalize_server(server)?;
+    if let SignInStep::Password { email, password } = &step {
+        let email = email.trim();
+        if email.is_empty() || email.len() > 320 || password.is_empty() || password.len() > 4096 {
+            return Err("login_details_invalid".into());
+        }
+    }
+    // Check secure persistence and the device identity before sending a password or a code.
+    let identity = identity()?;
+    identity.enrollment("validation", "validation", device_name, "client-worker")?;
+    let answer = match &step {
+        SignInStep::Password { email, password } => {
+            server_steps::password(client, &base, email.trim(), password).await?
+        }
+        SignInStep::Proof {
+            transaction,
+            method,
+            proof,
+        } => server_steps::proof(client, &base, transaction, method, proof).await?,
+    };
+    match answer {
+        server_steps::Step::Done(login) => keep_login(client, &base, login, device_name, confirm)
+            .await
+            .map(|(saved, view)| SignIn::Done(Box::new(saved), view)),
+        server_steps::Step::Next(pending) => Ok(SignIn::Next(pending)),
+    }
+}
+
+/// The password step for adding another approved library. A library that asks for another
+/// sign-in step is refused here; it can still be signed in to from the start screen.
 async fn request_login(
     client: &reqwest::Client,
     server: &str,
@@ -263,11 +462,10 @@ async fn request_login(
     // Check secure persistence and the device identity before sending a password.
     let identity = identity()?;
     identity.enrollment("validation", "validation", device_name, "client-worker")?;
-    let response = client.post(base.join("api/auth/login").unwrap())
-        .json(&serde_json::json!({ "email": email, "password": password.as_str(), "rememberMe": true }))
-        .send().await.map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    let login: LoginResponse = transport::json(response).await?;
-    Ok((base, login))
+    match server_steps::password(client, &base, email, &password).await? {
+        server_steps::Step::Done(login) => Ok((base, login)),
+        server_steps::Step::Next(_) => Err("library_sign_in_steps_required".into()),
+    }
 }
 
 /// A server session from any sign-in method becomes this computer's saved connection.
@@ -306,31 +504,35 @@ async fn finish_new_connection(
     if let Ok(Some(caps)) = &capabilities {
         saved.server_id.clone_from(&caps.server_id);
     }
-    let result = (|| {
-        if library_switch::already_approved(saved)? {
-            return Err("library_already_approved".into());
-        }
-        credentials::save("connection", saved)
-    })();
-    let result = match result {
-        Err(error) => Err(error),
-        Ok(()) => match confirm(saved) {
-            Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
-            // A changed item may belong to another writer. Revoke our minted token only.
-            Err(error) if error == "credential_confirmation_changed" => Err(error),
-            Err(error)
-                if !saved.server_id.is_empty()
-                    && matches!(
+    let result = if saved.server_id.is_empty() {
+        // The server did not say which server it is, so there is nothing a restart could check
+        // this sign-in against. It is not saved; the session just minted is ended below.
+        Err("server_sign_in_retry_required".into())
+    } else {
+        let stored = library_switch::already_approved(saved).and_then(|approved| {
+            if approved {
+                return Err("library_already_approved".into());
+            }
+            credentials::save("connection", saved)
+        });
+        match stored {
+            Err(error) => Err(error),
+            Ok(()) => match confirm(saved) {
+                Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
+                // A changed item may belong to another writer. Revoke our minted token only.
+                Err(error) if error == "credential_confirmation_changed" => Err(error),
+                Err(error)
+                    if matches!(
                         error.as_str(),
                         "credential_unlock_required" | "credential_confirmation_unavailable"
                     ) =>
-            {
-                return Err(error)
-            }
-            Err(_) => {
-                credentials::delete("connection").and(Err("server_sign_in_retry_required".into()))
-            }
-        },
+                {
+                    return Err(error)
+                }
+                Err(_) => credentials::delete("connection")
+                    .and(Err("server_sign_in_retry_required".into())),
+            },
+        }
     };
     let base = normalize_server(&saved.server)?;
     let _ = client
@@ -346,75 +548,107 @@ async fn restore_connection(
     retry: Option<bool>,
     window: WebviewWindow,
     app: tauri::AppHandle,
-    state: State<'_, DesktopState>,
 ) -> Result<Option<ConnectionView>, String> {
     require_local(&window)?;
+    let result = restore_saved(&app, Some(&window), retry.unwrap_or(false)).await;
+    // A server that did not answer is tried again from here, with backoff, window shown or not.
+    app.state::<reconnect::Reconnect>()
+        .after_restore(&app, &result);
+    result
+}
+
+/// Restores the saved sign-in and resumes its worker and folder watch. `window`: the window that
+/// asked, which may be prompted to unlock the credential store; the backend's own reconnect
+/// attempts have none and never prompt.
+pub(crate) async fn restore_saved(
+    app: &AppHandle,
+    window: Option<&WebviewWindow>,
+    retry: bool,
+) -> Result<Option<ConnectionView>, String> {
+    let state = app.state::<DesktopState>();
     let mut current = state.0.lock().await;
-    app.state::<media_copy::MediaCopy>().cancel();
     if app.state::<host_setup::HostSetup>().background_active() {
+        app.state::<media_copy::MediaCopy>().cancel();
         return Ok(None);
     }
-    app.state::<source_import::SourceJobs>().stop().await;
-    app.state::<drop_import::DropImport>()
-        .reset_for_restore()
-        .await;
-    app.state::<worker_setup::WorkerSetup>().stop().await;
-    let Some(mut saved) = credentials::load_interactive::<SavedConnection>(
-        "connection",
-        &window,
-        retry.unwrap_or(false),
-    )?
-    else {
+    let loaded = match window {
+        Some(window) => {
+            credentials::load_interactive::<SavedConnection>("connection", window, retry)
+        }
+        None => credentials::load::<SavedConnection>("connection"),
+    };
+    let Some(mut saved) = loaded? else {
         // The saved sign-in is gone: drop any connection still held so the window and the
-        // background agree (the jobs above already stopped).
+        // background agree.
+        stop_connection_work(app).await;
         let held = current.take();
+        // Only the offline copies of the library that was signed in are cleared.
         let offline = app.state::<offline_albums::OfflineAlbums>();
         offline.deactivate().await;
         if let Some(saved) = held.as_ref() {
-            let _ = offline.purge(&app, saved).await;
+            let _ = offline.purge(app, saved).await;
         }
         app.state::<media_copy::MediaCopy>().fence_session();
         drop(current);
         if held.is_some() {
-            tray::refresh(&app).await;
+            tray::refresh(app).await;
         }
         return Ok(None);
     };
-    if saved.server_id.is_empty() {
-        return Err("server_identity_not_confirmed".into());
+    // Restoring the connection already in use is only a check: it must not interrupt its work.
+    let checking = current
+        .as_ref()
+        .is_some_and(|held| saved_sign_in::same_session(held, &saved));
+    let plan = saved_sign_in::check(&transport::client()?, &saved)
+        .await
+        .plan();
+    if !checking || plan.stop_work {
+        stop_connection_work(app).await;
     }
-    if let Err(error) = verify_photo_account(&transport::client()?, &saved).await {
-        if matches!(
-            error.as_str(),
-            "server_http_401" | "server_http_403" | "account_identity_changed"
-        ) {
-            let offline = app.state::<offline_albums::OfflineAlbums>();
-            offline.deactivate().await;
-            let _ = offline.purge(&app, &saved).await;
-        }
-        return Err(error);
+    if plan.purge_albums {
+        let offline = app.state::<offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        let _ = offline.purge(app, &saved).await;
     }
-    if retry.unwrap_or(false) {
-        credentials::unlock_existing_identity(&window)?;
+    plan.resume_work?;
+    if let Some(window) = window.filter(|_| retry) {
+        credentials::unlock_existing_identity(window)?;
     }
+    let setup = app.state::<worker_setup::WorkerSetup>();
+    let (mut view, worker_kept) = prepare(&mut saved, checking && setup.running().await).await;
+    // A sign-in saved before its server was identified learns and saves the identity in
+    // `prepare`, from the server its session was just checked against. Until then it is not used.
+    saved_sign_in::identified(&saved)?;
+    // Import approvals saved before libraries were kept apart move to this library's scope.
     credentials::migrate_source_approvals(&saved)?;
-    let mut view = prepare(&mut saved).await;
     if view.state == "identity-changed" {
         let offline = app.state::<offline_albums::OfflineAlbums>();
         offline.deactivate().await;
-        let _ = offline.purge(&app, &saved).await;
+        let _ = offline.purge(app, &saved).await;
     }
-    if view.state == "preparing"
-        && view.features.worker_session
-        && start_worker_setup(&app, &saved, false).await.is_err()
-    {
-        view.state = "worker-setup-failed".into();
+    if view.state == "preparing" && view.features.worker_session {
+        // Starting replaces a running worker with one that holds the session just issued. A
+        // check that kept the session leaves the worker alone, unless it ended meanwhile.
+        if !(worker_kept && setup.running().await)
+            && start_worker_setup(app, &saved, false).await.is_err()
+        {
+            view.state = "worker-setup-failed".into();
+        }
+    } else if checking && !matches!(view.state.as_str(), "offline" | "enrollment-failed") {
+        // The server answered that this computer has no AI work now; a lost reply says nothing.
+        app.state::<worker_setup::WorkerSetup>().stop().await;
     }
-    resume_approved_watch(&app, &saved).await;
+    let jobs = app.state::<source_import::SourceJobs>();
+    if !(checking && (jobs.watching() || jobs.copying())) {
+        resume_approved_watch(app, &saved).await;
+    }
     *current = Some(saved);
-    app.state::<media_copy::MediaCopy>().fence_session();
+    if !checking {
+        // A different session: media copies listed for the previous one can no longer start.
+        app.state::<media_copy::MediaCopy>().fence_session();
+    }
     drop(current);
-    tray::refresh(&app).await;
+    tray::refresh(app).await;
     Ok(Some(view))
 }
 
@@ -455,6 +689,16 @@ async fn resume_approved_watch(app: &AppHandle, saved: &SavedConnection) {
     }
 }
 
+/// Ends the imports, media copy and worker that belong to a connection no longer in use.
+async fn stop_connection_work(app: &AppHandle) {
+    app.state::<media_copy::MediaCopy>().cancel();
+    app.state::<source_import::SourceJobs>().stop().await;
+    app.state::<drop_import::DropImport>()
+        .reset_for_restore()
+        .await;
+    app.state::<worker_setup::WorkerSetup>().stop().await;
+}
+
 #[tauri::command]
 async fn sign_out(
     window: WebviewWindow,
@@ -462,6 +706,7 @@ async fn sign_out(
     state: State<'_, DesktopState>,
 ) -> Result<lifecycle::SignOutResult, String> {
     require_local(&window)?;
+    app.state::<reconnect::Reconnect>().cancel();
     let mut current = state.0.lock().await;
     app.state::<media_copy::MediaCopy>().cancel();
     app.state::<source_import::SourceJobs>().stop().await;
@@ -477,24 +722,43 @@ async fn sign_out(
             result => result?,
         },
     };
+    *current = None;
+    // Only the signed-in library's offline copies are cleared; other approved libraries keep theirs.
     let offline = app.state::<offline_albums::OfflineAlbums>();
     offline.deactivate().await;
     let offline_cleared = match saved.as_ref() {
         Some(saved) => offline.purge(&app, saved).await.is_ok(),
         None => true,
     };
-    let result = lifecycle::finish_sign_out(
+    app.state::<media_copy::MediaCopy>().fence_session();
+    // Written down before the sign-in goes, so a crash from here on still wipes the Photos data.
+    photo_session::mark(&app);
+    // The saved sign-in is removed while the connection is still locked: a restore waiting on the
+    // lock would otherwise find it, sign in again and leave a live session behind a signed-out
+    // window. Every sign-in saves under this lock too, so nothing can bring it back in between.
+    // It is kept only while its library's local cleanup is unfinished, so a retry can find it.
+    let local = {
+        let worker = credentials::delete("worker-session").is_ok();
+        let approved = offline_cleared
+            && saved
+                .as_ref()
+                .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
+        let sources = credentials::delete_source_approvals(saved.as_ref());
+        let connection = approved && credentials::delete("connection").is_ok();
+        worker && connection && sources
+    };
+    drop(current);
+    tray::refresh(&app).await;
+    Ok(lifecycle::finish_sign_out(
+        async { local },
         async {
-            let worker = credentials::delete("worker-session").is_ok();
-            let approved = offline_cleared
-                && saved
-                    .as_ref()
-                    .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
-            let sources = credentials::delete_source_approvals(saved.as_ref());
-            let connection = approved && credentials::delete("connection").is_ok();
-            worker && connection && sources
+            // The Photos session lives in the web data store, not in its window: it is wiped
+            // through the window that asked, with the Photos window open or closed. Clearing the
+            // window also forgets which library it was opened for.
+            let closed = clear_photos_window(&app).is_ok();
+            let cleared = photo_session::clear(&app, &window);
+            cleared && closed
         },
-        async { clear_photos_window(&app).is_ok() },
         async {
             match saved.as_ref() {
                 Some(saved) => revoke_photo_connection(saved).await,
@@ -502,12 +766,7 @@ async fn sign_out(
             }
         },
     )
-    .await;
-    *current = None;
-    app.state::<media_copy::MediaCopy>().fence_session();
-    drop(current);
-    tray::refresh(&app).await;
-    Ok(result)
+    .await)
 }
 
 async fn revoke_photo_connection(saved: &SavedConnection) -> bool {
@@ -586,6 +845,8 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
     } else {
         photo_window(app, &base, base.clone(), expected.clone())?
     };
+    // An earlier sign-out that could not wipe its Photos data is made good before a new session.
+    photo_session::clear_if_owed(app);
     let result = (|| {
         let domain = base.host_str().ok_or("server_address_invalid")?;
         let secure = base.scheme() == "https";
@@ -616,6 +877,7 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
             .navigate(base.join("photos").unwrap())
             .map_err(|_| "photo_window_unavailable")?;
         photos.show().map_err(|_| "photo_window_unavailable")?;
+        photos.set_focus().map_err(|_| "photo_window_unavailable")?;
         Ok(())
     })();
     if result.is_ok() {
@@ -681,6 +943,7 @@ pub fn run() {
         .manage(offline_albums::OfflineAlbums::default())
         .manage(host_setup::HostSetup::default())
         .manage(worker_setup::WorkerSetup::default())
+        .manage(accelerated_pack::AcceleratedPack::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
         .manage(source_import::ImportTransfer::default())
@@ -688,6 +951,8 @@ pub fn run() {
         .manage(media_copy::MediaCopy::default())
         .manage(tray::TrayState::default())
         .manage(cloud_account::email::EmailAttempt::default())
+        .manage(cloud_account::ServerStep::default())
+        .manage(reconnect::Reconnect::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let placement = app.state::<window_placement::WindowPlacement>();
@@ -695,10 +960,21 @@ pub fn run() {
                 let _ = window.show();
                 placement.remember(&window);
             }
+            // A sign-out that was cut short before it wiped the Photos data finishes here.
+            photo_session::clear_if_owed(app.handle());
             file_manager_import::setup(app.handle());
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(error) = window_close::guard_app_quit(app.handle()) {
+                eprintln!("app menu unavailable: {error}");
+            }
+            // Dock Quit and a logout, restart or shutdown go through the exit guard too.
+            #[cfg(target_os = "macos")]
+            if let Err(error) = macos_quit::install(app.handle()) {
+                eprintln!("quit guard unavailable: {error}");
             }
             Ok(())
         })
@@ -712,13 +988,18 @@ pub fn run() {
             host_commands::local_host_status,
             host_commands::prepare_local_host,
             host_commands::provision_local_host_profile,
+            host_commands::local_host_carry_status,
+            host_commands::carry_local_host_library,
+            host_commands::confirm_local_host_carry,
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
+            host_commands::quit_local_host,
             connect_server,
             library_switch::approved_libraries,
             library_switch::add_approved_library,
             library_switch::activate_approved_library,
             library_switch::remove_approved_library,
+            connect_server_step,
             restore_connection,
             sign_out,
             open_photos,
@@ -731,6 +1012,11 @@ pub fn run() {
             offline_albums::offline_album_cancel,
             offline_albums::offline_album_browse_library,
             worker_setup_status,
+            accelerated_pack_status,
+            download_accelerated_pack,
+            decline_accelerated_pack,
+            cancel_accelerated_pack_download,
+            retry_accelerated_provider,
             prepare_models,
             control_worker,
             discover_camera_folders,
@@ -769,6 +1055,8 @@ pub fn run() {
             server_admin::remote_status,
             server_admin::update_remote,
             server_admin::test_remote_access,
+            server_admin::server_step_up,
+            server_admin::saved_sign_in_verification,
             server_admin::open_external,
             tray::tray_refresh,
             cloud_account::cloud_sign_in,
@@ -780,7 +1068,8 @@ pub fn run() {
             cloud_account::email::cloud_email_consents,
             cloud_account::email::cloud_email_start,
             cloud_account::email::cloud_email_complete,
-            cloud_account::connect_cloud_server
+            cloud_account::connect_cloud_server,
+            cloud_account::connect_cloud_server_step
         ])
         .on_webview_event(|webview, event| {
             if webview.label() == "main" {
@@ -811,13 +1100,8 @@ pub fn run() {
                 }
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     placement.save(window.app_handle());
-                    if cfg!(target_os = "macos")
-                        || window.state::<host_setup::HostSetup>().background_active()
-                        || window.state::<source_import::SourceJobs>().watching()
-                        || window.state::<media_copy::MediaCopy>().is_active()
-                    {
+                    if window_close::on_close_requested(window) {
                         api.prevent_close();
-                        let _ = window.hide();
                     }
                 }
                 _ => {}
@@ -832,6 +1116,11 @@ pub fn run() {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
+            }
+            // Windows ends a session by exiting this app without asking first.
+            #[cfg(windows)]
+            if matches!(event, tauri::RunEvent::Exit) {
+                host_commands::session_ending(app);
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 app.state::<window_placement::WindowPlacement>().save(app);
@@ -854,6 +1143,21 @@ pub fn run() {
         });
 }
 
+fn worker_paths(app: &tauri::AppHandle) -> Result<worker_setup::SetupPaths, String> {
+    Ok(worker_setup::SetupPaths {
+        data: app
+            .path()
+            .app_local_data_dir()
+            .map_err(|_| "app_data_directory_unavailable")?
+            .join("worker"),
+        bundle: worker_setup::bundled_runtime(
+            &app.path()
+                .resource_dir()
+                .map_err(|_| "app_resources_unavailable")?,
+        ),
+    })
+}
+
 pub(crate) async fn start_worker_setup(
     app: &tauri::AppHandle,
     saved: &SavedConnection,
@@ -869,18 +1173,7 @@ pub(crate) async fn start_worker_setup(
         publish_worker_status(app, status);
         return Ok(());
     }
-    let paths = worker_setup::SetupPaths {
-        data: app
-            .path()
-            .app_local_data_dir()
-            .map_err(|_| "app_data_directory_unavailable")?
-            .join("worker"),
-        bundle: worker_setup::bundled_runtime(
-            &app.path()
-                .resource_dir()
-                .map_err(|_| "app_resources_unavailable")?,
-        ),
-    };
+    let paths = worker_paths(app)?;
     let handle = app.clone();
     app.state::<worker_setup::WorkerSetup>()
         .start(
@@ -906,6 +1199,105 @@ async fn worker_setup_status(
 ) -> Result<worker_setup::SetupStatus, String> {
     require_local(&window)?;
     Ok(app.state::<worker_setup::WorkerSetup>().status())
+}
+
+/// FD-60: the GPU runtime pack this computer could download, and where that download stands.
+#[tauri::command]
+async fn accelerated_pack_status(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<accelerated_pack::PackStatus, String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    let mut status = app.state::<accelerated_pack::AcceleratedPack>().status(
+        &paths.bundle,
+        &paths.data,
+        &provider_selection::Host,
+    );
+    if status.state == "available" {
+        status.metered = tauri::async_runtime::spawn_blocking(resource_policy::sample)
+            .await
+            .is_ok_and(|network| network.unmetered == Some(false));
+    }
+    Ok(status)
+}
+
+/// The person chose Download: nothing else ever starts this transfer. The worker is restarted
+/// once the pack is ready, so it is installed and qualified without reopening the app.
+#[tauri::command]
+async fn download_accelerated_pack(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<accelerated_pack::PackStatus, String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    let handle = app.clone();
+    let status = app
+        .state::<accelerated_pack::AcceleratedPack>()
+        .download(paths.bundle, paths.data, move |status| {
+            let _ = handle.emit_to("main", "accelerated-pack", status);
+        })
+        .await?;
+    if status.state == "ready" {
+        restart_running_worker(&app, &state).await;
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+async fn decline_accelerated_pack(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<accelerated_pack::PackStatus, String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    Ok(app.state::<accelerated_pack::AcceleratedPack>().decline(
+        &paths.bundle,
+        &paths.data,
+        &provider_selection::Host,
+    ))
+}
+
+#[tauri::command]
+async fn cancel_accelerated_pack_download(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    require_local(&window)?;
+    app.state::<accelerated_pack::AcceleratedPack>().cancel();
+    Ok(())
+}
+
+/// Try the GPU again after it failed its check or measured slower: forget what was remembered
+/// about this runtime and let the worker qualify it again.
+#[tauri::command]
+async fn retry_accelerated_provider(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    provider_selection::forget(&paths.data);
+    restart_running_worker(&app, &state).await;
+    Ok(())
+}
+
+/// Start the worker again when it is running, so a change to its runtimes takes effect. A worker
+/// the person paused or stopped stays as they left it.
+async fn restart_running_worker(app: &tauri::AppHandle, state: &State<'_, DesktopState>) {
+    let setup = app.state::<worker_setup::WorkerSetup>();
+    if setup.status().control != worker_control::WorkerControl::Running || !setup.running().await {
+        return;
+    }
+    let current = state.0.lock().await;
+    if let Some(saved) = current
+        .as_ref()
+        .filter(|saved| saved.mode == "client-worker" && saved.device_id.is_some())
+    {
+        let _ = start_worker_setup(app, saved, false).await;
+    }
 }
 
 #[tauri::command]
@@ -1290,7 +1682,8 @@ async fn prepare_photo_import(
     state: State<'_, DesktopState>,
 ) -> Result<source_import::ImportView, String> {
     require_local(&window)?;
-    let current = state.0.lock().await;
+    // The inventory scan of a large folder must not hold the connection lock.
+    let current = state.0.lock().await.clone();
     let saved = current.as_ref().ok_or("sign_in_required")?;
     let status = app
         .state::<source_import::SourceJobs>()
@@ -1347,6 +1740,9 @@ async fn control_photo_import(
 }
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod resume_tests {
     #[test]
     fn resume_names_why_the_server_refused() {
@@ -1367,5 +1763,77 @@ mod resume_tests {
             super::resume_refusal("paused", true).as_deref(),
             Some("worker_setup_unavailable")
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_session_tests {
+    use super::*;
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+    fn saved() -> SavedConnection {
+        SavedConnection {
+            server: "http://192.168.1.20:2283/".into(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Ada".into(),
+            token: "session".into(),
+            device_name: "Desk".into(),
+            mode: "client-worker".into(),
+            device_id: Some("device".into()),
+        }
+    }
+    fn worker() -> worker::SavedWorker {
+        worker::SavedWorker {
+            server_id: "server".into(),
+            account_id: "account".into(),
+            device_id: "device".into(),
+            session_id: "worker-session".into(),
+            authorization_epoch: 1,
+            worker_token: "token".into(),
+            expires_at: "2026-11-12T11:00:00Z".into(),
+            next_sequence: 7,
+        }
+    }
+
+    #[test]
+    fn a_connection_check_keeps_a_valid_worker_session() {
+        let now = OffsetDateTime::parse("2026-11-12T10:00:00Z", &Rfc3339).unwrap();
+        assert!(worker_session_reusable(&saved(), &Ok(Some(worker())), now));
+    }
+
+    #[test]
+    fn a_session_that_is_not_known_to_be_valid_is_replaced() {
+        let now = OffsetDateTime::parse("2026-11-12T10:00:00Z", &Rfc3339).unwrap();
+        let reusable = |change: fn(&mut worker::SavedWorker, &mut SavedConnection)| {
+            let (mut worker, mut saved) = (worker(), saved());
+            change(&mut worker, &mut saved);
+            worker_session_reusable(&saved, &Ok(Some(worker)), now)
+        };
+        // Expired, or about to; an expiry that can't be read says nothing.
+        assert!(!reusable(
+            |worker, _| worker.expires_at = "2020-01-01T00:00:00Z".into()
+        ));
+        assert!(!reusable(|worker, _| worker.expires_at = "soon".into()));
+        // Another server, account or device, or one this computer is no longer enrolled as.
+        assert!(!reusable(|worker, _| worker.server_id = "other".into()));
+        assert!(!reusable(|worker, _| worker.account_id = "other".into()));
+        assert!(!reusable(|worker, _| worker.device_id = "other".into()));
+        assert!(!reusable(|_, saved| saved.device_id = None));
+        // No proofs left.
+        assert!(!reusable(|worker, _| worker.next_sequence = 0));
+        // Missing or unreadable: unknown, so a new session is issued.
+        assert!(!worker_session_reusable(&saved(), &Ok(None), now));
+        assert!(!worker_session_reusable(
+            &saved(),
+            &Err("credential_store_unavailable".into()),
+            now
+        ));
+        let lapsing = {
+            let mut worker = worker();
+            worker.expires_at = "2026-11-12T10:00:20Z".into();
+            worker
+        };
+        assert!(!worker_session_reusable(&saved(), &Ok(Some(lapsing)), now));
     }
 }
