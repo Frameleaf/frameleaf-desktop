@@ -226,6 +226,34 @@ use it instead, and `FRAMELEAF_TEST_OUTPUT` to an absolute folder to keep
 screenshots of the Manager page. `Desktop candidate` runs these tests on Linux
 for every pull request.
 
+## Installed model and provider evidence
+
+Install the approved Desktop candidate on Apple Silicon, Windows x64 or the
+Linux target under test. Record the installer SHA-256 and verify the installed
+app identity. Pair the app with the test Library, enable the intended search,
+face or OCR workload, and let Desktop finish native worker setup.
+
+After Library accepts a native fixture and Desktop verifies the acceptance,
+Desktop writes a private JSON receipt in
+`<app-local-data>/worker/qualification-evidence/`. The latest successful fixture
+for each model key and provider replaces its previous receipt. Collect only
+receipts with qualification timestamps from the current run and the expected
+app version, target architecture and signed runtime manifest digest. Search has
+separate receipts for default text, English text and vision. In the candidate
+revision's `runtime/model-catalogue.json`, locate the profile matching the
+receipt's `modelKey`, `runtimeSourceRevision` and `spec.provider`. Canonicalize
+only that profile's `spec.entries` using JSON Canonicalization Scheme, the same
+serialization the harness uses. Compute the lowercase SHA-256 of the canonical
+UTF-8 bytes without a trailing newline and compare it with `configSha256`.
+Check the model name, snapshot, provider and execution state in each receipt.
+A mixed accelerator result records `ready-mixed`.
+
+Keep the receipts with the matching installer digest. They record fixture
+acceptance by Library. Run a representative Library job for each route on the
+installed combination to qualify end-to-end processing. The opt-in NAS harness
+checks all three search receipts together and accepts separate Face and OCR
+runs. Each harness run executes one representative job.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers
