@@ -31,6 +31,10 @@ const ACCELERATED_STORE: &str = "runtimes-accelerated";
 /// `tools/check_windows_cuda_libraries.py` holds every pack to the same arithmetic.
 #[cfg(windows)]
 const ACCELERATED_STORE: &str = "gpu";
+const REMEMBERED: &str = "provider-failures.json";
+/// How Windows names an Intel or NVIDIA display adapter (the PCI vendor of its hardware id).
+const INTEL_ADAPTER: &str = "pci\\ven_8086&";
+const NVIDIA_ADAPTER: &str = "pci\\ven_10de&";
 const WORKLOADS: [&str; 3] = ["clip", "ocr", "face"];
 
 /// What this computer has. Injected so each operating system's rule is tested on all of them.
@@ -39,6 +43,55 @@ pub(crate) trait Probe {
     fn read(&self, path: &str) -> Option<String>;
     fn list(&self, directory: &str) -> Vec<String>;
     fn variable(&self, name: &str) -> Option<String>;
+    /// Windows: every display adapter a driver is installed for, as its hardware id in lower
+    /// case (`pci\ven_8086&dev_a7a0...`) and that driver's version. Empty anywhere else.
+    fn adapters(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+}
+/// The display adapter class of the Windows registry: one numbered key per adapter that has a
+/// driver, naming the hardware id the driver matched and the driver's version.
+#[cfg(windows)]
+fn display_adapters() -> Vec<(String, String)> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    fn text(key: &[u16], value: &str) -> Option<String> {
+        let value = wide(value);
+        let mut words = [0u16; 512];
+        let mut size = std::mem::size_of_val(&words) as u32;
+        // SAFETY: both names are NUL-terminated and outlive the call; `size` is the size of
+        // `words` in bytes, and the call writes no more than that and reports what it wrote.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                words.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let written = words.get(..size as usize / 2)?;
+        String::from_utf16(written.split(|word| *word == 0).next()?).ok()
+    }
+    // The keys are numbered from 0000; a removed adapter can leave a gap.
+    (0..64)
+        .filter_map(|index| {
+            let key = wide(&format!(
+                "SYSTEM\\CurrentControlSet\\Control\\Class\\{{4d36e968-e325-11ce-bfc1-08002be10318}}\\{index:04}"
+            ));
+            Some((
+                text(&key, "MatchingDeviceId")?.to_ascii_lowercase(),
+                text(&key, "DriverVersion").unwrap_or_default(),
+            ))
+        })
+        .collect()
 }
 pub(crate) struct Host;
 impl Probe for Host {
@@ -61,6 +114,33 @@ impl Probe for Host {
     fn variable(&self, name: &str) -> Option<String> {
         std::env::var(name).ok()
     }
+    #[cfg(windows)]
+    fn adapters(&self) -> Vec<(String, String)> {
+        display_adapters()
+    }
+}
+
+/// Linux: the PCI device id of every Intel (PCI vendor 0x8086) display adapter.
+fn intel_cards(probe: &dyn Probe) -> Vec<String> {
+    let mut cards = probe.list("/sys/class/drm");
+    cards.sort();
+    cards
+        .iter()
+        .filter(|card| {
+            card.strip_prefix("card")
+                .is_some_and(|index| index.bytes().all(|b| b.is_ascii_digit()))
+                && probe
+                    .read(&format!("/sys/class/drm/{card}/device/vendor"))
+                    .is_some_and(|vendor| vendor.trim() == "0x8086")
+        })
+        .map(|card| {
+            probe
+                .read(&format!("/sys/class/drm/{card}/device/device"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .collect()
 }
 
 /// Whether this computer has the device a provider needs. Only a first gate: qualification is
@@ -76,16 +156,147 @@ pub(crate) fn device_eligible(provider: &str, os: &str, arch: &str, probe: &dyn 
             .variable("SystemRoot")
             .is_some_and(|root| probe.exists(&format!("{root}\\System32\\nvcuda.dll"))),
         // An Intel (PCI vendor 0x8086) display adapter.
-        ("OpenVINOExecutionProvider", "linux", "x86_64") => {
-            probe.list("/sys/class/drm").iter().any(|card| {
-                card.strip_prefix("card")
-                    .is_some_and(|index| index.bytes().all(|b| b.is_ascii_digit()))
-                    && probe
-                        .read(&format!("/sys/class/drm/{card}/device/vendor"))
-                        .is_some_and(|vendor| vendor.trim() == "0x8086")
-            })
-        }
+        ("OpenVINOExecutionProvider", "linux", "x86_64") => !intel_cards(probe).is_empty(),
+        // FD-64: an Intel display adapter with its graphics driver installed. The pinned OpenVINO
+        // (2025.4) runs its GPU device on Intel HD, UHD, Iris and Arc graphics under Windows 10
+        // and 11 and needs that driver, which it does not carry; Windows lists an adapter under
+        // the Intel hardware id only once such a driver is installed for it.
+        ("OpenVINOExecutionProvider", "windows", "x86_64") => probe
+            .adapters()
+            .iter()
+            .any(|(adapter, _)| adapter.starts_with(INTEL_ADAPTER)),
         _ => false,
+    }
+}
+
+/// FD-63: the oldest NVIDIA driver for Windows that runs any CUDA 12 (NVIDIA's release notes:
+/// 527.41 for CUDA 12.0). The pack's CUDA is 12.x, so no older driver can run it.
+const CUDA_MINIMUM_WINDOWS_DRIVER: (u32, u32) = (527, 41);
+
+/// NVIDIA's own driver version (`560.94`) from the version Windows records for the driver
+/// (`32.0.15.6094`): the last five digits of its third and fourth fields.
+fn nvidia_driver(version: &str) -> Option<(u32, u32)> {
+    let fields: Vec<&str> = version.trim().split('.').collect();
+    if fields.len() != 4
+        || fields
+            .iter()
+            .any(|field| field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()))
+        || fields[2].len() > 4
+        || fields[3].len() > 4
+    {
+        return None;
+    }
+    let digits = format!("{}{:0>4}", fields[2], fields[3]);
+    let tail = digits.get(digits.len().checked_sub(5)?..)?;
+    Some((tail[..3].parse().ok()?, tail[3..].parse().ok()?))
+}
+
+/// FD-63: whether the NVIDIA driver installed on Windows is known to be too old for the pack's
+/// CUDA. Only a version that is read and understood can say so: with no NVIDIA adapter listed,
+/// or a version in another form, the answer is no and qualification decides as before. One
+/// adapter with a driver that is new enough is enough.
+pub(crate) fn driver_outdated(provider: &str, os: &str, probe: &dyn Probe) -> bool {
+    if (provider, os) != ("CUDAExecutionProvider", "windows") {
+        return false;
+    }
+    let drivers: Vec<Option<(u32, u32)>> = probe
+        .adapters()
+        .iter()
+        .filter(|(adapter, _)| adapter.starts_with(NVIDIA_ADAPTER))
+        .map(|(_, driver)| nvidia_driver(driver))
+        .collect();
+    !drivers.is_empty()
+        && drivers
+            .iter()
+            .all(|driver| driver.is_some_and(|version| version < CUDA_MINIMUM_WINDOWS_DRIVER))
+}
+
+/// FD-64: the device and driver a remembered result was measured with, as a digest. A driver
+/// update, an operating system update that carries the driver, or another card changes it, and
+/// the provider is then tried again. Empty when nothing identifies the device, which only
+/// matches a result remembered the same way.
+pub(crate) fn device_identity(provider: &str, os: &str, probe: &dyn Probe) -> String {
+    use sha2::{Digest, Sha256};
+    let adapters = |vendor: &str| {
+        let mut found: Vec<String> = probe
+            .adapters()
+            .into_iter()
+            .filter(|(adapter, _)| adapter.starts_with(vendor))
+            .map(|(adapter, driver)| format!("{adapter} {driver}"))
+            .collect();
+        found.sort();
+        found.join("\n")
+    };
+    let facts = match (provider, os) {
+        // CoreML and the Metal driver come with macOS: its version and build.
+        ("CoreMLExecutionProvider", "macos") => probe
+            .read("/System/Library/CoreServices/SystemVersion.plist")
+            .unwrap_or_default(),
+        // The loaded NVIDIA driver's version and the model of each card it drives.
+        ("CUDAExecutionProvider", "linux") => {
+            let mut facts = probe
+                .read("/proc/driver/nvidia/version")
+                .unwrap_or_default();
+            let mut cards = probe.list("/proc/driver/nvidia/gpus");
+            cards.sort();
+            for card in cards {
+                let information = probe
+                    .read(&format!("/proc/driver/nvidia/gpus/{card}/information"))
+                    .unwrap_or_default();
+                for line in information
+                    .lines()
+                    .filter(|line| line.starts_with("Model:") || line.starts_with("GPU UUID:"))
+                {
+                    facts.push_str(line);
+                    facts.push('\n');
+                }
+            }
+            facts
+        }
+        ("CUDAExecutionProvider", "windows") => adapters(NVIDIA_ADAPTER),
+        ("OpenVINOExecutionProvider", "windows") => adapters(INTEL_ADAPTER),
+        // The Intel cards and the kernel that carries their driver.
+        ("OpenVINOExecutionProvider", "linux") => {
+            let cards = intel_cards(probe);
+            if cards.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{}\n{}",
+                    cards.join("\n"),
+                    probe.read("/proc/sys/kernel/osrelease").unwrap_or_default()
+                )
+            }
+        }
+        _ => String::new(),
+    };
+    if facts.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{:x}", Sha256::digest(facts.as_bytes()))
+    }
+}
+
+/// FD-64: a cause that says nothing lasting about the provider: its process was not serving
+/// in time, which a busy computer explains as well as a faulty provider does. The processor
+/// takes over for this run and the provider is tried again the next time the worker starts.
+fn passing(code: &str) -> bool {
+    matches!(code, "worker_execution_deadline" | "runtime_not_ready")
+}
+
+/// FD-64: Retry Setup forgets what was remembered, so the provider is tried and measured again.
+pub(crate) fn forget(data: &Path) {
+    let _ = std::fs::remove_file(data.join(REMEMBERED));
+}
+
+/// FD-64: the request for what the server offers the accelerated runtime failed. A failure the
+/// worker reconnects after (`Err`) ends this preparation so it is asked again; any other is the
+/// reason the processor is used for this run.
+fn inventory_failure(code: String) -> Result<String, String> {
+    if crate::worker_setup::retryable(&code) {
+        Err(code)
+    } else {
+        Ok(code)
     }
 }
 
@@ -145,10 +356,11 @@ pub(crate) fn warm_milliseconds<'a>(
 /// What one accelerated runtime (its signed manifest names the epoch) is remembered for on this
 /// computer: the providers that failed or measured slower, so they are not retried every time
 /// the worker starts, and the workloads it measured faster for, so they are not measured again.
-/// A newer runtime starts clean.
+/// A newer runtime starts clean, and so does another device or driver (`device_identity`).
 pub(crate) struct Failures {
     path: PathBuf,
     runtime: String,
+    device: String,
     codes: BTreeMap<String, String>,
     /// Workload -> the model keys of the accelerated group that measured faster. The result is
     /// about those models: another model offered for the same workload is measured itself.
@@ -159,6 +371,9 @@ pub(crate) struct Failures {
 struct Remembered {
     schema_version: u32,
     runtime: String,
+    /// Absent in a record saved before results named their device: it then matches no device.
+    #[serde(default)]
+    device: String,
     failures: BTreeMap<String, String>,
     /// Results saved before they named their models: read so the record still loads, never
     /// trusted and never written again (the workload is measured again).
@@ -180,13 +395,14 @@ fn code_shaped(value: &str) -> bool {
 impl Failures {
     /// A missing, unreadable or foreign record remembers nothing: the provider is tried once
     /// more, and a failure is then held for this run whether or not it can be written.
-    pub(crate) fn load(path: &Path, runtime: &str) -> Self {
+    pub(crate) fn load(path: &Path, runtime: &str, device: &str) -> Self {
         let (codes, faster) = read_bounded(path, 16 * 1024)
             .ok()
             .and_then(|raw| serde_json::from_slice::<Remembered>(&raw).ok())
             .filter(|saved| {
                 saved.schema_version == 1
                     && saved.runtime == runtime
+                    && saved.device == device
                     && saved.failures.iter().all(|(workload, code)| {
                         WORKLOADS.contains(&workload.as_str()) && code_shaped(code)
                     })
@@ -206,6 +422,7 @@ impl Failures {
         Self {
             path: path.into(),
             runtime: runtime.into(),
+            device: device.into(),
             codes,
             faster,
         }
@@ -241,6 +458,7 @@ impl Failures {
         let saved = Remembered {
             schema_version: 1,
             runtime: self.runtime.clone(),
+            device: self.device.clone(),
             failures: self.codes.clone(),
             faster: BTreeSet::new(),
             measured: self.faster.clone(),
@@ -271,6 +489,8 @@ fn workload_of(group: &[ApprovedProfile]) -> &str {
 pub(crate) struct Offer {
     pub provider: String,
     pub manifest_sha256: String,
+    /// `device_identity` of the device this runtime would use.
+    pub device: String,
     pub groups: Vec<Vec<ApprovedProfile>>,
 }
 
@@ -308,7 +528,7 @@ impl Plan {
         });
         let failures = offer
             .as_ref()
-            .map(|offer| Failures::load(failures, &offer.manifest_sha256));
+            .map(|offer| Failures::load(failures, &offer.manifest_sha256, &offer.device));
         Self {
             cpu,
             offer,
@@ -437,7 +657,8 @@ impl Plan {
         true
     }
     /// The accelerated runtime's process did not serve: every workload on it moves to the
-    /// processor, remembered for this runtime epoch.
+    /// processor, remembered for this runtime epoch and device unless the cause is a passing
+    /// one (`passing`), which holds for this run only.
     ///
     /// Stopping the worker, signing out or a pause for power or network is never the provider's
     /// fault, whatever process happened to be starting at that moment.
@@ -458,7 +679,7 @@ impl Plan {
             .collect();
         let mut changed = false;
         for workload in workloads {
-            changed |= self.demote(&workload, code, true);
+            changed |= self.demote(&workload, code, !passing(code));
         }
         changed
     }
@@ -571,6 +792,10 @@ fn install_accelerated(
     {
         return Err("provider_device_ineligible".into());
     }
+    // FD-63: a driver known to be too old is said so, instead of a check that cannot pass.
+    if driver_outdated(&provider, std::env::consts::OS, probe) {
+        return Err("provider_driver_outdated".into());
+    }
     let store = open_runtime_store(&data.join(ACCELERATED_STORE))?;
     // A stale release (older epoch than the processor runtime) cannot load; the bundle replaces it.
     let active = store.load_active().ok().flatten();
@@ -612,19 +837,25 @@ pub(crate) async fn open(
     cpu: &InstalledRuntime,
     worker: &WorkerTransport,
     cpu_groups: Vec<Vec<ApprovedProfile>>,
-) -> (Option<Lane>, Plan) {
+) -> Result<(Option<Lane>, Plan), String> {
     let (bundle, data, release) = (
         paths.bundle.clone(),
         paths.data.clone(),
         cpu.manifest_sha256().to_owned(),
     );
     let opened = tauri::async_runtime::spawn_blocking(move || {
-        install_accelerated(&bundle, &data, &release, &Host)
+        install_accelerated(&bundle, &data, &release, &Host).map(|lane| {
+            lane.map(|lane| {
+                let device =
+                    device_identity(lane.installed.provider(), std::env::consts::OS, &Host);
+                (lane, device)
+            })
+        })
     })
     .await
     .unwrap_or_else(|_| Err("runtime_preparation_failed".into()));
     let offered = match opened {
-        Ok(Some(lane)) => {
+        Ok(Some((lane, device))) => {
             let (source, provider) = (
                 lane.installed.source_revision().to_owned(),
                 lane.installed.provider().to_owned(),
@@ -635,19 +866,20 @@ pub(crate) async fn open(
                 .and_then(|inventory| {
                     crate::worker_setup::inventory_profiles(&inventory, &source, &provider)
                 }) {
-                Ok((groups, _)) => Ok(Some((lane, groups))),
-                Err(code) => Err(code),
+                Ok((groups, _)) => Ok(Some((lane, device, groups))),
+                Err(code) => Err(inventory_failure(code)?),
             }
         }
         Ok(None) => Ok(None),
         Err(code) => Err(code),
     };
-    let failures = paths.data.join("provider-failures.json");
-    match offered {
-        Ok(Some((lane, groups))) => {
+    let failures = paths.data.join(REMEMBERED);
+    Ok(match offered {
+        Ok(Some((lane, device, groups))) => {
             let offer = Offer {
                 provider: lane.installed.provider().into(),
                 manifest_sha256: lane.installed.manifest_sha256().into(),
+                device,
                 groups,
             };
             (
@@ -657,7 +889,7 @@ pub(crate) async fn open(
         }
         Ok(None) => (None, Plan::new(cpu_groups, None, None, &failures)),
         Err(code) => (None, Plan::new(cpu_groups, None, Some(code), &failures)),
-    }
+    })
 }
 
 /// After a successful qualification: reclaim accelerated runtime packs that can never run again.
@@ -680,8 +912,13 @@ mod tests {
     struct Fixture {
         files: BTreeMap<String, String>,
         variables: BTreeMap<String, String>,
+        adapters: Vec<(String, String)>,
     }
     impl Fixture {
+        fn adapter(mut self, hardware: &str, driver: &str) -> Self {
+            self.adapters.push((hardware.into(), driver.into()));
+            self
+        }
         fn file(mut self, path: &str, text: &str) -> Self {
             self.files.insert(path.into(), text.into());
             self
@@ -705,7 +942,12 @@ mod tests {
         fn variable(&self, name: &str) -> Option<String> {
             self.variables.get(name).cloned()
         }
+        fn adapters(&self) -> Vec<(String, String)> {
+            self.adapters.clone()
+        }
     }
+    const INTEL_ARC: &str = "pci\\ven_8086&dev_56a0";
+    const NVIDIA_CARD: &str = "pci\\ven_10de&dev_2684";
 
     #[test]
     fn a_provider_is_eligible_only_where_its_device_is_present() {
@@ -748,6 +990,260 @@ mod tests {
     }
 
     #[test]
+    fn an_nvidia_driver_too_old_for_cuda_12_is_known_only_from_a_version_that_is_understood() {
+        assert_eq!(nvidia_driver("32.0.15.6094"), Some((560, 94)));
+        assert_eq!(nvidia_driver("31.0.15.2756"), Some((527, 56)));
+        assert_eq!(nvidia_driver("27.21.14.5671"), Some((456, 71)));
+        assert_eq!(nvidia_driver("30.0.14.9649"), Some((496, 49)));
+        for unknown in [
+            "",
+            "560.94",
+            "32.0.15",
+            "32.0.15.x",
+            "32.0.15.60941",
+            "10.0.1.2.3",
+        ] {
+            assert_eq!(nvidia_driver(unknown), None, "{unknown}");
+        }
+        let outdated = |fixture: &Fixture| driver_outdated(CUDA, "windows", fixture);
+        // The first driver for CUDA 12.0 and anything newer pass; the one before does not.
+        assert!(!outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "31.0.15.2741")
+        ));
+        assert!(!outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "32.0.15.6094")
+        ));
+        assert!(outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "31.0.15.2740")
+        ));
+        assert!(outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "27.21.14.5671")
+        ));
+        // Unknown never refuses: no NVIDIA adapter listed, or a version in another form.
+        assert!(!outdated(&Fixture::default()));
+        assert!(!outdated(
+            &Fixture::default().adapter(INTEL_ARC, "27.21.14.5671")
+        ));
+        assert!(!outdated(&Fixture::default().adapter(NVIDIA_CARD, "")));
+        assert!(!outdated(
+            &Fixture::default()
+                .adapter(NVIDIA_CARD, "27.21.14.5671")
+                .adapter(NVIDIA_CARD, "unknown")
+        ));
+        // A second card with a driver that is new enough is enough.
+        assert!(!outdated(
+            &Fixture::default()
+                .adapter(NVIDIA_CARD, "27.21.14.5671")
+                .adapter("pci\\ven_10de&dev_1c82", "32.0.15.6094")
+        ));
+        // Only CUDA on Windows is judged this way.
+        let old = Fixture::default().adapter(NVIDIA_CARD, "27.21.14.5671");
+        assert!(!driver_outdated(CUDA, "linux", &old));
+        assert!(!driver_outdated(OPENVINO, "windows", &old));
+    }
+
+    #[test]
+    fn openvino_is_eligible_on_windows_with_an_intel_adapter_and_its_driver() {
+        // An NVIDIA card, and an Intel one Windows drives with its basic display driver (no
+        // Intel graphics driver, so it is not listed under the Intel hardware id).
+        let other = Fixture::default()
+            .adapter(NVIDIA_CARD, "32.0.15.6094")
+            .adapter("pci\\cc_0300", "10.0.26100.1");
+        assert!(!device_eligible(OPENVINO, "windows", "x86_64", &other));
+        let intel = other.adapter(INTEL_ARC, "32.0.101.6078");
+        assert!(device_eligible(OPENVINO, "windows", "x86_64", &intel));
+        // Integrated graphics count the same; the vendor must be the whole field.
+        let integrated = Fixture::default().adapter("pci\\ven_8086&dev_a7a0&subsys_0b1a1028", "");
+        assert!(device_eligible(OPENVINO, "windows", "x86_64", &integrated));
+        let lookalike = Fixture::default().adapter("pci\\ven_80860&dev_a7a0", "1");
+        assert!(!device_eligible(OPENVINO, "windows", "x86_64", &lookalike));
+        // Only where the app ships that runtime, and never for another provider or system.
+        assert!(!device_eligible(OPENVINO, "windows", "aarch64", &intel));
+        assert!(!device_eligible(OPENVINO, "linux", "x86_64", &intel));
+        assert!(!device_eligible(CUDA, "windows", "x86_64", &intel));
+        // The app targets what the runtime packs are built for.
+        let profiles: serde_json::Value =
+            serde_json::from_str(include_str!("../../runtime/profiles.json")).unwrap();
+        let targets = profiles["profiles"]["openvino-ort"]["targets"]
+            .as_array()
+            .unwrap();
+        assert!(targets.iter().any(|target| target == "windows-x86_64"));
+    }
+
+    #[test]
+    fn the_device_identity_follows_the_card_and_its_driver_on_every_system() {
+        let identity = |provider: &str, os: &str, probe: &Fixture| {
+            let value = device_identity(provider, os, probe);
+            assert!(value.is_empty() || value.len() == 64, "{value}");
+            value
+        };
+        // Nothing to read: no identity, on every system.
+        let none = Fixture::default();
+        for (provider, os) in [
+            (COREML, "macos"),
+            (CUDA, "linux"),
+            (CUDA, "windows"),
+            (OPENVINO, "linux"),
+            (OPENVINO, "windows"),
+            (CPU, "linux"),
+        ] {
+            assert_eq!(identity(provider, os, &none), "", "{provider} {os}");
+        }
+        // Windows: the adapter of the provider's vendor and its driver version.
+        let windows = |driver: &str| {
+            Fixture::default()
+                .adapter(NVIDIA_CARD, driver)
+                .adapter(INTEL_ARC, "32.0.101.6078")
+        };
+        let before = identity(CUDA, "windows", &windows("31.0.15.3623"));
+        assert!(!before.is_empty());
+        assert_eq!(before, identity(CUDA, "windows", &windows("31.0.15.3623")));
+        assert_ne!(before, identity(CUDA, "windows", &windows("32.0.15.6094")));
+        // Another vendor's driver update is not this provider's.
+        assert_eq!(
+            identity(OPENVINO, "windows", &windows("31.0.15.3623")),
+            identity(OPENVINO, "windows", &windows("32.0.15.6094"))
+        );
+        let swapped = Fixture::default().adapter("pci\\ven_10de&dev_2204", "31.0.15.3623");
+        assert_ne!(before, identity(CUDA, "windows", &swapped));
+        // Linux CUDA: the loaded driver's version and each card's model.
+        let linux = |version: &str, model: &str| {
+            Fixture::default()
+                .file("/proc/driver/nvidia/version", version)
+                .file(
+                    "/proc/driver/nvidia/gpus/0000:01:00.0/information",
+                    &format!("Model: \t\t {model}\nIRQ:   \t\t 131\n"),
+                )
+        };
+        let old = identity(CUDA, "linux", &linux("NVRM version: 535.54", "RTX 3080"));
+        assert!(!old.is_empty());
+        assert_ne!(
+            old,
+            identity(CUDA, "linux", &linux("NVRM version: 570.86", "RTX 3080"))
+        );
+        assert_ne!(
+            old,
+            identity(CUDA, "linux", &linux("NVRM version: 535.54", "RTX 4090"))
+        );
+        // Linux OpenVINO: the Intel card and the kernel that carries its driver.
+        let intel = |device: &str, kernel: &str| {
+            Fixture::default()
+                .file("/sys/class/drm/card0/device/vendor", "0x8086\n")
+                .file("/sys/class/drm/card0/device/device", device)
+                .file("/proc/sys/kernel/osrelease", kernel)
+        };
+        let first = identity(OPENVINO, "linux", &intel("0x56a0\n", "6.8.0-45\n"));
+        assert!(!first.is_empty());
+        assert_ne!(
+            first,
+            identity(OPENVINO, "linux", &intel("0x56a0\n", "6.11.0-9\n"))
+        );
+        assert_ne!(
+            first,
+            identity(OPENVINO, "linux", &intel("0xa7a0\n", "6.8.0-45\n"))
+        );
+        // macOS: the system version and build.
+        let mac = |build: &str| {
+            Fixture::default().file("/System/Library/CoreServices/SystemVersion.plist", build)
+        };
+        assert_ne!(
+            identity(COREML, "macos", &mac("15.6 24G84")),
+            identity(COREML, "macos", &mac("15.7 24G222"))
+        );
+        // This computer answers without failing, whatever it has.
+        identity(COREML, std::env::consts::OS, &Fixture::default());
+        let _ = device_identity(CUDA, std::env::consts::OS, &Host);
+        assert!(Host.adapters().len() <= 64);
+    }
+
+    #[test]
+    fn a_remembered_failure_is_retried_after_a_driver_update_a_passing_cause_or_retry_setup() {
+        let root = directory();
+        let manifest = "a".repeat(64);
+        let fallen = |plan: &Plan| chosen(plan)[2].clone();
+        // A qualification failure with the old driver is remembered for that driver...
+        let mut old = plan_on(&root, &manifest, "driver-1");
+        assert!(old.demote("face", "runtime_qualification_failed", true));
+        assert_eq!(
+            fallen(&plan_on(&root, &manifest, "driver-1")),
+            row("face", CPU, Some("runtime_qualification_failed"))
+        );
+        // ...and the provider is tried again once the driver or the card is another.
+        let mut updated = plan_on(&root, &manifest, "driver-2");
+        assert_eq!(fallen(&updated), row("face", COREML, None));
+        assert!(updated.unmeasured("face"));
+        // What the new driver does is what is remembered from then on.
+        assert!(!updated.measured("face", Some(20.0), Some(28.0)));
+        assert!(!plan_on(&root, &manifest, "driver-2").unmeasured("face"));
+        assert!(plan_on(&root, &manifest, "driver-1").unmeasured("face"));
+        // A record saved before results named their device says nothing about this one.
+        let record = root.join("provider-failures.json");
+        std::fs::write(
+            &record,
+            format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{"face":"runtime_qualification_failed"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            fallen(&plan_on(&root, &manifest, "driver-2")),
+            row("face", COREML, None)
+        );
+
+        // A process that missed its readiness deadline moves its workloads to the processor for
+        // this run, without a retry loop, and is tried again at the next start.
+        for code in ["worker_execution_deadline", "runtime_not_ready"] {
+            assert!(passing(code));
+            let mut busy = plan_on(&root, &manifest, "driver-2");
+            assert!(busy.demote_runtime(&manifest, code), "{code}");
+            assert!(!busy.demote_runtime(&manifest, code), "{code}");
+            assert_eq!(fallen(&busy), row("face", CPU, Some(code)));
+            assert_eq!(
+                fallen(&plan_on(&root, &manifest, "driver-2")),
+                row("face", COREML, None),
+                "{code}"
+            );
+        }
+        // A process that died is the provider's failure and is remembered.
+        assert!(!passing("runtime_process_stopped") && !passing("runtime_qualification_timeout"));
+        let mut crashed = plan_on(&root, &manifest, "driver-2");
+        assert!(crashed.demote_runtime(&manifest, "runtime_process_stopped"));
+        let remembered = row("face", CPU, Some("runtime_process_stopped"));
+        assert_eq!(fallen(&plan_on(&root, &manifest, "driver-2")), remembered);
+
+        // Retry Setup forgets it: the provider is tried and measured again.
+        forget(&root);
+        assert!(!record.exists());
+        let retried = plan_on(&root, &manifest, "driver-2");
+        assert_eq!(fallen(&retried), row("face", COREML, None));
+        assert!(retried.unmeasured("face") && retried.unmeasured("clip"));
+        // Nothing to forget is not an error.
+        forget(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_connection_while_asking_for_the_accelerated_offer_is_retried() {
+        // What the worker reconnects after ends the preparation, so the offer is asked again.
+        for code in [
+            "worker_request_interrupted",
+            "server_response_interrupted",
+            "server_unreachable_or_certificate_invalid",
+            "worker_session_renewal_required",
+            "server_http_503",
+        ] {
+            assert!(crate::worker_setup::retryable(code), "{code}");
+            assert_eq!(inventory_failure(code.into()), Err(code.to_owned()));
+        }
+        // An answer that will not change by asking again is why the processor is used.
+        for code in [
+            "worker_model_inventory_invalid",
+            "server_http_400",
+            "server_http_404",
+        ] {
+            assert_eq!(inventory_failure(code.into()), Ok(code.to_owned()));
+        }
+    }
+
+    #[test]
     fn the_best_qualified_provider_is_chosen_and_the_processor_otherwise() {
         let cpu = || (CPU.to_string(), None);
         assert_eq!(
@@ -781,6 +1277,9 @@ mod tests {
         root
     }
     fn plan(root: &Path, manifest: &str) -> Plan {
+        plan_on(root, manifest, "")
+    }
+    fn plan_on(root: &Path, manifest: &str, device: &str) -> Plan {
         Plan::new(
             vec![
                 group("ViT-B-32__openai", CPU),
@@ -790,6 +1289,7 @@ mod tests {
             Some(Offer {
                 provider: COREML.into(),
                 manifest_sha256: manifest.into(),
+                device: device.into(),
                 // The server offers CoreML for search and faces, not for text recognition.
                 groups: vec![
                     group("ViT-B-32__openai", COREML),
@@ -935,7 +1435,7 @@ mod tests {
             format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{"face":"provider_failed"}}}}"#),
         )
         .unwrap();
-        let loaded = Failures::load(&path, &manifest);
+        let loaded = Failures::load(&path, &manifest, "");
         assert_eq!(loaded.get("face"), Some("provider_failed"));
         let any: BTreeSet<String> = ["face:key".to_owned()].into();
         assert!(!loaded.is_faster("face", &any) && !loaded.is_faster("clip", &any));
@@ -944,7 +1444,7 @@ mod tests {
             format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{}},"faster":["clip","video"]}}"#),
         )
         .unwrap();
-        assert!(!Failures::load(&path, &manifest).is_faster("clip", &any));
+        assert!(!Failures::load(&path, &manifest, "").is_faster("clip", &any));
         // A result saved before results named their models still loads (its failures hold) but
         // is not trusted: the workload is measured again.
         std::fs::write(
@@ -952,7 +1452,7 @@ mod tests {
             format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{"ocr":"provider_slower"}},"faster":["face"]}}"#),
         )
         .unwrap();
-        let old = Failures::load(&path, &manifest);
+        let old = Failures::load(&path, &manifest, "");
         assert_eq!(old.get("ocr"), Some("provider_slower"));
         assert!(!old.is_faster("face", &any));
         let mut reopened = plan(&legacy, &manifest);
@@ -968,6 +1468,7 @@ mod tests {
                 Some(Offer {
                     provider: COREML.into(),
                     manifest_sha256: manifest.clone(),
+                    device: String::new(),
                     groups: vec![group("buffalo_l", COREML)],
                 }),
                 None,
@@ -1129,6 +1630,7 @@ mod tests {
             Some(Offer {
                 provider: COREML.into(),
                 manifest_sha256: "a".repeat(64),
+                device: String::new(),
                 groups: vec![group("buffalo_l", COREML)],
             }),
             None,

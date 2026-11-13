@@ -329,6 +329,62 @@ class RuntimeBuilderTests(unittest.TestCase):
         with self.assertRaises(builder.BuildError):
             builder.requirement_block("setuptools>=1\n", "setuptools")
 
+    def test_intel_macos_takes_the_last_onnxruntime_with_a_wheel_for_it(self):
+        # FD-6: the locked onnxruntime publishes no Intel macOS wheel, so that one target
+        # installs one exact, hash-pinned wheel instead; every other target keeps the lock.
+        import json
+
+        profiles = json.loads(
+            (Path(__file__).parent.parent / "runtime/profiles.json").read_text()
+        )["profiles"]
+        cpu = profiles["cpu-ort"]
+        self.assertIn("macos-x86_64", cpu["targets"])
+        pins = builder.target_pins(cpu, "macos-x86_64")
+        self.assertEqual(set(pins), {"onnxruntime"})
+        for name, profile in profiles.items():
+            for target in profile["targets"]:
+                if (name, target) != ("cpu-ort", "macos-x86_64"):
+                    self.assertEqual(builder.target_pins(profile, target), {})
+        locked = (
+            "numpy==2.5.4 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+            "onnxruntime==1.31.0 \\\n    --hash=sha256:" + "b" * 64 + " \\\n"
+            "    --hash=sha256:" + "c" * 64 + "\n"
+            "packaging==26.3 \\\n    --hash=sha256:" + "d" * 64 + "\n"
+        )
+        self.assertEqual(builder.pinned_requirements(locked, {}), locked)
+        pinned = builder.pinned_requirements(locked, pins)
+        self.assertEqual(
+            pinned,
+            "numpy==2.5.4 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+            f"onnxruntime=={pins['onnxruntime']['version']} \\\n"
+            f"    --hash=sha256:{pins['onnxruntime']['sha256']}\n"
+            "packaging==26.3 \\\n    --hash=sha256:" + "d" * 64 + "\n",
+        )
+        builder.validate_requirements(pinned)
+        # A pin replaces a locked package; it cannot add one the source does not use.
+        with self.assertRaises(builder.BuildError):
+            builder.pinned_requirements(locked.replace("onnxruntime", "other"), pins)
+
+    def test_a_target_pin_is_one_exact_version_and_one_wheel_hash(self):
+        good = {"version": "1.23.2", "sha256": "a" * 64}
+        for pin in [
+            {"version": ">=1.23", "sha256": "a" * 64},
+            {"version": "1.23.2", "sha256": "a" * 63},
+            {"version": "1.23.2"},
+            {**good, "url": "https://example.com/onnxruntime.whl"},
+            "1.23.2",
+        ]:
+            with self.assertRaises(builder.BuildError):
+                builder.target_pins(
+                    {"targetPins": {"macos-x86_64": {"onnxruntime": pin}}},
+                    "macos-x86_64",
+                )
+        with self.assertRaises(builder.BuildError):
+            builder.target_pins(
+                {"targetPins": {"macos-x86_64": {"onnxruntime -r x": good}}},
+                "macos-x86_64",
+            )
+
     def test_git_source_bytes_are_canonical_despite_checkout_line_endings(self):
         import shutil
 

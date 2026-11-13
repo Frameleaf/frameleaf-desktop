@@ -38,6 +38,9 @@ test('each workload shows the provider the backend chose and why the processor s
   assert.equal(workloadProvider(providers, 'face'), 'Runs on CPU (GPU acceleration is not used: it did not pass its check on this computer)');
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_device_ineligible' }], 'face'),
     'Runs on CPU (GPU acceleration is not used: this computer has no supported GPU)');
+  // FD-63: a driver known to be too old is named, so the person knows what to do.
+  assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_driver_outdated' }], 'face'),
+    'Runs on CPU (GPU acceleration is not used: the NVIDIA driver is too old; update it to use the GPU)');
   // FD-56: a GPU provider that measured slower than the processor does not keep the workload.
   assert.equal(workloadProvider([{ workload: 'clip', provider: 'CPUExecutionProvider', fallback: 'provider_slower' }], 'clip'),
     'Runs on CPU (GPU acceleration is not used: the processor is faster for this on this computer)');

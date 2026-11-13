@@ -215,7 +215,11 @@ gh workflow run installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
 point to that exact workflow commit and match `package.json`, `Cargo.toml` and
 `tauri.conf.json`. An empty tag retains installer artifacts and skips draft staging.
 The default selection requests macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage.
-Intel macOS runtime dependencies are tracked in [FD-6](https://heroit.atlassian.net/browse/FD-6).
+The Intel macOS runtime ([FD-6](https://heroit.atlassian.net/browse/FD-6)) installs onnxruntime 1.23.2,
+the last release with an Intel macOS wheel, in place of the version the runtime source locks: the
+one wheel is named by version and SHA-256 under `targetPins` in `runtime/profiles.json`, recorded
+in the pack's `provenance.json`, and built and run on the Intel image by the `intel-macos` job of
+`runtime-pack.yml`. Every other dependency and every other target keeps the source lock.
 Choose `all` to include Windows x86-64 NSIS/MSI after Azure Artifact Signing is configured,
 or `linux` to build both Linux architectures independently.
 
@@ -285,7 +289,9 @@ workload with it. The first time with a runtime it also times the same fixtures
 on the processor, without the server: the provider keeps a workload only where
 its warm inference was faster, and that outcome is remembered for the runtime
 (`provider-failures.json`). Slower, failed or not measurable means the processor
-for that workload.
+for that workload. What is remembered is for that runtime with that device and
+driver: a driver update, another card or Retry Setup tries the provider again,
+and a process that was only late to start is not remembered at all.
 `cargo test --lib native_runtime::metal::local_pack -- --ignored` qualifies a
 locally built pack against the catalogue under a throwaway key (see the test for
 its three environment variables).

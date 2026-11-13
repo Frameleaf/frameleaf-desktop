@@ -13,6 +13,74 @@ const RECENT: u64 = 300_000;
 const LIFETIME: u64 = 30 * 86_400_000;
 const WINDOW: u64 = 60_000;
 const REPLY_LIMIT: usize = 65_536;
+/// Manager counts every paired request from one address, whatever it asks, against one
+/// allowance: this many in a window that opens with the first of them. Past it Manager answers
+/// `rate_limited` to all of them, status and start included, until the window closes.
+const PAIRED_REQUESTS: u64 = 120;
+const PAIRED_WINDOW: Duration = Duration::from_secs(600);
+/// The first wait between two looks at something Manager is still doing; each later one is
+/// twice the one before, up to `POLL_STEADY`.
+const POLL_FIRST: Duration = Duration::from_millis(250);
+/// The longest wait between two looks: polling that never ends spends half the allowance.
+const POLL_STEADY: Duration =
+    Duration::from_millis(PAIRED_WINDOW.as_millis() as u64 * 2 / PAIRED_REQUESTS);
+/// How long to wait after the look numbered `asked` (from 0) found Manager still at it.
+fn poll_delay(asked: u32) -> Duration {
+    POLL_FIRST
+        .saturating_mul(1 << asked.min(16))
+        .min(POLL_STEADY)
+}
+/// A refused request, with how long Manager asked this app to wait when it said so.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Refused {
+    pub(crate) code: String,
+    pub(crate) retry_after: Option<Duration>,
+}
+impl<T: Into<String>> From<T> for Refused {
+    fn from(code: T) -> Self {
+        Self {
+            code: code.into(),
+            retry_after: None,
+        }
+    }
+}
+/// Ask Manager on a paired route until it answers, inside its request allowance. Every loop
+/// that waits on a paired route goes through here. `Ok(None)` from `ask` is "not yet" and is
+/// asked again after a growing wait. `manager_rate_limited` says nothing about what was
+/// asked: it is waited out, for as long as Manager said or else the steady wait, and asked
+/// again. Any other refusal ends it. When `deadline` passes without an answer the result is
+/// `unanswered`, never an answer; a wait Manager asked for that ends after it is not begun.
+pub(crate) async fn paced<T, E, F>(
+    deadline: tokio::time::Instant,
+    unanswered: &str,
+    ask: impl Fn() -> F,
+) -> Result<T, String>
+where
+    E: Into<Refused>,
+    F: std::future::Future<Output = Result<Option<T>, E>>,
+{
+    let mut asked = 0;
+    loop {
+        let reply = ask().await.map_err(Into::into);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let wait = match reply {
+            Ok(Some(answer)) => return Ok(answer),
+            Ok(None) => poll_delay(asked),
+            Err(Refused { code, retry_after }) if code == "manager_rate_limited" => {
+                if retry_after.is_some_and(|wait| wait > remaining) {
+                    return Err(unanswered.into());
+                }
+                retry_after.unwrap_or(POLL_STEADY).max(poll_delay(asked))
+            }
+            Err(refused) => return Err(refused.code),
+        };
+        if remaining.is_zero() {
+            return Err(unanswered.into());
+        }
+        asked += 1;
+        tokio::time::sleep(wait.min(remaining)).await;
+    }
+}
 /// Status and backup lists grow with history; 1,000 backup entries alone exceed 64 KiB.
 const LIST_LIMIT: usize = 1024 * 1024;
 const SCOPES: [Scope; 5] = [
@@ -773,31 +841,53 @@ pub async fn send(
     identity: &DeviceIdentity,
     command: Command,
 ) -> Result<Value, String> {
-    let request = prepare(
-        saved,
-        identity,
-        &command,
-        clock()?,
-        &Uuid::new_v4().to_string(),
-    )?;
-    let limit = if matches!(command, Command::Status {} | Command::Backups {}) {
-        LIST_LIMIT
-    } else {
-        REPLY_LIMIT
-    };
-    let value = reply_limit(
-        saved_client(saved)?
+    send_paced(saved, identity, command)
+        .await
+        .map_err(|refused| refused.code)
+}
+/// Manager's `Retry-After`, in whole seconds, on the reply that refused a request.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse().ok().map(Duration::from_secs)
+}
+/// `send` for a caller that waits on Manager with `paced`: a refusal keeps how long Manager
+/// asked this app to wait.
+pub(crate) async fn send_paced(
+    saved: &SavedManager,
+    identity: &DeviceIdentity,
+    command: Command,
+) -> Result<Value, Refused> {
+    let mut wait = None;
+    let sent = async {
+        let request = prepare(
+            saved,
+            identity,
+            &command,
+            clock()?,
+            &Uuid::new_v4().to_string(),
+        )?;
+        let limit = if matches!(command, Command::Status {} | Command::Backups {}) {
+            LIST_LIMIT
+        } else {
+            REPLY_LIMIT
+        };
+        let response = saved_client(saved)?
             .post(format!("{}{}", saved.origin, request.path))
             .header("content-type", "application/json")
             .header("x-frameleaf-manager-proof", request.proof)
             .body(request.body)
             .send()
             .await
-            .map_err(|_| "manager_unreachable_or_certificate_invalid")?,
-        limit,
-    )
-    .await?;
-    validate_reply(saved, &command, value)
+            .map_err(|_| "manager_unreachable_or_certificate_invalid")?;
+        wait = retry_after(response.headers());
+        let value = reply_limit(response, limit).await?;
+        validate_reply(saved, &command, value)
+    }
+    .await;
+    sent.map_err(|code: String| Refused {
+        code,
+        retry_after: wait,
+    })
 }
 async fn grant_action(
     saved: &SavedManager,
