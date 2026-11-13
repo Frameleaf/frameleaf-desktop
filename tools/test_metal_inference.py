@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,6 +41,8 @@ class Collector:
         }
 
 
+# The adapter only ever runs on macOS; its fixtures use POSIX absolute model paths.
+@unittest.skipIf(os.name == "nt", "the CoreML adapter binds POSIX model paths")
 class MetalInferenceTests(unittest.TestCase):
     def setUp(self):
         path = Path(__file__).resolve().parent.parent / "runtime/metal_inference.py"
