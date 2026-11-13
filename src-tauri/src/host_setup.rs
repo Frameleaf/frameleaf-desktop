@@ -15,6 +15,7 @@ use std::{
 };
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct View {
     state: String,
@@ -986,6 +987,9 @@ where
 /// or a renewed certificate, then settle its TLS identity in the keystore. A failure never
 /// stops a running library; the next start does both again.
 fn settle_identity(running: &mut Running) {
+    // Manager is ready on the ports this start chose. If saying so fails, they stay marked
+    // as unconfirmed and the next start that comes up on them says it again.
+    let _ = running.manager.confirm_ports();
     let followed = if running.features.ports || running.features.tls_rotation {
         let replaced = running.manager.replaced_certificates().to_vec();
         follow_grant(
@@ -2288,6 +2292,11 @@ fn launch(
         })
     }
 }
+
+/// Opt-in, against a real installed companion: see `tools/manager_e2e/README.md`.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "host_setup_manager_e2e.rs"]
+mod manager_e2e;
 
 #[cfg(test)]
 mod tests {
