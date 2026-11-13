@@ -22,6 +22,10 @@ pub(crate) struct SetupStatus {
     pub workloads: Vec<WorkloadStatus>,
     pub active_workload: Option<String>,
     pub models: Option<ModelProgress>,
+    /// Tasks finished since the worker last started; read-only, for the status display.
+    pub completed_tasks: u64,
+    /// FD-52: the provider each workload runs on, and why when the processor stands in.
+    pub providers: Vec<crate::provider_selection::WorkloadProvider>,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +75,8 @@ impl Progress {
                 models.download = None;
                 models
             }),
+            completed_tasks: current.completed_tasks,
+            providers: current.providers.clone(),
         };
         if *current == status {
             return;
@@ -91,6 +97,9 @@ impl Progress {
             drop(status);
             (self.notify)(snapshot);
         }
+    }
+    fn completed(&self) {
+        self.update(|status| status.completed_tasks += 1);
     }
     fn active(&self, workload: Option<&str>) {
         self.update(|status| status.active_workload = workload.map(str::to_owned));
@@ -139,6 +148,21 @@ pub(crate) struct WorkerSetup {
 impl WorkerSetup {
     pub fn status(&self) -> SetupStatus {
         self.status.lock().unwrap().clone()
+    }
+    /// A worker task is running and has not given up: it keeps its own session current.
+    pub(crate) async fn running(&self) -> bool {
+        !self.parked()
+            && self
+                .running
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|running| !running.task.inner().is_finished())
+    }
+    /// The worker gave up and waits for Retry Setup. The saved session may be one the server has
+    /// fenced since, so a retry starts from a newly issued session instead of replaying it.
+    fn parked(&self) -> bool {
+        self.status.lock().unwrap().state == "setup-needs-attention"
     }
     pub fn pause(&self) -> SetupStatus {
         self.user_paused.store(true, Ordering::Release);
@@ -233,9 +257,17 @@ impl WorkerSetup {
         allow_download: bool,
         notify: Arc<dyn Fn(SetupStatus) + Send + Sync>,
     ) {
+        let fresh = self.parked();
+        if fresh {
+            // FD-64: Retry Setup also tries a GPU provider that was remembered as failed.
+            crate::provider_selection::forget(&paths.data);
+        }
         self.start_work(notify, move |progress| async move {
-            loop {
-                let result = reconnect(&progress, |refresh| {
+            let server = saved.server.clone();
+            supervise(
+                &progress,
+                fresh,
+                |refresh| {
                     let saved = saved.clone();
                     let paths = paths.clone();
                     let progress = progress.clone();
@@ -246,33 +278,118 @@ impl WorkerSetup {
                         }
                         prepare(saved, paths, allow_download, progress).await
                     }
-                })
-                .await;
-                if !matches!(&result, Err(code) if code == "worker_no_eligible_workloads") {
-                    return result;
-                }
-                // An administrator can assign work at any time: ask the server again later.
-                progress.set(
-                    "no-eligible-work",
-                    Some("worker_no_eligible_workloads".into()),
-                );
-                recheck_after(&progress, NO_WORK_RECHECK).await?;
-            }
+                },
+                || {
+                    let server = server.clone();
+                    async move {
+                        tauri::async_runtime::spawn_blocking(move || network_route(&server))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                },
+                ROUTE_POLL,
+            )
+            .await
         })
         .await;
     }
 }
 
 const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
+const POLICY_RECHECK: Duration = Duration::from_secs(5 * 60);
+const ROUTE_POLL: Duration = Duration::from_secs(5);
+
+/// Keep the worker going across everything the server may change under it: lost connections and
+/// fenced sessions reconnect, and refusals an administrator or the network can lift are waited out.
+async fn supervise<F, Fut, R, RFut>(
+    progress: &Progress,
+    mut fresh: bool,
+    mut attempt: F,
+    mut route: R,
+    route_poll: Duration,
+) -> Result<(), String>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+    R: FnMut() -> RFut,
+    RFut: Future<Output = Option<std::net::IpAddr>>,
+{
+    loop {
+        let result = reconnect(progress, fresh, &mut attempt).await;
+        fresh = false;
+        match result {
+            // An administrator can assign work at any time: ask the server again later.
+            Err(code) if code == "worker_no_eligible_workloads" => {
+                progress.set("no-eligible-work", Some(code));
+                recheck_after(progress, NO_WORK_RECHECK).await?;
+            }
+            // The server will not use this computer for now: its owner turned helping off, or
+            // this computer left the home network. Either can change without anyone opening the app.
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "worker_policy_required" | "worker_lan_required"
+                ) =>
+            {
+                progress.set("paused", Some(code));
+                recheck_after_or_route_change(progress, POLICY_RECHECK, &mut route, route_poll)
+                    .await?;
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Wait out the period, and any user pause beyond it; Stop or a new start cancels the wait.
 async fn recheck_after(progress: &Progress, period: Duration) -> Result<(), String> {
+    recheck_after_or_route_change(progress, period, &mut || async { None }, Duration::MAX).await
+}
+
+/// As `recheck_after`, ended early when the route to the server changes (another network, a VPN).
+async fn recheck_after_or_route_change<R, RFut>(
+    progress: &Progress,
+    period: Duration,
+    route: &mut R,
+    poll: Duration,
+) -> Result<(), String>
+where
+    R: FnMut() -> RFut,
+    RFut: Future<Output = Option<std::net::IpAddr>>,
+{
     let started = std::time::Instant::now();
+    let initial = route().await;
+    let mut polled = std::time::Instant::now();
     while started.elapsed() < period || progress.user_paused.load(Ordering::Acquire) {
         check_cancel(&progress.cancelled)?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(250).min(poll)).await;
+        if polled.elapsed() >= poll && !progress.user_paused.load(Ordering::Acquire) {
+            polled = std::time::Instant::now();
+            if route().await != initial {
+                break;
+            }
+        }
     }
-    Ok(())
+    check_cancel(&progress.cancelled)
+}
+
+/// The local address this computer would use to reach the server. It changes when the network
+/// does; nothing is sent to find it.
+fn network_route(server: &str) -> Option<std::net::IpAddr> {
+    let target = crate::connection::normalize_server(server)
+        .ok()?
+        .socket_addrs(|| None)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .ok()?;
+    socket.connect(target).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
 }
 
 pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
@@ -370,11 +487,28 @@ impl WakeClock {
         resumed
     }
 }
+const TASK_FAILURE_LIMIT: u32 = 5;
+/// One bad task is dropped and the next is claimed; an unbroken run of them parks the worker.
+#[derive(Default)]
+struct TaskFailures(u32);
+impl TaskFailures {
+    fn completed(&mut self) {
+        self.0 = 0;
+    }
+    /// The pause before the next claim, or the code to park with once the run reaches the limit.
+    fn dropped(&mut self, code: String) -> Result<Duration, String> {
+        self.0 += 1;
+        if self.0 >= TASK_FAILURE_LIMIT {
+            return Err(code);
+        }
+        Ok(reconnect_delay(self.0, rand::random()))
+    }
+}
 fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
     let base = (1u64 << attempt.min(5)).min(30) * 1000;
     Duration::from_millis(base + entropy % (base + 1))
 }
-fn retryable(error: &str) -> bool {
+pub(crate) fn retryable(error: &str) -> bool {
     matches!(
         error,
         "worker_request_interrupted"
@@ -384,6 +518,11 @@ fn retryable(error: &str) -> bool {
             | "model_download_unavailable"
             | "model_download_interrupted"
             | "worker_session_renewal_required"
+            // The server ended this worker session (a household change fences the device) or the
+            // policy the work ran under: a newly issued session and qualification carry on. If the
+            // device itself is refused, issuing that session fails and the worker stops there.
+            | "worker_session_rejected"
+            | "worker_policy_changed"
             | "worker_lease_expired"
             | "worker_lease_lost"
             | "worker_execution_deadline"
@@ -399,10 +538,10 @@ fn retryable(error: &str) -> bool {
 }
 async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String>>>(
     progress: &Progress,
+    mut refresh: bool,
     mut attempt: F,
 ) -> Result<(), String> {
     let mut retries = 0u32;
-    let mut refresh = false;
     loop {
         wait_for_user(progress, || async { Ok(()) }).await?;
         let error = match attempt(refresh).await {
@@ -443,7 +582,20 @@ async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
     let worker = crate::transport::issue_worker_session(&client, saved).await?;
     crate::credentials::save("worker-session", &worker)
 }
-async fn resource_loss(required_memory: u64, clock: &WakeClock) -> String {
+/// FD-64: what stopped a qualification or a measurement, if anything. `Ok` is a pause for power,
+/// memory or sleep, to wait out and qualify again; `Err` ends the preparation with that code.
+fn interruption(resumed: bool, interrupted: Option<String>) -> Option<Result<String, String>> {
+    if resumed {
+        return Some(Ok("system_resumed".into()));
+    }
+    let reason = interrupted?;
+    Some(match reason.strip_prefix("resource_") {
+        Some(pause) => Ok(pause.into()),
+        None => Err(reason),
+    })
+}
+/// Watches work whose models are already loaded: the memory floor was applied when it was admitted.
+async fn resource_loss(clock: &WakeClock) -> String {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         if clock.observe(std::time::SystemTime::now()) {
@@ -451,7 +603,7 @@ async fn resource_loss(required_memory: u64, clock: &WakeClock) -> String {
         }
         match tauri::async_runtime::spawn_blocking(crate::resource_policy::sample).await {
             Ok(status) => {
-                if let Some(reason) = status.refusal(required_memory) {
+                if let Some(reason) = status.refusal_while_loaded() {
                     return reason.into();
                 }
             }
@@ -658,7 +810,7 @@ pub(crate) fn inventory_profiles(
 /// Whether the app's bundled runtime should replace the active one. The bundle is only read here,
 /// not trusted: activation verifies its signature and refuses a reused or rolled-back epoch, so a
 /// rebuilt runtime that kept its epoch fails visibly instead of leaving the old runtime running.
-fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) -> bool {
+pub(crate) fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     if format!("{:x}", Sha256::digest(manifest)) == active_sha256 {
         return false;
@@ -669,7 +821,79 @@ fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest: &[u8]) ->
         .is_none_or(|epoch| epoch >= active_epoch)
 }
 
+/// The two macOS floors the release checks enforce (`tools/check_macos_minimum.py`), read at
+/// build time so the app and the checks cannot disagree.
+const MACOS_MINIMUMS: &str = include_str!("../../packaging/macos/minimum-versions.json");
+fn os_version(text: &str) -> Option<(u64, u64)> {
+    let mut parts = text.trim().split('.').map(|part| part.parse::<u64>().ok());
+    Some((parts.next()??, parts.next().unwrap_or(Some(0))?))
+}
+/// The oldest macOS the AI runtime pack runs on. The app itself runs on older ones.
+fn ai_runtime_macos_floor() -> Option<(u64, u64)> {
+    serde_json::from_str::<serde_json::Value>(MACOS_MINIMUMS)
+        .ok()?
+        .get("aiRuntime")?
+        .as_str()
+        .and_then(os_version)
+}
+/// The macOS this app is running on; `None` on other systems or when it cannot be read.
+fn running_macos() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut text = [0u8; 32];
+        let mut length = text.len();
+        // SAFETY: the name is NUL-terminated and `length` is the size of `text`, which the
+        // kernel fills with at most that many bytes and reports back in `length`.
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.osproductversion".as_ptr(),
+                text.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        let text = text.get(..length).filter(|_| read)?;
+        os_version(std::str::from_utf8(text).ok()?.trim_end_matches('\0'))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+/// Refuse AI processing on a macOS older than the runtime pack needs, where the runtime would
+/// only fail to load. FD-64: on macOS a version or a floor that cannot be read is not known to
+/// be supported, so nothing is installed or downloaded; other systems have no such floor.
+fn runtime_os_supported(
+    os: &str,
+    running: Option<(u64, u64)>,
+    floor: Option<(u64, u64)>,
+) -> Result<(), String> {
+    if os != "macos" {
+        return Ok(());
+    }
+    match (running, floor) {
+        (Some(running), Some(floor)) if running >= floor => Ok(()),
+        (Some(_), Some(_)) => Err("runtime_os_unsupported".into()),
+        _ => Err("runtime_os_unknown".into()),
+    }
+}
+
 async fn prepare(
+    saved: SavedConnection,
+    paths: SetupPaths,
+    allow_download: bool,
+    progress: Progress,
+) -> Result<(), String> {
+    let os_supported = runtime_os_supported(
+        std::env::consts::OS,
+        running_macos(),
+        ai_runtime_macos_floor(),
+    );
+    prepare_on(os_supported, saved, paths, allow_download, progress).await
+}
+async fn prepare_on(
+    os_supported: Result<(), String>,
     saved: SavedConnection,
     paths: SetupPaths,
     allow_download: bool,
@@ -677,15 +901,18 @@ async fn prepare(
 ) -> Result<(), String> {
     use crate::{
         ml_transport::WorkerTransport,
+        native_predictor::Step,
         release_policy::open_runtime_store,
         runtime_store::{private_directory, read_bounded},
         transport,
     };
+    // Before anything is created, installed, downloaded or started.
+    os_supported?;
     progress.update(|status| status.models = None);
     progress.set("preparing-runtime", None);
     let cancelled = progress.cancelled.clone();
-    let data = paths.data.clone();
-    let (mut installed, attestation) = tauri::async_runtime::spawn_blocking(move || {
+    let (data, bundle) = (paths.data.clone(), paths.bundle.clone());
+    let (installed, attestation) = tauri::async_runtime::spawn_blocking(move || {
         check_cancel(&cancelled)?;
         let mut missing = Vec::new();
         let mut parent = data.as_path();
@@ -700,15 +927,15 @@ async fn prepare(
         private_directory(&data)?;
         private_directory(&data.join("models"))?;
         private_directory(&data.join("scratch"))?;
-        if !paths.bundle.exists()
+        if !bundle.exists()
             && matches!(std::fs::symlink_metadata(data.join("runtimes/active.json")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
             return Err("runtime_pack_unavailable".into());
         }
         let store = open_runtime_store(&data.join("runtimes"))?;
         let active = store.load_active()?;
-        let bundled = if paths.bundle.exists() {
-            Some(read_bounded(&paths.bundle.join("manifest.json"), 8 * 1024 * 1024)?)
+        let bundled = if bundle.exists() {
+            Some(read_bounded(&bundle.join("manifest.json"), 8 * 1024 * 1024)?)
         } else {
             None
         };
@@ -724,10 +951,10 @@ async fn prepare(
             (active, Some(manifest)) => {
                 // Release the shared lease first: activation takes the store's exclusive lock.
                 drop(active);
-                let signature: [u8; 64] = read_bounded(&paths.bundle.join("manifest.sig"), 64)?
+                let signature: [u8; 64] = read_bounded(&bundle.join("manifest.sig"), 64)?
                     .try_into()
                     .map_err(|_| "runtime_signature_invalid")?;
-                store.install_and_activate(&paths.bundle.join("payload"), &manifest, &signature)?;
+                store.install_and_activate(&bundle.join("payload"), &manifest, &signature)?;
                 store.load_active()?.ok_or("runtime_activation_failed")?
             }
             (_, None) => return Err("runtime_pack_unavailable".into()),
@@ -763,6 +990,12 @@ async fn prepare(
     if groups.is_empty() {
         return Err("worker_no_eligible_workloads".into());
     }
+    // FD-52: an accelerated runtime beside the processor one, where the app ships one this
+    // computer can use. Any fault on that side leaves every workload on the processor.
+    let (accelerated, mut plan) =
+        crate::provider_selection::open(&paths, &installed, &worker, groups.clone()).await?;
+    let mut installed =
+        crate::provider_selection::Runtimes::new(installed, attestation, accelerated);
     let profiles: Vec<_> = groups.iter().flatten().cloned().collect();
     let network = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
         .await
@@ -814,7 +1047,11 @@ async fn prepare(
         .await?;
         caches.push(cache);
     }
+    let mut failures = TaskFailures::default();
     'qualification: loop {
+        // The provider chosen for each workload; a failed provider is demoted and this restarts.
+        let groups = plan.groups();
+        progress.update(|status| status.providers = plan.providers());
         let mut prepared = Vec::new();
         let mut accepted_profiles = Vec::new();
         let mut accepted_caches = Vec::new();
@@ -843,7 +1080,7 @@ async fn prepare(
                 let challenge = match cancellable(
                     worker.request_qualification(
                         profile,
-                        &attestation,
+                        installed.attestation(profile.provider())?,
                         &uuid::Uuid::new_v4().to_string(),
                     ),
                     &progress.cancelled,
@@ -852,6 +1089,9 @@ async fn prepare(
                 {
                     Ok(value) => value,
                     Err(code) if code.starts_with("workload_desktop_") => {
+                        if plan.demote(workload, &code, false) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -860,19 +1100,15 @@ async fn prepare(
                 let spec = challenge.specification().to_vec();
                 let fixture = challenge.fixture().to_vec();
                 let scratch = paths.data.join("scratch");
+                let provider = profile.provider().to_owned();
                 let clock = WakeClock::new();
                 let ((runtime, qualified), interrupted) = monitored_preparation(
                     move |cancel| {
-                        let qualified =
-                            installed.qualify(&cache, &scratch, &spec, &fixture, &cancel);
+                        let qualified = installed
+                            .qualify(&provider, &cache, &scratch, &spec, &fixture, &cancel);
                         (installed, qualified)
                     },
-                    async {
-                        format!(
-                            "resource_{}",
-                            resource_loss(profile.minimum_memory(), &clock).await
-                        )
-                    },
+                    async { format!("resource_{}", resource_loss(&clock).await) },
                     || worker.maintain_session(),
                     &progress.cancelled,
                 )
@@ -900,6 +1136,9 @@ async fn prepare(
                                 | "runtime_qualification_report_invalid"
                         ) =>
                     {
+                        if plan.demote(workload, &code, true) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -913,6 +1152,9 @@ async fn prepare(
                 {
                     Ok(true) => {}
                     Ok(false) => {
+                        if plan.demote(workload, "worker_qualification_refused", false) {
+                            continue 'qualification;
+                        }
                         progress.workload(
                             workload,
                             "unavailable",
@@ -921,6 +1163,9 @@ async fn prepare(
                         continue 'workload;
                     }
                     Err(code) if code.starts_with("workload_desktop_") => {
+                        if plan.demote(workload, &code, false) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -934,6 +1179,9 @@ async fn prepare(
                 {
                     Ok(value) => value,
                     Err(code) if code.starts_with("workload_desktop_") => {
+                        if plan.demote(workload, &code, false) {
+                            continue 'qualification;
+                        }
                         progress.workload(workload, "unavailable", Some(code));
                         continue 'workload;
                     }
@@ -950,6 +1198,73 @@ async fn prepare(
                     eprintln!("worker_qualification_evidence_failed: {code}");
                 }
                 group_prepared.push((qualified, accepted));
+            }
+            // FD-56: an accelerated provider keeps a workload only where it measured faster than
+            // the processor here. Measured once per runtime epoch, on the same fixtures, without
+            // the server; anything that stops the measurement leaves the processor in charge.
+            if plan.unmeasured(workload) {
+                let accelerated_ms = crate::provider_selection::warm_milliseconds(
+                    group_prepared
+                        .iter()
+                        .map(|(qualified, _)| qualified.report()),
+                );
+                let twins: Vec<_> = plan
+                    .cpu_group(workload)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|profile| {
+                        let index = profiles
+                            .iter()
+                            .position(|item| item.model_key() == profile.model_key())?;
+                        Some((profile.clone(), caches[index].clone()))
+                    })
+                    .collect();
+                let scratch = paths.data.join("scratch");
+                let clock = WakeClock::new();
+                let ((runtime, cpu_ms), interrupted) = monitored_preparation(
+                    move |cancel| {
+                        let mut qualified = Vec::new();
+                        for (profile, cache) in &twins {
+                            let measured = profile
+                                .challenge(&uuid::Uuid::new_v4().to_string())
+                                .and_then(|(spec, fixture)| {
+                                    installed.qualify(
+                                        crate::provider_selection::CPU,
+                                        cache,
+                                        &scratch,
+                                        &spec,
+                                        &fixture,
+                                        &cancel,
+                                    )
+                                });
+                            match measured {
+                                Ok(value) => qualified.push(value),
+                                Err(_) => return (installed, None),
+                            }
+                        }
+                        let total = crate::provider_selection::warm_milliseconds(
+                            qualified.iter().map(|value| value.report()),
+                        );
+                        (installed, total)
+                    },
+                    async { format!("resource_{}", resource_loss(&clock).await) },
+                    || worker.maintain_session(),
+                    &progress.cancelled,
+                )
+                .await?;
+                installed = runtime;
+                check_cancel(&progress.cancelled)?;
+                // FD-64: a pause for power, memory or sleep measured nothing. Wait it out and
+                // qualify again, as above, instead of giving the workload to the processor.
+                if let Some(stopped) =
+                    interruption(clock.observe(std::time::SystemTime::now()), interrupted)
+                {
+                    progress.set("paused", Some(stopped?));
+                    continue 'qualification;
+                }
+                if plan.measured(workload, accelerated_ms, cpu_ms) {
+                    continue 'qualification;
+                }
             }
             prepared.extend(group_prepared);
             accepted_profiles.extend(group.iter().cloned());
@@ -979,6 +1294,27 @@ async fn prepare(
         })
         .await
         .map_err(|_| "worker_cache_publish_failed")??;
+        // Best effort: reclaim superseded model revisions and abandoned staging.
+        let models = paths.data.join("models");
+        let referenced = profiles
+            .iter()
+            .map(|profile| profile.cache_identity().2.to_owned())
+            .collect();
+        // FD-52: and runtime packs, combined model sets and scratch nothing can use any more.
+        let (data, bundle, set) = (paths.data.clone(), paths.bundle.clone(), cache.clone());
+        let active_runtime = installed.cpu().manifest_sha256().to_owned();
+        let accelerated_runtime = installed
+            .accelerated()
+            .map(|runtime| runtime.manifest_sha256().to_owned());
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let now = std::time::SystemTime::now();
+            let _ = crate::model_cache::prune(&models, &referenced, now);
+            if let Some(active) = accelerated_runtime {
+                crate::provider_selection::reclaim_superseded(&data, &bundle, &active);
+            }
+            crate::release_policy::reclaim_superseded(&data, &bundle, &active_runtime, &set, now)
+        })
+        .await;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
@@ -1005,9 +1341,7 @@ async fn prepare(
                         .iter()
                         .map(|(proof, accepted)| (proof, accepted))
                         .collect();
-                    let predictor = crate::native_predictor::NativePredictor::start_many(
-                        &installed, &bindings, &cache, &scratch, port,
-                    )?;
+                    let predictor = installed.start(&bindings, &cache, &scratch, port)?;
                     Ok::<_, String>((installed, prepared, predictor))
                 })
                 .await
@@ -1034,7 +1368,9 @@ async fn prepare(
                     progress.set("paused", Some("user_paused".into()));
                     break;
                 }
-                if let Some(reason) = resources.refusal(required_memory) {
+                // The models are loaded: only power and network can refuse now. Memory was checked
+                // at admission, and this process's own models must not count against its floor.
+                if let Some(reason) = resources.refusal_while_loaded() {
                     // Release model memory before waiting, otherwise the warm process can prevent recovery.
                     predictor.stop()?;
                     progress.set("paused", Some(reason.into()));
@@ -1052,14 +1388,45 @@ async fn prepare(
                 let completed = cancellable(async {
                     tokio::select! {
                         biased;
-                        reason = resource_loss(required_memory, &clock) => Err(format!("resource_{reason}")),
+                        reason = resource_loss(&clock) => Err(format!("resource_{reason}")),
                         result = predictor.execute_next_with_activity(&worker, &accepted, &mut cancel, |workload| progress.active(Some(workload))) => result,
                     }
                 }, &progress.cancelled).await;
                 progress.active(None);
                 match completed {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Step::Completed) => {
+                        failures.completed();
+                        progress.completed();
+                    }
+                    Ok(Step::Dropped(code)) => {
+                        // FD-52: the accelerated runtime's process died while inferring: its
+                        // workloads move to the processor instead of crashing on every restart.
+                        let lane = predictor.failed_lane().map(str::to_owned);
+                        if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                            predictor.stop()?;
+                            continue 'qualification;
+                        }
+                        let delay = match failures.dropped(code) {
+                            Ok(delay) => delay,
+                            Err(code) => {
+                                predictor.stop()?;
+                                return Err(code);
+                            }
+                        };
+                        cancellable(
+                            async {
+                                tokio::time::sleep(delay).await;
+                                Ok(())
+                            },
+                            &progress.cancelled,
+                        )
+                        .await?;
+                        if !predictor.is_running()? {
+                            // Inference was cut short: load the models again before the next claim.
+                            break;
+                        }
+                    }
+                    Ok(Step::Idle) => {
                         progress.set("waiting-for-work", None);
                         cancellable(
                             async {
@@ -1078,7 +1445,18 @@ async fn prepare(
                         }
                         break;
                     }
-                    Err(reason) => return Err(reason),
+                    Err(reason) => {
+                        // FD-52: the accelerated runtime's process did not serve: use the
+                        // processor for its workloads instead of failing the worker. A stop
+                        // or sign-out while it was starting is not a provider failure.
+                        check_cancel(&progress.cancelled)?;
+                        let lane = predictor.failed_lane().map(str::to_owned);
+                        if lane.is_some_and(|lane| plan.demote_runtime(&lane, &reason)) {
+                            predictor.stop()?;
+                            continue 'qualification;
+                        }
+                        return Err(reason);
+                    }
                 }
             }
         }
@@ -1116,6 +1494,26 @@ mod tests {
             root.join("debug/native-runtime")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn finished_tasks_are_counted_and_survive_state_changes() {
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(SetupStatus::default())),
+            notify: Arc::new(|_| {}),
+        };
+        progress.set("working", None);
+        progress.completed();
+        progress.completed();
+        progress.set("waiting-for-work", None);
+        progress.set("paused", Some("memory_low".into()));
+        let status = progress.status.lock().unwrap().clone();
+        assert_eq!(status.completed_tasks, 2);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["completedTasks"],
+            serde_json::json!(2)
+        );
     }
     #[test]
     fn global_progress_preserves_independent_workload_results() {
@@ -1274,7 +1672,7 @@ mod tests {
         let client = crate::transport::client().unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
-            reconnect(&progress, |refresh| {
+            reconnect(&progress, false, |refresh| {
                 let number = attempts.fetch_add(1, Ordering::AcqRel);
                 assert_eq!(refresh, number != 0);
                 let request = client.get(&url);
@@ -1294,13 +1692,35 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Acquire), 2);
     }
     #[tokio::test]
-    async fn authorization_identity_and_binding_failures_are_not_retried() {
+    async fn a_fenced_worker_session_is_reissued_but_a_refused_device_or_identity_is_not_retried() {
         let progress = Progress {
             user_paused: Arc::default(),
             cancelled: Arc::default(),
             status: Arc::default(),
             notify: Arc::new(|_| {}),
         };
+        // The server ended the session or the policy mid-loop: issue a new session and carry on.
+        for error in ["worker_session_rejected", "worker_policy_changed"] {
+            let refreshes = std::sync::Mutex::new(Vec::new());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                reconnect(&progress, false, |refresh| {
+                    refreshes.lock().unwrap().push(refresh);
+                    async move {
+                        if refresh {
+                            Ok(())
+                        } else {
+                            Err(error.into())
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(*refreshes.lock().unwrap(), [false, true], "{error}");
+        }
+        // Issuing the session is what proves the device: when that is refused, nothing is retried.
         for error in [
             "server_http_401",
             "server_http_403",
@@ -1312,7 +1732,7 @@ mod tests {
             "server_model_not_supported",
         ] {
             let attempts = std::sync::atomic::AtomicUsize::new(0);
-            let result = reconnect(&progress, |_| {
+            let result = reconnect(&progress, false, |_| {
                 attempts.fetch_add(1, Ordering::AcqRel);
                 async { Err(error.into()) }
             })
@@ -1333,7 +1753,7 @@ mod tests {
                     let _ = tx.send(value);
                 }),
                 move |progress| async move {
-                    reconnect(&progress, |_| {
+                    reconnect(&progress, false, |_| {
                         attempts.fetch_add(1, Ordering::AcqRel);
                         async { Err("worker_request_interrupted".into()) }
                     })
@@ -1357,7 +1777,7 @@ mod tests {
                     let _ = tx.send(value);
                 }),
                 move |progress| async move {
-                    reconnect(&progress, |_| {
+                    reconnect(&progress, false, |_| {
                         attempts.fetch_add(1, Ordering::AcqRel);
                         async { Err("worker_request_interrupted".into()) }
                     })
@@ -1511,7 +1931,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn interrupted_http_acquisition_removes_partial_weights() {
+    async fn interrupted_http_acquisition_never_publishes_partial_weights() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -1567,12 +1987,17 @@ mod tests {
         .await;
         let _ = stop_tx.send(());
         server.join().unwrap();
-        let files = std::fs::read_dir(&root).unwrap().count();
+        let files: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap_err(), "model_download_permission_required");
+        // FD-39: the partial is kept for a Range resume; it is never published unverified.
         assert_eq!(
-            files, 0,
-            "interrupted model must not leave partial or published weights"
+            files,
+            [format!(".download-{}", "0".repeat(64)).as_str()],
+            "interrupted model must leave only its resumable partial"
         );
     }
     #[tokio::test]
@@ -1746,6 +2171,197 @@ mod tests {
         assert!(renewals.load(Ordering::Acquire) > 0);
         assert_eq!(setup.status(), SetupStatus::default());
     }
+    #[test]
+    fn the_ai_runtime_floor_is_the_declared_one_and_only_an_older_macos_is_refused() {
+        let declared: serde_json::Value = serde_json::from_str(MACOS_MINIMUMS).unwrap();
+        let floor = ai_runtime_macos_floor().expect("aiRuntime is declared as major.minor");
+        assert_eq!(
+            format!("{}.{}", floor.0, floor.1),
+            declared["aiRuntime"].as_str().unwrap()
+        );
+        assert!(floor > os_version(declared["app"].as_str().unwrap()).unwrap());
+        assert_eq!(os_version("15.6.1"), Some((15, 6)));
+        assert_eq!(os_version("26\n"), Some((26, 0)));
+        assert_eq!(os_version("fifteen"), None);
+        let refused = Err("runtime_os_unsupported".to_string());
+        assert_eq!(
+            runtime_os_supported("macos", Some((floor.0 - 1, 9)), Some(floor)),
+            refused
+        );
+        assert_eq!(
+            runtime_os_supported("macos", Some((11, 0)), Some(floor)),
+            refused
+        );
+        assert_eq!(
+            runtime_os_supported("macos", Some(floor), Some(floor)),
+            Ok(())
+        );
+        assert_eq!(
+            runtime_os_supported("macos", Some((floor.0 + 1, 0)), Some(floor)),
+            Ok(())
+        );
+        // FD-64: on macOS a version or a floor that could not be read is not known to be
+        // supported, so setup stops with its own code instead of installing on a guess.
+        let unknown = Err("runtime_os_unknown".to_string());
+        assert_eq!(runtime_os_supported("macos", None, Some(floor)), unknown);
+        assert_eq!(runtime_os_supported("macos", Some((26, 0)), None), unknown);
+        assert_eq!(runtime_os_supported("macos", None, None), unknown);
+        // Other systems have no such floor, whatever is or is not read there.
+        for os in ["windows", "linux"] {
+            assert_eq!(runtime_os_supported(os, None, Some(floor)), Ok(()));
+            assert_eq!(runtime_os_supported(os, None, None), Ok(()));
+            assert_eq!(runtime_os_supported(os, Some((11, 0)), Some(floor)), Ok(()));
+        }
+        // The Mac this suite runs on is read and decided, never unknown.
+        #[cfg(target_os = "macos")]
+        assert_ne!(
+            runtime_os_supported("macos", running_macos(), ai_runtime_macos_floor()),
+            unknown
+        );
+        assert!(!retryable("runtime_os_unknown"));
+        #[cfg(target_os = "macos")]
+        assert!(running_macos().is_some_and(|version| version >= (11, 0)));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(running_macos(), None);
+        // It stops for the person: the worker never retries it by itself.
+        assert!(!retryable("runtime_os_unsupported"));
+    }
+    #[tokio::test]
+    async fn an_older_macos_stops_ai_setup_before_anything_is_created_or_started() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let data = root.join("app");
+        let status = Arc::new(Mutex::new(SetupStatus::default()));
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: status.clone(),
+            notify: Arc::new(|_| {}),
+        };
+        let saved = SavedConnection {
+            server: "https://127.0.0.1:1".into(),
+            server_id: "test".into(),
+            account_id: uuid::Uuid::new_v4().to_string(),
+            name: "Test".into(),
+            token: "synthetic".into(),
+            device_name: "Test".into(),
+            mode: "client-worker".into(),
+            device_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        // An older macOS, and (FD-64) one whose version could not be read.
+        for (running, code) in [
+            (Some((11, 0)), "runtime_os_unsupported"),
+            (None, "runtime_os_unknown"),
+        ] {
+            let result = prepare_on(
+                runtime_os_supported("macos", running, ai_runtime_macos_floor()),
+                saved.clone(),
+                SetupPaths {
+                    data: data.clone(),
+                    bundle: root.join("absent"),
+                },
+                true,
+                progress.clone(),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), code);
+            assert!(!data.exists(), "nothing is prepared on such a macOS");
+            assert_eq!(*status.lock().unwrap(), SetupStatus::default());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        // The worker reports it as a state that waits for the person, with its own code.
+        let setup = WorkerSetup::default();
+        setup
+            .start_work(Arc::new(|_| {}), |_| async {
+                Err("runtime_os_unsupported".into())
+            })
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.status().code.is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = setup.status();
+        assert_eq!(status.state, "setup-needs-attention");
+        assert_eq!(status.code.as_deref(), Some("runtime_os_unsupported"));
+    }
+    #[test]
+    fn a_pause_during_qualification_or_timing_is_waited_out_and_never_decides_the_provider() {
+        // Nothing stopped it: the measurement stands.
+        assert_eq!(interruption(false, None), None);
+        // Battery, memory or sleep: pause with that reason and qualify again.
+        for reason in [
+            "on_battery",
+            "memory_low",
+            "system_resumed",
+            "status_unavailable",
+        ] {
+            assert_eq!(
+                interruption(false, Some(format!("resource_{reason}"))),
+                Some(Ok(reason.to_owned()))
+            );
+        }
+        // The computer slept, whether or not the watcher saw it first.
+        assert_eq!(interruption(true, None), Some(Ok("system_resumed".into())));
+        assert_eq!(
+            interruption(true, Some("resource_on_battery".into())),
+            Some(Ok("system_resumed".into()))
+        );
+        // Anything else (the session could not be kept current) ends the preparation with its
+        // own code, which the worker reconnects after where it can.
+        assert_eq!(
+            interruption(false, Some("worker_request_interrupted".into())),
+            Some(Err("worker_request_interrupted".into()))
+        );
+        // The timing uses it: an interrupted measurement is no longer "speed unknown".
+        let source = include_str!("worker_setup.rs");
+        let production = &source[..source.find("mod tests {").unwrap()];
+        let timing = &production[production.find("if plan.unmeasured(workload)").unwrap()..];
+        let settled = timing.find("plan.measured(workload").unwrap();
+        assert!(timing[..settled].contains("interruption("));
+        assert!(timing[..settled].contains("continue 'qualification"));
+    }
+    #[tokio::test]
+    async fn retry_setup_forgets_remembered_provider_failures_and_an_ordinary_start_keeps_them() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let record = root.join("provider-failures.json");
+        let saved = SavedConnection {
+            server: "https://127.0.0.1:1".into(),
+            server_id: "test".into(),
+            account_id: uuid::Uuid::new_v4().to_string(),
+            name: "Test".into(),
+            token: "synthetic".into(),
+            device_name: "Test".into(),
+            mode: "client-worker".into(),
+            device_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let paths = SetupPaths {
+            data: root.clone(),
+            bundle: root.join("absent"),
+        };
+        let setup = WorkerSetup::default();
+        // The worker starting by itself keeps what it remembered.
+        std::fs::write(&record, b"{}").unwrap();
+        setup
+            .start(saved.clone(), paths.clone(), false, Arc::new(|_| {}))
+            .await;
+        setup.stop().await;
+        assert!(record.exists());
+        // Parked, waiting for the person: Retry Setup forgets it before anything else runs.
+        setup.status.lock().unwrap().state = "setup-needs-attention".into();
+        setup.start(saved, paths, false, Arc::new(|_| {})).await;
+        let forgotten = !record.exists();
+        setup.stop().await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(forgotten);
+    }
     #[tokio::test]
     async fn fresh_nested_app_directory_reports_missing_pack_without_touching_server_credentials() {
         let root = std::env::temp_dir()
@@ -1770,7 +2386,9 @@ mod tests {
             mode: "client-worker".into(),
             device_id: Some(uuid::Uuid::new_v4().to_string()),
         };
-        let result = prepare(
+        // Not the macOS this suite happens to run on: an older one is refused before the pack.
+        let result = prepare_on(
+            Ok(()),
             saved,
             SetupPaths {
                 data: data.clone(),
@@ -1907,5 +2525,343 @@ mod tests {
             .unwrap();
         assert_eq!(status.state, "setup-needs-attention");
         setup.stop().await;
+    }
+
+    // ---- FD-38: the worker against a server that fences sessions, changes policy and refuses tasks.
+    use crate::ml_transport::{
+        household_tests::{Device, FakeServer},
+        WorkerTransport,
+    };
+    use crate::native_predictor::{step_with, Step};
+    use std::sync::atomic::AtomicUsize;
+    type SavedSession = tokio::sync::Mutex<Option<WorkerTransport>>;
+
+    fn quiet() -> Progress {
+        Progress {
+            user_paused: Arc::default(),
+            cancelled: Arc::default(),
+            status: Arc::default(),
+            notify: Arc::new(|_| {}),
+        }
+    }
+    /// What `prepare` does once the runtime is ready, with the local model replaced: use the saved
+    /// session or issue a new one, qualify under it, then claim and work until `done`.
+    async fn work(
+        server: &FakeServer,
+        device: &Device,
+        saved: &SavedSession,
+        refresh: bool,
+        predicting: &dyn Fn(),
+        done: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut saved = saved.lock().await;
+        if refresh || saved.is_none() {
+            *saved = Some(server.session(device).await?);
+        }
+        let worker = saved.as_ref().unwrap();
+        let qualification = server.qualification(worker).await;
+        let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+        let mut failures = TaskFailures::default();
+        while !done() {
+            let step = step_with(worker, &[&qualification], &mut cancel, |_| async {
+                predicting();
+                Ok(serde_json::json!({}))
+            })
+            .await?;
+            match step {
+                Step::Completed => failures.completed(),
+                Step::Dropped(code) => drop(failures.dropped(code)?),
+                Step::Idle => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        Ok(())
+    }
+    /// The supervised worker for one device; returns its outcome and each attempt's `refresh`.
+    async fn run(
+        server: &FakeServer,
+        device: &Device,
+        saved: &SavedSession,
+        fresh: bool,
+        predicting: &dyn Fn(),
+        done: &dyn Fn() -> bool,
+    ) -> (Result<(), String>, Vec<bool>) {
+        let refreshes = Mutex::new(Vec::new());
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            supervise(
+                &quiet(),
+                fresh,
+                |refresh| {
+                    refreshes.lock().unwrap().push(refresh);
+                    work(server, device, saved, refresh, predicting, done)
+                },
+                || async { None },
+                ROUTE_POLL,
+            ),
+        )
+        .await
+        .expect("the worker stalled");
+        (result, refreshes.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_session_fenced_in_the_middle_of_a_task_is_reissued_and_work_continues() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 3);
+        let predictions = AtomicUsize::new(0);
+        let (result, refreshes) = run(
+            &server,
+            &device,
+            &saved,
+            false,
+            // The administrator changes this computer's household setting during its second task.
+            &|| {
+                if predictions.fetch_add(1, Ordering::AcqRel) == 1 {
+                    server.toggle_household(&device);
+                }
+            },
+            &|| server.completed(&device) == 2,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(refreshes, [false, true]);
+        assert_eq!(server.sessions_issued(&device), 2);
+        // The fenced task's result never passed the door and no failure was reported for it.
+        assert_eq!(server.reports(&device), ["result", "result"]);
+    }
+
+    #[tokio::test]
+    async fn a_household_change_on_one_computer_does_not_stop_another() {
+        let server = FakeServer::start();
+        let (a, b) = (server.enrol(), server.enrol());
+        let (saved_a, saved_b) = (SavedSession::default(), SavedSession::default());
+        for (device, saved) in [(&a, &saved_a), (&b, &saved_b)] {
+            server.queue(device, 1);
+            let done = || server.completed(device) == 1;
+            let (result, refreshes) = run(&server, device, saved, false, &|| {}, &done).await;
+            assert_eq!((result, refreshes), (Ok(()), vec![false]));
+        }
+
+        // The administrator toggles A while B is in the middle of a task.
+        server.queue(&b, 2);
+        let predictions = AtomicUsize::new(0);
+        let (result, refreshes) = run(
+            &server,
+            &b,
+            &saved_b,
+            false,
+            &|| {
+                if predictions.fetch_add(1, Ordering::AcqRel) == 0 {
+                    server.toggle_household(&a);
+                }
+            },
+            &|| server.completed(&b) == 2,
+        )
+        .await;
+        // B's task lost the policy revision it ran under: the server refused that result, B
+        // reported no failure for it, refreshed its authority and finished the next task.
+        assert_eq!(result, Ok(()));
+        assert_eq!(refreshes, [false, true]);
+        assert_eq!(server.reports(&b), ["result", "result", "result"]);
+
+        // A itself was fenced: its saved session is refused, a new one is issued and it carries on.
+        server.queue(&a, 1);
+        let done = || server.completed(&a) == 2;
+        let (result, refreshes) = run(&server, &a, &saved_a, false, &|| {}, &done).await;
+        assert_eq!((result, refreshes), (Ok(()), vec![false, true]));
+        assert_eq!(server.sessions_issued(&a), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_refused_task_is_dropped_and_the_next_one_is_claimed() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 3);
+        // The first task's input fails on the server; the second's result is refused (cancelled job).
+        server.respond_next(&device, "/input", 500, serde_json::json!({}));
+        server.respond_next(
+            &device,
+            "/result",
+            200,
+            serde_json::json!({"accepted":false}),
+        );
+        let done = || server.completed(&device) == 1;
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
+        // No reconnect and no new session: the same association claimed the third task.
+        assert_eq!(refreshes, [false]);
+        assert_eq!(server.sessions_issued(&device), 1);
+        // The held lease was failed back to the server; the refused one heard nothing more.
+        assert_eq!(server.reports(&device), ["fail", "result"]);
+    }
+
+    #[tokio::test]
+    async fn five_failed_tasks_in_a_row_park_the_worker_and_fewer_do_not() {
+        let mut failures = TaskFailures::default();
+        for _ in 0..3 {
+            for _ in 0..TASK_FAILURE_LIMIT - 1 {
+                let delay = failures.dropped("worker_result_refused".into()).unwrap();
+                assert!(delay >= Duration::from_secs(1) && delay <= Duration::from_secs(64));
+            }
+            failures.completed();
+        }
+
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 6);
+        for _ in 0..5 {
+            server.respond_next(
+                &device,
+                "/result",
+                200,
+                serde_json::json!({"accepted":false}),
+            );
+        }
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &|| false).await;
+        assert_eq!(result, Err("worker_result_refused".into()));
+        assert_eq!(refreshes, [false]);
+        assert_eq!(server.completed(&device), 0);
+
+        // Parked is the state Retry Setup is offered in.
+        let setup = WorkerSetup::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                move |_| async move { result },
+            )
+            .await;
+        let status = rx.recv().await.unwrap();
+        assert_eq!(status.state, "setup-needs-attention");
+        assert_eq!(status.code.as_deref(), Some("worker_result_refused"));
+        setup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn retry_setup_after_a_fenced_session_starts_from_a_new_one() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 1);
+        let done = || server.completed(&device) == 1;
+        let (result, _) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
+
+        // The worker parks, and the server fences its saved session while it sits there.
+        let setup = WorkerSetup::default();
+        assert!(!setup.parked());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        setup
+            .start_work(
+                Arc::new(move |status| {
+                    let _ = tx.send(status);
+                }),
+                |_| async { Err("runtime_start_failed".into()) },
+            )
+            .await;
+        assert_eq!(rx.recv().await.unwrap().state, "setup-needs-attention");
+        assert!(setup.parked());
+        server.toggle_household(&device);
+
+        // Retry Setup, in the same process: the first attempt already asks for a new session.
+        server.queue(&device, 1);
+        let done = || server.completed(&device) == 2;
+        let (result, refreshes) =
+            run(&server, &device, &saved, setup.parked(), &|| {}, &done).await;
+        assert_eq!((result, refreshes), (Ok(()), vec![true]));
+        assert_eq!(server.sessions_issued(&device), 2);
+
+        setup.stop().await;
+        assert!(!setup.parked());
+    }
+
+    #[tokio::test]
+    async fn a_policy_or_lan_refusal_waits_and_resumes_when_the_network_changes() {
+        for (message, code) in [
+            ("desktop_pool_policy_required", "worker_policy_required"),
+            ("desktop_worker_lan_required", "worker_lan_required"),
+        ] {
+            let server = FakeServer::start();
+            let device = server.enrol();
+            let saved = SavedSession::default();
+            server.queue(&device, 1);
+            server.respond_next(
+                &device,
+                "/claim",
+                403,
+                serde_json::json!({"message":message}),
+            );
+            let statuses = Arc::new(Mutex::new(Vec::new()));
+            let seen = statuses.clone();
+            let progress = Progress {
+                notify: Arc::new(move |status: SetupStatus| {
+                    seen.lock().unwrap().push((status.state, status.code))
+                }),
+                ..quiet()
+            };
+            let attempts = AtomicUsize::new(0);
+            let routes = AtomicUsize::new(0);
+            let done = || server.completed(&device) == 1;
+            // Far sooner than the five-minute timer: the route to the server changed.
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                supervise(
+                    &progress,
+                    false,
+                    |refresh| {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        work(&server, &device, &saved, refresh, &|| {}, &done)
+                    },
+                    || {
+                        let moved = routes.fetch_add(1, Ordering::AcqRel) > 0;
+                        async move { Some(std::net::IpAddr::from([192, 168, 1, 2 + moved as u8])) }
+                    },
+                    Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("the worker stayed parked")
+            .unwrap();
+            assert_eq!(attempts.load(Ordering::Acquire), 2);
+            assert_eq!(server.sessions_issued(&device), 1);
+            assert_eq!(
+                *statuses.lock().unwrap(),
+                [("paused".to_owned(), Some(code.to_owned()))]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_refusal_wait_also_ends_on_its_timer_and_on_stop() {
+        let progress = quiet();
+        let home = || async { Some(std::net::IpAddr::from([192, 168, 1, 2])) };
+        let poll = Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let period = Duration::from_millis(400);
+        recheck_after_or_route_change(&progress, period, &mut { home }, poll)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= period);
+        progress.cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            recheck_after_or_route_change(&progress, Duration::from_secs(60), &mut { home }, poll)
+                .await,
+            Err("worker_setup_cancelled".into())
+        );
+    }
+
+    #[test]
+    fn the_route_to_a_server_is_read_without_sending_anything() {
+        assert_eq!(
+            network_route("http://127.0.0.1:2283"),
+            Some(std::net::IpAddr::from([127, 0, 0, 1]))
+        );
+        assert_eq!(network_route("not a server"), None);
     }
 }

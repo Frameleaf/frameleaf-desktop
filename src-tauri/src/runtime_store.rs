@@ -355,11 +355,72 @@ impl RuntimeStore {
             installation_id: self.installation_id.clone(),
         }))
     }
+    /// Remove releases that can never run again, and staging an interrupted install left behind.
+    ///
+    /// `expected_active` is the release the caller just qualified with: if the store's pointer is
+    /// missing, unreadable or names another release, nothing is removed. `rollback` is the
+    /// release the app's own bundle would install; it is kept as well. Epochs never go back, so
+    /// every other release is dead weight. The shared lease keeps activation (which needs the
+    /// exclusive one) from publishing or staging a release while this runs; a sidecar can only be
+    /// running from the active release for the same reason.
+    pub fn prune(&self, expected_active: &str, rollback: Option<&str>) -> Result<usize, String> {
+        let _lease = self.lock(true)?;
+        match self.active()? {
+            Some(active) if active.manifest_sha256 == expected_active => {}
+            _ => return Ok(0),
+        }
+        let mut removed = 0;
+        let hex = |name: &str| name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit());
+        for (directory, stale) in [
+            (
+                self.root.join("releases"),
+                &(|name: &str| hex(name) && name != expected_active && Some(name) != rollback)
+                    as &dyn Fn(&str) -> bool,
+            ),
+            (self.root.clone(), &|name: &str| {
+                name.strip_prefix(".staging-")
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            }),
+        ] {
+            absolute_directory(&directory)?;
+            for entry in fs::read_dir(&directory).map_err(|_| "runtime_store_read_failed")? {
+                let Ok(entry) = entry else { continue };
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && stale(&name)
+                    && crate::model_cache::remove_contained(&directory, &name).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
     pub fn install_and_activate(
         &self,
         candidate: &Path,
         raw: &[u8],
         signature: &[u8; 64],
+    ) -> Result<(), String> {
+        self.install_and_activate_sharing(candidate, raw, signature, None)
+    }
+    /// The directory of one installed release, for `install_and_activate_sharing`.
+    pub fn release_payload(&self, manifest_sha256: &str) -> PathBuf {
+        self.root
+            .join("releases")
+            .join(manifest_sha256)
+            .join("payload")
+    }
+    /// As `install_and_activate`; files identical to those of `share` (an installed release of
+    /// the same pack in another store) are linked rather than stored twice.
+    pub fn install_and_activate_sharing(
+        &self,
+        candidate: &Path,
+        raw: &[u8],
+        signature: &[u8; 64],
+        share: Option<&Path>,
     ) -> Result<(), String> {
         let _lock = self.lock(false)?;
         absolute_directory(&self.root.join("releases"))?;
@@ -383,7 +444,7 @@ impl RuntimeStore {
         } else {
             let staging = Staging::create(self.root.join(format!(".staging-{}", Uuid::new_v4())))?;
             private_directory(&staging.0.join("payload"))?;
-            verified.copy_payload(&staging.0.join("payload"))?;
+            verified.copy_payload(&staging.0.join("payload"), share)?;
             VerifiedRuntime::verify(
                 &staging.0.join("payload"),
                 raw,

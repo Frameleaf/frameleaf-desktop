@@ -1,7 +1,9 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { formatBytes } from './ui-state';
+  import { explainError } from './errors';
 
   type Media = { id: string; name: string; mime: string };
   type Album = { id: string; name: string; bytes: number; expiresAt: number; items: Media[] };
@@ -18,20 +20,11 @@
   let message = $state('');
   let generation = 0;
   const album = $derived(albums.find(({ id }) => id === albumId));
+  // The other offline album codes take the shared copy in errors.ts; this window names what signing in is for.
   const errorMessages: Record<string, string> = {
     sign_in_required: 'Sign in to Frameleaf to open offline albums.',
-    offline_album_other_library: 'Offline storage belongs to another Library account. Return to that account to open its albums, or clear offline storage to start over on this computer.',
-    offline_album_access_changed: 'Library access or album membership changed. Keep the album again from Photos if it is still available.',
-    offline_album_storage_limit: 'The download exceeds the 2 GB offline cache.',
-    offline_album_original_changed: 'An original changed during the download. Open the album in Photos and try again.',
-    offline_album_cancelled: 'Download cancelled.',
-    offline_library_unreachable: 'Frameleaf could not reach the Library to verify this album.',
-    offline_album_save_failed: 'Frameleaf could not save the original to that folder.',
-    offline_album_save_unsupported: 'Choose a folder on a drive that supports saving without replacing existing files.',
-    offline_album_save_exists: 'Choose a new filename to save the original.',
-    offline_album_busy: 'Frameleaf is finishing another offline operation. Try again in a moment.',
   };
-  const explain = (error: unknown) => errorMessages[String(error)] ?? 'Frameleaf could not verify or open this offline album.';
+  const explain = (error: unknown) => errorMessages[String(error)] ?? explainError(error, 'Frameleaf could not verify or open this offline album.');
 
   function closeMedia() {
     generation += 1;
@@ -167,7 +160,7 @@
       <button class="btn" onclick={cancel}>Cancel Download</button>
     </section>
   {/if}
-  {#if message}<p role="status" class="notice">{message}</p>{/if}
+  {#if message}<p role="status" class="notice"><ErrorText text={message} /></p>{/if}
   {#if album}
     <div class="album-heading">
       <button class="btn quiet" onclick={() => { albumId = ''; closeMedia(); }}>All Offline Albums</button>
