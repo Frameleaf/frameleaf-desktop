@@ -55,6 +55,9 @@ export function vocabularyProblems(source: string): string[] {
   for (const term of fixedTerms) {
     for (const match of code.matchAll(new RegExp(term.replace(/[ -]/g, '[ -]'), 'gi'))) if (match[0] !== term) report(match.index, `"${match[0]}" should be "${term}"`);
   }
+  // Password is a fixed term too. The bare word is also the Manager password and plenty of identifiers,
+  // so only the phrase every sign-in message uses is checked.
+  for (const match of code.matchAll(/\bemail and password\b/g)) report(match.index, '"email and password" should be "email and Password"');
   return problems;
 }
 
@@ -94,6 +97,7 @@ test('the vocabulary check finds forbidden words in markup and strings, and leav
     const messages = { server_refused_two_factor_setup_required: 'Set up Two-Step Verification.', manager_login_details_invalid: 'Enter your Manager password.' };
     let { passwordLogin, onownlogin, loginMessage } = options; const url = 'https://example.test/sign-in';
     <p>Enter the Verification Code, a Recovery Code or your Password, or sign in with a Passkey.</p>`), []);
+  assert.deepEqual(found(`'Check your email and password.' 'or with email and Password'`), ['1: "email and password" should be "email and Password"']);
   // An allowed identifier does not excuse the same words in a sentence.
   assert.deepEqual(found(`'Enter your email_code or the email code'`), ['1: "email code"']);
 });

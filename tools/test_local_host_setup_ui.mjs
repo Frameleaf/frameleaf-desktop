@@ -95,8 +95,19 @@ try {
   const select = setup.getByLabel('Installed server package');
   assert.equal(await select.inputValue(), installed.manifestSha256);
   await select.selectOption(update.manifestSha256);
-  await setup.getByText('Moving an existing library to another package is unavailable on this computer.').waitFor();
+  // A backend that cannot move a library to another package: no offer to, and one press back to its own.
+  await setup.getByText('Your library can’t move to this package yet', { exact: true }).waitFor();
   assert.equal(await setup.getByRole('button', { name: 'Review package change' }).count(), 0);
+  await setup.getByRole('button', { name: 'Use My Library’s Package' }).click();
+  await setup.getByRole('button', { name: 'Prepare local Manager' }).waitFor();
+  assert.equal(await select.inputValue(), installed.manifestSha256);
+  // A backend that says it can is offered the change, whatever the platform.
+  status.packageChangeAvailable = true;
+  await setup.getByRole('button', { name: 'Check installation' }).click();
+  await select.selectOption(update.manifestSha256);
+  await setup.getByRole('button', { name: 'Review package change' }).waitFor();
+  // One that says nothing can only on macOS and Linux.
+  delete status.packageChangeAvailable;
   status.companionPlatform = 'linux';
   await setup.getByRole('button', { name: 'Check installation' }).click();
   compatibility = 'refused';
