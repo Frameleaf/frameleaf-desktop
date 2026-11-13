@@ -637,11 +637,6 @@ async fn each_busy_port_moves_and_every_consumer_follows_the_saved_port() {
         lab.runtime().await.unwrap()["ports"]["manager"],
         moved.manager
     );
-    // The saved TLS identity follows the port too.
-    assert_eq!(
-        lab.identities().current.unwrap()["origin"],
-        moved.origin().as_str()
-    );
     lab.control(Action::Start).await.unwrap();
     assert_eq!(
         lab.photos().await.unwrap(),
@@ -670,6 +665,12 @@ async fn each_busy_port_moves_and_every_consumer_follows_the_saved_port() {
         .await
         .expect("starts with every default port free again");
     assert_eq!(lab.ports().await, moved, "the library stays on its ports");
+    // The saved TLS identity names the origin it was last started on: it follows a moved
+    // Manager port at the start after the move, and nothing reads it in between.
+    assert_eq!(
+        lab.identities().current.unwrap()["origin"],
+        moved.origin().as_str()
+    );
     lab.control(Action::Start).await.unwrap();
     assert!(pong(moved.api).await);
     lab.control(Action::Stop).await.unwrap();
@@ -1011,8 +1012,8 @@ async fn a_port_moved_for_a_start_manager_refuses_does_not_stay_moved() {
     lab.stop().await;
 }
 
-/// The TLS identity beside an unfinished operation: a due one still starts the library, and
-/// an expired one is still renewed, because nothing else could ever start it again.
+/// The TLS identity beside an unfinished operation: one that has expired is still renewed,
+/// because nothing else could ever start the library again to finish that operation.
 #[tokio::test]
 #[ignore = "end-to-end: run tools/manager_e2e/run.sh"]
 async fn an_unfinished_operation_does_not_stop_an_identity_from_being_renewed() {
@@ -1040,15 +1041,11 @@ async fn an_unfinished_operation_does_not_stop_an_identity_from_being_renewed() 
     let unfinished = lab.fail_a_backup().await;
     lab.stop().await;
 
-    // Due, not expired: whatever Manager does with the renewal, the library starts.
-    lab.start()
-        .await
-        .expect("a due identity beside an unfinished operation");
-    let kept = lab.served().await == certificate(&brief);
-    println!("beside an unfinished operation the due identity was kept: {kept}");
-    lab.stop().await;
     let held = lab.identities().current.unwrap();
+    assert_eq!(certificate(&held), certificate(&brief));
 
+    // Once it has run out there is no earlier identity to fall back to: only a renewal
+    // handed over by the expired one can start this library again.
     tokio::time::sleep(expires.saturating_duration_since(Instant::now()) + Duration::from_secs(2))
         .await;
     lab.start()

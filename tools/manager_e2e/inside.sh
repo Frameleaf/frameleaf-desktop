@@ -68,6 +68,8 @@ run() {
   local package=$1 names=$2 first=${3:-$1} number account uid first_manifest controller
   # Nothing of an earlier account keeps a port: every earlier account's processes are ended.
   for uid in $(cat "$WORK/accounts" 2>/dev/null); do pkill -KILL -U "$uid" 2>/dev/null || true; done
+  # A database ended that way leaves its socket lock behind, which the next account cannot replace.
+  rm -f /tmp/.s.PGSQL.*
   number=$(( $(wc -l < "$WORK/accounts" 2>/dev/null || echo 0) + 1 ))
   account="library$number" uid=$((3000 + number))
   useradd --create-home --uid "$uid" "$account"
@@ -84,7 +86,7 @@ run() {
     FRAMELEAF_MANAGER_E2E=disposable \
     FRAMELEAF_MANAGER_E2E_MANIFEST="$(manifest "$package")" \
     FRAMELEAF_MANAGER_E2E_RELEASED="$(manifest "$first")" \
-    FRAMELEAF_MANAGER_E2E_SHORT="${FRAMELEAF_MANAGER_E2E_SHORT:-150}" \
+    FRAMELEAF_MANAGER_E2E_SHORT="${FRAMELEAF_MANAGER_E2E_SHORT:-480}" \
     dbus-run-session -- bash -uo pipefail -c '
       head -c 32 /dev/urandom | base64 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
       tests=$0 result=1

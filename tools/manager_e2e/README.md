@@ -40,7 +40,7 @@ about 25 GB in Docker's disk, and network access to GitHub, nodejs.org, crates.i
   the `pkexec` prompt that normally authorizes that is not shown.
 - Time does not pass. A TLS identity near or past its expiry is made by saving one that was
   issued earlier, through the same keystore records a start writes; one that expires during
-  the run is issued to last `FRAMELEAF_MANAGER_E2E_SHORT` seconds (default 150). Manager's
+  the run is issued to last `FRAMELEAF_MANAGER_E2E_SHORT` seconds (480 as run here; a start takes minutes under emulation). Manager's
   30-day grace period ending cannot be reached this way and stays unit-tested in the server
   repository.
 - A failed start whose first attempt presented a renewed identity is reached, for the grace
