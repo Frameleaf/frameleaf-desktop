@@ -1,7 +1,6 @@
 // User-facing copy for the error and status codes the Rust side returns. test/errors.test.ts reads the codes
 // from src-tauri/src and fails when one has no copy here. A component keeps its own wording only where its
-// screen needs different words for a code (a small override table that says why); LocalHost.svelte still
-// holds the copy for the codes only it shows.
+// screen needs different words for a code (a small override table that says why).
 const messages: Record<string, string> = {
   media_copy_exit_blocked: 'Finish or cancel the media copy, or wait for the update before quitting Frameleaf.',
   local_host_active: 'Stop local management before connecting to another server.',
@@ -333,9 +332,32 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'A backup or restore is already running. Wait for it to finish.', 'host_checkpoint_busy'],
   ['', 'The backup could not start. Check the photo server in Manager, then try again.', 'host_checkpoint_timeout host_checkpoint_unavailable'],
   ['', 'The restore could not be finished safely, so nothing was changed. Review the backup again in Manager before retrying.', 'host_restore_unavailable host_restore_activation_requires_review host_restore_activation_write_failed host_restore_media_changed'],
-  ['', 'Frameleaf could not secure its connection to local Manager on this computer, so it did not start. Quit and reopen Frameleaf, then try again.', 'native_manager_unprotected native_manager_protection_unavailable native_manager_https_unverified native_manager_tls_invalid native_manager_receipt_invalid native_tls_binding_invalid native_tls_generation_failed native_tls_identity_changed native_tls_identity_expired native_tls_identity_invalid'],
+  ['', 'Frameleaf could not secure its connection to local Manager on this computer, so it did not start. Quit and reopen Frameleaf, then try again.', 'native_manager_unprotected native_manager_protection_unavailable native_manager_https_unverified native_manager_tls_invalid native_manager_receipt_invalid native_tls_binding_invalid native_tls_generation_failed native_tls_identity_changed native_tls_identity_invalid'],
+  ['', 'Local Manager’s security certificate on this computer has expired, so local management did not start. Renewing it needs an update to Frameleaf and its companion. Your photos and library are not affected.', 'native_tls_identity_expired'],
   ['', 'The backup recovery key saved on this computer could not be read. Unlock your computer’s credential store, then try again.', 'native_backup_key_invalid native_backup_key_unavailable'],
   ['', 'This library’s backups are protected by a recovery key that is not on this computer. Recover the library with that key before continuing.', 'native_backup_key_recovery_required recovery_key_required'],
+  // ---- running your library on this computer: setup, packages and stopping ----
+  ['', 'Native server installation is not available on this platform in this build. You can connect to an existing server.', 'host_install_platform_unsupported'],
+  ['', 'Run the server component installer while signed in to this computer, then try again.', 'host_install_profile_required'],
+  ['', 'Prepare a private server profile for your account before starting local management.', 'host_install_linux_profile_required host_install_windows_profile_required'],
+  ['', 'An existing server profile must be migrated before setup can continue. Your library and saved credentials have been preserved.', 'host_profile_legacy_migration_required host_profile_legacy_state_unavailable'],
+  ['', 'System authorization was cancelled. You can try again.', 'host_profile_authorization_cancelled'],
+  ['', 'System authorization is unavailable. Check your desktop’s authorization service, then try again.', 'host_profile_authorization_unavailable'],
+  ['', 'The server profile could not be prepared. Check that your installed Frameleaf components are up to date. Your existing library has been preserved.', 'host_profile_prepare_failed'],
+  ['', 'Server component maintenance is unfinished or the component is in use. Local management is unavailable until maintenance completes.', 'host_package_maintenance host_package_busy'],
+  ['', 'The server component installation could not be verified. Local management is blocked; your existing library has been preserved.', 'host_package_check_unavailable host_package_not_initialized host_package_selection_changed host_package_state_invalid host_package_state_unavailable'],
+  ['', 'Local setup was cancelled.', 'native_manager_start_cancelled'],
+  ['', 'This library already uses a newer server package. Choose that package to continue.', 'host_upgrade_downgrade_refused'],
+  ['', 'Keep the server package this library last used installed until it has started once with the new package, then try again.', 'host_upgrade_previous_package_missing'],
+  ['', 'This library last ran with a companion built for an earlier version of Frameleaf, and this version cannot move it to the new companion yet. Your library has not been changed. Keep that earlier companion installed. To open the library now, use the version of Frameleaf it last ran with, or contact Frameleaf support.', 'host_upgrade_previous_package_incompatible'],
+  ['', 'A restore is waiting to finish with the package this library last used. Finish it in Manager with that package, then try the new package again.', 'host_restore_activation_pending'],
+  ['', 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.', 'host_upgrade_operation_pending'],
+  ['', 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.', 'host_update_requires_manager'],
+  ['', 'The photo server is not running. Start it in Manager, then open Photos.', 'local_photos_not_running'],
+  ['', 'Local management from an earlier session is still shutting down. Wait a moment, then try again.', 'native_manager_orphan_running'],
+  ['', 'Local management did not stop, and Frameleaf could not save what it needs to stop it after quitting, so Frameleaf is staying open. Stop the photo server in Manager, then choose Stop local management.', 'native_manager_record_unavailable'],
+  ['', 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, start the photo server in Manager again, then stop it there.', 'host_already_owned host_controller_already_owned host_controller_binding_changed host_controller_read_only host_controller_required host_controller_state_invalid host_controller_state_unavailable host_controller_state_write_failed host_process_exited host_process_state_failed host_process_state_requires_review host_recovery_requires_manager'],
+  ['', 'The existing library needs recovery. Its saved credentials and database were preserved.', 'native_profile_already_owned native_profile_binding_changed native_profile_binding_invalid native_profile_platform_unsupported native_profile_recovery_required native_profile_unavailable'],
   // ---- Manager ----
   ['', 'Pair this computer with Manager before using this action.', 'manager_approval_required manager_pairing_required'],
   ['', 'The Manager access saved on this computer could not be read. Disconnect and pair again with Manager.', 'manager_credential_invalid'],
