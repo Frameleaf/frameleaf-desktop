@@ -335,7 +335,7 @@ pub(crate) async fn acquire_file(
     acquire_file_with_progress(client, url, path, bytes, sha256, cancel, |_| {}).await
 }
 
-async fn acquire_file_with_progress(
+pub(crate) async fn acquire_file_with_progress(
     client: &Client,
     url: &str,
     path: &Path,

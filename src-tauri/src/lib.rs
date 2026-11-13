@@ -1,3 +1,4 @@
+mod accelerated_pack;
 mod camera_identity;
 mod camera_sources;
 pub mod cloud_account;
@@ -806,6 +807,7 @@ pub fn run() {
         .manage(offline_albums::OfflineAlbums::default())
         .manage(host_setup::HostSetup::default())
         .manage(worker_setup::WorkerSetup::default())
+        .manage(accelerated_pack::AcceleratedPack::default())
         .manage(source_consent::SourceConsent::default())
         .manage(source_import::SourceJobs::default())
         .manage(source_import::ImportTransfer::default())
@@ -868,6 +870,11 @@ pub fn run() {
             offline_albums::offline_album_cancel,
             offline_albums::offline_album_browse_library,
             worker_setup_status,
+            accelerated_pack_status,
+            download_accelerated_pack,
+            decline_accelerated_pack,
+            cancel_accelerated_pack_download,
+            retry_accelerated_provider,
             prepare_models,
             control_worker,
             discover_camera_folders,
@@ -993,6 +1000,21 @@ pub fn run() {
         });
 }
 
+fn worker_paths(app: &tauri::AppHandle) -> Result<worker_setup::SetupPaths, String> {
+    Ok(worker_setup::SetupPaths {
+        data: app
+            .path()
+            .app_local_data_dir()
+            .map_err(|_| "app_data_directory_unavailable")?
+            .join("worker"),
+        bundle: worker_setup::bundled_runtime(
+            &app.path()
+                .resource_dir()
+                .map_err(|_| "app_resources_unavailable")?,
+        ),
+    })
+}
+
 pub(crate) async fn start_worker_setup(
     app: &tauri::AppHandle,
     saved: &SavedConnection,
@@ -1008,18 +1030,7 @@ pub(crate) async fn start_worker_setup(
         publish_worker_status(app, status);
         return Ok(());
     }
-    let paths = worker_setup::SetupPaths {
-        data: app
-            .path()
-            .app_local_data_dir()
-            .map_err(|_| "app_data_directory_unavailable")?
-            .join("worker"),
-        bundle: worker_setup::bundled_runtime(
-            &app.path()
-                .resource_dir()
-                .map_err(|_| "app_resources_unavailable")?,
-        ),
-    };
+    let paths = worker_paths(app)?;
     let handle = app.clone();
     app.state::<worker_setup::WorkerSetup>()
         .start(
@@ -1045,6 +1056,105 @@ async fn worker_setup_status(
 ) -> Result<worker_setup::SetupStatus, String> {
     require_local(&window)?;
     Ok(app.state::<worker_setup::WorkerSetup>().status())
+}
+
+/// FD-60: the GPU runtime pack this computer could download, and where that download stands.
+#[tauri::command]
+async fn accelerated_pack_status(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<accelerated_pack::PackStatus, String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    let mut status = app.state::<accelerated_pack::AcceleratedPack>().status(
+        &paths.bundle,
+        &paths.data,
+        &provider_selection::Host,
+    );
+    if status.state == "available" {
+        status.metered = tauri::async_runtime::spawn_blocking(resource_policy::sample)
+            .await
+            .is_ok_and(|network| network.unmetered == Some(false));
+    }
+    Ok(status)
+}
+
+/// The person chose Download: nothing else ever starts this transfer. The worker is restarted
+/// once the pack is ready, so it is installed and qualified without reopening the app.
+#[tauri::command]
+async fn download_accelerated_pack(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<accelerated_pack::PackStatus, String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    let handle = app.clone();
+    let status = app
+        .state::<accelerated_pack::AcceleratedPack>()
+        .download(paths.bundle, paths.data, move |status| {
+            let _ = handle.emit_to("main", "accelerated-pack", status);
+        })
+        .await?;
+    if status.state == "ready" {
+        restart_running_worker(&app, &state).await;
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+async fn decline_accelerated_pack(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<accelerated_pack::PackStatus, String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    Ok(app.state::<accelerated_pack::AcceleratedPack>().decline(
+        &paths.bundle,
+        &paths.data,
+        &provider_selection::Host,
+    ))
+}
+
+#[tauri::command]
+async fn cancel_accelerated_pack_download(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    require_local(&window)?;
+    app.state::<accelerated_pack::AcceleratedPack>().cancel();
+    Ok(())
+}
+
+/// Try the GPU again after it failed its check or measured slower: forget what was remembered
+/// about this runtime and let the worker qualify it again.
+#[tauri::command]
+async fn retry_accelerated_provider(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    require_local(&window)?;
+    let paths = worker_paths(&app)?;
+    provider_selection::forget_failures(&paths.data);
+    restart_running_worker(&app, &state).await;
+    Ok(())
+}
+
+/// Start the worker again when it is running, so a change to its runtimes takes effect. A worker
+/// the person paused or stopped stays as they left it.
+async fn restart_running_worker(app: &tauri::AppHandle, state: &State<'_, DesktopState>) {
+    let setup = app.state::<worker_setup::WorkerSetup>();
+    if setup.status().control != worker_control::WorkerControl::Running || !setup.running().await {
+        return;
+    }
+    let current = state.0.lock().await;
+    if let Some(saved) = current
+        .as_ref()
+        .filter(|saved| saved.mode == "client-worker" && saved.device_id.is_some())
+    {
+        let _ = start_worker_setup(app, saved, false).await;
+    }
 }
 
 #[tauri::command]

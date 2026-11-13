@@ -334,6 +334,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -388,6 +389,16 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
+      # FD-60: the CUDA and OpenVINO packs the app downloads on demand. Each is verified against
+      # its signed delivery manifest (the one the installers carry) before its parts are staged.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run_id }}
+          pattern: factory-accelerated-*
+          path: accelerated-packs
+      - name: Verify the downloadable GPU runtime parts and stage them as release files
+        run: node tools/deliver_runtime.mjs --release accelerated-packs release-assets | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Create checksums and a draft release after every target succeeds
         env:
           GH_TOKEN: ${{ github.token }}

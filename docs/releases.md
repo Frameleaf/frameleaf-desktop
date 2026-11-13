@@ -315,9 +315,45 @@ python tools/build_runtime.py --source <frameleaf-app checkout at the profile's 
 candidate/payload/python/python.exe -I -B tools/smoke_accelerated_runtime.py CUDAExecutionProvider   # Linux: candidate/payload/python/bin/python3.12
 ```
 
-Neither provider has run on NVIDIA or Intel hardware. A CUDA pack is about 3 GB
-and no installer carries either: the factory builds one only when `accelerated`
-names it.
+Neither provider has run on NVIDIA or Intel hardware.
+
+#### Delivery of the CUDA and OpenVINO packs (FD-60)
+
+A CUDA pack is about 3 GB, too large for an installer and for one release file
+(GitHub: "Each file included in a release must be under 2 GiB"). Installers keep
+carrying the processor pack. The CUDA and OpenVINO packs for `windows-x86_64` and
+`linux-x86_64` are release files the app downloads only when the person chooses
+Download on the AI processing page, and only on a computer with the device.
+
+- Factory: a `default` run (or one naming `cuda-ort` / `openvino-ort`) builds
+  those packs beside each installer pack. The `deliver` job signs only the
+  pack's accelerated manifest, cuts the pack into 1 GiB parts
+  (`tools/deliver_runtime.mjs`: the manifest, its signature, then the payload
+  files in the byte order of their names) and signs a delivery manifest naming
+  every part by size and SHA-256 and the runtime manifest by SHA-256. Artifacts:
+  `factory-accelerated-manifest-<target>-<profile>` and
+  `factory-accelerated-parts-<target>-<profile>`. The installer pack
+  (`factory-runtime-<target>`) carries the delivery manifests in `accelerated/`;
+  packaging refuses one that is unsigned, for another target or of another epoch.
+- Release: the `stage` job verifies every part against its signed delivery
+  manifest and uploads the parts beside the installers. The app fetches them
+  from `releases/download/v<its own version>/`, so they are reachable once the
+  release is published, and a release must be staged from the same factory run
+  as its installers.
+- App (`src-tauri/src/accelerated_pack.rs`): HTTPS only, resumable, each part
+  checked against the delivery manifest the installer carried, then the pack is
+  installed by the runtime store like a bundled one (signature, every file's
+  digest, epoch rules) and qualified. A downloaded pack is admitted only at the
+  processor runtime's own epoch. Any failure leaves the processor in charge and
+  shows the reason with a retry.
+
+To rebuild a pack from factory artifacts on a computer with the device (for the
+hardware check above): `node tools/deliver_runtime.mjs --reassemble <profile>.json
+<profile>.sig <parts folder> <output folder>`.
+
+The processor manifest of a CUDA or OpenVINO pack is never signed (the signer
+refuses it: another dependency set than the processor profile), so such a pack
+cannot become an installer's own runtime.
 
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
