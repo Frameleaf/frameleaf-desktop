@@ -335,12 +335,15 @@ def run_gate(folders: list[Path]) -> dict:
                 )
                 process.stdin.write(b"frameleaf-native-start\n")
                 process.stdin.flush()
+                # The pipe stays open, as the app holds it for as long as the runtime runs.
                 try:
-                    _, errors = process.communicate(timeout=120) if not gated else (None, process.stderr.read())
-                    code = process.wait(timeout=120)
+                    code = process.wait(timeout=75)
+                    errors = process.stderr.read()
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    code, errors = None, b"no exit after 120 seconds"
+                    process.wait()
+                    code, errors = None, b"no exit after 75 seconds: " + process.stderr.read()
+                process.stdin.close()
                 results[f"{name} ({'gate' if gated else 'plain'})"] = {
                     "seconds": round(time.perf_counter() - started, 1),
                     "exit": code,
@@ -408,6 +411,12 @@ def main() -> None:
         "gate": run_gate(folders),
     }
     report["problems"] = problems + report["loader"]["problems"]
+    # Started as the app starts it, each probe must finish; the plain start is only the comparison.
+    report["problems"] += [
+        f"started as the app starts the runtime, '{name}' did not finish (exit {result['exit']}): {result['errors'][-600:].strip()}"
+        for name, result in report["gate"].items()
+        if name.endswith("(gate)") and result["exit"] != 0
+    ]
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "cuda-libraries.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (args.output / "cuda-libraries.md").write_text(markdown(report), encoding="utf-8")

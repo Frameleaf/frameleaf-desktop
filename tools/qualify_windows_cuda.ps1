@@ -36,7 +36,10 @@ a folder only this user can write to (under the user's profile): the app refuses
 anywhere else.
 
 .PARAMETER Output
-Where the evidence goes. Default: <Work>\evidence.
+Where the evidence goes. Default: <Work>\evidence. A folder of its own: it must be new, empty, or
+the evidence folder of an earlier run of this script, whose contents are then replaced. It may not
+be, contain or lie inside the Desktop checkout or -ServerSource, and inside -Work only the default
+is accepted. Anything else is refused before a single file is touched.
 
 .PARAMETER WithoutGpuRehearsal
 For CI on a computer WITHOUT a card only: runs every step, expects the processor to qualify and
@@ -58,6 +61,8 @@ $ErrorActionPreference = 'Stop'
 
 $Provider = 'CUDAExecutionProvider'
 $Processor = 'CPUExecutionProvider'
+# What the app reports when the runtime itself declines to qualify (here: no card for CUDA).
+$Refusal = 'runtime_qualification_failed'
 $Models = @('buffalo_s', 'buffalo_l', 'PP-OCRv5_mobile', 'ViT-B-32__openai')
 $Desktop = Split-Path -Parent $PSScriptRoot
 
@@ -80,12 +85,32 @@ function Require-Tool([string]$Name, [string]$Hint) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { Fail "$Name is not installed. $Hint" }
 }
 
-if (-not $Output) { $Output = Join-Path $Work 'evidence' }
+# Full paths first; nothing is created or removed until the evidence folder is known to be safe.
+function Full([string]$Path) { [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') }
+function Inside([string]$Path, [string]$Folder) { ($Path + '\').StartsWith($Folder + '\', [System.StringComparison]::OrdinalIgnoreCase) }
+function Overlap([string]$First, [string]$Second) { (Inside $First $Second) -or (Inside $Second $First) }
+$Marker = '.frameleaf-cuda-evidence'
+$Work = Full $Work
+$default = Join-Path $Work 'evidence'
+if (-not $Output) { $Output = $default }
+$Output = Full $Output
+if ($ServerSource) { $ServerSource = Full $ServerSource }
+if (Overlap $Output (Full $Desktop)) { Fail "-Output ($Output) overlaps the Desktop checkout; give it a folder of its own" }
+if ($ServerSource -and (Overlap $Output $ServerSource)) { Fail "-Output ($Output) overlaps -ServerSource; give it a folder of its own" }
+if ((Overlap $Output $Work) -and $Output -ne (Full $default)) { Fail "-Output ($Output) overlaps -Work; inside it only $default is accepted" }
+if ($ServerSource -and (Overlap $Work $ServerSource)) { Fail '-Work overlaps -ServerSource' }
+if (Overlap $Work (Full $Desktop)) { Fail '-Work overlaps the Desktop checkout' }
+if (Test-Path -LiteralPath $Output) {
+    if (-not (Test-Path -LiteralPath $Output -PathType Container)) { Fail "-Output ($Output) is a file" }
+    $existing = @(Get-ChildItem -LiteralPath $Output -Force)
+    if ($existing.Count -gt 0) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Output $Marker))) { Fail "-Output ($Output) is not empty and is not this script's evidence folder; nothing was removed" }
+        $existing | Remove-Item -Recurse -Force
+    }
+}
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
-$Work = (Resolve-Path $Work).Path
-if (Test-Path $Output) { Remove-Item -Recurse -Force $Output }
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
-$Output = (Resolve-Path $Output).Path
+Set-Content -LiteralPath (Join-Path $Output $Marker) -Value 'Evidence of tools/qualify_windows_cuda.ps1; replaced by its next run.'
 $Reports = Join-Path $Output 'reports'
 New-Item -ItemType Directory -Force -Path $Reports | Out-Null
 
@@ -267,8 +292,12 @@ for ($index = 0; $index -lt $cuda.Count; $index++) {
         if ($WithoutGpuRehearsal) { $failures.Add("$(Key $record) qualified on CUDA on a computer said to have no card") }
     } elseif (-not $WithoutGpuRehearsal) {
         $failures.Add("$(Key $record) did not qualify on CUDA: $($record.failure)")
-    } else {
+    } elseif ($record.failure -eq $Refusal) {
         $row.state = "refused ($($record.failure))"
+    } else {
+        # Only the runtime's own refusal counts: a process that did not start or did not finish is a fault.
+        $row.state = "FAULT ($($record.failure))"
+        $failures.Add("$(Key $record): CUDA was not refused cleanly without a card: $($record.failure)")
     }
     $rows += New-Object PSObject -Property $row
 }
