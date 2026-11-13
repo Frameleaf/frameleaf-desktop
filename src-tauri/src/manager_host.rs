@@ -691,6 +691,16 @@ fn ready(bytes: &[u8], id: &str, hash: &str, origin: &str) -> Result<(), String>
     }
     Ok(())
 }
+/// Why a start that did not reach readiness failed. Cancellation is noticed in several
+/// places, one of which reports it as an unverified connection; a cancelled start is always
+/// reported as cancelled, so it is never mistaken for a refusal by Manager.
+fn start_failure(cancelled: bool, error: String) -> String {
+    if cancelled {
+        "native_manager_start_cancelled".into()
+    } else {
+        error
+    }
+}
 pub struct NativeManager {
     child: Child,
     #[cfg(windows)]
@@ -1181,6 +1191,8 @@ impl NativeManager {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
             }
+            // A start the person cancelled says so, wherever the cancellation was noticed.
+            result = result.map_err(|error| start_failure(cancel.load(Ordering::Acquire), error));
             // Manager did not come up and has been ended, so a port this start moved to is
             // not kept: Manager may have refused it.
             if let Some(data) = &self.local_record {
@@ -1531,6 +1543,50 @@ mod tests {
             .unwrap(),
             "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
         );
+    }
+    /// A start cancelled while its port move was still unconfirmed: the move is taken back,
+    /// and the answer is the cancellation, never a busy port.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_start_with_a_moved_port_reads_as_cancelled_and_does_not_keep_the_move() {
+        use crate::manager_local::{recorded, save, Ports, Record};
+        assert_eq!(
+            start_failure(true, "native_manager_https_unverified".into()),
+            "native_manager_start_cancelled"
+        );
+        assert_eq!(
+            start_failure(false, "native_manager_https_unverified".into()),
+            "native_manager_https_unverified"
+        );
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-cancelled-move-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let ran = Record::new(Ports::default(), vec!["a".repeat(64)]);
+        let moved = Ports {
+            api: 2284,
+            ..Ports::default()
+        };
+        for (cancelled, expected) in [
+            (true, "native_manager_start_cancelled"),
+            // Not cancelled: the child ends without a receipt, and the busy port is named.
+            (false, "local_port_in_use_2283"),
+        ] {
+            save(&root, &Record::for_start(&ran, moved, vec!["a".repeat(64)])).unwrap();
+            let mut manager = NativeManager::test_child(Command::new("/bin/sleep").arg("1"));
+            manager.local_record = Some(root.clone());
+            let cancel = AtomicBool::new(cancelled);
+            assert_eq!(
+                manager
+                    .wait_ready(Duration::from_secs(5), &cancel)
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(recorded(&root).unwrap(), ran, "the move is not kept");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
     #[cfg(target_os = "linux")]
     #[test]

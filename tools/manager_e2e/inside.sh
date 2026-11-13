@@ -60,7 +60,7 @@ manifest() {
 }
 
 # run PACKAGE TESTS [FIRST_PACKAGE]: in a new account with a new library and keyring, the
-# space-separated TESTS one after another in one login session; the last one's result counts.
+# space-separated TESTS one after another in one login session; the first failure decides the result.
 # An earlier one may end without stopping what it started, as a crash of the app would.
 # With FIRST_PACKAGE the account's profile is prepared for that package, as for a library that
 # was started with it before PACKAGE was installed.
@@ -89,10 +89,13 @@ run() {
     FRAMELEAF_MANAGER_E2E_SHORT="${FRAMELEAF_MANAGER_E2E_SHORT:-480}" \
     dbus-run-session -- bash -uo pipefail -c '
       head -c 32 /dev/urandom | base64 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
-      tests=$0 result=1
+      tests=$0 result=0
+      [[ $# -gt 0 ]] || exit 2
       for name in "$@"; do
+        # Every test runs; the first one that fails decides the result.
         "$tests" --ignored --exact --nocapture --test-threads=1 "host_setup::manager_e2e::$name"
-        result=$?
+        status=$?
+        [[ $result -ne 0 ]] || result=$status
       done
       exit "$result"
     ' "$WORK/desktop-tests" $names

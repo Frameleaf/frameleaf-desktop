@@ -154,7 +154,7 @@ impl Lab {
             let mut settings = configuration(
                 &record,
                 &layout,
-                &runtime,
+                runtime.source_revision(),
                 &uid,
                 self.state.clone(),
                 self.data.clone(),
@@ -347,7 +347,12 @@ impl Lab {
             if sample {
                 let state = self.photo_server().await;
                 if seen.last().is_none_or(|(last, _)| *last != state) {
-                    seen.push((state, self.photos().await));
+                    let opened = self.photos().await;
+                    // Kept only if Manager reports the same state afterwards: a sample taken
+                    // across a change of state says nothing about either state.
+                    if self.photo_server().await == state {
+                        seen.push((state, opened));
+                    }
                 }
             }
             let operation = self.ask(Command::Operation { id }).await?;
@@ -359,7 +364,8 @@ impl Lab {
             if started.elapsed() > Duration::from_secs(20 * 60) {
                 return Err(format!("{name} did not finish"));
             }
-            tokio::time::sleep(POLL).await;
+            // A sampled poll asks Manager at least twice, so it is made a third as often.
+            tokio::time::sleep(if sample { POLL * 3 } else { POLL }).await;
         }
         println!(
             "{name}: complete in {:.1}s; seen while it ran: {seen:?}",
@@ -383,7 +389,6 @@ impl Lab {
 fn opened_only_while_running(seen: &[Sample]) {
     for (state, opened) in seen {
         match (state.as_str(), opened) {
-            // The two are separate requests; a state that changed in between is not a fault.
             (_, Err(code)) => assert!(
                 [
                     "local_photos_starting",
@@ -394,7 +399,7 @@ fn opened_only_while_running(seen: &[Sample]) {
                 "{state}: refused with {code}"
             ),
             (state, Ok(_)) => assert!(
-                state == "running" || state == "starting",
+                state == "running",
                 "Photos opened while Manager reported {state}"
             ),
         }
