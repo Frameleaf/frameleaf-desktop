@@ -496,7 +496,10 @@ mod tests {
         fs::write(outside.0.join("elsewhere"), b"outside").unwrap();
         for place in ["secrets/link", "media", "media/2026/link"] {
             let (root, state) = profile("junction");
-            let link = state.join(place);
+            // `mklink` reads a forward slash as a switch.
+            let link = place
+                .split('/')
+                .fold(state.clone(), |path, part| path.join(part));
             fs::create_dir_all(link.parent().unwrap()).unwrap();
             private_directory(&state).unwrap();
             junction(&link, &outside.0);
