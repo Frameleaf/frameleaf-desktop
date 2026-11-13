@@ -6,11 +6,7 @@ use super::*;
 use crate::manager::{Action, Command};
 use crate::manager_local::{Features, Ports};
 use crate::manager_tls::TlsIdentity;
-use std::{
-    io::{Read, Write},
-    path::PathBuf,
-    time::Instant,
-};
+use std::{path::PathBuf, time::Instant};
 
 const DAY: i64 = 24 * 60 * 60;
 /// How often an operation is asked about: every five seconds, and every fifteen while its
@@ -66,10 +62,7 @@ fn other(port: u16, answer: Answer) -> Other {
                     match answer {
                         Answer::Plain => {
                             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                            let _ = stream.read(&mut [0u8; 64]);
-                            let _ = stream.write_all(
-                                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
-                            );
+                            crate::manager_local::answer_in_plain_text(&mut stream);
                         }
                         Answer::Silent => held.push(stream),
                     }
