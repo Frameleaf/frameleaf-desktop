@@ -310,11 +310,10 @@ def git_blob(
     git: str, root: Path, revision: str, name: str, env: dict[str, str]
 ) -> bytes:
     relative(name)
-    mode = run(
-        [git, "ls-tree", "--format=%(objectmode)", revision, "--", name],
-        cwd=root,
-        env=env,
-    )
+    # "<mode> <type> <object>\t<path>": the plain listing, which every git prints (`--format`
+    # needs git 2.36, newer than Ubuntu 22.04's).
+    listing = run([git, "ls-tree", revision, "--", name], cwd=root, env=env)
+    mode = listing.split(" ", 1)[0] if listing.count("\n") == 0 else ""
     if mode not in {"100644", "100755"}:
         raise BuildError("runtime_source_file_invalid")
     size = int(run([git, "cat-file", "-s", f"{revision}:{name}"], cwd=root, env=env))

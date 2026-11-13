@@ -32,7 +32,7 @@
       "targets": [
         "macos-aarch64"
       ],
-      "sourceRevision": "4da8e50954ff08be437db51a0872ce5da0e8ba06"
+      "sourceRevision": "a70fd7dcee16526cb913308e9ea9596489b24ff6"
     },
     "cuda-ort": {
       "python": "3.12.13",
@@ -43,7 +43,7 @@
         "windows-x86_64",
         "linux-x86_64"
       ],
-      "sourceRevision": "4da8e50954ff08be437db51a0872ce5da0e8ba06"
+      "sourceRevision": "a70fd7dcee16526cb913308e9ea9596489b24ff6"
     },
     "openvino-ort": {
       "python": "3.12.13",
@@ -54,7 +54,7 @@
         "windows-x86_64",
         "linux-x86_64"
       ],
-      "sourceRevision": "4da8e50954ff08be437db51a0872ce5da0e8ba06"
+      "sourceRevision": "a70fd7dcee16526cb913308e9ea9596489b24ff6"
     }
   }
 }

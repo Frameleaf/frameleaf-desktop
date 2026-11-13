@@ -760,6 +760,11 @@ impl VerifiedRuntime {
             return Err("runtime_cancelled".into());
         }
         if !child.exit_status.is_some_and(|status| status.success()) {
+            // FD-56: the process leaves its reason in the report it could not pass. Say it, so
+            // a refusal is never silent; the code the caller acts on stays the same.
+            if let Some(why) = refusal(&child.scratch.join("report.json")) {
+                eprintln!("runtime qualification refused: {why}");
+            }
             return Err("runtime_qualification_failed".into());
         }
         let path = child.scratch.join("report.json");
@@ -791,6 +796,26 @@ impl VerifiedRuntime {
         })
     }
 }
+/// Why a qualification process refused: the code, and the short detail, in the report it left.
+/// For a person reading the log only: never trusted, never sent anywhere.
+fn refusal(report: &Path) -> Option<String> {
+    let raw = crate::runtime_store::read_bounded(report, 64 * 1024).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let reason = value["reason"].as_str().filter(|reason| {
+        !reason.is_empty()
+            && reason.len() <= 128
+            && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    })?;
+    let detail: String = value["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(500)
+        .collect();
+    Some(format!("{reason} {detail}").trim_end().to_owned())
+}
+
 /// `runtime_provider` is the one provider the installed runtime's signed manifest declares, and
 /// `expected_collector` the device collector that manifest carries (CoreML only).
 fn validate_report(
@@ -897,6 +922,45 @@ fn validate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_refused_qualification_names_its_reason_from_the_report_it_left() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-refusal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let report = root.join("report.json");
+        assert_eq!(refusal(&report), None);
+        std::fs::write(
+            &report,
+            r#"{"protocolVersion":1,"modelKey":"m","state":"incompatible","reason":"native_output_value_mismatch"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(&report).as_deref(),
+            Some("native_output_value_mismatch")
+        );
+        std::fs::write(
+            &report,
+            "{\"state\":\"incompatible\",\"reason\":\"native_qualification_failed\",\"detail\":\"RuntimeError: CUDA failure\\n2\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(&report).as_deref(),
+            Some("native_qualification_failed RuntimeError: CUDA failure2")
+        );
+        // Anything that is not a plain code is not repeated.
+        for bad in [
+            r#"{"reason":"Not A Code"}"#,
+            r#"{"reason":""}"#,
+            r#"{"reason":7}"#,
+            "not json",
+        ] {
+            std::fs::write(&report, bad).unwrap();
+            assert_eq!(refusal(&report), None, "{bad}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn report_for(provider: &str, state: &str, cpu_nodes: bool) -> [serde_json::Value; 2] {
         let mut nodes = serde_json::json!({ provider: 12 });
         if cpu_nodes {
