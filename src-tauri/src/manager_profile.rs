@@ -54,7 +54,6 @@ impl Profile {
         self.installation_transition.as_ref()
     }
     /// The keystore binding of an existing profile for a given package, without changing it.
-    #[cfg(not(windows))]
     pub(crate) fn binding_for(
         config: &Configuration,
         candidate: &Path,
@@ -126,7 +125,6 @@ impl Profile {
         )
     }
     /// Move a stopped profile's saved credentials to a newer package; returns (previous, next) bindings.
-    #[cfg(not(windows))]
     pub(crate) fn carry_forward(
         previous: (&Configuration, &Path, &str),
         next: (&Configuration, &Path, &str),
@@ -141,7 +139,6 @@ impl Profile {
         )
     }
     /// `carry_forward` with injectable keystore access for tests.
-    #[cfg(not(windows))]
     fn carry_forward_with(
         previous: (&Configuration, &Path, &str),
         next: (&Configuration, &Path, &str),
@@ -225,8 +222,8 @@ impl Profile {
                 }
             }
             None => {
-                let prior = source.ok_or("native_profile_recovery_required")?;
-                if !valid(&prior, &old) {
+                let prior = source.as_ref().ok_or("native_profile_recovery_required")?;
+                if !valid(prior, &old) {
                     return Err("native_profile_binding_changed".into());
                 }
                 let moved = Self {
@@ -239,6 +236,18 @@ impl Profile {
                 };
                 persist(&format!("{ACCOUNT}-{new}"), &moved)?;
             }
+        }
+        // The reservation moves only once the keystore is seen to hold the same secrets under
+        // the new binding. Until then, and if this fails, the previous package still starts.
+        let proven = load(&format!("{ACCOUNT}-{new}"))?.is_some_and(|saved| {
+            valid(&saved, &new)
+                && source.as_ref().is_none_or(|prior| {
+                    prior.database_password == saved.database_password
+                        && prior.backup_key == saved.backup_key
+                })
+        });
+        if !proven {
+            return Err("native_profile_unavailable".into());
         }
         if marker != new.as_bytes() {
             // A fixed name lets a retry replace what an interrupted move left behind.
@@ -263,9 +272,12 @@ impl Profile {
                 // Replacing the reservation is the only change; the old keystore entry is kept.
                 data.rename(temp, &data, ".host-profile")
                     .map_err(|_| "native_profile_unavailable")?;
+                // Windows has no directory flush; the file's own contents were flushed above.
+                #[cfg(unix)]
                 crate::host_storage::directory(&next.0.data)?
                     .sync_all()
-                    .map_err(|_| "native_profile_unavailable".to_string())
+                    .map_err(|_| "native_profile_unavailable".to_string())?;
+                Ok(())
             })();
             if result.is_err() {
                 let _ = data.remove_file(temp);
@@ -627,7 +639,6 @@ mod tests {
             }
         }
     }
-    #[cfg(not(windows))]
     #[test]
     fn profile_moves_its_secrets_to_a_newer_package_and_a_retry_finishes_the_move() {
         let f = Fixture::new();
@@ -704,6 +715,49 @@ mod tests {
             .unwrap_err(),
             "credential_store_locked"
         );
+        // A keystore that says it saved but does not hold the new entry, or holds other
+        // secrets under it, moves nothing: the reservation still names the previous package.
+        let before = Profile::binding_for(previous.0, &previous.1, &previous.2).unwrap();
+        assert_eq!(
+            Profile::carry_forward_with(
+                (previous.0, &previous.1, &previous.2),
+                (following.0, &following.1, &following.2),
+                None,
+                load,
+                |_, _| Ok(())
+            )
+            .unwrap_err(),
+            "native_profile_unavailable"
+        );
+        let other = std::cell::RefCell::new(None::<String>);
+        assert_eq!(
+            Profile::carry_forward_with(
+                (previous.0, &previous.1, &previous.2),
+                (following.0, &following.1, &following.2),
+                None,
+                |account: &str| match other.borrow().as_deref() {
+                    Some(saved) if !account.ends_with(&before) =>
+                        Ok(Some(serde_json::from_str(saved).unwrap())),
+                    _ => load(account),
+                },
+                |_, value: &Profile| {
+                    let mut changed = serde_json::to_value(value).unwrap();
+                    changed["databasePassword"] = "another-password-of-valid-length".into();
+                    *other.borrow_mut() = Some(changed.to_string());
+                    Ok(())
+                }
+            )
+            .unwrap_err(),
+            "native_profile_unavailable"
+        );
+        assert_eq!(
+            std::fs::read(f.1.data.join(".host-profile")).unwrap(),
+            before.as_bytes()
+        );
+        assert!(store
+            .borrow()
+            .keys()
+            .all(|account| account.ends_with(&before)));
         let (old, new) = Profile::carry_forward_with(
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
