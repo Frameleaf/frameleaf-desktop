@@ -35,6 +35,9 @@ pub(crate) struct View {
     companion_platform: Option<&'static str>,
     /// While a library is being carried to another package: export, restore, verify or switch.
     carry_step: Option<&'static str>,
+    /// A library on this computer moves to another companion package of the same database
+    /// version when it is next started with that package.
+    package_change_available: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,6 +96,7 @@ impl Default for View {
                 _ => None,
             },
             carry_step: None,
+            package_change_available: cfg!(any(target_os = "macos", target_os = "linux", windows)),
         }
     }
 }
@@ -1409,7 +1413,7 @@ fn configuration<U: Serialize>(
 /// correctly signed but built for another version of this app is named as that: the selected
 /// package is not what is wrong, and installing it again would not help. Such a move is not
 /// made, because its pins include the database version and nothing here migrates a database.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn previous_package_refusal(code: String) -> String {
     if code == "host_manifest_incompatible" {
         "host_upgrade_previous_package_incompatible".into()
@@ -1420,12 +1424,12 @@ fn previous_package_refusal(code: String) -> String {
 
 /// A library keeps its first installation identity. Moving it to a newer signed package copies its
 /// saved secrets and repoints its journals while it is cleanly stopped; downgrades are refused.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn carry_forward(
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn carry_forward<U: Serialize>(
     record: &Installation,
     runtime: &crate::host_runtime::VerifiedHostRuntime,
     next: &mut Configuration,
-    uid: u32,
+    uid: &U,
 ) -> Result<(), String> {
     let Some(marker) = crate::host_state::Owner::peek(&next.state)? else {
         return Ok(());
@@ -1445,7 +1449,7 @@ fn carry_forward(
         &previous_record,
         &previous_layout,
         previous_runtime.source_revision(),
-        &uid,
+        uid,
         next.state.clone(),
         next.data.clone(),
         // The ports Manager last ran with: its descriptor, and so the transition, names them.
@@ -1496,7 +1500,7 @@ fn carry_forward(
 }
 
 /// One side of a library move: the package's configuration, location and identity.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Package<'a> {
     config: &'a Configuration,
     candidate: &'a std::path::Path,
@@ -1506,7 +1510,8 @@ struct Package<'a> {
 
 /// The directory a carry-forward restored a library into, selected by the same journal write
 /// that selects the new package.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 struct CarriedDatabase<'a> {
     permit: &'a str,
     reference: &'a crate::host_database::Reference,
@@ -1515,7 +1520,7 @@ struct CarriedDatabase<'a> {
 }
 
 /// Every check runs before the first change; the journal write last commits the move.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn move_library(
     owner: crate::host_state::Owner,
     previous: Package,
@@ -1532,7 +1537,7 @@ fn move_library(
 /// `move_library`, or with `database` the move of a library whose database was carried into a
 /// new directory: the same checks and order, the same single journal write to commit, and
 /// that write also selects the directory. The original directory is left where it is.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn move_library_to(
     mut owner: crate::host_state::Owner,
     previous: Package,
@@ -1576,12 +1581,12 @@ fn move_library_to(
 }
 
 /// The exact bytes the host agent writes for a package's marker.
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 fn host_state_marker(package: (&str, &str)) -> Result<String, String> {
     host_state_marker_for(package, "19")
 }
 /// The marker of a package whose database build has the given Postgres major.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn host_state_marker_for(
     (manifest, revision): (&str, &str),
     major: &str,
@@ -1598,7 +1603,7 @@ fn host_state_marker_for(
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, PartialEq)]
 enum HostStatePackage {
     /// The host never created its database; the agent starts it fresh for any package.
@@ -1608,7 +1613,7 @@ enum HostStatePackage {
 }
 
 /// Read-only: which package the host agent's marker names, given both markers written out.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn host_state_package_named(
     state: &std::path::Path,
     previous: &str,
@@ -1648,7 +1653,7 @@ fn host_state_package_named(
 }
 
 /// The host agent's package marker names the package that last ran this database.
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 fn carry_host_state(
     state: &std::path::Path,
     previous: (&str, &str),
@@ -1661,7 +1666,7 @@ fn carry_host_state(
     )
 }
 /// `carry_host_state` for markers already written out.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn carry_host_state_named(
     state: &std::path::Path,
     previous: &str,
@@ -1695,9 +1700,12 @@ fn carry_host_state_named(
         drop(output);
         root.rename(temp, &root, "host-state.json")
             .map_err(|_| "host_state_invalid")?;
+        // Windows has no directory flush; the file's own contents were flushed above.
+        #[cfg(unix)]
         crate::host_storage::directory(state)?
             .sync_all()
-            .map_err(|_| "host_state_invalid".to_string())
+            .map_err(|_| "host_state_invalid".to_string())?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = root.remove_file(temp);
@@ -2268,8 +2276,7 @@ fn launch(
             data,
             recorded.ports,
         )?;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        carry_forward(record, &runtime, &mut configuration, uid)?;
+        carry_forward(record, &runtime, &mut configuration, &uid)?;
         if cancel.load(Ordering::Acquire) {
             return Err("native_manager_start_cancelled".into());
         }
@@ -2305,6 +2312,18 @@ mod manager_e2e;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new file only this account can read, as the host agent writes its own.
+    fn private_file(path: &std::path::Path, text: &str) {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        std::io::Write::write_all(&mut options.open(path).unwrap(), text.as_bytes()).unwrap();
+    }
 
     #[tokio::test]
     async fn photos_ask_manager_for_its_state_only_when_it_declares_that_and_open_only_on_running()
@@ -2894,7 +2913,6 @@ mod tests {
             .expect("installed Manager shutdown failed");
     }
 
-    #[cfg(unix)]
     #[test]
     fn host_package_marker_moves_forward_once_and_refuses_unknown_packages() {
         let root = std::env::temp_dir()
@@ -2911,15 +2929,8 @@ mod tests {
         let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
         let (ra, rb) = ("1".repeat(40), "2".repeat(40));
         let write = |text: &str| {
-            use std::os::unix::fs::OpenOptionsExt;
             let _ = std::fs::remove_file(&path);
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .unwrap();
-            std::fs::write(&path, text).unwrap();
+            private_file(&path, text);
         };
         write(&marker(&a, &ra));
         carry_host_state(&root, (&a, &ra), (&b, &rb)).unwrap();
@@ -2935,7 +2946,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn library_move_checks_everything_before_its_first_change() {
         use crate::host_state::Owner;
@@ -2958,14 +2968,7 @@ mod tests {
             }
             drop(owner);
             if let Some(text) = marker {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(state.join("host-state.json"))
-                    .unwrap();
-                std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+                private_file(&state.join("host-state.json"), text);
             }
             if pending {
                 crate::runtime_store::private_directory(&state.join("checkpoints")).unwrap();
@@ -2977,7 +2980,7 @@ mod tests {
             installation_id: id.into(),
             name: "Synthetic".into(),
             release: "frameleaf-v3.0.0-1".into(),
-            controller: "/bin/echo".into(),
+            controller: std::env::current_exe().unwrap(),
             state: state.into(),
             data: state.with_file_name("manager"),
             origin: "https://127.0.0.1:9443".into(),
