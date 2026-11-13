@@ -17,9 +17,10 @@
   import Remote from './pages/Remote.svelte';
   import { initials, hostOf } from './ui-state';
   import { connectionError, errorCopy } from './errors';
-  import { savedSignInState, savedSignInView, type Restored } from './connection-state';
+  import StepUp from './StepUp.svelte';
+  import { keptVerification, savedSignInState, savedSignInView, type Restored } from './connection-state';
   import type { Connection, SetupStatus, ServerSummary, CloudAccount } from './server-types';
-  import { noStepUp, stepUpDismissed, summaryStepUpAfter, type StepUpState } from './sign-in-steps';
+  import { noStepUp, stepUpDismissed, summaryStepUpAfter, verificationRequired, type StepOffer, type StepUpState } from './sign-in-steps';
   import { availablePage, pages, restoredPage, shortcutPage, type Page } from './navigation';
 
   const lastPageKey = 'frameleaf.last-page.v1';
@@ -101,6 +102,24 @@
     staleSignIn = !connection && state === 'stale';
     keptSignIn = !connection && (state === 'reconnecting' || state === 'needs-verification') ? state : null;
     if (!keptSignIn) failure = explain(error);
+    if (keptSignIn === 'needs-verification') void askKeptOffer();
+  }
+  // What the server asks for before the kept sign-in continues, so the person can verify on that screen.
+  // `restore_connection` answers with a bare code; the offer (methods and a transaction) is asked for here.
+  let keptOffer = $state<StepOffer | null>(null);
+  let keptOfferAsked = $state(false);
+  const verify = $derived(keptSignIn === 'needs-verification' && !connection ? keptVerification(keptOffer, keptOfferAsked) : null);
+  let keptOfferRequest = 0;
+  async function askKeptOffer() {
+    const asked = ++keptOfferRequest;
+    keptOffer = null; keptOfferAsked = false;
+    let offer: StepOffer | null = null;
+    let answered = true;
+    // No refusal means the server no longer asks: Check again restores the sign-in.
+    try { await invoke('saved_sign_in_verification'); answered = false; }
+    catch (error) { offer = verificationRequired(error); }
+    if (asked !== keptOfferRequest || keptSignIn !== 'needs-verification' || connection) return;
+    keptOffer = offer; keptOfferAsked = answered;
   }
   // `background` is an attempt nobody pressed a button for: it leaves the buttons and messages alone.
   async function restoreSaved(retry = false, background = false) {
@@ -309,10 +328,14 @@
           <div class="logo"><img src={mark} alt="" /><span>Frameleaf</span></div>
           <h2 tabindex="-1" bind:this={keptTitle}>{kept.panel.title}</h2>
           <p class="sub" role="status">{kept.panel.detail}</p>
+          {#if verify?.hint}<p class="sub" role="status">{verify.hint}</p>{/if}
+          {#if verify && keptOffer}
+            {#key keptOffer.transaction}<StepUp offer={keptOffer} retry={() => { void restoreSaved(true); }} onclose={() => { keptOffer = null; keptOfferAsked = false; }} />{/key}
+          {/if}
           <p>
-            <button class="btn primary" disabled={busy} onclick={retryKept}>{kept.panel.retry}</button>
+            <button class="btn" class:primary={!verify?.verifyHere && !verify?.signOutFirst} disabled={busy} onclick={retryKept}>{kept.panel.retry}</button>
             <button class="btn" disabled={busy} onclick={offlinePhotos}>Offline Albums</button>
-            <button class="btn quiet" disabled={busy} onclick={() => { signOutSheet = true; }}>Sign out…</button>
+            <button class="btn" class:quiet={!verify?.signOutFirst} class:primary={verify?.signOutFirst} disabled={busy} onclick={() => { signOutSheet = true; }}>Sign out…</button>
           </p>
         </div>
       </div>

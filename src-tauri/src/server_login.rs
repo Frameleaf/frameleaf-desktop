@@ -137,7 +137,8 @@ pub(crate) async fn server_sign_in_options(
     server: String,
 ) -> Result<SignInOptions, String> {
     crate::require_local(&window)?;
-    let base = normalize_server(&server)?;
+    // The one place an address is typed: every later step is given the origin this returns.
+    let base = crate::connection::typed_server(&server)?;
     let client = transport::client()?;
     let ping: Ping = get(&client, &base, "api/server/ping")
         .await
