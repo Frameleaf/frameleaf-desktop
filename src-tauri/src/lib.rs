@@ -5,6 +5,8 @@ pub mod connection;
 pub mod copy_source;
 pub mod copy_upload;
 mod credential_lock;
+#[cfg(any(not(target_os = "macos"), test))]
+mod credential_parts;
 mod credentials;
 mod discovery;
 mod drop_import;
@@ -36,6 +38,7 @@ pub mod native_predictor;
 pub mod native_runtime;
 mod offline_albums;
 mod package_lease;
+mod photo_session;
 pub mod photo_sources;
 mod process_tree;
 #[cfg(any(target_os = "linux", test))]
@@ -467,25 +470,29 @@ async fn finish_new_connection(
     if let Ok(Some(caps)) = &capabilities {
         saved.server_id.clone_from(&caps.server_id);
     }
-    let result = match credentials::save("connection", saved) {
-        Err(error) => Err(error),
-        Ok(()) => match confirm(saved) {
-            Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
-            // A changed item may belong to another writer. Revoke our minted token only.
-            Err(error) if error == "credential_confirmation_changed" => Err(error),
-            Err(error)
-                if !saved.server_id.is_empty()
-                    && matches!(
+    let result = if saved.server_id.is_empty() {
+        // The server did not say which server it is, so there is nothing a restart could check
+        // this sign-in against. It is not saved; the session just minted is ended below.
+        Err("server_sign_in_retry_required".into())
+    } else {
+        match credentials::save("connection", saved) {
+            Err(error) => Err(error),
+            Ok(()) => match confirm(saved) {
+                Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
+                // A changed item may belong to another writer. Revoke our minted token only.
+                Err(error) if error == "credential_confirmation_changed" => Err(error),
+                Err(error)
+                    if matches!(
                         error.as_str(),
                         "credential_unlock_required" | "credential_confirmation_unavailable"
                     ) =>
-            {
-                return Err(error)
-            }
-            Err(_) => {
-                credentials::delete("connection").and(Err("server_sign_in_retry_required".into()))
-            }
-        },
+                {
+                    return Err(error)
+                }
+                Err(_) => credentials::delete("connection")
+                    .and(Err("server_sign_in_retry_required".into())),
+            },
+        }
     };
     let base = normalize_server(&saved.server)?;
     let _ = client
@@ -544,9 +551,6 @@ pub(crate) async fn restore_saved(
         }
         return Ok(None);
     };
-    if saved.server_id.is_empty() {
-        return Err("server_identity_not_confirmed".into());
-    }
     // Restoring the connection already in use is only a check: it must not interrupt its work.
     let checking = current
         .as_ref()
@@ -568,6 +572,9 @@ pub(crate) async fn restore_saved(
     }
     let setup = app.state::<worker_setup::WorkerSetup>();
     let (mut view, worker_kept) = prepare(&mut saved, checking && setup.running().await).await;
+    // A sign-in saved before its server was identified learns and saves the identity in
+    // `prepare`, from the server its session was just checked against. Until then it is not used.
+    saved_sign_in::identified(&saved)?;
     if view.state == "identity-changed" {
         app.state::<offline_albums::OfflineAlbums>()
             .clear(app)
@@ -641,24 +648,30 @@ async fn sign_out(
         .state::<offline_albums::OfflineAlbums>()
         .clear(&app)
         .await;
+    // Written down before the sign-in goes, so a crash from here on still wipes the Photos data.
+    photo_session::mark(&app);
+    // The saved sign-in is removed while the connection is still locked: a restore waiting on the
+    // lock would otherwise find it, sign in again and leave a live session behind a signed-out
+    // window. Every sign-in saves under this lock too, so nothing can bring it back in between.
+    let local = {
+        let worker = credentials::delete("worker-session").is_ok();
+        let connection = credentials::delete("connection").is_ok();
+        let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
+        let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
+        worker && connection && sources && drops && offline
+    };
     drop(current);
     tray::refresh(&app).await;
     Ok(lifecycle::finish_sign_out(
+        async { local },
         async {
-            let worker = credentials::delete("worker-session").is_ok();
-            let connection = credentials::delete("connection").is_ok();
-            let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
-            let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
-            worker && connection && sources && drops && offline
-        },
-        async {
-            if let Some(photos) = app.get_webview_window("photos") {
-                let cleared = photos.clear_all_browsing_data().is_ok();
-                let closed = photos.close().is_ok();
-                cleared && closed
-            } else {
-                true
-            }
+            // The Photos session lives in the web data store, not in its window: it is wiped
+            // through the window that asked, with the Photos window open or closed.
+            let closed = app
+                .get_webview_window("photos")
+                .is_none_or(|photos| photos.close().is_ok());
+            let cleared = photo_session::clear(&app, &window);
+            cleared && closed
         },
         async {
             let Some(saved) = saved else {
@@ -718,6 +731,8 @@ pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Re
             return Ok(());
         }
     }
+    // An earlier sign-out that could not wipe its Photos data is made good before a new session.
+    photo_session::clear_if_owed(app);
     let photos = photo_window(app, &base, base.clone())?;
     let domain = base.host_str().ok_or("server_address_invalid")?;
     let secure = base.scheme() == "https";
@@ -822,6 +837,8 @@ pub fn run() {
                 let _ = window.show();
                 placement.remember(&window);
             }
+            // A sign-out that was cut short before it wiped the Photos data finishes here.
+            photo_session::clear_if_owed(app.handle());
             file_manager_import::setup(app.handle());
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
@@ -1485,6 +1502,9 @@ async fn control_photo_import(
     let _ = app.emit_to("main", "photo-import-history", ());
     Ok(status)
 }
+
+#[cfg(test)]
+mod session_tests;
 
 #[cfg(test)]
 mod resume_tests {

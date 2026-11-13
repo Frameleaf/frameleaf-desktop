@@ -50,6 +50,14 @@ pub(crate) fn same_session(held: &SavedConnection, saved: &SavedConnection) -> b
     held.server == saved.server && held.account_id == saved.account_id && held.token == saved.token
 }
 
+/// A sign-in is used only once its server has said which server it is.
+pub(crate) fn identified(saved: &SavedConnection) -> Result<(), String> {
+    if saved.server_id.is_empty() {
+        return Err("server_identity_not_confirmed".into());
+    }
+    Ok(())
+}
+
 pub(crate) async fn check(client: &reqwest::Client, saved: &SavedConnection) -> AccountCheck {
     #[derive(Deserialize)]
     struct User {
