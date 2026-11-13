@@ -360,6 +360,27 @@ pub(crate) enum Evidence {
     Running,
     Unknown,
 }
+/// Whether a job holds its leader and nothing else, from the job's count of live processes
+/// (`active`) and then whether the leader is still running. The order is the proof: a leader
+/// seen running after the count was in the job when it was counted, so a count of one was
+/// the leader. A count that cannot be read is `Unknown`; any process that is not the leader
+/// is `Running`.
+#[cfg(any(windows, test))]
+pub(crate) fn sole_member(
+    active: Result<u32, String>,
+    leader_running: impl FnOnce() -> Result<bool, String>,
+) -> Evidence {
+    match active {
+        Ok(0) => Evidence::Clear,
+        Ok(1) => match leader_running() {
+            Ok(true) => Evidence::Clear,
+            Ok(false) => Evidence::Running,
+            Err(_) => Evidence::Unknown,
+        },
+        Ok(_) => Evidence::Running,
+        Err(_) => Evidence::Unknown,
+    }
+}
 /// Only an accepted connection proves a listener and only a refusal proves there is none; a
 /// timeout or any other failure proves neither.
 pub(crate) fn listener_evidence(attempt: std::io::Result<std::net::TcpStream>) -> Evidence {
@@ -1390,8 +1411,22 @@ impl NativeManager {
             Ok(true)
         }
     }
+    /// Whether stopping this Manager can end anything besides Manager. Outside Windows the
+    /// stop signals Manager's own process and nothing else. On Windows it ends Manager's job,
+    /// and with it whatever Manager started: `Clear` only while that job holds Manager alone.
+    pub(crate) fn stops_alone(&mut self) -> Evidence {
+        #[cfg(windows)]
+        {
+            let active = self.tree.active();
+            sole_member(active, || self.has_exited().map(|exited| !exited))
+        }
+        #[cfg(not(windows))]
+        {
+            Evidence::Clear
+        }
+    }
     /// A stand-in child for lifecycle tests; it never reports readiness.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn test_child(command: &mut Command) -> Self {
         Self::spawn(
             command,
@@ -1507,6 +1542,31 @@ impl Drop for NativeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_holds_its_leader_alone_only_on_a_count_of_one_with_the_leader_running() {
+        let running = |alive: Result<bool, String>| move || alive;
+        let never = || -> Result<bool, String> { panic!("the leader is not asked") };
+        assert_eq!(sole_member(Ok(1), running(Ok(true))), Evidence::Clear);
+        // One process that is not the leader: something the leader started outlived it.
+        assert_eq!(sole_member(Ok(1), running(Ok(false))), Evidence::Running);
+        assert_eq!(
+            sole_member(
+                Ok(1),
+                running(Err("native_manager_state_unavailable".into()))
+            ),
+            Evidence::Unknown
+        );
+        // Nothing left to end.
+        assert_eq!(sole_member(Ok(0), never), Evidence::Clear);
+        for more in [2, 3, u32::MAX] {
+            assert_eq!(sole_member(Ok(more), never), Evidence::Running);
+        }
+        assert_eq!(
+            sole_member(Err("runtime_process_state_unavailable".into()), never),
+            Evidence::Unknown
+        );
+    }
     /// Captured from a Library 1.2.3 Manager's stored native-installation binding (synthetic fixture).
     #[cfg(unix)]
     #[test]

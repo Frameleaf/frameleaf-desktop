@@ -218,6 +218,13 @@ impl ProcessTree {
     /// Whether every process in the owned job has exited.
     #[cfg(windows)]
     pub(crate) fn is_empty(&self) -> Result<bool, String> {
+        self.active().map(|active| active == 0)
+    }
+
+    /// How many live processes the owned job holds, whatever started them: a job that does
+    /// not allow breakaway keeps every descendant, including those in jobs nested inside it.
+    #[cfg(windows)]
+    pub(crate) fn active(&self) -> Result<u32, String> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::{
             JobObjectBasicAccountingInformation, QueryInformationJobObject,
@@ -236,7 +243,7 @@ impl ProcessTree {
         {
             return Err("runtime_process_state_unavailable".to_string());
         }
-        Ok(info.ActiveProcesses == 0)
+        Ok(info.ActiveProcesses)
     }
 
     pub fn attach(child: &Child) -> Result<Self, String> {

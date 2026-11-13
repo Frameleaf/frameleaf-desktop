@@ -319,7 +319,8 @@ impl HostSetup {
     }
     /// Quit without stopping, allowed only after a stop for quitting failed and only while this
     /// app's record names the live Manager, so the next launch can attempt to stop it. Not on
-    /// Windows: leaving there ends Manager's job and would kill a running database.
+    /// Windows: leaving there ends Manager's job and would kill a running database. A Manager
+    /// whose job holds nothing else is stopped by the quit path itself instead.
     pub(crate) fn leave_for_exit(&self, leave: bool) -> Result<(), String> {
         if leave {
             if cfg!(not(unix)) || !self.exit_stop_failed.load(Ordering::Acquire) {
@@ -717,12 +718,20 @@ impl HostSetup {
         Ok(address)
     }
     pub(crate) async fn stop(&self) -> Result<View, String> {
-        self.stop_proven(false).await
+        self.stop_with(false, true).await
     }
     /// Stop Manager, only on the journal's proof that the database is closed. With `in_order`,
     /// a controller that still holds the journal is first closed in order through Manager; the
     /// same proof is then required before Manager is touched.
+    #[cfg(any(windows, test))]
     async fn stop_proven(&self, in_order: bool) -> Result<View, String> {
+        self.stop_with(in_order, false).await
+    }
+    /// `stop_proven`, and with `alone_suffices` also without the journal's proof when the stop
+    /// is proven to end Manager and nothing else (`stop_without_proof`). That is what Stop and
+    /// quitting need after an interrupted shutdown. It proves nothing about the library, so an
+    /// update keeps requiring the journal's proof.
+    async fn stop_with(&self, in_order: bool, alone_suffices: bool) -> Result<View, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
         let Some(running) = owner.as_mut() else {
             return Ok(self.snapshot());
@@ -755,9 +764,25 @@ impl HostSetup {
                         stop_photo_server(&mut *manager, configuration, ORDERLY_STOP),
                         Duration::from_secs(10),
                     )
-                    .await?
+                    .await
                 } else {
-                    prove()?
+                    prove()
+                };
+                let proof = match proof {
+                    Err(code) if alone_suffices => stop_without_proof(
+                        code,
+                        || {
+                            let mut lease =
+                                crate::host_state::Owner::acquire(&configuration.state, true)?;
+                            let journal = lease.idle(
+                                &configuration.installation_id,
+                                &installation.manifest_sha256,
+                            );
+                            Ok((lease, journal))
+                        },
+                        || manager.stops_alone(),
+                    )?,
+                    proof => proof?,
                 };
                 manager.shutdown(Duration::from_secs(10)).await?;
                 drop(proof);
@@ -787,7 +812,9 @@ impl HostSetup {
     /// The quit path. Unix asks Manager to exit even while the photo server runs: its controller
     /// then closes the database in order, and finishes on its own if this app exits first.
     /// Windows keeps the idle proof, because ending Manager's job there would kill the database;
-    /// a photo server that is still running is first closed in order through Manager.
+    /// a photo server that is still running is first closed in order through Manager. Where the
+    /// journal cannot give that proof (the last shutdown was interrupted), Manager is stopped
+    /// only while its job is proven to hold nothing else.
     /// The quit path as one decision. `exit_refused` is the code of whatever else would refuse
     /// the exit that follows: with one, nothing is stopped or left, because the app would
     /// stay open with its library stopped for nothing.
@@ -835,14 +862,16 @@ impl HostSetup {
         #[cfg(not(unix))]
         {
             let _ = timeout;
-            self.stop_proven(true).await
+            self.stop_with(true, true).await
         }
     }
     /// Installing an update on Windows ends this app, and with it Manager's job, which holds the
-    /// photo server and database. Close them in order through Manager first, on the same
-    /// journal proof Stop needs, then stop Manager. A failure is the reason nothing was
-    /// installed, and leaves the library as it was. This opens nothing by itself: the update
-    /// gate is taken afterwards and decides alone, so evidence it cannot read still blocks.
+    /// photo server and database. Close them in order through Manager first, on the journal's
+    /// proof of a clean stop, then stop Manager. Nothing less is accepted here: the gate that
+    /// follows needs that same proof, so a Manager stopped without it would be stopped for an
+    /// update that is then refused. A failure is the reason nothing was installed, and leaves
+    /// the library as it was. This opens nothing by itself: the update gate is taken
+    /// afterwards and decides alone, so evidence it cannot read still blocks.
     #[cfg(any(windows, test))]
     pub(crate) async fn stop_for_update(&self) -> Result<(), String> {
         self.stop_proven(true).await.map(|_| ())
@@ -853,7 +882,7 @@ impl HostSetup {
     /// kill-on-close, which the next start recovers from.
     #[cfg(windows)]
     pub(crate) fn stop_for_session_end(&self) {
-        let _ = tauri::async_runtime::block_on(self.stop_proven(true));
+        let _ = tauri::async_runtime::block_on(self.stop_with(true, true));
     }
 }
 /// How long Manager may take to close the photo server and database in order. Manager gives its
@@ -886,6 +915,38 @@ async fn orderly_stop_proof<P>(
             return proof;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// Whether an owned, live Manager may be stopped although the journal does not prove its
+/// library idle; `code` is why it does not. The journal's contents are not what makes a stop
+/// safe: what matters is that the stop ends nothing of the library. Two facts prove that,
+/// and both are required.
+/// - `lease`: the journal's exclusive lease, taken now and returned so it is kept until
+///   Manager has stopped, with what the journal says under it. A controller holds that lease
+///   from before it opens the database until it exits, so with it held no controller of this
+///   library is running and none can open the database.
+/// - `alone`: stopping Manager ends Manager and nothing else. On Windows the stop ends
+///   Manager's job, so the job must hold Manager alone: a database whose controller died,
+///   or anything else Manager started, is still in it.
+///
+/// A proof that failed because something holds the journal is never admitted. A lease that
+/// cannot be taken, and evidence that says running or cannot be read, refuse with `code`: the
+/// reason the stop was refused in the first place, which may be that Manager could not be
+/// asked to close a running photo server. This proves nothing about the library: the journal
+/// stays as it was, and an update is still blocked until it records a clean stop.
+fn stop_without_proof<L>(
+    code: String,
+    lease: impl FnOnce() -> Result<(L, Evidence), String>,
+    alone: impl FnOnce() -> Evidence,
+) -> Result<L, String> {
+    if idle_evidence(Err(code.clone())) == Evidence::Running {
+        return Err(code);
+    }
+    match lease() {
+        Ok((lease, journal)) if journal != Evidence::Running && alone() == Evidence::Clear => {
+            Ok(lease)
+        }
+        _ => Err(code),
     }
 }
 /// Ask the owned Manager to stop the photo server and database in order, with the grant this
@@ -3291,9 +3352,9 @@ mod tests {
         std::fs::remove_file(alias).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct OwnedFixture(std::path::PathBuf);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl OwnedFixture {
         fn new() -> Self {
             let root = std::env::temp_dir()
@@ -3343,7 +3404,7 @@ mod tests {
             setup
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for OwnedFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -3572,6 +3633,236 @@ mod tests {
             Err("host_recovery_requires_manager".to_string())
         );
         assert_eq!(reads.get(), 2);
+    }
+
+    /// A library whose controller died without a clean stop: the journal is left active and
+    /// held by nobody, as after a power cut or a killed photo server.
+    #[cfg(any(unix, windows))]
+    fn interrupted(state: &std::path::Path) {
+        let mut journal = crate::host_state::Owner::acquire(state, true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+    }
+
+    /// The decision behind Stop and quitting when the journal cannot prove the library idle.
+    /// It is the same on every OS; only where `alone` comes from differs.
+    #[test]
+    fn a_stop_without_the_journals_proof_needs_the_lease_and_a_manager_that_stops_alone() {
+        use std::cell::Cell;
+        let unproven = || "host_recovery_requires_manager".to_string();
+        // What the decision does with the journal lease and the evidence it is given, and
+        // whether it asked for each.
+        let decide = |code: &str, lease: Result<Evidence, &str>, alone: Evidence| {
+            let (took, asked) = (Cell::new(false), Cell::new(false));
+            let result = stop_without_proof(
+                code.to_string(),
+                || {
+                    took.set(true);
+                    lease
+                        .map(|journal| ("lease", journal))
+                        .map_err(str::to_string)
+                },
+                || {
+                    asked.set(true);
+                    alone
+                },
+            );
+            (result, took.get(), asked.get())
+        };
+        // The lease is held, the journal under it is merely unproven, and stopping Manager
+        // ends nothing else: the lease is handed on to be kept through the stop.
+        for code in [
+            "host_recovery_requires_manager",
+            "host_process_state_requires_review",
+            "host_controller_state_invalid",
+            "host_controller_binding_changed",
+        ] {
+            for journal in [Evidence::Unknown, Evidence::Clear] {
+                assert_eq!(
+                    decide(code, Ok(journal), Evidence::Clear),
+                    (Ok("lease"), true, true),
+                    "{code}"
+                );
+            }
+        }
+        // Something else would end with Manager, or that cannot be read: refused with the
+        // journal's own reason. Unknown refuses exactly as running does.
+        for alone in [Evidence::Running, Evidence::Unknown] {
+            assert_eq!(
+                decide(&unproven(), Ok(Evidence::Unknown), alone),
+                (Err(unproven()), true, true)
+            );
+        }
+        // A controller holds the journal: the database may be open. Nothing is even asked.
+        for held in ["host_controller_already_owned", "host_already_owned"] {
+            assert_eq!(
+                decide(held, Ok(Evidence::Unknown), Evidence::Clear),
+                (Err(held.to_string()), false, false)
+            );
+        }
+        // The lease cannot be taken (a controller holds it, or the journal cannot be opened):
+        // refused whatever else is true, with the reason the stop was refused for. That may
+        // be that Manager could not be asked to close a photo server that is running.
+        for code in [unproven(), "manager_pairing_required".to_string()] {
+            for refused in [
+                "host_controller_already_owned",
+                "host_controller_state_unavailable",
+                "host_state_not_private",
+                "host_profile_identity_changed",
+            ] {
+                assert_eq!(
+                    decide(&code, Err(refused), Evidence::Clear),
+                    (Err(code.clone()), true, false)
+                );
+            }
+        }
+        // Under the lease, an older host still holds this library.
+        assert_eq!(
+            decide(&unproven(), Ok(Evidence::Running), Evidence::Clear),
+            (Err(unproven()), true, false)
+        );
+    }
+
+    /// Quit, Stop and update for a live Manager whose library's last shutdown was interrupted,
+    /// through the calls the interface makes. The stand-in Manager is this OS's: outside
+    /// Windows stopping it signals it alone; on Windows the same table runs against a real job
+    /// in `windows_stops_after_an_interrupted_shutdown_only_a_manager_alone_in_its_job`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_shutdown_never_keeps_the_app_unquittable_and_keeps_updates_closed() {
+        let fixture = OwnedFixture::new();
+        interrupted(&fixture.state());
+        let own = || fixture.own("/bin/sleep", &["30"]);
+        let stopped = |setup: &HostSetup| {
+            assert!(!setup.background_active());
+            assert!(setup.owner.try_lock().unwrap().is_none());
+            // Stopping Manager proved nothing about the library: the journal still blocks.
+            assert_eq!(
+                setup.lock_for_update().err().unwrap(),
+                "update_library_not_idle"
+            );
+        };
+
+        // Update: refused with the journal's reason, and nothing is stopped for it.
+        let setup = own();
+        for strict in [
+            setup.stop_for_update().await.unwrap_err(),
+            setup.stop_proven(false).await.err().unwrap(),
+        ] {
+            assert_eq!(strict, "host_recovery_requires_manager");
+        }
+        assert!(setup.background_active());
+        assert!(live(&mut setup.owner.try_lock().unwrap()));
+        assert_eq!(setup.lock_for_update().err().unwrap(), "update_host_active");
+
+        // Stop local management.
+        assert_eq!(setup.stop().await.unwrap().state, "idle");
+        stopped(&setup);
+
+        // Stop and quit, as this OS does it.
+        let setup = own();
+        setup.quit(None, false).await.unwrap();
+        stopped(&setup);
+
+        // Stop and quit as Windows does it: in order, on the proof.
+        let setup = own();
+        assert_eq!(setup.stop_with(true, true).await.unwrap().state, "idle");
+        stopped(&setup);
+
+        // A controller that holds the journal is still never stopped past: Stop refuses, and
+        // the Windows quit path has to ask Manager, which this stand-in cannot be.
+        let setup = own();
+        let controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        assert_eq!(
+            setup.stop().await.err().unwrap(),
+            "host_controller_already_owned"
+        );
+        assert_eq!(
+            setup.stop_with(true, true).await.err().unwrap(),
+            "native_manager_not_ready"
+        );
+        assert!(setup.background_active());
+        drop(controller);
+
+        // Once the library has been started and stopped cleanly again, the update goes ahead.
+        cleanly_stopped(&fixture.state());
+        setup.stop_for_update().await.unwrap();
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    /// The same table on Windows, where it matters: stopping Manager ends its job. Run by the
+    /// Windows build only. The stand-in Manager is started exactly as the real one is.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_stops_after_an_interrupted_shutdown_only_a_manager_alone_in_its_job() {
+        let fixture = OwnedFixture::new();
+        interrupted(&fixture.state());
+        let alone = |setup: &HostSetup| {
+            let mut owner = setup.owner.try_lock().unwrap();
+            owner.as_mut().unwrap().manager.stops_alone()
+        };
+
+        // Manager started something that is still running in its job: neither Stop nor
+        // quitting ends the job, and the app stays protected.
+        let busy = fixture.own("cmd.exe", &["/c", "ping -n 120 127.0.0.1"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while alone(&busy) != Evidence::Running {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never started its child"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for refused in [
+            busy.stop().await.err().unwrap(),
+            busy.quit(None, false).await.unwrap_err(),
+            busy.stop_for_update().await.unwrap_err(),
+        ] {
+            assert_eq!(refused, "host_recovery_requires_manager");
+        }
+        assert!(busy.background_active());
+        assert!(live(&mut busy.owner.try_lock().unwrap()));
+        drop(busy);
+
+        // Manager alone in its job.
+        let setup = fixture.own("ping.exe", &["-n", "120", "127.0.0.1"]);
+        assert_eq!(alone(&setup), Evidence::Clear);
+        // Update: refused with the journal's reason, and nothing is stopped for it.
+        assert_eq!(
+            setup.stop_for_update().await.unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        assert!(setup.background_active());
+        // A controller holds the journal: nothing is stopped past it.
+        let controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        assert_eq!(
+            setup.stop().await.err().unwrap(),
+            "host_controller_already_owned"
+        );
+        assert!(setup.background_active());
+        drop(controller);
+        // Stop and quit.
+        setup.quit(None, false).await.unwrap();
+        assert!(!setup.background_active());
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        assert_eq!(
+            setup.lock_for_update().err().unwrap(),
+            "update_library_not_idle"
+        );
+
+        // Stop local management.
+        let setup = fixture.own("ping.exe", &["-n", "120", "127.0.0.1"]);
+        assert_eq!(setup.stop().await.unwrap().state, "idle");
+        assert!(!setup.background_active());
+        assert_eq!(
+            setup.lock_for_update().err().unwrap(),
+            "update_library_not_idle"
+        );
     }
 
     #[tokio::test]
