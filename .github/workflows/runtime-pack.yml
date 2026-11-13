@@ -79,14 +79,14 @@ jobs:
         run: |
           set -euo pipefail
           python desktop/tools/check_linux_glibc.py --max 2.35 candidate/payload | tee -a "$GITHUB_STEP_SUMMARY"
-      # FD-63: the processor pack's interpreter, started in the app's gate with the pipe held open
+      # FD-71: the processor pack's interpreter, started in the app's gate with the pipe held open
       # as the app holds it, must import onnxruntime and use its standard input (it hung on Windows).
       - name: Start the processor pack as the app starts it
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$RUNNER_OS" = Windows ]; then python=candidate/payload/python/python.exe; else python=candidate/payload/python/bin/python3.12; fi
-          "$python" -I -B desktop/tools/check_runtime_gate.py | tee -a "$GITHUB_STEP_SUMMARY"
+          candidate/payload/python/python.exe -I -B desktop/tools/check_runtime_gate.py | tee -a "$GITHUB_STEP_SUMMARY"
       # FD-52: the accelerated pack (processor and CoreML manifests over one payload) must build on
       # the hosted Apple Silicon runner; it is not signed, published or run on a GPU here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

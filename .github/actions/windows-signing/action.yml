@@ -1,9 +1,9 @@
 name: Configure Azure Artifact Signing
-description: Authenticate with GitHub OIDC and configure Tauri to sign before bundling
+description: Authenticate with GitHub OIDC and configure Windows signing
 inputs:
   config:
-    description: Generated Tauri config file
-    required: true
+    description: Generated Tauri config file, if using the Tauri bundler
+    required: false
   client-id:
     required: true
     description: Azure application client ID
@@ -51,13 +51,14 @@ runs:
         client-id: ${{ inputs.client-id }}
         tenant-id: ${{ inputs.tenant-id }}
         allow-no-subscriptions: true
-    - name: Configure the Tauri signing command
+    - name: Install the signer and configure Tauri when requested
       shell: pwsh
       env:
         TAURI_CONFIG: ${{ inputs.config }}
       run: |
         $ErrorActionPreference = 'Stop'
         Install-Module -Name ArtifactSigning -RequiredVersion 0.1.20 -Scope CurrentUser -Force -Repository PSGallery
+        if ([string]::IsNullOrWhiteSpace($env:TAURI_CONFIG)) { return }
         $config = Get-Content -LiteralPath $env:TAURI_CONFIG -Raw | ConvertFrom-Json
         $windows = @{ signCommand = @{
           cmd = 'pwsh'

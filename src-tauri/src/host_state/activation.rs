@@ -1,6 +1,6 @@
 //! Selection stays fenced until independent finalization admits writers.
 use super::*;
-mod safety;
+pub(super) mod safety;
 use crate::host_runtime::{CheckpointReceipt, PreparedRestore, VerifiedRestore};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -11,6 +11,16 @@ pub(crate) struct SafetySnapshot {
     checkpoint: CheckpointReceipt,
 }
 impl SafetySnapshot {
+    #[cfg(any(windows, test))]
+    pub(super) fn operation_id(&self) -> &str {
+        self.checkpoint.operation_id()
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn checkpoint_matches_manifest(&self, manifest: &str) -> bool {
+        self.checkpoint.matches_manifest(manifest)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         self.checkpoint.validate()?;
         if !crate::native_runtime::digest_valid(&self.snapshot_id, 64)
@@ -75,7 +85,7 @@ impl Intent {
         Ok(())
     }
 }
-fn sync_directory(root: &Dir) -> Result<(), String> {
+pub(super) fn sync_directory(root: &Dir) -> Result<(), String> {
     #[cfg(unix)]
     root.try_clone()
         .and_then(|root| root.into_std_file().sync_all())
@@ -84,7 +94,7 @@ fn sync_directory(root: &Dir) -> Result<(), String> {
     let _ = root;
     Ok(())
 }
-fn record(root: &Dir, name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn record(root: &Dir, name: &str, bytes: &[u8]) -> Result<(), String> {
     let mut opts = options(true);
     opts.create_new(true);
     let mut file = root
@@ -121,7 +131,7 @@ fn verify_record(root: &Dir, name: &str, expected: &[u8]) -> Result<(), String> 
     }
     Ok(())
 }
-fn read_record(root: &Dir, name: &str) -> Result<Option<Vec<u8>>, String> {
+pub(super) fn read_record(root: &Dir, name: &str) -> Result<Option<Vec<u8>>, String> {
     let file = match root.open_with(name, &options(false)) {
         Ok(file) => file.into_std(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

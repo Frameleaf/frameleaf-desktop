@@ -5,7 +5,7 @@ Run with the pack's own interpreter: `<payload>/python/python.exe -I -B check_ru
 The app starts every runtime through its gate program (`GATE` in src-tauri/src/native_runtime.rs,
 read from there): it waits for the start line on its standard input, then watches that pipe, which
 the app holds open for as long as the runtime runs. On Windows the watch used to keep a read of the
-pipe pending, and importing onnxruntime then waited behind it forever (FD-63). Each probe runs in
+pipe pending, and importing onnxruntime then waited behind it forever (FD-71). Each probe runs in
 that gate with the pipe held open and in the app's environment, and must exit within 120 seconds; a
 plain start is reported beside it for comparison. A stuck probe prints where it is stuck.
 """

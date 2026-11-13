@@ -68,6 +68,19 @@ Keep the final result and hashes, and discard the account and its terminal
 transcript after the run. This is a manual qualification on the identified
 installed bytes.
 
+## Staged rollout evidence
+
+Desktop provides local status for these checks. This view does not aggregate
+results across devices or accounts.
+
+| Signal | Available evidence |
+| --- | --- |
+| First and repeat imports | Use the verified import count next to **Photo sources → Import history**. One distinct completed run with at least one verified original and no pending album attachment shows a first observed import, and two or more show repeat imports. The count uses the current sign-in's signed history, including up to 100 archived runs. If Desktop reports `Desktop could not read archived import history`, the count may reflect only the current run. Verify archive readback before recording a first observed import. |
+| Update success | The signed updater checks, installs, and requests a restart. Confirm that the expected version opens after restart for installed evidence. The updater does not retain a success count. |
+| Restore drill | Manager's completed restore with `native-restore-started` confirms the database and server start. Record original photo and video readback separately using a media recovery drill. |
+| Local job completion | The worker accepts a completion when Library acknowledges the result for its lease. A ready or active worker status alone does not establish a completed job. |
+| Cloud routing failures | Desktop reports a missing usable address, failed probes, and identity mismatches during connection. These outcomes are per attempt, with no retained failure count or rate. |
+
 ## Supported systems
 
 ### macOS minimum versions
@@ -171,6 +184,34 @@ Set `FRAMELEAF_TEST_BROWSER` to the absolute path of another Chromium build to
 use it instead, and `FRAMELEAF_TEST_OUTPUT` to an absolute folder to keep
 screenshots of the Manager page. `Desktop candidate` runs these tests on Linux
 for every pull request.
+
+## Installed model and provider evidence
+
+Install the approved Desktop candidate on Apple Silicon, Windows x64 or the
+Linux target under test. Record the installer SHA-256 and verify the installed
+app identity. Pair the app with the test Library, enable the intended search,
+face or OCR workload, and let Desktop finish native worker setup.
+
+After Library accepts a native fixture and Desktop verifies the acceptance,
+Desktop writes a private JSON receipt in
+`<app-local-data>/worker/qualification-evidence/`. The latest successful fixture
+for each model key and provider replaces its previous receipt. Collect only
+receipts with qualification timestamps from the current run and the expected
+app version, target architecture and signed runtime manifest digest. Search has
+separate receipts for default text, English text and vision. In the candidate
+revision's `runtime/model-catalogue.json`, locate the profile matching the
+receipt's `modelKey`, `runtimeSourceRevision` and `spec.provider`. Canonicalize
+only that profile's `spec.entries` using JSON Canonicalization Scheme, the same
+serialization the harness uses. Compute the lowercase SHA-256 of the canonical
+UTF-8 bytes without a trailing newline and compare it with `configSha256`.
+Check the model name, snapshot, provider and execution state in each receipt.
+A mixed accelerator result records `ready-mixed`.
+
+Keep the receipts with the matching installer digest. They record fixture
+acceptance by Library. Run a representative Library job for each route on the
+installed combination to qualify end-to-end processing. The opt-in NAS harness
+checks all three search receipts together and accepts separate Face and OCR
+runs. Each harness run executes one representative job.
 
 ## Build and signing boundaries
 

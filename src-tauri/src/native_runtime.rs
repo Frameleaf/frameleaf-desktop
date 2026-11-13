@@ -312,7 +312,7 @@ pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> R
 }
 
 const START: &[u8] = b"frameleaf-native-start\n";
-/// FD-63: on Windows the watch for a lost parent must never sit in a read of the pipe. The C
+/// FD-71: on Windows the watch for a lost parent must never sit in a read of the pipe. The C
 /// runtime holds its lock on descriptor 0 for as long as a read of it is pending, and every other
 /// use of that descriptor in the process (`lseek`, `fstat`, a library setting up its standard
 /// streams as it loads) then waits for a read that never ends. onnxruntime's native module did
@@ -1324,10 +1324,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    /// FD-63: with the pipe held open, as the app holds it for as long as the runtime runs, the
-    /// runtime may still use its standard input handle: ask what it is (as onnxruntime's native
-    /// module does when it loads) and hand it to a child process. On Windows both waited forever
-    /// behind the gate's own read of the pipe.
+    /// FD-71: with the pipe held open, as the app holds it for as long as the runtime runs, the
+    /// runtime may still use its standard input: `lseek` and `fstat` on it (as onnxruntime's
+    /// native module does when it loads) and hand it to a child process. On Windows these waited
+    /// forever behind the gate's own read of the pipe.
     #[test]
     fn python_gate_leaves_the_standard_input_usable_while_the_parent_holds_the_pipe() {
         use std::{

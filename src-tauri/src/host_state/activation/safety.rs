@@ -36,14 +36,40 @@ impl SafetySnapshot {
         root: &Dir,
         prepared: &PreparedRestore,
     ) -> Result<(), String> {
-        self.readback(root, prepared)
+        let binding =
+            serde_json::to_value(&prepared.binding).map_err(|_| "host_restore_safety_invalid")?;
+        self.verify_snapshot(
+            root,
+            &prepared.binding.operation_id,
+            &prepared.binding.installation_id,
+            binding["libraryId"]
+                .as_str()
+                .ok_or("host_restore_safety_invalid")?,
+        )
+    }
+
+    pub(in crate::host_state) fn verify_snapshot(
+        &self,
+        root: &Dir,
+        operation_id: &str,
+        installation_id: &str,
+        library_id: &str,
+    ) -> Result<(), String> {
+        self.readback(root, operation_id, installation_id, library_id)
             .map_err(|_| "host_restore_safety_invalid".into())
     }
-    fn readback(&self, root: &Dir, prepared: &PreparedRestore) -> Result<(), String> {
+
+    fn readback(
+        &self,
+        root: &Dir,
+        operation_id: &str,
+        installation_id: &str,
+        library_id: &str,
+    ) -> Result<(), String> {
         self.validate()?;
         let (parent, _) = parent_dir(root, Path::new("restore-safety/placeholder"))?;
         private_directory(&parent)?;
-        let relative = PathBuf::from(&prepared.binding.operation_id).join("recovery.json");
+        let relative = PathBuf::from(operation_id).join("recovery.json");
         let (dir, _) = parent_dir(&parent, &relative)?;
         private_directory(&dir)?;
         let parent_id = root_identity(&parent)?;
@@ -92,8 +118,6 @@ impl SafetySnapshot {
         }
         let recovery: serde_json::Value =
             serde_json::from_slice(json).map_err(|_| "host_restore_safety_invalid")?;
-        let binding =
-            serde_json::to_value(&prepared.binding).map_err(|_| "host_restore_safety_invalid")?;
         let checkpoint =
             serde_json::to_value(&self.checkpoint).map_err(|_| "host_restore_safety_invalid")?;
         let mut expected_checkpoint = checkpoint.clone();
@@ -103,8 +127,8 @@ impl SafetySnapshot {
             || recovery["runtime"] != "native"
             || recovery["mediaIncluded"] != false
             || recovery["databaseFormat"] != "frameleaf-canonical"
-            || recovery["libraryId"] != binding["libraryId"]
-            || recovery["installation"]["id"] != binding["installationId"]
+            || recovery["libraryId"] != library_id
+            || recovery["installation"]["id"] != installation_id
             || recovery["checkpoint"] != expected_checkpoint
         {
             return Err("host_restore_safety_invalid".into());

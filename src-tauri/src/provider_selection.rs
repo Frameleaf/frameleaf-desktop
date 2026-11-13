@@ -721,6 +721,10 @@ impl Runtimes {
             .find(|lane| lane.installed.provider() == provider)
             .ok_or_else(|| "worker_provider_unavailable".into())
     }
+    /// The installed runtime that serves `provider`.
+    pub(crate) fn runtime(&self, provider: &str) -> Result<&InstalledRuntime, String> {
+        Ok(&self.lane(provider)?.installed)
+    }
     pub(crate) fn attestation(&self, provider: &str) -> Result<&RuntimeAttestation, String> {
         Ok(&self.lane(provider)?.attestation)
     }
