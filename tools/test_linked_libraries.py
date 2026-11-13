@@ -11,8 +11,9 @@ class LinkedLibraries(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.pack = Path(temporary.name).resolve() / "site-packages"
-        self.pack.mkdir()
+        # A space in the path: the linker's listing must not be split on whitespace.
+        self.pack = Path(temporary.name).resolve() / "runtime pack" / "site-packages"
+        self.pack.mkdir(parents=True)
 
     def listing(self, *, driver=None, cublas=None, cudart="pack"):
         inside = self.pack / "nvidia/lib"
@@ -36,6 +37,11 @@ class LinkedLibraries(unittest.TestCase):
         )
         self.assertIn(DRIVER, resolved)
         self.assertIn("libcublas.so.12", resolved)
+        self.assertIn(" ", str(self.pack))
+        # The same library under a sibling folder whose name merely starts like the pack's.
+        outside = str(self.pack.parent.parent / "runtime" / "libcublas.so.12")
+        with self.assertRaisesRegex(ValueError, "outside the pack"):
+            check_linked(self.listing(driver="/usr/lib/libcuda.so.1", cublas=outside), self.pack, True)
 
     def test_without_a_driver_only_the_driver_library_may_be_missing(self):
         resolved = check_linked(self.listing(), self.pack, False)

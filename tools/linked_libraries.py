@@ -3,9 +3,11 @@
 Used by `smoke_accelerated_runtime.py`; kept apart so the rule is tested without a pack.
 """
 
+import re
 from pathlib import Path
 
 DRIVER = "libcuda.so.1"
+_LINE = re.compile(r"^\s*(\S+) => (.*?)(?: \(0x[0-9a-fA-F]+\))?\s*$")
 
 
 def check_linked(listing: str, pack: Path, driver_present: bool) -> list[str]:
@@ -19,13 +21,15 @@ def check_linked(listing: str, pack: Path, driver_present: bool) -> list[str]:
     resolved: dict[str, str] = {}
     missing: list[str] = []
     for line in listing.splitlines():
-        parts = line.split()
-        if "=>" not in parts:
+        # "\tname => /a path/that may have spaces/name (0x7f...)" or "\tname => not found"
+        match = _LINE.match(line)
+        if not match:
             continue
-        if "not found" in line:
-            missing.append(parts[0])
-        elif len(parts) >= 3:
-            resolved[parts[0]] = parts[2]
+        name, where = match.group(1), match.group(2).strip()
+        if where == "not found":
+            missing.append(name)
+        elif where:
+            resolved[name] = where
     expected = [] if driver_present else [DRIVER]
     if sorted(missing) != expected:
         raise ValueError(f"unresolved libraries {sorted(missing)}, expected {expected}")
