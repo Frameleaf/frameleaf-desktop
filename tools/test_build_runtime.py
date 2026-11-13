@@ -154,15 +154,91 @@ class RuntimeBuilderTests(unittest.TestCase):
                     metal_observer=True,
                 )
 
-    def test_providers_without_a_build_recipe_are_refused(self):
+    def test_cuda_and_openvino_manifests_are_limited_to_their_approved_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "python").write_bytes(b"fixture")
+            arguments = (root, "python", "a" * 40, 7)
             for provider in ["CUDAExecutionProvider", "OpenVINOExecutionProvider"]:
+                for system in ["windows", "linux"]:
+                    value = builder.manifest(
+                        *arguments, system, "x86_64", provider, "frameleaf_ml"
+                    )
+                    self.assertEqual(value["provider"], provider)
+                    # Only CoreML has a device collector.
+                    self.assertNotIn("deviceObserver", value)
+                for system, architecture in [
+                    ("macos", "aarch64"),
+                    ("macos", "x86_64"),
+                    ("linux", "aarch64"),
+                ]:
+                    with self.assertRaises(builder.BuildError):
+                        builder.manifest(*arguments, system, architecture, provider)
                 with self.assertRaises(builder.BuildError):
                     builder.manifest(
-                        root, "python", "a" * 40, 7, "linux", "x86_64", provider
+                        *arguments,
+                        "linux",
+                        "x86_64",
+                        provider,
+                        "frameleaf_ml",
+                        metal_observer=True,
                     )
+            # A provider nobody approved has no recipe.
+            with self.assertRaises(builder.BuildError):
+                builder.manifest(
+                    *arguments, "linux", "x86_64", "MIGraphXExecutionProvider"
+                )
+
+    def test_device_libraries_come_from_the_lock_with_their_exact_hashes(self):
+        def block(name, marker=""):
+            return (
+                f"{name}==1.0{marker} \\\n"
+                f"    --hash=sha256:{'a' * 64} \\\n"
+                f"    --hash=sha256:{'b' * 64}\n"
+            )
+
+        linux = " ; platform_machine in 'x86_64 aarch64' and sys_platform == 'linux'"
+        locked = (
+            block("numpy")
+            + "".join(block(name, linux) for name in builder.CUDA_LIBRARIES)
+            + block("nvidia-cublas", linux)
+            + "".join(block(name) for name in builder.OPENVINO_WINDOWS_LIBRARIES)
+        )
+        for system in ["linux", "windows"]:
+            value = builder.device_requirements("CUDAExecutionProvider", system, locked)
+            # Every library the provider loads, each with both locked hashes and no marker: the
+            # builder has already chosen the platform, and the lock's marker names Linux only.
+            self.assertEqual(
+                value, "".join(block(name) for name in builder.CUDA_LIBRARIES)
+            )
+            builder.validate_requirements(value)
+        self.assertEqual(
+            builder.device_requirements("OpenVINOExecutionProvider", "windows", locked),
+            "".join(block(name) for name in builder.OPENVINO_WINDOWS_LIBRARIES),
+        )
+        # The Linux OpenVINO wheel contains OpenVINO; the other providers carry nothing extra.
+        for provider, system in [
+            ("OpenVINOExecutionProvider", "linux"),
+            ("CPUExecutionProvider", "linux"),
+            ("CoreMLExecutionProvider", "macos"),
+        ]:
+            self.assertEqual(builder.device_requirements(provider, system, locked), "")
+        # A library the lock does not pin, or pins without a hash, stops the build.
+        with self.assertRaises(builder.BuildError):
+            builder.device_requirements(
+                "CUDAExecutionProvider", "linux", block("numpy")
+            )
+        with self.assertRaises(builder.BuildError):
+            builder.device_requirements(
+                "CUDAExecutionProvider",
+                "linux",
+                locked.replace(
+                    block("nvidia-cudnn-cu12", linux), "nvidia-cudnn-cu12==1.0\n"
+                ),
+            )
+        self.assertEqual(builder.unmarked(block("numpy")), block("numpy"))
+        with self.assertRaises(builder.BuildError):
+            builder.unmarked("numpy==1.0 ; sys_platform == 'linux'\n")
 
     def test_collector_is_staged_only_with_the_hashes_its_build_recorded(self):
         import hashlib
@@ -381,6 +457,26 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 builder.dependency_indexes(system, architecture),
                 ["--default-index", "https://pypi.org/simple"],
             )
+        # CUDA: the server's own CUDA 12 feed first, so onnxruntime-gpu is its build, then PyPI.
+        for system in ["windows", "linux"]:
+            self.assertEqual(
+                builder.dependency_indexes(system, "x86_64", "CUDAExecutionProvider"),
+                [
+                    "--index",
+                    builder.CUDA_FEED,
+                    "--default-index",
+                    "https://pypi.org/simple",
+                ],
+            )
+        self.assertTrue(
+            builder.CUDA_FEED.startswith(
+                "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/"
+            )
+        )
+        self.assertEqual(
+            builder.dependency_indexes("windows", "x86_64", "OpenVINOExecutionProvider"),
+            ["--default-index", "https://pypi.org/simple"],
+        )
 
     def test_windows_system_root_survives_uppercase_environment_keys(self):
         import os

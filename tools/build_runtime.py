@@ -31,6 +31,38 @@ CPU_PROVIDER = "CPUExecutionProvider"
 # An accelerated pack keeps the processor manifest as `manifest.json` and adds this one over the
 # same payload, so the app can fall back to the processor without a second copy in the installer.
 ACCELERATED_MANIFEST = "manifest-accelerated.json"
+# FD-56: where each accelerated provider may be built, as the server's runtime-profiles.json
+# approves it.
+ACCELERATED_TARGETS = {
+    "CoreMLExecutionProvider": {("macos", "aarch64")},
+    "CUDAExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+    "OpenVINOExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+}
+# The server's lock takes onnxruntime-gpu from this explicit index (`onnxruntime-cuda12` in its
+# pyproject.toml): the CUDA 12 build, which PyPI no longer carries. Every wheel is still checked
+# against the hash the lock records.
+CUDA_FEED = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+# The CUDA 12 and cuDNN 9 libraries onnxruntime-gpu 1.29.0 loads (its `cuda` and `cudnn` extras
+# and its own `preload_dlls` list, plus what those libraries need themselves). A container has
+# them in its image; a desktop has no CUDA installation, so the pack carries them. The lock pins
+# each one for the Linux torch build; the same pinned wheels exist for Windows.
+CUDA_LIBRARIES = (
+    "nvidia-cublas-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
+    "nvidia-nvjitlink-cu12",
+)
+# The Linux onnxruntime-openvino wheel contains OpenVINO; the Windows one loads it from the
+# `openvino` package (its package notes: "install OpenVINO PyPi Package separately for Windows").
+OPENVINO_WINDOWS_LIBRARIES = ("openvino", "openvino-telemetry")
+# Server-only packages of the GPU extras, as DESKTOP_UNUSED is for every extra.
+ACCELERATED_UNUSED = {
+    "CUDAExecutionProvider": ("qwen-vl-utils",),
+    "OpenVINOExecutionProvider": ("openvino-genai",),
+}
 
 
 class BuildError(RuntimeError):
@@ -168,14 +200,10 @@ def manifest(
         or architecture not in {"aarch64", "x86_64"}
         or not (
             provider == CPU_PROVIDER
-            or (
-                provider == "CoreMLExecutionProvider"
-                and system == "macos"
-                and architecture == "aarch64"
-                # Without its collector a CoreML runtime can never be admitted.
-                and metal_observer
-            )
+            or (system, architecture) in ACCELERATED_TARGETS.get(provider, set())
         )
+        # Without its collector a CoreML runtime can never be admitted.
+        or (provider == "CoreMLExecutionProvider" and not metal_observer)
         or (metal_observer and provider not in {CPU_PROVIDER, "CoreMLExecutionProvider"})
     ):
         raise BuildError("runtime_manifest_invalid")
@@ -362,7 +390,32 @@ def source_build_requirements(text: str, locked: str | None = None) -> str:
     return requirement_block(text if locked is None else locked, "setuptools")
 
 
-def dependency_indexes(system: str, architecture: str) -> list[str]:
+def unmarked(block: str) -> str:
+    """A locked requirement without its environment marker: the builder has already chosen it."""
+    first, separator, rest = block.partition("\n")
+    name, marker, _ = first.partition(" ;")
+    if marker and not first.rstrip().endswith("\\"):
+        raise BuildError("runtime_build_tool_not_pinned")
+    return (name + " \\" if marker else first) + separator + rest
+
+
+def device_requirements(provider: str, system: str, locked: str) -> str:
+    """The device libraries an accelerated runtime carries, exactly as the server's lock pins them."""
+    names = {
+        ("CUDAExecutionProvider", "linux"): CUDA_LIBRARIES,
+        ("CUDAExecutionProvider", "windows"): CUDA_LIBRARIES,
+        ("OpenVINOExecutionProvider", "windows"): OPENVINO_WINDOWS_LIBRARIES,
+    }.get((provider, system), ())
+    return "".join(unmarked(requirement_block(locked, name)) for name in names)
+
+
+def dependency_indexes(
+    system: str, architecture: str, provider: str = CPU_PROVIDER
+) -> list[str]:
+    if provider == "CUDAExecutionProvider":
+        # The first index that has a package is the one used: onnxruntime-gpu from the server's
+        # CUDA 12 feed, everything else from PyPI.
+        return ["--index", CUDA_FEED, "--default-index", "https://pypi.org/simple"]
     # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
     if system == "linux" and architecture in {"x86_64", "aarch64"}:
@@ -403,11 +456,22 @@ def build(
     }.get(platform.machine(), "unsupported")
     if f"{system}-{architecture}" not in profile["targets"]:
         raise BuildError("runtime_target_unqualified")
-    # The processor manifest of an accelerated pack is the cpu-ort runtime on the same payload.
+    # The processor manifest of an accelerated pack is the processor provider of the same
+    # payload: the cpu-ort dependency set itself for CoreML, and for CUDA and OpenVINO the
+    # processor provider of their own onnxruntime build, on the same Python.
     if accelerated and (
-        base.get("provider") != CPU_PROVIDER
+        (system, architecture)
+        not in ACCELERATED_TARGETS.get(profile["provider"], set())
+        or base.get("provider") != CPU_PROVIDER
         or f"{system}-{architecture}" not in base.get("targets", [])
-        or any(base.get(key) != profile[key] for key in ("python", "uv", "extra"))
+        or any(
+            base.get(key) != profile[key]
+            for key in (
+                ("python", "uv", "extra")
+                if profile["provider"] == "CoreMLExecutionProvider"
+                else ("python", "uv")
+            )
+        )
     ):
         raise BuildError("runtime_profile_base_mismatch")
     uv = shutil.which("uv")
@@ -499,13 +563,23 @@ def build(
         run(
             [
                 *export,
-                *(arg for name in DESKTOP_UNUSED for arg in ("--prune", name)),
+                *(
+                    arg
+                    for name in (
+                        *DESKTOP_UNUSED,
+                        *ACCELERATED_UNUSED.get(profile["provider"], ()),
+                    )
+                    for arg in ("--prune", name)
+                ),
                 "--output-file",
                 requirements,
             ],
             cwd=ml,
             env=env,
         )
+        device = device_requirements(profile["provider"], system, locked.read_text())
+        if device:
+            requirements.write_text(requirements.read_text() + device)
         validate_requirements(requirements.read_text())
         downloads = work / "python-downloads"
         run(
@@ -581,7 +655,7 @@ def build(
                     if build_tools.stat().st_size
                     else []
                 ),
-                *dependency_indexes(system, architecture),
+                *dependency_indexes(system, architecture, profile["provider"]),
                 "-r",
                 requirements,
             ],
