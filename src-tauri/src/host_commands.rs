@@ -141,6 +141,46 @@ pub(crate) async fn provision_local_host_profile(
     }
     setup.provision(manifest_sha256).await
 }
+/// Whether this account's library can be moved to the chosen package's database build, and
+/// what that needs. Read-only.
+#[tauri::command]
+pub(crate) async fn local_host_carry_status(
+    window: WebviewWindow,
+    setup: State<'_, HostSetup>,
+    manifest_sha256: String,
+) -> Result<crate::host_setup::CarryView, String> {
+    require_local(&window)?;
+    Ok(setup.carry_status(manifest_sha256).await)
+}
+/// Move this account's library to the chosen package: one export run of the package it last
+/// ran with, a restore by the chosen one, and the switch.
+#[tauri::command]
+pub(crate) async fn carry_local_host_library(
+    window: WebviewWindow,
+    setup: State<'_, HostSetup>,
+    app: tauri::AppHandle,
+    manifest_sha256: String,
+) -> Result<View, String> {
+    require_local(&window)?;
+    let state = app.state::<crate::DesktopState>();
+    let current = state.0.lock().await;
+    if current.is_some()
+        || crate::credentials::load::<crate::connection::SavedConnection>("connection")?.is_some()
+    {
+        return Err("sign_out_before_switching_servers".into());
+    }
+    setup.carry(manifest_sha256).await
+}
+/// The person confirms the moved library works. Nothing is removed.
+#[tauri::command]
+pub(crate) async fn confirm_local_host_carry(
+    window: WebviewWindow,
+    setup: State<'_, HostSetup>,
+    manifest_sha256: String,
+) -> Result<crate::host_setup::CarryView, String> {
+    require_local(&window)?;
+    setup.carry_confirm(manifest_sha256).await
+}
 #[tauri::command]
 pub(crate) fn cancel_local_host_start(
     window: WebviewWindow,

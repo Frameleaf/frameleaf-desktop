@@ -46,6 +46,24 @@ impl Features {
     }
 }
 
+/// Whether a verified package's Manager declares one capability by name.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) fn package_declares(runtime: &Path, capability: &str) -> bool {
+    crate::runtime_store::read_bounded(&runtime.join("payload/manager/package.json"), 64 * 1024)
+        .is_ok_and(|package| declares(&package, capability))
+}
+/// Anything that is not exactly a list of names under `frameleaf.nativeCapabilities` declares
+/// nothing.
+fn declares(package: &[u8], capability: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(package)
+        .ok()
+        .and_then(|value| {
+            serde_json::from_value::<Vec<String>>(value["frameleaf"]["nativeCapabilities"].clone())
+                .ok()
+        })
+        .is_some_and(|names| names.iter().any(|declared| declared == capability))
+}
+
 /// The loopback ports of one hosted library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

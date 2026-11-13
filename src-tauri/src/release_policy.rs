@@ -100,6 +100,25 @@ pub fn verify_host_runtime(
     let (floor, keys) = parse_policy(POLICY)?;
     crate::host_runtime::VerifiedHostRuntime::verify(root, manifest, signature, &keys, floor)
 }
+/// The package a library last ran with, admitted for its one export run and nothing else: the
+/// same keys and release floor, and only the database builds this app declares it carries
+/// libraries forward from.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) fn verify_host_carry_source(
+    root: &Path,
+    manifest: &[u8],
+    signature: &[u8; 64],
+) -> Result<crate::host_runtime::CarrySourceRuntime, String> {
+    let (floor, keys) = parse_policy(POLICY)?;
+    crate::host_runtime::VerifiedHostRuntime::verify_carry_source(
+        root,
+        manifest,
+        signature,
+        &keys,
+        floor,
+        &crate::host_runtime::declared_carry_sources(),
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
