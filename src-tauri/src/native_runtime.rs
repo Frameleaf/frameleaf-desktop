@@ -335,6 +335,7 @@ else:
 /// Held under an exclusive lock for as long as a process owns an inference scratch, so pruning
 /// can tell an abandoned scratch from one in use (also by another instance of the app).
 pub(crate) const SCRATCH_OWNER: &str = ".owner";
+const SCRATCH_OWNER_PENDING: &str = ".owner-pending";
 fn own_scratch(scratch: &Path) -> Result<File, String> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create_new(true);
@@ -343,10 +344,19 @@ fn own_scratch(scratch: &Path) -> Result<File, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    // The owner record appears under its name only once its lock is held: pruning in another
+    // instance of the app must never see an unlocked owner of a scratch that is in use. Until the
+    // rename the scratch has no owner record, which pruning keeps for a week.
+    let pending = scratch.join(SCRATCH_OWNER_PENDING);
+    // A scratch is created for one sidecar; an owner record already there is never replaced.
+    if fs::symlink_metadata(scratch.join(SCRATCH_OWNER)).is_ok() {
+        return Err("runtime_scratch_failed".into());
+    }
     let owner = options
-        .open(scratch.join(SCRATCH_OWNER))
+        .open(&pending)
         .map_err(|_| "runtime_scratch_failed")?;
     owner.try_lock().map_err(|_| "runtime_scratch_failed")?;
+    fs::rename(&pending, scratch.join(SCRATCH_OWNER)).map_err(|_| "runtime_scratch_failed")?;
     Ok(owner)
 }
 
@@ -940,6 +950,30 @@ mod tests {
         for provider in ["MIGraphXExecutionProvider", "TensorrtExecutionProvider", ""] {
             assert!(check(provider, "ready-accelerator", false, provider).is_err());
         }
+    }
+    #[test]
+    fn scratch_owner_is_published_only_with_its_lock_held() {
+        let scratch = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("inference-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&scratch).unwrap();
+        let owner = own_scratch(&scratch).unwrap();
+        assert!(!scratch.join(SCRATCH_OWNER_PENDING).exists());
+        // The published record is the locked handle itself (also after the rename on Windows).
+        let published = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(scratch.join(SCRATCH_OWNER))
+            .unwrap();
+        assert!(published.try_lock().is_err());
+        // A second owner of the same scratch is refused and leaves the first one's record alone.
+        assert!(own_scratch(&scratch).is_err());
+        assert!(published.try_lock().is_err());
+        drop(owner);
+        assert!(published.try_lock().is_ok());
+        drop(published);
+        fs::remove_dir_all(scratch).unwrap();
     }
     #[test]
     fn qualification_cannot_start_a_different_runtime_manifest() {
