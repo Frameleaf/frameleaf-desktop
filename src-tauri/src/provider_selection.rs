@@ -361,10 +361,9 @@ impl Plan {
     /// against the processor with this runtime, so the caller measures before serving with it.
     pub(crate) fn unmeasured(&self, workload: &str) -> bool {
         self.choice(workload).0 != CPU
-            && !self
-                .failures
-                .as_ref()
-                .is_some_and(|failures| failures.is_faster(workload, &self.accelerated_keys(workload)))
+            && !self.failures.as_ref().is_some_and(|failures| {
+                failures.is_faster(workload, &self.accelerated_keys(workload))
+            })
     }
     /// The model keys of the accelerated group offered for a workload: what a measurement is of.
     fn accelerated_keys(&self, workload: &str) -> BTreeSet<String> {
