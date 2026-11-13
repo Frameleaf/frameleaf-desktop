@@ -21,7 +21,16 @@ use std::{
 pub(crate) const CPU: &str = "CPUExecutionProvider";
 const ACCELERATED_MANIFEST: &str = "manifest-accelerated.json";
 const ACCELERATED_SIGNATURE: &str = "manifest-accelerated.sig";
+#[cfg(not(windows))]
 const ACCELERATED_STORE: &str = "runtimes-accelerated";
+/// FD-63: Windows opens a library only below 260 characters, and an installed release already
+/// spends about 150 of them on the profile, this store and the release's own name. With the long
+/// name, a library the runtime cannot do without (numpy's OpenBLAS, 93 characters inside the
+/// pack) fell beyond the limit for a profile folder of 18 characters or more. No Windows
+/// installation has an accelerated store yet, so the short name moves nothing.
+/// `tools/check_windows_cuda_libraries.py` holds every pack to the same arithmetic.
+#[cfg(windows)]
+const ACCELERATED_STORE: &str = "gpu";
 const WORKLOADS: [&str; 3] = ["clip", "ocr", "face"];
 
 /// What this computer has. Injected so each operating system's rule is tested on all of them.

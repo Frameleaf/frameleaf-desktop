@@ -153,11 +153,11 @@ if ($head -ne $revision) {
 }
 
 # 3. The pack, then where an installed pack lives: as deep as
-# C:\Users\<20 characters>\AppData\Local\app.frameleaf.desktop\runtimes-accelerated\releases\<id>\payload,
+# C:\Users\<20 characters>\AppData\Local\app.frameleaf.desktop\gpu\releases\<id>\payload,
 # with a space and non-ASCII characters in the path. (Characters by code: this file stays ASCII.)
 Step 'Build the cuda-ort pack'
 $built = Join-Path $Work 'pack'
-$installPrefix = 'C:\Users\'.Length + 20 + '\AppData\Local\app.frameleaf.desktop\runtimes-accelerated\releases\'.Length + 64 + '\payload\'.Length
+$installPrefix = 'C:\Users\'.Length + 20 + '\AppData\Local\app.frameleaf.desktop\gpu\releases\'.Length + 64 + '\payload\'.Length
 $name = 'Zo' + [char]0x00EB + ' ' + [char]0x7528 + [char]0x6237
 $pad = $installPrefix - ($Work.Length + 1 + $name.Length + '\releases\'.Length + 64 + '\payload\'.Length)
 if ($pad -gt 1) { $name = $name + ' ' + ('x' * ($pad - 1)) } else { Write-Host "note: -Work is already deep; the pack path is longer than an installed one by $(-$pad) characters" }

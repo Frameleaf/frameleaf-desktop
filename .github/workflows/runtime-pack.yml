@@ -211,6 +211,27 @@ jobs:
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\desktop\tools\qualify_windows_cuda.ps1", [ref]$null, [ref]$errors)
           if ($errors.Count) { $errors | Out-Host; exit 1 }
+      # TEMPORARY (FD-63 diagnosis): where a runtime process is while it qualifies.
+      - name: Diagnostic recorder
+        shell: pwsh
+        run: |
+          python -m pip install --quiet py-spy
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\spy" | Out-Null
+          @'
+          $out = "$env:GITHUB_WORKSPACE\spy\spy.txt"
+          while ($true) {
+            Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.ExecutablePath -like '*\releases\*' } | ForEach-Object {
+              $age = ((Get-Date) - $_.CreationDate).TotalSeconds
+              if ($age -gt 30) {
+                "=== pid $($_.ProcessId) age $age $($_.CommandLine.Substring([Math]::Max(0, $_.CommandLine.Length - 400)))" | Add-Content $out
+                py-spy dump --pid $_.ProcessId 2>&1 | ForEach-Object { "$_" } | Add-Content $out
+                Get-CimInstance Win32_Process -Filter "ParentProcessId=$($_.ProcessId)" | ForEach-Object { "child: $($_.CommandLine)" } | Add-Content $out
+              }
+            }
+            Start-Sleep 25
+          }
+          '@ | Set-Content "$env:GITHUB_WORKSPACE\spy\spy.ps1"
+          Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$env:GITHUB_WORKSPACE\spy\spy.ps1" -WindowStyle Hidden
       - name: Rehearse the hardware run without a card (libraries, paths, processor qualification, CUDA refusal)
         shell: pwsh
         run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "$env:LOCALAPPDATA\fl" -Output "$env:GITHUB_WORKSPACE\evidence" -WithoutGpuRehearsal
@@ -219,6 +240,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: windows-cuda-libraries-evidence
-          path: evidence
+          path: |
+            evidence
+            spy/spy.txt
           if-no-files-found: warn
           retention-days: 14

@@ -48,9 +48,10 @@ ABSENT_BY_DESIGN = {
     "nvrtc64_131_0.dll": "the CUDA 13 name onnxruntime also tries; this build uses CUDA 12",
     "nvrtc-builtins.dll": "the name the run-time compiler's builtins library gives itself",
 }
-# `<profile>\AppData\Local\app.frameleaf.desktop\runtimes-accelerated\releases\<64 hex>\payload\`
+# `<profile>\AppData\Local\app.frameleaf.desktop\gpu\releases\<64 hex>\payload\`
 # for a profile at `C:\Users\<20 characters>` (the longest local account name).
-INSTALL_PREFIX = len("C:\\Users\\") + 20 + len("\\AppData\\Local\\app.frameleaf.desktop\\runtimes-accelerated\\releases\\") + 64 + len("\\payload\\")
+# `gpu` is `ACCELERATED_STORE` on Windows in src-tauri/src/provider_selection.rs.
+INSTALL_PREFIX = len("C:\\Users\\") + 20 + len("\\AppData\\Local\\app.frameleaf.desktop\\gpu\\releases\\") + 64 + len("\\payload\\")
 PATH_BUDGET = 259 - INSTALL_PREFIX
 
 
@@ -249,33 +250,39 @@ def start_libraries(ort) -> list[str]:
     return [PROVIDER_LIBRARY] + [parts[-1] for parts in ort._get_nvidia_dll_paths(True, True, True)]
 
 
-def run_child(pack: Path, folders: list[Path], stage: str, home: bool = True) -> dict:
-    """Start the pack's interpreter with the environment `VerifiedRuntime::launch` gives it on
-    Windows (src-tauri/src/native_runtime.rs): nothing inherited. `folders` and `home` are what
-    FD-63 added to it."""
+def app_environment(scratch: str, folders: list[Path], home: bool = True) -> dict[str, str]:
+    """The environment `VerifiedRuntime::launch` gives the runtime on Windows
+    (src-tauri/src/native_runtime.rs): nothing inherited. `folders` and `home` are what FD-63
+    added to it."""
     system = Path(os.environ["SystemRoot"]) / "System32"
+    environment = {
+        "SystemRoot": os.environ["SystemRoot"],
+        "PATH": os.pathsep.join(str(folder) for folder in [system, *folders]),
+        "FRAMELEAF_ML_AUTH_TOKEN": "0" * 64,
+        "TMP": scratch,
+        "TEMP": scratch,
+        "TMPDIR": scratch,
+        "XDG_CACHE_HOME": str(Path(scratch) / "cache"),
+        "HF_HOME": str(Path(scratch) / "huggingface"),
+        "TORCH_HOME": str(Path(scratch) / "torch"),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "MACHINE_LEARNING_MODEL_INTRA_OP_THREADS": "4",
+        "MACHINE_LEARNING_MODEL_INTER_OP_THREADS": "1",
+        "MACHINE_LEARNING_REQUEST_THREADS": "1",
+    }
+    if home:
+        environment["USERPROFILE"] = scratch
+    return environment
+
+
+def run_child(pack: Path, folders: list[Path], stage: str, home: bool = True) -> dict:
+    """Start the pack's interpreter in the app's environment for one stage of `child`."""
     with tempfile.TemporaryDirectory() as scratch:
-        environment = {
-            "SystemRoot": os.environ["SystemRoot"],
-            "PATH": os.pathsep.join(str(folder) for folder in [system, *folders]),
-            "FRAMELEAF_ML_AUTH_TOKEN": "0" * 64,
-            "TMP": scratch,
-            "TEMP": scratch,
-            "TMPDIR": scratch,
-            "XDG_CACHE_HOME": str(Path(scratch) / "cache"),
-            "HF_HOME": str(Path(scratch) / "huggingface"),
-            "TORCH_HOME": str(Path(scratch) / "torch"),
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "OMP_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "MACHINE_LEARNING_MODEL_INTRA_OP_THREADS": "4",
-            "MACHINE_LEARNING_MODEL_INTER_OP_THREADS": "1",
-            "MACHINE_LEARNING_REQUEST_THREADS": "1",
-        }
-        if home:
-            environment["USERPROFILE"] = scratch
+        environment = app_environment(scratch, folders, home)
         arguments = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--child", stage, "--pack", str(pack)]
         done = subprocess.run(
             arguments,
@@ -291,6 +298,55 @@ def run_child(pack: Path, folders: list[Path], stage: str, home: bool = True) ->
     if done.returncode != 0 or not lines:
         return {"problems": [f"the runtime process ended ({done.returncode:#x}) at stage {stage}: {done.stderr[-2000:].strip()}"]}
     return json.loads(lines[-1][len("RESULT ") :])
+
+
+GATE_PROBES = {
+    "hardware facts": "from frameleaf_ml.native_hardware import snapshot; snapshot()",
+    "platform": "import platform; platform.uname(); platform.processor()",
+    "child process": "import subprocess; subprocess.run(['cmd', '/c', 'ver'], capture_output=True)",
+    "event loop": "import asyncio; asyncio.run(asyncio.sleep(0))",
+    "memory": "import psutil; psutil.virtual_memory()",
+}
+
+
+def run_gate(folders: list[Path]) -> dict:
+    """Each probe in the pack's interpreter started exactly as the app starts a runtime: the
+    app's own gate program (read from its source) on a pipe that stays open, the app's
+    environment, nothing on the console. A probe that has not finished after 40 seconds reports
+    where it is stuck."""
+    source = (Path(__file__).resolve().parent.parent / "src-tauri" / "src" / "native_runtime.rs").read_text(encoding="utf-8")
+    gate = re.search(r'const GATE: &str = r#"(.*?)"#;', source, re.S).group(1)
+    results = {}
+    for name, statement in GATE_PROBES.items():
+        for gated in (True, False):
+            setup = "import faulthandler; faulthandler.dump_traceback_later(40, exit=True)"
+            program = [sys.executable, "-I", "-B", "-c", gate] if gated else [sys.executable, "-I", "-B", "-m"]
+            with tempfile.TemporaryDirectory() as scratch:
+                import time
+
+                started = time.perf_counter()
+                process = subprocess.Popen(
+                    program + ["timeit", "-n", "1", "-r", "1", "-s", setup, statement],
+                    cwd=scratch,
+                    env=app_environment(scratch, folders),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                process.stdin.write(b"frameleaf-native-start\n")
+                process.stdin.flush()
+                try:
+                    _, errors = process.communicate(timeout=120) if not gated else (None, process.stderr.read())
+                    code = process.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    code, errors = None, b"no exit after 120 seconds"
+                results[f"{name} ({'gate' if gated else 'plain'})"] = {
+                    "seconds": round(time.perf_counter() - started, 1),
+                    "exit": code,
+                    "errors": errors.decode("utf-8", "replace")[-3000:],
+                }
+    return results
 
 
 def run_stages(pack: Path, folders: list[Path], last: str, home: bool = True) -> dict:
@@ -349,6 +405,7 @@ def main() -> None:
         # What the app did before FD-63 (OS directory only, no home): evidence, nothing is required of it.
         "loaderBefore": run_stages(pack, [], "names", home=False),
         "loader": run_stages(pack, folders, "session" if args.session else "names"),
+        "gate": run_gate(folders),
     }
     report["problems"] = problems + report["loader"]["problems"]
     args.output.mkdir(parents=True, exist_ok=True)
@@ -357,6 +414,7 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     print(markdown(report))
     print("before FD-63 (OS directory only, no home directory):", json.dumps(report["loaderBefore"]["problems"], indent=2))
+    print("gate probes:", json.dumps(report["gate"], indent=2))
     print("preload seconds:", report["loader"].get("preloadSeconds"), "cuDNN:", report["loader"].get("cudnn"))
     print("payload bytes:", report["payloadBytes"], "files over the path budget:", len(report["overBudget"]))
     if report["problems"]:

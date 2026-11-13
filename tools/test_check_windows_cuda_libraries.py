@@ -103,7 +103,7 @@ class Table(unittest.TestCase):
 
     def test_the_path_budget_is_what_an_installed_pack_leaves_below_260(self) -> None:
         prefix = (
-            "C:\\Users\\" + "u" * 20 + "\\AppData\\Local\\app.frameleaf.desktop\\runtimes-accelerated\\releases\\" + "a" * 64 + "\\payload\\"
+            "C:\\Users\\" + "u" * 20 + "\\AppData\\Local\\app.frameleaf.desktop\\gpu\\releases\\" + "a" * 64 + "\\payload\\"
         )
         self.assertEqual(check.PATH_BUDGET, 259 - len(prefix))
         fits, deep = "p" * check.PATH_BUDGET, "p" * (check.PATH_BUDGET + 1)
