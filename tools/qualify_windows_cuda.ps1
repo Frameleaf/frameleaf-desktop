@@ -70,11 +70,13 @@ $Processor = 'CPUExecutionProvider'
 # Without a card, two refusals and nothing else count. The app itself never tries CUDA there
 # (`install_from` in src-tauri/src/provider_selection.rs: no nvcuda.dll, so
 # `provider_device_ineligible`, and the processor is used). Made to try anyway, the runtime must
-# refuse by itself: `runtime_qualification_failed` from the app, with the reason the runtime wrote
-# in its report, `native_device_execution_evidence_required` (frameleaf_ml/native_qualification.py:
-# CUDA ran, but no card its driver reports). A crash, a start failure or a timeout is a fault.
+# refuse by itself: `runtime_qualification_failed` from the app, with exactly this reason and
+# detail in the runtime's report: the session opened without CUDAExecutionProvider, because with no
+# driver the CUDA provider does not load (frameleaf_ml/sessions/ort.py raises
+# `native_provider_not_loaded`). Any other reason or detail, no report at all (a crash), a start
+# failure or a timeout is a fault.
 $Refusal = 'runtime_qualification_failed'
-$NoCardReason = 'native_device_execution_evidence_required'
+$NoCardRefusal = 'native_qualification_failed RuntimeError: native_provider_not_loaded'
 $NoCardGate = 'provider_device_ineligible'
 $Models = @('buffalo_s', 'buffalo_l', 'PP-OCRv5_mobile', 'ViT-B-32__openai')
 $Desktop = Split-Path -Parent $PSScriptRoot
@@ -349,7 +351,7 @@ for ($index = 0; $index -lt $cuda.Count; $index++) {
     $cpuWarm = if ($twin -and $twin.qualified) { [double]$twin.report.warmMilliseconds } else { $null }
     $row = [ordered]@{ profile = (Key $record); cpuWarmMs = $cpuWarm; cudaWarmMs = $null; cudaColdMs = $null; state = 'NOT QUALIFIED'; cudaNodes = 0; processorNodes = 0; cards = 0 }
     $gate = if ($record.PSObject.Properties['appGate']) { $record.appGate } else { $null }
-    $reason = if ($record.PSObject.Properties['refusalReason']) { $record.refusalReason } else { $null }
+    $reason = if ($record.PSObject.Properties['refusal']) { $record.refusal } else { $null }
     if (-not $WithoutGpuRehearsal -and $gate) { $failures.Add("$(Key $record): the app would not try CUDA on this computer: $gate") }
     if ($record.qualified) {
         $report = $record.report
@@ -369,7 +371,7 @@ for ($index = 0; $index -lt $cuda.Count; $index++) {
         if ($WithoutGpuRehearsal) { $failures.Add("$(Key $record) qualified on CUDA on a computer said to have no card") }
     } elseif (-not $WithoutGpuRehearsal) {
         $failures.Add("$(Key $record) did not qualify on CUDA: $($record.failure)")
-    } elseif ($record.failure -eq $Refusal -and $reason -eq $NoCardReason -and $gate -eq $NoCardGate) {
+    } elseif ($record.failure -ceq $Refusal -and $reason -ceq $NoCardRefusal -and $gate -ceq $NoCardGate) {
         $row.state = "refused ($gate; runtime: $reason)"
     } else {
         # Only the no-card refusal counts: another reason, no reason (the process ended without a
