@@ -9,6 +9,7 @@ mod credentials;
 mod discovery;
 mod drop_import;
 mod file_manager_import;
+mod host_carry;
 mod host_commands;
 pub mod host_control;
 mod host_database;
@@ -847,6 +848,9 @@ pub fn run() {
             host_commands::local_host_status,
             host_commands::prepare_local_host,
             host_commands::provision_local_host_profile,
+            host_commands::local_host_carry_status,
+            host_commands::carry_local_host_library,
+            host_commands::confirm_local_host_carry,
             host_commands::cancel_local_host_start,
             host_commands::stop_local_host_manager,
             host_commands::quit_local_host,

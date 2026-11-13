@@ -73,6 +73,12 @@ pub(crate) fn check_cleanup(path: &Path) -> Result<(), String> {
     admit_cleanup(&inspect(&directory)?)
 }
 
+/// The bytes an ordinary user may still write on the volume that holds `path`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) fn available_bytes(path: &Path) -> Result<u64, String> {
+    Ok(inspect(&directory(path)?)?.available_bytes)
+}
+
 /// Open the physical directory without following links; inspection does not require startup headroom.
 pub(crate) fn directory(path: &Path) -> Result<std::fs::File, String> {
     crate::native_runtime::absolute_directory(path)?;
