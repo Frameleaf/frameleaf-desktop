@@ -3815,7 +3815,12 @@ mod tests {
 
         // Manager started something that is still running in its job: neither Stop nor
         // quitting ends the job, and the app stays protected.
-        // It waits for its bootstrap line first, as Manager does: that is sent only after the // process is in its job, so nothing it starts can be outside the job. let busy = fixture.own( "cmd.exe", &["/c", "set /p line= & waitfor /t 120 FrameleafStandIn"], );
+        // It waits for its bootstrap line first, as Manager does: that is sent only after the
+        // process is in its job, so nothing it starts can be outside the job.
+        let busy = fixture.own(
+            "cmd.exe",
+            &["/c", "set /p line= & waitfor /t 120 FrameleafStandIn"],
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while alone(&busy) != Evidence::Running {
             assert!(
