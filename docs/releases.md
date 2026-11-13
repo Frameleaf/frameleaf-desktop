@@ -299,10 +299,13 @@ hash; a desktop has no CUDA installation. There is no Windows OpenVINO pack: the
 Windows `onnxruntime-openvino` 1.24.1 wheel needs the OpenVINO 2025.4 libraries
 it was built with, the server's lock has only `openvino` 2026.4.1, and with
 those the provider library does not load (Windows error 127). Pull-request CI
-builds the packs on hosted runners and loads the provider
-(`tools/smoke_accelerated_runtime.py`). Neither has run on NVIDIA or Intel
-hardware, a CUDA pack is about 2 GB and no installer carries either: the factory
-builds one only when `accelerated` names it.
+builds the packs on hosted runners and checks them without a GPU
+(`tools/smoke_accelerated_runtime.py`): for OpenVINO a session runs on its CPU
+device; for CUDA the bundled CUDA and cuDNN libraries are present and load, but
+onnxruntime's CUDA provider library needs the NVIDIA driver library and is not
+loaded there. Neither has run on NVIDIA or Intel hardware, a CUDA pack is about
+3 GB and no installer carries either: the factory builds one only when
+`accelerated` names it.
 
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
