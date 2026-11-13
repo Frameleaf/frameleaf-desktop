@@ -171,7 +171,7 @@ struct Hosted<'a> {
 /// From disk alone: `Clear` when no library was ever hosted at `state`, or when its journal
 /// proves it idle and nothing that could be its Manager answers on Manager's port. The port
 /// covers a Manager that left no usable record.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn hosted_library(state: &std::path::Path, listener: &dyn Fn() -> Evidence) -> Evidence {
     match std::fs::symlink_metadata(state) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Evidence::Clear,
@@ -230,7 +230,26 @@ impl HostSetup {
                 process: &crate::process_tree::ProcessIdentity::lookup,
             }))
         }
-        #[cfg(not(all(unix, not(test))))]
+        // On Windows nothing of the library outlives this app, so no Manager is looked for.
+        // The journal an earlier run left is still read: a new package must not be installed
+        // over a library whose last shutdown was interrupted. A location that cannot be
+        // determined blocks.
+        #[cfg(all(windows, not(test)))]
+        {
+            let state =
+                crate::windows_host_profile::state_path().map_err(|_| "update_library_not_idle")?;
+            let data = state.with_file_name("manager");
+            self.lock_for_update_at(Some(Hosted {
+                state: &state,
+                data: &data,
+                listener: &|| Evidence::Clear,
+            }))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.lock_for_update_at(None)
+        }
+        #[cfg(all(test, any(unix, windows)))]
         {
             self.lock_for_update_at(None)
         }
@@ -261,7 +280,8 @@ impl HostSetup {
     ///
     /// With all of that proven and the owner held, nothing is left that could start one.
     /// On Windows the controller and database die with this app's job, so a new run there
-    /// has nothing on disk to check.
+    /// looks for no process. It still reads the journal: a library whose last shutdown was
+    /// interrupted, or whose journal cannot be read, blocks there as everywhere.
     fn lock_for_update_at(&self, hosted: Option<Hosted<'_>>) -> Result<impl Drop + '_, String> {
         let mut owner = self.owner.try_lock().map_err(|_| "update_host_active")?;
         // Holding the owner proves no operation is in flight. A live Manager blocks, and a
@@ -277,11 +297,11 @@ impl HostSetup {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
             .map_or(Evidence::Clear, Library::idle);
-        #[cfg(any(target_os = "macos", target_os = "linux", test))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
         let journal = hosted.map_or(Evidence::Clear, |hosted| {
             hosted_library(hosted.state, hosted.listener)
         });
-        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows, test)))]
         let journal = Evidence::Clear;
         #[cfg(unix)]
         let manager = hosted.map_or(Evidence::Clear, |hosted| {
@@ -776,13 +796,10 @@ impl HostSetup {
                     Err(code) if alone_suffices => stop_without_proof(
                         code,
                         || {
-                            let mut lease =
+                            let lease =
                                 crate::host_state::Owner::acquire(&configuration.state, true)?;
-                            let journal = lease.idle(
-                                &configuration.installation_id,
-                                &installation.manifest_sha256,
-                            );
-                            Ok((lease, journal))
+                            let older = lease.older_host();
+                            Ok((lease, older))
                         },
                         || manager.stops_alone(),
                     )?,
@@ -926,9 +943,11 @@ async fn orderly_stop_proof<P>(
 /// safe: what matters is that the stop ends nothing of the library. Two facts prove that,
 /// and both are required.
 /// - `lease`: the journal's exclusive lease, taken now and returned so it is kept until
-///   Manager has stopped, with what the journal says under it. A controller holds that lease
-///   from before it opens the database until it exits, so with it held no controller of this
-///   library is running and none can open the database.
+///   Manager has stopped. A controller holds that lease from before it opens the database
+///   until it exits, so with it held no controller of this library is running and none can
+///   open the database. With it comes whether an older direct host, which has a lease of
+///   its own, still runs this library: that is asked whatever the journal says, and must
+///   be `Clear`.
 /// - `alone`: stopping Manager ends Manager and nothing else. On Windows the stop ends
 ///   Manager's job, so the job must hold Manager alone: a database whose controller died,
 ///   or anything else Manager started, is still in it.
@@ -947,9 +966,7 @@ fn stop_without_proof<L>(
         return Err(code);
     }
     match lease() {
-        Ok((lease, journal)) if journal != Evidence::Running && alone() == Evidence::Clear => {
-            Ok(lease)
-        }
+        Ok((lease, Evidence::Clear)) if alone() == Evidence::Clear => Ok(lease),
         _ => Err(code),
     }
 }
@@ -3671,7 +3688,7 @@ mod tests {
                 || {
                     took.set(true);
                     lease
-                        .map(|journal| ("lease", journal))
+                        .map(|older_host| ("lease", older_host))
                         .map_err(str::to_string)
                 },
                 || {
@@ -3681,34 +3698,33 @@ mod tests {
             );
             (result, took.get(), asked.get())
         };
-        // The lease is held, the journal under it is merely unproven, and stopping Manager
-        // ends nothing else: the lease is handed on to be kept through the stop.
+        // The lease is held with no older host under it, the journal is merely unproven, and
+        // stopping Manager ends nothing else: the lease is handed on to be kept through the
+        // stop.
         for code in [
             "host_recovery_requires_manager",
             "host_process_state_requires_review",
             "host_controller_state_invalid",
             "host_controller_binding_changed",
         ] {
-            for journal in [Evidence::Unknown, Evidence::Clear] {
-                assert_eq!(
-                    decide(code, Ok(journal), Evidence::Clear),
-                    (Ok("lease"), true, true),
-                    "{code}"
-                );
-            }
+            assert_eq!(
+                decide(code, Ok(Evidence::Clear), Evidence::Clear),
+                (Ok("lease"), true, true),
+                "{code}"
+            );
         }
         // Something else would end with Manager, or that cannot be read: refused with the
         // journal's own reason. Unknown refuses exactly as running does.
         for alone in [Evidence::Running, Evidence::Unknown] {
             assert_eq!(
-                decide(&unproven(), Ok(Evidence::Unknown), alone),
+                decide(&unproven(), Ok(Evidence::Clear), alone),
                 (Err(unproven()), true, true)
             );
         }
         // A controller holds the journal: the database may be open. Nothing is even asked.
         for held in ["host_controller_already_owned", "host_already_owned"] {
             assert_eq!(
-                decide(held, Ok(Evidence::Unknown), Evidence::Clear),
+                decide(held, Ok(Evidence::Clear), Evidence::Clear),
                 (Err(held.to_string()), false, false)
             );
         }
@@ -3728,11 +3744,81 @@ mod tests {
                 );
             }
         }
-        // Under the lease, an older host still holds this library.
-        assert_eq!(
-            decide(&unproven(), Ok(Evidence::Running), Evidence::Clear),
-            (Err(unproven()), true, false)
-        );
+        // Under the lease, an older host still holds this library, or its lease cannot be
+        // read. `an_interrupted_shutdown_never_keeps_the_app_unquittable_and_keeps_updates_closed`
+        // holds that lease for real.
+        for older_host in [Evidence::Running, Evidence::Unknown] {
+            assert_eq!(
+                decide(&unproven(), Ok(older_host), Evidence::Clear),
+                (Err(unproven()), true, false)
+            );
+        }
+    }
+
+    /// An older direct host running this library: it holds its own lease file while it runs.
+    #[cfg(any(unix, windows))]
+    fn older_host(state: &std::path::Path) -> std::fs::File {
+        let path = state.join("lease.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        file.try_lock().unwrap();
+        file
+    }
+    /// The update gate as a new run of this app takes it: nothing remembered, only what an
+    /// earlier run left on disk, and nothing answering on Manager's port.
+    #[cfg(any(unix, windows))]
+    fn new_run_gate(fixture: &OwnedFixture) -> Result<(), String> {
+        let (state, data) = (fixture.state(), fixture.0.join("data"));
+        let hosted = Hosted {
+            state: &state,
+            data: &data,
+            listener: &|| Evidence::Clear,
+            #[cfg(unix)]
+            process: &crate::process_tree::ProcessIdentity::lookup,
+        };
+        let setup = HostSetup::default();
+        // The gate borrows `setup`, so it is released before `setup` goes.
+        let code = setup.lock_for_update_at(Some(hosted)).err();
+        code.map_or(Ok(()), Err)
+    }
+
+    /// On every OS, Windows included: a new run installs nothing over a library whose journal
+    /// does not prove a clean stop. Unknown blocks exactly as running does.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_new_run_keeps_updates_closed_until_the_journal_on_disk_proves_a_clean_stop() {
+        let blocked = |fixture: &OwnedFixture| {
+            assert_eq!(
+                new_run_gate(fixture).unwrap_err(),
+                "update_library_not_idle"
+            );
+        };
+        // A profile that was prepared and never started holds no library.
+        let fixture = OwnedFixture::new();
+        new_run_gate(&fixture).unwrap();
+        // The last shutdown was interrupted.
+        interrupted(&fixture.state());
+        blocked(&fixture);
+        // A controller holds the journal.
+        let controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        blocked(&fixture);
+        drop(controller);
+        // Started again and stopped cleanly.
+        cleanly_stopped(&fixture.state());
+        new_run_gate(&fixture).unwrap();
+        // A journal that cannot be read.
+        std::fs::write(fixture.state().join("controller-state.json"), b"{").unwrap();
+        blocked(&fixture);
     }
 
     /// Quit, Stop and update for a live Manager whose library's last shutdown was interrupted,
@@ -3767,9 +3853,26 @@ mod tests {
         assert!(live(&mut setup.owner.try_lock().unwrap()));
         assert_eq!(setup.lock_for_update().err().unwrap(), "update_host_active");
 
+        // An older host still runs this library under the interrupted journal: nothing stops.
+        let older = older_host(&fixture.state());
+        for refused in [
+            setup.stop().await.err().unwrap(),
+            setup.stop_with(true, true).await.err().unwrap(),
+        ] {
+            assert_eq!(refused, "host_recovery_requires_manager");
+        }
+        assert!(live(&mut setup.owner.try_lock().unwrap()));
+        drop(older);
+        std::fs::remove_file(fixture.state().join("lease.lock")).unwrap();
+
         // Stop local management.
         assert_eq!(setup.stop().await.unwrap().state, "idle");
         stopped(&setup);
+        // A new run reads the same journal from disk.
+        assert_eq!(
+            new_run_gate(&fixture).unwrap_err(),
+            "update_library_not_idle"
+        );
 
         // Stop and quit, as this OS does it.
         let setup = own();
@@ -3800,6 +3903,7 @@ mod tests {
         cleanly_stopped(&fixture.state());
         setup.stop_for_update().await.unwrap();
         assert!(setup.lock_for_update().is_ok());
+        new_run_gate(&fixture).unwrap();
     }
 
     /// The same table on Windows, where it matters: stopping Manager ends its job. Run by the
@@ -3858,8 +3962,24 @@ mod tests {
             setup.stop().await.err().unwrap(),
             "host_controller_already_owned"
         );
+        // Quitting has to ask Manager to close it in order, which this stand-in cannot be.
+        assert_eq!(
+            setup.quit(None, false).await.unwrap_err(),
+            "native_manager_not_ready"
+        );
         assert!(setup.background_active());
         drop(controller);
+        // An older host still runs this library under the interrupted journal.
+        let older = older_host(&fixture.state());
+        for refused in [
+            setup.stop().await.err().unwrap(),
+            setup.quit(None, false).await.unwrap_err(),
+        ] {
+            assert_eq!(refused, "host_recovery_requires_manager");
+        }
+        assert!(setup.background_active());
+        drop(older);
+        std::fs::remove_file(fixture.state().join("lease.lock")).unwrap();
         // Stop and quit.
         assert_eq!(alone(&setup), Evidence::Clear);
         setup.quit(None, false).await.unwrap();
@@ -3867,6 +3987,11 @@ mod tests {
         assert!(setup.owner.try_lock().unwrap().is_none());
         assert_eq!(
             setup.lock_for_update().err().unwrap(),
+            "update_library_not_idle"
+        );
+        // The next run of this app reads the same journal from disk and installs nothing.
+        assert_eq!(
+            new_run_gate(&fixture).unwrap_err(),
             "update_library_not_idle"
         );
 
@@ -4368,7 +4493,7 @@ mod tests {
         }
     }
     /// A library whose journal records a clean stop and is held by nobody.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn cleanly_stopped(state: &std::path::Path) {
         let mut journal = crate::host_state::Owner::acquire(state, true).unwrap();
         journal
