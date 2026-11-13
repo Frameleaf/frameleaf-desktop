@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connectionError, describeError, errorCode, errorCopy, explainError, splitReference, workerReason } from '../src/errors.ts';
+import { connectionError, describeError, errorCode, errorCopy, explainError, skipSummary, splitReference, workerReason } from '../src/errors.ts';
 import { backendCodes, codesInSource, type BackendCodes } from './backend-error-codes.ts';
 
 const rust = fileURLToPath(new URL('../src-tauri/src', import.meta.url));
@@ -239,4 +239,20 @@ test('advice names something the person can actually do', () => {
   assert.equal(workerReason('server_http_401'), 'removed');
   // The server never re-enrolls a computer it removed, so removing it is not a fix.
   assert.doesNotMatch(errorCopy('worker_resume_enrollment_failed')!, /remove this computer/i);
+});
+
+test('an import says how many items it skipped and why, and never calls them imported', () => {
+  assert.equal(skipSummary({ source_folder_unreadable: 1, source_name_unsupported: 2, source_item_empty: 1 }),
+    '1 folder that could not be opened, 2 with a name that is not valid text, 1 empty');
+  assert.equal(skipSummary({ source_folder_unreadable: 2 }), '2 folders that could not be opened');
+  assert.equal(skipSummary({ source_new_reason: 3 }), '3 not copied');
+  assert.equal(skipSummary(undefined), '');
+  for (const code of ['source_folder_unreadable', 'source_entry_unreadable', 'source_name_unsupported']) {
+    assert.match(errorCopy(code)!, /skipped/);
+    assert.doesNotMatch(errorCopy(code)!, /drive access/);
+  }
+  const read = (file: string) => readFileSync(join(ui, file), 'utf8');
+  // Both places that report a finished import take their reasons from the same words.
+  assert.match(read('ImportHistory.svelte'), /skipSummary\(entry\.skippedReasons\)/);
+  assert.match(read('PhotoSources.svelte'), /skipped and not imported\$\{skipSummary\(job\.skippedReasons\)/);
 });

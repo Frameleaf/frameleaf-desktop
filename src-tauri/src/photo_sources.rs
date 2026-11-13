@@ -31,7 +31,9 @@ pub(crate) struct SourceFile {
 pub(crate) struct FolderScan {
     pub inventory: FolderInventory,
     pub files: Vec<SourceFile>,
-    pub unreadable: u64,
+    /// Entries left out because they could not be read or named, by reason code. Already counted
+    /// in `inventory.skipped`; the import continues with everything else.
+    pub unreadable: std::collections::BTreeMap<&'static str, u64>,
     /// Media files beyond this batch were found; a later batch starts after the last file here.
     pub more: bool,
 }
@@ -114,6 +116,48 @@ struct Level {
     children: Vec<String>,
 }
 
+/// A folder that could not be opened or listed (no permission, as `lost+found` on a card).
+pub(crate) const FOLDER_UNREADABLE: &str = "source_folder_unreadable";
+/// An entry whose metadata could not be read.
+pub(crate) const ENTRY_UNREADABLE: &str = "source_entry_unreadable";
+/// A photo, video or folder whose name is not valid Unicode: the manifest and the upload carry
+/// names as text.
+pub(crate) const NAME_UNSUPPORTED: &str = "source_name_unsupported";
+
+/// Tells an entry that can never be read from a source that went away (a card pulled mid-scan).
+struct Source<'a> {
+    root: &'a Path,
+    identity: Option<String>,
+}
+impl Source<'_> {
+    /// The scanned root is still the directory at its path and can still be listed. Anything
+    /// that cannot be established counts as gone.
+    fn present(&self) -> bool {
+        self.identity.is_some()
+            && crate::source_metadata::open_preview_root(self.root).is_ok_and(|dir| {
+                crate::copy_source::root_identity(&dir).ok() == self.identity
+                    && dir
+                        .entries()
+                        .is_ok_and(|mut entries| entries.next().is_none_or(|entry| entry.is_ok()))
+            })
+    }
+}
+impl FolderScan {
+    fn skip(&mut self, reason: &'static str) {
+        *self.unreadable.entry(reason).or_default() += 1;
+        self.inventory.skipped += 1;
+    }
+    /// Leaves one unreadable entry out with its reason. When the source itself is gone the scan
+    /// stops instead, so the import pauses and nothing is taken for skipped or finished.
+    fn skip_unreadable(&mut self, source: &Source<'_>, reason: &'static str) -> Result<(), String> {
+        if !source.present() {
+            return Err("source_folder_unavailable".into());
+        }
+        self.skip(reason);
+        Ok(())
+    }
+}
+
 fn walk(
     root: &Path,
     limit: usize,
@@ -177,6 +221,10 @@ fn walk(
     if crate::source_metadata::probe(&dir, Path::new("."), &root_meta)?.excluded {
         return Err("source_folder_excluded".into());
     }
+    let source = Source {
+        root,
+        identity: crate::copy_source::root_identity(&dir).ok(),
+    };
     let mut scan = FolderScan {
         inventory: FolderInventory {
             path: root.to_str().ok_or("source_folder_name_invalid")?.into(),
@@ -194,7 +242,7 @@ fn walk(
             empty: 0,
         },
         files: Vec::new(),
-        unreadable: 0,
+        unreadable: Default::default(),
         more: false,
     };
     let mut visited = 0;
@@ -212,6 +260,7 @@ fn walk(
                     limit,
                     pinned: pinned_root.is_some(),
                     camera: media.is_some(),
+                    source: &source,
                 },
                 &mut visited,
                 &mut scan,
@@ -229,6 +278,10 @@ fn walk(
             });
         }
         let Some(level) = stack.last_mut() else {
+            // A source that left during the scan may have ended a listing early without an error.
+            if !scan.unreadable.is_empty() && !source.present() {
+                return Err("source_folder_unavailable".into());
+            }
             return Ok(scan);
         };
         let Some(name) = level.children.pop() else {
@@ -249,20 +302,18 @@ fn walk(
                 }
                 next = Some((child, level.relative.join(name)));
             }
-            Err(_) => {
-                scan.unreadable += 1;
-                scan.inventory.skipped += 1;
-            }
+            Err(_) => scan.skip_unreadable(&source, FOLDER_UNREADABLE)?,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct Listing {
+struct Listing<'a> {
     depth: usize,
     limit: usize,
     pinned: bool,
     camera: bool,
+    source: &'a Source<'a>,
 }
 
 /// Lists one directory to its end, so no listing stays open while its subfolders are visited.
@@ -270,7 +321,7 @@ struct Listing {
 fn list(
     dir: &cap_std::fs::Dir,
     relative: &Path,
-    listing: Listing,
+    listing: Listing<'_>,
     visited: &mut usize,
     scan: &mut FolderScan,
     children: &mut Vec<String>,
@@ -279,8 +330,7 @@ fn list(
     let entries = match dir.entries() {
         Ok(entries) => entries,
         Err(_) => {
-            scan.unreadable += 1;
-            scan.inventory.skipped += 1;
+            scan.skip_unreadable(listing.source, FOLDER_UNREADABLE)?;
             return Ok(true);
         }
     };
@@ -292,19 +342,16 @@ fn list(
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
-                scan.unreadable += 1;
-                scan.inventory.skipped += 1;
+                scan.skip_unreadable(listing.source, ENTRY_UNREADABLE)?;
                 continue;
             }
         };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            scan.unreadable += 1;
-            scan.inventory.skipped += 1;
-            continue;
-        };
-        let lower = name.to_lowercase();
-        if name.starts_with('.')
+        // A name that is not valid Unicode is judged by its readable part first, so a file that
+        // is not a photo or video is ignored like any other.
+        let os_name = entry.file_name();
+        let shown = os_name.to_string_lossy();
+        let lower = shown.to_lowercase();
+        if shown.starts_with('.')
             || [".photoslibrary", ".photolibrary", ".app", ".bundle"]
                 .iter()
                 .any(|suffix| lower.ends_with(suffix))
@@ -312,11 +359,10 @@ fn list(
             scan.inventory.skipped += 1;
             continue;
         }
-        let meta = match dir.symlink_metadata(name) {
+        let meta = match dir.symlink_metadata(&os_name) {
             Ok(meta) => meta,
             Err(_) => {
-                scan.unreadable += 1;
-                scan.inventory.skipped += 1;
+                scan.skip_unreadable(listing.source, ENTRY_UNREADABLE)?;
                 continue;
             }
         };
@@ -325,14 +371,17 @@ fn list(
             scan.inventory.skipped += 1;
             continue;
         }
-        if !(meta.is_dir() || meta.is_file() && is_media_filename(name)) {
+        if !(meta.is_dir() || meta.is_file() && is_media_filename(&shown)) {
             continue;
         }
+        let Some(name) = os_name.to_str() else {
+            scan.skip(NAME_UNSUPPORTED);
+            continue;
+        };
         let observation = match crate::source_metadata::probe(dir, Path::new(name), &meta) {
             Ok(observation) => observation,
             Err(_) => {
-                scan.unreadable += 1;
-                scan.inventory.skipped += 1;
+                scan.skip_unreadable(listing.source, ENTRY_UNREADABLE)?;
                 continue;
             }
         };
@@ -603,7 +652,7 @@ mod root_tests {
             super::Path::new("nested/photo.jpg")
         );
         assert_eq!(scan.files[0].bytes, 8);
-        assert_eq!(scan.unreadable, 0);
+        assert!(scan.unreadable.is_empty());
         assert!(!scan.more);
         assert_eq!((scan.inventory.empty, scan.inventory.skipped), (1, 1));
         assert!(super::inventory(&root, 1).unwrap().truncated);
@@ -645,7 +694,7 @@ mod root_tests {
         .unwrap();
         assert_eq!((seen, all.inventory.photos), (20_000, 20_000));
         assert!(!all.inventory.truncated);
-        assert_eq!((all.unreadable, all.inventory.skipped), (0, 0));
+        assert_eq!((all.unreadable.len(), all.inventory.skipped), (0, 0));
         assert!(all.files.is_empty(), "a streamed scan keeps no file list");
 
         let first = super::scan_batch(&tree.0, super::Pin::Unpinned, None).unwrap();
@@ -677,6 +726,125 @@ mod root_tests {
         assert_eq!(scan.files.len(), 1);
         assert_eq!(scan.inventory.skipped, 2);
         assert!(!scan.inventory.truncated);
+    }
+
+    #[cfg(unix)]
+    fn names(scan: &super::FolderScan) -> Vec<&str> {
+        scan.files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_opened_is_left_out_with_its_reason_and_the_rest_is_scanned() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = Tree::new("unreadable-folder");
+        // As on an ext4 card: `lost+found` belongs to root and nobody else may open it.
+        let locked = tree.0.join("lost+found");
+        std::fs::create_dir_all(tree.0.join("DCIM")).unwrap();
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden.jpg"), b"original").unwrap();
+        std::fs::write(tree.0.join("DCIM/photo.jpg"), b"original").unwrap();
+        std::fs::write(tree.0.join("zz-last.jpg"), b"original").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Root may open anything, so nothing is unreadable to this runner.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let scan = super::scan_batch(&tree.0, super::Pin::Unpinned, None);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scan = scan.unwrap();
+        assert_eq!(names(&scan), ["DCIM/photo.jpg", "zz-last.jpg"]);
+        assert_eq!(
+            scan.unreadable,
+            std::collections::BTreeMap::from([(super::FOLDER_UNREADABLE, 1)])
+        );
+        assert_eq!((scan.inventory.photos, scan.inventory.skipped), (2, 1));
+        assert!(!scan.inventory.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_unicode_counts_only_when_it_is_a_photo_or_a_folder() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = |bytes: &'static [u8]| std::ffi::OsStr::from_bytes(bytes);
+        let tree = Tree::new("names");
+        std::fs::write(tree.0.join("photo.jpg"), b"original").unwrap();
+        if std::fs::write(tree.0.join(name(b"notes-\xff.txt")), b"text").is_err() {
+            // This filesystem (APFS) does not store such a name, so it cannot occur here.
+            return;
+        }
+        // A file that is not a photo or video is ignored whatever its name is.
+        let scan = super::scan_batch(&tree.0, super::Pin::Unpinned, None).unwrap();
+        assert_eq!(names(&scan), ["photo.jpg"]);
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.inventory.skipped, 0);
+
+        // A photo and a folder are left out with their reason; everything else is scanned.
+        std::fs::write(tree.0.join(name(b"shot-\xff.jpg")), b"original").unwrap();
+        std::fs::create_dir(tree.0.join(name(b"roll-\xff"))).unwrap();
+        std::fs::write(
+            tree.0.join(name(b"roll-\xff")).join("inside.jpg"),
+            b"original",
+        )
+        .unwrap();
+        std::fs::write(tree.0.join(name(b".hidden-\xff.jpg")), b"original").unwrap();
+        let scan = super::scan_batch(&tree.0, super::Pin::Unpinned, None).unwrap();
+        assert_eq!(names(&scan), ["photo.jpg"]);
+        assert_eq!(
+            scan.unreadable,
+            std::collections::BTreeMap::from([(super::NAME_UNSUPPORTED, 2)])
+        );
+        // The hidden file is skipped as any hidden file is, without a name reason.
+        assert_eq!((scan.inventory.photos, scan.inventory.skipped), (1, 3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_that_goes_away_during_the_scan_stops_it_instead_of_skipping_what_is_left() {
+        // Removed: the folder under the scan is gone, as when a card is pulled.
+        let tree = Tree::new("source-removed");
+        let root = tree.0.join("card");
+        std::fs::create_dir_all(root.join("DCIM")).unwrap();
+        std::fs::write(root.join("a.jpg"), b"original").unwrap();
+        std::fs::write(root.join("DCIM/b.jpg"), b"original").unwrap();
+        let result = super::scan_each(&root, super::Pin::Unpinned, &mut |_| {
+            let _ = std::fs::remove_dir_all(&root);
+            Ok(())
+        });
+        assert_eq!(result.err().as_deref(), Some("source_folder_unavailable"));
+
+        // Replaced: the path now names another directory, as an empty mount point does.
+        let root = tree.0.join("mount");
+        let gone = tree.0.join("unmounted");
+        std::fs::create_dir_all(root.join("DCIM")).unwrap();
+        std::fs::write(root.join("a.jpg"), b"original").unwrap();
+        std::fs::write(root.join("DCIM/b.jpg"), b"original").unwrap();
+        let result = super::scan_each(&root, super::Pin::Unpinned, &mut |_| {
+            if !gone.exists() {
+                std::fs::rename(&root, &gone).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                std::fs::remove_dir_all(gone.join("DCIM")).unwrap();
+            }
+            Ok(())
+        });
+        assert_eq!(result.err().as_deref(), Some("source_folder_unavailable"));
+
+        // One subfolder deleted while the source stays: that is a skipped entry, not a pause.
+        let root = tree.0.join("stays");
+        std::fs::create_dir_all(root.join("DCIM")).unwrap();
+        std::fs::write(root.join("a.jpg"), b"original").unwrap();
+        std::fs::write(root.join("DCIM/b.jpg"), b"original").unwrap();
+        let scan = super::scan_each(&root, super::Pin::Unpinned, &mut |_| {
+            let _ = std::fs::remove_dir_all(root.join("DCIM"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(scan.inventory.photos, 1);
+        assert_eq!(scan.unreadable.values().sum::<u64>(), 1);
     }
 
     #[test]

@@ -115,6 +115,9 @@ const messages: Record<string, string> = {
   source_item_invalid: 'This file is unsupported or linked. Some Windows cloud placeholders cannot be copied yet; export selected photos to an ordinary folder and try there.',
   source_item_unavailable: 'A selected file is unavailable. Check the folder before resuming.',
   source_item_empty: 'An empty file was skipped.',
+  source_folder_unreadable: 'A folder could not be opened, so it was skipped and the rest of the import carried on. To include it, give yourself access to that folder, then import again.',
+  source_entry_unreadable: 'An item could not be read, so it was skipped and the rest of the import carried on.',
+  source_name_unsupported: 'A photo, video or folder was skipped because its name contains characters that are not valid text. Rename it, then import again to include it.',
   source_preview_policy_unavailable: 'A download-free folder preview could not be enabled. No preview was started. Try again after restarting the app.',
   source_inventory_partial: 'The scan reached its safety limit. Choose a smaller photo subfolder for this copy.',
   source_inventory_unreadable: 'Some entries could not be inspected. Check folder and drive access before preparing the copy again.',
@@ -498,4 +501,25 @@ export function workerReason(code: string | null | undefined): WorkerReason | nu
 
 export function savedSignInNeedsRecovery(error: unknown): boolean {
   return ['credential_unlock_required', 'credential_confirmation_unavailable', 'credential_confirmation_changed'].includes(String(error));
+}
+
+// Why items were left out of an import, as fragments for an "N skipped (…)" summary. The full
+// sentence for each code is above.
+const skipReasons: Record<string, string | ((count: number) => string)> = {
+  source_item_changed: 'changed during the import',
+  source_item_unavailable: 'no longer in the folder',
+  source_item_excluded: 'hidden or excluded',
+  source_item_invalid: 'no longer a photo or video file',
+  source_item_empty: 'empty',
+  source_folder_unreadable: count => count === 1 ? 'folder that could not be opened' : 'folders that could not be opened',
+  source_entry_unreadable: 'could not be read',
+  source_name_unsupported: 'with a name that is not valid text',
+};
+
+/** "2 empty, 1 folder that could not be opened" for the reason counts of an import; '' for none. */
+export function skipSummary(reasons: Record<string, number> | null | undefined): string {
+  return Object.entries(reasons ?? {}).map(([code, count]) => {
+    const reason = skipReasons[code] ?? 'not copied';
+    return `${count.toLocaleString()} ${typeof reason === 'string' ? reason : reason(count)}`;
+  }).join(', ');
 }
