@@ -593,6 +593,8 @@ impl NativePredictor {
                         return Err("runtime_process_stopped".into());
                     }
                     if let Some(role) = role {
+                        // Named before the check: the deadline can fall while it is pending.
+                        waiting.store(index, Ordering::Release);
                         if !role.client.health().await.unwrap_or(false) {
                             unready = index;
                             break;
@@ -1293,6 +1295,57 @@ mod tests {
         // A failed prediction with the process still alive blames no lane.
         predictor.blame_exited(0);
         assert_eq!(predictor.failed_lane(), None);
+        // Two lanes: the processor lane fails its first check and then serves; the accelerated
+        // lane's check is still pending at the deadline. The accelerated lane is the one blamed.
+        {
+            let serving = TcpListener::bind("127.0.0.1:0").unwrap();
+            let hanging = TcpListener::bind("127.0.0.1:0").unwrap();
+            let processor_port = serving.local_addr().unwrap().port();
+            let accelerated_port = hanging.local_addr().unwrap().port();
+            thread::spawn(move || {
+                let mut first = true;
+                for socket in serving.incoming() {
+                    let Ok(mut socket) = socket else { break };
+                    if std::mem::take(&mut first) {
+                        continue; // closed without an answer: not serving yet
+                    }
+                    let mut request = [0; 1024];
+                    let _ = socket.read(&mut request);
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
+                    );
+                }
+            });
+            thread::spawn(move || {
+                // Accepts and never answers.
+                let held: Vec<_> = hanging.incoming().collect();
+                drop(held);
+            });
+            let lane = |port: u16, name: &str| Lane {
+                child: pack
+                    .start_sidecar(&root.join("cache"), &root.join("work"), port)
+                    .unwrap(),
+                manifest_sha256: name.into(),
+            };
+            let role = |port: u16, lane: usize| BoundRole {
+                client: client(port),
+                qualification_id: format!("fixture-{lane}"),
+                lane,
+            };
+            let mut pair = NativePredictor {
+                children: vec![lane(19996, "processor"), lane(19997, "accelerated")],
+                roles: vec![role(processor_port, 0), role(accelerated_port, 1)],
+                failed: None,
+            };
+            runtime.block_on(async {
+                let (_keep, mut never) = watch::channel(false);
+                assert_eq!(
+                    pair.ready(&mut never).await.unwrap_err(),
+                    "worker_execution_deadline"
+                );
+            });
+            assert_eq!(pair.failed_lane(), Some("accelerated"));
+        }
         let (_sender, mut cancel) = watch::channel(false);
         let mut future = Box::pin(worker_jobs(
             &mut predictor,
