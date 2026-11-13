@@ -39,7 +39,12 @@ anywhere else.
 Where the evidence goes. Default: <Work>\evidence. A folder of its own: it must be new, empty, or
 the evidence folder of an earlier run of this script, whose contents are then replaced. It may not
 be, contain or lie inside the Desktop checkout or -ServerSource, and inside -Work only the default
-is accepted. Anything else is refused before a single file is touched.
+is accepted, compared where the folders really lead (through junctions and symbolic links). It may
+not be or lie below a junction or symbolic link itself, and a link inside it is removed, never what
+it leads to. Anything else is refused before a single file is touched.
+
+.PARAMETER PrepareOutputOnly
+Check the folders and prepare the evidence folder, then stop (tools/test_qualify_windows_cuda.ps1).
 
 .PARAMETER WithoutGpuRehearsal
 For CI on a computer WITHOUT a card only: runs every step, expects the processor to qualify and
@@ -54,15 +59,23 @@ param(
     [string]$ServerSource,
     [string]$Work = (Join-Path $env:LOCALAPPDATA 'frameleaf-cuda-hardware'),
     [string]$Output,
-    [switch]$WithoutGpuRehearsal
+    [switch]$WithoutGpuRehearsal,
+    [switch]$PrepareOutputOnly
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Provider = 'CUDAExecutionProvider'
 $Processor = 'CPUExecutionProvider'
-# What the app reports when the runtime itself declines to qualify (here: no card for CUDA).
+# Without a card, two refusals and nothing else count. The app itself never tries CUDA there
+# (`install_from` in src-tauri/src/provider_selection.rs: no nvcuda.dll, so
+# `provider_device_ineligible`, and the processor is used). Made to try anyway, the runtime must
+# refuse by itself: `runtime_qualification_failed` from the app, with the reason the runtime wrote
+# in its report, `native_device_execution_evidence_required` (frameleaf_ml/native_qualification.py:
+# CUDA ran, but no card its driver reports). A crash, a start failure or a timeout is a fault.
 $Refusal = 'runtime_qualification_failed'
+$NoCardReason = 'native_device_execution_evidence_required'
+$NoCardGate = 'provider_device_ineligible'
 $Models = @('buffalo_s', 'buffalo_l', 'PP-OCRv5_mobile', 'ViT-B-32__openai')
 $Desktop = Split-Path -Parent $PSScriptRoot
 
@@ -86,26 +99,86 @@ function Require-Tool([string]$Name, [string]$Hint) {
 }
 
 # Full paths first; nothing is created or removed until the evidence folder is known to be safe.
+# A junction or symbolic link anywhere in a path makes its text say nothing about where it leads,
+# so every comparison is made on where the paths really lead (Windows' own final path), and an
+# evidence folder reached through a link is never emptied.
+if (-not ('FrameleafCuda.Paths' -as [type])) { Add-Type -Namespace FrameleafCuda -Name Paths -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle handle, System.Text.StringBuilder path, uint size, uint flags);
+// Where an existing file or folder really is, every junction and link on the way followed.
+public static string Final(string path) {
+    // No access asked, all sharing, open existing, backup semantics (a folder opens too).
+    using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+        if (handle.IsInvalid) { throw new System.ComponentModel.Win32Exception(); }
+        var buffer = new System.Text.StringBuilder(32768);
+        if (GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0) == 0) { throw new System.ComponentModel.Win32Exception(); }
+        var text = buffer.ToString();
+        if (text.StartsWith(@"\\?\UNC\")) { return @"\\" + text.Substring(8); }
+        if (text.StartsWith(@"\\?\")) { return text.Substring(4); }
+        return text;
+    }
+}
+'@ }
 function Full([string]$Path) { [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') }
+# Where a path leads: its deepest existing folder resolved through every link, then the rest.
+function Real([string]$Path) {
+    $path = Full $Path
+    $rest = @()
+    while (-not (Test-Path -LiteralPath $path)) {
+        $parent = Split-Path -Parent $path
+        if (-not $parent) { return $path }
+        $rest = @(Split-Path -Leaf $path) + $rest
+        $path = $parent
+    }
+    $real = [FrameleafCuda.Paths]::Final($path).TrimEnd('\')
+    foreach ($part in $rest) { $real = Join-Path $real $part }
+    $real
+}
+# The path, or one of the folders above it, is a junction or a symbolic link.
+function Linked([string]$Path) {
+    $path = Full $Path
+    while ($path) {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $true }
+        $path = Split-Path -Parent $path
+    }
+    $false
+}
+# Remove what a folder holds without ever going through a junction or link inside it: a link is
+# removed itself, never what it leads to.
+function Clear-Folder([string]$Folder) {
+    foreach ($item in @(Get-ChildItem -LiteralPath $Folder -Force)) {
+        $linked = [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        if ($item.PSIsContainer) {
+            if (-not $linked) { Clear-Folder $item.FullName }
+            [System.IO.Directory]::Delete($item.FullName, $false)
+        } else {
+            [System.IO.File]::Delete($item.FullName)
+        }
+    }
+}
 function Inside([string]$Path, [string]$Folder) { ($Path + '\').StartsWith($Folder + '\', [System.StringComparison]::OrdinalIgnoreCase) }
-function Overlap([string]$First, [string]$Second) { (Inside $First $Second) -or (Inside $Second $First) }
+function Overlap([string]$First, [string]$Second) { (Inside (Real $First) (Real $Second)) -or (Inside (Real $Second) (Real $First)) }
 $Marker = '.frameleaf-cuda-evidence'
 $Work = Full $Work
 $default = Join-Path $Work 'evidence'
 if (-not $Output) { $Output = $default }
 $Output = Full $Output
 if ($ServerSource) { $ServerSource = Full $ServerSource }
+if (Linked $Output) { Fail "-Output ($Output) is, or lies below, a junction or symbolic link; give it a plain folder of its own" }
 if (Overlap $Output (Full $Desktop)) { Fail "-Output ($Output) overlaps the Desktop checkout; give it a folder of its own" }
 if ($ServerSource -and (Overlap $Output $ServerSource)) { Fail "-Output ($Output) overlaps -ServerSource; give it a folder of its own" }
-if ((Overlap $Output $Work) -and $Output -ne (Full $default)) { Fail "-Output ($Output) overlaps -Work; inside it only $default is accepted" }
+if ((Overlap $Output $Work) -and (Real $Output) -ne (Real $default)) { Fail "-Output ($Output) overlaps -Work; inside it only $default is accepted" }
 if ($ServerSource -and (Overlap $Work $ServerSource)) { Fail '-Work overlaps -ServerSource' }
 if (Overlap $Work (Full $Desktop)) { Fail '-Work overlaps the Desktop checkout' }
 if (Test-Path -LiteralPath $Output) {
     if (-not (Test-Path -LiteralPath $Output -PathType Container)) { Fail "-Output ($Output) is a file" }
-    $existing = @(Get-ChildItem -LiteralPath $Output -Force)
-    if ($existing.Count -gt 0) {
-        if (-not (Test-Path -LiteralPath (Join-Path $Output $Marker))) { Fail "-Output ($Output) is not empty and is not this script's evidence folder; nothing was removed" }
-        $existing | Remove-Item -Recurse -Force
+    if (@(Get-ChildItem -LiteralPath $Output -Force).Count -gt 0) {
+        $own = Get-Item -LiteralPath (Join-Path $Output $Marker) -Force -ErrorAction SilentlyContinue
+        if (-not $own -or $own.PSIsContainer -or ($own.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { Fail "-Output ($Output) is not empty and is not this script's evidence folder; nothing was removed" }
+        Clear-Folder $Output
     }
 }
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
@@ -113,6 +186,7 @@ New-Item -ItemType Directory -Force -Path $Output | Out-Null
 Set-Content -LiteralPath (Join-Path $Output $Marker) -Value 'Evidence of tools/qualify_windows_cuda.ps1; replaced by its next run.'
 $Reports = Join-Path $Output 'reports'
 New-Item -ItemType Directory -Force -Path $Reports | Out-Null
+if ($PrepareOutputOnly) { Write-Host "evidence folder ready: $Output"; exit 0 }
 
 # 1. The card.
 Step 'NVIDIA card'
@@ -274,6 +348,9 @@ for ($index = 0; $index -lt $cuda.Count; $index++) {
     if (-not $twin) { $failures.Add("$(Key $record) has no processor twin in the same position") }
     $cpuWarm = if ($twin -and $twin.qualified) { [double]$twin.report.warmMilliseconds } else { $null }
     $row = [ordered]@{ profile = (Key $record); cpuWarmMs = $cpuWarm; cudaWarmMs = $null; cudaColdMs = $null; state = 'NOT QUALIFIED'; cudaNodes = 0; processorNodes = 0; cards = 0 }
+    $gate = if ($record.PSObject.Properties['appGate']) { $record.appGate } else { $null }
+    $reason = if ($record.PSObject.Properties['refusalReason']) { $record.refusalReason } else { $null }
+    if (-not $WithoutGpuRehearsal -and $gate) { $failures.Add("$(Key $record): the app would not try CUDA on this computer: $gate") }
     if ($record.qualified) {
         $report = $record.report
         $row.cudaWarmMs = [double]$report.warmMilliseconds
@@ -292,12 +369,13 @@ for ($index = 0; $index -lt $cuda.Count; $index++) {
         if ($WithoutGpuRehearsal) { $failures.Add("$(Key $record) qualified on CUDA on a computer said to have no card") }
     } elseif (-not $WithoutGpuRehearsal) {
         $failures.Add("$(Key $record) did not qualify on CUDA: $($record.failure)")
-    } elseif ($record.failure -eq $Refusal) {
-        $row.state = "refused ($($record.failure))"
+    } elseif ($record.failure -eq $Refusal -and $reason -eq $NoCardReason -and $gate -eq $NoCardGate) {
+        $row.state = "refused ($gate; runtime: $reason)"
     } else {
-        # Only the runtime's own refusal counts: a process that did not start or did not finish is a fault.
-        $row.state = "FAULT ($($record.failure))"
-        $failures.Add("$(Key $record): CUDA was not refused cleanly without a card: $($record.failure)")
+        # Only the no-card refusal counts: another reason, no reason (the process ended without a
+        # report), a start failure or a timeout is a fault.
+        $row.state = "FAULT ($($record.failure); runtime: $(if ($reason) { $reason } else { 'no reason' }); app: $(if ($gate) { $gate } else { 'would try CUDA' }))"
+        $failures.Add("$(Key $record): CUDA was not refused cleanly without a card: $($row.state)")
     }
     $rows += New-Object PSObject -Property $row
 }

@@ -33,6 +33,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_runtime_gate  # noqa: E402
 from pe_imports import PortableExecutable  # noqa: E402
 
 PROVIDER = "CUDAExecutionProvider"
@@ -300,69 +301,12 @@ def run_child(pack: Path, folders: list[Path], stage: str, home: bool = True) ->
     return json.loads(lines[-1][len("RESULT ") :])
 
 
+# FD-63: started in the app's gate, the runtime must load what serves and qualifies (a hardware
+# snapshot imports onnxruntime with the CUDA provider's pack), and may start a child process.
 GATE_PROBES = {
     "hardware facts": "from frameleaf_ml.native_hardware import snapshot; snapshot()",
-    "platform": "import platform; platform.uname(); platform.processor()",
-    "child process": "import subprocess; subprocess.run(['cmd', '/c', 'ver'], capture_output=True)",
+    **check_runtime_gate.PROBES,
 }
-# DIAGNOSTIC (FD-63): what Windows itself defines for every process, which the app does not pass on.
-SYSTEM_VARIABLES = (
-    "SystemDrive", "windir", "ProgramData", "ALLUSERSPROFILE", "ComSpec", "PATHEXT", "OS", "COMPUTERNAME",
-    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "NUMBER_OF_PROCESSORS", "ProgramFiles", "CommonProgramFiles",
-    "USERNAME", "USERDOMAIN", "APPDATA", "LOCALAPPDATA",
-)
-
-
-def run_gate(folders: list[Path]) -> dict:
-    """Each probe in the pack's interpreter started exactly as the app starts a runtime: the
-    app's own gate program (read from its source) on a pipe that stays open, the app's
-    environment, nothing on the console. A probe that has not finished after 40 seconds reports
-    where it is stuck. The other starts (no gate; Windows' own variables added) are comparisons."""
-    import threading
-    import time
-
-    source = (Path(__file__).resolve().parent.parent / "src-tauri" / "src" / "native_runtime.rs").read_text(encoding="utf-8")
-    gate = re.search(r'const GATE: &str = r#"(.*?)"#;', source, re.S).group(1)
-    results = {}
-    for name, statement in GATE_PROBES.items():
-        for gated, system in ((True, False), (False, False), (True, True), (False, True)):
-            setup = "import faulthandler; faulthandler.dump_traceback_later(40, exit=True)"
-            program = [sys.executable, "-I", "-B", "-c", gate] if gated else [sys.executable, "-I", "-B", "-m"]
-            with tempfile.TemporaryDirectory() as scratch:
-                environment = app_environment(scratch, folders)
-                if system:
-                    environment.update({key: os.environ[key] for key in SYSTEM_VARIABLES if key in os.environ})
-                started = time.perf_counter()
-                process = subprocess.Popen(
-                    program + ["timeit", "-n", "1", "-r", "1", "-s", setup, statement],
-                    cwd=scratch,
-                    env=environment,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                collected: list[bytes] = []
-                reader = threading.Thread(target=lambda: collected.append(process.stderr.read()), daemon=True)
-                reader.start()
-                process.stdin.write(b"frameleaf-native-start\n")
-                process.stdin.flush()
-                # The pipe stays open, as the app holds it for as long as the runtime runs.
-                try:
-                    code = process.wait(timeout=75)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                    code = None
-                reader.join(10)
-                process.stdin.close()
-                errors = b"".join(collected).decode("utf-8", "replace")
-                label = f"{name} ({'gate' if gated else 'plain'}{', system variables' if system else ''})"
-                results[label] = {
-                    "seconds": round(time.perf_counter() - started, 1),
-                    "exit": code,
-                    "errors": ("no exit after 75 seconds: " if code is None else "") + errors[-3000:],
-                }
-    return results
 
 
 def run_stages(pack: Path, folders: list[Path], last: str, home: bool = True) -> dict:
@@ -421,15 +365,10 @@ def main() -> None:
         # What the app did before FD-63 (OS directory only, no home): evidence, nothing is required of it.
         "loaderBefore": run_stages(pack, [], "names", home=False),
         "loader": run_stages(pack, folders, "session" if args.session else "names"),
-        "gate": run_gate(folders),
+        "gate": check_runtime_gate.run_probes(GATE_PROBES, folders),
     }
     report["problems"] = problems + report["loader"]["problems"]
-    # Started as the app starts it, each probe must finish; the plain start is only the comparison.
-    report["problems"] += [
-        f"started as the app starts the runtime, '{name}' did not finish (exit {result['exit']}): {result['errors'][-600:].strip()}"
-        for name, result in report["gate"].items()
-        if name.endswith("(gate)") and result["exit"] != 0
-    ]
+    report["problems"] += check_runtime_gate.problems(report["gate"])
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "cuda-libraries.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (args.output / "cuda-libraries.md").write_text(markdown(report), encoding="utf-8")

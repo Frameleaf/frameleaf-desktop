@@ -441,16 +441,45 @@ mod local_pack {
         fs::create_dir_all(&scratch).unwrap();
         let reports = std::env::var_os("FRAMELEAF_TEST_QUALIFY_REPORTS").map(PathBuf::from);
         let mut index = 0;
+        // What the app itself decides before it would try a provider on this computer
+        // (`install_from` in provider_selection.rs): no device, or a driver too old for it.
+        let probe = crate::provider_selection::Host;
+        let app_gate = |provider: &str| {
+            if provider == "CPUExecutionProvider" {
+                None
+            } else if !crate::provider_selection::device_eligible(
+                provider,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                &probe,
+            ) {
+                Some("provider_device_ineligible")
+            } else if crate::provider_selection::driver_outdated(
+                provider,
+                std::env::consts::OS,
+                &probe,
+            ) {
+                Some("provider_driver_outdated")
+            } else {
+                None
+            }
+        };
         let mut record = |provider: &str,
                           name: &str,
                           kind: &str,
                           failure: Option<&str>,
+                          refusal: Option<&str>,
                           report: Option<&serde_json::Value>| {
             if let Some(directory) = &reports {
                 index += 1;
+                // `refusalReason`: the code a refusing runtime wrote in its report (FD-63), absent
+                // when the process ended without one.
                 let evidence = serde_json::json!({
                     "provider": provider, "model": name, "fixtureKind": kind,
                     "qualified": failure.is_none(), "failure": failure, "report": report,
+                    "refusal": refusal,
+                    "refusalReason": refusal.and_then(|why| why.split_whitespace().next()),
+                    "appGate": app_gate(provider),
                 });
                 fs::write(
                     directory.join(format!("qualification-{index:02}.json")),
@@ -497,10 +526,18 @@ mod local_pack {
                         ["fixtureKind"]
                         .to_string();
                     let plain = kind.trim_matches('"').to_owned();
-                    match runtime.qualify(&cache, &scratch, &spec, &fixture, &cancel) {
+                    let mut refused = None;
+                    match runtime.qualify_explained(
+                        &cache,
+                        &scratch,
+                        &spec,
+                        &fixture,
+                        &cancel,
+                        &mut refused,
+                    ) {
                         Ok(qualified) => {
                             let report = qualified.report();
-                            record(runtime.provider(), name, &plain, None, Some(report));
+                            record(runtime.provider(), name, &plain, None, None, Some(report));
                             eprintln!(
                                 "QUALIFIED {} {name} {kind} state={} cold={:.0}ms warm={:.1}ms nodes={} device={}",
                                 runtime.provider(),
@@ -519,7 +556,14 @@ mod local_pack {
                         }
                         Err(code) => {
                             eprintln!("FAILED {} {name} {kind} {code}", runtime.provider());
-                            record(runtime.provider(), name, &plain, Some(&code), None);
+                            record(
+                                runtime.provider(),
+                                name,
+                                &plain,
+                                Some(&code),
+                                refused.as_deref(),
+                                None,
+                            );
                             failures.push(format!("{} {name} {kind} {code}", runtime.provider()));
                         }
                     }
