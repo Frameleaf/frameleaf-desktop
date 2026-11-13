@@ -10,12 +10,13 @@ on:
       epoch:
         description: 'Runtime epoch admitted by the release policy'
         type: string
-        default: '6'
+        default: '7'
         required: true
       accelerated:
-        description: 'Also sign the GPU manifest where a profile is approved (CoreML on macos-aarch64)'
-        type: boolean
-        default: false
+        description: 'GPU manifest: default = CoreML on macos-aarch64; none = processor only; cuda-ort / openvino-ort = that pack on Windows and Linux x86_64 (unverified on hardware)'
+        type: choice
+        default: default
+        options: [default, none, cuda-ort, openvino-ort]
 permissions:
   contents: read
 concurrency:
@@ -50,8 +51,8 @@ jobs:
             throw new Error('runtime_factory_epoch_invalid');
           const matrix = releaseMatrix(process.env.RELEASE_PLATFORMS);
           for (const item of matrix.include) {
-            item.source_revision = factorySourceRevisionFor(item.target);
-            item.profile = factoryProfileFor(item.target, process.env.RUNTIME_ACCELERATED === 'true');
+            item.profile = factoryProfileFor(item.target, process.env.RUNTIME_ACCELERATED);
+            item.source_revision = factorySourceRevisionFor(item.target, item.profile);
           }
           appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(matrix)}\n`);
           JS

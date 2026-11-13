@@ -36,12 +36,19 @@ export async function packageConfiguration(candidate, policy) {
           ))) &&
       profile.targets?.includes(`${platform}-${architecture}`),
   );
-  if (profiles.schemaVersion !== 1 || approvedFor(manifest).length !== 1)
-    throw new Error("runtime_bundle_source_unapproved");
   // The optional accelerated manifest shares the payload; the app uses it only when it is
   // signed, approved for this target and qualifies on the device.
   const accelerated = await verifySignedAccelerated(candidate, policy);
   if (accelerated && approvedFor(accelerated.manifest).length !== 1)
+    throw new Error("runtime_bundle_source_unapproved");
+  // FD-56: the processor manifest of an accelerated pack is the same payload, so it is built
+  // from the accelerated profile's source; alone, it must be the processor profile's.
+  if (
+    profiles.schemaVersion !== 1 ||
+    !(accelerated
+      ? manifest.sourceRevision === accelerated.manifest.sourceRevision
+      : approvedFor(manifest).length === 1)
+  )
     throw new Error("runtime_bundle_source_unapproved");
   const extra = accelerated ? [acceleratedManifest, acceleratedSignature] : [];
   if (platform === "linux") {
