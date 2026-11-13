@@ -23,13 +23,11 @@ impl Profile {
     }
     fn prepare(&self) -> Result<(), String> {
         self.no_legacy()?;
-        crate::windows_protection::private_directory(&self.root)?;
-        let mut pins = crate::windows_protection::pin_private_directory(&self.root)?;
+        let mut pins = crate::windows_protection::private_directory_pinned(&self.root)?;
         crate::host_storage::check(&self.root)?;
         let (state, data) = self.paths();
         for path in [state, data] {
-            crate::windows_protection::private_directory(&path)?;
-            pins.extend(crate::windows_protection::pin_private_directory(&path)?);
+            pins.extend(crate::windows_protection::private_directory_pinned(&path)?);
             crate::host_storage::check(&path)?;
         }
         Ok(())
@@ -39,9 +37,12 @@ impl Profile {
         if self.paths() != (state.to_owned(), data.to_owned()) {
             return Err(REQUIRED.into());
         }
+        // The root's admission inspects everything inside it, the state and Manager folders
+        // included, and stays pinned; each of those is then checked as a private root of its
+        // own and pinned, without walking the same tree a second and third time.
         let mut pins = crate::windows_protection::pin_private_directory(&self.root)?;
-        pins.extend(crate::windows_protection::pin_private_directory(state)?);
-        pins.extend(crate::windows_protection::pin_private_directory(data)?);
+        pins.extend(crate::windows_protection::pin_private_child(state)?);
+        pins.extend(crate::windows_protection::pin_private_child(data)?);
         for path in [self.root.as_path(), state, data] {
             crate::host_storage::check(path)?;
         }

@@ -88,7 +88,7 @@ jobs:
         if: runner.os == 'macOS' && runner.arch == 'ARM64'
         with:
           repository: Frameleaf/frameleaf-app
-          ref: a70fd7dcee16526cb913308e9ea9596489b24ff6
+          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
           path: coreml-server
           persist-credentials: false
       - name: Construct the CoreML pack with its device collector
@@ -96,7 +96,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision a70fd7dcee16526cb913308e9ea9596489b24ff6 --epoch 6 --profile coreml-ort
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile coreml-ort
           test -s coreml-candidate/manifest.json
           test -s coreml-candidate/manifest-accelerated.json
           coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
@@ -224,7 +224,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: a70fd7dcee16526cb913308e9ea9596489b24ff6
+          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -240,7 +240,7 @@ jobs:
           RUNTIME_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source server --output candidate --revision a70fd7dcee16526cb913308e9ea9596489b24ff6 --epoch 6 --profile "$RUNTIME_PROFILE"
+          python desktop/tools/build_runtime.py --source server --output candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile "$RUNTIME_PROFILE"
           test -s candidate/manifest.json
           test -s candidate/manifest-accelerated.json
           case "$RUNTIME_PROFILE" in
