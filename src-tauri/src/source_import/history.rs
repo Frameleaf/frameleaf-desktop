@@ -90,8 +90,8 @@ impl Entry {
                 .map(|album| album.name.clone()),
             verified,
             total,
-            skipped: view.skipped + import.map_or(0, |import| import.skipped),
-            skipped_reasons: skipped_reasons(manifest, cursor),
+            skipped: view.skipped,
+            skipped_reasons: view.skipped_reasons,
             album_pending: view.album_pending,
             can_retry: status == Status::Interrupted && cursor.upload_budget.is_some(),
         }
