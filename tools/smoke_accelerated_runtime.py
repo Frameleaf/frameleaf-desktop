@@ -7,10 +7,12 @@ libraries initialise. That is not an accelerator qualification: the runtime refu
 OpenVINO without one of its graphics devices.
 
 CUDA cannot create a session without an NVIDIA card. What is checked without one: every CUDA
-and cuDNN library onnxruntime itself lists is present in the pack and loads, and so does
-onnxruntime's CUDA provider library, whose dependencies they are. A session is then attempted;
-its failure is accepted only when this computer reports no NVIDIA device and the error is not a
-library that failed to load. Nothing here shows that inference runs on a card.
+library onnxruntime itself lists is in the pack and loads, cuDNN's main library is in the pack,
+and every cuDNN library the pack has loads. onnxruntime's CUDA provider library also needs the
+NVIDIA driver's own library, which only a computer with the driver has: without a device its
+load may fail for that one reason and no other. A session is then attempted; its failure is
+accepted only when this computer has no NVIDIA device and the error is not another library that
+failed to load. Nothing here shows the provider library loading or inference running on a card.
 """
 
 import ctypes
@@ -74,21 +76,6 @@ with tempfile.TemporaryDirectory() as temporary:
     else:
         windows = platform.system() == "Windows"
         site = Path(ort.__file__).resolve().parent.parent
-        # onnxruntime's own list of the CUDA and cuDNN libraries it preloads from the wheels.
-        libraries = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, True, True)]
-        assert len(libraries) >= 5, libraries
-        for library in libraries:
-            assert library.is_file(), f"missing from the pack: {library}"
-            ctypes.CDLL(str(library))  # raises when it or one of its dependencies does not load
-        capi = site / "onnxruntime" / "capi"
-        names = (
-            ["onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll"]
-            if windows
-            else ["libonnxruntime_providers_shared.so", "libonnxruntime_providers_cuda.so"]
-        )
-        for name in names:
-            ctypes.CDLL(str(capi / name))
-        print(f"CUDA: {len(libraries)} bundled libraries and the provider library loaded")
         # No NVIDIA device: neither the driver's own tool nor the driver library is here.
         driver = "nvcuda.dll" if windows else "libcuda.so.1"
         try:
@@ -98,6 +85,35 @@ with tempfile.TemporaryDirectory() as temporary:
             driver_present = False
         device = bool(facts["gpus"]) or driver_present or shutil.which("nvidia-smi") is not None
         print("NVIDIA device or driver present:", device)
+        # onnxruntime's own lists of what it preloads from the wheels. It requires the CUDA
+        # libraries and treats a cuDNN library that is absent as optional.
+        cuda = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, True, False)]
+        cudnn = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, False, True)]
+        assert len(cuda) >= 4 and cudnn, (cuda, cudnn)
+        for library in cuda:
+            assert library.is_file(), f"missing from the pack: {library}"
+        main = "cudnn64_9.dll" if windows else "libcudnn.so.9"
+        assert any(library.name == main and library.is_file() for library in cudnn), f"{main} is not in the pack"
+        loaded = [library for library in cuda + cudnn if library.is_file()]
+        for library in loaded:
+            ctypes.CDLL(str(library))  # raises when it or one of its dependencies does not load
+        print(f"CUDA: {len(cuda)} CUDA and {len(loaded) - len(cuda)} of {len(cudnn)} cuDNN libraries loaded from the pack")
+        capi = site / "onnxruntime" / "capi"
+        shared, cuda_provider = (
+            ("onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll")
+            if windows
+            else ("libonnxruntime_providers_shared.so", "libonnxruntime_providers_cuda.so")
+        )
+        ctypes.CDLL(str(capi / shared))
+        try:
+            ctypes.CDLL(str(capi / cuda_provider))
+            print("CUDA provider library loaded")
+        except OSError as error:
+            # Only the driver's library may be what is missing, and only where there is no device.
+            # Windows does not name the missing module, so there the absent driver is the evidence.
+            if device or (not windows and driver not in str(error)):
+                raise
+            print("CUDA provider library NOT loaded; it needs the NVIDIA driver library:", str(error)[:200])
         try:
             session = ort.InferenceSession(path.as_posix(), providers=[provider, "CPUExecutionProvider"])
             session.disable_fallback()
