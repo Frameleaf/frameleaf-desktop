@@ -10,7 +10,7 @@
   import { workerView, workloadReason } from '../mode-state';
   import { workloadProvider } from '../ai-processing';
   import { describeError } from '../errors';
-  import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent } from '../ui-state';
+  import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent, importProgress, importProgressText, type OverallProgress } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
   import { backupHealth, backupWarning, libraryHeadroom, storageWarning } from '../server-health';
 
@@ -39,7 +39,7 @@
 
   // Photo sources summary (read-only here; the Photo sources page owns the actions).
   type Consent = { id: string; name: string; path: string; registered: boolean; allowDownload: boolean };
-  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; uploadRemaining: number | null };
+  type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; uploadRemaining: number | null; overall?: OverallProgress | null };
   let consent = $state<Consent | null>(null);
   let job = $state<CopyJob | null>(null);
   let alive = true;
@@ -247,8 +247,8 @@
               <span class="ic" aria-hidden="true"><Icon name="folder" /></span>
               <span class="l">
                 <b>{consent.name}</b>
-                <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path}{job ? ` · ${job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'} · ${job.completed.toLocaleString()} of ${job.total.toLocaleString()} copies confirmed${job.uploadRemaining !== null ? ` · ${formatBytes(job.uploadRemaining)} upload allowance left` : ''}` : consent.registered ? ' · Registered with your server' : ' · Registration pending'}</small>
-                {#if job && !['complete', 'cancelled'].includes(job.state)}<span class="progress" role="progressbar" aria-valuenow={percent(job.completed, job.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copy progress"><span style="width:{percent(job.completed, job.total)}%"></span></span>{/if}
+                <small style={job && !['complete', 'cancelled'].includes(job.state) ? 'margin-bottom:8px' : ''}>{consent.path}{job ? ` · ${job.state === 'complete' ? 'Copy complete' : job.state === 'cancelled' ? 'Copy cancelled' : job.state === 'copying' ? 'Copying' : job.state === 'ready' ? 'Copy prepared' : job.state === 'paused' ? 'Copy paused' : 'Copy needs attention'} · ${importProgressText(job)}${job.uploadRemaining !== null ? ` · ${formatBytes(job.uploadRemaining)} upload allowance left` : ''}` : consent.registered ? ' · Registered with your server' : ' · Registration pending'}</small>
+                {#if job && !['complete', 'cancelled'].includes(job.state)}{@const progress = importProgress(job)}<span class="progress" role="progressbar" aria-valuenow={percent(progress.completed, progress.total)} aria-valuemin="0" aria-valuemax="100" aria-label="Copy progress"><span style="width:{percent(progress.completed, progress.total)}%"></span></span>{/if}
               </span>
               {#if job?.state === 'complete'}<span class="pill ok"><i aria-hidden="true"></i>Up to date</span>{:else if job?.state === 'copying'}<span class="pill wait"><i aria-hidden="true"></i>Copying</span>{:else if job}<span class="pill off"><i aria-hidden="true"></i>{job.state === 'ready' ? 'Prepared' : job.state === 'paused' ? 'Paused' : 'Attention'}</span>{/if}
               <button class="btn quiet" onclick={() => onopen('sources')}>Details</button>

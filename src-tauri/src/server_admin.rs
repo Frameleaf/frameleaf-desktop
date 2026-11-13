@@ -31,6 +31,10 @@ pub(crate) struct ServerSummary {
     pub storage: Option<Value>,
     pub version: Option<Value>,
     pub attention: Option<Value>,
+    /// The server refused the attention list until Two-Step Verification. The rest of the summary
+    /// still loads; Overview shows its Verify prompt for this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_verification: Option<Refused>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -255,17 +259,25 @@ pub(crate) async fn server_summary(
     state: State<'_, DesktopState>,
 ) -> Result<ServerSummary, Refused> {
     crate::require_local(&window)?;
-    let session = session(&state).await?;
+    summary(&session(&state).await?).await
+}
+
+async fn summary(session: &Session) -> Result<ServerSummary, Refused> {
     let me = session.me().await?;
     let (connections, storage, version) = tokio::join!(
         session.get("api/server/connections"),
         session.get("api/server/storage"),
         session.get("api/server/version-check"),
     );
-    let attention = if me.is_admin {
-        session.get("api/admin/attention").await.ok()
+    // The attention list is an administrator route: the server can ask for Two-Step Verification
+    // first. That request is handed on with the rest of the summary instead of being dropped.
+    let (attention, attention_verification) = if me.is_admin {
+        match optional(session.get("api/admin/attention").await) {
+            Ok(attention) => (attention, None),
+            Err(needed) => (None, Some(needed)),
+        }
     } else {
-        None
+        (None, None)
     };
     Ok(ServerSummary {
         me,
@@ -273,6 +285,7 @@ pub(crate) async fn server_summary(
         storage: storage.ok(),
         version: version.ok(),
         attention,
+        attention_verification,
     })
 }
 
@@ -747,6 +760,65 @@ mod verification_tests {
             assert_eq!(serde_json::to_value(&refused).unwrap(), json!(code));
             assert!(matches!(optional(Err(refused)), Ok(None)));
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::server_steps::fixture::{client, server};
+    use serde_json::json;
+
+    fn session_for(attention: (u16, Value), admin: bool) -> Session {
+        let (base, _) = server(move |request| match request.path.as_str() {
+            "/api/users/me" => (
+                200,
+                json!({"id": "u", "name": "Ada", "email": "ada@example.test", "isAdmin": admin}),
+            ),
+            "/api/admin/attention" => attention.clone(),
+            _ => (200, json!({})),
+        });
+        Session {
+            client: client(),
+            base,
+            token: "session".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_passes_on_the_attention_requests_two_step_verification() {
+        let needed = json!({
+            "code": "verification_required", "methods": ["frameleaf", "totp"], "transaction": "txn",
+        });
+        let summary = summary(&session_for((403, needed.clone()), true)).await;
+        let Ok(summary) = summary else {
+            panic!("the rest of the summary should still load");
+        };
+        assert!(summary.attention.is_none());
+        let sent = serde_json::to_value(&summary).unwrap();
+        assert_eq!(sent["attentionVerification"], needed);
+        assert_eq!(sent["me"]["isAdmin"], true);
+    }
+
+    #[tokio::test]
+    async fn summary_still_loads_without_an_attention_list() {
+        // Any other refusal of the optional list, and a member who never asks for it.
+        let other = summary(&session_for((500, json!({})), true)).await;
+        let Ok(other) = other else {
+            panic!("the summary should load");
+        };
+        assert!(other.attention.is_none() && other.attention_verification.is_none());
+        assert!(serde_json::to_value(&other)
+            .unwrap()
+            .get("attentionVerification")
+            .is_none());
+        let needed = json!({"code": "verification_required", "methods": [], "transaction": "txn"});
+        let member = summary(&session_for((403, needed), false)).await;
+        assert!(member.is_ok_and(
+            |summary| summary.attention.is_none() && summary.attention_verification.is_none()
+        ));
+        let listed = summary(&session_for((200, json!({"items": []})), true)).await;
+        assert!(listed.is_ok_and(|summary| summary.attention == Some(json!({"items": []}))));
     }
 }
 

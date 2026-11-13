@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { beginStep, chooseMethod, methodChoice, noStepUp, otherMethods, proofLabel, proofReady, stepFailed, stepPrompt, stepUpAfterFailure, stepUpDismissed, verificationRequired } from '../src/sign-in-steps.ts';
+import { beginStep, chooseMethod, linkPrompt, methodChoice, noStepUp, otherMethods, proofLabel, proofReady, stepFailed, stepPrompt, stepReady, stepUpAfterFailure, stepUpDismissed, summaryStepUpAfter, verificationRequired } from '../src/sign-in-steps.ts';
 import { connectionError } from '../src/errors.ts';
 
 test('a step opens on the server’s preferred proof and offers the others', () => {
   const step = beginStep({ transaction: 'txn', methods: ['totp', 'recovery_code'] });
-  assert.deepEqual(step, { transaction: 'txn', methods: ['totp', 'recovery_code'], method: 'totp', sentTo: null, passkey: false, failure: '' });
+  assert.deepEqual(step, { transaction: 'txn', methods: ['totp', 'recovery_code'], method: 'totp', sentTo: null, passkey: false, password: false, failure: '' });
   assert.deepEqual(otherMethods(step), ['recovery_code']);
   assert.equal(stepPrompt(step), 'Enter the Verification Code from your authenticator app.');
   assert.equal(proofLabel(step.method), 'Verification Code');
@@ -112,7 +112,7 @@ test('Overview and the AI library panel show the shared Verify prompt for their 
   const overview = read('../src/pages/Overview.svelte');
   const library = read('../src/pages/AiLibrary.svelte');
   // Overview's summary is loaded by the app shell, which hands the refused request to the page.
-  assert.match(app, /await invoke<ServerSummary>\('server_summary'\)[\s\S]{0,200}stepUpAfterFailure\(summaryStepUp, failed/);
+  assert.match(app, /await invoke<ServerSummary>\('server_summary'\)[\s\S]{0,200}summaryStepUpAfter\(summaryStepUp, result, failed/);
   assert.match(app, /<Overview [^>]*stepUp=\{summaryStepUp\.request\}[^>]*onstepupclose=\{\(\) => \{ summaryStepUp = stepUpDismissed; \}\}/);
   assert.match(overview, /\{#if stepUp\}\{#key stepUp\}<StepUp offer=\{stepUp\.offer\} retry=\{stepUp\.retry\} onclose=\{onstepupclose\} \/>/);
   assert.match(library, /await invoke<LibraryAiProcessing>\('server_ai_processing'\)[\s\S]{0,300}stepUpAfterFailure\(prompt, failed/);
@@ -125,4 +125,63 @@ test('Overview and the AI library panel show the shared Verify prompt for their 
     assert.match(page, /import StepUp from '\.\.\/StepUp\.svelte';/);
     assert.doesNotMatch(page, /server_step_up|<Sheet|This needs/);
   }
+});
+
+test('a summary whose attention list needs Two-Step Verification still loads and opens the Verify prompt', () => {
+  const retry = () => {};
+  const needed = { code: 'verification_required', methods: ['frameleaf', 'totp'], transaction: 'txn' };
+  const asked = summaryStepUpAfter(noStepUp, { attentionVerification: needed }, undefined, retry);
+  assert.deepEqual(asked, { request: { offer: { transaction: 'txn', methods: ['frameleaf', 'totp'] }, retry }, dismissed: false });
+  // The next refresh is refused again: the open prompt stays, and a dismissed one stays away.
+  assert.equal(summaryStepUpAfter(asked, { attentionVerification: { ...needed, transaction: 'next' } }, undefined, retry), asked);
+  assert.equal(summaryStepUpAfter(stepUpDismissed, { attentionVerification: needed }, undefined, retry), stepUpDismissed);
+  // Once nothing is refused the prompt goes; a summary that failed outright is judged by its error.
+  assert.equal(summaryStepUpAfter(asked, {}, undefined, retry), noStepUp);
+  assert.equal(summaryStepUpAfter(noStepUp, null, 'server_http_500', retry), noStepUp);
+  assert.equal(summaryStepUpAfter(noStepUp, null, needed, retry).request?.offer.transaction, 'txn');
+  // The backend hands the refusal on instead of dropping it (rustfmt may wrap the call).
+  const rust = readFileSync(new URL('../src-tauri/src/server_admin.rs', import.meta.url), 'utf8');
+  assert.match(rust, /optional\(\s*session\s*\.get\("api\/admin\/attention"\)\s*\.await\s*\)/);
+  assert.doesNotMatch(rust, /"api\/admin\/attention"\)\s*\.await\s*\.ok\(\)/);
+});
+
+test('Sign in with Frameleaf can ask for the server’s own Password with, or without, a code', () => {
+  // A first link on an account with an authenticator: the Password and one code, sent together.
+  const both = beginStep({ transaction: 'txn', methods: ['frameleaf', 'password', 'totp', 'recovery_code'] });
+  assert.equal(both.password, true);
+  assert.equal(both.method, 'totp');
+  assert.deepEqual(otherMethods(both), ['recovery_code']);
+  assert.equal(stepReady(both, '123456', ''), false);
+  assert.equal(stepReady(both, '', 'secret'), false);
+  assert.equal(stepReady(both, '123456', 'secret'), true);
+  assert.equal(stepReady(both, '123456', 'x'.repeat(1001)), false);
+  // A first link with no authenticator: the Password alone completes it, and nothing says "can't finish".
+  const alone = beginStep({ transaction: 'txn', methods: ['frameleaf', 'password'] });
+  assert.equal(alone.method, null);
+  assert.equal(stepPrompt(alone), '');
+  assert.equal(stepReady(alone, '', ''), false);
+  assert.equal(stepReady(alone, '', 'secret'), true);
+  // Only the authenticator: as any other step. A step with nothing to enter is never ready.
+  const code = beginStep({ transaction: 'txn', methods: ['frameleaf', 'totp'] });
+  assert.equal(code.password, false);
+  assert.equal(stepReady(code, '123456'), true);
+  assert.equal(stepReady(beginStep({ transaction: 'txn', methods: ['passkey'] }), '123456', 'secret'), false);
+  assert.match(linkPrompt, /Password once to link it to your Frameleaf account/);
+  for (const code of ['frameleaf_step_refused', 'frameleaf_step_expired']) assert.notEqual(connectionError(code), connectionError('unknown_code'), code);
+});
+
+test('every sign-in path declares the verification capability and shows the step it is answered with', () => {
+  const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const steps = read('../src-tauri/src/server_steps.rs');
+  const login = read('../src-tauri/src/server_login.rs');
+  // Password, Sign in with Frameleaf (exchange and its step-up) and the server's own OAuth callback.
+  assert.equal(steps.match(/"capabilities":\s*CAPABILITIES/g)?.length, 4);
+  assert.match(login, /"capabilities":\s*crate::server_steps::CAPABILITIES/);
+  const screen = read('../src/ServerSignIn.svelte');
+  assert.match(screen, /settle\(await invoke<SignInOutcome>\('connect_cloud_server', [^)]*\), 'frameleaf'\)/);
+  assert.match(screen, /invoke<SignInOutcome>\('connect_cloud_server_step', \{ transaction: current\.transaction, method: current\.method, proof: current\.method \? secret : null, password: current\.password \? typed : null, deviceName \}\)/);
+  // The window never names the server a Password goes to: the backend keeps the address that asked.
+  assert.doesNotMatch(screen, /connect_cloud_server_step', \{[^}]*server/);
+  // The server list reaches the same step through the server's sign-in screen.
+  assert.match(read('../src/pages/Welcome.svelte'), /if \(outcome\.status === 'done'\) onconnected\(outcome\.connection\);[\s\S]{0,200}resumeFrameleaf = true; await openServer\(outcome\.server/);
 });

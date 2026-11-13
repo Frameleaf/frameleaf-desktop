@@ -27,7 +27,8 @@ export type CloudServer = {
 export type ConnectionFeatures = { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean };
 export type Connection = { navigationScope?: string | null; server: string; name: string; mode: string; state: string; features: ConnectionFeatures };
 /** connect_server / connect_server_step: signed in, or the step that would complete the sign-in. */
-export type SignInOutcome = { status: 'done'; connection: Connection } | { status: 'next'; transaction: string; methods: string[]; sentTo: string | null };
+/** `server`: Sign in with Frameleaf only, the address of the server that asked for the step. */
+export type SignInOutcome = { status: 'done'; connection: Connection } | { status: 'next'; transaction: string; methods: string[]; sentTo: string | null; server?: string };
 export type Workload = { workload: string; state: string; modelNames: string[]; code: string | null };
 export type ModelProgress = { totalBytes: number; verifiedBytes: number; download: { receivedBytes: number; totalBytes: number } | null };
 export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[]; activeWorkload?: string | null; models?: ModelProgress | null; completedTasks?: number; providers?: import('./ai-processing').WorkloadProvider[] };
@@ -53,6 +54,8 @@ export type AttentionItem = {
 export type Attention = { checkedAt?: string; items?: AttentionItem[]; checks?: { kind: string; state: string }[]; dismissed?: string[] };
 export type ServerSummary = {
   me: Me; connections: ServerConnections | null; storage: ServerStorage | null; version: VersionCheck | null; attention: Attention | null;
+  /** The server refused the attention list until Two-Step Verification (a `verification_required` refusal). */
+  attentionVerification?: { code: string; methods: string[]; transaction: string };
 };
 
 // ---- cloud_status -----------------------------------------------------------------------------------

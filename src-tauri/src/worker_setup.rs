@@ -149,6 +149,16 @@ impl WorkerSetup {
     pub fn status(&self) -> SetupStatus {
         self.status.lock().unwrap().clone()
     }
+    /// A worker task is running and has not given up: it keeps its own session current.
+    pub(crate) async fn running(&self) -> bool {
+        !self.parked()
+            && self
+                .running
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|running| !running.task.inner().is_finished())
+    }
     /// The worker gave up and waits for Retry Setup. The saved session may be one the server has
     /// fenced since, so a retry starts from a newly issued session instead of replaying it.
     fn parked(&self) -> bool {

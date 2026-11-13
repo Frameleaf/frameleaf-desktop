@@ -75,6 +75,9 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # The oldest macOS the app itself runs on: `app` in packaging/macos/minimum-versions.json.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     permissions:
       contents: read
       actions: read
@@ -93,7 +96,7 @@ jobs:
           python-version: '3.12'
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - run: npm ci
@@ -156,6 +159,14 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
         run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
+      - name: Check the app and its AI runtime need no newer macOS than each declares
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" \
+            --report "$RUNNER_TEMP/macos-minimum-versions.json" src-tauri/target/release/bundle/macos/Frameleaf.app
+          { echo '### macOS minimum versions'; echo '```json'; cat "$RUNNER_TEMP/macos-minimum-versions.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Sign the macOS GUI with its provisioned Keychain identity and package the DMG
         if: runner.os == 'macOS'
         env:
@@ -248,6 +259,15 @@ jobs:
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
+      - name: Install the Linux package in clean Ubuntu and Debian containers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
       - name: Collect installers
         shell: python
         run: |

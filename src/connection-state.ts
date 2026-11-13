@@ -22,7 +22,7 @@ export type SavedSignInView = {
   signIn: boolean;
   /** The destructive "Clear saved sign-in" recovery, only for a sign-in that can no longer be used. */
   clearSavedSignIn: boolean;
-  /** Frameleaf retries by itself, with backoff. */
+  /** The backend retries by itself, with backoff, also while the window is hidden. */
   autoRetry: boolean;
   /** Shown in place of the sign-in form. */
   panel: { title: string; detail: string; retry: string } | null;
@@ -55,7 +55,5 @@ export function savedSignInView(state: SavedSignInState | null): SavedSignInView
   }
 }
 
-/** Seconds-scale backoff between reconnect attempts: 5 s doubling to a 5 minute ceiling. */
-export function reconnectDelay(attempt: number): number {
-  return Math.min(5_000 * 2 ** Math.min(Math.max(attempt, 0), 10), 300_000);
-}
+/** What the backend's own reconnect attempt led to (the `connection-restored` event). */
+export type Restored<Connection> = { connection: Connection | null; error: string | null };

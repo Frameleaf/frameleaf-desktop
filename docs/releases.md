@@ -68,6 +68,90 @@ Keep the final result and hashes, and discard the account and its terminal
 transcript after the run. This is a manual qualification on the identified
 installed bytes.
 
+## Supported systems
+
+### macOS minimum versions
+
+Two floors are declared in `packaging/macos/minimum-versions.json`:
+
+| Key | Value | Meaning |
+| --- | --- | --- |
+| `app` | 11.0 | The oldest macOS the app installs and runs on: photos, imports, Manager and local hosting. |
+| `aiRuntime` | 15.0 | The oldest macOS the optional AI runtime pack runs on. AI processing needs it; nothing else does. |
+
+`bundle.macOS.minimumSystemVersion` in `src-tauri/tauri.conf.json` and
+`MACOSX_DEPLOYMENT_TARGET` in the macOS build jobs of `desktop.yml` and
+`release.yml` carry the `app` value. The AI runtime floor is never written
+into the bundle, so an older Mac still installs and opens the app.
+
+Both values are the highest minimum recorded in the binaries of each part,
+read with `tools/check_macos_minimum.py` from the installed 0.1.6 Apple
+silicon app:
+
+| Part | Shipped binary | Minimum macOS |
+| --- | --- | --- |
+| App | `frameleaf-desktop` and the `frameleaf-native-host` sidecar | 11.0 |
+| App | Rust default for `aarch64-apple-darwin` (`rustc --print deployment-target`) | 11.0 |
+| App | Rust default for `x86_64-apple-darwin` | 10.12 |
+| App | Tauri default when no minimum is declared (the 0.1.6 `LSMinimumSystemVersion`) | 10.13 |
+| AI runtime | Python interpreter and most libraries | 11.0 |
+| AI runtime | protobuf | 12.0 |
+| AI runtime | OpenCV (`cv2`) and its libraries | 13.0 |
+| AI runtime | NumPy, ONNX Runtime | 14.0 |
+| AI runtime | `orjson` | 15.0 |
+
+`python3 tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" Frameleaf.app`
+treats the `native-runtime` folder as the AI runtime and everything else as
+the app. It fails when an app binary needs a newer macOS than `app`, when a
+runtime binary needs a newer macOS than `aiRuntime`, when a loaded binary
+records no minimum, when the bundle's `LSMinimumSystemVersion` or
+`tauri.conf.json` differs from `app`, or when `MACOSX_DEPLOYMENT_TARGET`
+does. `--report FILE` writes the declared and measured values as JSON.
+`Desktop candidate` runs the check on the unsigned shell. `Desktop release`
+runs it on the app with its runtime before signing and adds the report to the
+run summary. A runtime rebuilt for an older macOS lets `aiRuntime` be lowered;
+to change `app`, change the declaration, `tauri.conf.json` and both workflows
+together (`tools/test_check_macos_minimum.py` fails when they disagree).
+
+The app does not yet tell someone on macOS 11 to 14 why AI processing cannot
+start there; see the follow-up noted in FD-54.
+
+### Linux tray library
+
+The tray icon loads `libayatana-appindicator3.so.1` at run time and falls back
+to `libappindicator3.so.1`; it is not a link-time dependency of the binary. The
+package dependency is chosen by the Tauri bundler from the development package
+present at build time, so every Linux build job installs
+`libayatana-appindicator3-dev`. The `.deb` then depends on
+`libayatana-appindicator3-1`, which Ubuntu 22.04, Ubuntu 24.04 and Debian 12
+ship; `libappindicator3-1` is not in Debian 12. The AUR package depends on
+`libayatana-appindicator`.
+
+`tools/qualify_linux_deb_install.sh PACKAGE.deb` installs the package with
+`apt-get install` in clean `ubuntu:24.04`, `ubuntu:22.04` and `debian:12`
+containers and fails on an unmet dependency or a missing tray dependency. It
+also reports, as a warning, a distribution whose C library is too old to load
+the installed binaries. `Desktop candidate` runs it on every pull request.
+
+## Browser UI tests
+
+`tools/test_*_ui.mjs` drive the real interface in headless Chromium against a
+synthetic IPC bridge: the Manager page, navigation and local server setup. They
+need no server, credentials or saved sign-in. `npm test` skips them;
+`npm run test:ui` runs them and needs Playwright, which is not a project
+dependency:
+
+```sh
+npm install --no-save --prefix /tmp/frameleaf-playwright playwright-core@1.63.0
+node /tmp/frameleaf-playwright/node_modules/playwright-core/cli.js install chromium-headless-shell
+FRAMELEAF_TEST_PLAYWRIGHT=/tmp/frameleaf-playwright/node_modules/playwright-core/index.mjs npm run test:ui
+```
+
+Set `FRAMELEAF_TEST_BROWSER` to the absolute path of another Chromium build to
+use it instead, and `FRAMELEAF_TEST_OUTPUT` to an absolute folder to keep
+screenshots of the Manager page. `Desktop candidate` runs these tests on Linux
+for every pull request.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers

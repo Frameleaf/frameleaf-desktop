@@ -32,14 +32,17 @@ test('a refused proof is announced, tied to its field, and the field takes focus
   assert.match(step, /\{#if step\.failure\}<div class="inline-msg error" role="alert"><p id="two-step-error">/);
   assert.match(step, /<input id="two-step-proof"[^>]*aria-invalid=\{step\.failure \? 'true' : undefined\}[^>]*aria-describedby=\{step\.failure \? 'two-step-error' : undefined\}/);
   // Opening the step, another proof and a refusal each put focus on the field once it can be typed in.
-  assert.match(step, /\$effect\(\(\) => \{\s*void step\.method; void step\.failure;\s*if \(!busy\) void tick\(\)\.then\(\(\) => field\?\.focus\(\)\);/);
+  // A step that also asks for the Password starts on the Password.
+  assert.match(step, /\$effect\(\(\) => \{\s*void step\.method; void step\.failure;[\s\S]{0,120}if \(!busy\) void tick\(\)\.then\(\(\) => \(passwordField && !password \? passwordField : field \?\? passwordField\)\?\.focus\(\)\);/);
+  assert.match(step, /<input id="two-step-password" type="password"[^>]*aria-invalid=\{step\.failure \? 'true' : undefined\}[^>]*aria-describedby=\{step\.failure \? 'two-step-error' : undefined\}/);
 
   const server = read('ServerSignIn.svelte');
   assert.match(server, /\{#if failure\}<div class="inline-msg error notice" role="alert">/);
   // A wrong Password clears the field: focus returns to it. A step with nothing to type focuses its heading.
   assert.match(server, /failure = connectionError\(error\);[\s\S]{0,200}passwordField\?\.focus\(\)/);
-  assert.match(server, /if \(!step\.method\) void tick\(\)\.then\(\(\) => stepTitle\?\.focus\(\)\);/);
-  assert.match(server, /<h3 tabindex="-1" bind:this=\{stepTitle\}>Two-Step Verification<\/h3>/);
+  assert.match(server, /if \(!step\.method && !step\.password\) void tick\(\)\.then\(\(\) => stepTitle\?\.focus\(\)\);/);
+  assert.match(server, /\{@const stepName = step\.password \? 'Confirm your account on this server' : 'Two-Step Verification'\}/);
+  assert.match(server, /<h3 tabindex="-1" bind:this=\{stepTitle\}>\{stepName\}<\/h3>/);
 
   const account = read('FrameleafAccount.svelte');
   assert.match(account, /<div class="inline-msg error notice" role="alert">\s*<p id="fa-failure">/);
