@@ -46,13 +46,19 @@ const acceleratedProfiles = (target) =>
     .map(([name]) => name);
 
 /** The profile the factory builds for a target. `default` (or true): the accelerated profile
- * where exactly one is approved (CoreML on Apple Silicon), the processor profile elsewhere.
+ * that shares the processor profile's dependency set (CoreML on Apple Silicon), where exactly
+ * one is approved; the processor profile elsewhere.
  * `none` (or false): the processor profile. A profile name (`cuda-ort`, `openvino-ort`): that
  * profile on the targets that approve it, and the default on the others. */
 export function factoryProfileFor(target, accelerated) {
   factorySourceRevisionFor(target);
   const names = acceleratedProfiles(target);
-  const usual = names.length === 1 ? names[0] : "cpu-ort";
+  // Only a profile on the processor profile's own dependency set (CoreML) is a normal pack:
+  // a CUDA or OpenVINO pack is another, far larger payload and is built only when named.
+  const same = names.filter(
+    (name) => profiles.profiles[name].extra === profile.extra,
+  );
+  const usual = same.length === 1 ? same[0] : "cpu-ort";
   if (accelerated === false || accelerated === "none") return "cpu-ort";
   if (accelerated === true || accelerated === "default") return usual;
   if (

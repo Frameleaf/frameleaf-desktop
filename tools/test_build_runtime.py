@@ -159,8 +159,12 @@ class RuntimeBuilderTests(unittest.TestCase):
             root = Path(temporary)
             (root / "python").write_bytes(b"fixture")
             arguments = (root, "python", "a" * 40, 7)
-            for provider in ["CUDAExecutionProvider", "OpenVINOExecutionProvider"]:
-                for system in ["windows", "linux"]:
+            for provider, systems in [
+                ("CUDAExecutionProvider", ["windows", "linux"]),
+                # The locked Windows OpenVINO libraries do not match the provider: no recipe.
+                ("OpenVINOExecutionProvider", ["linux"]),
+            ]:
+                for system in systems:
                     value = builder.manifest(
                         *arguments, system, "x86_64", provider, "frameleaf_ml"
                     )
@@ -202,7 +206,7 @@ class RuntimeBuilderTests(unittest.TestCase):
             block("numpy")
             + "".join(block(name, linux) for name in builder.CUDA_LIBRARIES)
             + block("nvidia-cublas", linux)
-            + "".join(block(name) for name in builder.OPENVINO_WINDOWS_LIBRARIES)
+            + block("onnxruntime-gpu")
         )
         for system in ["linux", "windows"]:
             value = builder.device_requirements("CUDAExecutionProvider", system, locked)
@@ -212,13 +216,22 @@ class RuntimeBuilderTests(unittest.TestCase):
                 value, "".join(block(name) for name in builder.CUDA_LIBRARIES)
             )
             builder.validate_requirements(value)
-        self.assertEqual(
-            builder.device_requirements("OpenVINOExecutionProvider", "windows", locked),
-            "".join(block(name) for name in builder.OPENVINO_WINDOWS_LIBRARIES),
-        )
+        # Only onnxruntime-gpu comes from the server's CUDA 12 feed; the feed also mirrors other
+        # packages at other versions, so nothing else may be resolved against it.
+        rest, feed, index = builder.feed_requirements("CUDAExecutionProvider", locked)
+        self.assertEqual(feed, block("onnxruntime-gpu"))
+        self.assertEqual(rest + feed, locked)
+        self.assertEqual(index, builder.CUDA_FEED)
+        for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"]:
+            self.assertEqual(
+                builder.feed_requirements(provider, locked), (locked, "", None)
+            )
+        with self.assertRaises(builder.BuildError):
+            builder.feed_requirements("CUDAExecutionProvider", block("numpy"))
         # The Linux OpenVINO wheel contains OpenVINO; the other providers carry nothing extra.
         for provider, system in [
             ("OpenVINOExecutionProvider", "linux"),
+            ("OpenVINOExecutionProvider", "windows"),
             ("CPUExecutionProvider", "linux"),
             ("CoreMLExecutionProvider", "macos"),
         ]:
@@ -457,25 +470,10 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 builder.dependency_indexes(system, architecture),
                 ["--default-index", "https://pypi.org/simple"],
             )
-        # CUDA: the server's own CUDA 12 feed first, so onnxruntime-gpu is its build, then PyPI.
-        for system in ["windows", "linux"]:
-            self.assertEqual(
-                builder.dependency_indexes(system, "x86_64", "CUDAExecutionProvider"),
-                [
-                    "--index",
-                    builder.CUDA_FEED,
-                    "--default-index",
-                    "https://pypi.org/simple",
-                ],
-            )
         self.assertTrue(
             builder.CUDA_FEED.startswith(
                 "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/"
             )
-        )
-        self.assertEqual(
-            builder.dependency_indexes("windows", "x86_64", "OpenVINOExecutionProvider"),
-            ["--default-index", "https://pypi.org/simple"],
         )
 
     def test_windows_system_root_survives_uppercase_environment_keys(self):

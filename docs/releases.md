@@ -239,7 +239,8 @@ runtime in `runtime/profiles.json` is one the server approves.
 `runtime/profiles.json` lists only runtimes Desktop can build and the server can
 admit, and every source in it has profiles in the catalogue (the parity check
 fails otherwise). Today that is the CPU runtime on every target, `coreml-ort` on
-Apple Silicon, and `cuda-ort` and `openvino-ort` on Windows and Linux x86_64.
+Apple Silicon, `cuda-ort` on Windows and Linux x86_64 and `openvino-ort` on
+Linux x86_64.
 The accelerated profiles build their own runtime source (catalogue epoch 14),
 which verifies the model bytes a session loads; the CPU profile is unchanged.
 
@@ -270,12 +271,15 @@ for that workload.
 locally built pack against the catalogue under a throwaway key (see the test for
 its three environment variables).
 
-`--profile cuda-ort` and `--profile openvino-ort` build the same kind of pack on
-Windows and Linux x86_64. CUDA takes `onnxruntime-gpu` from the feed the server's
-lock names for it (its CUDA 12 build) and adds the CUDA and cuDNN wheels the lock
-pins, each checked against the locked hash; a desktop has no CUDA installation.
-OpenVINO on Windows adds the `openvino` wheel the same way. Pull-request CI
-builds both on hosted runners and loads the provider
+`--profile cuda-ort` (Windows and Linux x86_64) and `--profile openvino-ort`
+(Linux x86_64) build the same kind of pack. CUDA takes `onnxruntime-gpu`, and
+nothing else, from the feed the server's lock names for it (its CUDA 12 build)
+and adds the CUDA and cuDNN wheels the lock pins, each checked against the locked
+hash; a desktop has no CUDA installation. There is no Windows OpenVINO pack: the
+Windows `onnxruntime-openvino` 1.24.1 wheel needs the OpenVINO 2025.4 libraries
+it was built with, the server's lock has only `openvino` 2026.4.1, and with
+those the provider library does not load (Windows error 127). Pull-request CI
+builds the packs on hosted runners and loads the provider
 (`tools/smoke_accelerated_runtime.py`). Neither has run on NVIDIA or Intel
 hardware, a CUDA pack is about 2 GB and no installer carries either: the factory
 builds one only when `accelerated` names it.

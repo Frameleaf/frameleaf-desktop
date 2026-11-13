@@ -36,11 +36,15 @@ ACCELERATED_MANIFEST = "manifest-accelerated.json"
 ACCELERATED_TARGETS = {
     "CoreMLExecutionProvider": {("macos", "aarch64")},
     "CUDAExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
-    "OpenVINOExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+    # Not Windows: its onnxruntime-openvino 1.24.1 wheel needs the OpenVINO 2025.4 libraries it
+    # was built with, and the server's lock has only openvino 2026.4.1, with which the provider
+    # library does not load (Windows error 127, a missing entry point; seen in pull-request CI).
+    "OpenVINOExecutionProvider": {("linux", "x86_64")},
 }
 # The server's lock takes onnxruntime-gpu from this explicit index (`onnxruntime-cuda12` in its
-# pyproject.toml): the CUDA 12 build, which PyPI no longer carries. Every wheel is still checked
-# against the hash the lock records.
+# pyproject.toml): the CUDA 12 build, which PyPI no longer carries. Only that one package is
+# installed from it (the feed also mirrors other packages at other versions), and like every
+# wheel it is checked against the hash the lock records.
 CUDA_FEED = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
 # The CUDA 12 and cuDNN 9 libraries onnxruntime-gpu 1.29.0 loads (its `cuda` and `cudnn` extras
 # and its own `preload_dlls` list, plus what those libraries need themselves). A container has
@@ -55,9 +59,8 @@ CUDA_LIBRARIES = (
     "nvidia-curand-cu12",
     "nvidia-nvjitlink-cu12",
 )
-# The Linux onnxruntime-openvino wheel contains OpenVINO; the Windows one loads it from the
-# `openvino` package (its package notes: "install OpenVINO PyPi Package separately for Windows").
-OPENVINO_WINDOWS_LIBRARIES = ("openvino", "openvino-telemetry")
+# Packages taken from an index of their own, as the server's lock does.
+FEED_PACKAGES = {"CUDAExecutionProvider": ("onnxruntime-gpu", CUDA_FEED)}
 # Server-only packages of the GPU extras, as DESKTOP_UNUSED is for every extra.
 ACCELERATED_UNUSED = {
     "CUDAExecutionProvider": ("qwen-vl-utils",),
@@ -401,21 +404,27 @@ def unmarked(block: str) -> str:
 
 def device_requirements(provider: str, system: str, locked: str) -> str:
     """The device libraries an accelerated runtime carries, exactly as the server's lock pins them."""
+    # The Linux onnxruntime-openvino wheel contains OpenVINO itself.
     names = {
         ("CUDAExecutionProvider", "linux"): CUDA_LIBRARIES,
         ("CUDAExecutionProvider", "windows"): CUDA_LIBRARIES,
-        ("OpenVINOExecutionProvider", "windows"): OPENVINO_WINDOWS_LIBRARIES,
     }.get((provider, system), ())
     return "".join(unmarked(requirement_block(locked, name)) for name in names)
 
 
-def dependency_indexes(
-    system: str, architecture: str, provider: str = CPU_PROVIDER
-) -> list[str]:
-    if provider == "CUDAExecutionProvider":
-        # The first index that has a package is the one used: onnxruntime-gpu from the server's
-        # CUDA 12 feed, everything else from PyPI.
-        return ["--index", CUDA_FEED, "--default-index", "https://pypi.org/simple"]
+def feed_requirements(provider: str, text: str) -> tuple[str, str, str | None]:
+    """Split the requirements into those installed from the usual indexes and the one package
+    the server's lock takes from its own index: (the rest, that package's block, its index)."""
+    if provider not in FEED_PACKAGES:
+        return text, "", None
+    name, index = FEED_PACKAGES[provider]
+    block = requirement_block(text, name)
+    if text.count(block) != 1:
+        raise BuildError("runtime_build_tool_not_pinned")
+    return text.replace(block, ""), block, index
+
+
+def dependency_indexes(system: str, architecture: str) -> list[str]:
     # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
     if system == "linux" and architecture in {"x86_64", "aarch64"}:
@@ -632,6 +641,14 @@ def build(
                 cwd=work,
                 env=env,
             )
+        rest, feed_block, feed_index = feed_requirements(
+            profile["provider"], requirements.read_text()
+        )
+        usual, from_feed = requirements, work / "feed-requirements.txt"
+        if feed_index:
+            usual = work / "usual-requirements.txt"
+            usual.write_text(rest)
+            from_feed.write_text(feed_block)
         run(
             [
                 uv,
@@ -655,13 +672,35 @@ def build(
                     if build_tools.stat().st_size
                     else []
                 ),
-                *dependency_indexes(system, architecture, profile["provider"]),
+                *dependency_indexes(system, architecture),
                 "-r",
-                requirements,
+                usual,
             ],
             cwd=work,
             env=env,
         )
+        if feed_index:
+            run(
+                [
+                    uv,
+                    "--no-config",
+                    "pip",
+                    "install",
+                    "--python",
+                    executable,
+                    "--break-system-packages",
+                    "--require-hashes",
+                    "--no-deps",
+                    "--only-binary",
+                    ":all:",
+                    "--default-index",
+                    feed_index,
+                    "-r",
+                    from_feed,
+                ],
+                cwd=work,
+                env=env,
+            )
 
         commands = prefix / ("Scripts" if os.name == "nt" else "bin")
         # Console entry points embed the build path; the app uses only fixed Python modules.
