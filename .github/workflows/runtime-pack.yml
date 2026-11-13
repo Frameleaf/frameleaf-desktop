@@ -8,6 +8,10 @@ on:
       - 'tools/smoke_accelerated_runtime.py'
       - 'tools/linked_libraries.py'
       - 'tools/pe_imports.py'
+      - 'tools/check_windows_cuda_libraries.py'
+      - 'tools/test_check_windows_cuda_libraries.py'
+      - 'tools/qualify_windows_cuda.ps1'
+      - '.github/workflows/windows-cuda-hardware.yml'
       - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
@@ -160,3 +164,61 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 3
+  # FD-63: what can be known about Windows CUDA without a card, on the hosted Windows Server 2022
+  # image. The hardware script (tools/qualify_windows_cuda.ps1) runs here as a rehearsal: it builds
+  # the shipped cuda-ort pack, moves it to a folder as deep as an installed one with a space and
+  # non-ASCII characters, and fails if an NVIDIA library the CUDA provider or a bundled library
+  # needs is missing from the pack or is not found the way the app starts the runtime. The
+  # processor must qualify every profile from that folder and CUDA must be refused cleanly.
+  # A rehearsal never shows CUDA working: .github/workflows/windows-cuda-hardware.yml does that.
+  windows-cuda-libraries:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - name: The runtime source revision the app ships for CUDA
+        id: source
+        shell: pwsh
+        run: |
+          $revision = (Get-Content -Raw desktop/runtime/profiles.json | ConvertFrom-Json).profiles.'cuda-ort'.sourceRevision
+          if ($revision -notmatch '^[a-f0-9]{40}$') { throw 'no cuda-ort source revision' }
+          "revision=$revision" | Add-Content -Encoding UTF8 $env:GITHUB_OUTPUT
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ steps.source.outputs.revision }}
+          path: server
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Rust stable
+        shell: pwsh
+        run: rustup update stable; if ($LASTEXITCODE -ne 0) { exit 1 }; rustup default stable; exit $LASTEXITCODE
+      - name: The hardware script is valid in Windows PowerShell 5.1 as well
+        shell: powershell
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\desktop\tools\qualify_windows_cuda.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count) { $errors | Out-Host; exit 1 }
+      - name: Rehearse the hardware run without a card (libraries, paths, processor qualification, CUDA refusal)
+        shell: pwsh
+        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "C:\fl" -Output "$env:GITHUB_WORKSPACE\evidence" -WithoutGpuRehearsal
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-cuda-libraries-evidence
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 14

@@ -601,7 +601,19 @@ impl VerifiedRuntime {
         {
             // Windows needs its OS directory for platform DLL discovery, never an inherited PATH.
             if let Some(root) = std::env::var_os("SystemRoot") {
-                command.env("PATH", Path::new(&root).join("System32"));
+                // FD-63: after the OS directory, the folders of the pack's own NVIDIA libraries
+                // (signed and verified above), which those libraries load each other from by name.
+                let mut search = vec![Path::new(&root).join("System32")];
+                for folder in device_library_folders(
+                    self.provider(),
+                    self.manifest.files.keys().map(String::as_str),
+                ) {
+                    search.push(self.root.join(relative(&folder)?));
+                }
+                command.env(
+                    "PATH",
+                    std::env::join_paths(search).map_err(|_| "runtime_path_invalid")?,
+                );
                 command.env("SystemRoot", root);
             }
         }
@@ -642,6 +654,37 @@ impl VerifiedRuntime {
             .map_err(|_| "runtime_gate_failed")?;
         Ok(owner)
     }
+}
+
+/// FD-63: the folders of a CUDA pack that hold the NVIDIA wheels' Windows libraries
+/// (`.../site-packages/nvidia/<component>/bin`), relative to the payload.
+///
+/// onnxruntime opens a fixed list of them by full path before a session is created. The rest are
+/// opened later by name, by NVIDIA's own libraries: cuDNN's convolution library, the run-time
+/// compiler cuDNN and cuFFT use, cuFFT's linker. Windows looks for a library named that way in
+/// the program's folder, the OS directory and `PATH`, none of which is inside the pack.
+#[cfg(any(windows, test))]
+fn device_library_folders<'a>(
+    provider: &str,
+    files: impl Iterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut folders = BTreeSet::new();
+    if provider != "CUDAExecutionProvider" {
+        return folders;
+    }
+    for name in files {
+        let parts: Vec<&str> = name.split('/').collect();
+        let count = parts.len();
+        if count >= 5
+            && parts[count - 1].to_ascii_lowercase().ends_with(".dll")
+            && parts[count - 2] == "bin"
+            && parts[count - 4] == "nvidia"
+            && parts[count - 5] == "site-packages"
+        {
+            folders.insert(parts[..count - 1].join("/"));
+        }
+    }
+    folders
 }
 
 enum Invocation<'a> {
@@ -960,6 +1003,35 @@ mod tests {
             assert_eq!(refusal(&report), None, "{bad}");
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_cuda_pack_puts_the_folders_of_its_nvidia_libraries_on_the_search_path() {
+        let files = [
+            "python/python.exe",
+            "python/Lib/site-packages/onnxruntime/capi/onnxruntime_providers_cuda.dll",
+            "python/Lib/site-packages/nvidia/cudnn/bin/cudnn64_9.dll",
+            "python/Lib/site-packages/nvidia/cudnn/bin/cudnn_cnn64_9.DLL",
+            "python/Lib/site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll",
+            "python/Lib/site-packages/nvidia/cudnn/include/cudnn.h",
+            "python/Lib/site-packages/other/nvidia/x/bin/planted.dll",
+            "nvidia/cudnn/bin/outside.dll",
+        ];
+        let folders = |provider| {
+            device_library_folders(provider, files.iter().copied())
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            folders("CUDAExecutionProvider"),
+            [
+                "python/Lib/site-packages/nvidia/cuda_nvrtc/bin",
+                "python/Lib/site-packages/nvidia/cudnn/bin"
+            ]
+        );
+        // The processor manifest of the same pack, and every other provider, keep the OS directory alone.
+        for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"] {
+            assert!(folders(provider).is_empty(), "{provider}");
+        }
     }
     fn report_for(provider: &str, state: &str, cpu_nodes: bool) -> [serde_json::Value; 2] {
         let mut nodes = serde_json::json!({ provider: 12 });

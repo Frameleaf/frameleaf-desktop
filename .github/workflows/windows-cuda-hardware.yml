@@ -1,0 +1,78 @@
+name: Windows CUDA on NVIDIA hardware
+# FD-63: qualify the Windows CUDA pack on a real NVIDIA card. Started by hand only, on a runner the
+# person names: there is no default label, so it can not quietly run on a computer without a card
+# (and the first step fails on one). Nothing is signed, published or released.
+#
+#   gh workflow run windows-cuda-hardware.yml --ref main -f runner=<label of a Windows runner with an NVIDIA card>
+#
+# The same run on a PC: powershell -ExecutionPolicy Bypass -File tools\qualify_windows_cuda.ps1
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runs-on label of a Windows x64 runner with an NVIDIA card and its driver'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: windows-cuda-hardware-${{ inputs.runner }}
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 180
+    steps:
+      - name: NVIDIA card (fails without one)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'this workflow needs a Windows runner' }
+          $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+          if (-not $smi) { throw 'nvidia-smi is not installed: this runner has no NVIDIA driver' }
+          & $smi.Source
+          if ($LASTEXITCODE -ne 0) { throw 'nvidia-smi failed: no usable NVIDIA card' }
+          $cards = @(& $smi.Source --query-gpu=name,driver_version,memory.total --format=csv,noheader | Where-Object { $_ -and $_.Trim() })
+          if ($LASTEXITCODE -ne 0 -or $cards.Count -eq 0) { throw 'nvidia-smi reports no NVIDIA card' }
+          "### NVIDIA card`n" + (($cards | ForEach-Object { "- $_" }) -join "`n") | Add-Content -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - name: The runtime source revision the app ships for CUDA
+        id: source
+        shell: pwsh
+        run: |
+          $revision = (Get-Content -Raw desktop/runtime/profiles.json | ConvertFrom-Json).profiles.'cuda-ort'.sourceRevision
+          if ($revision -notmatch '^[a-f0-9]{40}$') { throw 'no cuda-ort source revision' }
+          "revision=$revision" | Add-Content -Encoding UTF8 $env:GITHUB_OUTPUT
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ steps.source.outputs.revision }}
+          path: server
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Rust stable
+        shell: pwsh
+        run: rustup update stable; if ($LASTEXITCODE -ne 0) { exit 1 }; rustup default stable; exit $LASTEXITCODE
+      - name: Qualify every profile on CUDA and on the processor
+        shell: pwsh
+        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "$env:RUNNER_TEMP\cuda" -Output "$env:GITHUB_WORKSPACE\evidence"
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-cuda-hardware-evidence
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 30
