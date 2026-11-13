@@ -11,6 +11,7 @@
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "node --test test/*.test.ts tools/test_*.mjs",
+    "test:ui": "node tools/run_ui_tests.mjs",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "node tools/package_desktop.mjs",
