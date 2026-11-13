@@ -71,6 +71,10 @@ struct Pending {
     schema_version: u32,
     operation_id: uuid::Uuid,
     identity: TlsIdentity,
+    /// Renewed identities that ran out while they were still pending. Manager may have
+    /// accepted any of them, so their keys are kept to hand over from, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    earlier: Vec<TlsIdentity>,
 }
 /// The bootstrap's `tlsRotation`: the key of the certificate Manager holds signs the hash of
 /// the certificate that replaces it.
@@ -88,6 +92,9 @@ pub(crate) struct StartIdentity {
     pub handover: Option<Handover>,
     /// A renewed identity is waiting and this start does not present it.
     pub set_aside: bool,
+    /// How many identities Manager may hold that the presented one can be handed over from.
+    /// Which one Manager holds is not known, so a start that fails is tried with the next.
+    pub signers: usize,
     /// Every certificate this library's Manager may be serving, the presented one first.
     pub certificates: Vec<String>,
 }
@@ -228,7 +235,12 @@ impl TlsIdentity {
             }
             return Ok(saved);
         }
-        let saved = Self::mint(installation_id, origin, host)?;
+        let saved = Self::mint(
+            installation_id,
+            origin,
+            host,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
         persist(&saved)?;
         Ok(saved)
     }
@@ -258,6 +270,7 @@ impl TlsIdentity {
         origin: &str,
         binding: &str,
         renew: bool,
+        signer: usize,
     ) -> Result<StartIdentity, String> {
         Self::for_start_in(
             &Keystore,
@@ -265,6 +278,7 @@ impl TlsIdentity {
             origin,
             binding,
             renew,
+            signer,
             OffsetDateTime::now_utc().unix_timestamp(),
         )
     }
@@ -274,6 +288,7 @@ impl TlsIdentity {
         origin: &str,
         binding: &str,
         renew: bool,
+        signer: usize,
         now: i64,
     ) -> Result<StartIdentity, String> {
         let host = hostname(installation_id, origin)?;
@@ -294,70 +309,124 @@ impl TlsIdentity {
             }
         }
         let expired = |identity: &Self| identity.expires_at <= now;
-        let pending: Option<Pending> = vault.load(&next)?;
+        let mut pending: Option<Pending> = vault.load(&next)?;
         if let Some(pending) = &pending {
             if pending.schema_version != 1 || pending.operation_id.is_nil() {
                 return Err("native_tls_identity_invalid".into());
             }
-            pending.identity.usable(installation_id)?;
+            for identity in std::iter::once(&pending.identity).chain(&pending.earlier) {
+                identity.usable(installation_id)?;
+            }
         }
-        let start = |identity: Self, handover, set_aside, other: Option<&Self>| StartIdentity {
-            certificates: std::iter::once(identity.certificate_pem.clone())
-                .chain(other.map(|other| other.certificate_pem.clone()))
-                .collect(),
+        if !renew {
+            // Not renewing: the identity Manager is known to have accepted, if it can still
+            // be used. A waiting one is kept until this start has succeeded.
+            return match (current, pending) {
+                (Some(current), _) if expired(&current) => {
+                    Err("native_tls_identity_expired".into())
+                }
+                (Some(current), pending) => Ok(StartIdentity {
+                    certificates: std::iter::once(&current)
+                        .chain(pending.iter().flat_map(|pending| {
+                            std::iter::once(&pending.identity).chain(&pending.earlier)
+                        }))
+                        .map(|identity| identity.certificate_pem.clone())
+                        .collect(),
+                    handover: None,
+                    set_aside: pending.is_some(),
+                    signers: 0,
+                    identity: current,
+                }),
+                (None, Some(_)) => Err("native_tls_identity_invalid".into()),
+                (None, None) => {
+                    let identity = Self::mint(installation_id, origin, host, now)?;
+                    vault.save(&account, &identity)?;
+                    Ok(StartIdentity {
+                        certificates: vec![identity.certificate_pem.clone()],
+                        handover: None,
+                        set_aside: false,
+                        signers: 0,
+                        identity,
+                    })
+                }
+            };
+        }
+        let due = |identity: &Self| {
+            identity
+                .expires_at
+                .checked_sub(now)
+                .is_none_or(|left| left <= EXPIRY_NOTICE_DAYS * DAY)
+        };
+        // A renewal is made when the saved identity is due, and made again when the one that
+        // was waiting has itself run out. Nothing is discarded: Manager may hold the saved
+        // identity or any renewal it was ever shown, so each of their keys stays available.
+        let renewal = match pending.take() {
+            Some(waiting) if !expired(&waiting.identity) => Some(waiting),
+            waiting if waiting.is_some() || current.as_ref().is_some_and(due) => {
+                let mut earlier = Vec::new();
+                if let Some(Pending {
+                    identity,
+                    earlier: older,
+                    ..
+                }) = waiting
+                {
+                    earlier = older;
+                    earlier.push(identity);
+                }
+                let renewal = Pending {
+                    schema_version: 1,
+                    operation_id: uuid::Uuid::new_v4(),
+                    identity: Self::mint(installation_id, origin, host.clone(), now)?,
+                    earlier,
+                };
+                // Durable before Manager is shown it: the key must outlive a crash.
+                vault.save(&next, &renewal)?;
+                Some(renewal)
+            }
+            _ => None,
+        };
+        let Some(renewal) = renewal else {
+            return match current {
+                Some(current) => Ok(StartIdentity {
+                    certificates: vec![current.certificate_pem.clone()],
+                    handover: None,
+                    set_aside: false,
+                    signers: 0,
+                    identity: current,
+                }),
+                None => {
+                    let identity = Self::mint(installation_id, origin, host, now)?;
+                    vault.save(&account, &identity)?;
+                    Ok(StartIdentity {
+                        certificates: vec![identity.certificate_pem.clone()],
+                        handover: None,
+                        set_aside: false,
+                        signers: 0,
+                        identity,
+                    })
+                }
+            };
+        };
+        // Whoever Manager holds signs: the saved identity first, then the newest earlier one.
+        let signers: Vec<&Self> = current.iter().chain(renewal.earlier.iter().rev()).collect();
+        let handover = match signers.get(signer) {
+            Some(holder) => Some(holder.hand_over(&renewal.identity, renewal.operation_id)?),
+            None if signers.is_empty() => None,
+            None => return Err("native_tls_identity_invalid".into()),
+        };
+        let certificates = std::iter::once(&renewal.identity)
+            .chain(signers.iter().copied())
+            .map(|identity| identity.certificate_pem.clone())
+            .collect();
+        let signers = signers.len();
+        let Pending { identity, .. } = renewal;
+        Ok(StartIdentity {
             identity,
             handover,
-            set_aside,
-        };
-        match (pending, current) {
-            (Some(pending), current) if renew => {
-                if expired(&pending.identity) {
-                    return Err("native_tls_identity_expired".into());
-                }
-                let handover = current
-                    .as_ref()
-                    .map(|current| current.hand_over(&pending.identity, pending.operation_id))
-                    .transpose()?;
-                let Pending { identity, .. } = pending;
-                Ok(start(identity, handover, false, current.as_ref()))
-            }
-            // Not renewing now: the identity Manager is known to have accepted, if it still can
-            // be used. The waiting one is kept until this start has succeeded.
-            (Some(pending), Some(current)) => {
-                if expired(&current) {
-                    return Err("native_tls_identity_expired".into());
-                }
-                Ok(start(current, None, true, Some(&pending.identity)))
-            }
-            (Some(_), None) => Err("native_tls_identity_invalid".into()),
-            (None, Some(current)) => {
-                let due = current
-                    .expires_at
-                    .checked_sub(now)
-                    .is_none_or(|left| left <= EXPIRY_NOTICE_DAYS * DAY);
-                if renew && due {
-                    let pending = Pending {
-                        schema_version: 1,
-                        operation_id: uuid::Uuid::new_v4(),
-                        identity: Self::mint(installation_id, origin, host)?,
-                    };
-                    let handover = current.hand_over(&pending.identity, pending.operation_id)?;
-                    // Durable before Manager is shown it: the key must outlive a crash.
-                    vault.save(&next, &pending)?;
-                    let Pending { identity, .. } = pending;
-                    return Ok(start(identity, Some(handover), false, Some(&current)));
-                }
-                if expired(&current) {
-                    return Err("native_tls_identity_expired".into());
-                }
-                Ok(start(current, None, false, None))
-            }
-            (None, None) => {
-                let identity = Self::mint(installation_id, origin, host)?;
-                vault.save(&account, &identity)?;
-                Ok(start(identity, None, false, None))
-            }
-        }
+            set_aside: false,
+            signers,
+            certificates,
+        })
     }
     /// Sign the handover from this identity to `next` with this identity's key.
     fn hand_over(&self, next: &Self, operation_id: uuid::Uuid) -> Result<Handover, String> {
@@ -405,11 +474,12 @@ impl TlsIdentity {
             .map_err(|_| "credential_store_unavailable")?;
         vault.delete(&next)
     }
-    fn mint(installation_id: &str, origin: &str, host: String) -> Result<Self, String> {
+    fn mint(installation_id: &str, origin: &str, host: String, now: i64) -> Result<Self, String> {
         let key = KeyPair::generate().map_err(|_| "native_tls_generation_failed")?;
         let mut params =
             CertificateParams::new(vec![host]).map_err(|_| "native_tls_generation_failed")?;
-        let now = OffsetDateTime::now_utc();
+        let now = OffsetDateTime::from_unix_timestamp(now)
+            .map_err(|_| "native_tls_generation_failed")?;
         params.not_before = now - Duration::minutes(5);
         params.not_after = now + Duration::days(365);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -574,7 +644,10 @@ mod tests {
         "a".repeat(64)
     }
     fn start(vault: &Memory, renew: bool, now: i64) -> Result<StartIdentity, String> {
-        TlsIdentity::for_start_in(vault, ID, ORIGIN, &binding(), renew, now)
+        TlsIdentity::for_start_in(vault, ID, ORIGIN, &binding(), renew, 0, now)
+    }
+    fn start_signed_by(vault: &Memory, signer: usize, now: i64) -> Result<StartIdentity, String> {
+        TlsIdentity::for_start_in(vault, ID, ORIGIN, &binding(), true, signer, now)
     }
     /// Verify a handover exactly as Manager does: the replaced certificate's key over the text.
     fn handed_over(handover: &Handover, previous: &TlsIdentity, next: &TlsIdentity) -> bool {
@@ -799,13 +872,136 @@ mod tests {
             "native_tls_identity_expired"
         );
     }
+    /// Every state of the saved identity (C) and a waiting renewal (P) against what Manager
+    /// may hold. Manager holding X starts with X, or with anything handed over by X's key.
+    #[test]
+    fn every_identity_state_leaves_a_start_manager_accepts_whichever_identity_it_holds() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        // What a Manager holding `held` does with each attempt of one start; true if any works.
+        let startable = |vault: &Memory, held: &TlsIdentity, at: i64| -> bool {
+            let first = start_signed_by(vault, 0, at).unwrap();
+            (0..first.signers.max(1)).any(|signer| {
+                let attempt = start_signed_by(vault, signer, at).unwrap();
+                attempt.identity.expires_at > at
+                    && (attempt.identity.certificate_pem == held.certificate_pem
+                        || attempt.handover.as_ref().is_some_and(|handover| {
+                            handed_over(handover, held, &attempt.identity)
+                        }))
+            })
+        };
+        let saved = |vault: &Memory| -> TlsIdentity {
+            vault.load(&format!("native-manager-tls-{}", binding())).unwrap().unwrap()
+        };
+        let waiting = |vault: &Memory| -> Option<Pending> {
+            vault.load(&format!("native-manager-tls-next-{}", binding())).unwrap()
+        };
+        // C valid or expired, no P: Manager can only hold C.
+        for at in [now + 10 * DAY, now + 340 * DAY, now + 400 * DAY] {
+            let vault = Memory::default();
+            start(&vault, true, now).unwrap();
+            let c = saved(&vault);
+            assert!(startable(&vault, &c, at), "C only, at {at}");
+        }
+        // P waiting: (when P was made, when the start happens). C runs out at 365 days and a
+        // P made at day 340 at day 705, so these cover C valid or expired with P valid or
+        // expired; in each, Manager may hold C (it never saw P) or P (it accepted it).
+        for (made, at) in [
+            (340, 341), // C valid, P valid
+            (340, 400), // C expired, P valid
+            (340, 720), // C expired, P expired
+            (336, 720), // the same, a little earlier
+        ] {
+            for holds_pending in [false, true] {
+                let vault = Memory::default();
+                start(&vault, true, now).unwrap();
+                let c = saved(&vault);
+                let p = start(&vault, true, now + made * DAY).unwrap().identity;
+                let held = if holds_pending { &p } else { &c };
+                assert!(
+                    startable(&vault, held, now + at * DAY),
+                    "made {made}, start {at}, Manager holds the pending one: {holds_pending}"
+                );
+                // Nothing Manager might hold was discarded by asking.
+                let kept = waiting(&vault).unwrap();
+                let keys: Vec<String> = std::iter::once(&kept.identity)
+                    .chain(&kept.earlier)
+                    .map(|identity| identity.certificate_pem.clone())
+                    .chain([saved(&vault).certificate_pem.clone()])
+                    .collect();
+                assert!(keys.contains(&c.certificate_pem) && keys.contains(&p.certificate_pem));
+            }
+        }
+        // C valid with an expired P cannot arise from the clock alone (P always outlives C),
+        // but a saved record can say so: the same recovery applies.
+        for holds_pending in [false, true] {
+            let vault = Memory::default();
+            start(&vault, true, now).unwrap();
+            let c = saved(&vault);
+            let p = TlsIdentity::mint(ID, ORIGIN, "127.0.0.1".into(), now - 400 * DAY).unwrap();
+            vault
+                .save(
+                    &format!("native-manager-tls-next-{}", binding()),
+                    &Pending {
+                        schema_version: 1,
+                        operation_id: uuid::Uuid::new_v4(),
+                        identity: serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap(),
+                        earlier: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let held = if holds_pending { &p } else { &c };
+            assert!(startable(&vault, held, now + DAY), "C valid, P expired");
+            // And the start that does not renew still presents C.
+            assert_eq!(
+                start(&vault, false, now + DAY).unwrap().identity.certificate_pem,
+                c.certificate_pem
+            );
+        }
+    }
+    #[test]
+    fn a_renewal_that_ran_out_while_waiting_is_replaced_without_losing_its_key() {
+        let vault = Memory::default();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let c = start(&vault, true, now).unwrap().identity;
+        let p = start(&vault, true, now + 340 * DAY).unwrap().identity;
+        // Two years offline: both have run out. The start is not refused.
+        let recovered = start_signed_by(&vault, 0, now + 720 * DAY).unwrap();
+        assert_eq!(recovered.signers, 2);
+        assert!(recovered.identity.expires_at > now + 720 * DAY);
+        assert!(handed_over(recovered.handover.as_ref().unwrap(), &c, &recovered.identity));
+        // The second attempt of the same start hands over from the renewal that ran out.
+        let second = start_signed_by(&vault, 1, now + 720 * DAY).unwrap();
+        assert_eq!(second.identity.certificate_pem, recovered.identity.certificate_pem);
+        assert!(handed_over(second.handover.as_ref().unwrap(), &p, &second.identity));
+        assert_eq!(
+            second.certificates,
+            [
+                second.identity.certificate_pem.clone(),
+                c.certificate_pem.clone(),
+                p.certificate_pem.clone()
+            ]
+        );
+        assert!(start_signed_by(&vault, 2, now + 720 * DAY).is_err());
+        // Once Manager is seen with the new identity, it is the identity and the rest goes.
+        TlsIdentity::promote_in(&vault, &binding()).unwrap();
+        let settled = start(&vault, true, now + 721 * DAY).unwrap();
+        assert_eq!(settled.identity.certificate_pem, recovered.identity.certificate_pem);
+        assert!(settled.handover.is_none() && settled.signers == 0);
+        // An older Manager is still never renewed, and says the identity has expired.
+        let vault = Memory::default();
+        start(&vault, false, now).unwrap();
+        assert_eq!(
+            start(&vault, false, now + 720 * DAY).err().unwrap(),
+            "native_tls_identity_expired"
+        );
+    }
     #[test]
     fn a_saved_identity_follows_managers_port_and_nothing_else() {
         let vault = Memory::default();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let first = start(&vault, false, now).unwrap();
         let moved =
-            TlsIdentity::for_start_in(&vault, ID, "https://127.0.0.1:9444", &binding(), false, now)
+            TlsIdentity::for_start_in(&vault, ID, "https://127.0.0.1:9444", &binding(), false, 0, now)
                 .unwrap();
         assert_eq!(
             moved.identity.certificate_pem,
@@ -817,14 +1013,14 @@ mod tests {
             ("bbbbbbbbbbbb", "https://127.0.0.1:9444"),
         ] {
             assert_eq!(
-                TlsIdentity::for_start_in(&vault, id, origin, &binding(), false, now)
+                TlsIdentity::for_start_in(&vault, id, origin, &binding(), false, 0, now)
                     .err()
                     .unwrap(),
                 "native_tls_identity_changed"
             );
         }
         for origin in ["http://127.0.0.1:9444", "https://127.0.0.1:9444/"] {
-            assert!(TlsIdentity::for_start_in(&vault, ID, origin, &binding(), true, now).is_err());
+            assert!(TlsIdentity::for_start_in(&vault, ID, origin, &binding(), true, 0, now).is_err());
         }
     }
     #[test]

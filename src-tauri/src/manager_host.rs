@@ -166,11 +166,12 @@ impl Configuration {
 pub(crate) struct LocalStart<'a> {
     /// What the package's Manager declares.
     pub features: crate::manager_local::Features,
-    /// Whether this attempt may present a renewed TLS identity.
-    pub renew_identity: bool,
-    /// Set as soon as this attempt presents a renewed identity, so a failure can be retried
-    /// with the identity it would have replaced.
-    pub renewing: &'a AtomicBool,
+    /// Whether this attempt may present a renewed TLS identity, and which of the identities
+    /// Manager may hold signs its handover.
+    pub renew_identity: Option<usize>,
+    /// Set as soon as this attempt presents a renewed identity, to how many identities could
+    /// sign its handover: a failure is retried with the next, then with the earlier identity.
+    pub signers: &'a std::sync::atomic::AtomicUsize,
 }
 /// Manager accepts a changed package once, from the descriptor it last ran with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,8 +709,8 @@ pub struct NativeManager {
     certificate_expires_at: Option<i64>,
     /// What to settle in the keystore once this Manager is verified ready.
     identity: IdentityChange,
-    /// The certificate a renewal replaces, which this computer's saved grant may still pin.
-    replaced_certificate: Option<String>,
+    /// The certificates a renewal replaces, one of which this computer's grant may still pin.
+    replaced_certificates: Vec<String>,
     _code_lease: Option<crate::package_lease::CodeLease>,
     _profile_pins: Vec<fs::File>,
 }
@@ -754,15 +755,17 @@ impl Programs<'_> {
             identity: tls,
             handover,
             set_aside,
+            signers,
             certificates,
         } = TlsIdentity::for_start(
             &config.installation_id,
             &config.origin,
             profile.binding(),
-            start.features.tls_rotation && start.renew_identity,
+            start.features.tls_rotation && start.renew_identity.is_some(),
+            start.renew_identity.unwrap_or(0),
         )?;
         if handover.is_some() {
-            start.renewing.store(true, Ordering::Release);
+            start.signers.store(signers, Ordering::Release);
         }
         profile.require_current(config)?;
         let mut lease = crate::host_state::Owner::acquire(&config.state, true)?;
@@ -819,9 +822,9 @@ impl Programs<'_> {
                 } else {
                     IdentityChange::None
                 };
-                // The other certificate of a renewal in progress, in either direction: the
-                // one being replaced, or the waiting one a rolled-back start set aside.
-                manager.replaced_certificate = certificates.get(1).cloned();
+                // The other certificates of a renewal in progress, in either direction: those
+                // being replaced, or the waiting ones a rolled-back start set aside.
+                manager.replaced_certificates = certificates.iter().skip(1).cloned().collect();
                 manager
             });
         #[cfg(unix)]
@@ -1016,7 +1019,7 @@ impl NativeManager {
             certificate_pem: String::new(),
             certificate_expires_at: None,
             identity: IdentityChange::None,
-            replaced_certificate: None,
+            replaced_certificates: Vec::new(),
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
         };
@@ -1308,12 +1311,14 @@ impl NativeManager {
             IdentityChange::SetAside(binding) => TlsIdentity::discard_pending(&binding),
         }
     }
-    /// The certificate a renewal presented by this Manager replaces, which this computer's
-    /// grant may still pin. Only once this Manager is verified ready with the new one.
-    pub(crate) fn replaced_certificate(&self) -> Option<&str> {
-        self.replaced_certificate
-            .as_deref()
-            .filter(|_| self.verified_ready)
+    /// The certificates a renewal presented by this Manager replaces, one of which this
+    /// computer's grant may still pin. Only once this Manager is verified ready.
+    pub(crate) fn replaced_certificates(&self) -> &[String] {
+        if self.verified_ready {
+            &self.replaced_certificates
+        } else {
+            &[]
+        }
     }
     pub(crate) fn certificate(&self) -> &str {
         &self.certificate_pem

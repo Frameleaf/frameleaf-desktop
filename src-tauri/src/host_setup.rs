@@ -505,11 +505,11 @@ impl HostSetup {
         }
         self.set("starting", None, Some(installation.clone()));
         let result = started_with_renewal(
-            |renew, renewing| {
+            |renew, signers| {
                 let (installation, cancel) = (installation.clone(), self.cancel.clone());
                 async move {
                     let mut running = tauri::async_runtime::spawn_blocking(move || {
-                        launch(&installation, &cancel, renew, &renewing)
+                        launch(&installation, &cancel, renew, &signers)
                     })
                     .await
                     .map_err(|_| "native_host_setup_failed".to_string())
@@ -832,57 +832,91 @@ where
     }
 }
 /// Start local management, renewing Manager's TLS identity when that is due. `attempt` is
-/// given whether it may renew, and a flag it sets once it presents a renewed identity. If
-/// such an attempt fails, one more is made with the identity the renewal would have replaced:
-/// a Manager that had already accepted the new one takes the old one back during its grace
-/// period, so the library starts either way. If that also fails, the first failure is the
-/// one reported, and the renewed identity stays saved for the next start.
+/// given which handover signer to use (None: do not renew), and a counter it sets, once it
+/// presents a renewed identity, to how many identities could sign the handover.
+///
+/// Which identity Manager holds is not always known (the saved one, or a renewal it accepted
+/// before this app last stopped), so a failed attempt is repeated with each further signer.
+/// After those, one more is made with the identity the renewal would have replaced: a Manager
+/// that had already accepted the new one takes the old one back during its grace period. If
+/// every attempt fails, the first failure is reported and everything stays saved for the next
+/// start: no key is discarded on a failure.
 async fn started_with_renewal<T, F>(
-    attempt: impl Fn(bool, Arc<AtomicBool>) -> F,
+    attempt: impl Fn(Option<usize>, Arc<std::sync::atomic::AtomicUsize>) -> F,
     cancel: &AtomicBool,
 ) -> Result<T, String>
 where
     F: std::future::Future<Output = Result<T, String>>,
 {
-    let renewing = Arc::new(AtomicBool::new(false));
-    match attempt(true, renewing.clone()).await {
-        Err(error) if renewing.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) => {
-            attempt(false, Arc::new(AtomicBool::new(false)))
-                .await
-                .map_err(|_| error)
-        }
-        result => result,
+    use std::sync::atomic::AtomicUsize;
+    let signers = Arc::new(AtomicUsize::new(0));
+    let first = match attempt(Some(0), signers.clone()).await {
+        Ok(started) => return Ok(started),
+        Err(error) => error,
+    };
+    let signers = signers.load(Ordering::Acquire);
+    if signers == 0 {
+        return Err(first);
     }
+    for next in (1..signers).map(Some).chain([None]) {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        if let Ok(started) = attempt(next, Arc::new(AtomicUsize::new(0))).await {
+            return Ok(started);
+        }
+    }
+    Err(first)
 }
 /// After Manager is verified ready: let this computer's saved grant follow it to a moved port
-/// or a renewed certificate, then settle its TLS identity in the keystore. Each step is
-/// retried by the next start if it fails here, so a failure never stops a running library.
+/// or a renewed certificate, then settle its TLS identity in the keystore. A failure never
+/// stops a running library; the next start does both again.
 fn settle_identity(running: &mut Running) {
-    if running.features.ports || running.features.tls_rotation {
-        // The grant first: if this app stops between the two, the next start presents the
-        // renewed identity again and finds the grant already pinned to it.
-        let replaced = running.manager.replaced_certificate().map(str::to_owned);
-        let _ = follow_grant(running, replaced.as_deref());
-    }
-    let _ = running.manager.settle_identity();
-}
-fn follow_grant(running: &Running, replaced: Option<&str>) -> Result<(), String> {
-    {
-        let Some(mut saved) =
-            crate::credentials::load::<crate::manager::SavedManager>(crate::manager::CREDENTIAL)?
-        else {
-            return Ok(());
-        };
-        if saved.follow_local(
-            &running.configuration.installation_id,
-            &running.configuration.origin,
+    let followed = if running.features.ports || running.features.tls_rotation {
+        let replaced = running.manager.replaced_certificates().to_vec();
+        follow_grant(
+            &running.configuration,
             running.manager.certificate(),
-            replaced,
-        ) {
-            crate::credentials::save(crate::manager::CREDENTIAL, &saved)?;
-        }
+            &replaced,
+            || crate::credentials::load(crate::manager::CREDENTIAL),
+            |saved| crate::credentials::save(crate::manager::CREDENTIAL, saved),
+        )
+    } else {
         Ok(())
+    };
+    settle_after(followed, || running.manager.settle_identity());
+}
+/// The grant first, and the identity only once the grant is known to be in step. Settling
+/// drops the record of which certificates were replaced; if the grant could not be read or
+/// saved, that record is the only way the next start can still re-pin it.
+fn settle_after(followed: Result<(), String>, settle: impl FnOnce() -> Result<(), String>) {
+    if followed.is_ok() {
+        let _ = settle();
     }
+}
+fn follow_grant(
+    configuration: &Configuration,
+    certificate: &str,
+    replaced: &[String],
+    load: impl FnOnce() -> Result<Option<crate::manager::SavedManager>, String>,
+    save: impl FnOnce(&crate::manager::SavedManager) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(mut saved) = load()? else {
+        return Ok(());
+    };
+    // With no renewal in progress there is no replaced certificate; the port may still move.
+    let candidates = replaced.iter().map(|pem| Some(pem.as_str())).chain([None]);
+    for candidate in candidates {
+        if saved.follow_local(
+            &configuration.installation_id,
+            &configuration.origin,
+            certificate,
+            candidate,
+        ) {
+            return save(&saved);
+        }
+    }
+    Ok(())
 }
 /// For a Manager that declares `runtime-status`: Manager says, over the pinned channel and
 /// bound to this request, what its own controller is doing, and Photos opens only while that
@@ -1482,12 +1516,12 @@ pub(crate) fn library_package(records: &[Installation]) -> Option<String> {
 fn launch(
     record: &Installation,
     cancel: &AtomicBool,
-    renew_identity: bool,
-    renewing: &AtomicBool,
+    renew_identity: Option<usize>,
+    signers: &std::sync::atomic::AtomicUsize,
 ) -> Result<Running, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
-        let _ = (record, cancel, renew_identity, renewing);
+        let _ = (record, cancel, renew_identity, signers);
         Err("host_install_platform_unsupported".into())
     }
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -1556,7 +1590,7 @@ fn launch(
             &crate::manager_host::LocalStart {
                 features,
                 renew_identity,
-                renewing,
+                signers,
             },
         )?;
         Ok(Running {
@@ -1657,72 +1691,170 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_renewal_is_retried_once_with_the_identity_it_would_have_replaced() {
+    fn a_failed_renewal_is_retried_with_each_signer_and_then_the_identity_it_would_replace() {
         use std::cell::RefCell;
-        let cancel = AtomicBool::new(false);
-        // What each attempt did: (may renew, presented a renewed identity, outcome).
-        let run =
-            |renews: bool, outcomes: Vec<Result<&'static str, String>>, cancel: &AtomicBool| {
-                let attempts = RefCell::new(Vec::new());
-                let outcomes = RefCell::new(outcomes.into_iter());
-                let result = tauri::async_runtime::block_on(started_with_renewal(
-                    |renew, renewing| {
-                        attempts.borrow_mut().push(renew);
-                        if renew && renews {
-                            renewing.store(true, Ordering::Release);
-                        }
-                        let outcome = outcomes.borrow_mut().next().expect("no further attempt");
-                        async move { outcome }
-                    },
-                    cancel,
-                ));
-                (result, attempts.into_inner())
-            };
+        // `signers`: how many identities could sign the handover; 0 when nothing is renewed.
+        let run = |signers: usize, outcomes: Vec<Result<&'static str, String>>, cancelled: bool| {
+            let cancel = AtomicBool::new(false);
+            let attempts = RefCell::new(Vec::new());
+            let outcomes = RefCell::new(outcomes.into_iter());
+            let result = tauri::async_runtime::block_on(started_with_renewal(
+                |renew, reported| {
+                    attempts.borrow_mut().push(renew);
+                    if renew.is_some() {
+                        reported.store(signers, Ordering::Release);
+                    }
+                    cancel.store(cancelled, Ordering::Release);
+                    let outcome = outcomes.borrow_mut().next().expect("no further attempt");
+                    async move { outcome }
+                },
+                &cancel,
+            ));
+            (result, attempts.into_inner())
+        };
+        let failed = |code: &str| Err::<&'static str, String>(code.to_string());
         // Nothing to renew: one attempt, whatever it returns.
+        assert_eq!(run(0, vec![Ok("started")], false), (Ok("started"), vec![Some(0)]));
         assert_eq!(
-            run(false, vec![Ok("started")], &cancel),
-            (Ok("started"), vec![true])
-        );
-        assert_eq!(
-            run(false, vec![Err("local_port_in_use_2283".into())], &cancel),
-            (Err("local_port_in_use_2283".into()), vec![true])
+            run(0, vec![failed("local_port_in_use_2283")], false),
+            (failed("local_port_in_use_2283"), vec![Some(0)])
         );
         // A renewal that succeeds needs no second attempt.
-        assert_eq!(
-            run(true, vec![Ok("renewed")], &cancel),
-            (Ok("renewed"), vec![true])
-        );
+        assert_eq!(run(1, vec![Ok("renewed")], false), (Ok("renewed"), vec![Some(0)]));
         // A renewal that fails: the earlier identity is tried, without renewing.
         assert_eq!(
-            run(
-                true,
-                vec![Err("native_manager_exited".into()), Ok("rolled back")],
-                &cancel
-            ),
-            (Ok("rolled back"), vec![true, false])
+            run(1, vec![failed("native_manager_exited"), Ok("rolled back")], false),
+            (Ok("rolled back"), vec![Some(0), None])
         );
-        // If that fails too, the first failure is the one that is reported.
+        // Manager may hold either of two identities: the second signer is tried before that.
+        assert_eq!(
+            run(2, vec![failed("native_manager_exited"), Ok("renewed")], false),
+            (Ok("renewed"), vec![Some(0), Some(1)])
+        );
         assert_eq!(
             run(
-                true,
-                vec![
-                    Err("native_manager_exited".into()),
-                    Err("native_tls_identity_expired".into())
-                ],
-                &cancel
+                2,
+                vec![failed("native_manager_exited"), failed("other"), Ok("rolled back")],
+                false
             ),
-            (Err("native_manager_exited".into()), vec![true, false])
+            (Ok("rolled back"), vec![Some(0), Some(1), None])
+        );
+        // If everything fails, the first failure is the one that is reported.
+        assert_eq!(
+            run(
+                2,
+                vec![
+                    failed("native_manager_exited"),
+                    failed("native_manager_start_timeout"),
+                    failed("native_tls_identity_expired")
+                ],
+                false
+            ),
+            (failed("native_manager_exited"), vec![Some(0), Some(1), None])
         );
         // A start the person cancelled is not started again.
-        cancel.store(true, Ordering::Release);
         assert_eq!(
-            run(
-                true,
-                vec![Err("native_manager_start_cancelled".into())],
-                &cancel
-            ),
-            (Err("native_manager_start_cancelled".into()), vec![true])
+            run(2, vec![failed("native_manager_start_cancelled")], true),
+            (failed("native_manager_start_cancelled"), vec![Some(0)])
         );
+    }
+
+    #[test]
+    fn the_identity_is_settled_only_after_the_grant_is_known_to_be_in_step() {
+        use crate::manager::SavedManager;
+        use std::cell::Cell;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+        let old = fixture["certificatePem"].as_str().unwrap().to_owned();
+        let mint = || {
+            crate::manager_tls::TlsIdentity::load_or_create(
+                "aaaaaaaaaaaa",
+                "https://127.0.0.1:9443",
+                || Ok(None),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .certificate()
+            .to_owned()
+        };
+        let (renewed, lapsed) = (mint(), mint());
+        let grant = |certificate: &str| -> SavedManager {
+            serde_json::from_value(serde_json::json!({
+                "origin":"https://127.0.0.1:9443","managerId":"22222222-2222-4222-8222-222222222222",
+                "deviceId":"11111111-1111-4111-8111-111111111111","installationId":"aaaaaaaaaaaa",
+                "publicKey":"6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+                "id":"33333333-3333-4333-8333-333333333333","token":"b".repeat(64),
+                "scopes":["status"],"expiresAt":1702592000000u64,"recentUntil":1700000300000u64,
+                "certificatePem":certificate
+            }))
+            .unwrap()
+        };
+        let configuration = Configuration {
+            installation_id: "aaaaaaaaaaaa".into(),
+            name: "My Frameleaf library".into(),
+            release: "frameleaf-v1.2.3-native.aaaaaaaaaaaa-1".into(),
+            controller: "/bin/echo".into(),
+            state: "/nonexistent/state".into(),
+            data: "/nonexistent/data".into(),
+            origin: "https://127.0.0.1:9443".into(),
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let settled = |followed: Result<(), String>| {
+            let done = Cell::new(false);
+            settle_after(followed, || {
+                done.set(true);
+                Ok(())
+            });
+            done.get()
+        };
+        let fingerprint = |pem: &str| crate::manager::certificate_fingerprint(pem).ok();
+        // The grant pinned the replaced certificate, whichever of the replaced ones that is.
+        for replaced in [vec![old.clone()], vec![lapsed.clone(), old.clone()]] {
+            let saved = Cell::new(None);
+            let followed = follow_grant(
+                &configuration,
+                &renewed,
+                &replaced,
+                || Ok(Some(grant(&old))),
+                |grant| {
+                    saved.set(grant.view().certificate_sha256);
+                    Ok(())
+                },
+            );
+            assert_eq!(followed, Ok(()));
+            assert_eq!(saved.take(), fingerprint(&renewed));
+            assert!(settled(followed));
+        }
+        // No grant, or one already in step: nothing to save, and the identity is settled.
+        let unsaved = |_: &SavedManager| -> Result<(), String> { panic!("nothing to save") };
+        assert!(settled(follow_grant(&configuration, &renewed, &[old.clone()], || Ok(None), unsaved)));
+        assert!(settled(follow_grant(
+            &configuration,
+            &renewed,
+            &[old.clone()],
+            || Ok(Some(grant(&renewed))),
+            unsaved
+        )));
+        // The grant could not be read, or could not be saved: Manager keeps running, and the
+        // identity is not settled, so the next start still knows what was replaced.
+        let unread = follow_grant(
+            &configuration,
+            &renewed,
+            &[old.clone()],
+            || Err("credential_store_unavailable".into()),
+            unsaved,
+        );
+        assert_eq!(unread, Err("credential_store_unavailable".into()));
+        assert!(!settled(unread));
+        let unwritten = follow_grant(
+            &configuration,
+            &renewed,
+            &[old.clone()],
+            || Ok(Some(grant(&old))),
+            |_| Err("credential_store_unavailable".into()),
+        );
+        assert!(!settled(unwritten));
     }
 
     /// Deny replacement of the executable and of its path while either Desktop launch is possible.

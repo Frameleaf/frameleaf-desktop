@@ -96,7 +96,7 @@ impl Record {
     fn valid(&self) -> bool {
         self.schema_version == 1
             && self.ports.valid()
-            && self.certificates.len() <= 4
+            && self.certificates.len() <= 64
             && self
                 .certificates
                 .iter()
@@ -177,10 +177,13 @@ pub(crate) fn save(data: &Path, record: &Record) -> Result<(), String> {
     directory
         .rename(TEMPORARY, &directory, RECORD)
         .map_err(failed)?;
+    // A directory handle cannot be flushed on Windows; the profile's own marker does the same.
+    #[cfg(unix)]
     crate::host_storage::directory(data)
         .map_err(|_| "local_manager_record_unavailable".to_string())?
         .sync_all()
-        .map_err(failed)
+        .map_err(failed)?;
+    Ok(())
 }
 
 /// Whose TLS listener answers on a port. Only positive evidence names it: `Ours` is a
@@ -718,7 +721,7 @@ mod tests {
                 vec![],
             ),
             Record::new(Ports::default(), vec!["not a fingerprint".into()]),
-            Record::new(Ports::default(), vec!["a".repeat(64); 5]),
+            Record::new(Ports::default(), vec!["a".repeat(64); 65]),
         ] {
             assert_eq!(
                 save(&root, &invalid).unwrap_err(),
