@@ -141,7 +141,9 @@ pub(crate) struct Failures {
     path: PathBuf,
     runtime: String,
     codes: BTreeMap<String, String>,
-    faster: BTreeSet<String>,
+    /// Workload -> the model keys of the accelerated group that measured faster. The result is
+    /// about those models: another model offered for the same workload is measured itself.
+    faster: BTreeMap<String, BTreeSet<String>>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -149,8 +151,15 @@ struct Remembered {
     schema_version: u32,
     runtime: String,
     failures: BTreeMap<String, String>,
-    #[serde(default)]
+    /// Results saved before they named their models: read so the record still loads, never
+    /// trusted and never written again (the workload is measured again).
+    #[serde(default, skip_serializing)]
     faster: BTreeSet<String>,
+    #[serde(default)]
+    measured: BTreeMap<String, BTreeSet<String>>,
+}
+fn model_key_shaped(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|b| b.is_ascii_graphic())
 }
 fn code_shaped(value: &str) -> bool {
     !value.is_empty()
@@ -176,8 +185,14 @@ impl Failures {
                         .faster
                         .iter()
                         .all(|workload| WORKLOADS.contains(&workload.as_str()))
+                    && saved.measured.iter().all(|(workload, keys)| {
+                        WORKLOADS.contains(&workload.as_str())
+                            && !keys.is_empty()
+                            && keys.len() <= 64
+                            && keys.iter().all(|key| model_key_shaped(key))
+                    })
             })
-            .map(|saved| (saved.failures, saved.faster))
+            .map(|saved| (saved.failures, saved.measured))
             .unwrap_or_default();
         Self {
             path: path.into(),
@@ -189,9 +204,12 @@ impl Failures {
     pub(crate) fn get(&self, workload: &str) -> Option<&str> {
         self.codes.get(workload).map(String::as_str)
     }
-    /// Measured faster than the processor with this runtime. A remembered failure wins.
-    pub(crate) fn is_faster(&self, workload: &str) -> bool {
-        self.faster.contains(workload) && !self.codes.contains_key(workload)
+    /// These models measured faster than the processor with this runtime. A remembered failure
+    /// wins, and a result for other models of the same workload says nothing about these.
+    pub(crate) fn is_faster(&self, workload: &str, keys: &BTreeSet<String>) -> bool {
+        !keys.is_empty()
+            && self.faster.get(workload) == Some(keys)
+            && !self.codes.contains_key(workload)
     }
     fn hold(&mut self, workload: &str, code: &str) {
         if WORKLOADS.contains(&workload) && code_shaped(code) {
@@ -199,9 +217,14 @@ impl Failures {
             self.faster.remove(workload);
         }
     }
-    fn hold_faster(&mut self, workload: &str) {
-        if WORKLOADS.contains(&workload) && !self.codes.contains_key(workload) {
-            self.faster.insert(workload.into());
+    fn hold_faster(&mut self, workload: &str, keys: BTreeSet<String>) {
+        if WORKLOADS.contains(&workload)
+            && !self.codes.contains_key(workload)
+            && !keys.is_empty()
+            && keys.len() <= 64
+            && keys.iter().all(|key| model_key_shaped(key))
+        {
+            self.faster.insert(workload.into(), keys);
         }
     }
     /// Best effort: the failure already holds for this run.
@@ -210,7 +233,8 @@ impl Failures {
             schema_version: 1,
             runtime: self.runtime.clone(),
             failures: self.codes.clone(),
-            faster: self.faster.clone(),
+            faster: BTreeSet::new(),
+            measured: self.faster.clone(),
         };
         let Ok(raw) = serde_json::to_vec(&saved) else {
             return;
@@ -340,7 +364,15 @@ impl Plan {
             && !self
                 .failures
                 .as_ref()
-                .is_some_and(|failures| failures.is_faster(workload))
+                .is_some_and(|failures| failures.is_faster(workload, &self.accelerated_keys(workload)))
+    }
+    /// The model keys of the accelerated group offered for a workload: what a measurement is of.
+    fn accelerated_keys(&self, workload: &str) -> BTreeSet<String> {
+        self.accelerated_group(workload)
+            .into_iter()
+            .flatten()
+            .map(|profile| profile.model_key().to_owned())
+            .collect()
     }
     /// The processor profiles of a workload, the twins of its accelerated ones.
     pub(crate) fn cpu_group(&self, workload: &str) -> Option<&Vec<ApprovedProfile>> {
@@ -361,8 +393,9 @@ impl Plan {
         }
         match measured_faster(accelerated_ms, cpu_ms) {
             Some(true) => {
+                let keys = self.accelerated_keys(workload);
                 if let Some(failures) = &mut self.failures {
-                    failures.hold_faster(workload);
+                    failures.hold_faster(workload, keys);
                     failures.save();
                 }
                 false
@@ -896,13 +929,59 @@ mod tests {
         .unwrap();
         let loaded = Failures::load(&path, &manifest);
         assert_eq!(loaded.get("face"), Some("provider_failed"));
-        assert!(!loaded.is_faster("face") && !loaded.is_faster("clip"));
+        let any: BTreeSet<String> = ["face:key".to_owned()].into();
+        assert!(!loaded.is_faster("face", &any) && !loaded.is_faster("clip", &any));
         std::fs::write(
             &path,
             format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{}},"faster":["clip","video"]}}"#),
         )
         .unwrap();
-        assert!(!Failures::load(&path, &manifest).is_faster("clip"));
+        assert!(!Failures::load(&path, &manifest).is_faster("clip", &any));
+        // A result saved before results named their models still loads (its failures hold) but
+        // is not trusted: the workload is measured again.
+        std::fs::write(
+            &path,
+            format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{"ocr":"provider_slower"}},"faster":["face"]}}"#),
+        )
+        .unwrap();
+        let old = Failures::load(&path, &manifest);
+        assert_eq!(old.get("ocr"), Some("provider_slower"));
+        assert!(!old.is_faster("face", &any));
+        let mut reopened = plan(&legacy, &manifest);
+        assert!(reopened.unmeasured("face"));
+
+        // The result is about the models that were measured. The server then offers another
+        // face model with the same runtime: it is measured itself, not waved through.
+        assert!(!reopened.measured("face", Some(20.0), Some(28.0)));
+        assert!(!reopened.unmeasured("face"));
+        let other_model = |root: &Path| {
+            Plan::new(
+                vec![group("buffalo_l", CPU)],
+                Some(Offer {
+                    provider: COREML.into(),
+                    manifest_sha256: manifest.clone(),
+                    groups: vec![group("buffalo_l", COREML)],
+                }),
+                None,
+                &root.join("provider-failures.json"),
+            )
+        };
+        let mut switched = other_model(&legacy);
+        assert_eq!(chosen(&switched), [row("face", COREML, None)]);
+        assert!(switched.unmeasured("face"));
+        // Slower with this model: the processor, whatever the other model measured.
+        assert!(switched.measured("face", Some(300.0), Some(200.0)));
+        assert_eq!(
+            chosen(&other_model(&legacy)),
+            [row("face", CPU, Some("provider_slower"))]
+        );
+        // And measured faster with this model, the result does not carry back to the first.
+        let fourth = directory();
+        let mut second = other_model(&fourth);
+        assert!(!second.measured("face", Some(30.0), Some(260.0)));
+        assert!(!other_model(&fourth).unmeasured("face"));
+        assert!(plan(&fourth, &manifest).unmeasured("face"));
+        std::fs::remove_dir_all(fourth).unwrap();
         for directory in [root, other, third, legacy] {
             std::fs::remove_dir_all(directory).unwrap();
         }
