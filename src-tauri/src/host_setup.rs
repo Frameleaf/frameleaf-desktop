@@ -32,6 +32,8 @@ pub(crate) struct View {
     profile_setup_available: bool,
     profile_requires_authorization: bool,
     companion_platform: Option<&'static str>,
+    /// While a library is being carried to another package: export, restore, verify or switch.
+    carry_step: Option<&'static str>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -89,6 +91,7 @@ impl Default for View {
                 ("linux", "x86_64") => Some("linux"),
                 _ => None,
             },
+            carry_step: None,
         }
     }
 }
@@ -192,6 +195,8 @@ pub(crate) struct HostSetup {
     certificate_renewable: AtomicBool,
     /// Manager's origin for this library when it is not the default.
     origin: Mutex<Option<String>>,
+    /// The step of a carry-forward in flight, for display.
+    carry_step: Arc<Mutex<Option<&'static str>>>,
     view: Mutex<View>,
 }
 impl HostSetup {
@@ -229,6 +234,12 @@ impl HostSetup {
     /// the evidence that must be `Clear` for it. Evidence that is missing, unreadable or
     /// could be racing is `Unknown`, and `Unknown` blocks exactly as `Running` does.
     /// - An operation of this app in flight: it holds the owner, which this takes and keeps.
+    ///   That includes carrying a library to another package, whose export run starts the
+    ///   previous package's database: the owner is held from before that run to after the
+    ///   switch.
+    /// - An export run that outlived this app (a crash): it holds the journal exclusively
+    ///   while it is supervised and leaves a database process file until its Postgres has
+    ///   stopped, and the journal row below needs both gone.
     /// - A Manager this run owns (on Windows, anything left in its job): `live`.
     /// - A controller or database outliving a Manager this run stopped, lost or left: the
     ///   remembered library's journal must prove a clean stop.
@@ -356,7 +367,101 @@ impl HostSetup {
         };
         view.certificate_renewable = view.certificate_expires_in_days.is_some()
             && self.certificate_renewable.load(Ordering::Acquire);
+        view.carry_step = *self
+            .carry_step
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         view
+    }
+    /// Whether this account's library can be carried to the selected package. Read-only.
+    pub(crate) async fn carry_status(&self, manifest: String) -> CarryView {
+        let Ok(_owner) = self.owner.try_lock() else {
+            return CarryView::refused("native_host_busy");
+        };
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                match Installation::read(&manifest) {
+                    Ok(record) => carry_status(&record),
+                    Err(code) => CarryView::refused(code),
+                }
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = manifest;
+                CarryView::refused("host_carry_platform_unsupported")
+            }
+        })
+        .await
+        .unwrap_or_else(|_| CarryView::refused("host_package_check_unavailable"))
+    }
+    /// Carry this account's library to the selected package: one export run of the package it
+    /// last ran with, a restore by the selected one, and the switch. This holds the owner for
+    /// its whole duration, which is what keeps an update from starting during an export run.
+    pub(crate) async fn carry(&self, manifest: String) -> Result<View, String> {
+        let owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
+        if owner.is_some() {
+            return Err("native_host_stop_required".into());
+        }
+        let installation = Installation::read(&manifest)?;
+        self.cancel.store(false, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+        self.set("carrying", None, Some(installation.clone()));
+        let (record, cancel, step) = (
+            installation.clone(),
+            self.cancel.clone(),
+            self.carry_step.clone(),
+        );
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                CarryPlan::read(&record)?.run(&cancel, &|name| {
+                    *step.lock().unwrap_or_else(|error| error.into_inner()) = Some(name);
+                })
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = (record, cancel, step);
+                Err("host_carry_platform_unsupported".to_string())
+            }
+        })
+        .await
+        .map_err(|_| "host_carry_failed".to_string())
+        .and_then(|result| result);
+        *self
+            .carry_step
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.active.store(false, Ordering::Release);
+        self.set(
+            if result.is_ok() {
+                "carried"
+            } else {
+                "needs-attention"
+            },
+            result.as_ref().err().cloned(),
+            Some(installation),
+        );
+        drop(owner);
+        result?;
+        Ok(self.snapshot())
+    }
+    /// The person confirms the carried library works. Nothing is removed by this.
+    pub(crate) async fn carry_confirm(&self, manifest: String) -> Result<CarryView, String> {
+        let _owner = self.owner.try_lock().map_err(|_| "native_host_busy")?;
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                carried_view(&Installation::read(&manifest)?, true)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = manifest;
+                Err("host_carry_platform_unsupported".to_string())
+            }
+        })
+        .await
+        .map_err(|_| "host_carry_failed".to_string())?
     }
     pub(crate) fn require_management_origin(&self, origin: &str) -> Result<(), String> {
         let view = self.snapshot();
@@ -1174,6 +1279,23 @@ fn verified(
     ),
     String,
 > {
+    let (layout, raw, signature) = package_files(record)?;
+    let runtime = crate::release_policy::verify_host_runtime(
+        &layout.runtime.join("payload"),
+        &raw,
+        &signature,
+    )?;
+    if runtime.manifest_sha256() != record.manifest_sha256 {
+        return Err("host_install_runtime_changed".into());
+    }
+    Ok((layout, runtime))
+}
+
+/// An installed package's record, controller and signed manifest, read again from disk.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn package_files(
+    record: &Installation,
+) -> Result<(crate::host_install::Layout, Vec<u8>, [u8; 64]), String> {
     let current = Installation::read(&record.manifest_sha256)?;
     if &current != record {
         return Err("host_install_record_invalid".into());
@@ -1191,15 +1313,43 @@ fn verified(
         crate::runtime_store::read_bounded(&layout.runtime.join("manifest.sig"), 64)?
             .try_into()
             .map_err(|_| "host_signature_invalid")?;
-    let runtime = crate::release_policy::verify_host_runtime(
+    Ok((layout, raw, signature))
+}
+
+/// The package a library last ran with, verified as the source of its one export run: the same
+/// record, controller, signature and file checks as `verified`, with the database build
+/// allowed to be an earlier one this app declares it carries libraries forward from.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn verified_carry_source(
+    record: &Installation,
+) -> Result<
+    (
+        crate::host_install::Layout,
+        crate::host_runtime::CarrySourceRuntime,
+    ),
+    String,
+> {
+    let (layout, raw, signature) = package_files(record)?;
+    let source = crate::release_policy::verify_host_carry_source(
         &layout.runtime.join("payload"),
         &raw,
         &signature,
     )?;
-    if runtime.manifest_sha256() != record.manifest_sha256 {
+    if source.manifest_sha256() != record.manifest_sha256 {
         return Err("host_install_runtime_changed".into());
     }
-    Ok((layout, runtime))
+    Ok((layout, source))
+}
+
+/// This account, which must be an ordinary signed-in user.
+#[cfg(unix)]
+fn account_uid() -> Result<u32, String> {
+    let uid = unsafe { libc::geteuid() };
+    let minimum_uid = if cfg!(target_os = "linux") { 1 } else { 501 };
+    if uid < minimum_uid || unsafe { libc::getuid() } != uid {
+        return Err("host_install_profile_required".into());
+    }
+    Ok(uid)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -1216,7 +1366,7 @@ fn verify_installed_package(record: &Installation) -> Result<(), String> {
 fn configuration<U: Serialize>(
     record: &Installation,
     layout: &crate::host_install::Layout,
-    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    source_revision: &str,
     uid: &U,
     state: std::path::PathBuf,
     data: std::path::PathBuf,
@@ -1231,7 +1381,7 @@ fn configuration<U: Serialize>(
         package["version"]
             .as_str()
             .ok_or("native_host_version_invalid")?,
-        runtime.source_revision(),
+        source_revision,
     )?;
     let identity = serde_json::to_vec(&(record, uid)).map_err(|_| "native_host_setup_failed")?;
     Ok(Configuration {
@@ -1286,7 +1436,7 @@ fn carry_forward(
     let mut previous = configuration(
         &previous_record,
         &previous_layout,
-        &previous_runtime,
+        previous_runtime.source_revision(),
         &uid,
         next.state.clone(),
         next.data.clone(),
@@ -1346,10 +1496,20 @@ struct Package<'a> {
     revision: &'a str,
 }
 
+/// The directory a carry-forward restored a library into, selected by the same journal write
+/// that selects the new package.
+#[cfg(unix)]
+struct CarriedDatabase<'a> {
+    permit: &'a str,
+    reference: &'a crate::host_database::Reference,
+    /// The Postgres majors of the previous and the new package, which their markers name.
+    majors: (&'a str, &'a str),
+}
+
 /// Every check runs before the first change; the journal write last commits the move.
 #[cfg(unix)]
 fn move_library(
-    mut owner: crate::host_state::Owner,
+    owner: crate::host_state::Owner,
     previous: Package,
     next: Package,
     profile: impl FnOnce(
@@ -1358,36 +1518,75 @@ fn move_library(
     ) -> Result<(String, String), String>,
     tls: impl FnOnce(&str, &str) -> Result<(), String>,
 ) -> Result<(), String> {
+    move_library_to(owner, previous, next, profile, tls, None)
+}
+
+/// `move_library`, or with `database` the move of a library whose database was carried into a
+/// new directory: the same checks and order, the same single journal write to commit, and
+/// that write also selects the directory. The original directory is left where it is.
+#[cfg(unix)]
+fn move_library_to(
+    mut owner: crate::host_state::Owner,
+    previous: Package,
+    next: Package,
+    profile: impl FnOnce(
+        (&Configuration, &std::path::Path, &str),
+        (&Configuration, &std::path::Path, &str),
+    ) -> Result<(String, String), String>,
+    tls: impl FnOnce(&str, &str) -> Result<(), String>,
+    database: Option<CarriedDatabase>,
+) -> Result<(), String> {
     let id = &previous.config.installation_id;
-    owner.check_movable(id, previous.manifest)?;
-    host_state_package(
-        &next.config.state,
-        (previous.manifest, previous.revision),
-        (next.manifest, next.revision),
-    )?;
+    match &database {
+        None => owner.check_movable(id, previous.manifest)?,
+        Some(carried) => owner.check_carriable(id, previous.manifest, carried.permit)?,
+    }
+    let majors = database
+        .as_ref()
+        .map_or(("19", "19"), |carried| carried.majors);
+    let markers = (
+        host_state_marker_for((previous.manifest, previous.revision), majors.0)?,
+        host_state_marker_for((next.manifest, next.revision), majors.1)?,
+    );
+    host_state_package_named(&next.config.state, &markers.0, &markers.1)?;
     let (old, new) = profile(
         (previous.config, previous.candidate, previous.manifest),
         (next.config, next.candidate, next.manifest),
     )?;
     tls(&old, &new)?;
-    carry_host_state(
-        &next.config.state,
-        (previous.manifest, previous.revision),
-        (next.manifest, next.revision),
-    )?;
-    owner.carry_forward(id, previous.manifest, next.manifest)
+    carry_host_state_named(&next.config.state, &markers.0, &markers.1)?;
+    match database {
+        None => owner.carry_forward(id, previous.manifest, next.manifest),
+        Some(carried) => owner.carry_forward_database(
+            id,
+            previous.manifest,
+            next.manifest,
+            carried.permit,
+            carried.reference,
+        ),
+    }
 }
 
 /// The exact bytes the host agent writes for a package's marker.
+#[cfg(all(unix, test))]
+fn host_state_marker(package: (&str, &str)) -> Result<String, String> {
+    host_state_marker_for(package, "19")
+}
+/// The marker of a package whose database build has the given Postgres major.
 #[cfg(unix)]
-fn host_state_marker((manifest, revision): (&str, &str)) -> Result<String, String> {
+fn host_state_marker_for(
+    (manifest, revision): (&str, &str),
+    major: &str,
+) -> Result<String, String> {
     if !crate::native_runtime::digest_valid(manifest, 64)
         || !crate::native_runtime::digest_valid(revision, 40)
+        || major.len() != 2
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
     {
         return Err("host_state_invalid".into());
     }
     Ok(format!(
-        r#"{{"schemaVersion":1,"manifestSha256":"{manifest}","sourceRevision":"{revision}","postgresMajor":"19"}}"#
+        r#"{{"schemaVersion":1,"manifestSha256":"{manifest}","sourceRevision":"{revision}","postgresMajor":"{major}"}}"#
     ))
 }
 
@@ -1400,15 +1599,14 @@ enum HostStatePackage {
     Next,
 }
 
-/// Read-only: which package the host agent's marker names.
+/// Read-only: which package the host agent's marker names, given both markers written out.
 #[cfg(unix)]
-fn host_state_package(
+fn host_state_package_named(
     state: &std::path::Path,
-    previous: (&str, &str),
-    next: (&str, &str),
+    previous: &str,
+    next: &str,
 ) -> Result<HostStatePackage, String> {
     use std::io::Read;
-    let (previous, next) = (host_state_marker(previous)?, host_state_marker(next)?);
     let root = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(state)?);
     let mut file = match root.open_with("host-state.json", &crate::host_state::options(false)) {
         Ok(file) => file.into_std(),
@@ -1442,17 +1640,30 @@ fn host_state_package(
 }
 
 /// The host agent's package marker names the package that last ran this database.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn carry_host_state(
     state: &std::path::Path,
     previous: (&str, &str),
     next: (&str, &str),
 ) -> Result<(), String> {
+    carry_host_state_named(
+        state,
+        &host_state_marker(previous)?,
+        &host_state_marker(next)?,
+    )
+}
+/// `carry_host_state` for markers already written out.
+#[cfg(unix)]
+fn carry_host_state_named(
+    state: &std::path::Path,
+    previous: &str,
+    next: &str,
+) -> Result<(), String> {
     use std::io::Write;
-    if host_state_package(state, previous, next)? != HostStatePackage::Previous {
+    if host_state_package_named(state, previous, next)? != HostStatePackage::Previous {
         return Ok(());
     }
-    let marker = host_state_marker(next)?;
+    let marker = next;
     let root = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(state)?);
     // A fixed name lets a retry replace what an interrupted move left behind.
     let temp = ".host-state.json.carry.tmp";
@@ -1484,6 +1695,473 @@ fn carry_host_state(
         let _ = root.remove_file(temp);
     }
     result
+}
+
+/// What the interface is told about moving this account's library to the selected package's
+/// database build.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CarryView {
+    /// The move can be started, or continued, now.
+    available: bool,
+    /// Why it cannot, when it cannot. Absent when it can, or when there is nothing to move.
+    code: Option<String>,
+    stage: Option<crate::host_carry::Stage>,
+    previous_postgres: Option<String>,
+    next_postgres: Option<String>,
+    required_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+    room: Option<crate::host_carry::Room>,
+    /// After the move: the database directory that is no longer used, and until when (Unix
+    /// seconds) it is described as kept. Nothing removes it.
+    previous_database: Option<String>,
+    keep_until: Option<u64>,
+}
+impl CarryView {
+    fn refused(code: impl Into<String>) -> Self {
+        Self {
+            code: Some(code.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn carry_clock() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| "host_carry_clock_unavailable".into())
+}
+
+/// Everything a carry-forward needs, verified before anything is changed: the selected
+/// package, the package this library last ran with admitted as an export source, and the two
+/// configurations Manager knows them by.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct CarryPlan {
+    record: Installation,
+    layout: crate::host_install::Layout,
+    runtime: crate::host_runtime::VerifiedHostRuntime,
+    previous_record: Installation,
+    previous_layout: crate::host_install::Layout,
+    source: crate::host_runtime::CarrySourceRuntime,
+    previous: Configuration,
+    next: Configuration,
+    packages: (
+        crate::host_carry::PackageIdentity,
+        crate::host_carry::PackageIdentity,
+    ),
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl CarryPlan {
+    /// Read-only. `host_carry_not_needed` means there is nothing to carry: no library, a
+    /// library already on this package, or one whose package has the same database build.
+    fn read(record: &Installation) -> Result<Self, String> {
+        use crate::host_carry::PackageIdentity;
+        let (layout, runtime) = verified(record)?;
+        let uid = account_uid()?;
+        let profile = layout.profiles.join(uid.to_string());
+        let (state, data) = (profile.join("state"), profile.join("manager"));
+        require_leaf(&state)?;
+        require_leaf(&data)?;
+        let recorded = crate::manager_local::recorded(&data)?;
+        let mut next = configuration(
+            record,
+            &layout,
+            runtime.source_revision(),
+            &uid,
+            state,
+            data,
+            recorded.ports,
+        )?;
+        let marker = crate::host_state::Owner::peek(&next.state)?.ok_or("host_carry_not_needed")?;
+        next.installation_id = marker.installation_id.clone();
+        if marker.manifest_sha256 == record.manifest_sha256 {
+            return Err("host_carry_not_needed".into());
+        }
+        let previous_record = Installation::read(&marker.manifest_sha256)
+            .map_err(|_| "host_upgrade_previous_package_missing")?;
+        let (previous_layout, source) = match verified(&previous_record) {
+            // The same database build: the ordinary package move applies and nothing is exported.
+            Ok(_) => return Err("host_carry_not_needed".into()),
+            Err(code) if code == "host_manifest_incompatible" => {
+                verified_carry_source(&previous_record).map_err(previous_package_refusal)?
+            }
+            Err(code) => return Err(code),
+        };
+        if runtime.epoch() <= source.epoch() {
+            return Err("host_upgrade_downgrade_refused".into());
+        }
+        // After the move this library's backups come from the previous package. Only a Manager
+        // that says it restores those may receive the library.
+        if !crate::manager_local::package_declares(&layout.runtime, crate::host_carry::CAPABILITY) {
+            return Err("host_carry_manager_unsupported".into());
+        }
+        let mut previous = configuration(
+            &previous_record,
+            &previous_layout,
+            source.source_revision(),
+            &uid,
+            next.state.clone(),
+            next.data.clone(),
+            next.ports()?,
+        )?;
+        previous.installation_id = marker.installation_id.clone();
+        let (postgres, vector) = runtime.database_build();
+        let packages = (
+            PackageIdentity {
+                manifest_sha256: previous_record.manifest_sha256.clone(),
+                postgres_version: source.postgres_version().into(),
+                pgvector_version: source.vector_version().into(),
+            },
+            PackageIdentity {
+                manifest_sha256: record.manifest_sha256.clone(),
+                postgres_version: postgres.into(),
+                pgvector_version: vector.into(),
+            },
+        );
+        Ok(Self {
+            record: record.clone(),
+            layout,
+            runtime,
+            previous_record,
+            previous_layout,
+            source,
+            previous,
+            next,
+            packages,
+        })
+    }
+    /// The permit on disk for this move, or the one that would be written. Nothing is saved.
+    fn permit(&self) -> Result<crate::host_carry::Permit, String> {
+        crate::host_carry::permit_for(
+            crate::host_carry::stored(&self.next.data),
+            &self.next.installation_id,
+            &self.packages.0,
+            &self.packages.1,
+            carry_clock()?,
+        )
+    }
+    /// The database directory the journal selects now, with the journal held.
+    fn database(&self, owner: &mut crate::host_state::Owner) -> Result<std::path::PathBuf, String> {
+        let (state, reference) = owner.carry_state(
+            &self.next.installation_id,
+            &self.previous_record.manifest_sha256,
+        )?;
+        match reference {
+            Some(reference) => reference.resolve(&state),
+            None => Ok(state.join("database")),
+        }
+    }
+    /// Read-only: whether the move can start, and what it needs.
+    fn status(&self) -> CarryView {
+        let mut view = CarryView {
+            previous_postgres: Some(self.packages.0.postgres_version.clone()),
+            next_postgres: Some(self.packages.1.postgres_version.clone()),
+            ..CarryView::default()
+        };
+        let permit = match self.permit() {
+            Ok(permit) => permit,
+            Err(code) => {
+                return CarryView {
+                    code: Some(code),
+                    ..view
+                }
+            }
+        };
+        view.stage = Some(permit.stage);
+        let measured =
+            crate::host_state::Owner::acquire(&self.next.state, true).and_then(|mut owner| {
+                owner.carry_admitted(
+                    &self.next.installation_id,
+                    &self.previous_record.manifest_sha256,
+                    &permit.permit_id,
+                )?;
+                self.database(&mut owner)
+            });
+        let database = match measured {
+            Ok(database) => database,
+            Err(code) => {
+                return CarryView {
+                    code: Some(code),
+                    ..view
+                }
+            }
+        };
+        let required = crate::host_carry::directory_bytes(&database)
+            .map(|bytes| crate::host_carry::required_bytes(bytes, permit.stage));
+        let available = crate::host_storage::available_bytes(&self.next.state);
+        view.required_bytes = required.clone().ok();
+        view.available_bytes = available.clone().ok();
+        let room = crate::host_carry::room(required, available);
+        view.room = Some(room);
+        match room {
+            crate::host_carry::Room::Enough => view.available = true,
+            crate::host_carry::Room::Short => {
+                view.code = Some("host_carry_space_insufficient".into())
+            }
+            crate::host_carry::Room::Unknown => view.code = Some("host_carry_space_unknown".into()),
+        }
+        view
+    }
+    /// Run what is left of the move. Each stage is recorded durably when it is proven, so a
+    /// run that stops anywhere is continued, never repeated, by the next.
+    fn run(
+        self,
+        cancel: &AtomicBool,
+        progress: &(dyn Fn(&'static str) + Sync),
+    ) -> Result<(), String> {
+        use crate::host_carry::{self as carry, Room, Stage};
+        use crate::host_runtime::CarryJournal;
+        let (state, data) = (&self.next.state, &self.next.data);
+        let (id, previous_manifest) = (
+            self.next.installation_id.as_str(),
+            self.previous_record.manifest_sha256.as_str(),
+        );
+        let cancelled = || {
+            if cancel.load(Ordering::Acquire) {
+                Err("host_carry_cancelled".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        // Held to the end: nothing else can start this library, or move it, meanwhile.
+        let mut owner = crate::host_state::Owner::acquire(state, true)?;
+        let mut permit = self.permit()?;
+        owner.carry_admitted(id, previous_manifest, &permit.permit_id)?;
+        let database = self.database(&mut owner)?;
+        // Room for everything still to be written, before anything is.
+        match carry::room(
+            carry::directory_bytes(&database)
+                .map(|bytes| carry::required_bytes(bytes, permit.stage)),
+            crate::host_storage::available_bytes(state),
+        ) {
+            Room::Enough => {}
+            Room::Short => return Err("host_carry_space_insufficient".into()),
+            Room::Unknown => return Err("host_carry_space_unknown".into()),
+        }
+        let ports = (self.next.database_port, self.next.api_port);
+        // The password the previous package's database was created with. The new directory is
+        // created with the same one, which the move then saves for the new package.
+        let password = || {
+            crate::manager_profile::Profile::from_keystore(
+                &self.previous,
+                &self.previous_layout.runtime,
+                previous_manifest,
+            )
+            .map(|profile| profile.password())
+        };
+        // Display only: the step the agent says it is in, while one runs.
+        let watched = |permit: &carry::Permit, step: &mut dyn FnMut() -> Result<(), String>| {
+            let done = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !done.load(Ordering::Acquire) {
+                        if let Some(name) = carry::step(state, permit) {
+                            progress(name);
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                });
+                let result = step();
+                done.store(true, Ordering::Release);
+                result
+            })
+        };
+        if permit.stage == Stage::Permitted {
+            cancelled()?;
+            progress("export");
+            let digest = match carry::read_export(state, &permit)? {
+                // An export finished before this app could record it is read back, not run again.
+                Some(digest) => digest,
+                None => {
+                    // Durable before the previous package is run.
+                    permit.begin_export()?;
+                    carry::save(data, &permit)?;
+                    let request = carry::export_request(&permit);
+                    let password = password()?;
+                    let process = self.source.start_export(
+                        state,
+                        &password,
+                        ports,
+                        CarryJournal {
+                            owner: &mut owner,
+                            installation_id: id,
+                            manifest_sha256: previous_manifest,
+                        },
+                        &request,
+                    )?;
+                    let mut process = Some(process);
+                    watched(&permit, &mut || {
+                        carry::run_step(
+                            process.take().ok_or("host_carry_export_failed")?,
+                            cancel,
+                            state,
+                        )
+                    })?;
+                    carry::read_export(state, &permit)?.ok_or("host_carry_export_invalid")?
+                }
+            };
+            // The permit is used: from here the previous package is never run again.
+            permit.exported(digest)?;
+            carry::save(data, &permit)?;
+        }
+        if permit.stage == Stage::Exported {
+            cancelled()?;
+            progress("restore");
+            if carry::read_restore(state, &permit)?.is_none() {
+                // The original must be provably stopped before another Postgres runs beside it.
+                owner.check_carriable(id, previous_manifest, &permit.permit_id)?;
+                let request = carry::restore_request(
+                    &permit,
+                    self.source.source_revision(),
+                    self.source.postgres_major()?,
+                );
+                let password = password()?;
+                let process = self.runtime.start_carry_restore(
+                    state,
+                    &password,
+                    ports,
+                    CarryJournal {
+                        owner: &mut owner,
+                        installation_id: id,
+                        manifest_sha256: previous_manifest,
+                    },
+                    &request,
+                )?;
+                let mut process = Some(process);
+                watched(&permit, &mut || {
+                    carry::run_step(
+                        process.take().ok_or("host_carry_restore_failed")?,
+                        cancel,
+                        state,
+                    )
+                })?;
+            }
+            let restored =
+                carry::read_restore(state, &permit)?.ok_or("host_carry_target_invalid")?;
+            restored.reference(state, &permit)?;
+            permit.restored(restored.attempt_id)?;
+            carry::save(data, &permit)?;
+        }
+        if permit.stage == Stage::Restored {
+            cancelled()?;
+            progress("switch");
+            // Everything is read again: the export the permit recorded, the proofs, the directory.
+            if carry::read_export(state, &permit)? != permit.export_sha256 {
+                return Err("host_carry_export_invalid".into());
+            }
+            let restored =
+                carry::read_restore(state, &permit)?.ok_or("host_carry_target_invalid")?;
+            if Some(&restored.attempt_id) != permit.attempt_id.as_ref() {
+                return Err("host_carry_target_invalid".into());
+            }
+            let reference = restored.reference(state, &permit)?;
+            let _code = crate::package_lease::CodeLease::acquire(&self.previous_layout.runtime)?;
+            let old_binding = crate::manager_profile::Profile::binding_for(
+                &self.previous,
+                &self.previous_layout.runtime,
+                previous_manifest,
+            )?;
+            // Manager accepts the new package only from the exact descriptor it last ran with.
+            let transition = crate::manager_tls::TlsIdentity::saved_certificate(&old_binding)?
+                .map(|certificate| -> Result<_, String> {
+                    Ok(crate::manager_host::Transition {
+                        operation_id: uuid::Uuid::new_v4(),
+                        from_fingerprint: self.source.descriptor_fingerprint(
+                            &self.previous,
+                            &self.previous_layout.runtime,
+                            &self.previous_record.controller_sha256,
+                            &certificate,
+                        )?,
+                    })
+                })
+                .transpose()?;
+            move_library_to(
+                owner,
+                Package {
+                    config: &self.previous,
+                    candidate: &self.previous_layout.runtime,
+                    manifest: previous_manifest,
+                    revision: self.source.source_revision(),
+                },
+                Package {
+                    config: &self.next,
+                    candidate: &self.layout.runtime,
+                    manifest: &self.record.manifest_sha256,
+                    revision: self.runtime.source_revision(),
+                },
+                |previous, next| {
+                    crate::manager_profile::Profile::carry_forward(previous, next, transition)
+                },
+                crate::manager_tls::TlsIdentity::carry_forward,
+                Some(CarriedDatabase {
+                    permit: &permit.permit_id,
+                    reference: &reference,
+                    majors: (
+                        self.source.postgres_major()?,
+                        self.runtime.postgres_major()?,
+                    ),
+                }),
+            )?;
+            permit.switched(carry_clock()?)?;
+            carry::save(data, &permit)?;
+            carry::label_previous(state, &permit, &database);
+        }
+        Ok(())
+    }
+}
+
+/// After the move: what the permit says about the directory that is no longer used. A journal
+/// that already names this package with a permit one write behind is brought up to date.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn carried_view(record: &Installation, confirm: bool) -> Result<CarryView, String> {
+    use crate::host_carry::{self as carry, Stage, Stored};
+    let uid = account_uid()?;
+    let profile = record.layout()?.profiles.join(uid.to_string());
+    let (state, data) = (profile.join("state"), profile.join("manager"));
+    let marker = crate::host_state::Owner::peek(&state)?.ok_or("host_carry_not_needed")?;
+    let mut permit = match carry::stored(&data) {
+        Stored::Present(permit) => *permit,
+        Stored::Absent => return Err("host_carry_not_needed".into()),
+        Stored::Unreadable => return Err("host_carry_permit_unreadable".into()),
+    };
+    if marker.manifest_sha256 != record.manifest_sha256
+        || permit.library_id != marker.installation_id
+        || permit.target.manifest_sha256 != record.manifest_sha256
+        || permit.stage < Stage::Restored
+    {
+        return Err("host_carry_not_needed".into());
+    }
+    if permit.stage == Stage::Restored {
+        // The journal write committed the move; only this record of it was not yet written.
+        permit.switched(carry_clock()?)?;
+        carry::save(&data, &permit)?;
+    }
+    if confirm && permit.stage == Stage::Switched {
+        permit.confirmed()?;
+        carry::save(&data, &permit)?;
+    }
+    Ok(CarryView {
+        stage: Some(permit.stage),
+        previous_postgres: Some(permit.previous.postgres_version.clone()),
+        next_postgres: Some(permit.target.postgres_version.clone()),
+        previous_database: Some(state.join("database").display().to_string()),
+        keep_until: permit.keep_until(),
+        ..CarryView::default()
+    })
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn carry_status(record: &Installation) -> CarryView {
+    match CarryPlan::read(record) {
+        Ok(plan) => plan.status(),
+        Err(code) if code == "host_carry_not_needed" => match carried_view(record, false) {
+            Ok(view) => view,
+            Err(code) if code == "host_carry_not_needed" => CarryView::default(),
+            Err(code) => CarryView::refused(code),
+        },
+        Err(code) => CarryView::refused(code),
+    }
 }
 
 /// The Library version a package carries, for display only.
@@ -1537,14 +2215,7 @@ fn launch(
     {
         let (layout, runtime) = verified(record)?;
         #[cfg(unix)]
-        let uid = {
-            let uid = unsafe { libc::geteuid() };
-            let minimum_uid = if cfg!(target_os = "linux") { 1 } else { 501 };
-            if uid < minimum_uid || unsafe { libc::getuid() } != uid {
-                return Err("host_install_profile_required".into());
-            }
-            uid
-        };
+        let uid = account_uid()?;
         #[cfg(windows)]
         let uid = crate::windows_protection::process_user_sid()?;
         #[cfg(unix)]
@@ -1580,8 +2251,15 @@ fn launch(
             }
         }
         #[allow(unused_mut)]
-        let mut configuration =
-            configuration(record, &layout, &runtime, &uid, state, data, recorded.ports)?;
+        let mut configuration = configuration(
+            record,
+            &layout,
+            runtime.source_revision(),
+            &uid,
+            state,
+            data,
+            recorded.ports,
+        )?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         carry_forward(record, &runtime, &mut configuration, uid)?;
         if cancel.load(Ordering::Acquire) {
@@ -3119,6 +3797,60 @@ mod tests {
         );
         cleanly_stopped(&fixture.state());
         assert!(setup.lock_for_update().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_export_run_keeps_updates_closed_while_it_runs_and_until_its_database_has_stopped() {
+        use crate::host_runtime::HostMode;
+        let fixture = OwnedFixture::new();
+        let state = fixture.state();
+        let data = fixture.0.join("data");
+        let hosted = on_disk(&state, &data, &|| Evidence::Clear);
+        let (id, previous) = ("aaaaaaaaaaaa", "a".repeat(64));
+        // A library that stopped cleanly with the package it last ran with.
+        let mut controller = crate::host_state::Owner::acquire(&state, true).unwrap();
+        controller
+            .activate(id, &previous, HostMode::Server)
+            .unwrap();
+        controller.clean_stop().unwrap();
+        drop(controller);
+        let setup = HostSetup::default();
+        assert!(setup.lock_for_update_at(Some(hosted)).is_ok());
+        // This app is carrying the library: the operation holds the owner from before the
+        // export run starts until after the switch.
+        let operation = setup.owner.try_lock().unwrap();
+        assert_eq!(
+            setup.lock_for_update_at(Some(hosted)).err().unwrap(),
+            "update_host_active"
+        );
+        drop(operation);
+        // Another run of this app is supervising an export run: it holds the journal, which
+        // it leaves stopped and bound to the previous package throughout.
+        let mut journal = crate::host_state::Owner::acquire(&state, true).unwrap();
+        journal.carry_state(id, &previous).unwrap();
+        assert_eq!(
+            HostSetup::default()
+                .lock_for_update_at(Some(hosted))
+                .err()
+                .unwrap(),
+            "update_library_not_idle"
+        );
+        drop(journal);
+        // That run is gone but the previous Postgres has not finished stopping, or was killed.
+        crate::runtime_store::private_directory(&state.join("database")).unwrap();
+        std::fs::write(state.join("database/postmaster.pid"), b"1").unwrap();
+        assert_eq!(
+            HostSetup::default()
+                .lock_for_update_at(Some(hosted))
+                .err()
+                .unwrap(),
+            "update_library_not_idle"
+        );
+        std::fs::remove_file(state.join("database/postmaster.pid")).unwrap();
+        assert!(HostSetup::default()
+            .lock_for_update_at(Some(hosted))
+            .is_ok());
     }
 
     #[cfg(unix)]
