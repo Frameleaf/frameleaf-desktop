@@ -398,7 +398,10 @@ jobs:
           pattern: factory-accelerated-*
           path: accelerated-packs
       - name: Verify the downloadable GPU runtime parts and stage them as release files
-        run: node tools/deliver_runtime.mjs --release accelerated-packs release-assets | tee -a "$GITHUB_STEP_SUMMARY"
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/deliver_runtime.mjs --release accelerated-packs release-assets | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Create checksums and a draft release after every target succeeds
         env:
           GH_TOKEN: ${{ github.token }}
