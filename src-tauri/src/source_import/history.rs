@@ -15,7 +15,7 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    fn for_consent(credential: &str, consent: &Consent) -> Self {
+    pub(super) fn for_consent(credential: &str, consent: &Consent) -> Self {
         if credential == crate::drop_import::CREDENTIAL {
             Self::Drop
         } else if consent.watch {
@@ -49,13 +49,19 @@ pub(crate) struct Entry {
     verified: usize,
     total: usize,
     skipped: u64,
+    /// How many of the skipped files have a known reason, by reason code. Never a filename.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_reasons: BTreeMap<String, u64>,
     album_pending: bool,
     can_retry: bool,
 }
 
 impl Entry {
-    fn from_run(kind: Kind, manifest: &Manifest, cursor: &Cursor, active: bool) -> Self {
+    pub(super) fn from_run(kind: Kind, manifest: &Manifest, cursor: &Cursor, active: bool) -> Self {
         let status = match cursor.state.as_str() {
+            // A finished batch of a larger folder is one step of an import that is still going.
+            "complete" if continues(manifest, cursor) && active => Status::Running,
+            "complete" if continues(manifest, cursor) => Status::Interrupted,
             "complete" => Status::Complete,
             "cancelled" => Status::Cancelled,
             _ if active => Status::Running,
@@ -63,18 +69,29 @@ impl Entry {
             _ => Status::Interrupted,
         };
         let view = view(manifest, cursor, "", None);
+        // The batches of one import share its entry: the import's id and start, and the counts
+        // of every batch so far. A later batch replaces the entry an earlier one left.
+        let import = manifest.import.as_ref();
+        let (verified, total) = match &view.overall {
+            Some(overall) => (
+                usize::try_from(overall.completed).unwrap_or(usize::MAX),
+                usize::try_from(overall.total.max(overall.completed)).unwrap_or(usize::MAX),
+            ),
+            None => (view.completed, view.total),
+        };
         Self {
-            run_id: manifest.id.clone(),
+            run_id: import.map_or_else(|| manifest.id.clone(), |import| import.id.clone()),
             kind,
             status,
-            created_at: manifest.created_at,
+            created_at: import.map_or(manifest.created_at, |import| import.created_at),
             album: manifest
                 .destination
                 .as_ref()
                 .map(|album| album.name.clone()),
-            verified: view.completed,
-            total: view.total,
+            verified,
+            total,
             skipped: view.skipped,
+            skipped_reasons: view.skipped_reasons,
             album_pending: view.album_pending,
             can_retry: status == Status::Interrupted && cursor.upload_budget.is_some(),
         }
@@ -204,15 +221,24 @@ pub(super) fn completed_watch(
     manifest: &Manifest,
     cursor: &Cursor,
 ) {
-    if cursor.state == "complete"
-        && record(
-            base,
-            saved,
-            identity,
-            Entry::from_run(Kind::Watch, manifest, cursor, false),
-        )
-        .is_err()
-    {
+    completed(base, saved, identity, Kind::Watch, manifest, cursor);
+}
+
+/// Keeps the summary of a completed run whose journal is about to hold the next one.
+pub(super) fn completed(
+    base: &Path,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    kind: Kind,
+    manifest: &Manifest,
+    cursor: &Cursor,
+) {
+    if cursor.state != "complete" {
+        return;
+    }
+    let mut entry = Entry::from_run(kind, manifest, cursor, false);
+    entry.status = Status::Complete;
+    if record(base, saved, identity, entry).is_err() {
         eprintln!("Desktop could not retain an import history summary");
     }
 }
@@ -347,6 +373,22 @@ pub(crate) async fn retry_photo_import(
     }
 }
 
+/// The archived entries of this sign-in, as the window receives them.
+#[cfg(test)]
+pub(super) fn archived(
+    base: &Path,
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+) -> Vec<serde_json::Value> {
+    let scope = scope(saved, identity).unwrap();
+    read(&archive(base, &scope), &scope, identity)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| serde_json::to_value(entry).unwrap())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +425,10 @@ mod tests {
             total_bytes: 10,
             skipped: 0,
             availability: None,
+            skipped_reasons: BTreeMap::new(),
+            more: false,
+            continues: None,
+            import: None,
         };
         let mut cursor = Cursor::new(&manifest).unwrap();
         cursor.state = "paused".into();

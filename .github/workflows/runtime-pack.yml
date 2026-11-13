@@ -4,8 +4,18 @@ on:
     paths:
       - 'tools/build_runtime.py'
       - 'tools/test_build_runtime.py'
+      - 'tools/build_coreml_observer.py'
+      - 'tools/smoke_accelerated_runtime.py'
+      - 'tools/smoke_cpu_runtime.py'
+      - 'tools/qualify_runtime_models.py'
+      - 'tools/check_macos_minimum.py'
+      - 'packaging/macos/minimum-versions.json'
+      - 'tools/linked_libraries.py'
+      - 'tools/pe_imports.py'
+      - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
+      - 'src-tauri/src/native_runtime/**'
       - 'src-tauri/src/runtime_store.rs'
       - 'src-tauri/src/process_tree.rs'
       - '.github/workflows/runtime-pack.yml'
@@ -20,7 +30,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-24.04]
+        # The same Linux image the factory builds the runtime on (tools/release_inputs.mjs).
+        os: [macos-latest, windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -56,6 +67,30 @@ jobs:
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
         run: python desktop/tools/build_runtime.py --source server --output candidate --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --epoch 6
+      - name: Check no Linux runtime binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/check_linux_glibc.py --max 2.35 candidate/payload | tee -a "$GITHUB_STEP_SUMMARY"
+      # FD-52: the accelerated pack (processor and CoreML manifests over one payload) must build on
+      # the hosted Apple Silicon runner; it is not signed, published or run on a GPU here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: a70fd7dcee16526cb913308e9ea9596489b24ff6
+          path: coreml-server
+          persist-credentials: false
+      - name: Construct the CoreML pack with its device collector
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision a70fd7dcee16526cb913308e9ea9596489b24ff6 --epoch 6 --profile coreml-ort
+          test -s coreml-candidate/manifest.json
+          test -s coreml-candidate/manifest-accelerated.json
+          coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
       - name: Retain private validation receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -72,6 +107,145 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: cpu-runtime-failure-${{ runner.os }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3
+  # FD-6: the Intel macOS processor pack must build on the factory's Intel image from the source
+  # the factory builds, with the one wheel `targetPins` names in place of the locked onnxruntime
+  # (which publishes no Intel macOS wheel), and run a model. Nothing is signed or published here.
+  intel-macos:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - id: source
+        name: The source the factory builds the processor pack from
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(python -c "import json; print(json.load(open('desktop/runtime/profiles.json'))['profiles']['cpu-ort']['sourceRevision'])")"
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: ${{ steps.source.outputs.revision }}
+          path: server
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Construct the Intel pack and run a model with it
+        shell: bash
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          python -m unittest discover -s desktop/tools -p 'test_build_runtime.py'
+          python desktop/tools/build_runtime.py --source server --output candidate --revision "$SOURCE_REVISION" --epoch 6
+          python - <<'PY'
+          import json
+          manifest = json.load(open("candidate/manifest.json"))
+          assert (manifest["platform"], manifest["architecture"], manifest["provider"]) == ("macos", "x86_64", "CPUExecutionProvider"), manifest
+          print(json.dumps(json.load(open("candidate/payload/provenance.json")), indent=2))
+          PY
+          grep -A1 '^onnxruntime==' candidate/payload/requirements.txt
+          candidate/payload/python/bin/python3.12 -I -B desktop/tools/smoke_cpu_runtime.py x86_64 | tee -a "$GITHUB_STEP_SUMMARY"
+      # The older onnxruntime must still give the catalogue's expected output for real models:
+      # the smallest of each kind (text recognition, faces, search) is staged and qualified as the app does.
+      - name: Qualify catalogue models with the Intel pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/qualify_runtime_models.py candidate "$RUNNER_TEMP/qualification" PP-OCRv5_mobile buffalo_s ViT-B-32__openai | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check no Intel runtime binary needs a newer macOS than the AI runtime minimum
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The checker reads a `native-runtime` folder as the AI runtime pack.
+          mkdir native-runtime
+          cp -R candidate/payload native-runtime/payload
+          python desktop/tools/check_macos_minimum.py --report macos-minimum.json native-runtime | tee -a "$GITHUB_STEP_SUMMARY"
+          cat macos-minimum.json
+      - name: Retain private validation receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-receipts-macOS-x86_64
+          path: |
+            candidate/manifest.json
+            candidate/payload/provenance.json
+            candidate/payload/requirements.txt
+            candidate/payload/build-requirements.txt
+            macos-minimum.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpu-runtime-failure-macOS-x86_64
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3
+  # FD-56: the CUDA and OpenVINO packs must build from the locked source on the hosted Windows and
+  # Linux runners and load their provider. Nothing is signed, published or run on a GPU here.
+  accelerated:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+        profile: [cuda-ort, openvino-ort]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: a70fd7dcee16526cb913308e9ea9596489b24ff6
+          path: server
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Construct the accelerated pack and load its provider
+        shell: bash
+        env:
+          RUNTIME_PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          python desktop/tools/build_runtime.py --source server --output candidate --revision a70fd7dcee16526cb913308e9ea9596489b24ff6 --epoch 6 --profile "$RUNTIME_PROFILE"
+          test -s candidate/manifest.json
+          test -s candidate/manifest-accelerated.json
+          case "$RUNTIME_PROFILE" in
+            cuda-ort) provider=CUDAExecutionProvider ;;
+            openvino-ort) provider=OpenVINOExecutionProvider ;;
+          esac
+          if [ "$RUNNER_OS" = Windows ]; then python=candidate/payload/python/python.exe; else python=candidate/payload/python/bin/python3.12; fi
+          du -sh candidate/payload || true
+          "$python" -I -B desktop/tools/smoke_accelerated_runtime.py "$provider"
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: accelerated-runtime-failure-${{ runner.os }}-${{ matrix.profile }}
           path: .candidate.error.log
           include-hidden-files: true
           if-no-files-found: ignore

@@ -1,29 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
-import { isAbsolute, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { enabled, withBrowser } from './ui_test_support.mjs';
 
+// Opt-in browser qualification of the sidebar, keyboard shortcuts, page restore and sign-out sheet.
 // Synthetic IPC exercises keyboard behavior without loading a saved credential or library.
-if (process.env.FRAMELEAF_MANAGER_UI_TEST !== '1') process.exit(0);
-const { FRAMELEAF_TEST_BROWSER: executablePath, FRAMELEAF_TEST_PLAYWRIGHT: playwright } = process.env;
-assert.ok(executablePath && isAbsolute(executablePath) && playwright && isAbsolute(playwright));
-const { chromium } = await import(pathToFileURL(playwright));
-const root = fileURLToPath(new URL('..', import.meta.url));
-const socket = createServer();
-await new Promise(resolve => socket.listen(0, '127.0.0.1', resolve));
-const { port } = socket.address();
-await new Promise(resolve => socket.close(resolve));
-const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
-const ended = new Promise(resolve => vite.once('close', resolve));
-let browser;
-try {
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(Error('Vite startup timeout')), 10000);
-    vite.stdout.on('data', chunk => { if (chunk.includes('Local:')) { clearTimeout(timeout); resolve(); } });
-    vite.once('error', reject);
-  });
-  browser = await chromium.launch({ executablePath, headless: true, args: ['--disable-gpu'] });
+// Run it with `npm run test:ui`.
+if (!enabled) process.exit(0);
+await withBrowser(async ({ browser, origin }) => {
   const page = await browser.newPage({ userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' });
   const errors = [];
   const calls = [];
@@ -42,7 +24,7 @@ try {
   await page.exposeFunction('navigationInvoke', (command, args) => {
     calls.push(command);
     if (command === 'plugin:event|listen') return 1;
-    if (command === 'discover_camera_folders') return [];
+    if (['discover_camera_folders', 'photo_import_history'].includes(command)) return [];
     if (command === 'local_host_status') return { backgroundActive: false };
     if (command === 'restore_connection') return {
       navigationScope: scope, server: 'https://nas.example', name: 'Pat', mode: 'client', state: 'ready',
@@ -66,7 +48,7 @@ try {
     globalThis.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
     globalThis.__TAURI_INTERNALS__ = { invoke: (...args) => globalThis.navigationInvoke(...args), transformCallback: () => 1 };
   });
-  await page.goto(`http://127.0.0.1:${port}`);
+  await page.goto(origin);
   const sidebar = page.getByRole('navigation', { name: 'Sidebar' });
   const account = sidebar.getByRole('button', { name: /Pat/ });
   const heading = name => page.getByRole('heading', { name, exact: true });
@@ -95,6 +77,9 @@ try {
   await page.keyboard.press('Enter');
   await page.keyboard.press('Tab');
   await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Offline Albums');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Sign out…');
   await page.keyboard.press('Enter');
   const dialog = page.getByRole('dialog');
   await dialog.waitFor();
@@ -157,8 +142,5 @@ try {
   assert.equal(await page.evaluate(() => localStorage.getItem('frameleaf.last-page.v1')), null);
   assert.deepEqual(calls.filter(command => command === 'sign_out'), ['sign_out']);
   assert.deepEqual(errors, []);
-} finally {
-  await browser?.close();
-  vite.kill();
-  await ended;
-}
+  process.stdout.write('Navigation UI browser flows passed: skip link, page shortcuts and restore, account menu, sign-out sheet, administrator pages.\n');
+});

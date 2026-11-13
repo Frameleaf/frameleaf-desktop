@@ -210,6 +210,9 @@ pub(crate) async fn install_desktop_update(
 ) -> Result<(), String> {
     require_local(&window)?;
     let host = app.state::<HostSetup>();
+    // Windows stops the library itself, below, once the update is downloaded. Everywhere else
+    // the library must already be idle.
+    #[cfg(not(windows))]
     let _owner = host.lock_for_update()?;
     let media_copy = app
         .state::<crate::media_copy::MediaCopy>()
@@ -233,6 +236,15 @@ pub(crate) async fn install_desktop_update(
         eprintln!("Desktop update download failed: {error}");
         "update_install_failed"
     })?;
+    // Installing ends this app and, on Windows, everything in Manager's job. The photo server
+    // and database are closed in order first; without the journal's proof that they are,
+    // nothing is installed and the reason is returned. The gate is then taken as everywhere
+    // else, and still refuses anything it cannot prove idle.
+    #[cfg(windows)]
+    let _owner = {
+        host.stop_for_update().await.map_err(stop_refused)?;
+        host.lock_for_update()?
+    };
     let restart = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let _media_copy = media_copy;
@@ -254,6 +266,13 @@ pub(crate) async fn install_desktop_update(
     })
     .await
     .map_err(|_| "update_install_failed")?
+}
+
+/// The update was not installed because the library on this computer could not be stopped
+/// first; `code` is why, and the interface says both.
+#[cfg(any(windows, test))]
+fn stop_refused(code: String) -> String {
+    format!("update_library_stop_{code}")
 }
 
 #[cfg(test)]
@@ -322,5 +341,13 @@ mod tests {
             assert!(!directory.join(PENDING).exists());
             assert!(!directory.join(RECEIPT).exists());
         }
+    }
+
+    #[test]
+    fn a_refused_library_stop_keeps_its_reason() {
+        assert_eq!(
+            super::stop_refused("manager_pairing_required".into()),
+            "update_library_stop_manager_pairing_required"
+        );
     }
 }

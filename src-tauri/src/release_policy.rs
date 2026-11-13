@@ -56,6 +56,10 @@ fn parse_policy(raw: &str) -> Result<(u64, Vec<VerifyingKey>), String> {
     }
     Ok((policy.minimum_runtime_epoch, keys))
 }
+/// The release floor and keys every signed runtime artifact is checked against.
+pub(crate) fn trust() -> Result<(u64, Vec<VerifyingKey>), String> {
+    parse_policy(POLICY)
+}
 pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
     let (floor, keys) = parse_policy(POLICY)?;
     RuntimeStore::new(
@@ -66,6 +70,32 @@ pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
     )
 }
 
+/// The release the app's own bundle would install: the rollback target pruning keeps.
+pub(crate) fn bundled_release(bundle: &Path, manifest: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    crate::runtime_store::read_bounded(&bundle.join(manifest), 8 * 1024 * 1024)
+        .ok()
+        .map(|raw| format!("{:x}", Sha256::digest(raw)))
+}
+
+/// Best effort, once the current selection has qualified with the active runtime: reclaim
+/// runtime packs that can never run again, combined model sets the selection no longer uses and
+/// inference scratch no worker owns. Each rule keeps what it cannot identify.
+pub(crate) fn reclaim_superseded(
+    data: &Path,
+    bundle: &Path,
+    active_runtime: &str,
+    active_set: &Path,
+    now: std::time::SystemTime,
+) {
+    if let Ok(store) = open_runtime_store(&data.join("runtimes")) {
+        let rollback = bundled_release(bundle, "manifest.json");
+        let _ = store.prune(active_runtime, rollback.as_deref());
+    }
+    let _ = crate::model_cache::prune_model_sets(&data.join("model-sets"), active_set, now);
+    let _ = crate::model_cache::prune_scratch(&data.join("scratch"), now);
+}
+
 pub fn verify_host_runtime(
     root: &Path,
     manifest: &[u8],
@@ -73,6 +103,25 @@ pub fn verify_host_runtime(
 ) -> Result<crate::host_runtime::VerifiedHostRuntime, String> {
     let (floor, keys) = parse_policy(POLICY)?;
     crate::host_runtime::VerifiedHostRuntime::verify(root, manifest, signature, &keys, floor)
+}
+/// The package a library last ran with, admitted for its one export run and nothing else: the
+/// same keys and release floor, and only the database builds this app declares it carries
+/// libraries forward from.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) fn verify_host_carry_source(
+    root: &Path,
+    manifest: &[u8],
+    signature: &[u8; 64],
+) -> Result<crate::host_runtime::CarrySourceRuntime, String> {
+    let (floor, keys) = parse_policy(POLICY)?;
+    crate::host_runtime::VerifiedHostRuntime::verify_carry_source(
+        root,
+        manifest,
+        signature,
+        &keys,
+        floor,
+        &crate::host_runtime::declared_carry_sources(),
+    )
 }
 #[cfg(test)]
 mod tests {
