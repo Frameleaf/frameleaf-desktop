@@ -115,6 +115,9 @@ const messages: Record<string, string> = {
   source_item_invalid: 'This file is unsupported or linked. Some Windows cloud placeholders cannot be copied yet; export selected photos to an ordinary folder and try there.',
   source_item_unavailable: 'A selected file is unavailable. Check the folder before resuming.',
   source_item_empty: 'An empty file was skipped.',
+  source_folder_unreadable: 'A folder could not be opened, so it was skipped and the rest of the import carried on. To include it, give yourself access to that folder, then import again.',
+  source_entry_unreadable: 'An item could not be read, so it was skipped and the rest of the import carried on.',
+  source_name_unsupported: 'A photo, video or folder was skipped because its name contains characters that are not valid text. Rename it, then import again to include it.',
   source_preview_policy_unavailable: 'A download-free folder preview could not be enabled. No preview was started. Try again after restarting the app.',
   source_inventory_partial: 'The scan reached its safety limit. Choose a smaller photo subfolder for this copy.',
   source_inventory_unreadable: 'Some entries could not be inspected. Check folder and drive access before preparing the copy again.',
@@ -280,6 +283,14 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'Frameleaf could not tell which macOS version this Mac is running, so AI processing was not set up. Photos remain available. Try again; if this keeps happening, update Frameleaf.', 'runtime_os_unknown'],
   ['runtime', 'The AI runtime that comes with Frameleaf is missing or could not be verified. Install Frameleaf again, then try again. Photos remain available.', 'app_resources_unavailable release_policy_invalid runtime_file_unavailable runtime_manifest_invalid runtime_manifest_incompatible runtime_signature_invalid runtime_artifact_changed runtime_artifact_invalid runtime_interpreter_unapproved runtime_inventory_failed runtime_inventory_limit runtime_inventory_mismatch runtime_link_forbidden runtime_path_invalid runtime_root_invalid runtime_size_invalid runtime_special_file_forbidden runtime_read_failed runtime_release_identity_changed runtime_device_observer_invalid runtime_device_entrypoint_invalid'],
   ['', 'GPU acceleration could not be used on this computer, so AI processing runs on the processor instead.', 'provider_device_ineligible provider_driver_outdated provider_failed provider_slower provider_speed_unknown worker_provider_unavailable'],
+  // ---- AI processing: the graphics card support Frameleaf downloads on request (FD-60) ----
+  ['download', 'The graphics card download did not finish. Check your connection, then try again: it continues from where it stopped.', 'accelerated_pack_download_interrupted'],
+  ['', 'The graphics card download did not match what Frameleaf published, so it was discarded. Try again to download it again.', 'accelerated_pack_download_invalid accelerated_pack_archive_invalid accelerated_pack_signature_invalid accelerated_pack_manifest_invalid'],
+  ['storage', 'Frameleaf could not save the graphics card download on this computer. Free up disk space, then try again.', 'accelerated_pack_storage_failed'],
+  ['storage', 'There is not enough free disk space for the graphics card download. It needs about twice its size while it is unpacked. Free up disk space, then try again.', 'accelerated_pack_disk_space'],
+  ['', 'The downloaded graphics card support does not belong to this version of Frameleaf, so it was removed. Download it again.', 'accelerated_pack_epoch_mismatch accelerated_pack_missing'],
+  ['', 'The graphics card download is already running.', 'accelerated_pack_busy'],
+  ['', 'There is no graphics card download for this computer.', 'accelerated_pack_unavailable'],
   ['restart', 'The AI runtime could not start, or stopped unexpectedly, on this computer. Quit and reopen Frameleaf, then try again.', 'runtime_start_failed runtime_gate_failed runtime_port_invalid runtime_port_unavailable runtime_process_invalid runtime_process_owner_failed runtime_process_shutdown_unconfirmed runtime_process_status_failed runtime_process_state_unavailable runtime_process_stop_failed runtime_process_stopped runtime_not_ready runtime_health_invalid runtime_client_failed runtime_prediction_interrupted runtime_prediction_invalid runtime_prediction_refused runtime_activation_failed runtime_preparation_failed'],
   ['restart', 'Another copy of Frameleaf is using the AI files on this computer. Close it, then try again.', 'runtime_store_busy runtime_store_lock_failed'],
   ['', 'Frameleaf’s AI folder on this computer is not private to your account, so it was not used. Photos remain available. If this keeps happening, contact Frameleaf support.', 'runtime_store_directory_not_private runtime_store_directory_exists runtime_store_path_invalid runtime_store_lock_invalid runtime_store_privacy_inventory_limit'],
@@ -498,4 +509,25 @@ export function workerReason(code: string | null | undefined): WorkerReason | nu
 
 export function savedSignInNeedsRecovery(error: unknown): boolean {
   return ['credential_unlock_required', 'credential_confirmation_unavailable', 'credential_confirmation_changed'].includes(String(error));
+}
+
+// Why items were left out of an import, as fragments for an "N skipped (…)" summary. The full
+// sentence for each code is above.
+const skipReasons: Record<string, string | ((count: number) => string)> = {
+  source_item_changed: 'changed during the import',
+  source_item_unavailable: 'no longer in the folder',
+  source_item_excluded: 'hidden or excluded',
+  source_item_invalid: 'no longer a photo or video file',
+  source_item_empty: 'empty',
+  source_folder_unreadable: count => count === 1 ? 'folder that could not be opened' : 'folders that could not be opened',
+  source_entry_unreadable: 'could not be read',
+  source_name_unsupported: 'with a name that is not valid text',
+};
+
+/** "2 empty, 1 folder that could not be opened" for the reason counts of an import; '' for none. */
+export function skipSummary(reasons: Record<string, number> | null | undefined): string {
+  return Object.entries(reasons ?? {}).map(([code, count]) => {
+    const reason = skipReasons[code] ?? 'not copied';
+    return `${count.toLocaleString()} ${typeof reason === 'string' ? reason : reason(count)}`;
+  }).join(', ');
 }

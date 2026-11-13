@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { deliverRuntime } from "./deliver_runtime.mjs";
 import { packageConfiguration } from "./package_desktop.mjs";
 import {
   acceleratedSignature,
@@ -70,6 +71,30 @@ export function factoryProfileFor(target, accelerated) {
   return names.includes(accelerated) ? accelerated : usual;
 }
 
+/** Every pack one factory run builds for a target (FD-60): the pack the installer carries and
+ * the accelerated packs too large for an installer (a dependency set of their own: CUDA,
+ * OpenVINO), which are delivered as release parts the app downloads on demand. `default` (or
+ * true) delivers every such pack approved for the target, a profile name only that one, and
+ * `none` (or false) none. The installer's pack is never one of them: the processor manifest of
+ * such a pack is not signed. */
+export function factoryPacksFor(target, accelerated) {
+  const large = acceleratedProfiles(target).filter(
+    (name) => profiles.profiles[name].extra !== profile.extra,
+  );
+  const named = large.includes(accelerated);
+  const installer = factoryProfileFor(target, named ? "default" : accelerated);
+  const delivered =
+    accelerated === true || accelerated === "default"
+      ? large
+      : named
+        ? [accelerated]
+        : [];
+  return [
+    { profile: installer, delivered: false },
+    ...delivered.map((name) => ({ profile: name, delivered: true })),
+  ];
+}
+
 export async function checkFactoryInputs(candidate, target, epoch) {
   candidate = resolve(candidate);
   const manifest = JSON.parse(
@@ -125,21 +150,68 @@ export async function signFactoryRuntime(candidate, target, epoch, privatePem, p
   return receipt;
 }
 
+/** FD-60: sign the accelerated manifest of a pack the app downloads on demand, cut the pack
+ * into release parts under `output/parts` and write its signed delivery manifest to `output`.
+ * Only the accelerated manifest is signed: the pack never serves as a processor runtime. */
+export async function deliverFactoryRuntime(
+  candidate,
+  output,
+  target,
+  epoch,
+  privatePem,
+  policy,
+  options,
+) {
+  candidate = resolve(candidate);
+  if (!(await checkFactoryInputs(candidate, target, epoch)))
+    throw new Error("runtime_factory_candidate_unapproved");
+  const receipt = await signCandidate(
+    candidate,
+    join(candidate, acceleratedSignature),
+    privatePem,
+    policy,
+    true,
+  );
+  const { profile, delivery, manifestSha256 } = await deliverRuntime(
+    candidate,
+    output,
+    privatePem,
+    policy,
+    options,
+  );
+  return {
+    ...receipt,
+    profile,
+    deliveryManifestSha256: manifestSha256,
+    parts: delivery.parts.length,
+    bytes: delivery.bytes,
+  };
+}
+
 if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
   try {
-    if (process.argv.length !== 5)
+    if (process.argv.length !== 5 && process.argv.length !== 6)
       throw new Error("runtime_factory_arguments_invalid");
+    const [candidate, target, epoch, delivery] = process.argv.slice(2);
     console.log(
       JSON.stringify(
-        await signFactoryRuntime(
-          process.argv[2],
-          process.argv[3],
-          Number(process.argv[4]),
-          await readSigningKey(),
-        ),
+        delivery
+          ? await deliverFactoryRuntime(
+              candidate,
+              delivery,
+              target,
+              Number(epoch),
+              await readSigningKey(),
+            )
+          : await signFactoryRuntime(
+              candidate,
+              target,
+              Number(epoch),
+              await readSigningKey(),
+            ),
       ),
     );
   } catch {
