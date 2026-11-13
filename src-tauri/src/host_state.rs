@@ -650,7 +650,7 @@ impl Owner {
         self.placement()
     }
     /// Package maintenance checks liveness only; this never authorizes starting or restoring a host.
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     pub(crate) fn package_idle(path: &Path) -> Result<(), String> {
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         no_activation(&root)?;
@@ -688,6 +688,30 @@ impl Owner {
             }
         }
     }
+    /// The lease an older direct host holds on this library for as long as it runs, taken
+    /// shared for the moment: none when that host never ran here.
+    fn host_lease(&self) -> Result<Option<TransientHostLease>, String> {
+        match self.root.open_with("lease.lock", &options(false)) {
+            Ok(file) => {
+                let file = file.into_std();
+                valid_file(&file)?;
+                file.try_lock_shared().map_err(|_| "host_already_owned")?;
+                Ok(Some(TransientHostLease(file)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err("host_process_state_requires_review".into()),
+        }
+    }
+    /// With this lease held: whether an older direct host still runs this library, whatever
+    /// the journal says. A lease file that cannot be read is `Unknown`.
+    pub(crate) fn older_host(&self) -> crate::manager_host::Evidence {
+        use crate::manager_host::Evidence;
+        match self.host_lease() {
+            Ok(_) => Evidence::Clear,
+            Err(code) if code == "host_already_owned" => Evidence::Running,
+            Err(_) => Evidence::Unknown,
+        }
+    }
     pub fn inspect(&mut self, id: &str, sha: &str) -> Result<Marker, String> {
         let marker = self.read()?.ok_or("host_recovery_requires_manager")?;
         self.binding(&marker, id, sha)?;
@@ -695,16 +719,7 @@ impl Owner {
             return Err("host_recovery_requires_manager".into());
         }
         // Older direct-host ownership must also be absent. The PID file is never read or adopted.
-        let _host_lease = match self.root.open_with("lease.lock", &options(false)) {
-            Ok(file) => {
-                let file = file.into_std();
-                valid_file(&file)?;
-                file.try_lock_shared().map_err(|_| "host_already_owned")?;
-                Some(TransientHostLease(file))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err("host_process_state_requires_review".into()),
-        };
+        let _host_lease = self.host_lease()?;
         let mut databases = vec![self.path.join("database")];
         if let Some(reference) = &marker.database_reference {
             databases.push(reference.resolve(&self.path)?);
