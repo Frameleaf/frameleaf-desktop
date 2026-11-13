@@ -46,13 +46,64 @@ pub(crate) async fn check_local_host_package(
         .await)
 }
 
+/// Tell Windows why this app may take time when the session ends, or withdraw that. Windows
+/// shows the reason on its shutdown screen and waits, instead of ending this app after its
+/// usual few seconds. The reason belongs to the main window: main thread only.
+#[cfg(windows)]
+fn set_shutdown_reason(app: &tauri::AppHandle, active: bool) {
+    use windows_sys::Win32::System::Shutdown::{
+        ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy,
+    };
+    let Some(window) = app
+        .get_webview_window("main")
+        .and_then(|window| window.hwnd().ok())
+    else {
+        return;
+    };
+    unsafe {
+        if active {
+            let reason: Vec<u16> = "Frameleaf is closing your photo library"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            ShutdownBlockReasonCreate(window.0 as _, reason.as_ptr());
+        } else {
+            ShutdownBlockReasonDestroy(window.0 as _);
+        }
+    }
+}
+/// Keep the session-end reason in step with whether local management is active.
+fn shutdown_reason(app: &tauri::AppHandle, view: &View) {
+    #[cfg(windows)]
+    {
+        let (handle, active) = (app.clone(), view.background_active);
+        let _ = app.run_on_main_thread(move || set_shutdown_reason(&handle, active));
+    }
+    #[cfg(not(windows))]
+    let _ = (app, view);
+}
+/// Windows is ending the session (sign-out, restart, shut down) and ends this app as soon as
+/// this returns: close the hosted library in order first. Called on the main thread.
+#[cfg(windows)]
+pub(crate) fn session_ending(app: &tauri::AppHandle) {
+    let setup = app.state::<HostSetup>();
+    if !setup.background_active() {
+        return;
+    }
+    set_shutdown_reason(app, true);
+    setup.stop_for_session_end();
+    set_shutdown_reason(app, false);
+}
 #[tauri::command]
 pub(crate) async fn local_host_status(
     window: WebviewWindow,
+    app: tauri::AppHandle,
     setup: State<'_, HostSetup>,
 ) -> Result<View, String> {
     require_local(&window)?;
-    setup.status().await
+    let view = setup.status().await?;
+    shutdown_reason(&app, &view);
+    Ok(view)
 }
 #[tauri::command]
 pub(crate) async fn prepare_local_host(
@@ -69,7 +120,9 @@ pub(crate) async fn prepare_local_host(
     {
         return Err("sign_out_before_switching_servers".into());
     }
-    setup.start(manifest_sha256).await
+    let view = setup.start(manifest_sha256).await?;
+    shutdown_reason(&app, &view);
+    Ok(view)
 }
 #[tauri::command]
 pub(crate) async fn provision_local_host_profile(
@@ -100,10 +153,13 @@ pub(crate) fn cancel_local_host_start(
 #[tauri::command]
 pub(crate) async fn stop_local_host_manager(
     window: WebviewWindow,
+    app: tauri::AppHandle,
     setup: State<'_, HostSetup>,
 ) -> Result<View, String> {
     require_local(&window)?;
-    setup.stop().await
+    let view = setup.stop().await?;
+    shutdown_reason(&app, &view);
+    Ok(view)
 }
 
 /// The quit path offered after a blocked exit: stop local management, then leave the app.
