@@ -351,6 +351,46 @@ class MetalObserverTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             other.verify(model, digest)
 
+    def test_a_model_loaded_from_memory_is_proved_by_its_digest_without_reading_the_file(
+        self,
+    ):
+        model = self.root / "model.onnx"
+        model.write_bytes(b"fixture")
+        digest = hashlib.sha256(model.read_bytes()).hexdigest()
+        observer = self.observer()
+        hashed = []
+        real = self.module.file_hash
+
+        def counting(path, limit):
+            if path == model:
+                hashed.append(path)
+            return real(path, limit)
+
+        patch.object(self.module, "file_hash", side_effect=counting).start()
+        # The session holds the approved bytes: what the file becomes no longer matters.
+        model.write_bytes(b"replaced after the session was created")
+        for _ in range(3):
+            with observer.observe(model, digest, digest):
+                pass
+        self.assertEqual(hashed, [])
+        self.assertEqual(self.native.fl_gpu_begin.call_count, 3)
+        self.assertEqual([call[1] for call in observer.calls], [digest] * 3)
+
+    def test_a_loaded_digest_other_than_the_approved_one_never_starts_a_run(self):
+        model = self.root / "model.onnx"
+        model.write_bytes(b"fixture")
+        digest = hashlib.sha256(model.read_bytes()).hexdigest()
+        for loaded in ["f" * 64, digest.upper(), digest[:-1], "", 7, digest.encode()]:
+            observer = self.observer()
+            with self.assertRaises(ValueError), observer.observe(model, digest, loaded):
+                pass
+            self.native.fl_gpu_begin.assert_not_called()
+            # A refused run leaves an observer that gives no evidence and observes nothing more.
+            with self.assertRaises(ValueError), observer.observe(model, digest, digest):
+                pass
+            with self.assertRaises(ValueError):
+                observer.evidence()
+
     @unittest.skipIf(os.name == "nt", "the collector runs on macOS; POSIX links")
     def test_a_parent_replaced_by_a_link_is_refused_on_every_call(self):
         real = self.root / "real"
