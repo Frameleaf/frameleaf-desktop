@@ -996,12 +996,22 @@ mod tests {
         report["qwenExecution"] = serde_json::json!({"build":"b11146-7fe450e19","binarySha256":binary,"coldMilliseconds":[100.0,120.0]});
         assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&binary)).is_ok());
         assert!(validate_report(&report, &spec, "binding", CPU, None, None).is_err());
-        assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&"e".repeat(64))).is_err());
+        assert!(
+            validate_report(&report, &spec, "binding", CPU, None, Some(&"e".repeat(64))).is_err()
+        );
         let mut invalid = report.clone();
         invalid["qwenExecution"]["build"] = serde_json::json!("b11146-000000000");
         assert!(validate_report(&invalid, &spec, "binding", CPU, None, Some(&binary)).is_err());
         // A Qwen candidate is CPU-only: never under an accelerated runtime's manifest.
-        assert!(validate_report(&report, &spec, "binding", "CoreMLExecutionProvider", None, Some(&binary)).is_err());
+        assert!(validate_report(
+            &report,
+            &spec,
+            "binding",
+            "CoreMLExecutionProvider",
+            None,
+            Some(&binary)
+        )
+        .is_err());
         report["qwenExecution"]["coldMilliseconds"] = serde_json::json!([100.0]);
         assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&binary)).is_err());
     }

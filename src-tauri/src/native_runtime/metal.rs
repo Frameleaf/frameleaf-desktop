@@ -209,7 +209,7 @@ mod tests {
     fn coreml_report_requires_signed_collector_and_complete_model_device_proof() {
         let (report, spec) = proof();
         let check = |report: &serde_json::Value, collector: Option<&str>| {
-            super::super::validate_report(report, &spec, &"f".repeat(64), COREML, collector)
+            super::super::validate_report(report, &spec, &"f".repeat(64), COREML, collector, None)
         };
         assert!(check(&report, Some(&"a".repeat(64))).is_ok());
         assert!(check(&report, None).is_err());
