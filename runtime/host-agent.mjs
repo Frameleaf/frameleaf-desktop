@@ -15,6 +15,8 @@ const fail = (code) => {
 const STUDIO_ENABLED = false;
 const RESTORE_SESSION = Symbol("private restore session");
 const RESTORE_VALIDATION = Symbol("private read-only restore validation");
+const CARRY_SESSION = Symbol("private carry-forward restore session");
+const CARRY_MODES = ["carry-export", "carry-restore"];
 // Read only the dedicated child IPC channel; stdout is never readiness evidence.
 export function studioReadyUntil(message, engineDigest, now = Date.now()) {
   if (!message || message.protocolVersion !== 1)
@@ -42,13 +44,14 @@ export function studioReadyUntil(message, engineDigest, now = Date.now()) {
 export function validateConfig(c) {
   if (
     !c ||
-    (c.mode !== undefined && !["server", "database", "checkpoint-cleanup", "restore-prepare"].includes(c.mode)) ||
+    (c.mode !== undefined && !["server", "database", "checkpoint-cleanup", "restore-prepare", ...CARRY_MODES].includes(c.mode)) ||
     !isAbsolute(c.state ?? "") ||
     !isAbsolute(c.runtime ?? "") ||
     c.state === c.runtime ||
     !/^[a-f0-9]{64}$/.test(c.manifestSha256) ||
     !/^[a-f0-9]{40}$/.test(c.sourceRevision) ||
-    c.postgresMajor !== "19" ||
+    // Only the one export run may name another Postgres major: it runs the previous package's own build.
+    (c.mode === "carry-export" ? typeof c.postgresMajor !== "string" || !/^[1-9][0-9]$/.test(c.postgresMajor) : c.postgresMajor !== "19") ||
     typeof c.password !== "string" ||
     c.password.length < 24 ||
     c.password.length > 512 ||
@@ -774,9 +777,13 @@ export async function readHostDatabase(profile, supplied, pathBinding) {
 /** Keep initialization and shutdown inside one validated private profile. */
 export async function runHost(c, stopping, ready, restoreSession) {
   validateConfig(c);
-  const restoreOnly = restoreSession?.[RESTORE_SESSION] === true;
+  const carryOnly = restoreSession?.[CARRY_SESSION] === true;
+  const restoreOnly = restoreSession?.[RESTORE_SESSION] === true || carryOnly;
   const validateOnly = restoreSession?.[RESTORE_VALIDATION] === true;
   if ((restoreSession !== undefined && !restoreOnly && !validateOnly) || (validateOnly && c.mode !== "database")) fail("host_restore_authority_invalid");
+  // The export run is the previous package's database and nothing else: read-only, loopback, no server.
+  const exportOnly = c.mode === "carry-export";
+  if (c.mode === "carry-restore") fail("host_carry_config_invalid");
   if (c.mode === "checkpoint-cleanup" || c.mode === "restore-prepare") {
     // Maintenance starts no original database; restore writes only a separate owned attempt.
     await checkpointDirectory(c.state);
@@ -803,7 +810,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
   if (!await isCanonicalHostPath(c.state, c.statePathBinding)) fail("host_state_not_private");
   const data = await readHostDatabase(c.state, databaseReference, c.statePathBinding);
   const selectedDatabase = databaseReference !== undefined;
-  const databaseOnly = c.mode === "database";
+  const databaseOnly = c.mode === "database" || exportOnly;
   if (!databaseOnly && !restoreOnly) await portFree(c.apiPort);
   await portFree(c.databasePort);
   if (databaseOnly) {
@@ -1038,12 +1045,16 @@ export async function runHost(c, stopping, ready, restoreSession) {
         ],
         { PGPASSWORD: c.password },
       );
+    const sql = (query) => command([executable("psql"), "-h", "127.0.0.1", "-p", String(c.databasePort), "-U", "frameleaf", "-d", "frameleaf", "-XAt", "-v", "ON_ERROR_STOP=1", "-c", query],
+      {PGPASSWORD:c.password}, false, {quiet:true, capture:true, timeout:7_200_000});
     if (restoreOnly) {
-      const input = await readHostRestoreInput(restoreSession.original, restoreSession.binding);
+      const input = carryOnly ? {dump:restoreSession.dump} : await readHostRestoreInput(restoreSession.original, restoreSession.binding);
       await command([executable("pgRestore"), "--list", input.dump], {}, false, {quiet:true, timeout:7_200_000});
       await command([executable("pgRestore"), "--no-password", "--host", "127.0.0.1", "--port", String(c.databasePort),
         "--username", "frameleaf", "--dbname", "frameleaf", "--single-transaction", "--exit-on-error", "--no-owner", "--no-acl", input.dump],
         {PGPASSWORD:c.password}, false, {quiet:true, timeout:7_200_000});
+      // Every row the previous Postgres counted must be here before the new server touches the schema.
+      if (carryOnly) restoreSession.inventory = carryInventoryMatches(restoreSession.manifest, await carryInventory(sql));
       await command([executable("node"), executable("server"), "frameleaf-admin", "restore-state"], {
         DB_HOSTNAME:"127.0.0.1", DB_PORT:String(c.databasePort), DB_USERNAME:"frameleaf", DB_PASSWORD:c.password, DB_DATABASE_NAME:"frameleaf",
         FRAMELEAF_MANAGER_ORIGIN:"restored_library", FRAMELEAF_MANAGER_INSTALLATION:restoreSession.binding.installationId,
@@ -1054,6 +1065,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
       const validation = JSON.parse(await command([executable("psql"), "-h", "127.0.0.1", "-p", String(c.databasePort), "-U", "frameleaf", "-d", "frameleaf", "-XAt", "-v", "ON_ERROR_STOP=1", "-c",
         "SELECT json_build_object('postgresMajor',current_setting('server_version_num')::int / 10000,'vectorVersion',(SELECT extversion FROM pg_extension WHERE extname='vector'),'canonical',to_regclass('public.user') IS NOT NULL AND to_regclass('public.asset') IS NOT NULL AND to_regclass('public.album') IS NOT NULL)"], {PGPASSWORD:c.password}));
       if (validation.postgresMajor !== 19 || validation.vectorVersion !== "0.8.7" || validation.canonical !== true) fail("host_restore_database_invalid");
+      if (carryOnly) restoreSession.vectorIndexes = await carryVectorIndexesUsable(sql);
       restoreSession.validation = {postgresMajor:19, vectorVersion:"0.8.7", canonical:true, executionStateReconstructed:true};
     }
     if (!databaseOnly && !restoreOnly) {
@@ -1153,7 +1165,12 @@ export async function runHost(c, stopping, ready, restoreSession) {
     ready((request) => {
       if (checkpointWork || cancelled || (app && (app.exitCode !== null || app.signalCode !== null)) || pg.exitCode !== null || pg.signalCode !== null)
         return Promise.reject(new Error("host_checkpoint_unavailable"));
-      const work = request.action === "cleanup-checkpoint"
+      // The export run answers for its own permit and nothing else.
+      if (exportOnly && !(request.action === "carry-inventory" || (request.action === "checkpoint" && request.operationId === c.carry?.permitId)))
+        return Promise.reject(new Error("host_checkpoint_unavailable"));
+      const work = request.action === "carry-inventory" && exportOnly
+        ? carryInventory(sql)
+        : request.action === "cleanup-checkpoint"
         ? cleanupHostCheckpoint(c, request.checkpoint)
         : createHostCheckpoint(c, request.operationId,
           (args, extra) => command(args, extra, false, { quiet: true, timeout: 7_200_000 }),
@@ -1220,7 +1237,7 @@ export async function runHost(c, stopping, ready, restoreSession) {
         await exited(child, 5000);
       }
     await log.close();
-    if ((restoreOnly || validateOnly) && pg && (!restoreStopped || pg.exitCode !== 0 || pg.signalCode !== null))
+    if ((restoreOnly || validateOnly || exportOnly) && pg && (!restoreStopped || pg.exitCode !== 0 || pg.signalCode !== null))
       stopError ??= new Error("host_restore_shutdown_unconfirmed");
     if (stopError) throw stopError;
   }
@@ -1239,6 +1256,27 @@ async function main() {
   process.on("SIGINT", stop);
   const config = JSON.parse(first.value);
   let checkpoint, pending, protocolFailure;
+  if (CARRY_MODES.includes(config?.mode)) {
+    // One run to completion: the only thing the owner may say is stop.
+    void (async () => {
+      for await (const line of { [Symbol.asyncIterator]: () => lines }) {
+        if (line !== "stop") protocolFailure = "host_control_command_invalid";
+        break;
+      }
+      stop();
+    })();
+    try {
+      await (config.mode === "carry-export" ? carryHostExport : carryHostRestore)(config, stopping);
+      if (protocolFailure) fail(protocolFailure);
+      process.stdout.write(JSON.stringify({ state: config.mode === "carry-export" ? "carry-exported" : "carry-restored" }) + "\n");
+      await stopping;
+      if (protocolFailure) fail(protocolFailure);
+    } finally {
+      input.close();
+      process.stdin.pause();
+    }
+    return;
+  }
   void (async () => {
     for await (const line of { [Symbol.asyncIterator]: () => lines }) {
       if (line === "stop") {
@@ -1642,5 +1680,354 @@ export async function validateHostRestoreTarget(configuration, supplied, stoppin
   } catch (error) {
     if (cancelled || error?.message === "host_restore_cancelled") fail("host_restore_cancelled");
     fail("host_restore_canonical_invalid");
+  }
+}
+
+
+// Carrying a library across companion packages. The previous package's Postgres runs once,
+// read-only, to write a verified export; the new package restores it into a fresh directory
+// beside the original. Nothing here selects a database, and the original database directory
+// and the photo files are never written, moved or removed.
+const CARRY_EXPORT_MARGIN = 256 * 1024 * 1024, CARRY_RESTORE_MARGIN = 1536 * 1024 * 1024, CARRY_RECORD_LIMIT = 1024 * 1024;
+const carryDigest = (value, length) => typeof value === "string" && value.length === length && /^[a-f0-9]+$/.test(value);
+const carryVersion = value => typeof value === "string" && /^[0-9][0-9A-Za-z.]{0,31}$/.test(value);
+const carryKeys = (value, keys) => Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join(",") === keys;
+function carryConfig(c) {
+  const carry = c.carry;
+  if (!carry || typeof carry !== "object" || typeof carry.permitId !== "string" || !CHECKPOINT_ID.test(carry.permitId) || !carryDigest(carry.libraryId, 12))
+    fail("host_carry_config_invalid");
+  if (c.mode === "carry-export" ? !carryKeys(carry, "libraryId,permitId,target") || !carryKeys(carry.target, "manifestSha256,postgresVersion,vectorVersion") ||
+      !carryDigest(carry.target.manifestSha256, 64) || carry.target.manifestSha256 === c.manifestSha256 ||
+      !carryVersion(carry.target.postgresVersion) || !carryVersion(carry.target.vectorVersion)
+    : c.mode !== "carry-restore" || !carryKeys(carry, "libraryId,permitId,source") || !carryKeys(carry.source, "manifestSha256,postgresMajor,sourceRevision") ||
+      !carryDigest(carry.source.manifestSha256, 64) || carry.source.manifestSha256 === c.manifestSha256 || !carryDigest(carry.source.sourceRevision, 40) ||
+      // A dump is only ever read by the same or a newer Postgres.
+      typeof carry.source.postgresMajor !== "string" || !/^[1-9][0-9]$/.test(carry.source.postgresMajor) || Number(carry.source.postgresMajor) > Number(c.postgresMajor))
+    fail("host_carry_config_invalid");
+  return structuredClone(carry);
+}
+async function carryPaths(c, permitId, create) {
+  await checkpointDirectory(c.state);
+  const root = join(c.state, "carry-forward"), directory = join(root, permitId);
+  for (const path of [root, directory]) await checkpointDirectory(path, create);
+  for (const path of [c.state, root, directory]) if (!await isCanonicalHostPath(path, c.statePathBinding)) fail("host_carry_record_invalid");
+  return { directory, exportRecord: join(directory, "export.json"), restoreRecord: join(directory, "restore.json"), checkpoint: join(c.state, "checkpoints", permitId) };
+}
+/** Display only: which step is under way. It is never read back as evidence of anything. */
+async function carryProgress(paths, step) {
+  await fs.writeFile(join(paths.directory, "progress"), step, { mode: 0o600 }).catch(() => {});
+}
+async function carryJson(path, pathBinding) {
+  const identity = await checkpointIdentity(path, false, pathBinding), before = await checkpointHash(path, () => {}, CARRY_RECORD_LIMIT);
+  const raw = await stateFile(path, CARRY_RECORD_LIMIT);
+  if (Buffer.byteLength(raw) !== before.bytes || createHash("sha256").update(raw).digest("hex") !== before.sha256 ||
+    await checkpointIdentity(path, false, pathBinding) !== identity) fail("host_carry_record_invalid");
+  return { value: JSON.parse(raw), sha256: before.sha256 };
+}
+/** Publish a record whole or not at all; a leftover partial is this function's own and is replaced. */
+async function carryWrite(directory, name, value) {
+  const partial = join(directory, "." + name + ".partial");
+  try {
+    const meta = await fs.lstat(partial);
+    if (!meta.isFile() || meta.isSymbolicLink() || meta.nlink !== 1) fail("host_carry_record_invalid");
+    await fs.unlink(partial);
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const file = await fs.open(partial, "wx", 0o600);
+  try { await file.writeFile(JSON.stringify(value) + "\n"); await file.sync(); } finally { await file.close(); }
+  await fs.rename(partial, join(directory, name));
+  await checkpointSyncDirectory(directory);
+}
+
+const CARRY_INVENTORY = `SELECT json_build_object(
+  'postgresVersion', current_setting('server_version'),
+  'postgresVersionNum', current_setting('server_version_num')::int,
+  'vectorVersion', (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
+  'extensions', (SELECT coalesce(json_agg(json_build_object('name', extname, 'version', extversion) ORDER BY extname), '[]'::json) FROM pg_extension WHERE extname <> 'plpgsql'),
+  'tables', (SELECT coalesce(json_agg(json_build_object('name', t.s || '.' || t.n, 'rows', t.c) ORDER BY t.s, t.n), '[]'::json) FROM (
+    SELECT schemaname s, tablename n, (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, tablename), false, true, '')))[1]::text::bigint c
+    FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema')) t),
+  'vectorIndexes', (SELECT coalesce(json_agg(json_build_object('name', n.nspname || '.' || i.relname, 'method', am.amname, 'valid', x.indisvalid AND x.indisready) ORDER BY n.nspname, i.relname), '[]'::json)
+    FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace JOIN pg_am am ON am.oid = i.relam
+    WHERE am.amname IN ('hnsw', 'ivfflat')))`;
+function carryInventoryRecord(value) {
+  const name = text => typeof text === "string" && text.length > 0 && text.length <= 200 && !/[\0\r\n]/.test(text);
+  const list = (items, keys, valid) => Array.isArray(items) && items.length <= 10_000 && items.every(item => carryKeys(item, keys) && valid(item)) &&
+    new Set(items.map(item => item.name)).size === items.length;
+  if (!carryKeys(value, "extensions,postgresVersion,postgresVersionNum,tables,vectorIndexes,vectorVersion") ||
+    !carryVersion(value.postgresVersion) || !Number.isSafeInteger(value.postgresVersionNum) || value.postgresVersionNum < 100000 || !carryVersion(value.vectorVersion) ||
+    !list(value.extensions, "name,version", item => name(item.name) && name(item.version)) ||
+    !list(value.tables, "name,rows", item => name(item.name) && Number.isSafeInteger(item.rows) && item.rows >= 0) || value.tables.length === 0 ||
+    !list(value.vectorIndexes, "method,name,valid", item => name(item.name) && ["hnsw", "ivfflat"].includes(item.method) && typeof item.valid === "boolean"))
+    fail("host_carry_inventory_invalid");
+  return structuredClone(value);
+}
+async function carryInventory(sql) {
+  return carryInventoryRecord(JSON.parse(await sql(CARRY_INVENTORY)));
+}
+/** Exact table set and exact row counts; every extension and vector index the source had is present and valid. */
+function carryInventoryMatches(manifest, actual) {
+  if (!isDeepStrictEqual(actual.tables, manifest.tables) ||
+    manifest.extensions.some(expected => !actual.extensions.some(item => item.name === expected.name)) ||
+    manifest.vectorIndexes.some(expected => !actual.vectorIndexes.some(item => item.name === expected.name && item.method === expected.method && item.valid === true)))
+    fail("host_carry_counts_mismatch");
+  return { tables: actual.tables.length, rows: actual.tables.reduce((sum, item) => sum + item.rows, 0) };
+}
+const CARRY_VECTOR_INDEXES = `SELECT coalesce(json_agg(json_build_object('name', n.nspname || '.' || i.relname, 'index', i.relname,
+  'table', format('%I.%I', tn.nspname, t.relname), 'column', format('%I', a.attname), 'valid', x.indisvalid AND x.indisready,
+  'operator', CASE WHEN oc.opcname LIKE '%cosine_ops' THEN '<=>' WHEN oc.opcname LIKE '%l2_ops' THEN '<->' WHEN oc.opcname LIKE '%ip_ops' THEN '<#>' WHEN oc.opcname LIKE '%l1_ops' THEN '<+>' END)
+  ORDER BY n.nspname, i.relname), '[]'::json)
+  FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace JOIN pg_am am ON am.oid = i.relam
+  JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tn ON tn.oid = t.relnamespace
+  JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.indkey[0] JOIN pg_opclass oc ON oc.oid = x.indclass[0]
+  WHERE am.amname IN ('hnsw', 'ivfflat')`;
+/** After the new server's migrations: every vector index is valid, and one with rows answers a nearest-neighbour query through the index. */
+async function carryVectorIndexesUsable(sql) {
+  const indexes = JSON.parse(await sql(CARRY_VECTOR_INDEXES));
+  if (!Array.isArray(indexes) || indexes.length > 1000) fail("host_carry_restore_invalid");
+  let searched = 0;
+  for (const item of indexes) {
+    if (!carryKeys(item, "column,index,name,operator,table,valid") || item.valid !== true || [item.index, item.table, item.column].some(text => typeof text !== "string" || !text || /[\0\r\n;]/.test(text)))
+      fail("host_carry_restore_invalid");
+    if (!["<=>", "<->", "<#>", "<+>"].includes(item.operator)) continue;
+    if ((await sql(`SELECT count(*) FROM (SELECT 1 FROM ${item.table} WHERE ${item.column} IS NOT NULL LIMIT 1) q`)).trim() !== "1") continue;
+    const output = await sql(`SELECT set_config('enable_seqscan', 'off', false); EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 FROM ${item.table} ORDER BY ${item.column} ${item.operator} (SELECT ${item.column} FROM ${item.table} WHERE ${item.column} IS NOT NULL LIMIT 1) LIMIT 1`);
+    const plan = JSON.parse(output.slice(output.indexOf("[")))[0]?.Plan;
+    const uses = node => Boolean(node) && (node["Index Name"] === item.index || (node.Plans ?? []).some(uses));
+    if (!plan || plan["Actual Rows"] !== 1 || !uses(plan)) fail("host_carry_restore_invalid");
+    searched++;
+  }
+  return { present: indexes.length, searched };
+}
+
+async function carryDirectoryBytes(path) {
+  try {
+    let bytes = 0, entries = 0;
+    const pending = [path];
+    while (pending.length) {
+      const current = pending.pop(), meta = await fs.lstat(current);
+      if (++entries > 2_000_000) throw Error();
+      if (meta.isDirectory()) for (const name of await fs.readdir(current)) pending.push(join(current, name));
+      else bytes += meta.size;
+    }
+    return bytes;
+  } catch { fail("host_carry_space_unknown"); }
+}
+/** Room that cannot be measured is room that is not there. */
+async function carrySpace(path, required) {
+  let free;
+  try {
+    const volume = await fs.statfs(path, { bigint: true });
+    free = volume.bavail * volume.bsize;
+  } catch { fail("host_carry_space_unknown"); }
+  if (free < BigInt(required)) fail("host_carry_space_insufficient");
+}
+function carryExportRecord(value) {
+  if (!carryKeys(value, "checkpoint,extensions,libraryId,permitId,schemaVersion,source,tables,target,vectorIndexes") || value.schemaVersion !== 1 ||
+    typeof value.permitId !== "string" || !CHECKPOINT_ID.test(value.permitId) || !carryDigest(value.libraryId, 12) ||
+    !carryKeys(value.source, "manifestSha256,postgresMajor,postgresVersion,sourceRevision,vectorVersion") ||
+    !carryDigest(value.source.manifestSha256, 64) || !carryDigest(value.source.sourceRevision, 40) ||
+    typeof value.source.postgresMajor !== "string" || !/^[1-9][0-9]$/.test(value.source.postgresMajor) ||
+    !carryVersion(value.source.postgresVersion) || !carryVersion(value.source.vectorVersion) ||
+    !carryKeys(value.target, "manifestSha256,postgresVersion,vectorVersion") || !carryDigest(value.target.manifestSha256, 64) ||
+    !carryVersion(value.target.postgresVersion) || !carryVersion(value.target.vectorVersion))
+    fail("host_carry_export_invalid");
+  const inventory = carryInventoryRecord({ postgresVersion: value.source.postgresVersion, postgresVersionNum: Number(value.source.postgresMajor) * 10000,
+    vectorVersion: value.source.vectorVersion, extensions: value.extensions, tables: value.tables, vectorIndexes: value.vectorIndexes });
+  const checkpoint = retirementReceipt({ manifestSha256: value.source.manifestSha256, sourceRevision: value.source.sourceRevision, postgresMajor: value.source.postgresMajor }, value.checkpoint);
+  if (checkpoint.operationId !== value.permitId) fail("host_carry_export_invalid");
+  return { schemaVersion: 1, permitId: value.permitId, libraryId: value.libraryId, source: { ...value.source }, target: { ...value.target }, checkpoint,
+    extensions: inventory.extensions, tables: inventory.tables, vectorIndexes: inventory.vectorIndexes };
+}
+/** The record, the receipt beside the dump and the dump's bytes must all still agree; absent means no export yet. */
+async function readCarryExport(c, carry, paths, check = () => {}) {
+  try {
+    await fs.lstat(paths.exportRecord);
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    fail("host_carry_export_invalid");
+  }
+  try {
+    const { value, sha256 } = await carryJson(paths.exportRecord, c.statePathBinding), record = carryExportRecord(value);
+    const source = c.mode === "carry-export" ? { manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor } : carry.source;
+    if (record.permitId !== carry.permitId || record.libraryId !== carry.libraryId ||
+      Object.entries(source).some(([key, item]) => record.source[key] !== item) ||
+      (c.mode === "carry-export" ? !isDeepStrictEqual(record.target, carry.target) : record.target.manifestSha256 !== c.manifestSha256) ||
+      (await fs.readdir(paths.checkpoint)).sort().join(",") !== "checkpoint.json,database.dump")
+      fail("host_carry_export_invalid");
+    const receipt = await checkpointReceipt(paths.checkpoint, { ...c, ...source }, carry.permitId, check);
+    if (!isDeepStrictEqual(receipt, record.checkpoint)) fail("host_carry_export_invalid");
+    return { state: "carry-exported", exportSha256: sha256, record, dump: join(paths.checkpoint, "database.dump") };
+  } catch (error) {
+    if (error?.message === "host_carry_cancelled") throw error;
+    fail("host_carry_export_invalid");
+  }
+}
+
+/** The one export run: the previous package's Postgres, read-only on loopback, no server; then it stops. */
+export async function carryHostExport(configuration, stopping) {
+  const c = { ...configuration, entryPoints: { ...configuration.entryPoints } };
+  let cancelled = false;
+  void stopping.then(() => { cancelled = true; });
+  const check = () => { if (cancelled) fail("host_carry_cancelled"); };
+  try {
+    validateConfig(c);
+    if (c.mode !== "carry-export") fail("host_carry_config_invalid");
+    const carry = carryConfig(c), paths = await carryPaths(c, carry.permitId, true);
+    // A complete export is the permit used: it is read back, and the previous Postgres is not started again.
+    const existing = await readCarryExport(c, carry, paths, check);
+    if (existing) return existing;
+    check();
+    const database = await readHostDatabase(c.state, c.databaseReference === undefined ? undefined : structuredClone(c.databaseReference), c.statePathBinding);
+    await carrySpace(c.state, await carryDirectoryBytes(database) + CARRY_EXPORT_MARGIN);
+    check();
+    await carryProgress(paths, "export");
+    let finish, result, failure;
+    const finished = new Promise(resolve => { finish = resolve; });
+    await runHost(c, Promise.race([stopping, finished]), handler => {
+      void (async () => {
+        const inventory = await handler({ action: "carry-inventory" });
+        result = { inventory, checkpoint: await handler({ action: "checkpoint", operationId: carry.permitId }) };
+      })().catch(error => { failure = error; }).finally(finish);
+    });
+    check();
+    if (failure) throw failure;
+    if (!result || String(Math.floor(result.inventory.postgresVersionNum / 10000)) !== c.postgresMajor) fail("host_carry_export_failed");
+    await carryWrite(paths.directory, "export.json", { schemaVersion: 1, permitId: carry.permitId, libraryId: carry.libraryId,
+      source: { manifestSha256: c.manifestSha256, sourceRevision: c.sourceRevision, postgresMajor: c.postgresMajor,
+        postgresVersion: result.inventory.postgresVersion, vectorVersion: result.inventory.vectorVersion },
+      target: carry.target, checkpoint: result.checkpoint, extensions: result.inventory.extensions, tables: result.inventory.tables,
+      vectorIndexes: result.inventory.vectorIndexes });
+    return await readCarryExport(c, carry, paths, check) ?? fail("host_carry_export_failed");
+  } catch (error) {
+    if (cancelled) fail("host_carry_cancelled");
+    if (/^host_carry_[a-z_]+$/.test(error?.message)) throw error;
+    fail("host_carry_export_failed");
+  }
+}
+
+function carryRestoreReceipt(value) {
+  const identity = text => typeof text === "string" && text.length <= 128 && /^[0-9]+:[0-9]+$/.test(text);
+  const count = number => Number.isSafeInteger(number) && number >= 0;
+  if (!carryKeys(value, "attemptId,databaseIdentity,exportSha256,permitId,profileIdentity,schemaVersion,state,targetIdentity,validation") ||
+    value.schemaVersion !== 1 || value.state !== "carry-restored" || ![value.permitId, value.attemptId].every(id => typeof id === "string" && CHECKPOINT_ID.test(id)) ||
+    ![value.profileIdentity, value.targetIdentity, value.databaseIdentity].every(identity) || !carryDigest(value.exportSha256, 64) ||
+    !carryKeys(value.validation, "canonical,executionStateReconstructed,offlineChecksums,postgresMajor,rows,schemaValidated,tables,vectorIndexes,vectorIndexesSearched,vectorVersion") ||
+    value.validation.postgresMajor !== 19 || value.validation.vectorVersion !== "0.8.7" ||
+    ["canonical", "executionStateReconstructed", "offlineChecksums", "schemaValidated"].some(key => value.validation[key] !== true) ||
+    !["rows", "tables", "vectorIndexes", "vectorIndexesSearched"].every(key => count(value.validation[key])))
+    fail("host_carry_target_invalid");
+  return structuredClone(value);
+}
+/** A finished restore is reused only while its directory is exactly what the receipt names; absent means none yet. */
+async function readCarryRestore(c, carry, paths, exported) {
+  try {
+    await fs.lstat(paths.restoreRecord);
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    fail("host_carry_target_invalid");
+  }
+  try {
+    const receipt = carryRestoreReceipt((await carryJson(paths.restoreRecord, c.statePathBinding)).value);
+    const target = join(c.state, "restore-targets", carry.permitId, receipt.attemptId), database = join(target, "database");
+    if (receipt.permitId !== carry.permitId || receipt.exportSha256 !== exported.exportSha256 ||
+      await checkpointIdentity(c.state, true, c.statePathBinding) !== receipt.profileIdentity ||
+      await checkpointIdentity(target, true, c.statePathBinding) !== receipt.targetIdentity ||
+      await checkpointIdentity(database, true, c.statePathBinding) !== receipt.databaseIdentity ||
+      !isDeepStrictEqual((await carryJson(join(target, "carry-result.json"), c.statePathBinding)).value, receipt) ||
+      (await stateFile(join(database, "PG_VERSION"), 16)).trim() !== c.postgresMajor)
+      fail("host_carry_target_invalid");
+    try {
+      await fs.lstat(join(database, "postmaster.pid"));
+      fail("host_carry_target_invalid");
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+    return receipt;
+  } catch { fail("host_carry_target_invalid"); }
+}
+async function carryOfflineChecksums(c, database, check) {
+  const tool = c.entryPoints.pgChecksums;
+  if (typeof tool !== "string" || tool.includes("\\") || tool.includes(":") || tool.split("/").some(part => !part || part === "." || part === "..") ||
+    basename(tool) !== "pg_checksums" + (process.platform === "win32" ? ".exe" : "")) fail("host_carry_restore_invalid");
+  let failed = false;
+  // pg_checksums appends forward slashes, which Windows extended paths cannot contain.
+  const child = spawn(join(c.runtime, tool), ["--check", "--pgdata", "."], { cwd: database, env: hostEnvironment(c), stdio: "ignore", windowsHide: true });
+  child.on("error", () => { failed = true; });
+  try {
+    while (!(await exited(child, 100))) check();
+  } finally {
+    if (!(await exited(child, 0))) { child.kill("SIGKILL"); await exited(child, 5000); }
+  }
+  if (failed || child.exitCode !== 0 || child.signalCode !== null) fail("host_carry_restore_invalid");
+}
+
+/** Restore the export into a fresh directory with the new package and prove it; the journal decides whether to use it. */
+export async function carryHostRestore(configuration, stopping) {
+  const c = { ...configuration, entryPoints: { ...configuration.entryPoints } };
+  let cancelled = false;
+  void stopping.then(() => { cancelled = true; });
+  const check = () => { if (cancelled) fail("host_carry_cancelled"); };
+  try {
+    validateConfig(c);
+    if (c.mode !== "carry-restore") fail("host_carry_config_invalid");
+    const carry = carryConfig(c), paths = await carryPaths(c, carry.permitId, false);
+    const exported = await readCarryExport(c, carry, paths, check) ?? fail("host_carry_export_invalid");
+    const prior = await readCarryRestore(c, carry, paths, exported);
+    if (prior) return prior;
+    check();
+    const original = await readHostDatabase(c.state, c.databaseReference === undefined ? undefined : structuredClone(c.databaseReference), c.statePathBinding);
+    await carrySpace(c.state, await carryDirectoryBytes(original) + CARRY_RESTORE_MARGIN);
+    check();
+    const profileIdentity = await checkpointIdentity(c.state, true, c.statePathBinding);
+    const root = join(c.state, "restore-targets"), operationRoot = join(root, carry.permitId);
+    for (const path of [root, operationRoot]) {
+      await checkpointDirectory(path, true);
+      if (!await isCanonicalHostPath(path, c.statePathBinding)) fail("host_carry_target_invalid");
+    }
+    const attemptId = randomUUID(), target = join(operationRoot, attemptId), database = join(target, "database");
+    await fs.mkdir(target, { mode: 0o700 });
+    const targetIdentity = await checkpointIdentity(target, true, c.statePathBinding);
+    const inner = { ...c, state: target, mode: "server", databaseReference: undefined, carry: undefined };
+    await claimState(inner);
+    const record = await fs.open(join(target, "carry-target.json"), "wx", 0o600);
+    try {
+      await record.writeFile(JSON.stringify({ schemaVersion: 1, permitId: carry.permitId, attemptId, profileIdentity, targetIdentity, exportSha256: exported.exportSha256 }) + "\n");
+      await record.sync();
+    } finally { await record.close(); }
+    for (const path of [target, operationRoot, root]) await checkpointSyncDirectory(path);
+    check();
+    const binding = { installationId: carry.libraryId, operationId: carry.permitId };
+    const session = { [CARRY_SESSION]: true, original: c, binding, dump: exported.dump, manifest: exported.record };
+    await carryProgress(paths, "restore");
+    let finish, prepared = false;
+    const finished = new Promise(resolve => { finish = resolve; });
+    await runHost(inner, Promise.race([stopping, finished]), () => { prepared = true; finish(); }, session);
+    check();
+    if (!prepared || !session.validation || !session.inventory || !session.vectorIndexes) fail("host_carry_restore_failed");
+    await carryProgress(paths, "verify");
+    await carryOfflineChecksums(c, database, check);
+    // The new server inspects its own schema with the database read-only, as after any restore.
+    const validation = { [RESTORE_VALIDATION]: true, original: c, prepared: { binding } };
+    let finishValidation, validated = false;
+    const validationFinished = new Promise(resolve => { finishValidation = resolve; });
+    await runHost({ ...inner, mode: "database" }, Promise.race([stopping, validationFinished]), () => { validated = true; finishValidation(); }, validation);
+    check();
+    if (!validated || validation.validated !== true) fail("host_carry_restore_invalid");
+    await carryOfflineChecksums(c, database, check);
+    const unchanged = await readCarryExport(c, carry, paths, check);
+    if (unchanged?.exportSha256 !== exported.exportSha256 || await checkpointIdentity(c.state, true, c.statePathBinding) !== profileIdentity ||
+      await checkpointIdentity(target, true, c.statePathBinding) !== targetIdentity) fail("host_carry_target_invalid");
+    const receipt = carryRestoreReceipt({ schemaVersion: 1, state: "carry-restored", permitId: carry.permitId, attemptId, profileIdentity, targetIdentity,
+      databaseIdentity: await checkpointIdentity(database, true, c.statePathBinding), exportSha256: exported.exportSha256,
+      validation: { ...session.validation, tables: session.inventory.tables, rows: session.inventory.rows, vectorIndexes: session.vectorIndexes.present,
+        vectorIndexesSearched: session.vectorIndexes.searched, offlineChecksums: true, schemaValidated: true } });
+    check();
+    const result = await fs.open(join(target, "carry-result.json"), "wx", 0o600);
+    try { await result.writeFile(JSON.stringify(receipt) + "\n"); await result.sync(); } finally { await result.close(); }
+    await checkpointSyncDirectory(target);
+    await carryWrite(paths.directory, "restore.json", receipt);
+    return receipt;
+  } catch (error) {
+    if (cancelled) fail("host_carry_cancelled");
+    if (/^host_carry_[a-z_]+$/.test(error?.message)) throw error;
+    fail("host_carry_restore_failed");
   }
 }
