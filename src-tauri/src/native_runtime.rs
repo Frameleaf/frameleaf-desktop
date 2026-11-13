@@ -609,8 +609,14 @@ impl VerifiedRuntime {
         {
             // Windows needs its OS directory for platform DLL discovery, never an inherited PATH.
             if let Some(root) = std::env::var_os("SystemRoot") {
-                command.env("PATH", Path::new(&root).join("System32"));
-                command.env("SystemRoot", root);
+                let mut folders = Vec::new();
+                for folder in device_library_folders(
+                    self.provider(),
+                    self.manifest.files.keys().map(String::as_str),
+                ) {
+                    folders.push(self.root.join(relative(&folder)?));
+                }
+                command.envs(windows_environment(&root, &scratch, &folders)?);
             }
         }
         crate::process_tree::configure(&mut command);
@@ -650,6 +656,62 @@ impl VerifiedRuntime {
             .map_err(|_| "runtime_gate_failed")?;
         Ok(owner)
     }
+}
+
+/// FD-63: the folders of a CUDA pack that hold the NVIDIA wheels' Windows libraries
+/// (`.../site-packages/nvidia/<component>/bin`), relative to the payload.
+///
+/// onnxruntime opens a fixed list of them by full path before a session is created. The rest are
+/// opened later by name, by NVIDIA's own libraries: cuDNN's convolution library, the run-time
+/// compiler cuDNN and cuFFT use, cuFFT's linker. Windows looks for a library named that way in
+/// the program's folder, the OS directory and `PATH`, none of which is inside the pack.
+#[cfg(any(windows, test))]
+fn device_library_folders<'a>(
+    provider: &str,
+    files: impl Iterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut folders = BTreeSet::new();
+    if provider != "CUDAExecutionProvider" {
+        return folders;
+    }
+    for name in files {
+        let parts: Vec<&str> = name.split('/').collect();
+        let count = parts.len();
+        if count >= 5
+            && parts[count - 1].to_ascii_lowercase().ends_with(".dll")
+            && parts[count - 2] == "bin"
+            && parts[count - 4] == "nvidia"
+            && parts[count - 5] == "site-packages"
+        {
+            folders.insert(parts[..count - 1].join("/"));
+        }
+    }
+    folders
+}
+
+/// What a runtime process gets on Windows besides the variables every platform sets.
+///
+/// `PATH`: the OS directory, then (FD-63) the pack's own NVIDIA library folders, signed and
+/// verified before this point; never an inherited `PATH`. `USERPROFILE` (FD-63): the runtime's
+/// settings name a default folder under the home directory when they are imported, and Python on
+/// Windows has no home directory without this variable, so the import failed and nothing
+/// qualified. The process's own scratch stands in; the user's profile stays out of reach.
+#[cfg(any(windows, test))]
+fn windows_environment(
+    system_root: &std::ffi::OsStr,
+    scratch: &Path,
+    library_folders: &[PathBuf],
+) -> Result<[(&'static str, std::ffi::OsString); 3], String> {
+    let mut search = vec![Path::new(system_root).join("System32")];
+    search.extend(library_folders.iter().cloned());
+    Ok([
+        (
+            "PATH",
+            std::env::join_paths(search).map_err(|_| "runtime_path_invalid")?,
+        ),
+        ("SystemRoot", system_root.to_owned()),
+        ("USERPROFILE", scratch.as_os_str().to_owned()),
+    ])
 }
 
 enum Invocation<'a> {
@@ -703,6 +765,20 @@ impl VerifiedRuntime {
         spec: &[u8],
         fixture: &[u8],
         cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<QualifiedRuntime, String> {
+        self.qualify_explained(cache, private_root, spec, fixture, cancel, &mut None)
+    }
+    /// `qualify`, also handing back what a refusing process wrote as its reason (`refusal`), so
+    /// FD-63's hardware evidence can tell the runtime's own refusal from a process that crashed
+    /// or wrote nothing: both are `runtime_qualification_failed` to the caller.
+    pub(crate) fn qualify_explained(
+        &self,
+        cache: &Path,
+        private_root: &Path,
+        spec: &[u8],
+        fixture: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
+        refused: &mut Option<String>,
     ) -> Result<QualifiedRuntime, String> {
         use std::{
             sync::atomic::Ordering,
@@ -792,7 +868,8 @@ impl VerifiedRuntime {
         if !child.exit_status.is_some_and(|status| status.success()) {
             // FD-56: the process leaves its reason in the report it could not pass. Say it, so
             // a refusal is never silent; the code the caller acts on stays the same.
-            if let Some(why) = refusal(&child.scratch.join("report.json")) {
+            *refused = refusal(&child.scratch.join("report.json"));
+            if let Some(why) = refused {
                 eprintln!("runtime qualification refused: {why}");
             }
             return Err("runtime_qualification_failed".into());
@@ -1071,6 +1148,81 @@ mod tests {
             assert_eq!(refusal(&report), None, "{bad}");
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_cuda_pack_puts_the_folders_of_its_nvidia_libraries_on_the_search_path() {
+        let files = [
+            "python/python.exe",
+            "python/Lib/site-packages/onnxruntime/capi/onnxruntime_providers_cuda.dll",
+            "python/Lib/site-packages/nvidia/cudnn/bin/cudnn64_9.dll",
+            "python/Lib/site-packages/nvidia/cudnn/bin/cudnn_cnn64_9.DLL",
+            "python/Lib/site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll",
+            "python/Lib/site-packages/nvidia/cudnn/include/cudnn.h",
+            "python/Lib/site-packages/other/nvidia/x/bin/planted.dll",
+            "nvidia/cudnn/bin/outside.dll",
+        ];
+        let folders = |provider| {
+            device_library_folders(provider, files.iter().copied())
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            folders("CUDAExecutionProvider"),
+            [
+                "python/Lib/site-packages/nvidia/cuda_nvrtc/bin",
+                "python/Lib/site-packages/nvidia/cudnn/bin"
+            ]
+        );
+        // The processor manifest of the same pack, and every other provider, keep the OS directory alone.
+        for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"] {
+            assert!(folders(provider).is_empty(), "{provider}");
+        }
+    }
+    #[test]
+    fn a_windows_runtime_searches_the_os_directory_then_the_pack_and_has_a_home() {
+        let scratch = Path::new("scratch folder");
+        let folders = [PathBuf::from("pack").join("cudnn"), PathBuf::from("nvrtc")];
+        let environment =
+            windows_environment(std::ffi::OsStr::new("root"), scratch, &folders).unwrap();
+        let search: Vec<PathBuf> = std::env::split_paths(&environment[0].1).collect();
+        assert_eq!(environment[0].0, "PATH");
+        assert_eq!(
+            search,
+            [
+                Path::new("root").join("System32"),
+                folders[0].clone(),
+                folders[1].clone()
+            ]
+        );
+        assert_eq!(environment[1], ("SystemRoot", "root".into()));
+        assert_eq!(environment[2], ("USERPROFILE", scratch.into()));
+    }
+    /// Python on Windows finds no home directory in an emptied environment; the runtime's
+    /// settings ask for one when they are imported.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_runtime_process_can_name_its_home_directory() {
+        use std::process::Command;
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        let home = |with: bool| {
+            let mut command = Command::new("python");
+            command
+                .env_clear()
+                .args(["-I", "-B", "-c"])
+                .arg("from pathlib import Path; Path.home()");
+            for (name, value) in windows_environment(&root, &scratch, &[]).unwrap() {
+                if with || name != "USERPROFILE" {
+                    command.env(name, value);
+                }
+            }
+            // The hosted Python is found through the inherited PATH, which a pack never needs.
+            let python = std::env::var_os("PATH").unwrap();
+            command.env("PATH", python);
+            command.output().unwrap().status.success()
+        };
+        assert!(!home(false), "the environment before FD-63 had a home");
+        assert!(home(true));
     }
     fn report_for(provider: &str, state: &str, cpu_nodes: bool) -> [serde_json::Value; 2] {
         let mut nodes = serde_json::json!({ provider: 12 });

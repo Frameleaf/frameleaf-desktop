@@ -21,7 +21,16 @@ use std::{
 pub(crate) const CPU: &str = "CPUExecutionProvider";
 pub(crate) const ACCELERATED_MANIFEST: &str = "manifest-accelerated.json";
 pub(crate) const ACCELERATED_SIGNATURE: &str = "manifest-accelerated.sig";
-const ACCELERATED_STORE: &str = "runtimes-accelerated";
+#[cfg(not(windows))]
+pub(crate) const ACCELERATED_STORE: &str = "runtimes-accelerated";
+/// FD-63: Windows opens a library only below 260 characters, and an installed release already
+/// spends about 150 of them on the profile, this store and the release's own name. With the long
+/// name, a library the runtime cannot do without (numpy's OpenBLAS, 93 characters inside the
+/// pack) fell beyond the limit for a profile folder of 18 characters or more. No Windows
+/// installation has an accelerated store yet, so the short name moves nothing.
+/// `tools/check_windows_cuda_libraries.py` holds every pack to the same arithmetic.
+#[cfg(windows)]
+pub(crate) const ACCELERATED_STORE: &str = "gpu";
 const REMEMBERED: &str = "provider-failures.json";
 /// How Windows names an Intel or NVIDIA display adapter (the PCI vendor of its hardware id).
 const INTEL_ADAPTER: &str = "pci\\ven_8086&";
@@ -158,6 +167,48 @@ pub(crate) fn device_eligible(provider: &str, os: &str, arch: &str, probe: &dyn 
             .any(|(adapter, _)| adapter.starts_with(INTEL_ADAPTER)),
         _ => false,
     }
+}
+
+/// FD-63: the oldest NVIDIA driver for Windows that runs any CUDA 12 (NVIDIA's release notes:
+/// 527.41 for CUDA 12.0). The pack's CUDA is 12.x, so no older driver can run it.
+const CUDA_MINIMUM_WINDOWS_DRIVER: (u32, u32) = (527, 41);
+
+/// NVIDIA's own driver version (`560.94`) from the version Windows records for the driver
+/// (`32.0.15.6094`): the last five digits of its third and fourth fields.
+fn nvidia_driver(version: &str) -> Option<(u32, u32)> {
+    let fields: Vec<&str> = version.trim().split('.').collect();
+    if fields.len() != 4
+        || fields
+            .iter()
+            .any(|field| field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()))
+        || fields[2].len() > 4
+        || fields[3].len() > 4
+    {
+        return None;
+    }
+    let digits = format!("{}{:0>4}", fields[2], fields[3]);
+    let tail = digits.get(digits.len().checked_sub(5)?..)?;
+    Some((tail[..3].parse().ok()?, tail[3..].parse().ok()?))
+}
+
+/// FD-63: whether the NVIDIA driver installed on Windows is known to be too old for the pack's
+/// CUDA. Only a version that is read and understood can say so: with no NVIDIA adapter listed,
+/// or a version in another form, the answer is no and qualification decides as before. One
+/// adapter with a driver that is new enough is enough.
+pub(crate) fn driver_outdated(provider: &str, os: &str, probe: &dyn Probe) -> bool {
+    if (provider, os) != ("CUDAExecutionProvider", "windows") {
+        return false;
+    }
+    let drivers: Vec<Option<(u32, u32)>> = probe
+        .adapters()
+        .iter()
+        .filter(|(adapter, _)| adapter.starts_with(NVIDIA_ADAPTER))
+        .map(|(_, driver)| nvidia_driver(driver))
+        .collect();
+    !drivers.is_empty()
+        && drivers
+            .iter()
+            .all(|driver| driver.is_some_and(|version| version < CUDA_MINIMUM_WINDOWS_DRIVER))
 }
 
 /// FD-64: the device and driver a remembered result was measured with, as a digest. A driver
@@ -717,6 +768,8 @@ impl Runtimes {
 pub(crate) struct Installer<'a> {
     /// Whether this computer has the device a provider needs.
     pub eligible: &'a dyn Fn(&str) -> bool,
+    /// FD-63: whether the device's driver is known to be too old for that provider's pack.
+    pub outdated: &'a dyn Fn(&str) -> bool,
     /// Open the runtime store at a path with the app's release authority.
     pub store: &'a dyn Fn(&Path) -> Result<crate::runtime_store::RuntimeStore, String>,
 }
@@ -740,6 +793,7 @@ fn install_accelerated(
                 probe,
             )
         },
+        outdated: &|provider| driver_outdated(provider, std::env::consts::OS, probe),
         store: &|path| crate::release_policy::open_runtime_store(path),
     };
     match std::fs::symlink_metadata(bundle.join(ACCELERATED_MANIFEST)) {
@@ -799,6 +853,10 @@ fn install_from(
         .ok_or("runtime_manifest_invalid")?;
     if provider == CPU || !(with.eligible)(&provider) {
         return Err("provider_device_ineligible".into());
+    }
+    // FD-63: a driver known to be too old is said so, instead of a check that cannot pass.
+    if (with.outdated)(&provider) {
+        return Err("provider_driver_outdated".into());
     }
     if let Some(cpu_epoch) = downloaded {
         crate::accelerated_pack::epoch_admissible(&manifest, cpu_epoch)?;
@@ -1010,6 +1068,59 @@ mod tests {
         assert!(!device_eligible(CUDA, "linux", "x86_64", &intel));
         let amd = Fixture::default().file("/sys/class/drm/card0/device/vendor", "0x1002\n");
         assert!(!device_eligible(OPENVINO, "linux", "x86_64", &amd));
+    }
+
+    #[test]
+    fn an_nvidia_driver_too_old_for_cuda_12_is_known_only_from_a_version_that_is_understood() {
+        assert_eq!(nvidia_driver("32.0.15.6094"), Some((560, 94)));
+        assert_eq!(nvidia_driver("31.0.15.2756"), Some((527, 56)));
+        assert_eq!(nvidia_driver("27.21.14.5671"), Some((456, 71)));
+        assert_eq!(nvidia_driver("30.0.14.9649"), Some((496, 49)));
+        for unknown in [
+            "",
+            "560.94",
+            "32.0.15",
+            "32.0.15.x",
+            "32.0.15.60941",
+            "10.0.1.2.3",
+        ] {
+            assert_eq!(nvidia_driver(unknown), None, "{unknown}");
+        }
+        let outdated = |fixture: &Fixture| driver_outdated(CUDA, "windows", fixture);
+        // The first driver for CUDA 12.0 and anything newer pass; the one before does not.
+        assert!(!outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "31.0.15.2741")
+        ));
+        assert!(!outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "32.0.15.6094")
+        ));
+        assert!(outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "31.0.15.2740")
+        ));
+        assert!(outdated(
+            &Fixture::default().adapter(NVIDIA_CARD, "27.21.14.5671")
+        ));
+        // Unknown never refuses: no NVIDIA adapter listed, or a version in another form.
+        assert!(!outdated(&Fixture::default()));
+        assert!(!outdated(
+            &Fixture::default().adapter(INTEL_ARC, "27.21.14.5671")
+        ));
+        assert!(!outdated(&Fixture::default().adapter(NVIDIA_CARD, "")));
+        assert!(!outdated(
+            &Fixture::default()
+                .adapter(NVIDIA_CARD, "27.21.14.5671")
+                .adapter(NVIDIA_CARD, "unknown")
+        ));
+        // A second card with a driver that is new enough is enough.
+        assert!(!outdated(
+            &Fixture::default()
+                .adapter(NVIDIA_CARD, "27.21.14.5671")
+                .adapter("pci\\ven_10de&dev_1c82", "32.0.15.6094")
+        ));
+        // Only CUDA on Windows is judged this way.
+        let old = Fixture::default().adapter(NVIDIA_CARD, "27.21.14.5671");
+        assert!(!driver_outdated(CUDA, "linux", &old));
+        assert!(!driver_outdated(OPENVINO, "windows", &old));
     }
 
     #[test]
