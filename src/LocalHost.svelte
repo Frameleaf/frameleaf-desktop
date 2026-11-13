@@ -22,7 +22,11 @@
     windows: 'Download and run the Frameleaf Companion Server EXE for Windows x64.',
     linux: 'On Ubuntu 24.04 for Intel or AMD, install both Frameleaf Companion Server DEBs (bootstrap and runtime) together, with pkexec.',
   };
-  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; certificateRenewable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
+  // Moving a library to a companion whose database is newer: one copy made by the earlier companion, restored by the new one.
+  type Carry = { available: boolean; code: string | null; stage: 'permitted' | 'exported' | 'restored' | 'switched' | 'confirmed' | null; previousPostgres: string | null; nextPostgres: string | null; requiredBytes: number | null; availableBytes: number | null; room: 'enough' | 'short' | 'unknown' | null; previousDatabase: string | null; keepUntil: number | null };
+  const carrySteps = [['export', 'Copying the database with the earlier companion'], ['restore', 'Building the new database'], ['verify', 'Checking the new database against the original'], ['switch', 'Switching your library to the new database']] as const;
+  const gigabytes = (bytes: number | null) => bytes === null ? 'an unknown amount' : `${(bytes / 1e9).toFixed(1)} GB`;
+  type View = { carryStep?: string | null; companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; certificateRenewable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -44,6 +48,10 @@
   let allowRecovery = $state(false);
   let authorized = $state(false);
   let packageChange = $state<Installation | null>(null);
+  let carry = $state<Carry | null>(null);
+  let carryReview = $state(false);
+  let carrying = $state(false);
+  let carryRequest = 0;
   let compatibility = $state<{ manifestSha256: string; controllerSha256: string; state: Compatibility } | null>(null);
   let checkRequest = 0;
   const libraryPackage = $derived(installations.find(record => record.library));
@@ -59,7 +67,10 @@
   ));
   const changingPackage = $derived(!!libraryPackage && !!selectedPackage && selected !== libraryPackage.manifestSha256);
   const canMovePackage = $derived(view?.companionPlatform === 'mac' || view?.companionPlatform === 'linux');
-  const headline = $derived(profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer');
+  // Offered only when the backend names both database versions: otherwise the ordinary package change applies.
+  const carryOffered = $derived(!!carry?.previousPostgres && !!carry.nextPostgres && !carry.previousDatabase && canMovePackage && changingPackage);
+  const carryStepIndex = $derived(carrySteps.findIndex(([name]) => name === view?.carryStep));
+  const headline = $derived(carrying ? 'Moving your library to the new database…' : profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer');
   const pill = $derived(view?.state === 'manager-ready' ? { label: authorized ? 'Authorized' : 'Ready', tone: 'ok' } : profilePending || starting || busy ? { label: 'Working', tone: 'wait' } : view?.state === 'needs-attention' ? { label: 'Needs attention', tone: 'bad' } : view?.backgroundActive ? { label: 'Active', tone: 'wait' } : { label: 'Not started', tone: 'off' });
   function explain(code: unknown): string {
     const value = String(code);
@@ -99,6 +110,38 @@
     const result = await invoke<Compatibility>('check_local_host_package', { manifestSha256, controllerSha256 }).catch(() => 'unknown');
     if (disposed || checkRequest !== request) return;
     compatibility = { manifestSha256, controllerSha256, state: result === 'verified' || result === 'refused' || result === 'outdated' ? result : 'unknown' };
+    if (result === 'verified') await checkCarry(manifestSha256);
+  }
+  async function checkCarry(manifestSha256: string) {
+    const request = ++carryRequest;
+    carry = null;
+    const result = await invoke<Carry>('local_host_carry_status', { manifestSha256 }).catch(() => null);
+    if (!disposed && carryRequest === request && selected === manifestSha256) carry = result;
+  }
+  async function moveLibrary() {
+    if (busy || !native || !selectedPackage || !carry?.available) return;
+    carryReview = false; busy = true; carrying = true; onactive(true); failure = ''; notice = '';
+    const manifestSha256 = selected;
+    const watch = setInterval(() => { void invoke<View>('local_host_status').then(current => { if (carrying) show(current); }).catch(() => {}); }, 1000);
+    try {
+      show(await invoke<View>('carry_local_host_library', { manifestSha256 }));
+      notice = 'Your library has been moved to the new database. Choose Prepare local Manager to start it.';
+    } catch (error) {
+      failure = explain(error);
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
+    } finally {
+      clearInterval(watch); busy = false; carrying = false;
+      installations = await invoke<Installation[]>('installed_local_hosts').catch(() => installations);
+      await checkCarry(manifestSha256);
+      focusOn(() => title);
+    }
+  }
+  async function confirmCarry() {
+    if (busy || !native || !selected) return;
+    busy = true; failure = '';
+    try { carry = await invoke<Carry>('confirm_local_host_carry', { manifestSha256: selected }); }
+    catch (error) { failure = explain(error); }
+    finally { busy = false; }
   }
   function selectPackage(event: Event & { currentTarget: HTMLSelectElement }) {
     selected = event.currentTarget.value;
@@ -258,7 +301,26 @@
         </select>
       </div>
     {/if}
-    {#if changingPackage && !canMovePackage}
+    {#if carrying}
+      <div class="row"><span class="spin" aria-hidden="true"></span>
+        <ol role="status" aria-label="Moving your library" style="flex:1;margin:0;padding-left:18px">
+          {#each carrySteps as [name, label], index (name)}<li aria-current={index === carryStepIndex ? 'step' : undefined}>{#if index === carryStepIndex}<b>{label}…</b>{:else}{label}{index < carryStepIndex ? ' (done)' : ''}{/if}</li>{/each}
+        </ol>
+        <button class="btn quiet" disabled={!native} onclick={cancel}>Stop the move</button>
+      </div>
+    {:else if carry?.previousDatabase && carry.stage === 'switched'}
+      <div class="row">
+        <span class="l" role="status"><b>Your library now uses a new database</b><small>It was moved from Postgres {carry.previousPostgres} to Postgres {carry.nextPostgres}. The earlier database folder was not changed and is kept at {carry.previousDatabase}{carry.keepUntil ? ` until at least ${new Date(carry.keepUntil * 1000).toLocaleDateString()}` : ''}, together with the earlier companion, so the move can be undone with help from Frameleaf support. Frameleaf does not delete it. When you have checked that your photos, albums and people are all here, confirm below.</small></span>
+        <button class="btn" disabled={busy || !native} onclick={confirmCarry}>My library is all here</button>
+      </div>
+    {:else if carryOffered && carry && selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
+      <div class="row">
+        <span class="l"><b>Move your library to this companion</b>
+          <small>{#if carry.available}This companion uses a newer database (Postgres {carry.nextPostgres}) than the one your library last ran with (Postgres {carry.previousPostgres}), so the library has to be moved before it can start. {carry.stage && carry.stage !== 'permitted' ? 'An earlier move was not finished; it continues from where it stopped.' : 'Your photos are not touched.'}{:else}<ErrorText text={explain(carry.code ?? 'host_carry_failed')} />{#if carry.room === 'short'} The move needs {gigabytes(carry.requiredBytes)} free and this computer has {gigabytes(carry.availableBytes)}.{/if}{/if}</small>
+        </span>
+        <button class="btn primary" disabled={busy || !native || !packageVerified || !carry.available} onclick={() => { carryReview = true; }}>Review the move</button>
+      </div>
+    {:else if changingPackage && !canMovePackage}
       <div class="row"><span class="l"><b>Choose this library’s current package</b><small>Moving an existing library to another package is unavailable on this computer.</small></span></div>
     {:else if selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
       <div class="row">
@@ -292,6 +354,18 @@
   <p class="foot">{profilePending ? profileCopy.quit : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}{view?.state === 'manager-ready' && !authorized ? ' Keep this password for recovery. The app saves a separate management grant in your secure credential store.' : ''}</p>
 </section>
 
+{#if carryReview && carry}
+  <Sheet title="Move this library to the new database?" kind="warning" onclose={() => { carryReview = false; }} onsubmit={moveLibrary}>
+    <p>Postgres {carry.previousPostgres} → Postgres {carry.nextPostgres}</p>
+    <p>Frameleaf starts the earlier companion once, only to copy your library’s database. Photos cannot be opened, nobody can sign in, and nothing can connect from other devices while it runs. The new companion then builds a new database folder from that copy and checks it against the original: every table, the people and search indexes, and the database’s own checksums.</p>
+    <p>Only when every check passes does your library switch to the new folder. If anything fails before that, nothing changes and your library still opens with the version of Frameleaf it last ran with. Your photo files are never copied, moved or changed. The earlier database folder and the earlier companion are kept afterwards.</p>
+    <p>This needs {gigabytes(carry.requiredBytes)} of free space; this computer has {gigabytes(carry.availableBytes)}. It can take a while for a large library, and Frameleaf cannot be updated until it finishes.</p>
+    {#snippet actions()}
+      <button class="btn" type="button" onclick={() => { carryReview = false; }}>Cancel</button>
+      <button class="btn primary" type="submit">Move my library</button>
+    {/snippet}
+  </Sheet>
+{/if}
 {#if packageChange}
   <Sheet title="Move this library to another package?" kind="warning" onclose={() => { packageChange = null; }} onsubmit={confirmPackageChange}>
     {#if libraryPackage?.version && packageChange.version}<p>Current Library {libraryPackage.version} → Library {packageChange.version}</p>{/if}
