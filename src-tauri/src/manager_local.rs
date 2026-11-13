@@ -1120,4 +1120,47 @@ mod tests {
         assert_eq!(tls_peer(port, &[ours]), Peer::Unknown);
         server.join().unwrap();
     }
+
+    // TEMPORARY (FD-69): evidence for the Windows runner, removed in the next commit.
+    #[test]
+    fn temporary_fd_69_two_hundred_rounds() {
+        let ours = crate::manager::certificate_fingerprint(identity().certificate()).unwrap();
+        let round = |serve: fn(std::net::TcpStream)| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || serve(listener.accept().unwrap().0));
+            let peer = tls_peer(port, std::slice::from_ref(&ours));
+            server.join().unwrap();
+            peer
+        };
+        // The listener as it was: at most 16 bytes read, a reply, a close with the rest unread.
+        let before = (0..200)
+            .filter(|_| {
+                round(|mut stream| {
+                    let _ = stream.read(&mut [0u8; 16]);
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+                }) != Peer::Foreign
+            })
+            .count();
+        // Written straight to stderr so a passing run still shows it.
+        let _ = writeln!(
+            std::io::stderr(),
+            "FD-69 old listener: {before}/200 rounds were not Foreign"
+        );
+        for _ in 0..200 {
+            let peer = round(|mut stream| {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                answer_in_plain_text(&mut stream);
+            });
+            assert_eq!(peer, Peer::Foreign);
+        }
+        let _ = writeln!(std::io::stderr(), "FD-69 fixed listener: 200/200 Foreign");
+        for _ in 0..200 {
+            a_connection_reset_names_nobody();
+        }
+        let _ = writeln!(std::io::stderr(), "FD-69 reset: 200/200 Unknown");
+    }
 }
