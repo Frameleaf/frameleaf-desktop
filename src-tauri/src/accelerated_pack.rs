@@ -9,7 +9,9 @@
 //! a bundled pack: signature, every file's digest, epoch rules, then qualification.
 //!
 //! A pack is the concatenation of its runtime manifest, that manifest's 64-byte signature and
-//! the payload files in the byte order of their names, cut into parts.
+//! the payload files in the byte order of their names, cut into parts. The delivery manifest
+//! also lists the files that were executable where the pack was built; only those are made
+//! executable here, as a bundled pack keeps the modes of its files.
 use crate::{
     model_cache::{acquire_file_with_progress, check_cancel},
     native_runtime::{digest_valid, relative, Artifact},
@@ -37,6 +39,9 @@ const DIRECTORY: &str = "accelerated-pack";
 /// GitHub refuses a release file of 2 GiB or more.
 const PART_LIMIT: u64 = 2 * 1024 * 1024 * 1024 - 1;
 const PACK_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
+/// A delivery manifest lists the executable files of a pack, so it can be far larger than its
+/// few parts alone would make it.
+const DELIVERY_LIMIT: usize = 2 * 1024 * 1024;
 /// The release of this very version: the parts the installer's delivery manifests describe.
 const RELEASE: &str = concat!(
     "https://github.com/Frameleaf/frameleaf-desktop/releases/download/v",
@@ -67,6 +72,8 @@ struct Manifest {
     manifest_sha256: String,
     manifest_bytes: u64,
     bytes: u64,
+    /// Payload files that were executable where the pack was built, in byte order.
+    executable: Vec<String>,
     parts: Vec<Part>,
 }
 /// The few fields of the pack's runtime manifest unpacking needs. The runtime store parses and
@@ -78,7 +85,6 @@ struct PackManifest {
     architecture: String,
     provider: String,
     epoch: u64,
-    python: String,
     files: BTreeMap<String, Artifact>,
 }
 
@@ -111,7 +117,7 @@ impl Delivery {
         os: &str,
         arch: &str,
     ) -> Result<Self, String> {
-        if raw.is_empty() || raw.len() > 64 * 1024 || !signed(raw, signature, keys) {
+        if raw.is_empty() || raw.len() > DELIVERY_LIMIT || !signed(raw, signature, keys) {
             return Err("accelerated_pack_signature_invalid".into());
         }
         let manifest: Manifest =
@@ -144,6 +150,15 @@ impl Delivery {
             || total != manifest.bytes
             || manifest.bytes > PACK_LIMIT
             || manifest.bytes <= manifest.manifest_bytes + 64
+            || manifest.executable.len() > 100_000
+            || manifest
+                .executable
+                .iter()
+                .any(|name| relative(name).is_err())
+            || manifest
+                .executable
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err("accelerated_pack_manifest_invalid".into());
         }
@@ -177,7 +192,7 @@ fn deliveries(
     names
         .iter()
         .filter_map(|name| {
-            let raw = read_bounded(&directory.join(name), 64 * 1024).ok()?;
+            let raw = read_bounded(&directory.join(name), DELIVERY_LIMIT as u64).ok()?;
             let signature: [u8; 64] = read_bounded(
                 &directory.join(format!("{}.sig", name.strip_suffix(".json")?)),
                 64,
@@ -188,6 +203,21 @@ fn deliveries(
             Delivery::verify(&raw, &signature, keys, floor, os, arch).ok()
         })
         .collect()
+}
+fn installable_with(
+    bundle: &Path,
+    data: &Path,
+    keys: &[VerifyingKey],
+    floor: u64,
+    os: &str,
+    arch: &str,
+    probe: &dyn Probe,
+) -> Option<PathBuf> {
+    let delivery = offer_with(bundle, keys, floor, os, arch, probe)?;
+    let _guard = READY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ready_matches(data, &delivery).then(|| ready(data))
 }
 fn offer_with(
     bundle: &Path,
@@ -251,11 +281,16 @@ fn remove_tree(path: &Path) {
 /// The downloaded pack the worker should install: the folder holding its signed runtime manifest
 /// and (until it is installed) its payload. `None` when the app has no eligible pack downloaded.
 pub(crate) fn installable(bundle: &Path, data: &Path, probe: &dyn Probe) -> Option<PathBuf> {
-    let delivery = offer(bundle, probe)?;
-    let _guard = READY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ready_matches(data, &delivery).then(|| ready(data))
+    let (floor, keys) = crate::release_policy::trust().ok()?;
+    installable_with(
+        bundle,
+        data,
+        &keys,
+        floor,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        probe,
+    )
 }
 /// The runtime store holds the pack now: the unpacked payload is no longer needed. Its signed
 /// manifest stays, so the worker keeps finding the installed runtime.
@@ -415,11 +450,14 @@ fn part_url(base: &str, name: &str) -> Result<String, String> {
 }
 /// A client for the release host: HTTPS only, through the redirect GitHub answers with.
 fn release_client() -> Result<reqwest::Client, String> {
+    release_client_builder()
+        .build()
+        .map_err(|_| "network_client_unavailable".into())
+}
+fn release_client_builder() -> reqwest::ClientBuilder {
     crate::transport::streaming_client_builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|_| "network_client_unavailable".into())
 }
 
 /// Download every part into `parts/`, resuming what an earlier attempt left and checking each
@@ -574,6 +612,11 @@ fn unpack_into(
         || manifest.files.len() > 100_000
         || payload_bytes.and_then(|total| total.checked_add(raw.len() as u64 + 64))
             != Some(delivery.0.bytes)
+        || delivery
+            .0
+            .executable
+            .iter()
+            .any(|name| !manifest.files.contains_key(name))
     {
         return Err("accelerated_pack_archive_invalid".into());
     }
@@ -583,8 +626,9 @@ fn unpack_into(
         let path = payload.join(relative(name).map_err(|_| "accelerated_pack_archive_invalid")?);
         fs::create_dir_all(path.parent().ok_or("accelerated_pack_archive_invalid")?)
             .map_err(|_| "accelerated_pack_storage_failed")?;
-        // Only the interpreter is run directly, as in an installed package.
-        let mut file = create_file(&path, *name == manifest.python)?;
+        // Executable exactly where the signed delivery manifest says the built file was.
+        let executable = delivery.0.executable.binary_search(name).is_ok();
+        let mut file = create_file(&path, executable)?;
         write_stream(&mut stream, &mut file, artifact.bytes, cancel)?;
         file.sync_all()
             .map_err(|_| "accelerated_pack_storage_failed")?;

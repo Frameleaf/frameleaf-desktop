@@ -143,6 +143,42 @@ fn private_acl(owner: &[u8], acl: &[u8], expected_owner: &[u8], trusted: &[Vec<u
     }
     true
 }
+/// The photo library: originals, thumbnails and encoded video, several files per photo, so its
+/// size has no bound. The host agent names it `media`; nothing else it keeps (database,
+/// credentials, journals, checkpoints) is stored under that name.
+fn library_directory(name: Option<&std::ffi::OsStr>) -> bool {
+    name.and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("media"))
+}
+/// How many entries admission always inspects: everything else, and separately a library.
+const INVENTORY_LIMIT: usize = 100_000;
+/// How long admission keeps inspecting a library past that many of its entries.
+const LIBRARY_OVERTIME: std::time::Duration = std::time::Duration::from_secs(1);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk {
+    /// Inspect this entry; anything but private refuses admission.
+    Inspect,
+    /// Stop looking inside library directories. What was not reached is neither verified nor
+    /// refused: the protected, verified root above it already keeps every other account out.
+    LeaveLibrary,
+    /// More state outside a library than this app writes: refuse, as before.
+    Refuse,
+}
+/// What admission does with the `count`th entry (from one) of its kind. Up to the limit every
+/// entry is inspected, inside a library or not, exactly as when the limit refused everything
+/// larger. Past it only a library goes on, and only for as long as `overtime` allows: its
+/// size alone must never leave a library unstartable.
+fn walk_step(library: bool, count: usize, overtime: impl FnOnce() -> std::time::Duration) -> Walk {
+    if count <= INVENTORY_LIMIT {
+        Walk::Inspect
+    } else if !library {
+        Walk::Refuse
+    } else if overtime() < LIBRARY_OVERTIME {
+        Walk::Inspect
+    } else {
+        Walk::LeaveLibrary
+    }
+}
 #[cfg(windows)]
 mod user;
 #[cfg(windows)]
@@ -984,6 +1020,50 @@ mod tests {
             let mut bad = good.clone();
             bad[offset] = value;
             assert!(!safe_acl(&system, &bad, &trusted, false), "offset {offset}");
+        }
+    }
+    #[test]
+    fn only_the_library_directory_is_unbounded() {
+        use std::ffi::OsStr;
+        for name in ["media", "Media", "MEDIA"] {
+            assert!(library_directory(Some(OsStr::new(name))));
+        }
+        for name in [
+            "database",
+            "checkpoints",
+            "secrets",
+            "manager",
+            "state",
+            "home",
+            "media2",
+            "medi",
+            "media.json",
+            "",
+        ] {
+            assert!(!library_directory(Some(OsStr::new(name))), "{name}");
+        }
+        assert!(!library_directory(None));
+    }
+    #[test]
+    fn size_refuses_only_outside_a_library_and_never_skips_what_was_inspected_before() {
+        use std::time::Duration;
+        let unread = || -> Duration { panic!("the clock matters only past the limit") };
+        for library in [false, true] {
+            for count in [1, 2, INVENTORY_LIMIT - 1, INVENTORY_LIMIT] {
+                assert_eq!(walk_step(library, count, unread), Walk::Inspect);
+            }
+        }
+        for count in [INVENTORY_LIMIT + 1, INVENTORY_LIMIT * 50] {
+            // Outside a library the clock is not consulted: more is always refused.
+            assert_eq!(walk_step(false, count, unread), Walk::Refuse);
+            assert_eq!(walk_step(true, count, || Duration::ZERO), Walk::Inspect);
+            assert_eq!(
+                walk_step(true, count, || LIBRARY_OVERTIME - Duration::from_millis(1)),
+                Walk::Inspect
+            );
+            for late in [LIBRARY_OVERTIME, LIBRARY_OVERTIME * 100] {
+                assert_eq!(walk_step(true, count, || late), Walk::LeaveLibrary);
+            }
         }
     }
 }

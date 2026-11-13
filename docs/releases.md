@@ -411,7 +411,10 @@ Download on the AI processing page, and only on a computer with the device.
   pack's accelerated manifest, cuts the pack into 1 GiB parts
   (`tools/deliver_runtime.mjs`: the manifest, its signature, then the payload
   files in the byte order of their names) and signs a delivery manifest naming
-  every part by size and SHA-256 and the runtime manifest by SHA-256. Artifacts:
+  every part by size and SHA-256 and the runtime manifest by SHA-256, and
+  listing the payload files that are executable where the pack was built (the
+  app makes exactly those executable, as a bundled pack keeps its files' modes).
+  Artifacts:
   `factory-accelerated-manifest-<target>-<profile>` and
   `factory-accelerated-parts-<target>-<profile>`. The installer pack
   (`factory-runtime-<target>`) carries the delivery manifests in `accelerated/`;
