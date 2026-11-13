@@ -3,7 +3,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -312,6 +314,56 @@ class MetalObserverTests(unittest.TestCase):
         with observer.observe(model, digest), self.assertRaises(ValueError):
             observer.evidence(drain=True)
         self.native.fl_gpu_reset.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "the collector runs on macOS; POSIX change times")
+    def test_a_settled_model_is_hashed_once_and_any_later_change_still_stops_the_run(self):
+        model = self.root / "model.onnx"
+        model.write_bytes(b"fixture")
+        digest = hashlib.sha256(model.read_bytes()).hexdigest()
+        observer = self.observer()
+        hashed = []
+        real = self.module.file_hash
+
+        def counting(path, limit):
+            if path == model:
+                hashed.append(path)
+            return real(path, limit)
+
+        patch.object(self.module, "file_hash", side_effect=counting).start()
+        # Just written: its timestamps cannot yet tell a later write apart, so every check hashes.
+        with observer.observe(model, digest):
+            pass
+        self.assertEqual(len(hashed), 2)
+        # Once the file is older than the settle margin, one hash stands for the calls after it.
+        later = patch.object(
+            self.module.time,
+            "time_ns",
+            return_value=self.module.time.time_ns() + 60_000_000_000,
+        )
+        later.start()
+        for _ in range(3):
+            with observer.observe(model, digest):
+                pass
+        self.assertEqual(len(hashed), 3)
+        # The same size and the old modification time do not hide a change: the change time moved.
+        before = model.stat()
+        time.sleep(0.05)  # past a coarse filesystem clock tick
+        with model.open("r+b") as stream:
+            stream.write(b"changed")
+        os.utime(model, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaises(ValueError), observer.observe(model, digest):
+            pass
+        self.assertEqual(len(hashed), 4)
+        self.native.fl_gpu_begin.assert_called_with(4)
+        self.assertEqual(self.native.fl_gpu_begin.call_count, 4)
+        # A replaced file (another inode) with the approved bytes is hashed again and accepted.
+        other = self.observer()
+        model.unlink()
+        model.write_bytes(b"fixture")
+        with other.observe(model, digest):
+            pass
+        with self.assertRaises(ValueError), other.observe(model, "f" * 64):
+            pass
 
 
 if __name__ == "__main__":
