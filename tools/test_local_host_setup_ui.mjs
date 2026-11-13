@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // Browser qualification uses synthetic IPC. It never installs or starts a real companion.
 if (process.env.FRAMELEAF_MANAGER_UI_TEST !== '1') process.exit(0);
 const { FRAMELEAF_TEST_BROWSER: executablePath, FRAMELEAF_TEST_PLAYWRIGHT: playwright } = process.env;
-assert.ok(executablePath && isAbsolute(executablePath) && playwright && isAbsolute(playwright));
+assert.ok((!executablePath || isAbsolute(executablePath)) && playwright && isAbsolute(playwright));
 const { chromium } = await import(pathToFileURL(playwright));
 const root = fileURLToPath(new URL('..', import.meta.url));
 const socket = createServer();
@@ -16,7 +16,7 @@ const address = socket.address();
 assert.ok(address && typeof address !== 'string');
 await new Promise(resolve => socket.close(resolve));
 const origin = `http://127.0.0.1:${address.port}`;
-const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
+const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' } });
 const ended = new Promise(resolve => vite.once('close', resolve));
 let browser;
 const installed = { manifestSha256: 'a'.repeat(64), controllerSha256: 'b'.repeat(64), version: '1.2.4', library: true };
@@ -27,7 +27,7 @@ try {
     vite.stdout.on('data', chunk => { if (chunk.includes('Local:')) { clearTimeout(timeout); resolve(); } });
     vite.once('error', reject);
   });
-  browser = await chromium.launch({ executablePath, headless: true, args: ['--disable-gpu'] });
+  browser = await chromium.launch({ ...(executablePath ? { executablePath } : {}), headless: true, args: ['--disable-gpu'] });
   const page = await browser.newPage();
   const calls = [];
   const errors = [];

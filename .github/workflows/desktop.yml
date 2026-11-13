@@ -27,6 +27,9 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      # The oldest macOS the app itself runs on: `app` in packaging/macos/minimum-versions.json.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -40,7 +43,7 @@ jobs:
           python-version: '3.12'
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
       - name: Linux ELF relocation tooling
         if: runner.os == 'Linux'
         shell: bash
@@ -68,6 +71,14 @@ jobs:
         run: ./tools/test_windows_sign.ps1
       - run: npm test
       - run: npm run check
+      - name: Run the browser UI tests against a synthetic IPC bridge
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/playwright" playwright-core@1.63.0
+          node "$RUNNER_TEMP/playwright/node_modules/playwright-core/cli.js" install --with-deps chromium-headless-shell
+          FRAMELEAF_TEST_PLAYWRIGHT="$RUNNER_TEMP/playwright/node_modules/playwright-core/index.mjs" npm run test:ui
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - name: Use the pinned host Node for actual Windows interop tests
         if: runner.os == 'Windows'
@@ -191,6 +202,18 @@ jobs:
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build unsigned shell smoke-test candidate
         run: npm run desktop:build:shell -- --debug
+      - name: Check no app binary needs a newer macOS than declared
+        if: runner.os == 'macOS'
+        run: python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" src-tauri/target/debug/bundle/macos/Frameleaf.app
+      - name: Install the unsigned Linux package in clean Ubuntu and Debian containers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/debug/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
       - name: Install the unsigned Windows shell and exercise Welcome
         if: runner.os == 'Windows'
         shell: pwsh
@@ -305,7 +328,7 @@ jobs:
           persist-credentials: false
       - name: Linux native dependencies and Secret Service
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev dbus-x11 gnome-keyring
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev dbus-x11 gnome-keyring
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
