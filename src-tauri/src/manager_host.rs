@@ -807,7 +807,7 @@ impl Programs<'_> {
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         self.check()?;
-        let _profile_pins = protect_profile_parents(config)?;
+        let profile_pins = protect_profile_parents(config)?;
         protect(&config.controller, &mut BTreeSet::new())?;
         if self.root.file_name() != Some(std::ffi::OsStr::new("payload")) {
             return Err("native_manager_layout_invalid".into());
@@ -866,7 +866,14 @@ impl Programs<'_> {
             crate::manager_local::save(&config.data, &record)?;
         }
         let started = self
-            .spawn_from_keystore(config, &profile, &tls, lease, handover.as_ref())
+            .spawn_from_keystore(
+                config,
+                &profile,
+                &tls,
+                lease,
+                handover.as_ref(),
+                profile_pins,
+            )
             .map(|mut manager| {
                 manager.local_record = Some(config.data.clone());
                 let binding = profile.binding().to_owned();
@@ -904,6 +911,7 @@ impl Programs<'_> {
         tls: &TlsIdentity,
         lease: crate::host_state::Owner,
         handover: Option<&crate::manager_tls::Handover>,
+        profile_pins: Vec<fs::File>,
     ) -> Result<NativeManager, String> {
         // This lease proves no controller of this library is running, so a listener on any of
         // its ports belongs to another program.
@@ -925,6 +933,7 @@ impl Programs<'_> {
             Some(lease),
             profile.installation_transition(),
             handover,
+            Some(profile_pins),
         )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
@@ -935,7 +944,7 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
     ) -> Result<NativeManager, String> {
-        self.start_owned(config, password, backup_key, tls, None, None, None)
+        self.start_owned(config, password, backup_key, tls, None, None, None, None)
     }
     #[allow(clippy::too_many_arguments)]
     fn start_owned(
@@ -947,6 +956,7 @@ impl Programs<'_> {
         startup_lease: Option<crate::host_state::Owner>,
         transition: Option<&Transition>,
         handover: Option<&crate::manager_tls::Handover>,
+        held_profile_pins: Option<Vec<fs::File>>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
@@ -961,7 +971,19 @@ impl Programs<'_> {
         let candidate = self.root.parent().ok_or("native_manager_layout_invalid")?;
         validate_paths(candidate, &config.state, &config.data)?;
         self.check()?;
-        let profile_pins = protect_profile_parents(config)?;
+        // On Windows a start from the keystore admitted the profile and has held it pinned
+        // ever since; the same pins go to Manager's owner. Elsewhere the parents are checked
+        // again here, as they always were.
+        #[cfg(windows)]
+        let profile_pins = match held_profile_pins {
+            Some(pins) => pins,
+            None => protect_profile_parents(config)?,
+        };
+        #[cfg(not(windows))]
+        let profile_pins = {
+            drop(held_profile_pins);
+            protect_profile_parents(config)?
+        };
         protect(&config.controller, &mut BTreeSet::new())?;
         let code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
         let controller = crate::runtime_store::read_bounded(&config.controller, 256 * 1024 * 1024)?;
@@ -1694,76 +1716,94 @@ mod tests {
             assert_eq!(manager_backup_path(unchanged), None, "{unchanged}");
         }
     }
-    /// What Manager stores on Windows, written out as its `JSON.stringify` does: the fields in
-    /// its schema's order, and the backup engine's path with the separator it rewrote.
+    /// The descriptor fingerprints of two packages of one library on Windows. The same two
+    /// values are what `tools/check_manager_transition.mjs` requires the real Manager to store
+    /// for the same descriptors, and to accept as a package transition, on a Windows runner.
     #[cfg(windows)]
     #[test]
-    fn windows_descriptor_fingerprint_is_of_the_path_manager_rewrote() {
-        let m = "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435";
-        let c = "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b";
+    fn windows_descriptor_fingerprints_are_the_ones_manager_stores() {
         let root = r"\\.\GLOBALROOT\Device\HarddiskVolume3\Program Files\Frameleaf Desktop Host";
-        let controller = format!(r"{root}\Controllers\{m}\{c}\frameleaf-native-host.exe");
-        let candidate = format!(r"{root}\Runtimes\{m}");
         let state = r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\Zoë\AppData\Local\Frameleaf Desktop Host\state";
         let engine = "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6";
-        let certificate = "9fdf3df9908cdfa7823ee232f00c28e749bd4a5f04cdec60429c3c232b496ec2";
-        let text = |value: &str| serde_json::to_string(value).unwrap();
-        let stored = format!(
-            concat!(
-                r#"{{"protocolVersion":2,"installation":{{"runtime":"native","id":"1d0ea3c5161e","#,
-                r#""secureInstallationId":"c6c6b19e-000f-88a2-9241-7571029303a6","controller":{},"#,
-                r#""candidate":{},"state":{},"manifestSha256":"{}","#,
-                r#""sourceRevision":"c64039743af7bb0d68b602ff842683906019de52","certified":false,"#,
-                r#""databasePort":54329,"apiPort":2283}},"controllerSha256":"{}","#,
-                r#""backupEngine":{{"executable":{},"sha256":"{}"}},"name":"My Frameleaf library","#,
-                r#""release":"frameleaf-v1.2.3-native.c64039743af7-1","tlsCertificatePemSha256":"{}"}}"#,
+        let certificate = format!("{:x}", Sha256::digest(b"synthetic certificate"));
+        for (m, c, revision, release, expected) in [
+            (
+                "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435".to_string(),
+                "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b".to_string(),
+                "c64039743af7bb0d68b602ff842683906019de52".to_string(),
+                "frameleaf-v1.2.3-native.c64039743af7-1",
+                "18db0c2f9c9d2c6de9fa7ba619ccae542cb0f4c6509f6aa84dcfb1ce9f20c9e2",
             ),
-            text(&controller),
-            text(&candidate),
-            text(state),
-            m,
-            c,
-            text(&format!(r"{candidate}\payload\backup\restic.exe")),
-            engine,
-            certificate,
-        );
-        let installation = Binding {
-            runtime: "native",
-            id: "1d0ea3c5161e",
-            secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
-            controller: Path::new(&controller),
-            candidate: Path::new(&candidate),
-            state: Path::new(state),
-            manifest_sha256: m,
-            source_revision: "c64039743af7bb0d68b602ff842683906019de52",
-            certified: false,
-            database_port: 54329,
-            api_port: 2283,
-        };
-        // As this app builds it: the payload directory joined to the manifest's role.
-        let backup = crate::host_runtime::BackupEngine {
-            executable: Path::new(&candidate)
-                .join("payload")
-                .join("backup/restic.exe"),
-            sha256: engine.into(),
-        };
-        assert!(backup
-            .executable
-            .to_str()
-            .unwrap()
-            .ends_with(r"\backup/restic.exe"));
-        assert_eq!(
-            fingerprint(
-                installation,
+            (
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(40),
+                "frameleaf-v1.2.4-native.dddddddddddd-1",
+                "9e4edbeab516450823bc031af37a5497c90d6a13f45d4eaff2fbf5d3b832ad25",
+            ),
+        ] {
+            let controller = format!(r"{root}\Controllers\{m}\{c}\frameleaf-native-host.exe");
+            let candidate = format!(r"{root}\Runtimes\{m}");
+            let installation = Binding {
+                runtime: "native",
+                id: "1d0ea3c5161e",
+                secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
+                controller: Path::new(&controller),
+                candidate: Path::new(&candidate),
+                state: Path::new(state),
+                manifest_sha256: &m,
+                source_revision: &revision,
+                certified: false,
+                database_port: 54329,
+                api_port: 2283,
+            };
+            // As this app builds it: the payload directory joined to the manifest's role.
+            let backup = crate::host_runtime::BackupEngine {
+                executable: Path::new(&candidate)
+                    .join("payload")
+                    .join("backup/restic.exe"),
+                sha256: engine.into(),
+            };
+            assert!(backup
+                .executable
+                .to_str()
+                .unwrap()
+                .ends_with(r"\backup/restic.exe"));
+            // Written out as Manager's `JSON.stringify` does: its schema's field order, and
+            // the backup engine's path with the separator it rewrote.
+            let text = |value: &str| serde_json::to_string(value).unwrap();
+            let stored = format!(
+                concat!(
+                    r#"{{"protocolVersion":2,"installation":{{"runtime":"native","id":"1d0ea3c5161e","#,
+                    r#""secureInstallationId":"c6c6b19e-000f-88a2-9241-7571029303a6","controller":{},"#,
+                    r#""candidate":{},"state":{},"manifestSha256":"{}","sourceRevision":"{}","#,
+                    r#""certified":false,"databasePort":54329,"apiPort":2283}},"controllerSha256":"{}","#,
+                    r#""backupEngine":{{"executable":{},"sha256":"{}"}},"name":"My Frameleaf library","#,
+                    r#""release":"{}","tlsCertificatePemSha256":"{}"}}"#,
+                ),
+                text(&controller),
+                text(&candidate),
+                text(state),
+                m,
+                revision,
                 c,
+                text(&format!(r"{candidate}\payload\backup\restic.exe")),
+                engine,
+                release,
+                certificate,
+            );
+            let computed = fingerprint(
+                installation,
+                &c,
                 backup,
                 "My Frameleaf library",
-                "frameleaf-v1.2.3-native.c64039743af7-1",
-                certificate.into(),
+                release,
+                certificate.clone(),
             )
-            .unwrap(),
-            format!("{:x}", Sha256::digest(stored.as_bytes()))
-        );
+            .unwrap();
+            assert_eq!(computed, format!("{:x}", Sha256::digest(stored.as_bytes())));
+            assert_eq!(computed, expected);
+        }
     }
     /// A start cancelled while its port move was still unconfirmed: the move is taken back,
     /// and the answer is the cancellation, never a busy port.

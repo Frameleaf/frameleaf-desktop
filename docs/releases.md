@@ -360,7 +360,7 @@ runtime in `runtime/profiles.json` is one the server approves.
 admit, and every source in it has profiles in the catalogue (the parity check
 fails otherwise). Today that is the CPU runtime on every target, `coreml-ort` on
 Apple Silicon, and `cuda-ort` and `openvino-ort` on Windows and Linux x86_64.
-The accelerated profiles build their own runtime source (catalogue epoch 15),
+The accelerated profiles build their own runtime source (catalogue epoch 16),
 which verifies the model bytes a session loads; the CPU profile is unchanged.
 
 `python tools/build_runtime.py --profile coreml-ort` builds an accelerated pack:
@@ -371,7 +371,7 @@ The factory workflow builds it for `macos-aarch64` by default (`accelerated:
 default`; choose `none` for the processor pack alone), and signs both manifests
 (`manifest-accelerated.sig`) after Apple code signing; packaging ships the second
 manifest beside the first. Both manifests of that pack name the accelerated
-profile's source, so the server must already carry catalogue epoch 15: against an
+profile's source, so the server must already carry catalogue epoch 16: against an
 older server neither manifest is known and that Mac has no AI processing until
 the server is updated. Release the server first: a tagged release run stops in
 `prepare` with `catalogue_ahead_of_server` when `runtime/model-catalogue.json` has

@@ -125,24 +125,48 @@ impl Profile {
         )
     }
     /// Move a stopped profile's saved credentials to a newer package; returns (previous, next) bindings.
+    /// `resume` keeps the transition already saved for the newer package: Manager may have
+    /// accepted it, and accepts it again only unchanged.
     pub(crate) fn carry_forward(
         previous: (&Configuration, &Path, &str),
         next: (&Configuration, &Path, &str),
         transition: Option<crate::manager_host::Transition>,
+        resume: bool,
     ) -> Result<(String, String), String> {
         Self::carry_forward_with(
             previous,
             next,
             transition,
+            resume,
             crate::credentials::load,
             crate::credentials::save,
         )
+    }
+    /// Take back a move Manager has not confirmed: the reservation names `back` again, the
+    /// package the library last ran with. Its keystore entry was never removed and must still
+    /// be there with the same secrets; nothing is written to the keystore.
+    pub(crate) fn return_to(
+        moved: (&Configuration, &Path, &str),
+        back: (&Configuration, &Path, &str),
+    ) -> Result<(String, String), String> {
+        Self::return_to_with(moved, back, crate::credentials::load)
+    }
+    /// `return_to` with injectable keystore access for tests.
+    fn return_to_with(
+        moved: (&Configuration, &Path, &str),
+        back: (&Configuration, &Path, &str),
+        load: impl Fn(&str) -> Result<Option<Self>, String>,
+    ) -> Result<(String, String), String> {
+        Self::carry_forward_with(moved, back, None, true, load, |_, _| {
+            Err("native_profile_recovery_required".into())
+        })
     }
     /// `carry_forward` with injectable keystore access for tests.
     fn carry_forward_with(
         previous: (&Configuration, &Path, &str),
         next: (&Configuration, &Path, &str),
         transition: Option<crate::manager_host::Transition>,
+        resume: bool,
         load: impl Fn(&str) -> Result<Option<Self>, String>,
         persist: impl FnOnce(&str, &Self) -> Result<(), String>,
     ) -> Result<(String, String), String> {
@@ -196,20 +220,30 @@ impl Profile {
                 && saved.backup_key.as_deref().is_none_or(valid_backup_key)
         };
         let source = load(&format!("{ACCOUNT}-{old}"))?;
-        match load(&format!("{ACCOUNT}-{new}"))? {
+        let target = load(&format!("{ACCOUNT}-{new}"))?;
+        let differs = |saved: &Self| {
+            !valid(saved, &new)
+                || source.as_ref().is_some_and(|prior| {
+                    prior.database_password != saved.database_password
+                        || prior.backup_key != saved.backup_key
+                })
+        };
+        // A fresh move finds an entry for the newer package left by an earlier move that was
+        // taken back; the library has run with the previous package since, so that entry is
+        // stale and is replaced from the previous package's below. A resumed move may already
+        // have been accepted by Manager, so it must find the same secrets it saved before.
+        let target = match target {
+            Some(saved) if differs(&saved) && !resume && source.is_some() => None,
+            target => target,
+        };
+        match target {
             Some(saved) => {
-                // A retried move must find the same secrets it saved before stopping.
-                if !valid(&saved, &new)
-                    || source.as_ref().is_some_and(|prior| {
-                        prior.database_password != saved.database_password
-                            || prior.backup_key != saved.backup_key
-                    })
-                {
+                if differs(&saved) {
                     return Err("native_profile_binding_changed".into());
                 }
                 // Manager has not run with this package while the journal names the previous one,
                 // so the transition must describe the package moved from now, not an earlier attempt.
-                if saved.installation_transition != transition {
+                if !resume && saved.installation_transition != transition {
                     let refreshed = Self {
                         schema_version: 1,
                         binding_sha256: new.clone(),
@@ -700,6 +734,7 @@ mod tests {
             (previous.0, &previous.1, &previous.2),
             (&different, &following.1, &following.2),
             None,
+            false,
             load,
             save
         )
@@ -709,6 +744,7 @@ mod tests {
                 (previous.0, &previous.1, &previous.2),
                 (following.0, &following.1, &following.2),
                 None,
+                false,
                 load,
                 |_, _| Err("credential_store_locked".into())
             )
@@ -723,6 +759,7 @@ mod tests {
                 (previous.0, &previous.1, &previous.2),
                 (following.0, &following.1, &following.2),
                 None,
+                false,
                 load,
                 |_, _| Ok(())
             )
@@ -735,6 +772,7 @@ mod tests {
                 (previous.0, &previous.1, &previous.2),
                 (following.0, &following.1, &following.2),
                 None,
+                false,
                 |account: &str| match other.borrow().as_deref() {
                     Some(saved) if !account.ends_with(&before) =>
                         Ok(Some(serde_json::from_str(saved).unwrap())),
@@ -762,6 +800,7 @@ mod tests {
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
             None,
+            false,
             load,
             save,
         )
@@ -776,6 +815,7 @@ mod tests {
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
             None,
+            false,
             load,
             |_, _| panic!("must not move twice"),
         )
@@ -789,6 +829,7 @@ mod tests {
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
             Some(current.clone()),
+            false,
             load,
             save,
         )
@@ -802,12 +843,148 @@ mod tests {
         assert_eq!(moved.password().as_str(), password.as_str());
         assert_eq!(moved.backup_key().unwrap().as_str(), key.as_str());
         drop(moved);
+        let saved_transition = || {
+            load(&format!("{ACCOUNT}-{new}"))
+                .unwrap()
+                .unwrap()
+                .installation_transition
+                .clone()
+        };
+        let marker = || std::fs::read(f.1.data.join(".host-profile")).unwrap();
+        // Resuming the same move keeps the transition Manager may already have accepted.
+        let later = crate::manager_host::Transition {
+            operation_id: uuid::Uuid::new_v4(),
+            from_fingerprint: "d".repeat(64),
+        };
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(later.clone()),
+            true,
+            load,
+            |_, _| panic!("a resumed move keeps what was saved"),
+        )
+        .unwrap();
+        assert_eq!(saved_transition(), Some(current.clone()));
+        // Taking the move back names the previous package again and writes no secrets.
+        for _ in 0..2 {
+            let (from, to) = Profile::return_to_with(
+                (following.0, &following.1, &following.2),
+                (previous.0, &previous.1, &previous.2),
+                load,
+            )
+            .unwrap();
+            assert_eq!((from.as_str(), to.as_str()), (new.as_str(), old.as_str()));
+            assert_eq!(marker(), old.as_bytes());
+        }
+        assert_eq!(saved_transition(), Some(current.clone()));
+        let back = Profile::load_or_create(previous.0, &previous.1, &previous.2, load, |_, _| {
+            panic!("the previous package's entry was never removed")
+        })
+        .unwrap();
+        assert_eq!(back.password().as_str(), password.as_str());
+        assert_eq!(back.backup_key().unwrap().as_str(), key.as_str());
+        drop(back);
+        // Moving forward again after that still resumes with the same transition.
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(later),
+            true,
+            load,
+            |_, _| panic!("a resumed move keeps what was saved"),
+        )
+        .unwrap();
+        assert_eq!(marker(), new.as_bytes());
+        assert_eq!(saved_transition(), Some(current));
+        // Without the previous package's entry, or with other secrets in it, nothing goes back.
+        assert_eq!(
+            Profile::return_to_with(
+                (following.0, &following.1, &following.2),
+                (previous.0, &previous.1, &previous.2),
+                |account: &str| if account.ends_with(&old) {
+                    Ok(None)
+                } else {
+                    load(account)
+                },
+            )
+            .unwrap_err(),
+            "native_profile_recovery_required"
+        );
+        assert!(Profile::return_to_with(
+            (following.0, &following.1, &following.2),
+            (previous.0, &previous.1, &previous.2),
+            |account: &str| {
+                let mut saved = serde_json::to_value(load(account)?.unwrap()).unwrap();
+                if account.ends_with(&old) {
+                    saved["databasePassword"] = "another-password-of-valid-length".into();
+                }
+                Ok(Some(serde_json::from_value(saved).unwrap()))
+            },
+        )
+        .is_err());
+        assert_eq!(marker(), new.as_bytes());
+        // Taken back once more, and the previous package runs and its secrets change. The
+        // newer package's entry is now stale: resuming the unconfirmed move refuses it, and
+        // the next fresh move (Manager has been ready with the previous package since)
+        // replaces it with the previous package's secrets instead of failing on it forever.
+        Profile::return_to_with(
+            (following.0, &following.1, &following.2),
+            (previous.0, &previous.1, &previous.2),
+            load,
+        )
+        .unwrap();
+        let renewed = "a-renewed-password-of-valid-length";
+        {
+            let account = format!("{ACCOUNT}-{old}");
+            let mut saved: serde_json::Value =
+                serde_json::from_str(&store.borrow()[&account]).unwrap();
+            saved["databasePassword"] = renewed.into();
+            store.borrow_mut().insert(account, saved.to_string());
+        }
+        assert_eq!(
+            Profile::carry_forward_with(
+                (previous.0, &previous.1, &previous.2),
+                (following.0, &following.1, &following.2),
+                None,
+                true,
+                load,
+                |_, _| panic!("a resumed move never replaces"),
+            )
+            .unwrap_err(),
+            "native_profile_binding_changed"
+        );
+        assert_eq!(marker(), old.as_bytes());
+        let fresh = crate::manager_host::Transition {
+            operation_id: uuid::Uuid::new_v4(),
+            from_fingerprint: "e".repeat(64),
+        };
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(fresh.clone()),
+            false,
+            load,
+            save,
+        )
+        .unwrap();
+        assert_eq!(marker(), new.as_bytes());
+        let moved =
+            Profile::load_or_create(following.0, &following.1, &following.2, load, |_, _| {
+                panic!("moved profile is complete")
+            })
+            .unwrap();
+        assert_eq!(moved.password().as_str(), renewed);
+        assert_eq!(moved.backup_key().unwrap().as_str(), key.as_str());
+        assert_eq!(moved.installation_transition(), Some(&fresh));
+        drop(moved);
         // Unknown reservations and missing secrets are refused rather than replaced.
         std::fs::write(f.1.data.join(".host-profile"), "f".repeat(64)).unwrap();
         assert!(Profile::carry_forward_with(
             (previous.0, &previous.1, &previous.2),
             (following.0, &following.1, &following.2),
             None,
+            false,
             load,
             save
         )
@@ -818,12 +995,83 @@ mod tests {
                 (previous.0, &previous.1, &previous.2),
                 (following.0, &following.1, &following.2),
                 None,
+                false,
                 |_| Ok(None),
                 save
             )
             .unwrap_err(),
             "native_profile_recovery_required"
         );
+    }
+    /// The real Credential Manager, under bindings of this test's own. Hosted runners only.
+    #[cfg(windows)]
+    #[test]
+    fn the_real_credential_manager_holds_a_profile_moved_to_another_package_and_back() {
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+            return;
+        }
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for account in &self.0 {
+                    let _ = crate::credentials::delete(account);
+                }
+            }
+        }
+        let f = Fixture::new();
+        std::fs::create_dir(f.0.join("runtime-next")).unwrap();
+        let next = Configuration {
+            release: "frameleaf-v3.0.1-1".into(),
+            ..f.1.clone()
+        };
+        let previous = (&f.1, f.0.join("runtime"), "b".repeat(64));
+        let following = (&next, f.0.join("runtime-next"), "c".repeat(64));
+        let created = Profile::from_keystore(previous.0, &previous.1, &previous.2).unwrap();
+        let (password, key) = (created.password(), created.backup_key().unwrap());
+        let mut cleanup = Cleanup(vec![format!("{ACCOUNT}-{}", created.binding())]);
+        drop(created);
+        let transition = crate::manager_host::Transition {
+            operation_id: uuid::Uuid::new_v4(),
+            from_fingerprint: "c".repeat(64),
+        };
+        let (old, new) = Profile::carry_forward(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(transition.clone()),
+            false,
+        )
+        .unwrap();
+        cleanup.0.push(format!("{ACCOUNT}-{new}"));
+        assert_eq!(cleanup.0[0], format!("{ACCOUNT}-{old}"));
+        let moved = Profile::from_keystore(following.0, &following.1, &following.2).unwrap();
+        assert_eq!(moved.binding(), new);
+        assert_eq!(moved.installation_transition(), Some(&transition));
+        assert_eq!(moved.password().as_str(), password.as_str());
+        assert_eq!(moved.backup_key().unwrap().as_str(), key.as_str());
+        drop(moved);
+        // The previous package's entry is still in the store, and the move can be taken back.
+        assert!(crate::credentials::load::<Profile>(&cleanup.0[0])
+            .unwrap()
+            .is_some());
+        Profile::return_to(
+            (following.0, &following.1, &following.2),
+            (previous.0, &previous.1, &previous.2),
+        )
+        .unwrap();
+        let back = Profile::from_keystore(previous.0, &previous.1, &previous.2).unwrap();
+        assert_eq!(back.binding(), old);
+        assert_eq!(back.password().as_str(), password.as_str());
+        drop(back);
+        // Moving again resumes with the transition the store already holds.
+        Profile::carry_forward(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            None,
+            true,
+        )
+        .unwrap();
+        let again = Profile::from_keystore(following.0, &following.1, &following.2).unwrap();
+        assert_eq!(again.installation_transition(), Some(&transition));
     }
     #[test]
     fn legacy_backup_key_migration_preserves_database_password_and_fails_closed_if_persistence_is_locked(

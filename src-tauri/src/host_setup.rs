@@ -168,6 +168,19 @@ struct Hosted<'a> {
     #[cfg(unix)]
     process: &'a dyn Fn(u32) -> crate::process_tree::Presence,
 }
+/// The record of an unconfirmed package move, for the update gate. No Manager folder means no
+/// library and no record; a record that is present, confirmed or not, is the next start's to
+/// settle and does not block. One that cannot be read is `Unknown`.
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+fn move_record(data: &std::path::Path) -> Evidence {
+    match std::fs::symlink_metadata(data) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Evidence::Clear,
+        _ => match crate::package_move::stored(data) {
+            crate::package_move::Stored::Unreadable => Evidence::Unknown,
+            _ => Evidence::Clear,
+        },
+    }
+}
 /// From disk alone: `Clear` when no library was ever hosted at `state`, or when its journal
 /// proves it idle and nothing that could be its Manager answers on Manager's port. The port
 /// covers a Manager that left no usable record.
@@ -303,6 +316,13 @@ impl HostSetup {
         });
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows, test)))]
         let journal = Evidence::Clear;
+        // A record of a package move that cannot be read leaves unknown which package Manager
+        // holds: that blocks as unreadable journal evidence does.
+        #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+        let journal = match hosted.map_or(Evidence::Clear, |hosted| move_record(hosted.data)) {
+            Evidence::Clear => journal,
+            unread => unread,
+        };
         #[cfg(unix)]
         let manager = hosted.map_or(Evidence::Clear, |hosted| {
             crate::manager_host::recorded_manager(hosted.data, hosted.process)
@@ -661,6 +681,8 @@ impl HostSetup {
         });
         match result {
             Ok(running) => {
+                // Manager is ready with the package the journal names: no move is unconfirmed.
+                crate::package_move::settled(&running.configuration.data);
                 self.adopt(&mut owner, running);
                 self.set("manager-ready", None, self.snapshot().installation);
             }
@@ -1502,6 +1524,17 @@ fn previous_package_refusal(code: String) -> String {
 
 /// A library keeps its first installation identity. Moving it to a newer signed package copies its
 /// saved secrets and repoints its journals while it is cleanly stopped; downgrades are refused.
+///
+/// The move is committed before Manager is started with the new package, and Manager may
+/// refuse it. Until Manager is ready with one of the two packages the move is recorded as
+/// unconfirmed: the package the library last ran with can be chosen again, which takes the
+/// move back, and choosing the new one again sends Manager the same transition as before.
+/// "Unconfirmed" means only that this app has not seen Manager ready. Manager stores the new
+/// package's fingerprint as soon as it accepts the transition, so after a crash or a slow
+/// start it may have accepted the move; it then refuses the taken-back package
+/// (`native_installation_changed`) and nothing changes. This app cannot read Manager's
+/// refusal (its stderr is not kept outside tests), so the take-back stays available and the
+/// copy for `host_upgrade_move_unconfirmed` says it works only after a refusal.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn carry_forward<U: Serialize>(
     record: &Installation,
@@ -1509,18 +1542,29 @@ fn carry_forward<U: Serialize>(
     next: &mut Configuration,
     uid: &U,
 ) -> Result<(), String> {
+    use crate::package_move::Plan;
     let Some(marker) = crate::host_state::Owner::peek(&next.state)? else {
         return Ok(());
     };
     next.installation_id = marker.installation_id.clone();
-    if marker.manifest_sha256 == record.manifest_sha256 {
-        return Ok(());
-    }
+    let plan = crate::package_move::plan(
+        &marker.manifest_sha256,
+        &record.manifest_sha256,
+        &crate::package_move::stored(&next.data),
+    );
+    let plan = crate::package_move::after_media_move(plan, marker.media_moved());
+    let resume = match plan {
+        Plan::Start => return Ok(()),
+        Plan::Refuse(code) => return Err(code.into()),
+        Plan::Forward { resume } => Some(resume),
+        Plan::Return => None,
+    };
     let previous_record = Installation::read(&marker.manifest_sha256)
         .map_err(|_| "host_upgrade_previous_package_missing")?;
     let (previous_layout, previous_runtime) =
         verified(&previous_record).map_err(previous_package_refusal)?;
-    if runtime.epoch() <= previous_runtime.epoch() {
+    // Going back to the package an unconfirmed move left is not a downgrade.
+    if resume.is_some() && runtime.epoch() <= previous_runtime.epoch() {
         return Err("host_upgrade_downgrade_refused".into());
     }
     let mut previous = configuration(
@@ -1538,6 +1582,31 @@ fn carry_forward<U: Serialize>(
     // Hold the previous package and the journal for the whole move.
     let _code = crate::package_lease::CodeLease::acquire(&previous_layout.runtime)?;
     let owner = crate::host_state::Owner::acquire(&next.state, true)?;
+    let packages = (
+        Package {
+            config: &previous,
+            candidate: &previous_layout.runtime,
+            manifest: &marker.manifest_sha256,
+            revision: previous_runtime.source_revision(),
+        },
+        Package {
+            config: next,
+            candidate: &layout.runtime,
+            manifest: &record.manifest_sha256,
+            revision: runtime.source_revision(),
+        },
+    );
+    let Some(resume) = resume else {
+        // The previous package's saved secrets and certificate were never removed: only the
+        // reservation, the host marker and the journal name it again.
+        return move_library(
+            owner,
+            packages.0,
+            packages.1,
+            crate::manager_profile::Profile::return_to,
+            |_, _| Ok(()),
+        );
+    };
     // Manager accepts the new package only from the exact descriptor it last ran with.
     let old_binding = crate::manager_profile::Profile::binding_for(
         &previous,
@@ -1558,22 +1627,18 @@ fn carry_forward<U: Serialize>(
             })
         })
         .transpose()?;
+    let pending = crate::package_move::Move::new(&marker.manifest_sha256, &record.manifest_sha256);
+    let data = next.data.clone();
     move_library(
         owner,
-        Package {
-            config: &previous,
-            candidate: &previous_layout.runtime,
-            manifest: &marker.manifest_sha256,
-            revision: previous_runtime.source_revision(),
+        packages.0,
+        packages.1,
+        |previous, next| {
+            // Every check has passed; this is recorded before the first change.
+            crate::package_move::save(&data, &pending)?;
+            crate::manager_profile::Profile::carry_forward(previous, next, transition, resume)
         },
-        Package {
-            config: next,
-            candidate: &layout.runtime,
-            manifest: &record.manifest_sha256,
-            revision: runtime.source_revision(),
-        },
-        |previous, next| crate::manager_profile::Profile::carry_forward(previous, next, transition),
-        crate::manager_tls::TlsIdentity::carry_forward,
+        |old, new| crate::manager_tls::TlsIdentity::carry_forward(old, new, !resume),
     )
 }
 
@@ -1629,7 +1694,7 @@ fn move_library_to(
 ) -> Result<(), String> {
     let id = &previous.config.installation_id;
     match &database {
-        None => owner.check_movable(id, previous.manifest)?,
+        None => owner.check_package_movable(id, previous.manifest)?,
         Some(carried) => owner.check_carriable(id, previous.manifest, carried.permit)?,
     }
     let majors = database
@@ -1846,6 +1911,19 @@ struct CarryPlan {
         crate::host_carry::PackageIdentity,
     ),
 }
+/// A database carry builds its transition from the package the journal names. While a package
+/// move is unconfirmed, Manager may still hold the package before it, so a carry would be
+/// refused by Manager and then leave neither side of the move startable. Only a library with
+/// no unconfirmed move is carried; a record that cannot be read refuses.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn no_unconfirmed_move(data: &std::path::Path) -> Result<(), String> {
+    match crate::package_move::stored(data) {
+        crate::package_move::Stored::Absent => Ok(()),
+        crate::package_move::Stored::Present(_) => Err("host_upgrade_move_unconfirmed".into()),
+        crate::package_move::Stored::Unreadable => Err("host_upgrade_move_unavailable".into()),
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CarryPlan {
     /// Read-only. `host_carry_not_needed` means there is nothing to carry: no library, a
@@ -1883,6 +1961,7 @@ impl CarryPlan {
             }
             Err(code) => return Err(code),
         };
+        no_unconfirmed_move(&next.data)?;
         if runtime.epoch() <= source.epoch() {
             return Err("host_upgrade_downgrade_refused".into());
         }
@@ -2021,6 +2100,7 @@ impl CarryPlan {
         };
         // Held to the end: nothing else can start this library, or move it, meanwhile.
         let mut owner = crate::host_state::Owner::acquire(state, true)?;
+        no_unconfirmed_move(data)?;
         let mut permit = self.permit()?;
         owner.carry_admitted(id, previous_manifest, &permit.permit_id)?;
         let database = self.database(&mut owner)?;
@@ -2186,9 +2266,11 @@ impl CarryPlan {
                     revision: self.runtime.source_revision(),
                 },
                 |previous, next| {
-                    crate::manager_profile::Profile::carry_forward(previous, next, transition)
+                    crate::manager_profile::Profile::carry_forward(
+                        previous, next, transition, false,
+                    )
                 },
-                crate::manager_tls::TlsIdentity::carry_forward,
+                |old, new| crate::manager_tls::TlsIdentity::carry_forward(old, new, true),
                 Some(CarriedDatabase {
                     permit: &permit.permit_id,
                     reference: &reference,
@@ -2323,6 +2405,8 @@ fn launch(
         // Downstream shared setup helpers may create missing leaves; keep both existing objects pinned.
         #[cfg(windows)]
         let _profiles = [pin_profile_leaf(&state)?, pin_profile_leaf(&data)?];
+        // On Windows the pin above is this same admission of the state folder, still held.
+        #[cfg(unix)]
         require_leaf(&state)?;
         require_leaf(&data)?;
         // Where this library last listened. A record that cannot be read refuses the start.
@@ -2390,6 +2474,45 @@ mod manager_e2e;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carry from a package whose move is unconfirmed would build its transition from a
+    /// package Manager may not hold, and the move record would then refuse both sides of it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_database_carry_is_refused_while_a_package_move_is_unconfirmed_or_unknown() {
+        let data = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-carry-move-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&data).unwrap();
+        no_unconfirmed_move(&data).unwrap();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        crate::package_move::save(&data, &crate::package_move::Move::new(&a, &b)).unwrap();
+        assert_eq!(
+            no_unconfirmed_move(&data).unwrap_err(),
+            "host_upgrade_move_unconfirmed"
+        );
+        std::fs::write(data.join("desktop-package-move.json"), b"{}").unwrap();
+        assert_eq!(
+            no_unconfirmed_move(&data).unwrap_err(),
+            "host_upgrade_move_unavailable"
+        );
+        crate::package_move::settled(&data);
+        no_unconfirmed_move(&data).unwrap();
+        // Both the read-only plan and the carry itself, with the library held, check it.
+        let source = include_str!("host_setup.rs");
+        let read = &source[source.find("fn read(record: &Installation)").unwrap()..];
+        assert!(
+            read[..read.find("fn permit(").unwrap()].contains("no_unconfirmed_move(&next.data)?")
+        );
+        let run = &source[source
+            .find("progress: &(dyn Fn(&'static str) + Sync),")
+            .unwrap()..];
+        let held = run.find("Owner::acquire(state, true)?").unwrap();
+        let checked = run.find("no_unconfirmed_move(data)?").unwrap();
+        assert!(held < checked && checked < run.find("self.permit()?").unwrap());
+        std::fs::remove_dir_all(&data).unwrap();
+    }
 
     /// A new file only this account can read, as the host agent writes its own.
     fn private_file(path: &std::path::Path, text: &str) {
@@ -3138,6 +3261,34 @@ mod tests {
             run(&state).0.unwrap_err(),
             "host_controller_binding_changed"
         );
+        // Taking an unconfirmed move back is the same move with the packages exchanged: the
+        // journal and the host marker name the previous package again, and it can move again.
+        let exchanged = config(&state);
+        move_library(
+            Owner::acquire(&state, true).unwrap(),
+            Package {
+                config: &exchanged,
+                candidate: std::path::Path::new("/runtime/b"),
+                manifest: &b,
+                revision: &rb,
+            },
+            Package {
+                config: &exchanged,
+                candidate: std::path::Path::new("/runtime/a"),
+                manifest: &a,
+                revision: &ra,
+            },
+            |_, _| Ok(("e".repeat(64), "d".repeat(64))),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.join("host-state.json")).unwrap(),
+            previous
+        );
+        assert_eq!(Owner::peek(&state).unwrap().unwrap().manifest_sha256, a);
+        run(&state).0.unwrap();
+        assert_eq!(Owner::peek(&state).unwrap().unwrap().manifest_sha256, b);
         std::fs::remove_dir_all(root).unwrap();
         // A host that never created its database moves without a marker to rewrite.
         let (root, state) = setup(false, None, false);
@@ -4504,6 +4655,27 @@ mod tests {
             )
             .unwrap();
         journal.clean_stop().unwrap();
+    }
+
+    /// A record of a package move that cannot be read keeps the update gate of a new run
+    /// closed; a readable one, confirmed or not, and no Manager folder at all, do not.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_new_run_keeps_updates_closed_while_a_package_move_record_cannot_be_read() {
+        let fixture = OwnedFixture::new();
+        let data = fixture.0.join("data");
+        new_run_gate(&fixture).unwrap();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        crate::package_move::save(&data, &crate::package_move::Move::new(&a, &b)).unwrap();
+        new_run_gate(&fixture).unwrap();
+        std::fs::write(data.join("desktop-package-move.json"), b"{}").unwrap();
+        assert_eq!(
+            new_run_gate(&fixture).unwrap_err(),
+            "update_library_not_idle"
+        );
+        crate::package_move::settled(&data);
+        new_run_gate(&fixture).unwrap();
+        assert_eq!(move_record(&fixture.0.join("absent")), Evidence::Clear);
     }
 
     #[cfg(unix)]

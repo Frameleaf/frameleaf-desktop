@@ -12,6 +12,7 @@ on:
       - 'packaging/macos/minimum-versions.json'
       - 'tools/linked_libraries.py'
       - 'tools/pe_imports.py'
+      - 'tools/check_runtime_gate.py'
       - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
@@ -73,13 +74,21 @@ jobs:
         run: |
           set -euo pipefail
           python desktop/tools/check_linux_glibc.py --max 2.35 candidate/payload | tee -a "$GITHUB_STEP_SUMMARY"
+      # FD-71: the processor pack's interpreter, started in the app's gate with the pipe held open
+      # as the app holds it, must import onnxruntime and use its standard input (it hung on Windows).
+      - name: Start the processor pack as the app starts it
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate/payload/python/python.exe -I -B desktop/tools/check_runtime_gate.py | tee -a "$GITHUB_STEP_SUMMARY"
       # FD-52: the accelerated pack (processor and CoreML manifests over one payload) must build on
       # the hosted Apple Silicon runner; it is not signed, published or run on a GPU here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: runner.os == 'macOS' && runner.arch == 'ARM64'
         with:
           repository: Frameleaf/frameleaf-app
-          ref: a70fd7dcee16526cb913308e9ea9596489b24ff6
+          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
           path: coreml-server
           persist-credentials: false
       - name: Construct the CoreML pack with its device collector
@@ -87,7 +96,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision a70fd7dcee16526cb913308e9ea9596489b24ff6 --epoch 6 --profile coreml-ort
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile coreml-ort
           test -s coreml-candidate/manifest.json
           test -s coreml-candidate/manifest-accelerated.json
           coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
@@ -215,7 +224,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: a70fd7dcee16526cb913308e9ea9596489b24ff6
+          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -231,7 +240,7 @@ jobs:
           RUNTIME_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source server --output candidate --revision a70fd7dcee16526cb913308e9ea9596489b24ff6 --epoch 6 --profile "$RUNTIME_PROFILE"
+          python desktop/tools/build_runtime.py --source server --output candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile "$RUNTIME_PROFILE"
           test -s candidate/manifest.json
           test -s candidate/manifest-accelerated.json
           case "$RUNTIME_PROFILE" in
