@@ -21,6 +21,25 @@ use uuid::Uuid;
 const PATH: &str = "/offline-photos.html";
 const INTENT: &str = "/__frameleaf_desktop__/offline-albums/";
 const BUSY: &str = "offline_album_busy";
+/// Offline copies a sign-out still owes a clear, one non-secret cleanup scope per file.
+const OWED: &str = "offline-cleanup-owed";
+
+fn owe_cleanup(base: &std::path::Path, scope: &CleanupScope) {
+    if !crate::native_runtime::digest_valid(scope.id(), 64) {
+        return;
+    }
+    let directory = base.join(OWED);
+    let _ = std::fs::create_dir_all(&directory);
+    if let Ok(bytes) = serde_json::to_vec(scope) {
+        let _ = std::fs::write(directory.join(format!("{}.json", scope.id())), bytes);
+    }
+}
+
+fn forget_owed(base: &std::path::Path, id: &str) {
+    if crate::native_runtime::digest_valid(id, 64) {
+        let _ = std::fs::remove_file(base.join(OWED).join(format!("{id}.json")));
+    }
+}
 
 pub(crate) struct OfflineAlbums {
     operation: AsyncMutex<()>,
@@ -79,6 +98,53 @@ impl OfflineAlbums {
     pub async fn purge_scope(&self, app: &AppHandle, scope: &CleanupScope) -> Result<(), String> {
         let _permit = self.operation.lock().await;
         Cache::purge_scope(&crate::import_base(app)?, scope)
+    }
+
+    /// Sign-out clears the signed-in library's offline copies. The debt is written down first,
+    /// so a failed or interrupted clear is made good by `settle_owed` without the saved sign-in.
+    pub async fn purge_or_owe(&self, app: &AppHandle, saved: &SavedConnection) -> bool {
+        let Ok(scope) = CleanupScope::from_saved(saved) else {
+            return false;
+        };
+        let base = crate::import_base(app).ok();
+        if let Some(base) = base.as_deref() {
+            owe_cleanup(base, &scope);
+        }
+        let _permit = self.operation.lock().await;
+        let Some(base) = base else {
+            return false;
+        };
+        let cleared = Cache::purge_scope(&base, &scope).is_ok();
+        if cleared {
+            forget_owed(&base, scope.id());
+        }
+        cleared
+    }
+
+    /// Clears the offline copies an earlier sign-out could not. True when none are still owed.
+    pub async fn settle_owed(&self, app: &AppHandle) -> bool {
+        let Ok(base) = crate::import_base(app) else {
+            return false;
+        };
+        let directory = base.join(OWED);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let _permit = self.operation.lock().await;
+        let mut settled = true;
+        for entry in entries.flatten() {
+            let scope = std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CleanupScope>(&bytes).ok());
+            match scope {
+                Some(scope) if Cache::purge_scope(&base, &scope).is_ok() => {
+                    forget_owed(&base, scope.id());
+                }
+                _ => settled = false,
+            }
+        }
+        settled
     }
 
     fn clear_playback(&self) {

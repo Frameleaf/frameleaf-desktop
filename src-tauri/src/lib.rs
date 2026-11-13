@@ -577,6 +577,10 @@ pub(crate) async fn restore_saved(
         }
         None => credentials::load::<SavedConnection>("connection"),
     };
+    // Offline copies an earlier sign-out could not clear are cleared before any sign-in is used.
+    app.state::<offline_albums::OfflineAlbums>()
+        .settle_owed(app)
+        .await;
     let Some(mut saved) = loaded? else {
         // The saved sign-in is gone: drop any connection still held so the window and the
         // background agree.
@@ -726,8 +730,9 @@ async fn sign_out(
     // Only the signed-in library's offline copies are cleared; other approved libraries keep theirs.
     let offline = app.state::<offline_albums::OfflineAlbums>();
     offline.deactivate().await;
+    // A clear that fails stays owed and is made good at the next restore, without the sign-in.
     let offline_cleared = match saved.as_ref() {
-        Some(saved) => offline.purge(&app, saved).await.is_ok(),
+        Some(saved) => offline.purge_or_owe(&app, saved).await,
         None => true,
     };
     app.state::<media_copy::MediaCopy>().fence_session();
@@ -736,16 +741,16 @@ async fn sign_out(
     // The saved sign-in is removed while the connection is still locked: a restore waiting on the
     // lock would otherwise find it, sign in again and leave a live session behind a signed-out
     // window. Every sign-in saves under this lock too, so nothing can bring it back in between.
-    // It is kept only while its library's local cleanup is unfinished, so a retry can find it.
+    // It is removed even when the library's offline copies could not be cleared: that clear is
+    // owed on its own and reported here.
     let local = {
         let worker = credentials::delete("worker-session").is_ok();
-        let approved = offline_cleared
-            && saved
-                .as_ref()
-                .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
+        let approved = saved
+            .as_ref()
+            .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
         let sources = credentials::delete_source_approvals(saved.as_ref());
-        let connection = approved && credentials::delete("connection").is_ok();
-        worker && connection && sources
+        let connection = credentials::delete("connection").is_ok();
+        worker && connection && sources && approved && offline_cleared
     };
     drop(current);
     tray::refresh(&app).await;

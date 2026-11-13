@@ -225,7 +225,7 @@
       libraryRevision += 1;
       keptSignIn = null;
       summaryRequest += 1; connection = null; setup = null; summary = null; summaryStepUp = noStepUp; signOutSheet = false; accountMenu = false; page = 'overview'; staleSignIn = !result.localCleared;
-      notice = !result.localCleared ? 'Desktop could not clear the saved sign-in or offline copies. Unlock the secure credential store and check local storage, then sign out again.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
+      notice = !result.localCleared ? 'Desktop could not finish clearing this computer’s saved sign-in or this library’s offline copies. Unlock the secure credential store and check local storage; Desktop clears leftover offline copies the next time it starts.' : !result.photosCleared ? 'Sign-in stopped, but the Photos window could not be cleared. Close it and clear this server’s browsing data.' : result.remoteRevoked ? 'Signed out. Local credentials were removed.' : 'Signed out on this computer. The server was unreachable; revoke this computer from your server when it is available.';
       void invoke('tray_refresh').catch(() => {});
       void tick().then(focusContent);
     } catch (error) { failure = explain(error); }
