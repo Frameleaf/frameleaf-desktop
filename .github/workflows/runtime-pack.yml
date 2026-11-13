@@ -6,6 +6,7 @@ on:
       - 'tools/test_build_runtime.py'
       - 'tools/build_coreml_observer.py'
       - 'tools/smoke_accelerated_runtime.py'
+      - 'tools/linked_libraries.py'
       - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
