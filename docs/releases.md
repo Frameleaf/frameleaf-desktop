@@ -113,8 +113,11 @@ run summary. A runtime rebuilt for an older macOS lets `aiRuntime` be lowered;
 to change `app`, change the declaration, `tauri.conf.json` and both workflows
 together (`tools/test_check_macos_minimum.py` fails when they disagree).
 
-The app does not yet tell someone on macOS 11 to 14 why AI processing cannot
-start there; see the follow-up noted in FD-54.
+The app reads `aiRuntime` from the same declaration when it is built. On an
+older macOS, AI setup stops before it prepares anything, with the code
+`runtime_os_unsupported`, and the AI processing card says which macOS is
+needed. It does not retry by itself and offers no Retry Setup. Photos and
+everything else keep working.
 
 ### Linux tray library
 
@@ -130,8 +133,25 @@ ship; `libappindicator3-1` is not in Debian 12. The AUR package depends on
 `tools/qualify_linux_deb_install.sh PACKAGE.deb` installs the package with
 `apt-get install` in clean `ubuntu:24.04`, `ubuntu:22.04` and `debian:12`
 containers and fails on an unmet dependency or a missing tray dependency. It
-also reports, as a warning, a distribution whose C library is too old to load
-the installed binaries. `Desktop candidate` runs it on every pull request.
+then runs every binary the package installs in `/usr/bin` with `--version` in
+each container, and fails when one does not load there. `Desktop candidate`
+runs it on every pull request.
+
+### Linux C library
+
+A Linux binary needs at least the glibc of the machine it was linked on.
+Ubuntu 22.04 has glibc 2.35 and Debian 12 has 2.36, so the Linux jobs that
+build what ships run on `ubuntu-22.04`: the `linux-package` job of `Desktop
+candidate`, and `Desktop release`, the installer candidates and the runtime
+factory through `releaseMatrix` in `tools/release_inputs.mjs`. The `check` job
+of `Desktop candidate` stays on `ubuntu-24.04`, which the host package
+qualification needs; its package is not shipped. Ubuntu 22.04 ships
+WebKitGTK 4.1 and `libayatana-appindicator3`, so nothing else changes.
+
+`tools/check_linux_glibc.py --max 2.35 PATH...` reads the `GLIBC_x.y` versions
+every ELF file under a folder, or inside a `.deb`, needs and fails when one is
+newer than the limit. The same three workflows run it on the `.deb` they
+build, and the runtime candidate workflow runs it on the runtime payload.
 
 ## Browser UI tests
 

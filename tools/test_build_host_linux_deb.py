@@ -310,7 +310,9 @@ class LinuxHostDebTests(unittest.TestCase):
             installed.parent.chmod(0o755)
             self.assertNotEqual(run('runtime', 'preinst', 'unknown'), 0)
 
-    @unittest.skipUnless(shutil.which('dpkg-deb') and os.name == 'posix', 'requires Debian archive tool')
+    # The host packages are built on Ubuntu 24.04; dpkg before 1.21.9 (Ubuntu 22.04) has no --threads-max.
+    @unittest.skipUnless(shutil.which('dpkg-deb') and os.name == 'posix' and '--threads-max' in subprocess.run(
+        ['dpkg-deb', '--help'], capture_output=True, text=True).stdout, 'requires a Debian archive tool with --threads-max')
     def test_real_archives_have_root_owners_and_required_bootstrap(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

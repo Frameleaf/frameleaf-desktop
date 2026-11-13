@@ -1435,6 +1435,10 @@ mod tests {
         let root = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
         let source = root.open("photo.jpg").unwrap();
         let before = stamp(&source.metadata().unwrap()).unwrap();
+        // The new content has the same length, so only the file's times tell the versions
+        // apart. Kernels without fine-grained timestamps (Ubuntu 22.04) stamp both writes with
+        // the same timer tick when they follow each other at once.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         fs::write(path.join("photo.jpg"), b"modified").unwrap();
         assert_eq!(
             unchanged(&root, Path::new("photo.jpg"), &source, &before, 8, 8)

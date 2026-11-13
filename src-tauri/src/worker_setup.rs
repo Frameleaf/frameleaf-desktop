@@ -804,7 +804,68 @@ pub(crate) fn bundle_supersedes(active_sha256: &str, active_epoch: u64, manifest
         .is_none_or(|epoch| epoch >= active_epoch)
 }
 
+/// The two macOS floors the release checks enforce (`tools/check_macos_minimum.py`), read at
+/// build time so the app and the checks cannot disagree.
+const MACOS_MINIMUMS: &str = include_str!("../../packaging/macos/minimum-versions.json");
+fn os_version(text: &str) -> Option<(u64, u64)> {
+    let mut parts = text.trim().split('.').map(|part| part.parse::<u64>().ok());
+    Some((parts.next()??, parts.next().unwrap_or(Some(0))?))
+}
+/// The oldest macOS the AI runtime pack runs on. The app itself runs on older ones.
+fn ai_runtime_macos_floor() -> Option<(u64, u64)> {
+    serde_json::from_str::<serde_json::Value>(MACOS_MINIMUMS)
+        .ok()?
+        .get("aiRuntime")?
+        .as_str()
+        .and_then(os_version)
+}
+/// The macOS this app is running on; `None` on other systems or when it cannot be read.
+fn running_macos() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut text = [0u8; 32];
+        let mut length = text.len();
+        // SAFETY: the name is NUL-terminated and `length` is the size of `text`, which the
+        // kernel fills with at most that many bytes and reports back in `length`.
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.osproductversion".as_ptr(),
+                text.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        let text = text.get(..length).filter(|_| read)?;
+        os_version(std::str::from_utf8(text).ok()?.trim_end_matches('\0'))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+/// Refuse AI processing on a macOS older than the runtime pack needs, where the runtime would
+/// only fail to load. A version that cannot be read refuses nothing.
+fn runtime_os_supported(
+    running: Option<(u64, u64)>,
+    floor: Option<(u64, u64)>,
+) -> Result<(), String> {
+    match (running, floor) {
+        (Some(running), Some(floor)) if running < floor => Err("runtime_os_unsupported".into()),
+        _ => Ok(()),
+    }
+}
+
 async fn prepare(
+    saved: SavedConnection,
+    paths: SetupPaths,
+    allow_download: bool,
+    progress: Progress,
+) -> Result<(), String> {
+    prepare_on(running_macos(), saved, paths, allow_download, progress).await
+}
+async fn prepare_on(
+    macos: Option<(u64, u64)>,
     saved: SavedConnection,
     paths: SetupPaths,
     allow_download: bool,
@@ -817,6 +878,8 @@ async fn prepare(
         runtime_store::{private_directory, read_bounded},
         transport,
     };
+    // Before anything is created, installed, downloaded or started.
+    runtime_os_supported(macos, ai_runtime_macos_floor())?;
     progress.update(|status| status.models = None);
     progress.set("preparing-runtime", None);
     let cancelled = progress.cancelled.clone();
@@ -2003,6 +2066,96 @@ mod tests {
         assert!(renewals.load(Ordering::Acquire) > 0);
         assert_eq!(setup.status(), SetupStatus::default());
     }
+    #[test]
+    fn the_ai_runtime_floor_is_the_declared_one_and_only_an_older_macos_is_refused() {
+        let declared: serde_json::Value = serde_json::from_str(MACOS_MINIMUMS).unwrap();
+        let floor = ai_runtime_macos_floor().expect("aiRuntime is declared as major.minor");
+        assert_eq!(
+            format!("{}.{}", floor.0, floor.1),
+            declared["aiRuntime"].as_str().unwrap()
+        );
+        assert!(floor > os_version(declared["app"].as_str().unwrap()).unwrap());
+        assert_eq!(os_version("15.6.1"), Some((15, 6)));
+        assert_eq!(os_version("26\n"), Some((26, 0)));
+        assert_eq!(os_version("fifteen"), None);
+        let refused = Err("runtime_os_unsupported".to_string());
+        assert_eq!(
+            runtime_os_supported(Some((floor.0 - 1, 9)), Some(floor)),
+            refused
+        );
+        assert_eq!(runtime_os_supported(Some((11, 0)), Some(floor)), refused);
+        assert_eq!(runtime_os_supported(Some(floor), Some(floor)), Ok(()));
+        assert_eq!(
+            runtime_os_supported(Some((floor.0 + 1, 0)), Some(floor)),
+            Ok(())
+        );
+        // Not macOS, or a version that could not be read: nothing is refused on a guess.
+        assert_eq!(runtime_os_supported(None, Some(floor)), Ok(()));
+        assert_eq!(runtime_os_supported(Some((11, 0)), None), Ok(()));
+        #[cfg(target_os = "macos")]
+        assert!(running_macos().is_some_and(|version| version >= (11, 0)));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(running_macos(), None);
+        // It stops for the person: the worker never retries it by itself.
+        assert!(!retryable("runtime_os_unsupported"));
+    }
+    #[tokio::test]
+    async fn an_older_macos_stops_ai_setup_before_anything_is_created_or_started() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let data = root.join("app");
+        let status = Arc::new(Mutex::new(SetupStatus::default()));
+        let progress = Progress {
+            user_paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: status.clone(),
+            notify: Arc::new(|_| {}),
+        };
+        let saved = SavedConnection {
+            server: "https://127.0.0.1:1".into(),
+            server_id: "test".into(),
+            account_id: uuid::Uuid::new_v4().to_string(),
+            name: "Test".into(),
+            token: "synthetic".into(),
+            device_name: "Test".into(),
+            mode: "client-worker".into(),
+            device_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let result = prepare_on(
+            Some((11, 0)),
+            saved,
+            SetupPaths {
+                data: data.clone(),
+                bundle: root.join("absent"),
+            },
+            true,
+            progress,
+        )
+        .await;
+        let created = data.exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result.unwrap_err(), "runtime_os_unsupported");
+        assert!(!created, "nothing is prepared on an unsupported macOS");
+        assert_eq!(*status.lock().unwrap(), SetupStatus::default());
+        // The worker reports it as a state that waits for the person, with its own code.
+        let setup = WorkerSetup::default();
+        setup
+            .start_work(Arc::new(|_| {}), |_| async {
+                Err("runtime_os_unsupported".into())
+            })
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.status().code.is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = setup.status();
+        assert_eq!(status.state, "setup-needs-attention");
+        assert_eq!(status.code.as_deref(), Some("runtime_os_unsupported"));
+    }
     #[tokio::test]
     async fn fresh_nested_app_directory_reports_missing_pack_without_touching_server_credentials() {
         let root = std::env::temp_dir()
@@ -2027,7 +2180,9 @@ mod tests {
             mode: "client-worker".into(),
             device_id: Some(uuid::Uuid::new_v4().to_string()),
         };
-        let result = prepare(
+        // Not the macOS this suite happens to run on: an older one is refused before the pack.
+        let result = prepare_on(
+            None,
             saved,
             SetupPaths {
                 data: data.clone(),

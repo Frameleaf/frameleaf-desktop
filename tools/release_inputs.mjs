@@ -29,8 +29,9 @@ export function releaseMatrix(platforms) {
     ] : []),
     ...(platforms === "all" || platforms === "windows" ? [{ os: "windows-2022", target: "windows-x86_64" }] : []),
     ...(platforms !== "windows" ? [
-      { os: "ubuntu-24.04", target: "linux-x86_64" },
-      { os: "ubuntu-24.04-arm", target: "linux-aarch64" },
+      // Ubuntu 22.04 has glibc 2.35: what is built there also loads on Debian 12.
+      { os: "ubuntu-22.04", target: "linux-x86_64" },
+      { os: "ubuntu-22.04-arm", target: "linux-aarch64" },
     ] : []),
   ] };
 }

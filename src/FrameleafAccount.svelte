@@ -44,7 +44,7 @@
     : mode === 'code' ? { title: 'Check your email', sub: 'Enter the Verification Code to finish.' }
     : mode === 'second' ? second
     : mode === 'browser' ? { title: 'Finish in your browser', sub: 'This account signs in with a Passkey, or needs a step this app can’t show.' }
-    : { title: 'Frameleaf account', sub: 'Use the same sign-in you use on the web.' });
+    : { title: 'Frameleaf account', sub: 'Sign In with Frameleaf opens your browser, with the same sign-in you use on the web.' });
 
   // Only the latest load may set the terms: a slower, older answer must not replace what the person read and accepted.
   let consentRequest = 0;
@@ -193,11 +193,12 @@
     {#if mode === 'create'}
       <p>Already have an account? <button class="link" type="button" onclick={() => { mode = 'sign-in'; failure = ''; }}>Sign in</button></p>
     {:else}
-      <p>New to Frameleaf? <button class="link" type="button" onclick={() => { mode = 'create'; failure = ''; }}>Create an account</button>. <button class="link" type="button" onclick={onownlogin}>Use my server’s own sign-in instead</button>.</p>
-      <button class="btn quiet" type="button" disabled={busy || !native} onclick={onbrowser}>Use a Passkey in My Browser</button>
+      <p>New to Frameleaf? <button class="link" type="button" onclick={() => { mode = 'create'; failure = ''; }}>Create an account</button>. <button class="link" type="button" onclick={onownlogin}>Sign in with a server Password instead</button>.</p>
     {/if}
     <button class="btn quiet" type="button" disabled={busy} onclick={onback}>Back</button>
-    <button class="btn primary" type="submit" form="frameleaf-account" disabled={busy || !native || !email || (mode === 'create' && (!agreed || !consents))}>{busy ? 'Sending…' : mode === 'create' ? 'Create Account' : 'Continue'}</button>
+    <!-- Signing in goes through Sign in with Frameleaf in the browser; an emailed Verification Code is the other way. -->
+    <button class="btn" class:primary={mode === 'create'} type="submit" form="frameleaf-account" disabled={busy || !native || !email || (mode === 'create' && (!agreed || !consents))}>{busy ? 'Sending…' : mode === 'create' ? 'Create Account' : 'Email Me a Verification Code'}</button>
+    {#if mode !== 'create'}<button class="btn primary" type="button" disabled={busy || !native} onclick={onbrowser}>Sign In with Frameleaf</button>{/if}
   </div>
 {/if}
 

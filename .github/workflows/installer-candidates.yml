@@ -156,7 +156,16 @@ jobs:
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
-      - name: Install the Linux package in clean Ubuntu and Debian containers
+      - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          python tools/check_linux_glibc.py --max 2.35 "${packages[0]}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install and run the Linux package in clean Ubuntu and Debian containers
         if: runner.os == 'Linux'
         shell: bash
         run: |
