@@ -160,10 +160,8 @@ class RuntimeBuilderTests(unittest.TestCase):
             (root / "python").write_bytes(b"fixture")
             arguments = (root, "python", "a" * 40, 7)
             for provider, systems in [
-                # Windows has no recipe for either: with the locked libraries neither provider
-                # library loads there (pull-request CI, Windows error 127).
-                ("CUDAExecutionProvider", ["linux"]),
-                ("OpenVINOExecutionProvider", ["linux"]),
+                ("CUDAExecutionProvider", ["windows", "linux"]),
+                ("OpenVINOExecutionProvider", ["windows", "linux"]),
             ]:
                 for system in systems:
                     value = builder.manifest(
@@ -176,7 +174,6 @@ class RuntimeBuilderTests(unittest.TestCase):
                     ("macos", "aarch64"),
                     ("macos", "x86_64"),
                     ("linux", "aarch64"),
-                    ("windows", "x86_64"),
                 ]:
                     with self.assertRaises(builder.BuildError):
                         builder.manifest(*arguments, system, architecture, provider)
@@ -195,34 +192,20 @@ class RuntimeBuilderTests(unittest.TestCase):
                     *arguments, "linux", "x86_64", "MIGraphXExecutionProvider"
                 )
 
-    def test_device_libraries_come_from_the_lock_with_their_exact_hashes(self):
-        def block(name, marker=""):
+    def test_only_the_gpu_wheel_comes_from_the_cuda_feed(self):
+        def block(name):
             return (
-                f"{name}==1.0{marker} \\\n"
+                f"{name}==1.0 \\\n"
                 f"    --hash=sha256:{'a' * 64} \\\n"
                 f"    --hash=sha256:{'b' * 64}\n"
             )
 
-        linux = " ; platform_machine in 'x86_64 aarch64' and sys_platform == 'linux'"
-        locked = (
-            block("numpy")
-            + "".join(block(name, linux) for name in builder.CUDA_LIBRARIES)
-            + block("nvidia-cublas", linux)
-            + block("onnxruntime-gpu")
-        )
-        for system in ["linux"]:
-            value = builder.device_requirements("CUDAExecutionProvider", system, locked)
-            # Every library the provider loads, each with both locked hashes and no marker: the
-            # builder has already chosen the platform, and the lock's marker names Linux only.
-            self.assertEqual(
-                value, "".join(block(name) for name in builder.CUDA_LIBRARIES)
-            )
-            builder.validate_requirements(value)
-        # Only onnxruntime-gpu comes from the server's CUDA 12 feed; the feed also mirrors other
-        # packages at other versions, so nothing else may be resolved against it.
+        locked = block("numpy") + block("onnxruntime-gpu") + block("nvidia-cudnn-cu12")
+        # The feed also mirrors other packages at other versions, so nothing else may be
+        # resolved against it.
         rest, feed, index = builder.feed_requirements("CUDAExecutionProvider", locked)
         self.assertEqual(feed, block("onnxruntime-gpu"))
-        self.assertEqual(rest + feed, locked)
+        self.assertEqual(rest, block("numpy") + block("nvidia-cudnn-cu12"))
         self.assertEqual(index, builder.CUDA_FEED)
         for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"]:
             self.assertEqual(
@@ -230,31 +213,6 @@ class RuntimeBuilderTests(unittest.TestCase):
             )
         with self.assertRaises(builder.BuildError):
             builder.feed_requirements("CUDAExecutionProvider", block("numpy"))
-        # The Linux OpenVINO wheel contains OpenVINO; the other providers carry nothing extra.
-        for provider, system in [
-            ("OpenVINOExecutionProvider", "linux"),
-            ("OpenVINOExecutionProvider", "windows"),
-            ("CUDAExecutionProvider", "windows"),
-            ("CPUExecutionProvider", "linux"),
-            ("CoreMLExecutionProvider", "macos"),
-        ]:
-            self.assertEqual(builder.device_requirements(provider, system, locked), "")
-        # A library the lock does not pin, or pins without a hash, stops the build.
-        with self.assertRaises(builder.BuildError):
-            builder.device_requirements(
-                "CUDAExecutionProvider", "linux", block("numpy")
-            )
-        with self.assertRaises(builder.BuildError):
-            builder.device_requirements(
-                "CUDAExecutionProvider",
-                "linux",
-                locked.replace(
-                    block("nvidia-cudnn-cu12", linux), "nvidia-cudnn-cu12==1.0\n"
-                ),
-            )
-        self.assertEqual(builder.unmarked(block("numpy")), block("numpy"))
-        with self.assertRaises(builder.BuildError):
-            builder.unmarked("numpy==1.0 ; sys_platform == 'linux'\n")
 
     def test_collector_is_staged_only_with_the_hashes_its_build_recorded(self):
         import hashlib

@@ -32,27 +32,29 @@
       "targets": [
         "macos-aarch64"
       ],
-      "sourceRevision": "c2203495fa2400e369604347557473d81f0b9b6b"
+      "sourceRevision": "4da8e50954ff08be437db51a0872ce5da0e8ba06"
     },
     "cuda-ort": {
       "python": "3.12.13",
       "uv": "0.11.2",
-      "extra": "cuda",
+      "extra": "desktop-cuda",
       "provider": "CUDAExecutionProvider",
       "targets": [
+        "windows-x86_64",
         "linux-x86_64"
       ],
-      "sourceRevision": "c2203495fa2400e369604347557473d81f0b9b6b"
+      "sourceRevision": "4da8e50954ff08be437db51a0872ce5da0e8ba06"
     },
     "openvino-ort": {
       "python": "3.12.13",
       "uv": "0.11.2",
-      "extra": "openvino",
+      "extra": "desktop-openvino",
       "provider": "OpenVINOExecutionProvider",
       "targets": [
+        "windows-x86_64",
         "linux-x86_64"
       ],
-      "sourceRevision": "c2203495fa2400e369604347557473d81f0b9b6b"
+      "sourceRevision": "4da8e50954ff08be437db51a0872ce5da0e8ba06"
     }
   }
 }

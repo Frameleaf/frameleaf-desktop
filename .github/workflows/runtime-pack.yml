@@ -7,6 +7,7 @@ on:
       - 'tools/build_coreml_observer.py'
       - 'tools/smoke_accelerated_runtime.py'
       - 'tools/linked_libraries.py'
+      - 'tools/pe_imports.py'
       - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
@@ -74,7 +75,7 @@ jobs:
         if: runner.os == 'macOS' && runner.arch == 'ARM64'
         with:
           repository: Frameleaf/frameleaf-app
-          ref: c2203495fa2400e369604347557473d81f0b9b6b
+          ref: 4da8e50954ff08be437db51a0872ce5da0e8ba06
           path: coreml-server
           persist-credentials: false
       - name: Construct the CoreML pack with its device collector
@@ -82,7 +83,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision c2203495fa2400e369604347557473d81f0b9b6b --epoch 6 --profile coreml-ort
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision 4da8e50954ff08be437db51a0872ce5da0e8ba06 --epoch 6 --profile coreml-ort
           test -s coreml-candidate/manifest.json
           test -s coreml-candidate/manifest-accelerated.json
           coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
@@ -112,9 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux only. On Windows neither provider library loads with the locked libraries
-        # (Windows error 127 in both cases), so Desktop builds no Windows GPU pack.
-        os: [ubuntu-24.04]
+        os: [windows-latest, ubuntu-24.04]
         profile: [cuda-ort, openvino-ort]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -126,7 +125,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: c2203495fa2400e369604347557473d81f0b9b6b
+          ref: 4da8e50954ff08be437db51a0872ce5da0e8ba06
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -142,7 +141,7 @@ jobs:
           RUNTIME_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source server --output candidate --revision c2203495fa2400e369604347557473d81f0b9b6b --epoch 6 --profile "$RUNTIME_PROFILE"
+          python desktop/tools/build_runtime.py --source server --output candidate --revision 4da8e50954ff08be437db51a0872ce5da0e8ba06 --epoch 6 --profile "$RUNTIME_PROFILE"
           test -s candidate/manifest.json
           test -s candidate/manifest-accelerated.json
           case "$RUNTIME_PROFILE" in

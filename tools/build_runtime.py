@@ -35,40 +35,20 @@ ACCELERATED_MANIFEST = "manifest-accelerated.json"
 # approves it.
 ACCELERATED_TARGETS = {
     "CoreMLExecutionProvider": {("macos", "aarch64")},
-    # Not Windows: with the locked CUDA and cuDNN wheels, onnxruntime-gpu 1.29.0's provider
-    # library does not load there (Windows error 127, an entry point missing from a library it
-    # depends on; seen in pull-request CI). The cause is not identified.
-    "CUDAExecutionProvider": {("linux", "x86_64")},
-    # Not Windows: its onnxruntime-openvino 1.24.1 wheel needs the OpenVINO 2025.4 libraries it
-    # was built with, and the server's lock has only openvino 2026.4.1, with which the provider
-    # library does not load (Windows error 127, a missing entry point; seen in pull-request CI).
-    "OpenVINOExecutionProvider": {("linux", "x86_64")},
+    "CUDAExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+    "OpenVINOExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
 }
 # The server's lock takes onnxruntime-gpu from this explicit index (`onnxruntime-cuda12` in its
 # pyproject.toml): the CUDA 12 build, which PyPI no longer carries. Only that one package is
 # installed from it (the feed also mirrors other packages at other versions), and like every
 # wheel it is checked against the hash the lock records.
 CUDA_FEED = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
-# The CUDA 12 and cuDNN 9 libraries onnxruntime-gpu 1.29.0 loads (its `cuda` and `cudnn` extras
-# and its own `preload_dlls` list, plus what those libraries need themselves). A container has
-# them in its image; a desktop has no CUDA installation, so the pack carries them. The lock pins
-# each one for the Linux torch build.
-CUDA_LIBRARIES = (
-    "nvidia-cublas-cu12",
-    "nvidia-cuda-nvrtc-cu12",
-    "nvidia-cuda-runtime-cu12",
-    "nvidia-cudnn-cu12",
-    "nvidia-cufft-cu12",
-    "nvidia-curand-cu12",
-    "nvidia-nvjitlink-cu12",
-)
+# The CUDA, cuDNN and (on Windows) OpenVINO libraries a pack carries are those the runtime source's
+# `desktop-cuda` and `desktop-openvino` extras lock: the versions each provider library was built
+# against. A container has them in its image; a desktop has no installation of them.
 # Packages taken from an index of their own, as the server's lock does.
 FEED_PACKAGES = {"CUDAExecutionProvider": ("onnxruntime-gpu", CUDA_FEED)}
-# Server-only packages of the GPU extras, as DESKTOP_UNUSED is for every extra.
-ACCELERATED_UNUSED = {
-    "CUDAExecutionProvider": ("qwen-vl-utils",),
-    "OpenVINOExecutionProvider": ("openvino-genai",),
-}
+
 
 
 class BuildError(RuntimeError):
@@ -396,24 +376,6 @@ def source_build_requirements(text: str, locked: str | None = None) -> str:
     return requirement_block(text if locked is None else locked, "setuptools")
 
 
-def unmarked(block: str) -> str:
-    """A locked requirement without its environment marker: the builder has already chosen it."""
-    first, separator, rest = block.partition("\n")
-    name, marker, _ = first.partition(" ;")
-    if marker and not first.rstrip().endswith("\\"):
-        raise BuildError("runtime_build_tool_not_pinned")
-    return (name + " \\" if marker else first) + separator + rest
-
-
-def device_requirements(provider: str, system: str, locked: str) -> str:
-    """The device libraries an accelerated runtime carries, exactly as the server's lock pins them."""
-    # The Linux onnxruntime-openvino wheel contains OpenVINO itself.
-    names = {
-        ("CUDAExecutionProvider", "linux"): CUDA_LIBRARIES,
-    }.get((provider, system), ())
-    return "".join(unmarked(requirement_block(locked, name)) for name in names)
-
-
 def feed_requirements(provider: str, text: str) -> tuple[str, str, str | None]:
     """Split the requirements into those installed from the usual indexes and the one package
     the server's lock takes from its own index: (the rest, that package's block, its index)."""
@@ -574,23 +536,13 @@ def build(
         run(
             [
                 *export,
-                *(
-                    arg
-                    for name in (
-                        *DESKTOP_UNUSED,
-                        *ACCELERATED_UNUSED.get(profile["provider"], ()),
-                    )
-                    for arg in ("--prune", name)
-                ),
+                *(arg for name in DESKTOP_UNUSED for arg in ("--prune", name)),
                 "--output-file",
                 requirements,
             ],
             cwd=ml,
             env=env,
         )
-        device = device_requirements(profile["provider"], system, locked.read_text())
-        if device:
-            requirements.write_text(requirements.read_text() + device)
         validate_requirements(requirements.read_text())
         downloads = work / "python-downloads"
         run(

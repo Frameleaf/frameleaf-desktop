@@ -6,13 +6,15 @@ OpenVINO also runs on a processor, so a session on its CPU device proves the pro
 libraries initialise. That is not an accelerator qualification: the runtime refuses to qualify
 OpenVINO without one of its graphics devices.
 
-CUDA (Linux) cannot create a session without an NVIDIA card. What is checked without one: every
-CUDA and cuDNN library onnxruntime lists is in the pack and opens on its own; onnxruntime's CUDA
-provider library is in the pack and the dynamic linker resolves everything it links against
-from the pack except the NVIDIA driver library `libcuda.so.1`, which only a computer with the
-driver has. Any other unresolved library fails. With a device the session must be on CUDA;
-without one, the only accepted outcome is that the driver library is the one thing missing.
-Nothing here shows a CUDA session or inference on a card.
+CUDA cannot create a session without an NVIDIA card. What is checked without one: the CUDA
+libraries onnxruntime lists and cuDNN's main library are in the pack and every bundled one opens
+on its own; the CUDA provider library is in the pack and everything it needs is there. On
+Windows its import table is read: every library it imports is found and exports every imported
+function, and the library then loads (it does not import the driver's library). On Linux the
+dynamic linker resolves everything it links against from the pack except the NVIDIA driver
+library `libcuda.so.1`, which only a computer with the driver has. With a device the session
+must be on CUDA and run; without one, the only accepted outcome is that the driver is absent.
+On a computer without a card nothing here shows a CUDA session or inference.
 """
 
 import ctypes
@@ -30,6 +32,7 @@ provider = sys.argv[1]
 if provider not in {"CUDAExecutionProvider", "OpenVINOExecutionProvider"}:
     raise SystemExit("unsupported provider")
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from frameleaf_ml import native_hardware, native_ort  # noqa: E402
 from frameleaf_ml.native_qualification import accelerator_present  # noqa: E402
 
@@ -61,6 +64,21 @@ with tempfile.TemporaryDirectory() as temporary:
     path = Path(temporary) / "model.onnx"
     onnx.save(model, path)
     if provider == "OpenVINOExecutionProvider":
+        if platform.system() == "Windows":
+            import os
+
+            from pe_imports import unsatisfied
+
+            # The Windows wheel loads OpenVINO from the `openvino` package: name what is missing.
+            capi = Path(ort.__file__).resolve().parent / "capi"
+            libraries = Path(ort.__file__).resolve().parent.parent / "openvino" / "libs"
+            assert (libraries / "openvino.dll").is_file(), "openvino.dll is not in the pack"
+            system = Path(os.environ["SystemRoot"]) / "System32"
+            problems = unsatisfied(
+                capi / "onnxruntime_providers_openvino.dll", [capi, libraries, Path(sys.executable).parent, system]
+            )
+            assert not problems, f"the provider library's imports are not satisfied: {problems}"
+            print("OpenVINO provider library imports are satisfied by the pack")
         assert "CPU" in facts["openvinoDevices"], facts["openvinoDevices"]
         session = ort.InferenceSession(
             path.as_posix(),
@@ -74,13 +92,12 @@ with tempfile.TemporaryDirectory() as temporary:
         # A hosted runner has no Intel graphics device: this is not an accelerator.
         print("accelerator present:", accelerator_present(provider, facts))
     else:
-        if platform.system() != "Linux":
-            raise SystemExit("Desktop builds a CUDA pack for Linux only")
         import os
         import subprocess
 
+        windows = platform.system() == "Windows"
         site = Path(ort.__file__).resolve().parent.parent
-        driver = "libcuda.so.1"
+        driver = "nvcuda.dll" if windows else "libcuda.so.1"
         try:
             ctypes.CDLL(driver)
             driver_present = True
@@ -88,43 +105,65 @@ with tempfile.TemporaryDirectory() as temporary:
             driver_present = False
         device = bool(facts["gpus"]) or driver_present or shutil.which("nvidia-smi") is not None
         print("NVIDIA device or driver present:", device)
-        # onnxruntime's own lists of what it preloads from the wheels: every one must be in the
-        # pack and open on its own.
-        libraries = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(False, True, True)]
-        assert len(libraries) >= 7, libraries
-        for library in libraries:
+        # onnxruntime's own lists of what it preloads from the wheels. The CUDA libraries and
+        # cuDNN's main library must be in the pack; every one that is there must open on its own.
+        # (onnxruntime treats a cuDNN engine library the wheel does not have as optional.)
+        cuda = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, True, False)]
+        cudnn = [site.joinpath(*parts) for parts in ort._get_nvidia_dll_paths(windows, False, True)]
+        assert len(cuda) >= 4 and cudnn, (cuda, cudnn)
+        for library in cuda:
             assert library.is_file(), f"missing from the pack: {library}"
+        main = "cudnn64_9.dll" if windows else "libcudnn.so.9"
+        assert any(library.name == main and library.is_file() for library in cudnn), f"{main} is not in the pack"
+        bundled = [library for library in cuda + cudnn if library.is_file()]
+        for library in bundled:
             ctypes.CDLL(str(library))  # raises when it or one of its dependencies does not load
-        print(f"CUDA: {len(libraries)} bundled CUDA and cuDNN libraries are in the pack and load")
-        # The provider library and what it links against: with the pack's own library folders on
-        # the search path, the dynamic linker may fail to find the NVIDIA driver library and
-        # nothing else. That one library belongs to the driver, which a computer without a card
-        # does not have.
+        print(f"CUDA: {len(cuda)} CUDA and {len(bundled) - len(cuda)} of {len(cudnn)} cuDNN libraries are in the pack and load")
         capi = site / "onnxruntime" / "capi"
-        provider_library = capi / "libonnxruntime_providers_cuda.so"
-        assert provider_library.is_file() and (capi / "libonnxruntime_providers_shared.so").is_file()
-        folders = sorted({str(library.parent) for library in libraries} | {str(capi)})
-        listing = subprocess.run(
-            ["ldd", str(provider_library)],
-            capture_output=True,
-            text=True,
-            check=True,
-            env={**os.environ, "LD_LIBRARY_PATH": ":".join(folders)},
-        ).stdout
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from linked_libraries import check_linked
+        folders = sorted({library.parent for library in bundled} | {capi})
+        if windows:
+            from pe_imports import PortableExecutable, unsatisfied
 
-        # Raises unless every NVIDIA library it links against resolves inside the pack and the
-        # driver library is the one thing missing (or, with a driver, resolves from the system).
-        resolved = check_linked(listing, site, driver_present)
-        unresolved = [] if driver_present else [driver]
-        print("CUDA provider library resolves", resolved, "unresolved:", unresolved)
+            provider_library = capi / "onnxruntime_providers_cuda.dll"
+            assert provider_library.is_file() and (capi / "onnxruntime_providers_shared.dll").is_file()
+            # Every library the provider imports is found, and exports every function imported
+            # from it. (Its failure to load names neither: error 126 or 127.) The driver's own
+            # library is not among its imports, so nothing here depends on a card.
+            system = Path(os.environ["SystemRoot"]) / "System32"
+            problems = unsatisfied(provider_library, [*folders, Path(sys.executable).parent, system])
+            imported = sorted(PortableExecutable(provider_library).imports())
+            print("CUDA provider library imports", [name for name in imported if not name.lower().startswith("api-ms-")])
+            assert not problems, f"the provider library's imports are not satisfied: {problems}"
+            assert driver not in [name.lower() for name in imported]
+            ctypes.CDLL(str(capi / "onnxruntime_providers_shared.dll"))
+            ctypes.CDLL(str(provider_library))  # the real loader agrees
+            print("CUDA provider library loaded")
+            unresolved = [] if driver_present else [driver]
+        else:
+            provider_library = capi / "libonnxruntime_providers_cuda.so"
+            assert provider_library.is_file() and (capi / "libonnxruntime_providers_shared.so").is_file()
+            listing = subprocess.run(
+                ["ldd", str(provider_library)],
+                capture_output=True,
+                text=True,
+                check=True,
+                env={**os.environ, "LD_LIBRARY_PATH": ":".join(str(folder) for folder in folders)},
+            ).stdout
+            from linked_libraries import check_linked
+
+            # Raises unless every NVIDIA library it links against resolves inside the pack and the
+            # driver library is the one thing missing (or, with a driver, resolves from the system).
+            resolved = check_linked(listing, site, driver_present)
+            unresolved = [] if driver_present else [driver]
+            print("CUDA provider library resolves", resolved, "unresolved:", unresolved)
         session = ort.InferenceSession(path.as_posix(), providers=[provider, "CPUExecutionProvider"])
         used = session.get_providers()
         print("session providers:", used)
         if device:
             # With a card the session must really be on CUDA, not quietly on the processor.
             assert provider in used, used
+            assert np.allclose(session.run(None, feed)[0], expected)
+            print("CUDA session ran on the card")
         else:
             # Without the driver onnxruntime leaves CUDA out; that is the only reason accepted.
             assert unresolved == [driver] and provider not in used, (unresolved, used)
