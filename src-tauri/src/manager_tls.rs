@@ -116,6 +116,28 @@ impl Vault for Keystore {
         crate::credentials::delete(account)
     }
 }
+/// Copy what the keystore holds under `from` to `to`, unless `to` already holds something:
+/// that is never replaced. The move goes on only once the keystore is seen to hold the same
+/// value under `to`; a store that reports a save it does not hold stops it there.
+fn copy_once<T>(
+    from: &str,
+    to: &str,
+    load: impl Fn(&str) -> Result<Option<T>, String>,
+    persist: impl FnOnce(&str, &T) -> Result<(), String>,
+    same: impl Fn(&T, &T) -> bool,
+) -> Result<(), String> {
+    if load(to)?.is_some() {
+        return Ok(());
+    }
+    let Some(saved) = load(from)? else {
+        return Ok(());
+    };
+    persist(to, &saved)?;
+    match load(to)? {
+        Some(stored) if same(&saved, &stored) => Ok(()),
+        _ => Err("credential_store_unavailable".into()),
+    }
+}
 fn pending_account(binding: &str) -> Result<String, String> {
     if !crate::native_runtime::digest_valid(binding, 64) {
         return Err("native_tls_binding_invalid".into());
@@ -171,13 +193,32 @@ impl TlsIdentity {
         let _lock = IDENTITY_LOCK
             .lock()
             .map_err(|_| "credential_store_unavailable")?;
-        if crate::credentials::load::<Pending>(&to)?.is_some() {
-            return Ok(());
-        }
-        match crate::credentials::load::<Pending>(&from)? {
-            Some(pending) => crate::credentials::save(&to, &pending),
-            None => Ok(()),
-        }
+        copy_once(
+            &from,
+            &to,
+            crate::credentials::load::<Pending>,
+            crate::credentials::save,
+            |saved, stored| {
+                saved.schema_version == stored.schema_version
+                    && saved.operation_id == stored.operation_id
+                    && saved.identity.same(&stored.identity)
+                    && saved.earlier.len() == stored.earlier.len()
+                    && saved
+                        .earlier
+                        .iter()
+                        .zip(&stored.earlier)
+                        .all(|(saved, stored)| saved.same(stored))
+            },
+        )
+    }
+    /// Every saved field, compared in place: no copy of the private key is made to compare.
+    fn same(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.installation_id == other.installation_id
+            && self.origin == other.origin
+            && self.certificate_pem == other.certificate_pem
+            && self.private_key_pem == other.private_key_pem
+            && self.expires_at == other.expires_at
     }
     /// `carry_forward` with injectable keystore access for tests.
     fn carry_forward_with(
@@ -190,14 +231,8 @@ impl TlsIdentity {
         let _lock = IDENTITY_LOCK
             .lock()
             .map_err(|_| "credential_store_unavailable")?;
-        if load(&to)?.is_some() {
-            return Ok(());
-        }
         // No saved certificate means Manager mints one at start; Desktop then asks to pair again.
-        match load(&from)? {
-            Some(saved) => persist(&to, &saved),
-            None => Ok(()),
-        }
+        copy_once(&from, &to, load, persist, Self::same)
     }
     pub fn from_keystore(
         installation_id: &str,
@@ -543,26 +578,53 @@ mod tests {
             .unwrap()
         };
         let saved = identity();
-        let copied = std::cell::RefCell::new(None);
+        let clone = |value: &TlsIdentity| -> TlsIdentity {
+            serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+        };
+        let from_old = |account: &str| {
+            Ok((account == account_for_profile(&old).unwrap()).then(|| clone(&saved)))
+        };
+        // A store that reports a save it does not hold, or holds another key, stops the move.
+        assert_eq!(
+            TlsIdentity::carry_forward_with(&old, &new, from_old, |_, _| Ok(())).unwrap_err(),
+            "credential_store_unavailable"
+        );
+        let other = std::cell::RefCell::new(None::<TlsIdentity>);
+        assert_eq!(
+            TlsIdentity::carry_forward_with(
+                &old,
+                &new,
+                |account| match other.borrow().as_ref() {
+                    Some(stored) if account == account_for_profile(&new).unwrap() =>
+                        Ok(Some(clone(stored))),
+                    _ => from_old(account),
+                },
+                |_, _| {
+                    *other.borrow_mut() = Some(identity());
+                    Ok(())
+                },
+            )
+            .unwrap_err(),
+            "credential_store_unavailable"
+        );
+        let copied = std::cell::RefCell::new(None::<TlsIdentity>);
         TlsIdentity::carry_forward_with(
             &old,
             &new,
-            |account| {
-                Ok((account == account_for_profile(&old).unwrap()).then(|| {
-                    serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap()
-                }))
+            |account| match copied.borrow().as_ref() {
+                Some(stored) if account == account_for_profile(&new).unwrap() => {
+                    Ok(Some(clone(stored)))
+                }
+                _ => from_old(account),
             },
             |account, value| {
                 assert_eq!(account, account_for_profile(&new).unwrap());
-                *copied.borrow_mut() = Some(value.certificate_pem.clone());
+                *copied.borrow_mut() = Some(clone(value));
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(
-            copied.borrow().as_deref(),
-            Some(saved.certificate_pem.as_str())
-        );
+        assert!(copied.borrow().as_ref().unwrap().same(&saved));
         let existing = identity();
         TlsIdentity::carry_forward_with(
             &old,
@@ -577,6 +639,46 @@ mod tests {
         .unwrap();
         TlsIdentity::carry_forward_with(&old, &new, |_| Ok(None), |_, _| panic!("nothing to copy"))
             .unwrap();
+    }
+    /// The real Credential Manager, under bindings of this test's own. Hosted runners only.
+    #[cfg(windows)]
+    #[test]
+    fn the_real_credential_manager_holds_a_certificate_moved_with_its_profile() {
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+            return;
+        }
+        use sha2::{Digest, Sha256};
+        let binding = || format!("{:x}", Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
+        let (old, new) = (binding(), binding());
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for account in &self.0 {
+                    let _ = crate::credentials::delete(account);
+                }
+            }
+        }
+        let _cleanup = Cleanup(vec![
+            account_for_profile(&old).unwrap(),
+            account_for_profile(&new).unwrap(),
+        ]);
+        assert_eq!(TlsIdentity::saved_certificate(&old).unwrap(), None);
+        // Nothing saved: nothing is moved, and Manager mints a certificate at start.
+        TlsIdentity::carry_forward(&old, &new).unwrap();
+        assert_eq!(TlsIdentity::saved_certificate(&new).unwrap(), None);
+        let saved =
+            TlsIdentity::from_keystore("aaaaaaaaaaaa", "https://127.0.0.1:9443", &old).unwrap();
+        TlsIdentity::carry_forward(&old, &new).unwrap();
+        let moved: TlsIdentity = crate::credentials::load(&account_for_profile(&new).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(moved.same(&saved));
+        // The previous package's certificate is still there, and a second move changes nothing.
+        assert_eq!(
+            TlsIdentity::saved_certificate(&old).unwrap().as_deref(),
+            Some(saved.certificate_pem.as_str())
+        );
+        TlsIdentity::carry_forward(&old, &new).unwrap();
     }
     #[test]
     fn expiry_is_announced_only_in_its_last_thirty_days_and_never_after() {

@@ -7,7 +7,6 @@ use std::{
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, LocalFree, ERROR_NO_TOKEN},
@@ -188,7 +187,10 @@ fn directory(path: &Path, user: &[u8], mode: DirectoryMode) -> Result<Vec<File>,
     match fs::symlink_metadata(&path) {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
-                && !matches!(mode, DirectoryMode::ExistingOnly) =>
+                && !matches!(
+                    mode,
+                    DirectoryMode::ExistingOnly | DirectoryMode::ExistingNode
+                ) =>
         {
             let security = descriptor(user)?;
             let attributes = SECURITY_ATTRIBUTES {
@@ -234,37 +236,55 @@ fn directory(path: &Path, user: &[u8], mode: DirectoryMode) -> Result<Vec<File>,
     }
     // Each frame pins its directory and ancestors until all children have been inspected.
     parents.push(file.try_clone().map_err(|_| ERROR)?);
-    let mut pending = vec![scan(&path, file, false)?];
-    // Entries seen outside and inside library directories, when a library passed the limit,
-    // and whether the rest of the library is being left to the verified root.
-    let (mut state, mut library, mut over, mut left) = (0usize, 0usize, None::<Instant>, false);
-    while let Some((_, entries, inside)) = pending.last_mut() {
-        let inside = *inside;
-        let Some(entry) = entries.next() else {
+    if matches!(mode, DirectoryMode::ExistingNode) {
+        return Ok(parents);
+    }
+    let (pin, entries) = scan(&path, file)?;
+    let mut pending = vec![Frame {
+        _pin: pin,
+        entries,
+        depth: 0,
+        state: super::state_directory(0, path.file_name()),
+        library: false,
+    }];
+    // Entries seen outside and inside the library.
+    let (mut outside, mut inside) = (0usize, 0usize);
+    while let Some(frame) = pending.last_mut() {
+        let Some(entry) = frame.entries.next() else {
             pending.pop();
             continue;
         };
-        let count = if inside {
-            library += 1;
-            library
+        let (depth, state, library) = (frame.depth, frame.state, frame.library);
+        let count = if library {
+            inside += 1;
+            inside
         } else {
-            state += 1;
-            state
+            outside += 1;
+            outside
         };
-        match super::walk_step(inside, count, || {
-            overtime(*over.get_or_insert_with(Instant::now))
-        }) {
-            super::Walk::Inspect => {}
-            super::Walk::Refuse => return Err("runtime_store_privacy_inventory_limit".into()),
-            super::Walk::LeaveLibrary => {
-                left = true;
-                while pending.last().is_some_and(|frame| frame.2) {
-                    pending.pop();
+        let step = super::walk_step(library, count);
+        if step == super::Walk::Refuse {
+            return Err("runtime_store_privacy_inventory_limit".into());
+        }
+        let entry = entry.map_err(|_| ERROR)?;
+        let path = entry.path();
+        if step == super::Walk::Listed {
+            // What the directory listing already returned: no open, no further system call.
+            let listed = entry.metadata().map_err(|_| ERROR)?;
+            match super::listed_entry(
+                listed.file_attributes() & 0x400 != 0,
+                listed.is_dir(),
+                listed.is_file(),
+            ) {
+                super::Listed::Refuse => {
+                    #[cfg(test)]
+                    eprintln!("private directory listed entry refused: {path:?}");
+                    return Err(ERROR.into());
                 }
-                continue;
+                super::Listed::File => continue,
+                super::Listed::Directory => {}
             }
         }
-        let path = entry.map_err(|_| ERROR)?.path();
         let file = open(&path)?;
         let (owner, acl, _) = super::native::security(&file)?;
         // Elevated writes may use a trusted SYSTEM/Administrators owner; foreign grants still fail.
@@ -275,27 +295,36 @@ fn directory(path: &Path, user: &[u8], mode: DirectoryMode) -> Result<Vec<File>,
         }
         if file.metadata().map_err(|_| ERROR)?.is_dir() {
             // The library directory itself was just inspected like any other entry.
-            let inside = inside || super::library_directory(path.file_name());
-            if !(inside && left) {
-                pending.push(scan(&path, file, inside)?);
-            }
+            let library = library || super::library_directory(state, path.file_name());
+            let state = super::state_directory(depth + 1, path.file_name());
+            let (pin, entries) = scan(&path, file)?;
+            pending.push(Frame {
+                _pin: pin,
+                entries,
+                depth: depth + 1,
+                state,
+                library,
+            });
         }
     }
     Ok(parents)
 }
 
-/// How long a library has been past the inventory limit.
-fn overtime(since: Instant) -> Duration {
-    #[cfg(test)]
-    if let Some(fixed) = OVERTIME.with(std::cell::Cell::get) {
-        return fixed;
-    }
-    since.elapsed()
+/// One directory being enumerated. The checked object stays open without delete sharing
+/// until the frame is exhausted.
+struct Frame {
+    _pin: File,
+    entries: fs::ReadDir,
+    /// How far below the admitted directory this one is.
+    depth: usize,
+    /// This is the host's state directory.
+    state: bool,
+    /// This is the library directory, or inside it.
+    library: bool,
 }
 
 /// Enumeration keeps the checked object open without delete sharing until its frame is exhausted.
-/// `library` says whether the directory is, or is inside, a library directory.
-fn scan(path: &Path, pin: File, library: bool) -> Result<(File, fs::ReadDir, bool), String> {
+fn scan(path: &Path, pin: File) -> Result<(File, fs::ReadDir), String> {
     #[cfg(test)]
     BEFORE_SCAN.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -303,7 +332,7 @@ fn scan(path: &Path, pin: File, library: bool) -> Result<(File, fs::ReadDir, boo
         }
     });
     let entries = fs::read_dir(path).map_err(|_| ERROR)?;
-    Ok((pin, entries, library))
+    Ok((pin, entries))
 }
 
 /// Admission may reuse an existing private directory; it never repairs permissions.
@@ -329,10 +358,24 @@ pub(crate) fn pin_private_directory(path: &Path) -> Result<Vec<File>, String> {
     let user = current_user()?;
     directory(path, &user, DirectoryMode::ExistingOnly)
 }
+/// `private_directory`, keeping the admitted directory and its ancestors pinned: one
+/// admission where a caller would otherwise admit and then pin.
+pub(crate) fn private_directory_pinned(path: &Path) -> Result<Vec<File>, String> {
+    directory(path, &current_user()?, DirectoryMode::CreateOrReuse)
+}
+/// Pin an existing private directory that lies inside one the caller has just admitted and
+/// still holds pinned. Its ancestry and its own owner and protected ACL are checked here;
+/// what is inside it was inspected by that admission and is not inspected again.
+pub(crate) fn pin_private_child(path: &Path) -> Result<Vec<File>, String> {
+    let user = current_user()?;
+    directory(path, &user, DirectoryMode::ExistingNode)
+}
 enum DirectoryMode {
     CreateOrReuse,
     CreateNew,
     ExistingOnly,
+    /// Existing only, and only the directory itself: see `pin_private_child`.
+    ExistingNode,
 }
 
 #[cfg(test)]
@@ -340,8 +383,6 @@ type ScanHook = Box<dyn FnMut(&Path)>;
 #[cfg(test)]
 thread_local! {
     static BEFORE_SCAN: std::cell::RefCell<Option<ScanHook>> = const { std::cell::RefCell::new(None) };
-    /// A fixed answer for how long a library has been past the inventory limit.
-    static OVERTIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -428,50 +469,78 @@ mod tests {
         private_directory(&state).unwrap();
         (root, state)
     }
-    struct ResetOvertime;
-    impl Drop for ResetOvertime {
-        fn drop(&mut self) {
-            OVERTIME.with(|fixed| fixed.set(None));
-        }
+    /// Shown in the job log and as an annotation: a passing test's own output is not.
+    fn notice(text: &str) {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(format!("::notice::{text}\n").as_bytes());
     }
 
     #[test]
-    fn a_library_past_the_inventory_limit_starts_and_everything_else_is_still_inspected() {
+    fn a_library_of_any_size_starts_and_nothing_in_it_is_skipped() {
         let (root, state) = profile("large-library");
-        let _reset = ResetOvertime;
-        // Eleven directories of 9,100 empty files: 100,111 entries, more than the limit.
+        // Thirty-three directories of 9,100 empty files: 300,333 entries, three times the limit.
+        let created = std::time::Instant::now();
         let bulk = state.join("bulk");
         fs::create_dir(&bulk).unwrap();
-        for directory in 0..11 {
+        for directory in 0..33 {
             let directory = bulk.join(format!("{directory:02}"));
             fs::create_dir(&directory).unwrap();
             for file in 0..9_100 {
                 File::create(directory.join(file.to_string())).unwrap();
             }
         }
+        let created = created.elapsed();
         assert_eq!(
             private_directory(&state).unwrap_err(),
             "runtime_store_privacy_inventory_limit",
-            "negative control: this much state outside a library is still refused"
+            "negative control: this much state outside the library is still refused"
         );
-        let media = state.join("media");
-        fs::rename(&bulk, &media).unwrap();
-        // The same tree as a photo library is admitted, through the profile root too, with
-        // time left to inspect all of it.
-        OVERTIME.with(|fixed| fixed.set(Some(Duration::ZERO)));
-        private_directory(&state).unwrap();
-        pin_private_directory(&root.0).unwrap();
-        // An exposed file that sorts after the first 100,000 entries.
-        fs::create_dir(media.join("zz")).unwrap();
-        fs::write(media.join("zz").join("exposed"), b"synthetic").unwrap();
-        grant_users_read(&media.join("zz").join("exposed"));
+        // A `media` that is not directly inside the state directory is state like any other.
+        let home = state.join("home");
+        fs::create_dir(&home).unwrap();
+        fs::rename(&bulk, home.join("media")).unwrap();
         assert_eq!(
             private_directory(&state).unwrap_err(),
-            ERROR,
-            "while time allows, entries past the limit are still inspected"
+            "runtime_store_privacy_inventory_limit"
         );
-        // Out of time: what was not reached neither passes inspection nor refuses the start.
-        OVERTIME.with(|fixed| fixed.set(Some(super::super::LIBRARY_OVERTIME)));
+        let media = state.join("media");
+        fs::rename(home.join("media"), &media).unwrap();
+        fs::remove_dir(&home).unwrap();
+        // The same tree as the photo library is admitted, through the profile root too.
+        let walked = std::time::Instant::now();
+        private_directory(&state).unwrap();
+        let walked = walked.elapsed();
+        notice(&format!(
+            "private directory admission of a 300,333-entry library: one walk {} ms (creating the tree took {} ms)",
+            walked.as_millis(),
+            created.as_millis()
+        ));
+        pin_private_directory(&root.0).unwrap();
+        // Everything from here sorts after the library's first 100,000 entries.
+        let last = media.join("zz");
+        fs::create_dir(&last).unwrap();
+        // A directory with a foreign grant refuses however large the library is.
+        let loose = last.join("loose");
+        fs::create_dir(&loose).unwrap();
+        fs::write(loose.join("photo"), b"synthetic").unwrap();
+        private_directory(&state).unwrap();
+        grant_users_read(&loose);
+        assert_eq!(private_directory(&state).unwrap_err(), ERROR);
+        assert_eq!(pin_private_directory(&root.0).unwrap_err(), ERROR);
+        fs::remove_dir_all(&loose).unwrap();
+        private_directory(&state).unwrap();
+        // So does a junction leaving the tree, read from the listing without opening it.
+        let outside = Fixture(
+            std::env::temp_dir().join(format!("frameleaf-junction-to-{}", uuid::Uuid::new_v4())),
+        );
+        fs::create_dir(&outside.0).unwrap();
+        junction(&last.join("link"), &outside.0);
+        assert_eq!(private_directory(&state).unwrap_err(), ERROR);
+        fs::remove_dir(last.join("link")).unwrap();
+        private_directory(&state).unwrap();
+        // The one thing not read past the limit is an ordinary file's own ACL.
+        fs::write(last.join("exposed"), b"synthetic").unwrap();
+        grant_users_read(&last.join("exposed"));
         private_directory(&state).unwrap();
         // State outside the library that sorts after it is inspected all the same.
         let secrets = state.join("secrets");
@@ -482,9 +551,60 @@ mod tests {
         assert_eq!(private_directory(&state).unwrap_err(), ERROR);
         fs::remove_dir_all(&secrets).unwrap();
         private_directory(&state).unwrap();
-        // And so are the library's first 100,000 entries, as they always were.
+        // And a file among the library's first 100,000 entries is, as it always was.
         grant_users_read(&media.join("00").join("0"));
         assert_eq!(private_directory(&state).unwrap_err(), ERROR);
+    }
+
+    #[test]
+    fn media_anywhere_but_directly_inside_state_is_inspected_like_any_other_state() {
+        // Not the library: its files are opened and their ACLs read, whatever it is called.
+        for place in ["home/media", "database/media", "studio-work/a/media"] {
+            let (root, state) = profile("other-media");
+            let elsewhere = place
+                .split('/')
+                .fold(state.clone(), |path, part| path.join(part));
+            fs::create_dir_all(&elsewhere).unwrap();
+            fs::write(elsewhere.join("file"), b"synthetic").unwrap();
+            private_directory(&root.0).unwrap();
+            grant_users_read(&elsewhere.join("file"));
+            assert_eq!(private_directory(&state).unwrap_err(), ERROR, "{place}");
+            assert_eq!(private_directory(&root.0).unwrap_err(), ERROR, "{place}");
+        }
+        // Nor is a `media` beside `state`, or inside a directory that is not called `state`.
+        let (root, _) = profile("other-media");
+        for elsewhere in [root.0.join("media"), root.0.join("manager").join("media")] {
+            fs::create_dir_all(&elsewhere).unwrap();
+            fs::write(elsewhere.join("file"), b"synthetic").unwrap();
+            private_directory(&root.0).unwrap();
+            grant_users_read(&elsewhere.join("file"));
+            assert_eq!(private_directory(&root.0).unwrap_err(), ERROR);
+            fs::remove_dir_all(&elsewhere).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_child_pin_checks_and_holds_the_directory_itself_and_is_not_an_admission() {
+        let (root, state) = profile("child-pin");
+        fs::write(state.join("journal"), b"synthetic").unwrap();
+        let held = pin_private_directory(&root.0).unwrap();
+        let pins = pin_private_child(&state).unwrap();
+        assert!(fs::rename(&state, state.with_extension("moved")).is_err());
+        drop(pins);
+        // It never creates, and it refuses a directory that is not itself private.
+        assert!(pin_private_child(&root.0.join("absent")).is_err());
+        assert!(!root.0.join("absent").exists());
+        let inherited = root.0.join("inherited");
+        fs::create_dir(&inherited).unwrap();
+        assert!(
+            pin_private_child(&inherited).is_err(),
+            "a directory that only inherits its ACL is not a private root"
+        );
+        // What is inside is the admitting walk's to inspect: that walk refuses it.
+        grant_users_read(&state.join("journal"));
+        pin_private_child(&state).unwrap();
+        drop(held);
+        assert_eq!(pin_private_directory(&root.0).unwrap_err(), ERROR);
     }
 
     #[test]

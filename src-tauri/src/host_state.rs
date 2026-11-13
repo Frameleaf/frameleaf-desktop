@@ -147,11 +147,17 @@ impl Owner {
     }
 
     pub fn acquire(path: &Path, writable: bool) -> Result<Self, String> {
+        #[cfg(not(windows))]
         if writable {
             crate::runtime_store::private_directory(path)?;
         }
+        // One admission that also pins: admitting and then pinning walked the tree twice.
         #[cfg(windows)]
-        let profile_pins = crate::windows_protection::pin_private_directory(path)?;
+        let profile_pins = if writable {
+            crate::windows_protection::private_directory_pinned(path)?
+        } else {
+            crate::windows_protection::pin_private_directory(path)?
+        };
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         #[cfg(unix)]
         {
