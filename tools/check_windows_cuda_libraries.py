@@ -304,50 +304,63 @@ GATE_PROBES = {
     "hardware facts": "from frameleaf_ml.native_hardware import snapshot; snapshot()",
     "platform": "import platform; platform.uname(); platform.processor()",
     "child process": "import subprocess; subprocess.run(['cmd', '/c', 'ver'], capture_output=True)",
-    "event loop": "import asyncio; asyncio.run(asyncio.sleep(0))",
-    "memory": "import psutil; psutil.virtual_memory()",
 }
+# DIAGNOSTIC (FD-63): what Windows itself defines for every process, which the app does not pass on.
+SYSTEM_VARIABLES = (
+    "SystemDrive", "windir", "ProgramData", "ALLUSERSPROFILE", "ComSpec", "PATHEXT", "OS", "COMPUTERNAME",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "NUMBER_OF_PROCESSORS", "ProgramFiles", "CommonProgramFiles",
+    "USERNAME", "USERDOMAIN", "APPDATA", "LOCALAPPDATA",
+)
 
 
 def run_gate(folders: list[Path]) -> dict:
     """Each probe in the pack's interpreter started exactly as the app starts a runtime: the
     app's own gate program (read from its source) on a pipe that stays open, the app's
     environment, nothing on the console. A probe that has not finished after 40 seconds reports
-    where it is stuck."""
+    where it is stuck. The other starts (no gate; Windows' own variables added) are comparisons."""
+    import threading
+    import time
+
     source = (Path(__file__).resolve().parent.parent / "src-tauri" / "src" / "native_runtime.rs").read_text(encoding="utf-8")
     gate = re.search(r'const GATE: &str = r#"(.*?)"#;', source, re.S).group(1)
     results = {}
     for name, statement in GATE_PROBES.items():
-        for gated in (True, False):
+        for gated, system in ((True, False), (False, False), (True, True), (False, True)):
             setup = "import faulthandler; faulthandler.dump_traceback_later(40, exit=True)"
             program = [sys.executable, "-I", "-B", "-c", gate] if gated else [sys.executable, "-I", "-B", "-m"]
             with tempfile.TemporaryDirectory() as scratch:
-                import time
-
+                environment = app_environment(scratch, folders)
+                if system:
+                    environment.update({key: os.environ[key] for key in SYSTEM_VARIABLES if key in os.environ})
                 started = time.perf_counter()
                 process = subprocess.Popen(
                     program + ["timeit", "-n", "1", "-r", "1", "-s", setup, statement],
                     cwd=scratch,
-                    env=app_environment(scratch, folders),
+                    env=environment,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
+                collected: list[bytes] = []
+                reader = threading.Thread(target=lambda: collected.append(process.stderr.read()), daemon=True)
+                reader.start()
                 process.stdin.write(b"frameleaf-native-start\n")
                 process.stdin.flush()
                 # The pipe stays open, as the app holds it for as long as the runtime runs.
                 try:
                     code = process.wait(timeout=75)
-                    errors = process.stderr.read()
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-                    code, errors = None, b"no exit after 75 seconds: " + process.stderr.read()
+                    code = None
+                reader.join(10)
                 process.stdin.close()
-                results[f"{name} ({'gate' if gated else 'plain'})"] = {
+                errors = b"".join(collected).decode("utf-8", "replace")
+                label = f"{name} ({'gate' if gated else 'plain'}{', system variables' if system else ''})"
+                results[label] = {
                     "seconds": round(time.perf_counter() - started, 1),
                     "exit": code,
-                    "errors": errors.decode("utf-8", "replace")[-3000:],
+                    "errors": ("no exit after 75 seconds: " if code is None else "") + errors[-3000:],
                 }
     return results
 
