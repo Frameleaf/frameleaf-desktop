@@ -112,10 +112,18 @@ with tempfile.TemporaryDirectory() as temporary:
             env={**os.environ, "LD_LIBRARY_PATH": ":".join(folders)},
         ).stdout
         unresolved = sorted(line.split()[0] for line in listing.splitlines() if "not found" in line)
-        resolved = [line.split()[0] for line in listing.splitlines() if "=>" in line and "not found" not in line]
-        print("CUDA provider library resolves", len(resolved), "libraries; unresolved:", unresolved)
-        for needed in ("libcublas", "libcudnn", "libcufft", "libcudart"):
-            assert any(name.startswith(needed) for name in resolved), f"{needed} is not resolved from the pack"
+        resolved = {
+            line.split()[0]: line.split()[2]
+            for line in listing.splitlines()
+            if "=>" in line and "not found" not in line and len(line.split()) >= 3
+        }
+        print("CUDA provider library resolves", sorted(resolved), "unresolved:", unresolved)
+        # Every NVIDIA library it links against comes from the pack, not from this computer.
+        # (cuDNN is not linked; onnxruntime opens it by name, and it was opened above.)
+        nvidia = {name: where for name, where in resolved.items() if name.startswith(("libcu", "libnv"))}
+        assert any(name.startswith("libcublas") for name in nvidia), nvidia
+        for name, where in nvidia.items():
+            assert Path(where).resolve().is_relative_to(site), f"{name} resolves outside the pack: {where}"
         assert unresolved == ([] if driver_present else [driver]), unresolved
         session = ort.InferenceSession(path.as_posix(), providers=[provider, "CPUExecutionProvider"])
         used = session.get_providers()
