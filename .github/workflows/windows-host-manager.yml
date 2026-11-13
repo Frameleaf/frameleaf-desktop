@@ -7,6 +7,8 @@ on:
       - 'tools/build_runtime.py'
       - 'tools/test_build_host_manager.py'
       - 'tools/source_archive.py'
+      - 'tools/check_manager_transition.mjs'
+      - 'src-tauri/src/manager_host.rs'
       - '.github/workflows/windows-host-manager.yml'
   workflow_dispatch:
 permissions:
@@ -96,6 +98,11 @@ jobs:
           with tarfile.open(root / 'manager-component.tar.gz', 'w:gz') as archive:
               archive.add(root / 'manager', arcname='manager')
               archive.add(root / 'qualification.json', arcname='qualification.json')
+      - name: Check that the real Manager stores and accepts the package transition Desktop sends
+        shell: pwsh
+        run: |
+          node tools/check_manager_transition.mjs "$env:RUNNER_TEMP/fl-windows-manager/manager/app/build"
+          if ($LASTEXITCODE) { throw 'The real Manager does not accept the Windows package transition Desktop computes' }
       - name: Retain the qualified private Manager component
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
