@@ -8,8 +8,8 @@
   import StepUp from '../StepUp.svelte';
   import type { StepUpRequest } from '../sign-in-steps';
   import { workerView, workloadReason } from '../mode-state';
-  import { workloadProvider } from '../ai-processing';
-  import { describeError } from '../errors';
+  import { workloadProvider, acceleratedPackView, type AcceleratedPack } from '../ai-processing';
+  import { describeError, explainError } from '../errors';
   import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent, importProgress, importProgressText, type OverallProgress } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
   import { backupHealth, backupWarning, libraryHeadroom, storageWarning } from '../server-health';
@@ -42,9 +42,22 @@
   type CopyJob = { sourceId: string; state: string; total: number; completed: number; logicalBytes: number; skipped: number; code: string | null; uploadRemaining: number | null; overall?: OverallProgress | null };
   let consent = $state<Consent | null>(null);
   let job = $state<CopyJob | null>(null);
+  // FD-60: the GPU runtime pack this computer can download, shown where this computer does AI
+  // processing. Nothing is fetched until Download.
+  let pack = $state<AcceleratedPack | null>(null);
+  let packBusy = $state(false);
+  const packView = $derived(acceleratedPackView(pack, setup?.providers, formatBytes, code => explainError(code)));
   let alive = true;
   onMount(() => {
     let unlisten: UnlistenFn | undefined;
+    let unlistenPack: UnlistenFn | undefined;
+    if (native && section === 'ai') void (async () => {
+      try {
+        unlistenPack = await listen<AcceleratedPack>('accelerated-pack', event => { if (alive) pack = event.payload; });
+        if (!alive) { unlistenPack(); return; }
+        pack = await invoke<AcceleratedPack>('accelerated_pack_status');
+      } catch { /* the offer is best-effort: AI processing does not depend on it */ }
+    })();
     if (native) void (async () => {
       try {
         unlisten = await listen<CopyJob>('photo-import', event => { if (alive && event.payload.sourceId === consent?.id) job = event.payload; });
@@ -53,8 +66,26 @@
         if (consent?.registered) job = await invoke<CopyJob | null>('photo_import_status').catch(() => null);
       } catch { /* the summary is best-effort */ }
     })();
-    return () => { alive = false; unlisten?.(); };
+    return () => { alive = false; unlisten?.(); unlistenPack?.(); };
   });
+
+  async function packAction(action: 'download' | 'decline' | 'cancel' | 'retry-provider') {
+    if (!native || (packBusy && action !== 'cancel')) return;
+    failure = '';
+    if (action === 'cancel') {
+      try { await invoke('cancel_accelerated_pack_download'); } catch (error) { fail(error); }
+      return;
+    }
+    packBusy = true;
+    try {
+      if (action === 'download') pack = await invoke<AcceleratedPack>('download_accelerated_pack');
+      else if (action === 'decline') pack = await invoke<AcceleratedPack>('decline_accelerated_pack');
+      else await invoke('retry_accelerated_provider');
+    } catch (error) {
+      fail(error);
+      pack = await invoke<AcceleratedPack>('accelerated_pack_status').catch(() => pack);
+    } finally { packBusy = false; }
+  }
 
   async function photos() {
     failure = '';
@@ -214,6 +245,20 @@
                 <span class="progress" role="progressbar" aria-valuenow={downloaded} aria-valuemin="0" aria-valuemax="100" aria-label="Model file download"><span style="width:{downloaded}%"></span></span>
               {/if}
             </span>
+          </div>
+        {/if}
+        {#if section === 'ai' && packView && canControl}
+          <div class="row top">
+            <span class="l">
+              <b>{packView.title}</b>
+              <small>{packView.detail}</small>
+              {#if packView.progress !== null}
+                <span class="progress" role="progressbar" aria-valuenow={packView.progress} aria-valuemin="0" aria-valuemax="100" aria-label="Graphics card support download"><span style="width:{packView.progress}%"></span></span>
+              {/if}
+            </span>
+            {#each packView.actions as action, index (action)}
+              <button class="btn" class:primary={index === 0 && action === 'download' && !pack?.declined} class:quiet={index > 0} disabled={!native || (packBusy && action !== 'cancel')} onclick={() => packAction(action)}>{action === 'download' ? (pack?.state === 'failed' ? 'Try Again' : 'Download') : action === 'decline' ? 'Not Now' : action === 'cancel' ? 'Cancel' : 'Try Again'}</button>
+            {/each}
           </div>
         {/if}
         {#each setup?.workloads ?? [] as workload (workload.workload)}

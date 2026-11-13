@@ -517,6 +517,20 @@ jobs:
             while read -r name; do mv "$download/$name" "release-assets/$name"; done <<< "$names"
             rm -rf "$download"
           done < <(jq -r '.attach[] | "\(.run) \(.workflow) \(.artifact) \(.files | tojson)"' <<< "$COMPANIONS")
+      # FD-60: the CUDA and OpenVINO packs the app downloads on demand. Each is verified against
+      # its signed delivery manifest (the one the installers carry) before its parts join this
+      # run's assets; the draft merge below uploads them like any other asset.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run_id }}
+          pattern: factory-accelerated-*
+          path: accelerated-packs
+      - name: Verify the downloadable GPU runtime parts and stage them as release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/deliver_runtime.mjs --release accelerated-packs release-assets | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Merge this run into the draft for the tag
         id: draft
         env:

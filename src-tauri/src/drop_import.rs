@@ -198,7 +198,7 @@ fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
     let scan = if folder {
         // A one-time drop may come from a card, USB drive or network share, as a camera import may.
         let scan = photo_sources::scan_batch(&root, photo_sources::Pin::Dropped(&identity), None)?;
-        if scan.inventory.truncated || scan.unreadable > 0 {
+        if scan.inventory.truncated {
             return Err("source_inventory_partial".into());
         }
         scan
@@ -256,7 +256,7 @@ fn preview_paths(paths: &[PathBuf]) -> Result<Plan, String> {
                 empty,
             },
             files,
-            unreadable: 0,
+            unreadable: Default::default(),
             more: false,
         }
     };
