@@ -285,7 +285,9 @@ workload with it. The first time with a runtime it also times the same fixtures
 on the processor, without the server: the provider keeps a workload only where
 its warm inference was faster, and that outcome is remembered for the runtime
 (`provider-failures.json`). Slower, failed or not measurable means the processor
-for that workload.
+for that workload. What is remembered is for that runtime with that device and
+driver: a driver update, another card or Retry Setup tries the provider again,
+and a process that was only late to start is not remembered at all.
 `cargo test --lib native_runtime::metal::local_pack -- --ignored` qualifies a
 locally built pack against the catalogue under a throwaway key (see the test for
 its three environment variables).
