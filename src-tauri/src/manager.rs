@@ -87,6 +87,12 @@ pub enum Command {
         action: Action,
         id: Uuid,
     },
+    /// What Manager's controller is doing now. Only for a Manager that declares
+    /// `runtime-status`, and never from the interface.
+    #[serde(skip_deserializing)]
+    Runtime {
+        nonce: Uuid,
+    },
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -129,6 +135,49 @@ impl SavedManager {
         Ok(())
     }
 
+    /// This computer's grant for the Manager it hosts follows that Manager to another loopback
+    /// port and to the certificate that replaced the one the grant pins. Only a grant for this
+    /// installation that pins `certificate` or the certificate it `replaced` is touched, and
+    /// only between loopback origins on the same host. Returns whether anything changed.
+    pub(crate) fn follow_local(
+        &mut self,
+        installation_id: &str,
+        origin: &str,
+        certificate: &str,
+        replaced: Option<&str>,
+    ) -> bool {
+        let fingerprint = |pem: &str| certificate_fingerprint(pem).ok();
+        let Some(pinned) = self.certificate_pem.as_deref().and_then(fingerprint) else {
+            return false;
+        };
+        let loopback = |value: &str| {
+            url::Url::parse(value).ok().filter(|url| {
+                url.scheme() == "https"
+                    && url.origin().ascii_serialization() == value
+                    && matches!(url.host_str(), Some("127.0.0.1" | "[::1]"))
+            })
+        };
+        let same_host = match (loopback(&self.origin), loopback(origin)) {
+            (Some(from), Some(to)) => from.host_str() == to.host_str(),
+            _ => false,
+        };
+        let (Some(current), true, true) = (
+            fingerprint(certificate),
+            self.installation_id == installation_id,
+            same_host,
+        ) else {
+            return false;
+        };
+        if pinned != current && replaced.and_then(fingerprint).as_ref() != Some(&pinned) {
+            return false;
+        }
+        if self.origin == origin && pinned == current {
+            return false;
+        }
+        self.origin = origin.into();
+        self.certificate_pem = Some(certificate.into());
+        true
+    }
     pub fn view(&self) -> View {
         View {
             origin: self.origin.clone(),
@@ -677,6 +726,16 @@ fn prepare(
             "/manager-api/desktop/resume",
             json!({"action":action,"id":id}),
         ),
+        Command::Runtime { nonce } => {
+            if nonce.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Status,
+                "/manager-api/desktop/runtime",
+                json!({"nonce":nonce}),
+            )
+        }
     };
     if !saved.scopes.contains(&scope) {
         return Err("manager_scope_denied".into());
@@ -910,6 +969,28 @@ fn public_error(operation: &mut Value) {
         operation["error"] = json!("manager_operation_failed");
     }
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Runtime {
+    protocol_version: u32,
+    nonce: String,
+    installation_id: String,
+    capabilities: Vec<String>,
+    ports: RuntimePorts,
+    photo_server: RuntimePhotoServer,
+}
+#[derive(Deserialize)]
+struct RuntimePorts {
+    manager: u16,
+    api: u16,
+    database: u16,
+}
+#[derive(Deserialize)]
+struct RuntimePhotoServer {
+    state: String,
+    #[serde(default)]
+    code: Option<String>,
+}
 fn validate_reply(
     saved: &SavedManager,
     command: &Command,
@@ -1040,6 +1121,32 @@ fn validate_reply(
                 serde_json::from_value(value.clone()).map_err(|_| invalid())?;
             if !identifier(&accepted.id)
                 || matches!(command,Command::Resume{id,..}if accepted.id!=id.to_string())
+            {
+                return Err(invalid());
+            }
+        }
+        Command::Runtime { nonce } => {
+            // A later Manager may add fields here; what is read must be exactly as expected.
+            let runtime: Runtime = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if runtime.protocol_version != 1
+                || runtime.nonce != nonce.to_string()
+                || runtime.installation_id != saved.installation_id
+                || [
+                    runtime.ports.manager,
+                    runtime.ports.api,
+                    runtime.ports.database,
+                ]
+                .contains(&0)
+                || !matches!(
+                    runtime.photo_server.state.as_str(),
+                    "running" | "starting" | "stopping" | "stopped" | "unknown"
+                )
+                || runtime
+                    .photo_server
+                    .code
+                    .as_deref()
+                    .is_some_and(|code| !public_code(code))
+                || runtime.capabilities.len() > 64
             {
                 return Err(invalid());
             }

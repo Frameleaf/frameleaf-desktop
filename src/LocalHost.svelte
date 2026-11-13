@@ -22,7 +22,7 @@
     windows: 'Download and run the Frameleaf Companion Server EXE for Windows x64.',
     linux: 'On Ubuntu 24.04 for Intel or AMD, install both Frameleaf Companion Server DEBs (bootstrap and runtime) together, with pkexec.',
   };
-  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
+  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; certificateRenewable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -227,7 +227,7 @@
     {#if view?.certificateExpiresInDays}
       <div class="row">
         <span class="ic dim" aria-hidden="true"><Icon name="warn" /></span>
-        <span class="l" role="status"><b>Local Manager’s security certificate expires in {view.certificateExpiresInDays} {view.certificateExpiresInDays === 1 ? 'day' : 'days'}</b><small>After that, local management on this computer will not start until the certificate is renewed, which needs an update to Frameleaf and its companion. Your photos and library are not affected. Check for updates before then.</small></span>
+        <span class="l" role="status"><b>Local Manager’s security certificate expires in {view.certificateExpiresInDays} {view.certificateExpiresInDays === 1 ? 'day' : 'days'}</b><small>{view.certificateRenewable ? 'Frameleaf renews it the next time local management starts: stop local management here, then start it again. Your photos and library are not affected.' : 'After that, local management on this computer will not start until the certificate is renewed, which needs an update to Frameleaf and its companion. Your photos and library are not affected. Check for updates before then.'}</small></span>
       </div>
     {/if}
     {#if profilePending}<div class="row"><span class="spin" aria-hidden="true"></span><p role="status" style="flex:1">{profileCopy.pending}</p></div>{/if}

@@ -123,7 +123,7 @@ impl Programs<'_> {
     }
 }
 /// Supplied only by reviewed native setup; not a Tauri/HTTP command or credential record.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     pub installation_id: String,
@@ -135,6 +135,42 @@ pub struct Configuration {
     pub origin: String,
     pub database_port: u16,
     pub api_port: u16,
+}
+impl Configuration {
+    /// The configuration a profile's keystore binding names. The ports are chosen per start,
+    /// so the binding keeps the defaults every existing profile was bound with; the package,
+    /// the paths and the directories' identities are what tie the secrets to this library.
+    pub(crate) fn binding_form(&self) -> Self {
+        let ports = crate::manager_local::Ports::default();
+        Self {
+            origin: ports.origin(),
+            database_port: ports.database,
+            api_port: ports.api,
+            ..self.clone()
+        }
+    }
+    pub(crate) fn ports(&self) -> Result<crate::manager_local::Ports, String> {
+        Ok(crate::manager_local::Ports {
+            manager: local_origin(&self.origin)?,
+            api: self.api_port,
+            database: self.database_port,
+        })
+    }
+    pub(crate) fn set_ports(&mut self, ports: crate::manager_local::Ports) {
+        self.origin = ports.origin();
+        self.api_port = ports.api;
+        self.database_port = ports.database;
+    }
+}
+/// What one start from the keystore may do beyond the first released protocol.
+pub(crate) struct LocalStart<'a> {
+    /// What the package's Manager declares.
+    pub features: crate::manager_local::Features,
+    /// Whether this attempt may present a renewed TLS identity.
+    pub renew_identity: bool,
+    /// Set as soon as this attempt presents a renewed identity, so a failure can be retried
+    /// with the identity it would have replaced.
+    pub renewing: &'a AtomicBool,
 }
 /// Manager accepts a changed package once, from the descriptor it last ran with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,8 +706,22 @@ pub struct NativeManager {
     certificate_pem: String,
     /// When the TLS identity this Manager serves runs out; None for a Manager given none.
     certificate_expires_at: Option<i64>,
+    /// What to settle in the keystore once this Manager is verified ready.
+    identity: IdentityChange,
+    /// The certificate a renewal replaces, which this computer's saved grant may still pin.
+    replaced_certificate: Option<String>,
     _code_lease: Option<crate::package_lease::CodeLease>,
     _profile_pins: Vec<fs::File>,
+}
+/// What a start did with this profile's TLS identity; the string is the profile binding.
+#[derive(Default)]
+enum IdentityChange {
+    #[default]
+    None,
+    /// A renewed identity is presented with a handover.
+    Renewed(String),
+    /// A renewed identity is waiting, and the one it would replace is presented.
+    SetAside(String),
 }
 #[derive(Default)]
 struct Leases {
@@ -680,7 +730,11 @@ struct Leases {
     profiles: Vec<fs::File>,
 }
 impl Programs<'_> {
-    pub fn start_from_keystore(&self, config: &Configuration) -> Result<NativeManager, String> {
+    pub(crate) fn start_from_keystore(
+        &self,
+        config: &mut Configuration,
+        start: &LocalStart<'_>,
+    ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         self.check()?;
         let _profile_pins = protect_profile_parents(config)?;
@@ -696,10 +750,44 @@ impl Programs<'_> {
             candidate,
             self.runtime.manifest_sha256(),
         )?;
-        let tls =
-            TlsIdentity::from_keystore(&config.installation_id, &config.origin, profile.binding())?;
+        let crate::manager_tls::StartIdentity {
+            identity: tls,
+            handover,
+            set_aside,
+            certificates,
+        } = TlsIdentity::for_start(
+            &config.installation_id,
+            &config.origin,
+            profile.binding(),
+            start.features.tls_rotation && start.renew_identity,
+        )?;
+        if handover.is_some() {
+            start.renewing.store(true, Ordering::Release);
+        }
         profile.require_current(config)?;
-        let lease = crate::host_state::Owner::acquire(&config.state, true)?;
+        let mut lease = crate::host_state::Owner::acquire(&config.state, true)?;
+        let fingerprints = certificates
+            .iter()
+            .map(|pem| crate::manager::certificate_fingerprint(pem))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The lease is held, so no controller runs; the journal then says whether its photo
+        // server and database were closed, or never existed.
+        let idle = lease.idle(&config.installation_id, self.runtime.manifest_sha256());
+        config.set_ports(crate::manager_local::ports_for_start(
+            start.features,
+            config.ports()?,
+            idle,
+            &fingerprints,
+        )?);
+        validate_configuration(config)?;
+        // Durable before the spawn: where this library listens, and what its Manager serves.
+        let record = crate::manager_local::Record::new(config.ports()?, fingerprints);
+        if crate::manager_local::stored(&config.data)
+            != crate::manager_local::Stored::Present(record.clone())
+        {
+            crate::runtime_store::private_directory(&config.data)?;
+            crate::manager_local::save(&config.data, &record)?;
+        }
         // This lease proves no controller of this library is running, so a listener on any of
         // its ports belongs to another program.
         foreign_listener(&[
@@ -712,14 +800,30 @@ impl Programs<'_> {
         // a Manager may be running, even before one has bound its port.
         #[cfg(unix)]
         record_launch_intent(&config.data)?;
-        let started = self.start_owned(
-            config,
-            &password,
-            &backup_key,
-            &tls,
-            Some(lease),
-            profile.installation_transition(),
-        );
+        let started = self
+            .start_owned(
+                config,
+                &password,
+                &backup_key,
+                &tls,
+                Some(lease),
+                profile.installation_transition(),
+                handover.as_ref(),
+            )
+            .map(|mut manager| {
+                let binding = profile.binding().to_owned();
+                manager.identity = if handover.is_some() {
+                    IdentityChange::Renewed(binding)
+                } else if set_aside {
+                    IdentityChange::SetAside(binding)
+                } else {
+                    IdentityChange::None
+                };
+                // The other certificate of a renewal in progress, in either direction: the
+                // one being replaced, or the waiting one a rolled-back start set aside.
+                manager.replaced_certificate = certificates.get(1).cloned();
+                manager
+            });
         #[cfg(unix)]
         match &started {
             // If this write fails the intent stays, which a later run reads as "may be running".
@@ -740,8 +844,9 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
     ) -> Result<NativeManager, String> {
-        self.start_owned(config, password, backup_key, tls, None, None)
+        self.start_owned(config, password, backup_key, tls, None, None, None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn start_owned(
         &self,
         config: &Configuration,
@@ -750,6 +855,7 @@ impl Programs<'_> {
         tls: &TlsIdentity,
         startup_lease: Option<crate::host_state::Owner>,
         transition: Option<&Transition>,
+        handover: Option<&crate::manager_tls::Handover>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
@@ -795,6 +901,9 @@ impl Programs<'_> {
             tls: crate::manager_tls::BootstrapTls<'a>,
             #[serde(skip_serializing_if = "Option::is_none")]
             installation_transition: Option<&'a Transition>,
+            /// Only for a Manager that declares `tls-rotation`: any other refuses the field.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tls_rotation: Option<&'a crate::manager_tls::Handover>,
         }
         let bootstrap = Bootstrap {
             protocol_version: 2,
@@ -807,6 +916,7 @@ impl Programs<'_> {
             backup_key,
             tls: tls.wire(),
             installation_transition: transition,
+            tls_rotation: handover,
         };
         let mut input = Zeroizing::new(
             serde_json::to_vec(&bootstrap).map_err(|_| "native_manager_config_invalid")?,
@@ -905,6 +1015,8 @@ impl NativeManager {
             startup_lease: leases.startup,
             certificate_pem: String::new(),
             certificate_expires_at: None,
+            identity: IdentityChange::None,
+            replaced_certificate: None,
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
         };
@@ -1182,6 +1294,29 @@ impl NativeManager {
     }
     pub(crate) fn certificate_expires_at(&self) -> Option<i64> {
         self.certificate_expires_at
+    }
+    /// Once this Manager is verified ready: make the identity it accepted the saved one.
+    /// A renewed identity it served is promoted; a waiting one it was not shown is dropped,
+    /// because Manager answering with the earlier identity proves that is what it holds.
+    pub(crate) fn settle_identity(&mut self) -> Result<(), String> {
+        if !self.verified_ready {
+            return Err("native_manager_not_ready".into());
+        }
+        match std::mem::take(&mut self.identity) {
+            IdentityChange::None => Ok(()),
+            IdentityChange::Renewed(binding) => TlsIdentity::promote(&binding),
+            IdentityChange::SetAside(binding) => TlsIdentity::discard_pending(&binding),
+        }
+    }
+    /// The certificate a renewal presented by this Manager replaces, which this computer's
+    /// grant may still pin. Only once this Manager is verified ready with the new one.
+    pub(crate) fn replaced_certificate(&self) -> Option<&str> {
+        self.replaced_certificate
+            .as_deref()
+            .filter(|_| self.verified_ready)
+    }
+    pub(crate) fn certificate(&self) -> &str {
+        &self.certificate_pem
     }
     /// Whether Manager and everything it started under this owner have exited.
     pub(crate) fn tree_exited(&mut self) -> Result<bool, String> {

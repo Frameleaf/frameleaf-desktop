@@ -444,6 +444,19 @@ impl Owner {
             marker.generation,
         ))
     }
+    /// With this lease held: whether anything of this library other than Manager could be
+    /// listening. `Clear` for a profile that holds nothing but an unwritten journal (no
+    /// controller ever started, so there is no photo server or database), and for a journal
+    /// that proves a clean stop with no database process file. Anything unread, unfinished or
+    /// bound to something else is `Unknown`.
+    pub(crate) fn idle(&mut self, id: &str, sha: &str) -> crate::manager_host::Evidence {
+        use crate::manager_host::Evidence;
+        match self.admit_idle(id, sha) {
+            Ok(()) => Evidence::Clear,
+            Err(code) if code == "host_already_owned" => Evidence::Running,
+            Err(_) => Evidence::Unknown,
+        }
+    }
     /// Keep this lease alive through Manager shutdown so a controller cannot start concurrently.
     pub(crate) fn admit_idle(&mut self, id: &str, sha: &str) -> Result<(), String> {
         if !crate::native_runtime::digest_valid(id, 12)

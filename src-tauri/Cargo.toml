@@ -38,6 +38,8 @@ time = { version = "0.3", features = ["parsing"] }
 tauri-plugin-single-instance = "2"
 serde_json_canonicalizer = "=0.3.2"
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# Already in the tree through reqwest; used directly to read the certificate a local listener presents.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tauri-plugin-dialog = "=2.8.3"
 tauri-plugin-opener = "=2.7.2"
 mdns-sd = "=0.13.11"
