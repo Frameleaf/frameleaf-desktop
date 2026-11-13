@@ -1425,6 +1425,16 @@ impl NativeManager {
             Evidence::Clear
         }
     }
+    /// For a failed test: what Manager's job holds and whether Manager has exited.
+    #[cfg(all(test, windows))]
+    pub(crate) fn job_report(&mut self) -> String {
+        format!(
+            "manager={} exited={:?} {}",
+            self.child.id(),
+            self.has_exited(),
+            self.tree.report()
+        )
+    }
     /// A stand-in child for lifecycle tests; it never reports readiness.
     #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn test_child(command: &mut Command) -> Self {

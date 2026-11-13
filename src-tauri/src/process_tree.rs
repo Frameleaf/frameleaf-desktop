@@ -246,6 +246,58 @@ impl ProcessTree {
         Ok(info.ActiveProcesses)
     }
 
+    /// For a failed test: the job's count and the program of each process it holds.
+    #[cfg(all(test, windows))]
+    pub(crate) fn report(&self) -> String {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::{
+                JobObjects::{JobObjectBasicProcessIdList, QueryInformationJobObject},
+                Threading::{
+                    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+                },
+            },
+        };
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two 32-bit counts, then pointer-sized process IDs.
+        let mut list = vec![0usize; 258];
+        let size = (list.len() * std::mem::size_of::<usize>()) as u32;
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                list.as_mut_ptr().cast(),
+                size,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return format!("active={:?} members unavailable", self.active());
+        }
+        let listed = unsafe { *list.as_ptr().cast::<u32>().add(1) } as usize;
+        let first = 8 / std::mem::size_of::<usize>();
+        let mut report = format!("active={:?}", self.active());
+        for id in list.iter().skip(first).take(listed.min(256)) {
+            let mut name = [0u16; 512];
+            let mut length = name.len() as u32;
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, *id as u32) };
+            let known = !process.is_null()
+                && unsafe {
+                    QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut length)
+                } != 0;
+            if !process.is_null() {
+                unsafe { CloseHandle(process) };
+            }
+            let name = if known {
+                String::from_utf16_lossy(&name[..length as usize])
+            } else {
+                "unknown".to_string()
+            };
+            report.push_str(&format!(" [{id} {name}]"));
+        }
+        report
+    }
+
     pub fn attach(child: &Child) -> Result<Self, String> {
         #[cfg(unix)]
         {

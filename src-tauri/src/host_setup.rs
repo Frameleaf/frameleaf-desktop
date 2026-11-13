@@ -3808,7 +3808,9 @@ mod tests {
         interrupted(&fixture.state());
         let alone = |setup: &HostSetup| {
             let mut owner = setup.owner.try_lock().unwrap();
-            owner.as_mut().unwrap().manager.stops_alone()
+            let manager = &mut owner.as_mut().unwrap().manager;
+            eprintln!("{}", manager.job_report());
+            manager.stops_alone()
         };
 
         // Manager started something that is still running in its job: neither Stop nor
