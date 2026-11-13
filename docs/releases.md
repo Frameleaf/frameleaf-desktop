@@ -68,6 +68,110 @@ Keep the final result and hashes, and discard the account and its terminal
 transcript after the run. This is a manual qualification on the identified
 installed bytes.
 
+## Supported systems
+
+### macOS minimum versions
+
+Two floors are declared in `packaging/macos/minimum-versions.json`:
+
+| Key | Value | Meaning |
+| --- | --- | --- |
+| `app` | 11.0 | The oldest macOS the app installs and runs on: photos, imports, Manager and local hosting. |
+| `aiRuntime` | 15.0 | The oldest macOS the optional AI runtime pack runs on. AI processing needs it; nothing else does. |
+
+`bundle.macOS.minimumSystemVersion` in `src-tauri/tauri.conf.json` and
+`MACOSX_DEPLOYMENT_TARGET` in the macOS build jobs of `desktop.yml` and
+`release.yml` carry the `app` value. The AI runtime floor is never written
+into the bundle, so an older Mac still installs and opens the app.
+
+Both values are the highest minimum recorded in the binaries of each part,
+read with `tools/check_macos_minimum.py` from the installed 0.1.6 Apple
+silicon app:
+
+| Part | Shipped binary | Minimum macOS |
+| --- | --- | --- |
+| App | `frameleaf-desktop` and the `frameleaf-native-host` sidecar | 11.0 |
+| App | Rust default for `aarch64-apple-darwin` (`rustc --print deployment-target`) | 11.0 |
+| App | Rust default for `x86_64-apple-darwin` | 10.12 |
+| App | Tauri default when no minimum is declared (the 0.1.6 `LSMinimumSystemVersion`) | 10.13 |
+| AI runtime | Python interpreter and most libraries | 11.0 |
+| AI runtime | protobuf | 12.0 |
+| AI runtime | OpenCV (`cv2`) and its libraries | 13.0 |
+| AI runtime | NumPy, ONNX Runtime | 14.0 |
+| AI runtime | `orjson` | 15.0 |
+
+`python3 tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" Frameleaf.app`
+treats the `native-runtime` folder as the AI runtime and everything else as
+the app. It fails when an app binary needs a newer macOS than `app`, when a
+runtime binary needs a newer macOS than `aiRuntime`, when a loaded binary
+records no minimum, when the bundle's `LSMinimumSystemVersion` or
+`tauri.conf.json` differs from `app`, or when `MACOSX_DEPLOYMENT_TARGET`
+does. `--report FILE` writes the declared and measured values as JSON.
+`Desktop candidate` runs the check on the unsigned shell. `Desktop release`
+runs it on the app with its runtime before signing and adds the report to the
+run summary. A runtime rebuilt for an older macOS lets `aiRuntime` be lowered;
+to change `app`, change the declaration, `tauri.conf.json` and both workflows
+together (`tools/test_check_macos_minimum.py` fails when they disagree).
+
+The app reads `aiRuntime` from the same declaration when it is built. On an
+older macOS, AI setup stops before it prepares anything, with the code
+`runtime_os_unsupported`, and the AI processing card says which macOS is
+needed. It does not retry by itself and offers no Retry Setup. Photos and
+everything else keep working.
+
+### Linux tray library
+
+The tray icon loads `libayatana-appindicator3.so.1` at run time and falls back
+to `libappindicator3.so.1`; it is not a link-time dependency of the binary. The
+package dependency is chosen by the Tauri bundler from the development package
+present at build time, so every Linux build job installs
+`libayatana-appindicator3-dev`. The `.deb` then depends on
+`libayatana-appindicator3-1`, which Ubuntu 22.04, Ubuntu 24.04 and Debian 12
+ship; `libappindicator3-1` is not in Debian 12. The AUR package depends on
+`libayatana-appindicator`.
+
+`tools/qualify_linux_deb_install.sh PACKAGE.deb` installs the package with
+`apt-get install` in clean `ubuntu:24.04`, `ubuntu:22.04` and `debian:12`
+containers and fails on an unmet dependency or a missing tray dependency. It
+then runs every binary the package installs in `/usr/bin` with `--version` in
+each container, and fails when one does not load there. `Desktop candidate`
+runs it on every pull request.
+
+### Linux C library
+
+A Linux binary needs at least the glibc of the machine it was linked on.
+Ubuntu 22.04 has glibc 2.35 and Debian 12 has 2.36, so the Linux jobs that
+build what ships run on `ubuntu-22.04`: the `linux-package` job of `Desktop
+candidate`, and `Desktop release`, the installer candidates and the runtime
+factory through `releaseMatrix` in `tools/release_inputs.mjs`. The `check` job
+of `Desktop candidate` stays on `ubuntu-24.04`, which the host package
+qualification needs; its package is not shipped. Ubuntu 22.04 ships
+WebKitGTK 4.1 and `libayatana-appindicator3`, so nothing else changes.
+
+`tools/check_linux_glibc.py --max 2.35 PATH...` reads the `GLIBC_x.y` versions
+every ELF file under a folder, or inside a `.deb`, needs and fails when one is
+newer than the limit. The same three workflows run it on the `.deb` they
+build, and the runtime candidate workflow runs it on the runtime payload.
+
+## Browser UI tests
+
+`tools/test_*_ui.mjs` drive the real interface in headless Chromium against a
+synthetic IPC bridge: the Manager page, navigation and local server setup. They
+need no server, credentials or saved sign-in. `npm test` skips them;
+`npm run test:ui` runs them and needs Playwright, which is not a project
+dependency:
+
+```sh
+npm install --no-save --prefix /tmp/frameleaf-playwright playwright-core@1.63.0
+node /tmp/frameleaf-playwright/node_modules/playwright-core/cli.js install chromium-headless-shell
+FRAMELEAF_TEST_PLAYWRIGHT=/tmp/frameleaf-playwright/node_modules/playwright-core/index.mjs npm run test:ui
+```
+
+Set `FRAMELEAF_TEST_BROWSER` to the absolute path of another Chromium build to
+use it instead, and `FRAMELEAF_TEST_OUTPUT` to an absolute folder to keep
+screenshots of the Manager page. `Desktop candidate` runs these tests on Linux
+for every pull request.
+
 ## Build and signing boundaries
 
 `Desktop candidate` tests and builds unsigned shell smoke-test installers
@@ -108,12 +212,30 @@ gh workflow run installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
 ```
 
 `Signed desktop release` is manually dispatched from `main`. A supplied tag must
-point to that exact workflow commit and match `package.json`, `Cargo.toml` and
-`tauri.conf.json`. An empty tag retains installer artifacts and skips draft staging.
+point to that exact workflow commit and match the version in `package.json`,
+`package-lock.json`, `Cargo.toml`, `Cargo.lock` and `tauri.conf.json`
+(`node tools/release_inputs.mjs v<version>` checks all five). An empty tag retains
+installer artifacts and skips draft staging.
 The default selection requests macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage.
-Intel macOS runtime dependencies are tracked in [FD-6](https://heroit.atlassian.net/browse/FD-6).
-Choose `all` to include Windows x86-64 NSIS/MSI after Azure Artifact Signing is configured,
-or `linux` to build both Linux architectures independently.
+The Intel macOS runtime ([FD-6](https://heroit.atlassian.net/browse/FD-6)) installs onnxruntime 1.23.2,
+the last release with an Intel macOS wheel, in place of the version the runtime source locks: the
+one wheel is named by version and SHA-256 under `targetPins` in `runtime/profiles.json`, recorded
+in the pack's `provenance.json`, and built and run on the Intel image by the `intel-macos` job of
+`runtime-pack.yml`. Every other dependency and every other target keeps the source lock.
+
+Every platform can be released by itself, so one that cannot build or be signed
+does not hold back the others. `platforms` is one of:
+
+| Choice | Targets |
+| --- | --- |
+| `macos-linux` (default) | Both macOS and both Linux architectures |
+| `all` | Everything, including Windows |
+| `macos`, `linux` | Both architectures of that system |
+| `macos-aarch64`, `macos-x86_64`, `linux-x86_64`, `linux-aarch64`, `windows` | That one target |
+
+The factory workflow takes the same choices. Runs for the same tag add to one
+draft (see [Staging](#staging-one-draft-per-tag)); the full order is in
+[Publishing a release](#publishing-a-release-owner-checklist).
 
 The installer pipeline consumes factory-signed ML runtimes rather than exposing
 the Infisical Ed25519 release key to app-build jobs. Specify a successful
@@ -138,6 +260,141 @@ The runtime pack producer/upload is a separate factory-authoring prerequisite;
 the existing `Private CPU runtime candidate` workflow uploads receipts only and
 does not satisfy this artifact contract.
 
+### Model catalogue and runtime profiles
+
+`runtime/model-catalogue.json` is a copy of the server's
+`server/resources/desktop/model-catalogue.json`; both sides compile it and must
+hold the same epoch and profiles. Check it from this repository with the server
+checkout beside it:
+
+```sh
+git -C ../immich show origin/main:server/resources/desktop/model-catalogue.json | python3 tools/check_catalogue_parity.py -
+```
+
+Add `--runtime-profiles <server runtime-profiles.json>` to also check that every
+runtime in `runtime/profiles.json` is one the server approves.
+
+`runtime/profiles.json` lists only runtimes Desktop can build and the server can
+admit, and every source in it has profiles in the catalogue (the parity check
+fails otherwise). Today that is the CPU runtime on every target, `coreml-ort` on
+Apple Silicon, and `cuda-ort` and `openvino-ort` on Windows and Linux x86_64.
+The accelerated profiles build their own runtime source (catalogue epoch 15),
+which verifies the model bytes a session loads; the CPU profile is unchanged.
+
+`python tools/build_runtime.py --profile coreml-ort` builds an accelerated pack:
+one payload (the CPU dependency set plus the CoreML device collector from
+`native/coreml_observer.m`, which the server requires) with two manifests,
+`manifest.json` for the processor and `manifest-accelerated.json` for CoreML.
+The factory workflow builds it for `macos-aarch64` by default (`accelerated:
+default`; choose `none` for the processor pack alone), and signs both manifests
+(`manifest-accelerated.sig`) after Apple code signing; packaging ships the second
+manifest beside the first. Both manifests of that pack name the accelerated
+profile's source, so the server must already carry catalogue epoch 15: against an
+older server neither manifest is known and that Mac has no AI processing until
+the server is updated. Release the server first: a tagged release run stops in
+`prepare` with `catalogue_ahead_of_server` when `runtime/model-catalogue.json` has
+a higher epoch than the catalogue in the latest published `frameleaf-v<version>`
+release of `Frameleaf/frameleaf-app`, unless `allow_unreleased_catalogue` is set.
+
+### Runtime epoch
+
+An installed app remembers the highest runtime epoch it accepted for its
+platform. It refuses a pack with a lower epoch (`runtime_epoch_rollback`) and a
+different pack with the same epoch (`runtime_epoch_reused`), so an epoch is
+never used twice for different bytes on one platform, and never goes down.
+
+`runtime/factory-epochs.json` records `highestUsedEpoch`: the highest epoch any
+pack was built with for a release or a draft. It is 8 (the 0.1.6 draft pack; the
+packs built on November 9 for 0.1.5 used 6), so the next epoch to use is **9**. The factory workflow
+has no default epoch: `epoch` must be given and must be above the record, and a
+tagged release refuses a pack whose epoch is not above it. Every platform of one
+release uses the same new epoch, in one factory run or several. After the
+release is published, raise `highestUsedEpoch` to that epoch (and the number in
+this paragraph) in the next version change. A pack rebuilt after an earlier one
+with the same epoch reached a draft or a tester needs the next epoch: raise the
+record first.
+
+```sh
+gh workflow run factory-runtime.yml --ref main -f platforms=all -f epoch=9 -f accelerated=default
+```
+
+The app installs the accelerated manifest in its own store and qualifies each
+workload with it. The first time with a runtime it also times the same fixtures
+on the processor, without the server: the provider keeps a workload only where
+its warm inference was faster, and that outcome is remembered for the runtime
+(`provider-failures.json`). Slower, failed or not measurable means the processor
+for that workload. What is remembered is for that runtime with that device and
+driver: a driver update, another card or Retry Setup tries the provider again,
+and a process that was only late to start is not remembered at all.
+`cargo test --lib native_runtime::metal::local_pack -- --ignored` qualifies a
+locally built pack against the catalogue under a throwaway key (see the test for
+its three environment variables).
+
+`--profile cuda-ort` and `--profile openvino-ort` build the same kind of pack on
+Windows and Linux x86_64, from the runtime source's `desktop-cuda` and
+`desktop-openvino` extras, which lock the libraries each provider library was
+built against: for onnxruntime-gpu 1.29.0 the CUDA 12 runtime 12.9.79 (its
+provider library imports functions the 12.6.77 runtime does not export, which on
+Windows is error 127 at load), cuBLAS, cuFFT, cuRAND, NVRTC and cuDNN 9; for
+onnxruntime-openvino 1.24.1 on Windows the `openvino` 2025.4.1 wheel (the Linux
+wheel contains it). `onnxruntime-gpu`, and nothing else, comes from the feed the
+server's lock names for it; every wheel is checked against the locked hash.
+
+Pull-request CI builds the four packs on hosted runners and checks them without a
+GPU (`tools/smoke_accelerated_runtime.py`). OpenVINO: a session runs on its CPU
+device. CUDA: the bundled CUDA and cuDNN libraries are in the pack and open; on
+Windows the provider library's import table is satisfied by the pack and the
+library loads; on Linux everything it links against resolves from the pack
+except the NVIDIA driver library. No CUDA session is created there. To verify on
+a Windows or Linux computer with an NVIDIA card and driver, build the pack and
+run the same script with the pack's interpreter; it must print `CUDA session ran
+on the card`:
+
+```sh
+python tools/build_runtime.py --source <frameleaf-app checkout at the profile's sourceRevision> --output candidate --revision <that revision> --epoch 7 --profile cuda-ort
+candidate/payload/python/python.exe -I -B tools/smoke_accelerated_runtime.py CUDAExecutionProvider   # Linux: candidate/payload/python/bin/python3.12
+```
+
+Neither provider has run on NVIDIA or Intel hardware.
+
+#### Delivery of the CUDA and OpenVINO packs (FD-60)
+
+A CUDA pack is about 3 GB, too large for an installer and for one release file
+(GitHub: "Each file included in a release must be under 2 GiB"). Installers keep
+carrying the processor pack. The CUDA and OpenVINO packs for `windows-x86_64` and
+`linux-x86_64` are release files the app downloads only when the person chooses
+Download on the AI processing page, and only on a computer with the device.
+
+- Factory: a `default` run (or one naming `cuda-ort` / `openvino-ort`) builds
+  those packs beside each installer pack. The `deliver` job signs only the
+  pack's accelerated manifest, cuts the pack into 1 GiB parts
+  (`tools/deliver_runtime.mjs`: the manifest, its signature, then the payload
+  files in the byte order of their names) and signs a delivery manifest naming
+  every part by size and SHA-256 and the runtime manifest by SHA-256. Artifacts:
+  `factory-accelerated-manifest-<target>-<profile>` and
+  `factory-accelerated-parts-<target>-<profile>`. The installer pack
+  (`factory-runtime-<target>`) carries the delivery manifests in `accelerated/`;
+  packaging refuses one that is unsigned, for another target or of another epoch.
+- Release: the `stage` job verifies every part against its signed delivery
+  manifest and uploads the parts beside the installers. The app fetches them
+  from `releases/download/v<its own version>/`, so they are reachable once the
+  release is published, and a release must be staged from the same factory run
+  as its installers.
+- App (`src-tauri/src/accelerated_pack.rs`): HTTPS only, resumable, each part
+  checked against the delivery manifest the installer carried, then the pack is
+  installed by the runtime store like a bundled one (signature, every file's
+  digest, epoch rules) and qualified. A downloaded pack is admitted only at the
+  processor runtime's own epoch. Any failure leaves the processor in charge and
+  shows the reason with a retry.
+
+To rebuild a pack from factory artifacts on a computer with the device (for the
+hardware check above): `node tools/deliver_runtime.mjs --reassemble <profile>.json
+<profile>.sig <parts folder> <output folder>`.
+
+The processor manifest of a CUDA or OpenVINO pack is never signed (the signer
+refuses it: another dependency set than the processor profile), so such a pack
+cannot become an installer's own runtime.
+
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
 and native target before bundling. macOS additionally verifies that the embedded
@@ -156,14 +413,89 @@ Users on builds that predate the updater need one manual install. Publish a rele
 covering all supported formats when promoting it to Latest so each can receive
 the update.
 
+### Checks before anything is built
+
+The `prepare` job stops the run, with the reason as the job's error, when:
+
+- the tag is missing, is not the version in the five version files, or does not
+  point at the commit the workflow runs on;
+- the factory run is not a successful manual `factory-runtime.yml` run on `main`,
+  was built from a commit outside this commit's history, or has no unexpired
+  `factory-runtime-<target>` artifact for a selected target
+  (`runtime_run_pack_missing`);
+- a selected pack was built from a source or profile `runtime/profiles.json` on
+  this commit does not approve for that target (`runtime_run_pack_unapproved`),
+  or, for a tagged release, with an epoch that is not above
+  `runtime/factory-epochs.json` (`runtime_run_pack_epoch_used`). Only the pack's
+  manifests are read here; the build job still verifies the whole signed payload;
+- for a tagged release, the model catalogue is newer than the latest server
+  release (`catalogue_ahead_of_server`), or the companion run is missing or not
+  trusted (below).
+
+When Windows is selected, the `signing-preflight` job then reads the
+`desktop-release` variables before any platform builds and fails with
+`windows_signing_unconfigured`, naming each variable that is not set and the
+settings page to set it on.
+
+### Companion packages
+
+The app sends people to the releases page for the Library companion package, so
+a release carries it. `companion_run_ids` names the successful
+`macos-host-package.yml` run (manual, on `main`, from a commit in this commit's
+history) whose `frameleaf-macos-arm64-companion-installed` artifact holds the
+notarized `FrameleafCompanion_<version>_arm64.pkg`. That workflow has already
+checked the installer signature, notarization and Gatekeeper; the release checks
+the package against the checksum the run recorded and adds it to the draft. A
+tagged release that includes `macos-aarch64` needs this input, or `none` to
+stage the draft without it.
+
+No workflow retains a signed, final Linux or Windows companion package: the
+Linux packages are built and signed across `linux-host-signing.yml` and the
+Ubuntu qualification without being uploaded, and the Windows installer is only
+produced unsigned (`-setup-unsigned.exe`). Those, and the `SOURCES` files, are
+still added to the draft by hand. The run summary and the draft notes name each
+selected platform whose companion package was not attached.
+
+`macos-host-package.yml` reads its input from the draft with release id
+`419477762`, which no longer exists: producing a new Apple Silicon companion
+package needs that workflow pointed at a current draft first. The run that
+produced 1.2.4 is `42148037724`; its artifact expires on February 4, 2027.
+
+### Staging: one draft per tag
+
 Only after every selected target passes does a separate job receive repository
-write permission and create a **draft prerelease** with installers, signed updater
-packages, `latest.json` and `SHA256SUMS`. The updater sees the manifest after the
-release is published as Latest. The workflow never publishes automatically or
-replaces an existing release.
-If a draft already exists for the tag, the create step fails; inspect/remove the
-draft deliberately before retrying. Successful CI or code signing does not prove
-installed-device, NAS-job, GPU or native-host acceptance.
+write permission. It verifies the updater signatures, then:
+
+- when the tag has no release, creates a **draft prerelease** with the
+  installers, signed updater packages, `latest.json` and `SHA256SUMS`;
+- when the tag already has a draft, **adds** this run's assets to it and
+  replaces `latest.json` and `SHA256SUMS` with ones rebuilt from everything on
+  the draft. `latest.json` then offers every platform any run staged; each
+  signature is carried through exactly as it was written.
+
+`tools/release_draft.mjs` decides this (`tools/test_release_draft.mjs`). It
+refuses, changing nothing, when the release for the tag is already published
+(`release_not_draft`), when more than one release exists for the tag
+(`release_tag_ambiguous`; GitHub allows two drafts for one tag, which is how
+both 0.1.5 runs staged a partial draft each), and when the draft already has an
+asset of the same name with different bytes (`release_asset_conflict`). A
+rebuild never has the same bytes: to replace a platform, delete its assets and
+their `.sig` files from the draft, then run again. Re-running only the failed
+`stage` job reuses the built installers and is safe. Files added to the draft by
+hand are kept and listed in the next run's `SHA256SUMS`.
+
+The run summary and the draft notes list the targets in `latest.json` and state
+when Windows was excluded from the update feed; Windows entries from an earlier
+release are not carried forward. The same job stamps the AUR and Chocolatey
+files from the checksums of the whole draft (see
+[`packaging/README.md`](../packaging/README.md)). The updater sees the manifest after the
+release is published as Latest. The workflow never publishes or deletes a
+release. Successful CI or code signing does not prove installed-device, NAS-job,
+GPU or native-host acceptance.
+
+Release runs share one concurrency group: they run one at a time, and GitHub
+keeps only one waiting. Dispatch the next run when no other is waiting, or the
+waiting one is cancelled.
 
 ## Signing credentials
 
@@ -255,28 +587,99 @@ The macOS factory signer verifies the unsigned inventory, signs the interpreter 
 embedded Mach-O libraries with Developer ID and secure timestamps, then seals the
 final bytes with the factory key. The installer verifies that inventory again.
 
-## Dispatch
+## Publishing a release: owner checklist
 
-For an Apple Silicon installer artifact, run the factory and signed desktop
-workflows on `main` with `platforms=macos-aarch64`. Pass the successful factory
-run ID to the signed workflow and leave the tag empty. After signing, notarization
-and embedded runtime verification, the workflow submits the signed DMG to Apple,
-retains the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`,
+Steps 1 to 4 can be done ahead of time. Only Windows needs Microsoft's identity
+validation; macOS and Linux ship without it.
+
+1. **Windows only, once: finish Microsoft's identity validation.** When Microsoft
+   approves Frameleaf Inc., create the Public Trust certificate profile, assign
+   the signer role, and set `AZURE_SIGNING_PROFILE` and `WINDOWS_SIGNING_SUBJECT`
+   as variables of the `desktop-release` environment
+   ([Azure Artifact Signing setup](#azure-artifact-signing-setup)). Until then
+   skip every Windows step below; a Windows run stops in `signing-preflight`.
+2. **Release the server first** when `runtime/model-catalogue.json` has a higher
+   epoch than the latest `frameleaf-v<version>` server release (today: Desktop
+   15, `frameleaf-v1.2.21` 14).
+3. **Merge everything that ships, including the version change**, to `main`.
+   The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
+   on it prints the tag.
+4. **Build the runtime packs** on `main`, at or before `<commit>`, with the next
+   epoch ([Runtime epoch](#runtime-epoch): 9), for every platform being
+   released. Separate runs per platform are fine; note each run id. A run is
+   only accepted by the release when every platform in it succeeded, so build
+   Intel by itself until it has succeeded once.
+
+   Run it once each for `macos-aarch64`, `linux`, `macos-x86_64` and (with step 1
+   done) `windows`. Factory runs also go one at a time with only one waiting:
+   dispatch the next when no other is waiting.
+
+   ```sh
+   gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f platforms=<platforms> -f epoch=9 -f accelerated=default
+   ```
+
+   With `accelerated=default` a `windows` or `linux` run also builds the CUDA and
+   OpenVINO packs the app downloads on request
+   ([Delivery of the CUDA and OpenVINO packs](#delivery-of-the-cuda-and-openvino-packs-fd-60)):
+   its `deliver` jobs must succeed, or no installer pack is signed. No factory
+   run has built those packs yet, so expect to iterate on the first one.
+5. **Have the companion packages ready** ([Companion packages](#companion-packages)):
+   the run id of the notarized Apple Silicon package (`42148037724` for 1.2.4),
+   and the Linux, Windows and `SOURCES` files to add by hand (the same 1.2.4
+   files are on the 0.1.5 release).
+6. **Tag the commit and push the tag.** A pushed tag is never moved.
+
+   ```sh
+   git tag v<version> <commit>
+   git push origin v<version>
+   ```
+7. **Run the release once per platform group**, each with the factory run that
+   built those platforms. Every run adds to the same draft.
+
+   ```sh
+   gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f tag=v<version> -f platforms=macos-aarch64 \
+     -f runtime_run_id=<factory run> -f companion_run_ids=<macos-host-package run>
+   gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f tag=v<version> -f platforms=linux -f runtime_run_id=<factory run>
+   gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run>   # needs step 1
+   ```
+
+   Each run also verifies the CUDA and OpenVINO pack parts of its factory run
+   (`frameleaf-accelerated-*.partNN`) and adds them to the draft. Use the same
+   factory run for a platform's installers and its parts: the installer carries
+   the signed list of exactly those parts.
+
+   Intel Macs: the Intel runtime now builds with onnxruntime 1.23.2
+   ([FD-6](https://heroit.atlassian.net/browse/FD-6)), but no signed factory run
+   has produced an Intel pack yet. Until one succeeds, build and release it as
+   its own `macos-x86_64` runs so a failure there does not stop Apple Silicon or
+   Linux. Once one has, `platforms=macos-linux` (or `all` with step 1 done) in
+   steps 4 and 7 replaces the separate macOS and Linux runs. A platform left out
+   stays on its installed version; the draft notes say which.
+8. **Add the hand-attached files to the draft** (step 5) before the last run of
+   step 7, so the final `SHA256SUMS` lists them; or re-run the `stage` job of the
+   last run afterwards.
+9. **Review the draft**: one draft for the tag, the commit, the targets listed
+   under "Update feed" in its notes, `SHA256SUMS`, the companion packages, the
+   `frameleaf-accelerated-*` parts for Windows and Linux x86_64, and
+   installed-device acceptance on each platform. The app can download the parts
+   only once the release is published, so a GPU pack is accepted on a device
+   after step 10 (or from the factory artifacts with
+   `tools/deliver_runtime.mjs --reassemble` before it).
+10. **Publish**: clear "pre-release", set it as the latest release and publish.
+    From then the updater offers it to every target in `latest.json`.
+11. **Afterwards**: publish the AUR files, and Chocolatey only when the release
+    has the signed MSI (Windows; the `package-manager-files` artifact of the last
+    run, [`packaging/README.md`](../packaging/README.md)); raise
+    `highestUsedEpoch` in `runtime/factory-epochs.json` to the epoch released.
+
+For an installer to try without publishing, run step 7 with no `tag`: the
+installers are kept as `signed-installers-<target>` artifacts and nothing is
+staged. For Apple Silicon the workflow submits the signed DMG to Apple, retains
+the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`,
 staples the accepted ticket, and checks Gatekeeper. If Apple outlasts the
-runner, use the recorded request ID with `notarytool info` and staple the retained
-DMG after acceptance. The verified DMG is available in the workflow artifact
-`signed-installers-macos-aarch64`. Draft release staging requires a tag.
-
-After the workflow is merged, factory packs and credentials are available, and
-the chosen version is ready for a candidate:
-
-```sh
-git tag v0.1.0 <reviewed-main-commit>
-git push origin v0.1.0
-gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
-  -f tag=v0.1.0 -f runtime_run_id=<successful-factory-run-id> \
-  -f platforms=macos-linux
-```
-
-Review the draft's exact commit, signatures, checksums and installed-device
-acceptance before publishing. No tag or public release is created by this change.
+runner, use the recorded request ID with `notarytool info` and staple the
+retained DMG after acceptance.

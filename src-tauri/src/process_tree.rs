@@ -10,6 +10,143 @@ pub struct ProcessTree(i32);
 #[cfg(windows)]
 pub struct ProcessTree(std::os::windows::io::OwnedHandle);
 
+/// What tells one process from a later one that reuses its PID: its start time and its program.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProcessIdentity {
+    pub pid: u32,
+    pub started: String,
+    pub program: std::path::PathBuf,
+}
+/// What can be said about the process holding a PID right now. `Unknown` is its own answer:
+/// a lookup that failed proves neither that the process exists nor that it is gone.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Presence {
+    /// No live process has this PID.
+    Absent,
+    Present(ProcessIdentity),
+    Unknown,
+}
+#[cfg(unix)]
+impl ProcessIdentity {
+    /// The identity of the live process with this PID, when it could be read.
+    pub(crate) fn of(pid: u32) -> Option<Self> {
+        match Self::lookup(pid) {
+            Presence::Present(identity) => Some(identity),
+            Presence::Absent | Presence::Unknown => None,
+        }
+    }
+    pub(crate) fn lookup(pid: u32) -> Presence {
+        // PID 0 and 1 and anything outside pid_t are never a child this app started; a record
+        // naming one says nothing about the process it meant.
+        let Some(raw) = i32::try_from(pid).ok().filter(|pid| *pid > 1) else {
+            return Presence::Unknown;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            if unsafe {
+                libc::proc_pidinfo(
+                    raw,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            } != size
+            {
+                return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    Presence::Absent
+                } else {
+                    Presence::Unknown
+                };
+            }
+            let info = unsafe { info.assume_init() };
+            if info.pbi_pid != pid {
+                return Presence::Unknown;
+            }
+            // SZOMB: an exited process that has not been reaped is not alive.
+            if info.pbi_status == 5 {
+                return Presence::Absent;
+            }
+            let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            let length =
+                unsafe { libc::proc_pidpath(raw, path.as_mut_ptr().cast(), path.len() as u32) };
+            if length <= 0 {
+                return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    Presence::Absent
+                } else {
+                    Presence::Unknown
+                };
+            }
+            path.truncate(length as usize);
+            let Ok(program) = String::from_utf8(path) else {
+                return Presence::Unknown;
+            };
+            Presence::Present(Self {
+                pid,
+                started: format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+                program: program.into(),
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = raw;
+            // Only "no such process" proves absence; any other failure is unknown.
+            let gone = |error: &std::io::Error| {
+                error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH)
+            };
+            let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat,
+                Err(error) if gone(&error) => return Presence::Absent,
+                Err(_) => return Presence::Unknown,
+            };
+            // The command name may contain spaces and brackets; fields resume after the last ')'.
+            let Some(mut fields) = stat
+                .rfind(')')
+                .and_then(|end| stat.get(end + 1..))
+                .map(str::split_ascii_whitespace)
+            else {
+                return Presence::Unknown;
+            };
+            match fields.next() {
+                // An exited process that has not been reaped is not alive.
+                Some("Z" | "X" | "x") => return Presence::Absent,
+                Some(_) => {}
+                None => return Presence::Unknown,
+            }
+            // Field 22 of proc(5) stat: start time in clock ticks since this boot.
+            let Some(ticks) = fields.nth(18).filter(|ticks| {
+                !ticks.is_empty() && ticks.bytes().all(|byte| byte.is_ascii_digit())
+            }) else {
+                return Presence::Unknown;
+            };
+            let Ok(boot) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+                return Presence::Unknown;
+            };
+            let program = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+                Ok(program) => program,
+                Err(error) if gone(&error) => return Presence::Absent,
+                Err(_) => return Presence::Unknown,
+            };
+            Presence::Present(Self {
+                pid,
+                started: format!("{}:{ticks}", boot.trim()),
+                program,
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = raw;
+            Presence::Unknown
+        }
+    }
+}
+
 pub fn configure(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -76,6 +213,30 @@ impl ProcessTree {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Whether every process in the owned job has exited.
+    #[cfg(windows)]
+    pub(crate) fn is_empty(&self) -> Result<bool, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("runtime_process_state_unavailable".to_string());
+        }
+        Ok(info.ActiveProcesses == 0)
     }
 
     pub fn attach(child: &Child) -> Result<Self, String> {

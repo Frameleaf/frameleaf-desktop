@@ -11,9 +11,44 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+# The server admits a CoreML report only from a runtime whose signed manifest carries this
+# collector (server `desktop-runtime-attestation.ts`); its library hash is the collector identity.
+METAL_PACKAGE = "private/frameleaf_desktop_ml"
+METAL_FILES = (
+    "__init__.py",
+    "entry.py",
+    "metal_observer.py",
+    "metal_inference.py",
+    "_frameleaf_coreml_observer.dylib",
+)
+CPU_PROVIDER = "CPUExecutionProvider"
+# An accelerated pack keeps the processor manifest as `manifest.json` and adds this one over the
+# same payload, so the app can fall back to the processor without a second copy in the installer.
+ACCELERATED_MANIFEST = "manifest-accelerated.json"
+# FD-56: where each accelerated provider may be built, as the server's runtime-profiles.json
+# approves it.
+ACCELERATED_TARGETS = {
+    "CoreMLExecutionProvider": {("macos", "aarch64")},
+    "CUDAExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+    "OpenVINOExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+}
+# The server's lock takes onnxruntime-gpu from this explicit index (`onnxruntime-cuda12` in its
+# pyproject.toml): the CUDA 12 build, which PyPI no longer carries. Only that one package is
+# installed from it (the feed also mirrors other packages at other versions), and like every
+# wheel it is checked against the hash the lock records.
+CUDA_FEED = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+# The CUDA, cuDNN and (on Windows) OpenVINO libraries a pack carries are those the runtime source's
+# `desktop-cuda` and `desktop-openvino` extras lock: the versions each provider library was built
+# against. A container has them in its image; a desktop has no installation of them.
+# Packages taken from an index of their own, as the server's lock does.
+FEED_PACKAGES = {"CUDAExecutionProvider": ("onnxruntime-gpu", CUDA_FEED)}
+
 
 
 class BuildError(RuntimeError):
@@ -139,6 +174,8 @@ def manifest(
     architecture: str,
     provider: str,
     module_namespace: str = "immich_ml",
+    *,
+    metal_observer: bool = False,
 ) -> dict:
     relative(python)
     if (
@@ -148,18 +185,28 @@ def manifest(
         or system not in {"macos", "windows", "linux"}
         or architecture not in {"aarch64", "x86_64"}
         or not (
-            provider == "CPUExecutionProvider"
-            or (
-                provider == "CoreMLExecutionProvider"
-                and system == "macos"
-                and architecture == "aarch64"
-            )
+            provider == CPU_PROVIDER
+            or (system, architecture) in ACCELERATED_TARGETS.get(provider, set())
         )
+        # Without its collector a CoreML runtime can never be admitted.
+        or (provider == "CoreMLExecutionProvider" and not metal_observer)
+        or (metal_observer and provider not in {CPU_PROVIDER, "CoreMLExecutionProvider"})
     ):
         raise BuildError("runtime_manifest_invalid")
     files = inventory(root)
     if python not in files:
         raise BuildError("runtime_interpreter_missing")
+    if metal_observer and (
+        system != "macos"
+        or architecture != "aarch64"
+        or module_namespace != "frameleaf_ml"
+        or any(
+            f"{METAL_PACKAGE}/{name}" not in files
+            or not 0 < files[f"{METAL_PACKAGE}/{name}"]["bytes"] <= 4 * 1024 * 1024
+            for name in METAL_FILES
+        )
+    ):
+        raise BuildError("runtime_device_observer_invalid")
     return {
         "schemaVersion": 1,
         "protocolVersion": 1,
@@ -174,8 +221,44 @@ def manifest(
             if module_namespace == "frameleaf_ml"
             else {}
         ),
+        **(
+            {"deviceObserver": {"kind": "metal-v1"}}
+            if metal_observer and provider == "CoreMLExecutionProvider"
+            else {}
+        ),
         "files": files,
     }
+
+
+def stage_metal_observer(payload: Path, component: Path) -> None:
+    files = inventory(component)
+    if set(files) != set(METAL_FILES) | {"provenance.json"}:
+        raise BuildError("runtime_device_observer_inventory_invalid")
+    provenance = json.loads((component / "provenance.json").read_text())
+    fields = dict(
+        zip(
+            METAL_FILES,
+            (
+                "packageInitSha256",
+                "entrySha256",
+                "loaderSha256",
+                "adapterSha256",
+                "librarySha256",
+            ),
+            strict=True,
+        )
+    )
+    if any(
+        files[name]["sha256"] != provenance.get(field) for name, field in fields.items()
+    ):
+        raise BuildError("runtime_device_observer_hash_invalid")
+    destination = payload / METAL_PACKAGE
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in METAL_FILES:
+        target = destination / name
+        shutil.copyfile(component / name, target)
+        if sha256(target) != provenance[fields[name]]:
+            raise BuildError("runtime_device_observer_hash_invalid")
 
 
 def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
@@ -227,11 +310,10 @@ def git_blob(
     git: str, root: Path, revision: str, name: str, env: dict[str, str]
 ) -> bytes:
     relative(name)
-    mode = run(
-        [git, "ls-tree", "--format=%(objectmode)", revision, "--", name],
-        cwd=root,
-        env=env,
-    )
+    # "<mode> <type> <object>\t<path>": the plain listing, which every git prints (`--format`
+    # needs git 2.36, newer than Ubuntu 22.04's).
+    listing = run([git, "ls-tree", revision, "--", name], cwd=root, env=env)
+    mode = listing.split(" ", 1)[0] if listing.count("\n") == 0 else ""
     if mode not in {"100644", "100755"}:
         raise BuildError("runtime_source_file_invalid")
     size = int(run([git, "cat-file", "-s", f"{revision}:{name}"], cwd=root, env=env))
@@ -293,6 +375,47 @@ def source_build_requirements(text: str, locked: str | None = None) -> str:
     return requirement_block(text if locked is None else locked, "setuptools")
 
 
+def feed_requirements(provider: str, text: str) -> tuple[str, str, str | None]:
+    """Split the requirements into those installed from the usual indexes and the one package
+    the server's lock takes from its own index: (the rest, that package's block, its index)."""
+    if provider not in FEED_PACKAGES:
+        return text, "", None
+    name, index = FEED_PACKAGES[provider]
+    block = requirement_block(text, name)
+    if text.count(block) != 1:
+        raise BuildError("runtime_build_tool_not_pinned")
+    return text.replace(block, ""), block, index
+
+
+def target_pins(profile: dict, target: str) -> dict[str, dict[str, str]]:
+    """The packages a target takes at another exact version than the runtime source locks,
+    because the locked version publishes no wheel for it (FD-6: onnxruntime on Intel macOS)."""
+    pins = profile.get("targetPins", {}).get(target, {})
+    if not isinstance(pins, dict) or any(
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+        or not isinstance(pin, dict)
+        or set(pin) != {"version", "sha256"}
+        or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", str(pin["version"]))
+        or not re.fullmatch(r"[a-f0-9]{64}", str(pin["sha256"]))
+        for name, pin in pins.items()
+    ):
+        raise BuildError("runtime_target_pin_invalid")
+    return pins
+
+
+def pinned_requirements(text: str, pins: dict[str, dict[str, str]]) -> str:
+    """Replace each pinned package's locked requirement with the one wheel the pin names. The
+    package must be locked exactly once: a pin never adds a package the source does not use."""
+    for name, pin in sorted(pins.items()):
+        block = requirement_block(text, name)
+        if text.count(block) != 1:
+            raise BuildError("runtime_build_tool_not_pinned")
+        text = text.replace(
+            block, f"{name}=={pin['version']} \\\n    --hash=sha256:{pin['sha256']}\n"
+        )
+    return text
+
+
 def dependency_indexes(system: str, architecture: str) -> list[str]:
     # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
@@ -348,11 +471,14 @@ def build(
         raise BuildError("runtime_output_must_be_new")
     if not re.fullmatch(r"[a-f0-9]{40}", revision) or not 1 <= epoch < 2**63:
         raise BuildError("runtime_manifest_invalid")
-    profile = json.loads(
+    profiles = json.loads(
         (Path(__file__).parent.parent / "runtime/profiles.json").read_text()
-    )["profiles"].get(profile_name)
+    )["profiles"]
+    profile = profiles.get(profile_name)
     if not profile:
         raise BuildError("runtime_profile_unknown")
+    accelerated = profile["provider"] != CPU_PROVIDER
+    base = profiles.get("cpu-ort", {})
     system = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}.get(
         platform.system(), "unsupported"
     )
@@ -366,6 +492,24 @@ def build(
         raise BuildError("runtime_target_unqualified")
     if qwen is not None and (profile_name != "cpu-ort"):
         raise BuildError("runtime_qwen_target_unqualified")
+    # The processor manifest of an accelerated pack is the processor provider of the same
+    # payload: the cpu-ort dependency set itself for CoreML, and for CUDA and OpenVINO the
+    # processor provider of their own onnxruntime build, on the same Python.
+    if accelerated and (
+        (system, architecture)
+        not in ACCELERATED_TARGETS.get(profile["provider"], set())
+        or base.get("provider") != CPU_PROVIDER
+        or f"{system}-{architecture}" not in base.get("targets", [])
+        or any(
+            base.get(key) != profile[key]
+            for key in (
+                ("python", "uv", "extra")
+                if profile["provider"] == "CoreMLExecutionProvider"
+                else ("python", "uv")
+            )
+        )
+    ):
+        raise BuildError("runtime_profile_base_mismatch")
     uv = shutil.which("uv")
     git = shutil.which("git")
     if not uv or not git:
@@ -418,6 +562,12 @@ def build(
             env=env,
         ).splitlines()
         module_namespace = source_package(tracked)
+        metal_observer = profile["provider"] == "CoreMLExecutionProvider"
+        if metal_observer and (
+            module_namespace != "frameleaf_ml"
+            or "machine-learning/frameleaf_ml/native_device.py" not in tracked
+        ):
+            raise BuildError("runtime_observer_source_incompatible")
         uv_version = run([uv, "--version"], cwd=work, env=env)
         if uv_version.split()[1] != profile["uv"]:
             raise BuildError("runtime_uv_version_mismatch")
@@ -456,6 +606,8 @@ def build(
             cwd=ml,
             env=env,
         )
+        pins = target_pins(profile, f"{system}-{architecture}")
+        requirements.write_text(pinned_requirements(requirements.read_text(), pins))
         validate_requirements(requirements.read_text())
         downloads = work / "python-downloads"
         run(
@@ -508,6 +660,14 @@ def build(
                 cwd=work,
                 env=env,
             )
+        rest, feed_block, feed_index = feed_requirements(
+            profile["provider"], requirements.read_text()
+        )
+        usual, from_feed = requirements, work / "feed-requirements.txt"
+        if feed_index:
+            usual = work / "usual-requirements.txt"
+            usual.write_text(rest)
+            from_feed.write_text(feed_block)
         run(
             [
                 uv,
@@ -533,11 +693,33 @@ def build(
                 ),
                 *dependency_indexes(system, architecture),
                 "-r",
-                requirements,
+                usual,
             ],
             cwd=work,
             env=env,
         )
+        if feed_index:
+            run(
+                [
+                    uv,
+                    "--no-config",
+                    "pip",
+                    "install",
+                    "--python",
+                    executable,
+                    "--break-system-packages",
+                    "--require-hashes",
+                    "--no-deps",
+                    "--only-binary",
+                    ":all:",
+                    "--default-index",
+                    feed_index,
+                    "-r",
+                    from_feed,
+                ],
+                cwd=work,
+                env=env,
+            )
 
         commands = prefix / ("Scripts" if os.name == "nt" else "bin")
         # Console entry points embed the build path; the app uses only fixed Python modules.
@@ -569,6 +751,20 @@ def build(
             target = site / Path(name).relative_to("machine-learning")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(git_blob(git, source, revision, name, env))
+        if metal_observer:
+            component = work / "metal-observer"
+            run(
+                [
+                    sys.executable,
+                    "-B",
+                    Path(__file__).with_name("build_coreml_observer.py"),
+                    "--output",
+                    component,
+                ],
+                cwd=work,
+                env=env,
+            )
+            stage_metal_observer(payload, component)
         notices = payload / "licenses"
         notices.mkdir()
         (notices / "Frameleaf-AGPL-3.0.txt").write_bytes(
@@ -594,6 +790,8 @@ def build(
             "sourceBuildAllowlist": ["antlr4-python3-runtime==4.9.3"]
             if build_tools.stat().st_size
             else [],
+            # What this target installs instead of the version the source locks.
+            **({"targetPins": pins} if pins else {}),
         }
         qwen_relative = None
         if qwen is not None:
@@ -627,7 +825,7 @@ def build(
         )
         if (
             Path(smoke["prefix"]).resolve() != (payload / "python").resolve()
-            or profile["provider"] not in smoke["providers"]
+            or not {profile["provider"], CPU_PROVIDER} <= set(smoke["providers"])
         ):
             raise BuildError("runtime_relocation_failed")
         if qwen_relative is not None:
@@ -637,19 +835,42 @@ def build(
             )
             if not re.search(rb"\b" + QWEN_LLAMA_REVISION[:9].encode() + rb"[a-f0-9]*\b", version.stdout + version.stderr):
                 raise BuildError("runtime_qwen_revision_unverified")
-        value = manifest(
-            payload,
-            executable.relative_to(payload).as_posix(),
-            revision,
-            epoch,
-            system,
-            architecture,
-            profile["provider"],
-            module_namespace,
-        )
-        (bundle / "manifest.json").write_text(
-            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-        )
+        if metal_observer:
+            # The collector must load from its relocated place; a device is not required to build.
+            loaded = run(
+                [
+                    executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import ctypes,sys; sys.path.insert(0,sys.argv[1]); "
+                    "import frameleaf_desktop_ml.entry,frameleaf_desktop_ml.metal_inference; "
+                    "print(ctypes.CDLL(sys.argv[1]+'/frameleaf_desktop_ml/_frameleaf_coreml_observer.dylib')"
+                    ".fl_gpu_abi_version())",
+                    payload / "private",
+                ],
+                cwd=work,
+                env=smoke_env,
+            )
+            if loaded != "1":
+                raise BuildError("runtime_device_observer_invalid")
+        for name, provider in [("manifest.json", CPU_PROVIDER)] + (
+            [(ACCELERATED_MANIFEST, profile["provider"])] if accelerated else []
+        ):
+            value = manifest(
+                payload,
+                executable.relative_to(payload).as_posix(),
+                revision,
+                epoch,
+                system,
+                architecture,
+                provider,
+                module_namespace,
+                metal_observer=metal_observer,
+            )
+            (bundle / name).write_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            )
         if run([git, "rev-parse", "HEAD"], cwd=source, env=env) != revision:
             raise BuildError("runtime_source_revision_changed")
         # Immutable Git blobs preserve the preprocessing identity on CRLF checkouts too.

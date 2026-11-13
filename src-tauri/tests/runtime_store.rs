@@ -139,6 +139,135 @@ fn incomplete_staging_and_tampered_installed_payload_are_never_adopted() {
     assert!(store.load_active().is_err());
 }
 
+// FD-52: the accelerated manifest of a pack is installed in its own store over the same files.
+#[test]
+fn a_second_store_shares_identical_payload_files_and_still_verifies_every_byte() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let authority = common::authority();
+    let open = |name: &str| {
+        RuntimeStore::new(
+            &fixture.0.join(name),
+            vec![key.verifying_key()],
+            1,
+            authority.clone(),
+        )
+        .unwrap()
+    };
+    let processor = open("runtimes");
+    let raw = manifest(2);
+    processor
+        .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+        .unwrap();
+    let shared = processor.release_payload(&format!("{:x}", Sha256::digest(&raw)));
+    let mut other: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    other["provider"] = json!("CUDAExecutionProvider");
+    let accelerated_raw = serde_json::to_vec(&other).unwrap();
+    let signature = key.sign(&accelerated_raw).to_bytes();
+    let id = format!("{:x}", Sha256::digest(&accelerated_raw));
+    // A shared file whose bytes are not the manifest's is never adopted.
+    fs::write(shared.join("python"), b"tamperd").unwrap();
+    let refused = open("refused");
+    assert!(refused
+        .install_and_activate_sharing(&candidate, &accelerated_raw, &signature, Some(&shared))
+        .is_err());
+    assert!(refused.load_active().unwrap().is_none());
+    fs::write(shared.join("python"), b"fixture").unwrap();
+    let accelerated = open("runtimes-accelerated");
+    accelerated
+        .install_and_activate_sharing(&candidate, &accelerated_raw, &signature, Some(&shared))
+        .unwrap();
+    let installed = accelerated.load_active().unwrap().unwrap();
+    assert_eq!(installed.manifest_sha256(), id);
+    assert_eq!(installed.provider(), "CUDAExecutionProvider");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(accelerated.release_payload(&id).join("python"))
+                .unwrap()
+                .ino(),
+            fs::metadata(shared.join("python")).unwrap().ino()
+        );
+    }
+    // The processor runtime is untouched, and a missing share is simply copied.
+    assert_eq!(processor.load_active().unwrap().unwrap().epoch(), 2);
+    let copied = open("copied");
+    copied
+        .install_and_activate_sharing(
+            &candidate,
+            &accelerated_raw,
+            &signature,
+            Some(&fixture.0.join("absent")),
+        )
+        .unwrap();
+    assert_eq!(copied.load_active().unwrap().unwrap().manifest_sha256(), id);
+}
+
+// FD-52: superseded runtime packs are reclaimed, never the active one or the rollback target.
+#[test]
+fn prune_removes_only_superseded_releases_and_abandoned_staging_inside_the_store() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let root = fixture.0.join("store");
+    let store =
+        RuntimeStore::new(&root, vec![key.verifying_key()], 1, common::authority()).unwrap();
+    let mut ids = Vec::new();
+    for epoch in [2, 3, 4] {
+        let raw = manifest(epoch);
+        store
+            .install_and_activate(&candidate, &raw, &key.sign(&raw).to_bytes())
+            .unwrap();
+        ids.push(format!("{:x}", Sha256::digest(&raw)));
+    }
+    let releases = root.join("releases");
+    let staging = root.join(format!(".staging-{}", Uuid::new_v4()));
+    let outside = fixture.0.join("f".repeat(64));
+    for directory in [&staging, &releases.join("notes"), &outside] {
+        fs::create_dir_all(directory.join("payload")).unwrap();
+        fs::write(directory.join("payload/python"), b"kept").unwrap();
+    }
+    fs::create_dir(root.join(".staging-incomplete")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, releases.join("e".repeat(64))).unwrap();
+    // The caller qualified with a release that is not the active one: unknown, so nothing goes.
+    assert_eq!(store.prune(&ids[0], None).unwrap(), 0);
+    assert_eq!(store.prune(&"0".repeat(64), None).unwrap(), 0);
+    assert!(staging.exists() && releases.join(&ids[0]).exists());
+    // A running worker holds the shared lease; pruning beside it keeps the release it runs from.
+    let running = store.load_active().unwrap().unwrap();
+    assert_eq!(running.manifest_sha256(), ids[2]);
+    assert_eq!(store.prune(&ids[2], Some(&ids[1])).unwrap(), 2);
+    assert!(!releases.join(&ids[0]).exists());
+    assert!(!staging.exists());
+    for kept in [&ids[1], &ids[2]] {
+        assert!(releases.join(kept).join("payload/python").exists());
+    }
+    assert_eq!(store.prune(&ids[2], None).unwrap(), 1);
+    assert!(!releases.join(&ids[1]).exists());
+    drop(running);
+    // The active release still verifies and loads; nothing unrecognised or outside was touched.
+    assert_eq!(
+        store.load_active().unwrap().unwrap().manifest_sha256(),
+        ids[2]
+    );
+    assert!(releases.join("notes/payload/python").exists());
+    assert!(root.join(".staging-incomplete").exists());
+    assert!(outside.join("payload/python").exists());
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(releases.join("e".repeat(64))).is_ok());
+    // An unreadable active pointer is unknown too.
+    fs::write(root.join("active.json"), b"{").unwrap();
+    assert!(store.prune(&ids[2], None).is_err());
+    assert!(releases.join(&ids[2]).exists());
+}
+
 #[test]
 fn epoch_cannot_be_reused_for_different_runtime_bytes() {
     let fixture = Fixture::new();

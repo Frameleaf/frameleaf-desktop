@@ -140,35 +140,162 @@ class RuntimeBuilderTests(unittest.TestCase):
                     "foreign",
                 )
 
+    def metal_root(self, temporary):
+        root = Path(temporary)
+        (root / "python").write_bytes(b"fixture")
+        package = root / builder.METAL_PACKAGE
+        package.mkdir(parents=True)
+        for name in builder.METAL_FILES:
+            (package / name).write_bytes(b"fixture")
+        return root
+
     def test_coreml_manifest_is_limited_to_apple_silicon_macos(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "python").write_bytes(b"fixture")
+            root = self.metal_root(temporary)
+            arguments = (root, "python", "a" * 40, 7)
             value = builder.manifest(
-                root,
-                "python",
-                "a" * 40,
-                7,
+                *arguments,
                 "macos",
                 "aarch64",
                 "CoreMLExecutionProvider",
+                "frameleaf_ml",
+                metal_observer=True,
             )
             self.assertEqual(value["provider"], "CoreMLExecutionProvider")
-            for system, architecture in [
-                ("windows", "x86_64"),
-                ("linux", "aarch64"),
-                ("macos", "x86_64"),
+            self.assertEqual(value["deviceObserver"], {"kind": "metal-v1"})
+            # The processor manifest of the same pack seals the collector without naming it.
+            processor = builder.manifest(
+                *arguments,
+                "macos",
+                "aarch64",
+                "CPUExecutionProvider",
+                "frameleaf_ml",
+                metal_observer=True,
+            )
+            self.assertNotIn("deviceObserver", processor)
+            self.assertEqual(processor["files"], value["files"])
+            for system, architecture, namespace, observer in [
+                ("windows", "x86_64", "frameleaf_ml", True),
+                ("linux", "aarch64", "frameleaf_ml", True),
+                ("macos", "x86_64", "frameleaf_ml", True),
+                # A CoreML runtime without its collector, or on the upstream namespace, is never admitted.
+                ("macos", "aarch64", "frameleaf_ml", False),
+                ("macos", "aarch64", "immich_ml", True),
             ]:
                 with self.assertRaises(builder.BuildError):
                     builder.manifest(
-                        root,
-                        "python",
-                        "a" * 40,
-                        7,
+                        *arguments,
                         system,
                         architecture,
                         "CoreMLExecutionProvider",
+                        namespace,
+                        metal_observer=observer,
                     )
+            (root / builder.METAL_PACKAGE / "entry.py").unlink()
+            with self.assertRaisesRegex(builder.BuildError, "device_observer"):
+                builder.manifest(
+                    *arguments,
+                    "macos",
+                    "aarch64",
+                    "CoreMLExecutionProvider",
+                    "frameleaf_ml",
+                    metal_observer=True,
+                )
+
+    def test_cuda_and_openvino_manifests_are_limited_to_their_approved_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "python").write_bytes(b"fixture")
+            arguments = (root, "python", "a" * 40, 7)
+            for provider, systems in [
+                ("CUDAExecutionProvider", ["windows", "linux"]),
+                ("OpenVINOExecutionProvider", ["windows", "linux"]),
+            ]:
+                for system in systems:
+                    value = builder.manifest(
+                        *arguments, system, "x86_64", provider, "frameleaf_ml"
+                    )
+                    self.assertEqual(value["provider"], provider)
+                    # Only CoreML has a device collector.
+                    self.assertNotIn("deviceObserver", value)
+                for system, architecture in [
+                    ("macos", "aarch64"),
+                    ("macos", "x86_64"),
+                    ("linux", "aarch64"),
+                ]:
+                    with self.assertRaises(builder.BuildError):
+                        builder.manifest(*arguments, system, architecture, provider)
+                with self.assertRaises(builder.BuildError):
+                    builder.manifest(
+                        *arguments,
+                        "linux",
+                        "x86_64",
+                        provider,
+                        "frameleaf_ml",
+                        metal_observer=True,
+                    )
+            # A provider nobody approved has no recipe.
+            with self.assertRaises(builder.BuildError):
+                builder.manifest(
+                    *arguments, "linux", "x86_64", "MIGraphXExecutionProvider"
+                )
+
+    def test_only_the_gpu_wheel_comes_from_the_cuda_feed(self):
+        def block(name):
+            return (
+                f"{name}==1.0 \\\n"
+                f"    --hash=sha256:{'a' * 64} \\\n"
+                f"    --hash=sha256:{'b' * 64}\n"
+            )
+
+        locked = block("numpy") + block("onnxruntime-gpu") + block("nvidia-cudnn-cu12")
+        # The feed also mirrors other packages at other versions, so nothing else may be
+        # resolved against it.
+        rest, feed, index = builder.feed_requirements("CUDAExecutionProvider", locked)
+        self.assertEqual(feed, block("onnxruntime-gpu"))
+        self.assertEqual(rest, block("numpy") + block("nvidia-cudnn-cu12"))
+        self.assertEqual(index, builder.CUDA_FEED)
+        for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"]:
+            self.assertEqual(
+                builder.feed_requirements(provider, locked), (locked, "", None)
+            )
+        with self.assertRaises(builder.BuildError):
+            builder.feed_requirements("CUDAExecutionProvider", block("numpy"))
+
+    def test_collector_is_staged_only_with_the_hashes_its_build_recorded(self):
+        import hashlib
+        import json
+
+        fields = (
+            "packageInitSha256",
+            "entrySha256",
+            "loaderSha256",
+            "adapterSha256",
+            "librarySha256",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            component = Path(temporary) / "component"
+            component.mkdir()
+            provenance = {}
+            for name, field in zip(builder.METAL_FILES, fields):
+                (component / name).write_bytes(name.encode())
+                provenance[field] = hashlib.sha256(name.encode()).hexdigest()
+            (component / "provenance.json").write_text(json.dumps(provenance))
+            payload = Path(temporary) / "payload"
+            payload.mkdir()
+            builder.stage_metal_observer(payload, component)
+            self.assertEqual(
+                sorted(path.name for path in (payload / builder.METAL_PACKAGE).iterdir()),
+                sorted(builder.METAL_FILES),
+            )
+            (component / "entry.py").write_bytes(b"changed after its build")
+            other = Path(temporary) / "other"
+            other.mkdir()
+            with self.assertRaisesRegex(builder.BuildError, "hash_invalid"):
+                builder.stage_metal_observer(other, component)
+            (component / "extra.py").write_bytes(b"unapproved")
+            with self.assertRaisesRegex(builder.BuildError, "inventory_invalid"):
+                builder.stage_metal_observer(Path(temporary), component)
 
     def test_inventory_is_stable_and_binds_every_byte(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -249,6 +376,62 @@ class RuntimeBuilderTests(unittest.TestCase):
         )
         with self.assertRaises(builder.BuildError):
             builder.requirement_block("setuptools>=1\n", "setuptools")
+
+    def test_intel_macos_takes_the_last_onnxruntime_with_a_wheel_for_it(self):
+        # FD-6: the locked onnxruntime publishes no Intel macOS wheel, so that one target
+        # installs one exact, hash-pinned wheel instead; every other target keeps the lock.
+        import json
+
+        profiles = json.loads(
+            (Path(__file__).parent.parent / "runtime/profiles.json").read_text()
+        )["profiles"]
+        cpu = profiles["cpu-ort"]
+        self.assertIn("macos-x86_64", cpu["targets"])
+        pins = builder.target_pins(cpu, "macos-x86_64")
+        self.assertEqual(set(pins), {"onnxruntime"})
+        for name, profile in profiles.items():
+            for target in profile["targets"]:
+                if (name, target) != ("cpu-ort", "macos-x86_64"):
+                    self.assertEqual(builder.target_pins(profile, target), {})
+        locked = (
+            "numpy==2.5.4 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+            "onnxruntime==1.31.0 \\\n    --hash=sha256:" + "b" * 64 + " \\\n"
+            "    --hash=sha256:" + "c" * 64 + "\n"
+            "packaging==26.3 \\\n    --hash=sha256:" + "d" * 64 + "\n"
+        )
+        self.assertEqual(builder.pinned_requirements(locked, {}), locked)
+        pinned = builder.pinned_requirements(locked, pins)
+        self.assertEqual(
+            pinned,
+            "numpy==2.5.4 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+            f"onnxruntime=={pins['onnxruntime']['version']} \\\n"
+            f"    --hash=sha256:{pins['onnxruntime']['sha256']}\n"
+            "packaging==26.3 \\\n    --hash=sha256:" + "d" * 64 + "\n",
+        )
+        builder.validate_requirements(pinned)
+        # A pin replaces a locked package; it cannot add one the source does not use.
+        with self.assertRaises(builder.BuildError):
+            builder.pinned_requirements(locked.replace("onnxruntime", "other"), pins)
+
+    def test_a_target_pin_is_one_exact_version_and_one_wheel_hash(self):
+        good = {"version": "1.23.2", "sha256": "a" * 64}
+        for pin in [
+            {"version": ">=1.23", "sha256": "a" * 64},
+            {"version": "1.23.2", "sha256": "a" * 63},
+            {"version": "1.23.2"},
+            {**good, "url": "https://example.com/onnxruntime.whl"},
+            "1.23.2",
+        ]:
+            with self.assertRaises(builder.BuildError):
+                builder.target_pins(
+                    {"targetPins": {"macos-x86_64": {"onnxruntime": pin}}},
+                    "macos-x86_64",
+                )
+        with self.assertRaises(builder.BuildError):
+            builder.target_pins(
+                {"targetPins": {"macos-x86_64": {"onnxruntime -r x": good}}},
+                "macos-x86_64",
+            )
 
     def test_git_source_bytes_are_canonical_despite_checkout_line_endings(self):
         import shutil
@@ -352,6 +535,11 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 builder.dependency_indexes(system, architecture),
                 ["--default-index", "https://pypi.org/simple"],
             )
+        self.assertTrue(
+            builder.CUDA_FEED.startswith(
+                "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/"
+            )
+        )
 
     def test_windows_system_root_survives_uppercase_environment_keys(self):
         import os

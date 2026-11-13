@@ -1,8 +1,11 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '../Icon.svelte';
   import { connectionError } from '../errors';
+  import StepUp from '../StepUp.svelte';
+  import { verificationRequired, type StepOffer } from '../sign-in-steps';
   import { formatUsd, formatUsdShort, formatWhen, relativeTime, workloadName } from '../ui-state';
   import type { WalletStatus, Wallet, Settlement } from '../server-types';
 
@@ -13,6 +16,12 @@
   let failure = $state('');
   let notice = $state('');
   const explain = connectionError;
+  // A request the server refuses until Two-Step Verification is answered in place, then run again.
+  let stepUp = $state<{ offer: StepOffer; retry: () => void } | null>(null);
+  function failed(error: unknown, retry: () => void) {
+    const offer = verificationRequired(error);
+    if (offer) stepUp = { offer, retry }; else failure = explain(error);
+  }
   const wallet = $derived<Wallet | null>(data?.wallet ?? data?.ml?.wallet ?? null);
   const settlements = $derived<Settlement[]>(data?.settlements?.items ?? []);
   const caps = [10, 20, 50, 100];
@@ -26,7 +35,7 @@
     if (!native) return;
     busy = true; failure = '';
     try { data = await invoke<WalletStatus>('wallet_status'); }
-    catch (error) { failure = explain(error); }
+    catch (error) { failed(error, () => { void load(); }); }
     finally { busy = false; }
   }
   onMount(() => { void load(); });
@@ -38,8 +47,8 @@
       if (data) data = { ...data, wallet: updated && typeof updated === 'object' ? { ...(wallet ?? {}), ...updated } : wallet };
       notice = change.dailyCapUsd !== undefined ? `Daily cap set to ${formatUsdShort(change.dailyCapUsd)}.` : change.autoTopUp ? 'Auto-reload turned on.' : 'Auto-reload turned off.';
     } catch (error) {
-      failure = explain(error);
-      if (String(error) === 'wallet_step_up_required' && wallet?.settingsUrl) notice = 'Open your account settings on frameleaf.cloud to raise the cap or turn on auto-reload.';
+      // `wallet_step_up_required` is explained once, by the error message, which carries Open Settings.
+      failed(error, () => { void update(change); });
     } finally { saving = false; }
   }
   async function open(url: string | null | undefined, amount?: number) {
@@ -67,7 +76,8 @@
   </header>
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s AI credit.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p>{#if String(failure).includes('frameleaf.cloud') && wallet?.settingsUrl}<button class="btn small" onclick={() => open(wallet?.settingsUrl)}>Open Settings</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p>{#if String(failure).includes('frameleaf.cloud') && wallet?.settingsUrl}<button class="btn small" onclick={() => open(wallet?.settingsUrl)}>Open Settings</button>{/if}<button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={() => { stepUp = null; }} />{/key}{/if}
     {#if notice}<div class="inline-msg" role="status"><p>{notice}</p>{#if notice.includes('frameleaf.cloud') && wallet?.settingsUrl}<button class="btn small" onclick={() => open(wallet?.settingsUrl)}>Open Settings</button>{/if}<button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if data?.ml?.detail && connection !== 'ready'}<div class="inline-msg" role="status"><p>{data.ml.detail}</p></div>{/if}
     <div>

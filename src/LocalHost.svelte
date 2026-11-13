@@ -1,16 +1,20 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { managerError, localProfilePending, profileSetupCopy } from './manager-state';
   import Icon from './Icon.svelte';
+  import { explainError } from './errors';
+  import ErrorText from './ErrorText.svelte';
   import Sheet from './Sheet.svelte';
-  type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused';
+  type Compatibility = 'checking' | 'verified' | 'unknown' | 'refused' | 'outdated';
+  const outdatedCompanion = 'This companion package does not match this version of Frameleaf. Install the companion for this version, then choose Check installation. Your library has not been changed.';
   const compatibilityCopy = {
     checking: { label: 'Checking companion package…', detail: 'This can take a moment.' },
     verified: { label: 'Companion package verified', detail: 'This package passed the checks for this version of Frameleaf.' },
     unknown: { label: 'Compatibility unknown', detail: 'Frameleaf could not finish checking this package. Choose Check installation to retry.' },
     refused: { label: 'Companion package refused', detail: 'This package did not pass verification. Choose a different installed package or install a compatible companion.' },
+    outdated: { label: 'Companion update needed', detail: outdatedCompanion },
   };
   type Installation = { manifestSha256: string; controllerSha256: string; version?: string | null; library?: boolean };
   const companionInstructions = {
@@ -18,7 +22,11 @@
     windows: 'Download and run the Frameleaf Companion Server EXE for Windows x64.',
     linux: 'On Ubuntu 24.04 for Intel or AMD, install both Frameleaf Companion Server DEBs (bootstrap and runtime) together, with pkexec.',
   };
-  type View = { companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
+  // Moving a library to a companion whose database is newer: one copy made by the earlier companion, restored by the new one.
+  type Carry = { available: boolean; code: string | null; stage: 'permitted' | 'exported' | 'restored' | 'switched' | 'confirmed' | null; previousPostgres: string | null; nextPostgres: string | null; requiredBytes: number | null; availableBytes: number | null; room: 'enough' | 'short' | 'unknown' | null; previousDatabase: string | null; keepUntil: number | null };
+  const carrySteps = [['export', 'Copying the database with the earlier companion'], ['restore', 'Building the new database'], ['verify', 'Checking the new database against the original'], ['switch', 'Switching your library to the new database']] as const;
+  const gigabytes = (bytes: number | null) => bytes === null ? 'an unknown amount' : `${(bytes / 1e9).toFixed(1)} GB`;
+  type View = { carryStep?: string | null; packageChangeAvailable?: boolean | null; companionPlatform?: keyof typeof companionInstructions | null; state: string; code: string | null; backgroundActive: boolean; leaveAvailable?: boolean; certificateExpiresInDays?: number | null; certificateRenewable?: boolean; profileSetupAvailable: boolean; profileRequiresAuthorization: boolean; origin: string | null; installation: Installation | null };
   let { onactive, onmanagerchange }: { onactive: (active: boolean) => void; onmanagerchange: () => void } = $props();
   const native = isTauri();
   let installations = $state<Installation[]>([]);
@@ -32,11 +40,18 @@
   let disposed = false;
   let failure = $state('');
   let notice = $state('');
+  let quitOffered = $state(false);
+  // What the stop and quit controls are about, read out with them: the failure, else the notice.
+  const describedBy = $derived(failure ? 'local-host-failure' : notice ? 'local-host-notice' : undefined);
   let managerPassword = $state('');
   let allowManagement = $state(false);
   let allowRecovery = $state(false);
   let authorized = $state(false);
   let packageChange = $state<Installation | null>(null);
+  let carry = $state<Carry | null>(null);
+  let carryReview = $state(false);
+  let carrying = $state(false);
+  let carryRequest = 0;
   let compatibility = $state<{ manifestSha256: string; controllerSha256: string; state: Compatibility } | null>(null);
   let checkRequest = 0;
   const libraryPackage = $derived(installations.find(record => record.library));
@@ -51,37 +66,50 @@
     (view.state === 'needs-attention' && (view.code === 'host_profile_prepare_failed' || view.code?.startsWith('host_profile_authorization_')))
   ));
   const changingPackage = $derived(!!libraryPackage && !!selectedPackage && selected !== libraryPackage.manifestSha256);
-  const canMovePackage = $derived(view?.companionPlatform === 'mac' || view?.companionPlatform === 'linux');
-  const headline = $derived(profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer');
+  // Whether this computer can move an existing library to another package. The backend says so when it
+  // knows (`packageChangeAvailable`); one that does not say can only do it on macOS and Linux.
+  const canMovePackage = $derived(view?.packageChangeAvailable ?? (view?.companionPlatform === 'mac' || view?.companionPlatform === 'linux'));
+  const packageMoveUnavailable = 'This version of Frameleaf can’t move an existing library to another companion package on this computer. Your library has not been changed. Keep the companion your library last used installed, and choose Use My Library’s Package to go back to it. If that package says Companion update needed, open your library with the version of Frameleaf it last ran with until a Frameleaf update can move it.';
+  // The library's own package was built for another version of Frameleaf, and this computer cannot move
+  // the library to a newer one: installing the companion for this version would lead nowhere.
+  const libraryStranded = $derived(packageCheck === 'outdated' && !canMovePackage && !!libraryPackage && selected === libraryPackage.manifestSha256);
+  const libraryStrandedCopy = 'Your library last ran with a companion made for another version of Frameleaf, and this version can’t move it to a newer companion on this computer. Your library has not been changed. Keep that companion installed, and open your library with the version of Frameleaf it last ran with until a Frameleaf update can move it.';
+  function useLibraryPackage() {
+    if (busy || checking || !libraryPackage) return;
+    selected = libraryPackage.manifestSha256;
+    void checkSelected();
+  }
+  // Offered only when the backend names both database versions: otherwise the ordinary package change applies.
+  const carryOffered = $derived(!!carry?.previousPostgres && !!carry.nextPostgres && !carry.previousDatabase && canMovePackage && changingPackage);
+  const carryStepIndex = $derived(carrySteps.findIndex(([name]) => name === view?.carryStep));
+  const headline = $derived(carrying ? 'Moving your library to the new database…' : profilePending ? 'Preparing your server profile…' : starting ? 'Preparing local management…' : busy ? 'Checking local management…' : view?.state === 'manager-ready' ? 'Local Manager is ready' : 'Run your library on this computer');
   const pill = $derived(view?.state === 'manager-ready' ? { label: authorized ? 'Authorized' : 'Ready', tone: 'ok' } : profilePending || starting || busy ? { label: 'Working', tone: 'wait' } : view?.state === 'needs-attention' ? { label: 'Needs attention', tone: 'bad' } : view?.backgroundActive ? { label: 'Active', tone: 'wait' } : { label: 'Not started', tone: 'off' });
   function explain(code: unknown): string {
     const value = String(code);
     if (value.startsWith('manager_') || value === 'native_manager_not_ready' || value === 'native_host_busy') return managerError(value);
-    if (value === 'host_install_platform_unsupported') return 'Native server installation is not available on this platform in this build. You can connect to an existing server.';
-    if (value === 'host_install_profile_required') return 'Run the server component installer while signed in to this computer, then try again.';
-    if (value === 'host_install_linux_profile_required' || value === 'host_install_windows_profile_required') return 'Prepare a private server profile for your account before starting local management.';
-    if (value.startsWith('host_profile_legacy_')) return 'An existing server profile must be migrated before setup can continue. Your library and saved credentials have been preserved.';
-    if (value === 'host_profile_authorization_cancelled') return 'System authorization was cancelled. You can try again.';
-    if (value === 'host_profile_authorization_unavailable') return 'System authorization is unavailable. Check your desktop’s authorization service, then try again.';
-    if (value === 'host_profile_prepare_failed') return 'The server profile could not be prepared. Check that your installed Frameleaf components are up to date. Your existing library has been preserved.';
-    if (value === 'host_package_maintenance' || value === 'host_package_busy') return 'Server component maintenance is unfinished or the component is in use. Local management is unavailable until maintenance completes.';
-    if (value.startsWith('host_package_')) return 'The server component installation could not be verified. Local management is blocked; your existing library has been preserved.';
-    if (value === 'native_manager_start_cancelled') return 'Local setup was cancelled.';
-    if (value === 'host_upgrade_downgrade_refused') return 'This library already uses a newer server package. Choose that package to continue.';
-    if (value === 'host_upgrade_previous_package_missing') return 'Keep the server package this library last used installed until it has started once with the new package, then try again.';
-    if (value === 'host_restore_activation_pending') return 'A restore is waiting to finish with the package this library last used. Finish it in Manager with that package, then try the new package again.';
-    if (value === 'host_upgrade_operation_pending') return 'Finish or discard the unfinished backup or restore with the package this library last used, then try the new package again.';
-    if (value === 'host_update_requires_manager') return 'This library’s server package record does not match the selected package. If a move to a newer package was interrupted, start it with that newer package to finish. Your library has been preserved.';
-    if (value.startsWith('host_controller_') || value.startsWith('host_recovery_') || value.startsWith('host_process_') || value === 'host_already_owned') return 'Stop the photo server in Manager before stopping local management. If its last shutdown was interrupted, recover it in Manager first.';
+    // Wording for codes that mean something narrower on this screen than their shared copy in errors.ts
+    // says: the busy port is one this library needs and the library is known to be untouched, a companion
+    // built for another version is fixed by installing the right one, and every credential-store failure
+    // here has the same remedy. Every other code takes the shared copy.
+    const port = /^local_port_in_use_(\d+)$/.exec(value);
+    if (port) return `Another program on this computer is using port ${port[1]}, which your library needs. Close that program or change its port, then try again. Your library has not been changed.`;
+    if (value === 'host_manifest_incompatible') return outdatedCompanion;
     if (value.startsWith('credential_')) return 'Unlock your computer’s secure credential store and try again.';
-    if (value.startsWith('native_profile_')) return 'The existing library needs recovery. Its saved credentials and database were preserved.';
-    return 'Local setup could not finish. Check the server installation and secure credential store, then retry.';
+    return explainError(value, 'Local setup could not finish. Check the server installation and secure credential store, then retry.');
+  }
+  // Where keyboard and screen-reader focus goes when the control that had it is replaced by a new state.
+  let title = $state<HTMLElement>();
+  let quitButton = $state<HTMLButtonElement>();
+  let leaveButton = $state<HTMLButtonElement>();
+  function focusOn(target: () => HTMLElement | null | undefined) {
+    void tick().then(() => { if (!disposed) (target() ?? title)?.focus(); });
   }
   function show(value: View) {
     if (disposed) return;
     const ready = value.state === 'manager-ready' && view?.state !== 'manager-ready';
     if (value.state !== 'manager-ready') authorized = false;
     view = value; onactive(value.backgroundActive);
+    if (!value.backgroundActive) quitOffered = false;
     if (ready) onmanagerchange();
   }
   async function checkSelected() {
@@ -93,7 +121,39 @@
     compatibility = { manifestSha256, controllerSha256, state: 'checking' };
     const result = await invoke<Compatibility>('check_local_host_package', { manifestSha256, controllerSha256 }).catch(() => 'unknown');
     if (disposed || checkRequest !== request) return;
-    compatibility = { manifestSha256, controllerSha256, state: result === 'verified' || result === 'refused' ? result : 'unknown' };
+    compatibility = { manifestSha256, controllerSha256, state: result === 'verified' || result === 'refused' || result === 'outdated' ? result : 'unknown' };
+    if (result === 'verified') await checkCarry(manifestSha256);
+  }
+  async function checkCarry(manifestSha256: string) {
+    const request = ++carryRequest;
+    carry = null;
+    const result = await invoke<Carry>('local_host_carry_status', { manifestSha256 }).catch(() => null);
+    if (!disposed && carryRequest === request && selected === manifestSha256) carry = result;
+  }
+  async function moveLibrary() {
+    if (busy || !native || !selectedPackage || !carry?.available) return;
+    carryReview = false; busy = true; carrying = true; onactive(true); failure = ''; notice = '';
+    const manifestSha256 = selected;
+    const watch = setInterval(() => { void invoke<View>('local_host_status').then(current => { if (carrying) show(current); }).catch(() => {}); }, 1000);
+    try {
+      show(await invoke<View>('carry_local_host_library', { manifestSha256 }));
+      notice = 'Your library has been moved to the new database. Choose Prepare local Manager to start it.';
+    } catch (error) {
+      failure = explain(error);
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
+    } finally {
+      clearInterval(watch); busy = false; carrying = false;
+      installations = await invoke<Installation[]>('installed_local_hosts').catch(() => installations);
+      await checkCarry(manifestSha256);
+      focusOn(() => title);
+    }
+  }
+  async function confirmCarry() {
+    if (busy || !native || !selected) return;
+    busy = true; failure = '';
+    try { carry = await invoke<Carry>('confirm_local_host_carry', { manifestSha256: selected }); }
+    catch (error) { failure = explain(error); }
+    finally { busy = false; }
   }
   function selectPackage(event: Event & { currentTarget: HTMLSelectElement }) {
     selected = event.currentTarget.value;
@@ -114,7 +174,7 @@
   onMount(() => {
     if (!native) return;
     let unlisten: UnlistenFn | undefined;
-    void listen('native-host-exit-blocked', () => { notice = profilePending ? profileCopy.quit : 'Stop the photo server in Manager, then stop local management before quitting. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
+    void listen('native-host-exit-blocked', () => { quitOffered = !profilePending; if (quitOffered) focusOn(() => quitButton); notice = profilePending ? profileCopy.quit : 'Local management is still running. Choose Stop and quit to close it and leave Frameleaf. Closing this window keeps local management running.'; }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { notice = 'Use Stop local management before quitting this app.'; });
     void refresh();
     return () => { disposed = true; unlisten?.(); };
   });
@@ -137,7 +197,7 @@
   async function prepare() {
     if (busy || !native || !selectedPackage || !packageVerified) return;
     busy = true; starting = true; onactive(true); failure = ''; notice = '';
-    try { show(await invoke<View>('prepare_local_host', { manifestSha256: selected })); }
+    try { show(await invoke<View>('prepare_local_host', { manifestSha256: selected })); focusOn(() => document.getElementById('local-manager-password')); }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
     finally { busy = false; starting = false; }
   }
@@ -169,7 +229,7 @@
   async function photos() {
     busy = true; failure = ''; notice = '';
     try { await invoke('open_local_photos'); }
-    catch (error) { failure = String(error) === 'photo_window_unavailable' ? 'The Photos window could not open. Try again.' : explain(error); }
+    catch (error) { failure = explain(error); }
     finally { busy = false; }
   }
   async function cancel() {
@@ -180,16 +240,28 @@
     busy = true; failure = ''; notice = '';
     try {
       show(await invoke<View>('stop_local_host_manager'));
+      // The Stop button is gone with the state it stopped.
+      if (!view?.backgroundActive) focusOn(() => title);
       if (!packageVerified) await checkSelected();
     }
     catch (error) { failure = explain(error); const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current); }
+    finally { busy = false; }
+  }
+  async function stopAndQuit(leaveRunning = false) {
+    busy = true; failure = ''; notice = '';
+    try { await invoke('quit_local_host', { leaveRunning }); }
+    catch (error) {
+      const current = await invoke<View>('local_host_status').catch(() => null); if (current) show(current);
+      failure = !leaveRunning && String(error) === 'native_manager_shutdown_unconfirmed' && current?.leaveAvailable ? 'Local management did not stop in time. Try again, or choose Quit anyway: it keeps running, and Frameleaf will try to stop it the next time it opens.' : explain(error);
+      // Quit anyway is new on screen; otherwise stay on the control that was tried, or the heading if it went.
+      focusOn(() => !leaveRunning && current?.leaveAvailable ? leaveButton : leaveRunning ? leaveButton ?? quitButton : quitButton); }
     finally { busy = false; }
   }
 </script>
 
 <section aria-label="Local library setup" aria-busy={busy || checking}>
   <div class="group-head">
-    <h2 class="group-title">Run Frameleaf here</h2>
+    <h2 class="group-title" tabindex="-1" bind:this={title}>Run Frameleaf here</h2>
     {#if starting}<button class="btn quiet" disabled={!native} onclick={cancel}>Cancel setup</button>{/if}
     {#if canMovePackage && libraryPackage && !view?.backgroundActive}
       <button class="btn quiet" disabled={busy || !native} onclick={openDownloads}>Find companion updates</button>
@@ -200,17 +272,28 @@
     <div class="row">
       <span class="ic" aria-hidden="true"><Icon name="computer" /></span>
       <span class="l"><b>{headline}</b><small>Keep your photo library on this computer. Frameleaf prepares private storage for your account.</small></span>
-      <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
-      {#if view?.backgroundActive && !profilePending}<button class="btn" disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
+      <span class="pill {pill.tone}"><i aria-hidden="true"></i><span class="visually-hidden">Local management: </span>{pill.label}</span>
+      {#if view?.backgroundActive && !profilePending}<button class="btn" aria-describedby={describedBy} disabled={busy || !native} onclick={stop}>Stop local management</button>{/if}
+      {#if quitOffered && view?.backgroundActive && !profilePending}<button class="btn" aria-label="Stop local management and quit Frameleaf" aria-describedby={describedBy} bind:this={quitButton} disabled={busy || !native} onclick={() => stopAndQuit()}>Stop and quit</button>{/if}
+      {#if view?.leaveAvailable && view.backgroundActive && !profilePending}<button class="btn" aria-label="Quit Frameleaf and leave local management running" aria-describedby={describedBy} bind:this={leaveButton} disabled={busy || !native} onclick={() => stopAndQuit(true)}>Quit anyway</button>{/if}
     </div>
-    {#if failure}<div class="row"><p class="danger-text" role="alert" style="flex:1">{failure}</p></div>{/if}
-    {#if notice}<div class="row"><p role="status" style="flex:1">{notice}</p></div>{/if}
+    {#if failure}<div class="row"><span class="ic dim" aria-hidden="true"><Icon name="warn" /></span><p id="local-host-failure" class="danger-text" role="alert" style="flex:1"><ErrorText text={failure} /></p></div>{/if}
+    {#if notice}<div class="row"><p id="local-host-notice" role="status" style="flex:1">{notice}</p></div>{/if}
+    {#if view?.certificateExpiresInDays}
+      <div class="row">
+        <span class="ic dim" aria-hidden="true"><Icon name="warn" /></span>
+        <span class="l" role="status"><b>Local Manager’s security certificate expires in {view.certificateExpiresInDays} {view.certificateExpiresInDays === 1 ? 'day' : 'days'}</b><small>{view.certificateRenewable ? 'Frameleaf renews it the next time local management starts: stop local management here, then start it again. Your photos and library are not affected.' : 'After that, local management on this computer will not start until the certificate is renewed, which needs an update to Frameleaf and its companion. Your photos and library are not affected. Check for updates before then.'}</small></span>
+      </div>
+    {/if}
     {#if profilePending}<div class="row"><span class="spin" aria-hidden="true"></span><p role="status" style="flex:1">{profileCopy.pending}</p></div>{/if}
     {#if packageCheck && (!view?.backgroundActive || view?.state === 'needs-attention')}
       {@const check = compatibilityCopy[packageCheck]}
       <div class="row">
-        <span class="l" role="status"><b>{check.label}</b><small>{check.detail}</small></span>
-        {#if packageCheck === 'refused' && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
+        <span class="l" role="status"><b>{libraryStranded ? 'This version of Frameleaf can’t open your library' : check.label}</b><small>{libraryStranded ? libraryStrandedCopy : check.detail}</small></span>
+        <!-- A newer companion is no help to a library this computer cannot move to it. -->
+        {#if !libraryStranded}
+          {#if (packageCheck === 'refused' || packageCheck === 'outdated') && view?.companionPlatform}<button class="btn quiet" onclick={openDownloads}>Open companion downloads</button>{/if}
+        {/if}
       </div>
     {/if}
     {#if selectedPackage && needsProfile}
@@ -233,8 +316,32 @@
         </select>
       </div>
     {/if}
-    {#if changingPackage && !canMovePackage}
-      <div class="row"><span class="l"><b>Choose this library’s current package</b><small>Moving an existing library to another package is unavailable on this computer.</small></span></div>
+    <!-- Its own row, outside the chain below: the library still has to be started, with Prepare, before anyone can look. -->
+    {#if !carrying && carry?.previousDatabase && carry.stage === 'switched'}
+      <div class="row">
+        <span class="l" role="status"><b>Your library now uses a new database</b><small>It was moved from Postgres {carry.previousPostgres} to Postgres {carry.nextPostgres}. The earlier database folder was not changed and is kept at {carry.previousDatabase}{carry.keepUntil ? ` until at least ${new Date(carry.keepUntil * 1000).toLocaleDateString()}` : ''}, together with the earlier companion, so the move can be undone with help from Frameleaf support. Frameleaf does not delete it. Start your library and check that your photos, albums and people are all here, then choose My library is all here.</small></span>
+        <button class="btn" disabled={busy || !native} onclick={confirmCarry}>My library is all here</button>
+      </div>
+    {/if}
+    {#if carrying}
+      <div class="row"><span class="spin" aria-hidden="true"></span>
+        <ol role="status" aria-label="Moving your library" style="flex:1;margin:0;padding-left:18px">
+          {#each carrySteps as [name, label], index (name)}<li aria-current={index === carryStepIndex ? 'step' : undefined}>{#if index === carryStepIndex}<b>{label}…</b>{:else}{label}{index < carryStepIndex ? ' (done)' : ''}{/if}</li>{/each}
+        </ol>
+        <button class="btn quiet" disabled={!native} onclick={cancel}>Stop the move</button>
+      </div>
+    {:else if carryOffered && carry && selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
+      <div class="row">
+        <span class="l"><b>Move your library to this companion</b>
+          <small>{#if carry.available}This companion uses a newer database (Postgres {carry.nextPostgres}) than the one your library last ran with (Postgres {carry.previousPostgres}), so the library has to be moved before it can start. {carry.stage && carry.stage !== 'permitted' ? 'An earlier move was not finished; it continues from where it stopped.' : 'Your photos are not touched.'}{:else}<ErrorText text={explain(carry.code ?? 'host_carry_failed')} />{#if carry.room === 'short'} The move needs {gigabytes(carry.requiredBytes)} free and this computer has {gigabytes(carry.availableBytes)}.{/if}{/if}</small>
+        </span>
+        <button class="btn primary" disabled={busy || !native || !packageVerified || !carry.available} onclick={() => { carryReview = true; }}>Review the move</button>
+      </div>
+    {:else if changingPackage && !canMovePackage}
+      <div class="row">
+        <span class="l" role="status"><b>Your library can’t move to this package yet</b><small>{packageMoveUnavailable}</small></span>
+        <button class="btn" disabled={busy || checking || !native} onclick={useLibraryPackage}>Use My Library’s Package</button>
+      </div>
     {:else if selectedPackage && !needsProfile && (!view?.backgroundActive || view?.state === 'needs-attention')}
       <div class="row">
         <span class="l"><b>{changingPackage ? 'Move your library to this package' : 'Set up local management'}</b>
@@ -267,6 +374,18 @@
   <p class="foot">{profilePending ? profileCopy.quit : 'Closing the window keeps explicitly started local management running. Stopping local management preserves your library and saved credentials.'}{view?.state === 'manager-ready' && !authorized ? ' Keep this password for recovery. The app saves a separate management grant in your secure credential store.' : ''}</p>
 </section>
 
+{#if carryReview && carry}
+  <Sheet title="Move this library to the new database?" kind="warning" onclose={() => { carryReview = false; }} onsubmit={moveLibrary}>
+    <p>Postgres {carry.previousPostgres} → Postgres {carry.nextPostgres}</p>
+    <p>Frameleaf starts the earlier companion once, only to copy your library’s database. Photos cannot be opened, nobody can sign in, and nothing can connect from other devices while it runs. The new companion then builds a new database folder from that copy and checks it against the original: every table, the people and search indexes, and the database’s own checksums.</p>
+    <p>Only when every check passes does your library switch to the new folder. If anything fails before that, nothing changes and your library still opens with the version of Frameleaf it last ran with. Your photo files are never copied, moved or changed. The earlier database folder and the earlier companion are kept afterwards.</p>
+    <p>This needs {gigabytes(carry.requiredBytes)} of free space; this computer has {gigabytes(carry.availableBytes)}. It can take a while for a large library, and Frameleaf cannot be updated until it finishes.</p>
+    {#snippet actions()}
+      <button class="btn" type="button" onclick={() => { carryReview = false; }}>Cancel</button>
+      <button class="btn primary" type="submit">Move my library</button>
+    {/snippet}
+  </Sheet>
+{/if}
 {#if packageChange}
   <Sheet title="Move this library to another package?" kind="warning" onclose={() => { packageChange = null; }} onsubmit={confirmPackageChange}>
     {#if libraryPackage?.version && packageChange.version}<p>Current Library {libraryPackage.version} → Library {packageChange.version}</p>{/if}
