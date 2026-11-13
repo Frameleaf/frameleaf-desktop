@@ -36,10 +36,14 @@ runs:
         WINDOWS_SIGNING_SUBJECT: ${{ inputs.subject }}
       run: |
         if ($env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REF -ne 'refs/heads/main') { throw 'Signing requires Windows on main' }
+        $missing = @()
         foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_SIGNING_PROFILE', 'WINDOWS_SIGNING_SUBJECT') {
           $value = [Environment]::GetEnvironmentVariable($name)
-          if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains("`n") -or $value.Contains("`r")) { throw "Missing or invalid $name" }
+          if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains("`n") -or $value.Contains("`r")) { $missing += $name; continue }
           "$name=$value" >> $env:GITHUB_ENV
+        }
+        if ($missing) {
+          throw "Windows signing is not configured: $($missing -join ', ') not set. Set as environment variables (not secrets) of the desktop-release environment: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/settings/environments (docs/releases.md, Azure Artifact Signing setup)."
         }
     - name: Azure login with GitHub OIDC
       uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3

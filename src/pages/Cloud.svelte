@@ -1,9 +1,12 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '../Icon.svelte';
-  import { connectionError } from '../errors';
-  import { formatBytes, formatDate, relativeTime, percent, formatWhen } from '../ui-state';
+  import { connectionError, errorCopy } from '../errors';
+  import StepUp from '../StepUp.svelte';
+  import { verificationRequired, type StepOffer } from '../sign-in-steps';
+  import { backupKeyText, backupRunText, formatBytes, formatDate, relativeTime, percent, formatWhen } from '../ui-state';
   import type { CloudStatus, ServerSummary } from '../server-types';
 
   let { native, summary }: { native: boolean; summary: ServerSummary | null } = $props();
@@ -14,6 +17,12 @@
   const license = $derived(data?.license ?? null);
   const backup = $derived(data?.backup ?? null);
   const explain = connectionError;
+  // A request the server refuses until Two-Step Verification is answered in place, then run again.
+  let stepUp = $state<{ offer: StepOffer; retry: () => void } | null>(null);
+  function failed(error: unknown, retry: () => void) {
+    const offer = verificationRequired(error);
+    if (offer) stepUp = { offer, retry }; else failure = explain(error);
+  }
   const linkPill = $derived(!cloud ? { label: busy ? 'Checking' : 'Unavailable', tone: 'off' } : cloud.state === 'linked' ? { label: 'Linked', tone: 'ok' } : cloud.state === 'pending' ? { label: 'Waiting for approval', tone: 'wait' } : cloud.state === 'revoked' ? { label: 'Link revoked', tone: 'bad' } : cloud.state === 'not-configured' ? { label: 'Not set up', tone: 'off' } : { label: 'Not linked', tone: 'off' });
   const planState = $derived(license?.state ?? 'none');
   const planSlot = $derived(license?.plan ?? null);
@@ -31,7 +40,7 @@
     if (!native) return;
     busy = true; failure = '';
     try { data = await invoke<CloudStatus>('cloud_status'); }
-    catch (error) { failure = explain(error); }
+    catch (error) { failed(error, () => { void load(); }); }
     finally { busy = false; }
   }
   onMount(() => { void load(); });
@@ -61,7 +70,8 @@
   </header>
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s Frameleaf Cloud account and plan.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={() => { stepUp = null; }} />{/key}{/if}
     {#if cloud?.lastError}<div class="inline-msg" role="status"><p>There was a problem checking this server’s Cloud connection. Try refreshing.</p></div>{/if}
     <div>
       <div class="group-head"><h2 class="group-title">Account</h2></div>
@@ -105,7 +115,7 @@
       <div class="group">
         {#if backup?.configured}
           <div class="row">
-            <span class="l"><b>{backup.activeRun ? `Backing up · ${Math.round(backup.activeRun.progress)}%` : backup.lastRun ? `Last backup ${formatWhen(backup.lastRun.finishedAt ?? backup.lastRun.startedAt)}` : 'No backup has run yet'}</b><small>{backup.activeRun ? `${backup.activeRun.uploaded.toLocaleString()} files uploaded · ${formatBytes(backup.activeRun.bytesUploaded)}` : backup.lastRun ? `${backup.lastRun.status === 'completed' ? 'Done' : backup.lastRun.status === 'failed' ? `Failed${backup.lastRun.error ? ` · ${backup.lastRun.error}` : ''}` : backup.lastRun.status} · ${backup.lastRun.uploaded.toLocaleString()} new files${backup.lastSuccessAt ? ` · last success ${relativeTime(backup.lastSuccessAt)}` : ''}` : ''}{backup.keyMode ? ` · key ${backup.keyMode === 'server' ? 'kept on server' : 'in your memory'}${backup.escrow?.stored ? ' with recovery kit' : ''}` : ''}</small></span>
+            <span class="l"><b>{backup.activeRun ? `Backing up · ${Math.round(backup.activeRun.progress)}%` : backup.lastRun ? `Last backup ${formatWhen(backup.lastRun.finishedAt ?? backup.lastRun.startedAt)}` : 'No backup has run yet'}</b><small>{backup.activeRun ? `${backup.activeRun.uploaded.toLocaleString()} files uploaded · ${formatBytes(backup.activeRun.bytesUploaded)}` : backup.lastRun ? `${backupRunText(backup.lastRun, errorCopy)} · ${backup.lastRun.uploaded.toLocaleString()} new files${backup.lastSuccessAt ? ` · last success ${relativeTime(backup.lastSuccessAt)}` : ''}` : ''}{backupKeyText(backup.keyMode) ? ` · ${backupKeyText(backup.keyMode)}${backup.escrow?.stored ? ', with a recovery kit' : ''}` : ''}</small></span>
             <span class="pill {backup.activeRun ? 'wait' : backup.lastRun?.status === 'completed' ? 'ok' : backup.lastRun?.status === 'failed' ? 'bad' : 'off'}"><i aria-hidden="true"></i>{backup.activeRun ? 'Running' : backup.lastRun?.status === 'completed' ? 'Healthy' : backup.lastRun?.status === 'failed' ? 'Failed' : backup.lastRun?.status === 'waiting-for-key' ? 'Waiting for key' : 'Idle'}</span>
           </div>
           <div class="row top"><span class="l"><b>Storage</b><small style="margin-bottom:8px">{used !== null ? formatBytes(used) : 'Usage unknown'}{quota ? ` of ${formatBytes(quota)} included · extra 1 TB blocks are added automatically` : backup.bucket ? ` in ${backup.bucket}` : ''}{backup.managed?.location ? ` · ${backup.managed.location.city}, ${backup.managed.location.country}` : ''}</small>{#if quota}<span class="progress" class:warn={percent(used, quota) > 90} role="progressbar" aria-valuenow={percent(used, quota)} aria-valuemin="0" aria-valuemax="100" aria-label="Backup storage used"><span style="width:{percent(used, quota)}%"></span></span>{/if}</span></div>
