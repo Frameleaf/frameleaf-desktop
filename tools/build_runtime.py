@@ -11,9 +11,26 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+# The server admits a CoreML report only from a runtime whose signed manifest carries this
+# collector (server `desktop-runtime-attestation.ts`); its library hash is the collector identity.
+METAL_PACKAGE = "private/frameleaf_desktop_ml"
+METAL_FILES = (
+    "__init__.py",
+    "entry.py",
+    "metal_observer.py",
+    "metal_inference.py",
+    "_frameleaf_coreml_observer.dylib",
+)
+CPU_PROVIDER = "CPUExecutionProvider"
+# An accelerated pack keeps the processor manifest as `manifest.json` and adds this one over the
+# same payload, so the app can fall back to the processor without a second copy in the installer.
+ACCELERATED_MANIFEST = "manifest-accelerated.json"
 
 
 class BuildError(RuntimeError):
@@ -139,6 +156,8 @@ def manifest(
     architecture: str,
     provider: str,
     module_namespace: str = "immich_ml",
+    *,
+    metal_observer: bool = False,
 ) -> dict:
     relative(python)
     if (
@@ -148,18 +167,32 @@ def manifest(
         or system not in {"macos", "windows", "linux"}
         or architecture not in {"aarch64", "x86_64"}
         or not (
-            provider == "CPUExecutionProvider"
+            provider == CPU_PROVIDER
             or (
                 provider == "CoreMLExecutionProvider"
                 and system == "macos"
                 and architecture == "aarch64"
+                # Without its collector a CoreML runtime can never be admitted.
+                and metal_observer
             )
         )
+        or (metal_observer and provider not in {CPU_PROVIDER, "CoreMLExecutionProvider"})
     ):
         raise BuildError("runtime_manifest_invalid")
     files = inventory(root)
     if python not in files:
         raise BuildError("runtime_interpreter_missing")
+    if metal_observer and (
+        system != "macos"
+        or architecture != "aarch64"
+        or module_namespace != "frameleaf_ml"
+        or any(
+            f"{METAL_PACKAGE}/{name}" not in files
+            or not 0 < files[f"{METAL_PACKAGE}/{name}"]["bytes"] <= 4 * 1024 * 1024
+            for name in METAL_FILES
+        )
+    ):
+        raise BuildError("runtime_device_observer_invalid")
     return {
         "schemaVersion": 1,
         "protocolVersion": 1,
@@ -174,8 +207,44 @@ def manifest(
             if module_namespace == "frameleaf_ml"
             else {}
         ),
+        **(
+            {"deviceObserver": {"kind": "metal-v1"}}
+            if metal_observer and provider == "CoreMLExecutionProvider"
+            else {}
+        ),
         "files": files,
     }
+
+
+def stage_metal_observer(payload: Path, component: Path) -> None:
+    files = inventory(component)
+    if set(files) != set(METAL_FILES) | {"provenance.json"}:
+        raise BuildError("runtime_device_observer_inventory_invalid")
+    provenance = json.loads((component / "provenance.json").read_text())
+    fields = dict(
+        zip(
+            METAL_FILES,
+            (
+                "packageInitSha256",
+                "entrySha256",
+                "loaderSha256",
+                "adapterSha256",
+                "librarySha256",
+            ),
+            strict=True,
+        )
+    )
+    if any(
+        files[name]["sha256"] != provenance.get(field) for name, field in fields.items()
+    ):
+        raise BuildError("runtime_device_observer_hash_invalid")
+    destination = payload / METAL_PACKAGE
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in METAL_FILES:
+        target = destination / name
+        shutil.copyfile(component / name, target)
+        if sha256(target) != provenance[fields[name]]:
+            raise BuildError("runtime_device_observer_hash_invalid")
 
 
 def build_environment(work: Path, inherited: dict[str, str]) -> dict[str, str]:
@@ -315,11 +384,14 @@ def build(
         raise BuildError("runtime_output_must_be_new")
     if not re.fullmatch(r"[a-f0-9]{40}", revision) or not 1 <= epoch < 2**63:
         raise BuildError("runtime_manifest_invalid")
-    profile = json.loads(
+    profiles = json.loads(
         (Path(__file__).parent.parent / "runtime/profiles.json").read_text()
-    )["profiles"].get(profile_name)
+    )["profiles"]
+    profile = profiles.get(profile_name)
     if not profile:
         raise BuildError("runtime_profile_unknown")
+    accelerated = profile["provider"] != CPU_PROVIDER
+    base = profiles.get("cpu-ort", {})
     system = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}.get(
         platform.system(), "unsupported"
     )
@@ -331,6 +403,13 @@ def build(
     }.get(platform.machine(), "unsupported")
     if f"{system}-{architecture}" not in profile["targets"]:
         raise BuildError("runtime_target_unqualified")
+    # The processor manifest of an accelerated pack is the cpu-ort runtime on the same payload.
+    if accelerated and (
+        base.get("provider") != CPU_PROVIDER
+        or f"{system}-{architecture}" not in base.get("targets", [])
+        or any(base.get(key) != profile[key] for key in ("python", "uv", "extra"))
+    ):
+        raise BuildError("runtime_profile_base_mismatch")
     uv = shutil.which("uv")
     git = shutil.which("git")
     if not uv or not git:
@@ -383,6 +462,12 @@ def build(
             env=env,
         ).splitlines()
         module_namespace = source_package(tracked)
+        metal_observer = profile["provider"] == "CoreMLExecutionProvider"
+        if metal_observer and (
+            module_namespace != "frameleaf_ml"
+            or "machine-learning/frameleaf_ml/native_device.py" not in tracked
+        ):
+            raise BuildError("runtime_observer_source_incompatible")
         uv_version = run([uv, "--version"], cwd=work, env=env)
         if uv_version.split()[1] != profile["uv"]:
             raise BuildError("runtime_uv_version_mismatch")
@@ -534,6 +619,20 @@ def build(
             target = site / Path(name).relative_to("machine-learning")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(git_blob(git, source, revision, name, env))
+        if metal_observer:
+            component = work / "metal-observer"
+            run(
+                [
+                    sys.executable,
+                    "-B",
+                    Path(__file__).with_name("build_coreml_observer.py"),
+                    "--output",
+                    component,
+                ],
+                cwd=work,
+                env=env,
+            )
+            stage_metal_observer(payload, component)
         notices = payload / "licenses"
         notices.mkdir()
         (notices / "Frameleaf-AGPL-3.0.txt").write_bytes(
@@ -587,22 +686,45 @@ def build(
         )
         if (
             Path(smoke["prefix"]).resolve() != (payload / "python").resolve()
-            or profile["provider"] not in smoke["providers"]
+            or not {profile["provider"], CPU_PROVIDER} <= set(smoke["providers"])
         ):
             raise BuildError("runtime_relocation_failed")
-        value = manifest(
-            payload,
-            executable.relative_to(payload).as_posix(),
-            revision,
-            epoch,
-            system,
-            architecture,
-            profile["provider"],
-            module_namespace,
-        )
-        (bundle / "manifest.json").write_text(
-            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-        )
+        if metal_observer:
+            # The collector must load from its relocated place; a device is not required to build.
+            loaded = run(
+                [
+                    executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import ctypes,sys; sys.path.insert(0,sys.argv[1]); "
+                    "import frameleaf_desktop_ml.entry,frameleaf_desktop_ml.metal_inference; "
+                    "print(ctypes.CDLL(sys.argv[1]+'/frameleaf_desktop_ml/_frameleaf_coreml_observer.dylib')"
+                    ".fl_gpu_abi_version())",
+                    payload / "private",
+                ],
+                cwd=work,
+                env=smoke_env,
+            )
+            if loaded != "1":
+                raise BuildError("runtime_device_observer_invalid")
+        for name, provider in [("manifest.json", CPU_PROVIDER)] + (
+            [(ACCELERATED_MANIFEST, profile["provider"])] if accelerated else []
+        ):
+            value = manifest(
+                payload,
+                executable.relative_to(payload).as_posix(),
+                revision,
+                epoch,
+                system,
+                architecture,
+                provider,
+                module_namespace,
+                metal_observer=metal_observer,
+            )
+            (bundle / name).write_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            )
         if run([git, "rev-parse", "HEAD"], cwd=source, env=env) != revision:
             raise BuildError("runtime_source_revision_changed")
         # Immutable Git blobs preserve the preprocessing identity on CRLF checkouts too.

@@ -66,6 +66,32 @@ pub fn open_runtime_store(root: &Path) -> Result<RuntimeStore, String> {
     )
 }
 
+/// The release the app's own bundle would install: the rollback target pruning keeps.
+pub(crate) fn bundled_release(bundle: &Path, manifest: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    crate::runtime_store::read_bounded(&bundle.join(manifest), 8 * 1024 * 1024)
+        .ok()
+        .map(|raw| format!("{:x}", Sha256::digest(raw)))
+}
+
+/// Best effort, once the current selection has qualified with the active runtime: reclaim
+/// runtime packs that can never run again, combined model sets the selection no longer uses and
+/// inference scratch no worker owns. Each rule keeps what it cannot identify.
+pub(crate) fn reclaim_superseded(
+    data: &Path,
+    bundle: &Path,
+    active_runtime: &str,
+    active_set: &Path,
+    now: std::time::SystemTime,
+) {
+    if let Ok(store) = open_runtime_store(&data.join("runtimes")) {
+        let rollback = bundled_release(bundle, "manifest.json");
+        let _ = store.prune(active_runtime, rollback.as_deref());
+    }
+    let _ = crate::model_cache::prune_model_sets(&data.join("model-sets"), active_set, now);
+    let _ = crate::model_cache::prune_scratch(&data.join("scratch"), now);
+}
+
 pub fn verify_host_runtime(
     root: &Path,
     manifest: &[u8],

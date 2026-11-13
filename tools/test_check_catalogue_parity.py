@@ -10,6 +10,7 @@ from check_catalogue_parity import (  # noqa: E402
     catalogue_differences,
     main,
     runtime_differences,
+    source_differences,
 )
 
 
@@ -96,6 +97,28 @@ class CatalogueParity(unittest.TestCase):
             self.assertEqual(main([str(server), "--desktop", str(desktop)]), 0)
             desktop.write_text(json.dumps(catalogue(profile(), epoch=12)))
             self.assertEqual(main([str(server), "--desktop", str(desktop)]), 1)
+
+    def test_runtime_without_a_catalogue_profile_for_its_provider_and_source_fails(self):
+        runtime = copy.deepcopy(RUNTIME)
+        runtime["profiles"]["cpu-ort"]["sourceRevision"] = "a" * 40
+        runtime["profiles"]["coreml-ort"] = {
+            "provider": "CoreMLExecutionProvider",
+            "sourceRevision": "a" * 40,
+        }
+        server = catalogue(profile(), profile(provider="CoreMLExecutionProvider"))
+        self.assertEqual(source_differences(runtime, server), [])
+        self.assertEqual(
+            source_differences(runtime, catalogue(profile())),
+            [
+                "runtime profile coreml-ort: no catalogue profile for "
+                "CoreMLExecutionProvider @aaaaaaaa"
+            ],
+        )
+        runtime["profiles"]["cpu-ort"]["sourceRevision"] = "b" * 40
+        self.assertEqual(
+            source_differences(runtime, server),
+            ["runtime profile cpu-ort: no catalogue profile for CPUExecutionProvider @bbbbbbbb"],
+        )
 
 
 if __name__ == "__main__":

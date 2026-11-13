@@ -92,35 +92,112 @@ class RuntimeBuilderTests(unittest.TestCase):
                     "foreign",
                 )
 
+    def metal_root(self, temporary):
+        root = Path(temporary)
+        (root / "python").write_bytes(b"fixture")
+        package = root / builder.METAL_PACKAGE
+        package.mkdir(parents=True)
+        for name in builder.METAL_FILES:
+            (package / name).write_bytes(b"fixture")
+        return root
+
     def test_coreml_manifest_is_limited_to_apple_silicon_macos(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "python").write_bytes(b"fixture")
+            root = self.metal_root(temporary)
+            arguments = (root, "python", "a" * 40, 7)
             value = builder.manifest(
-                root,
-                "python",
-                "a" * 40,
-                7,
+                *arguments,
                 "macos",
                 "aarch64",
                 "CoreMLExecutionProvider",
+                "frameleaf_ml",
+                metal_observer=True,
             )
             self.assertEqual(value["provider"], "CoreMLExecutionProvider")
-            for system, architecture in [
-                ("windows", "x86_64"),
-                ("linux", "aarch64"),
-                ("macos", "x86_64"),
+            self.assertEqual(value["deviceObserver"], {"kind": "metal-v1"})
+            # The processor manifest of the same pack seals the collector without naming it.
+            processor = builder.manifest(
+                *arguments,
+                "macos",
+                "aarch64",
+                "CPUExecutionProvider",
+                "frameleaf_ml",
+                metal_observer=True,
+            )
+            self.assertNotIn("deviceObserver", processor)
+            self.assertEqual(processor["files"], value["files"])
+            for system, architecture, namespace, observer in [
+                ("windows", "x86_64", "frameleaf_ml", True),
+                ("linux", "aarch64", "frameleaf_ml", True),
+                ("macos", "x86_64", "frameleaf_ml", True),
+                # A CoreML runtime without its collector, or on the upstream namespace, is never admitted.
+                ("macos", "aarch64", "frameleaf_ml", False),
+                ("macos", "aarch64", "immich_ml", True),
             ]:
                 with self.assertRaises(builder.BuildError):
                     builder.manifest(
-                        root,
-                        "python",
-                        "a" * 40,
-                        7,
+                        *arguments,
                         system,
                         architecture,
                         "CoreMLExecutionProvider",
+                        namespace,
+                        metal_observer=observer,
                     )
+            (root / builder.METAL_PACKAGE / "entry.py").unlink()
+            with self.assertRaisesRegex(builder.BuildError, "device_observer"):
+                builder.manifest(
+                    *arguments,
+                    "macos",
+                    "aarch64",
+                    "CoreMLExecutionProvider",
+                    "frameleaf_ml",
+                    metal_observer=True,
+                )
+
+    def test_providers_without_a_build_recipe_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "python").write_bytes(b"fixture")
+            for provider in ["CUDAExecutionProvider", "OpenVINOExecutionProvider"]:
+                with self.assertRaises(builder.BuildError):
+                    builder.manifest(
+                        root, "python", "a" * 40, 7, "linux", "x86_64", provider
+                    )
+
+    def test_collector_is_staged_only_with_the_hashes_its_build_recorded(self):
+        import hashlib
+        import json
+
+        fields = (
+            "packageInitSha256",
+            "entrySha256",
+            "loaderSha256",
+            "adapterSha256",
+            "librarySha256",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            component = Path(temporary) / "component"
+            component.mkdir()
+            provenance = {}
+            for name, field in zip(builder.METAL_FILES, fields):
+                (component / name).write_bytes(name.encode())
+                provenance[field] = hashlib.sha256(name.encode()).hexdigest()
+            (component / "provenance.json").write_text(json.dumps(provenance))
+            payload = Path(temporary) / "payload"
+            payload.mkdir()
+            builder.stage_metal_observer(payload, component)
+            self.assertEqual(
+                sorted(path.name for path in (payload / builder.METAL_PACKAGE).iterdir()),
+                sorted(builder.METAL_FILES),
+            )
+            (component / "entry.py").write_bytes(b"changed after its build")
+            other = Path(temporary) / "other"
+            other.mkdir()
+            with self.assertRaisesRegex(builder.BuildError, "hash_invalid"):
+                builder.stage_metal_observer(other, component)
+            (component / "extra.py").write_bytes(b"unapproved")
+            with self.assertRaisesRegex(builder.BuildError, "inventory_invalid"):
+                builder.stage_metal_observer(Path(temporary), component)
 
     def test_inventory_is_stable_and_binds_every_byte(self):
         with tempfile.TemporaryDirectory() as temporary:

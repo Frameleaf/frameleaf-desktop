@@ -8,6 +8,7 @@
   import StepUp from '../StepUp.svelte';
   import type { StepUpRequest } from '../sign-in-steps';
   import { workerView, workloadReason } from '../mode-state';
+  import { workloadProvider } from '../ai-processing';
   import { describeError } from '../errors';
   import { workloadName, workloadPill, hostOf, connectionTransport, formatBytes, relativeTime, percent, computerWord, platformFromUserAgent, importProgress, importProgressText, type OverallProgress } from '../ui-state';
   import type { Connection, SetupStatus, ServerSummary, AttentionItem } from '../server-types';
@@ -218,7 +219,7 @@
         {#each setup?.workloads ?? [] as workload (workload.workload)}
           {@const pill = workloadPill(workload.state)}
           <div class="row">
-            <span class="l"><b>{workloadName(workload.workload)}</b><small>{workload.modelNames?.length ? workload.modelNames.join(' · ') : pill.detail}{workload.modelNames?.length && workload.state !== 'ready' ? ` · ${pill.detail}` : ''}{workload.state === 'unavailable' && workloadReason(workload.code) ? ` · ${workloadReason(workload.code)}` : ''}</small></span>
+            <span class="l"><b>{workloadName(workload.workload)}</b><small>{workload.modelNames?.length ? workload.modelNames.join(' · ') : pill.detail}{workload.modelNames?.length && workload.state !== 'ready' ? ` · ${pill.detail}` : ''}{workload.state === 'unavailable' && workloadReason(workload.code) ? ` · ${workloadReason(workload.code)}` : ''}{workload.state !== 'unavailable' && workloadProvider(setup?.providers, workload.workload) ? ` · ${workloadProvider(setup?.providers, workload.workload)}` : ''}</small></span>
             <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
           </div>
         {/each}

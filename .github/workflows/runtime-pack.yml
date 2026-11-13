@@ -4,8 +4,11 @@ on:
     paths:
       - 'tools/build_runtime.py'
       - 'tools/test_build_runtime.py'
+      - 'tools/build_coreml_observer.py'
+      - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
+      - 'src-tauri/src/native_runtime/**'
       - 'src-tauri/src/runtime_store.rs'
       - 'src-tauri/src/process_tree.rs'
       - '.github/workflows/runtime-pack.yml'
@@ -56,6 +59,24 @@ jobs:
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
         run: python desktop/tools/build_runtime.py --source server --output candidate --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --epoch 6
+      # FD-52: the accelerated pack (processor and CoreML manifests over one payload) must build on
+      # the hosted Apple Silicon runner; it is not signed, published or run on a GPU here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        with:
+          repository: Frameleaf/frameleaf-app
+          ref: f2c451a6bf71ca3f3aec986e07f0852937268e2f
+          path: coreml-server
+          persist-credentials: false
+      - name: Construct the CoreML pack with its device collector
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision f2c451a6bf71ca3f3aec986e07f0852937268e2f --epoch 6 --profile coreml-ort
+          test -s coreml-candidate/manifest.json
+          test -s coreml-candidate/manifest-accelerated.json
+          coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
       - name: Retain private validation receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

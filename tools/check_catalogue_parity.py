@@ -86,6 +86,20 @@ def runtime_differences(desktop, server):
     return problems
 
 
+def source_differences(runtime, catalogue):
+    """A runtime Desktop builds must have catalogue profiles for its provider and source."""
+    known = {
+        (profile["spec"]["provider"], profile["runtimeSourceRevision"])
+        for profile in catalogue["profiles"]
+    }
+    return [
+        f"runtime profile {name}: no catalogue profile for {profile['provider']} "
+        f"@{str(profile.get('sourceRevision'))[:8]}"
+        for name, profile in sorted(runtime["profiles"].items())
+        if (profile["provider"], profile.get("sourceRevision")) not in known
+    ]
+
+
 def load(path):
     return json.load(sys.stdin) if path == "-" else json.loads(Path(path).read_text())
 
@@ -104,6 +118,7 @@ def main(argv=None):
         ours = load(ROOT / "runtime/profiles.json")
         theirs = load(args.runtime_profiles)
         problems += runtime_differences(ours, theirs)
+        problems += source_differences(ours, server)
         for name in sorted(set(theirs["profiles"]) - set(ours["profiles"])):
             print(f"catalogue only (Desktop builds no {name} runtime)")
     for problem in problems:

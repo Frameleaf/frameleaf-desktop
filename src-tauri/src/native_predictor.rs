@@ -388,13 +388,24 @@ where
     settle(transport, &task, qualifications[index], outcome).await
 }
 
+/// How long every runtime process may take to answer its first health check.
+const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
+
 pub struct NativePredictor {
-    child: NativeSidecar,
+    /// One process per runtime in use (the processor runtime, an accelerated one, or both).
+    children: Vec<Lane>,
     roles: Vec<BoundRole>,
+    /// The process that was not serving when `ready` last failed.
+    failed: Option<usize>,
+}
+struct Lane {
+    child: NativeSidecar,
+    manifest_sha256: String,
 }
 struct BoundRole {
     client: BoundClient,
     qualification_id: String,
+    lane: usize,
 }
 struct ActiveExecution<'a> {
     predictor: &'a mut NativePredictor,
@@ -456,6 +467,16 @@ impl NativePredictor {
         private_root: &Path,
         port: u16,
     ) -> Result<Self, String> {
+        Self::start_lanes(&[(installed, port)], bindings, cache, private_root)
+    }
+    /// Start one process per runtime that has a binding; each binding runs on the runtime whose
+    /// signed manifest it was qualified with. Roles keep the order of `bindings`.
+    pub(crate) fn start_lanes(
+        runtimes: &[(&InstalledRuntime, u16)],
+        bindings: &[(&QualifiedRuntime, &AcceptedQualification)],
+        cache: &Path,
+        private_root: &Path,
+    ) -> Result<Self, String> {
         if !(1..=64).contains(&bindings.len()) {
             return Err("worker_model_binding_invalid".into());
         }
@@ -476,46 +497,132 @@ impl NativePredictor {
                 return Err("worker_model_binding_invalid".into());
             }
         }
-        let proofs: Vec<_> = bindings.iter().map(|(qualified, _)| *qualified).collect();
-        let child = installed.start_bound_sidecar(&proofs, cache, private_root, port)?;
+        if bindings.iter().any(|(qualified, _)| {
+            runtimes
+                .iter()
+                .filter(|(runtime, _)| runtime.manifest_sha256() == qualified.manifest_sha256())
+                .count()
+                != 1
+        }) {
+            return Err("runtime_qualification_binding_invalid".into());
+        }
+        let mut children: Vec<(Lane, u16)> = Vec::new();
+        for (installed, port) in runtimes {
+            let proofs: Vec<_> = bindings
+                .iter()
+                .map(|(qualified, _)| *qualified)
+                .filter(|qualified| qualified.manifest_sha256() == installed.manifest_sha256())
+                .collect();
+            if proofs.is_empty() {
+                continue;
+            }
+            // A failure here drops (and so stops) the processes already started.
+            let child = installed.start_bound_sidecar(&proofs, cache, private_root, *port)?;
+            children.push((
+                Lane {
+                    child,
+                    manifest_sha256: installed.manifest_sha256().into(),
+                },
+                *port,
+            ));
+        }
         let roles = bindings
             .iter()
             .map(|(qualified, accepted)| {
                 let spec: Value = serde_json::from_slice(qualified.specification())
                     .map_err(|_| "worker_model_binding_invalid")?;
+                let lane = children
+                    .iter()
+                    .position(|(lane, _)| lane.manifest_sha256 == qualified.manifest_sha256())
+                    .ok_or("runtime_qualification_binding_invalid")?;
+                let (owner, port) = &children[lane];
                 Ok(BoundRole {
-                    client: BoundClient::new(port, child.authorization().into(), &spec)?,
+                    client: BoundClient::new(*port, owner.child.authorization().into(), &spec)?,
                     qualification_id: accepted.id().into(),
+                    lane,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self { child, roles })
+        Ok(Self {
+            children: children.into_iter().map(|(lane, _)| lane).collect(),
+            roles,
+            failed: None,
+        })
     }
+    /// Stop every process; the first failure is reported after all were asked to stop.
     pub fn stop(&mut self) -> Result<(), String> {
-        self.child.stop()
+        let mut result = Ok(());
+        for lane in &mut self.children {
+            let stopped = lane.child.stop();
+            if result.is_ok() {
+                result = stopped;
+            }
+        }
+        result
     }
     pub(crate) fn is_running(&mut self) -> Result<bool, String> {
-        self.child.is_running()
+        for lane in &mut self.children {
+            if !lane.child.is_running()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
+    /// The signed manifest of the runtime whose process was not serving when work last failed
+    /// to start: a provider that did not initialise.
+    pub(crate) fn failed_lane(&self) -> Option<&str> {
+        self.failed
+            .map(|index| self.children[index].manifest_sha256.as_str())
+    }
+    /// A lane is blamed (`failed_lane`) only when it is the reason this returned a startup
+    /// failure: its process had stopped, or it was still not serving at the deadline. A wait
+    /// that is cancelled or dropped while a lane is merely loading blames nothing.
     async fn ready(&mut self, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const NONE: usize = usize::MAX;
+        self.failed = None;
+        let waiting = AtomicUsize::new(NONE);
+        let (children, roles) = (&mut self.children, &self.roles);
         let wait = async {
             loop {
-                if !self.child.is_running()? {
-                    return Err("runtime_process_stopped".into());
+                let mut unready = NONE;
+                for (index, lane) in children.iter_mut().enumerate() {
+                    let role = roles.iter().find(|role| role.lane == index);
+                    if !lane.child.is_running()? {
+                        waiting.store(index, Ordering::Release);
+                        return Err("runtime_process_stopped".into());
+                    }
+                    if let Some(role) = role {
+                        // Named before the check: the deadline can fall while it is pending.
+                        waiting.store(index, Ordering::Release);
+                        if !role.client.health().await.unwrap_or(false) {
+                            unready = index;
+                            break;
+                        }
+                    }
                 }
-                if self.roles[0].client.health().await.unwrap_or(false) {
+                waiting.store(unready, Ordering::Release);
+                if unready == NONE {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        race_prediction(
-            wait,
-            std::future::pending(),
-            cancel,
-            Duration::from_secs(15),
-        )
-        .await
+        let result = race_prediction(wait, std::future::pending(), cancel, READY_DEADLINE).await;
+        if matches!(
+            result.as_ref().map_err(String::as_str),
+            Err("runtime_process_stopped" | "worker_execution_deadline")
+        ) {
+            self.failed = Some(waiting.load(Ordering::Acquire)).filter(|index| *index != NONE);
+        }
+        result
+    }
+    /// After a failed prediction: a lane whose process is gone crashed while inferring (a
+    /// cancelled or refused prediction leaves it running), so the caller can stop using it.
+    fn blame_exited(&mut self, lane: usize) {
+        if !self.children[lane].child.is_running().unwrap_or(false) {
+            self.failed = Some(lane);
+        }
     }
     /// Execute one admitted job; empty NAS model grants cannot claim work.
     pub async fn execute_next(
@@ -593,7 +700,8 @@ impl NativePredictor {
         }
         let qualification = qualifications[index];
         let role = &self.roles[index];
-        let child = &mut self.child;
+        let lane = role.lane;
+        let child = &mut self.children[lane].child;
         let claimed = &task;
         let outcome = run_claimed(
             transport,
@@ -617,6 +725,10 @@ impl NativePredictor {
             },
         )
         .await;
+        if outcome.is_err() {
+            // Before this owner stops anything itself.
+            self.blame_exited(lane);
+        }
         if outcome.as_ref().is_err_and(|failure| failure.inferring) {
             // Terminate inference before waiting for a failed/cancelled lease acknowledgement.
             self.stop()?;
@@ -1132,13 +1244,108 @@ mod tests {
             .start_sidecar(&root.join("cache"), &root.join("work"), 19998)
             .unwrap();
         let mut predictor = NativePredictor {
-            child,
+            children: vec![Lane {
+                child,
+                manifest_sha256: pack.manifest_sha256().into(),
+            }],
             roles: vec![BoundRole {
                 client: client(19998),
                 qualification_id: "fixture".into(),
+                lane: 0,
             }],
+            failed: None,
         };
-        assert!(predictor.child.is_running().unwrap());
+        assert!(predictor.is_running().unwrap());
+        // FD-52: nothing listens on the port, so the lane is running but not serving yet.
+        let lane = pack.manifest_sha256().to_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Still not serving at the deadline: that lane failed to start.
+            let (_keep, mut never) = watch::channel(false);
+            assert_eq!(
+                predictor.ready(&mut never).await.unwrap_err(),
+                "worker_execution_deadline"
+            );
+            assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
+            // Cancelled while it is still loading: nothing is blamed (and the old blame is gone).
+            let (stop, mut stopping) = watch::channel(false);
+            {
+                let waiting = predictor.ready(&mut stopping);
+                tokio::pin!(waiting);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                        .await
+                        .is_err()
+                );
+                stop.send(true).unwrap();
+                assert_eq!(waiting.await.unwrap_err(), "worker_cancelled");
+            }
+            assert_eq!(predictor.failed_lane(), None);
+            // The wait is dropped (sign-out drops the whole future): nothing is blamed either.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), predictor.ready(&mut never))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(predictor.failed_lane(), None);
+        });
+        // A failed prediction with the process still alive blames no lane.
+        predictor.blame_exited(0);
+        assert_eq!(predictor.failed_lane(), None);
+        // Two lanes: the processor lane fails its first check and then serves; the accelerated
+        // lane's check is still pending at the deadline. The accelerated lane is the one blamed.
+        {
+            let serving = TcpListener::bind("127.0.0.1:0").unwrap();
+            let hanging = TcpListener::bind("127.0.0.1:0").unwrap();
+            let processor_port = serving.local_addr().unwrap().port();
+            let accelerated_port = hanging.local_addr().unwrap().port();
+            thread::spawn(move || {
+                let mut first = true;
+                for socket in serving.incoming() {
+                    let Ok(mut socket) = socket else { break };
+                    if std::mem::take(&mut first) {
+                        continue; // closed without an answer: not serving yet
+                    }
+                    let mut request = [0; 1024];
+                    let _ = socket.read(&mut request);
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
+                    );
+                }
+            });
+            thread::spawn(move || {
+                // Accepts and never answers.
+                let held: Vec<_> = hanging.incoming().collect();
+                drop(held);
+            });
+            let lane = |port: u16, name: &str| Lane {
+                child: pack
+                    .start_sidecar(&root.join("cache"), &root.join("work"), port)
+                    .unwrap(),
+                manifest_sha256: name.into(),
+            };
+            let role = |port: u16, lane: usize| BoundRole {
+                client: client(port),
+                qualification_id: format!("fixture-{lane}"),
+                lane,
+            };
+            let mut pair = NativePredictor {
+                children: vec![lane(19996, "processor"), lane(19997, "accelerated")],
+                roles: vec![role(processor_port, 0), role(accelerated_port, 1)],
+                failed: None,
+            };
+            runtime.block_on(async {
+                let (_keep, mut never) = watch::channel(false);
+                assert_eq!(
+                    pair.ready(&mut never).await.unwrap_err(),
+                    "worker_execution_deadline"
+                );
+            });
+            assert_eq!(pair.failed_lane(), Some("accelerated"));
+        }
         let (_sender, mut cancel) = watch::channel(false);
         let mut future = Box::pin(worker_jobs(
             &mut predictor,
@@ -1156,7 +1363,19 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
         drop(future);
-        assert!(!predictor.child.is_running().unwrap());
+        assert!(!predictor.is_running().unwrap());
+        // FD-52: a process that is gone after a failed prediction, or at the next start, is blamed.
+        predictor.blame_exited(0);
+        assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
+        runtime.block_on(async {
+            let (_keep, mut never) = watch::channel(false);
+            predictor.failed = None;
+            assert_eq!(
+                predictor.ready(&mut never).await.unwrap_err(),
+                "runtime_process_stopped"
+            );
+        });
+        assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
         drop(predictor);
         fs::remove_dir_all(root).unwrap();
     }

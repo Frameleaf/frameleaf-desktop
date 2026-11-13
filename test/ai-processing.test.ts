@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { processingPlaces, queueProgress, queueState, type AiQueue } from '../src/ai-processing.ts';
+import { processingPlaces, queueProgress, queueState, workloadProvider, type AiQueue } from '../src/ai-processing.ts';
 
 const run: AiQueue = {
   name: 'smartSearch', state: 'running', isPaused: false,
@@ -24,4 +24,27 @@ test('keeps reported wait reasons and configured places separate from execution'
   assert.equal(processingPlaces(['local', 'desktops', 'cloud']), 'Library server → Your computers → Frameleaf Cloud');
   assert.equal(processingPlaces(['future-value']), 'Unknown');
   assert.equal(processingPlaces([]), 'Off');
+});
+
+// FD-52: the provider shown is the one the backend chose, never a guess.
+test('each workload shows the provider the backend chose and why the processor stands in', () => {
+  const providers = [
+    { workload: 'clip', provider: 'CoreMLExecutionProvider', fallback: null },
+    { workload: 'face', provider: 'CPUExecutionProvider', fallback: 'runtime_qualification_timeout' },
+    { workload: 'ocr', provider: 'CPUExecutionProvider', fallback: null },
+  ];
+  assert.equal(workloadProvider(providers, 'clip'), 'Runs on CoreML');
+  assert.equal(workloadProvider(providers, 'ocr'), 'Runs on CPU');
+  assert.equal(workloadProvider(providers, 'face'), 'Runs on CPU (GPU acceleration is not used: it did not pass its check on this computer)');
+  assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_device_ineligible' }], 'face'),
+    'Runs on CPU (GPU acceleration is not used: this computer has no supported GPU)');
+  assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'workload_desktop_runtime_incompatible' }], 'face'),
+    'Runs on CPU (GPU acceleration is not used: the Library did not accept it)');
+  assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'runtime_signature_invalid' }], 'face'),
+    'Runs on CPU (GPU acceleration is not used: it could not be prepared on this computer)');
+  assert.equal(workloadProvider([{ workload: 'clip', provider: 'CUDAExecutionProvider', fallback: null }], 'clip'), 'Runs on NVIDIA CUDA');
+  // Nothing chosen yet, an older backend, or a provider this build has no name for: say nothing.
+  for (const none of [undefined, null, [], [{ workload: 'clip', provider: 'InventedProvider', fallback: null }]])
+    assert.equal(workloadProvider(none, 'clip'), '');
+  assert.equal(workloadProvider(providers, 'enrichment'), '');
 });

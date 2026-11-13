@@ -237,12 +237,28 @@ Add `--runtime-profiles <server runtime-profiles.json>` to also check that every
 runtime in `runtime/profiles.json` is one the server approves.
 
 `runtime/profiles.json` lists only runtimes Desktop can build and the server can
-admit, and every source in it has profiles in the catalogue. Today that is the
-CPU runtime on every target. The catalogue also carries CoreML, CUDA and OpenVINO
-profiles; Desktop ignores them until a signed runtime for that provider exists.
-CUDA and OpenVINO are not buildable by `build_runtime.py`. CoreML is not listed
-because the server admits a CoreML report only from a runtime that carries its
-signed device collector, which this repository does not build.
+admit, and every source in it has profiles in the catalogue (the parity check
+fails otherwise). Today that is the CPU runtime on every target and `coreml-ort`
+on Apple Silicon.
+
+`python tools/build_runtime.py --profile coreml-ort` builds an accelerated pack:
+one payload (the CPU dependency set plus the CoreML device collector from
+`native/coreml_observer.m`, which the server requires) with two manifests,
+`manifest.json` for the processor and `manifest-accelerated.json` for CoreML.
+The factory workflow builds it for `macos-aarch64` only when dispatched with
+`accelerated` checked, and then signs both manifests (`manifest-accelerated.sig`)
+after Apple code signing; packaging ships the second manifest beside the first.
+The app installs the accelerated manifest in its own store, qualifies each
+workload with it and falls back to the processor runtime per workload when the
+provider fails, remembering the failure for that runtime.
+`cargo test --lib native_runtime::metal::local_pack -- --ignored` qualifies a
+locally built pack against the catalogue under a throwaway key (see the test for
+its three environment variables).
+
+The catalogue also carries CUDA and OpenVINO profiles; Desktop ignores them.
+Neither is buildable: the locked `cuda` extra has no CUDA or cuDNN libraries once
+torch is left out and comes from a package feed the builder does not approve,
+and the runtime source reports every OpenVINO qualification as incompatible.
 
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval

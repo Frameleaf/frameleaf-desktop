@@ -64,3 +64,31 @@ export function processingPlaces(sources: string[]): string {
   const names: Record<string, string> = { local: 'Library server', desktops: 'Your computers', cloud: 'Frameleaf Cloud' };
   return sources.map(source => names[source] ?? 'Unknown').join(' → ');
 }
+
+/** FD-52: the provider a workload runs on here, as the backend chose it. */
+export type WorkloadProvider = { workload: string; provider: string; fallback: string | null };
+
+export const providerNames: Readonly<Record<string, string>> = {
+  CPUExecutionProvider: 'CPU',
+  CoreMLExecutionProvider: 'CoreML',
+  CUDAExecutionProvider: 'NVIDIA CUDA',
+  OpenVINOExecutionProvider: 'Intel OpenVINO',
+};
+
+/** Why the processor stands in for a GPU provider this app could have used. */
+function fallbackReason(code: string): string {
+  if (code === 'provider_device_ineligible') return 'this computer has no supported GPU';
+  if (code === 'worker_qualification_refused' || code.startsWith('workload_desktop_')) return 'the Library did not accept it';
+  if (code.startsWith('runtime_qualification_') || code === 'runtime_process_stopped' || code === 'runtime_not_ready' || code === 'provider_failed')
+    return 'it did not pass its check on this computer';
+  return 'it could not be prepared on this computer';
+}
+
+/** "Runs on CoreML", or "Runs on CPU (GPU acceleration is not used: …)" after a fallback. Empty when the backend has not chosen. */
+export function workloadProvider(providers: WorkloadProvider[] | null | undefined, workload: string): string {
+  const chosen = providers?.find(item => item.workload === workload);
+  if (!chosen) return '';
+  const name = providerNames[chosen.provider];
+  if (!name) return '';
+  return chosen.fallback ? `Runs on ${name} (GPU acceleration is not used: ${fallbackReason(chosen.fallback)})` : `Runs on ${name}`;
+}

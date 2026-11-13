@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  factoryProfileFor,
   factorySourceRevision,
   factorySourceRevisionFor,
   signFactoryRuntime,
@@ -194,4 +195,83 @@ test("factory keeps the common source outside the explicit ARM recipe", () => {
     () => factorySourceRevisionFor("windows-aarch64"),
     /runtime_factory_source_invalid/,
   );
+});
+
+// FD-52: the release owner opts in to the accelerated profile; only Apple Silicon has one.
+test("factory picks the accelerated profile only where one is approved and asked for", () => {
+  assert.equal(factoryProfileFor("macos-aarch64", true), "coreml-ort");
+  assert.equal(factoryProfileFor("macos-aarch64", false), "cpu-ort");
+  for (const target of ["macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64"])
+    assert.equal(factoryProfileFor(target, true), "cpu-ort");
+  assert.throws(
+    () => factoryProfileFor("windows-aarch64", true),
+    /runtime_factory_source_invalid/,
+  );
+});
+
+test("factory signs both manifests of an accelerated pack and refuses a foreign accelerated source", async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const arch = Object.getOwnPropertyDescriptor(process, "arch");
+  const pack = async (acceleratedSource) => {
+    const f = await fixture(t, { moduleNamespace: "frameleaf_ml" });
+    const manifest = JSON.parse(await readFile(join(f.root, "manifest.json")));
+    const add = async (name, bytes) => {
+      await mkdir(join(f.root, "payload", name, ".."), { recursive: true });
+      await writeFile(join(f.root, "payload", name), bytes);
+      manifest.files[name] = {
+        bytes: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    };
+    await add(
+      "provenance.json",
+      Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          sourceRepository: "Frameleaf/frameleaf-app",
+          sourceRevision: manifest.sourceRevision,
+          profile: "coreml-ort",
+          python: "3.12.13",
+        }),
+      ),
+    );
+    for (const name of [
+      "__init__.py",
+      "entry.py",
+      "metal_observer.py",
+      "metal_inference.py",
+      "_frameleaf_coreml_observer.dylib",
+    ])
+      await add(`private/frameleaf_desktop_ml/${name}`, Buffer.from(name));
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(manifest));
+    await writeFile(
+      join(f.root, "manifest-accelerated.json"),
+      JSON.stringify({
+        ...manifest,
+        ...acceleratedSource,
+        provider: "CoreMLExecutionProvider",
+        deviceObserver: { kind: "metal-v1" },
+      }),
+    );
+    return f;
+  };
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    Object.defineProperty(process, "arch", { ...arch, value: "arm64" });
+    const f = await pack({});
+    const receipt = await signFactoryRuntime(f.root, f.target, 2, f.privatePem, f.policy);
+    assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
+    assert.equal((await readFile(join(f.root, "manifest-accelerated.sig"))).length, 64);
+    assert.notEqual(receipt.accelerated.manifestSha256, receipt.manifestSha256);
+    const foreign = await pack({ epoch: 3 });
+    await assert.rejects(
+      signFactoryRuntime(foreign.root, foreign.target, 2, foreign.privatePem, foreign.policy),
+      /runtime_accelerated_manifest_mismatch/,
+    );
+    for (const name of ["manifest.sig", "manifest-accelerated.sig"])
+      await assert.rejects(readFile(join(foreign.root, name)), { code: "ENOENT" });
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    Object.defineProperty(process, "arch", arch);
+  }
 });

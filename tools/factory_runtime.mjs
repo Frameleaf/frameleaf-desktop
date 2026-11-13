@@ -2,7 +2,13 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { packageConfiguration } from "./package_desktop.mjs";
-import { boundedFile, readSigningKey, signCandidate } from "./sign_runtime.mjs";
+import {
+  acceleratedSignature,
+  boundedFile,
+  readSigningKey,
+  signCandidate,
+  verifyUnsignedAccelerated,
+} from "./sign_runtime.mjs";
 
 const profiles = JSON.parse(
   await readFile(new URL("../runtime/profiles.json", import.meta.url)),
@@ -22,6 +28,19 @@ export function factorySourceRevisionFor(target) {
   return factorySourceRevision;
 }
 
+/** The profile the factory builds for a target: its accelerated profile when the release
+ * owner asks for one and exactly one is approved there, otherwise the processor profile. */
+export function factoryProfileFor(target, accelerated) {
+  factorySourceRevisionFor(target);
+  const names = Object.entries(profiles.profiles)
+    .filter(
+      ([, value]) =>
+        value.provider !== profile.provider && value.targets.includes(target),
+    )
+    .map(([name]) => name);
+  return accelerated && names.length === 1 ? names[0] : "cpu-ort";
+}
+
 export async function checkFactoryInputs(candidate, target, epoch) {
   candidate = resolve(candidate);
   const manifest = JSON.parse(
@@ -37,17 +56,36 @@ export async function checkFactoryInputs(candidate, target, epoch) {
     manifest.provider !== profile.provider
   )
     throw new Error("runtime_factory_candidate_unapproved");
+  // An accelerated manifest is signed only for the profile approved for this target, from
+  // that profile's own source.
+  const accelerated = await verifyUnsignedAccelerated(candidate);
+  const approved = profiles.profiles[factoryProfileFor(target, true)];
+  if (
+    accelerated &&
+    (accelerated.manifest.provider !== approved.provider ||
+      accelerated.manifest.sourceRevision !== approved.sourceRevision)
+  )
+    throw new Error("runtime_factory_candidate_unapproved");
+  return Boolean(accelerated);
 }
 
 export async function signFactoryRuntime(candidate, target, epoch, privatePem, policy) {
   candidate = resolve(candidate);
-  await checkFactoryInputs(candidate, target, epoch);
+  const accelerated = await checkFactoryInputs(candidate, target, epoch);
   const receipt = await signCandidate(
     candidate,
     join(candidate, "manifest.sig"),
     privatePem,
     policy,
   );
+  if (accelerated)
+    receipt.accelerated = await signCandidate(
+      candidate,
+      join(candidate, acceleratedSignature),
+      privatePem,
+      policy,
+      true,
+    );
   await packageConfiguration(candidate, policy);
   return receipt;
 }

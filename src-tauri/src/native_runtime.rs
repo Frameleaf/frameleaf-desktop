@@ -1,4 +1,5 @@
 //! Signed private runtimes; no shell, ambient Python or server-selected executable.
+mod metal;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -45,6 +46,8 @@ struct Manifest {
     source_revision: String,
     #[serde(default)]
     module_namespace: ModuleNamespace,
+    #[serde(default)]
+    device_observer: Option<metal::Descriptor>,
     files: BTreeMap<String, Artifact>,
 }
 
@@ -187,6 +190,7 @@ impl VerifiedRuntime {
         {
             return Err("runtime_manifest_incompatible".into());
         }
+        metal::validate(&manifest)?;
         relative(&manifest.python)?;
         if !manifest.files.contains_key(&manifest.python) {
             return Err("runtime_interpreter_unapproved".into());
@@ -205,13 +209,28 @@ impl VerifiedRuntime {
     pub(crate) fn epoch(&self) -> u64 {
         self.manifest.epoch
     }
-    pub(crate) fn copy_payload(&self, destination: &Path) -> Result<(), String> {
+    /// `share` is the payload of an installed release with the same files (the processor and
+    /// accelerated manifests of one pack): its files are linked instead of copied again. The
+    /// caller verifies every byte of the result against this manifest either way.
+    pub(crate) fn copy_payload(
+        &self,
+        destination: &Path,
+        share: Option<&Path>,
+    ) -> Result<(), String> {
         self.check_files()?;
         for (name, artifact) in &self.manifest.files {
             let source = self.root.join(relative(name)?);
             let target = destination.join(relative(name)?);
             fs::create_dir_all(target.parent().ok_or("runtime_path_invalid")?)
                 .map_err(|_| "runtime_copy_failed")?;
+            if let Some(share) = share {
+                let shared = share.join(relative(name)?);
+                if no_link(&shared).is_ok_and(|meta| meta.is_file() && meta.len() == artifact.bytes)
+                    && fs::hard_link(&shared, &target).is_ok()
+                {
+                    continue;
+                }
+            }
             let metadata = no_link(&source)?;
             let input = File::open(source).map_err(|_| "runtime_copy_failed")?;
             let mut options = fs::OpenOptions::new();
@@ -303,8 +322,43 @@ def lost_parent():
     os._exit(125)
 threading.Thread(target=lost_parent,daemon=True).start()
 sys.argv=sys.argv[1:]
-runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
+if sys.argv[0]=='frameleaf-desktop-metal-v1':
+    parent,expected_hash,mode=sys.argv[1:4]
+    sys.argv=[mode]+sys.argv[4:]
+    sys.path.insert(0,parent)
+    from frameleaf_desktop_ml.entry import run
+    run(mode,expected_hash)
+else:
+    runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
 "#;
+
+/// Held under an exclusive lock for as long as a process owns an inference scratch, so pruning
+/// can tell an abandoned scratch from one in use (also by another instance of the app).
+pub(crate) const SCRATCH_OWNER: &str = ".owner";
+const SCRATCH_OWNER_PENDING: &str = ".owner-pending";
+fn own_scratch(scratch: &Path) -> Result<File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // The owner record appears under its name only once its lock is held: pruning in another
+    // instance of the app must never see an unlocked owner of a scratch that is in use. Until the
+    // rename the scratch has no owner record, which pruning keeps for a week.
+    let pending = scratch.join(SCRATCH_OWNER_PENDING);
+    // A scratch is created for one sidecar; an owner record already there is never replaced.
+    if fs::symlink_metadata(scratch.join(SCRATCH_OWNER)).is_ok() {
+        return Err("runtime_scratch_failed".into());
+    }
+    let owner = options
+        .open(&pending)
+        .map_err(|_| "runtime_scratch_failed")?;
+    owner.try_lock().map_err(|_| "runtime_scratch_failed")?;
+    fs::rename(&pending, scratch.join(SCRATCH_OWNER)).map_err(|_| "runtime_scratch_failed")?;
+    Ok(owner)
+}
 
 pub struct NativeSidecar {
     child: std::process::Child,
@@ -314,6 +368,8 @@ pub struct NativeSidecar {
     stopped: bool,
     exit_status: Option<std::process::ExitStatus>,
     lease: Option<std::sync::Arc<File>>,
+    /// Released before the scratch is removed.
+    owner: Option<File>,
 }
 impl NativeSidecar {
     pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
@@ -356,6 +412,7 @@ impl NativeSidecar {
 impl Drop for NativeSidecar {
     fn drop(&mut self) {
         let _ = self.stop();
+        drop(self.owner.take());
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
@@ -430,6 +487,13 @@ impl VerifiedRuntime {
         builder
             .create(&scratch)
             .map_err(|_| "runtime_scratch_failed")?;
+        let owner = match own_scratch(&scratch) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&scratch);
+                return Err(error);
+            }
+        };
         let mut secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
         let token = zeroize::Zeroizing::new(
@@ -482,10 +546,7 @@ impl VerifiedRuntime {
             .arg("-B")
             .arg("-c")
             .arg(GATE)
-            .arg(format!(
-                "{}.{module}",
-                self.manifest.module_namespace.prefix()
-            ))
+            .args(metal::arguments(&self.manifest, &self.root, module)?)
             .arg("--cache-dir")
             .arg(cache)
             .current_dir(&scratch)
@@ -570,6 +631,7 @@ impl VerifiedRuntime {
             stopped: false,
             exit_status: None,
             lease: None,
+            owner: Some(owner),
         };
         owner
             .child
@@ -719,6 +781,7 @@ impl VerifiedRuntime {
             &value,
             &format!("{:x}", Sha256::digest(spec)),
             self.provider(),
+            metal::collector_hash(&self.manifest),
         )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
@@ -728,12 +791,14 @@ impl VerifiedRuntime {
         })
     }
 }
-/// `runtime_provider` is the one provider the installed runtime's signed manifest declares.
+/// `runtime_provider` is the one provider the installed runtime's signed manifest declares, and
+/// `expected_collector` the device collector that manifest carries (CoreML only).
 fn validate_report(
     report: &serde_json::Value,
     spec: &serde_json::Value,
     binding: &str,
     runtime_provider: &str,
+    expected_collector: Option<&str>,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -778,6 +843,13 @@ fn validate_report(
     // CoreML can keep work on the processor inside its own nodes, so it never reports
     // accelerator-only execution (the runtime and the server use the same rule).
     let always_mixed = provider == "CoreMLExecutionProvider";
+    // The server refuses a CoreML report without the signed collector's device proof, and any
+    // other report that carries one; refuse the same here instead of submitting it.
+    if always_mixed {
+        metal::validate_report(report, spec, expected_collector.ok_or_else(invalid)?)?;
+    } else if expected_collector.is_some() || !report["deviceExecution"].is_null() {
+        return Err(invalid());
+    }
     let execution = report["execution"]
         .as_array()
         .filter(|v| !v.is_empty() && v.len() <= 64)
@@ -841,7 +913,7 @@ mod tests {
     }
     fn check(provider: &str, state: &str, cpu_nodes: bool, runtime: &str) -> Result<(), String> {
         let [report, spec] = report_for(provider, state, cpu_nodes);
-        validate_report(&report, &spec, &"c".repeat(64), runtime)
+        validate_report(&report, &spec, &"c".repeat(64), runtime, None)
     }
     #[test]
     fn report_is_accepted_only_for_the_provider_the_runtime_declares() {
@@ -850,8 +922,9 @@ mod tests {
         const OPENVINO: &str = "OpenVINOExecutionProvider";
         const CUDA: &str = "CUDAExecutionProvider";
         assert!(check(CPU, "ready-cpu", false, CPU).is_ok());
-        assert!(check(COREML, "ready-mixed", false, COREML).is_ok());
-        assert!(check(COREML, "ready-mixed", true, COREML).is_ok());
+        // CoreML is accepted only with its collector's device proof (see `metal`).
+        assert!(check(COREML, "ready-mixed", false, COREML).is_err());
+        assert!(check(COREML, "ready-mixed", true, COREML).is_err());
         for provider in [OPENVINO, CUDA] {
             assert!(check(provider, "ready-accelerator", false, provider).is_ok());
             assert!(check(provider, "ready-mixed", true, provider).is_ok());
@@ -877,6 +950,30 @@ mod tests {
         for provider in ["MIGraphXExecutionProvider", "TensorrtExecutionProvider", ""] {
             assert!(check(provider, "ready-accelerator", false, provider).is_err());
         }
+    }
+    #[test]
+    fn scratch_owner_is_published_only_with_its_lock_held() {
+        let scratch = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("inference-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&scratch).unwrap();
+        let owner = own_scratch(&scratch).unwrap();
+        assert!(!scratch.join(SCRATCH_OWNER_PENDING).exists());
+        // The published record is the locked handle itself (also after the rename on Windows).
+        let published = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(scratch.join(SCRATCH_OWNER))
+            .unwrap();
+        assert!(published.try_lock().is_err());
+        // A second owner of the same scratch is refused and leaves the first one's record alone.
+        assert!(own_scratch(&scratch).is_err());
+        assert!(published.try_lock().is_err());
+        drop(owner);
+        assert!(published.try_lock().is_ok());
+        drop(published);
+        fs::remove_dir_all(scratch).unwrap();
     }
     #[test]
     fn qualification_cannot_start_a_different_runtime_manifest() {
