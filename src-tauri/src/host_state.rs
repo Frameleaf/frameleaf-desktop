@@ -351,7 +351,6 @@ impl Owner {
         }
     }
     /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
-    #[cfg(unix)]
     pub(crate) fn check_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
         if !self.writable {
             return Err("host_controller_read_only".into());
@@ -371,7 +370,6 @@ impl Owner {
     /// finished or discarded with it first. Two things are not unfinished work: the directory
     /// a completed carry-forward restored this library into, which is its database now, with
     /// the export it came from; and what the carry-forward under way (`permit`) has written.
-    #[cfg(unix)]
     fn operations_clear(&self, current: &Marker, permit: Option<&str>) -> Result<(), String> {
         let carried = current
             .database_reference
@@ -454,7 +452,6 @@ impl Owner {
     /// Whether a library may be carried forward under `permit`: cleanly stopped with nothing
     /// holding it and no database process file, no restore under way, and nothing in the
     /// operation directories but this permit's own work.
-    #[cfg(unix)]
     pub(crate) fn check_carriable(
         &mut self,
         id: &str,
@@ -476,7 +473,6 @@ impl Owner {
     }
     /// Select the newer package and the directory it restored this library into. Every check
     /// runs first and this one write commits both; the original directory stays where it is.
-    #[cfg(unix)]
     pub(crate) fn carry_forward_database(
         &mut self,
         id: &str,
@@ -511,7 +507,6 @@ impl Owner {
         Ok(())
     }
     /// Repoint a cleanly stopped library at a newer package. This write commits the move.
-    #[cfg(unix)]
     pub(crate) fn carry_forward(
         &mut self,
         id: &str,
@@ -756,7 +751,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn stopped_library_moves_to_a_newer_package_only_once_and_only_when_cleanly_stopped() {
         let fixture = Fixture::new();
