@@ -92,12 +92,22 @@ def source_differences(runtime, catalogue):
         (profile["spec"]["provider"], profile["runtimeSourceRevision"])
         for profile in catalogue["profiles"]
     }
-    return [
+    problems = [
         f"runtime profile {name}: no catalogue profile for {profile['provider']} "
         f"@{str(profile.get('sourceRevision'))[:8]}"
         for name, profile in sorted(runtime["profiles"].items())
         if (profile["provider"], profile.get("sourceRevision")) not in known
     ]
+    # FD-56: an accelerated pack is one payload with a processor manifest too, which the app
+    # falls back to; that manifest names the same source.
+    problems += [
+        f"runtime profile {name}: no catalogue profile for the processor manifest of its pack "
+        f"@{str(profile.get('sourceRevision'))[:8]}"
+        for name, profile in sorted(runtime["profiles"].items())
+        if profile["provider"] != "CPUExecutionProvider"
+        and ("CPUExecutionProvider", profile.get("sourceRevision")) not in known
+    ]
+    return problems
 
 
 def load(path):

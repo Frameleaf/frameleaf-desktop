@@ -38,6 +38,11 @@ test('each workload shows the provider the backend chose and why the processor s
   assert.equal(workloadProvider(providers, 'face'), 'Runs on CPU (GPU acceleration is not used: it did not pass its check on this computer)');
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_device_ineligible' }], 'face'),
     'Runs on CPU (GPU acceleration is not used: this computer has no supported GPU)');
+  // FD-56: a GPU provider that measured slower than the processor does not keep the workload.
+  assert.equal(workloadProvider([{ workload: 'clip', provider: 'CPUExecutionProvider', fallback: 'provider_slower' }], 'clip'),
+    'Runs on CPU (GPU acceleration is not used: the processor is faster for this on this computer)');
+  assert.equal(workloadProvider([{ workload: 'clip', provider: 'CPUExecutionProvider', fallback: 'provider_speed_unknown' }], 'clip'),
+    'Runs on CPU (GPU acceleration is not used: its speed could not be measured this time)');
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'workload_desktop_runtime_incompatible' }], 'face'),
     'Runs on CPU (GPU acceleration is not used: the Library did not accept it)');
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'runtime_signature_invalid' }], 'face'),

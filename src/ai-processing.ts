@@ -78,6 +78,8 @@ export const providerNames: Readonly<Record<string, string>> = {
 /** Why the processor stands in for a GPU provider this app could have used. */
 function fallbackReason(code: string): string {
   if (code === 'provider_device_ineligible') return 'this computer has no supported GPU';
+  if (code === 'provider_slower') return 'the processor is faster for this on this computer';
+  if (code === 'provider_speed_unknown') return 'its speed could not be measured this time';
   if (code === 'worker_qualification_refused' || code.startsWith('workload_desktop_')) return 'the Library did not accept it';
   if (code.startsWith('runtime_qualification_') || code === 'runtime_process_stopped' || code === 'runtime_not_ready' || code === 'provider_failed')
     return 'it did not pass its check on this computer';

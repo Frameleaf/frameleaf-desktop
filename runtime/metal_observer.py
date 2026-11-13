@@ -127,13 +127,31 @@ class MetalObserver:
     def check_model(self, model: Path, expected_sha256: str) -> None:
         """Hash every byte of the model, through a path none of whose directories is a link.
 
-        Hashing around every run is deliberate. Remembering a digest would need a way to know
-        the contents have not changed since, and no file identity or timestamp the platform
-        offers guarantees that (coarse or adjustable clocks, filesystems that differ). If CoreML
-        is ever considered for shipping, the sound way to drop this cost is to hash once the
-        read-only, memory-mapped bytes the session itself loads, not to trust metadata."""
+        This is what proves the model of a session that was created from a file: hashing around
+        every run is then deliberate, because no file identity or timestamp the platform offers
+        guarantees the contents are unchanged since an earlier hash (coarse or adjustable clocks,
+        filesystems that differ). A session created from memory needs none of it: see
+        `check_run`."""
         checked_parents(model)
         if file_hash(model, 16 * 1024**3) != expected_sha256:
+            raise ValueError("metal_model_changed")
+
+    def check_run(
+        self, model: Path, expected_sha256: str, loaded_sha256: str | None
+    ) -> None:
+        """The model that a run uses is the approved one.
+
+        `loaded_sha256` is the digest the runtime took of the very bytes it created the session
+        from, in memory. Those bytes cannot change under the session, so comparing digests is the
+        whole proof and the file is not read again. Without it the session reads a file, and
+        only hashing that file around the run says what ran."""
+        if loaded_sha256 is None:
+            self.check_model(model, expected_sha256)
+        elif (
+            not isinstance(loaded_sha256, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", loaded_sha256)
+            or loaded_sha256 != expected_sha256
+        ):
             raise ValueError("metal_model_changed")
 
     def verify(self, model: Path, expected_sha256: str) -> None:
@@ -180,13 +198,15 @@ class MetalObserver:
         return value
 
     @contextmanager
-    def observe(self, model: Path, expected_sha256: str) -> Iterator[None]:
+    def observe(
+        self, model: Path, expected_sha256: str, loaded_sha256: str | None = None
+    ) -> Iterator[None]:
         if not self.lock.acquire(blocking=False):
             raise ValueError("metal_parallel_call_refused")
         try:
             if self.failed or len(self.calls) >= 64 or self.next_identifier >= 2**64:
                 raise ValueError("metal_observer_unavailable")
-            self.check_model(model, expected_sha256)
+            self.check_run(model, expected_sha256, loaded_sha256)
             self.facts()
             if not self.installed:
                 if self.library.fl_gpu_install() != 0:
@@ -201,7 +221,8 @@ class MetalObserver:
             finally:
                 if self.library.fl_gpu_end(identifier) != 0:
                     raise ValueError("metal_scope_end_failed")
-            self.check_model(model, expected_sha256)
+            if loaded_sha256 is None:
+                self.check_model(model, expected_sha256)
             self.facts()
             self.calls.append((identifier, expected_sha256))
         except BaseException:

@@ -332,7 +332,12 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
     "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"],
   });
-  assert.deepEqual(Object.keys(profiles), ["cpu-ort", "coreml-ort"]);
+  assert.deepEqual(Object.keys(profiles), [
+    "cpu-ort",
+    "coreml-ort",
+    "cuda-ort",
+    "openvino-ort",
+  ]);
   const f = await fixture(t);
   const provenance = JSON.parse(
     await readFile(join(f.root, "payload/provenance.json"), "utf8"),
@@ -627,7 +632,11 @@ test("the collector is sealed by both manifests and a processor manifest never n
 test("packaging ships the accelerated manifest beside the processor one only when both are signed", async (t) => {
   const { packageConfiguration } = await import("./package_desktop.mjs");
   const f = await acceleratedFixture(t);
-  const source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
+  // FD-56: both manifests of an accelerated pack are built from the accelerated profile's source.
+  const source = JSON.parse(
+    await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
+  ).profiles["coreml-ort"].sourceRevision;
+  assert.notEqual(source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f");
   const provenance = Buffer.from(
     JSON.stringify({
       schemaVersion: 1,

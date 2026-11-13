@@ -197,23 +197,66 @@ test("factory keeps the common source outside the explicit ARM recipe", () => {
   );
 });
 
-// FD-52: the release owner opts in to the accelerated profile; only Apple Silicon has one.
-test("factory picks the accelerated profile only where one is approved and asked for", () => {
-  assert.equal(factoryProfileFor("macos-aarch64", true), "coreml-ort");
-  assert.equal(factoryProfileFor("macos-aarch64", false), "cpu-ort");
+// FD-56: the accelerated pack is the factory's normal output where exactly one profile is
+// approved (Apple Silicon); a CUDA or OpenVINO pack is built only when it is named.
+test("factory picks the accelerated profile only where one is approved or named", () => {
+  for (const choice of [true, "default"])
+    assert.equal(factoryProfileFor("macos-aarch64", choice), "coreml-ort");
+  for (const choice of [false, "none"])
+    assert.equal(factoryProfileFor("macos-aarch64", choice), "cpu-ort");
   for (const target of ["macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64"])
-    assert.equal(factoryProfileFor(target, true), "cpu-ort");
+    for (const choice of [true, "default", false, "none"])
+      assert.equal(factoryProfileFor(target, choice), "cpu-ort");
+  for (const [name, targets] of [
+    ["cuda-ort", ["linux-x86_64", "windows-x86_64"]],
+    ["openvino-ort", ["linux-x86_64", "windows-x86_64"]],
+  ]) {
+    for (const target of targets)
+      assert.equal(factoryProfileFor(target, name), name);
+    // Targets that do not approve it keep their usual pack.
+    assert.equal(factoryProfileFor("macos-aarch64", name), "coreml-ort");
+    assert.equal(factoryProfileFor("linux-aarch64", name), "cpu-ort");
+  }
+  for (const choice of ["cpu-ort", "unknown", "constructor", "", undefined, 1])
+    assert.throws(
+      () => factoryProfileFor("linux-x86_64", choice),
+      /runtime_factory_profile_invalid/,
+    );
   assert.throws(
     () => factoryProfileFor("windows-aarch64", true),
     /runtime_factory_source_invalid/,
   );
 });
 
+test("an accelerated pack builds its own profile's source and the processor pack the common one", () => {
+  const coreml = factorySourceRevisionFor("macos-aarch64", "coreml-ort");
+  assert.match(coreml, /^[a-f0-9]{40}$/);
+  assert.equal(factorySourceRevisionFor("linux-x86_64", "cuda-ort"), coreml);
+  assert.equal(factorySourceRevisionFor("linux-x86_64", "openvino-ort"), coreml);
+  assert.equal(factorySourceRevisionFor("windows-x86_64", "cuda-ort"), coreml);
+  assert.equal(factorySourceRevisionFor("macos-aarch64"), factorySourceRevision);
+  // A profile is never built for a target that does not approve it.
+  for (const [target, name] of [
+    ["linux-x86_64", "coreml-ort"],
+    ["macos-aarch64", "cuda-ort"],
+    ["linux-aarch64", "openvino-ort"],
+    ["linux-x86_64", "unknown"],
+    ["linux-x86_64", "constructor"],
+  ])
+    assert.throws(
+      () => factorySourceRevisionFor(target, name),
+      /runtime_factory_source_invalid/,
+    );
+});
+
 test("factory signs both manifests of an accelerated pack and refuses a foreign accelerated source", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
   const arch = Object.getOwnPropertyDescriptor(process, "arch");
-  const pack = async (acceleratedSource) => {
-    const f = await fixture(t, { moduleNamespace: "frameleaf_ml" });
+  const pack = async (acceleratedSource, source = "coreml-ort") => {
+    const f = await fixture(t, {
+      moduleNamespace: "frameleaf_ml",
+      sourceRevision: factorySourceRevisionFor("macos-aarch64", source),
+    });
     const manifest = JSON.parse(await readFile(join(f.root, "manifest.json")));
     const add = async (name, bytes) => {
       await mkdir(join(f.root, "payload", name, ".."), { recursive: true });
@@ -270,6 +313,17 @@ test("factory signs both manifests of an accelerated pack and refuses a foreign 
     );
     for (const name of ["manifest.sig", "manifest-accelerated.sig"])
       await assert.rejects(readFile(join(foreign.root, name)), { code: "ENOENT" });
+    // FD-56: an accelerated pack built from the processor profile's source is not the approved
+    // CoreML runtime (the catalogue has no reason to trust that source for it).
+    if (factorySourceRevisionFor("macos-aarch64") !== factorySourceRevisionFor("macos-aarch64", "coreml-ort")) {
+      const stale = await pack({}, "cpu-ort");
+      await assert.rejects(
+        signFactoryRuntime(stale.root, stale.target, 2, stale.privatePem, stale.policy),
+        /runtime_factory_candidate_unapproved/,
+      );
+      for (const name of ["manifest.sig", "manifest-accelerated.sig"])
+        await assert.rejects(readFile(join(stale.root, name)), { code: "ENOENT" });
+    }
   } finally {
     Object.defineProperty(process, "platform", platform);
     Object.defineProperty(process, "arch", arch);

@@ -31,6 +31,24 @@ CPU_PROVIDER = "CPUExecutionProvider"
 # An accelerated pack keeps the processor manifest as `manifest.json` and adds this one over the
 # same payload, so the app can fall back to the processor without a second copy in the installer.
 ACCELERATED_MANIFEST = "manifest-accelerated.json"
+# FD-56: where each accelerated provider may be built, as the server's runtime-profiles.json
+# approves it.
+ACCELERATED_TARGETS = {
+    "CoreMLExecutionProvider": {("macos", "aarch64")},
+    "CUDAExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+    "OpenVINOExecutionProvider": {("windows", "x86_64"), ("linux", "x86_64")},
+}
+# The server's lock takes onnxruntime-gpu from this explicit index (`onnxruntime-cuda12` in its
+# pyproject.toml): the CUDA 12 build, which PyPI no longer carries. Only that one package is
+# installed from it (the feed also mirrors other packages at other versions), and like every
+# wheel it is checked against the hash the lock records.
+CUDA_FEED = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+# The CUDA, cuDNN and (on Windows) OpenVINO libraries a pack carries are those the runtime source's
+# `desktop-cuda` and `desktop-openvino` extras lock: the versions each provider library was built
+# against. A container has them in its image; a desktop has no installation of them.
+# Packages taken from an index of their own, as the server's lock does.
+FEED_PACKAGES = {"CUDAExecutionProvider": ("onnxruntime-gpu", CUDA_FEED)}
+
 
 
 class BuildError(RuntimeError):
@@ -168,14 +186,10 @@ def manifest(
         or architecture not in {"aarch64", "x86_64"}
         or not (
             provider == CPU_PROVIDER
-            or (
-                provider == "CoreMLExecutionProvider"
-                and system == "macos"
-                and architecture == "aarch64"
-                # Without its collector a CoreML runtime can never be admitted.
-                and metal_observer
-            )
+            or (system, architecture) in ACCELERATED_TARGETS.get(provider, set())
         )
+        # Without its collector a CoreML runtime can never be admitted.
+        or (provider == "CoreMLExecutionProvider" and not metal_observer)
         or (metal_observer and provider not in {CPU_PROVIDER, "CoreMLExecutionProvider"})
     ):
         raise BuildError("runtime_manifest_invalid")
@@ -296,11 +310,10 @@ def git_blob(
     git: str, root: Path, revision: str, name: str, env: dict[str, str]
 ) -> bytes:
     relative(name)
-    mode = run(
-        [git, "ls-tree", "--format=%(objectmode)", revision, "--", name],
-        cwd=root,
-        env=env,
-    )
+    # "<mode> <type> <object>\t<path>": the plain listing, which every git prints (`--format`
+    # needs git 2.36, newer than Ubuntu 22.04's).
+    listing = run([git, "ls-tree", revision, "--", name], cwd=root, env=env)
+    mode = listing.split(" ", 1)[0] if listing.count("\n") == 0 else ""
     if mode not in {"100644", "100755"}:
         raise BuildError("runtime_source_file_invalid")
     size = int(run([git, "cat-file", "-s", f"{revision}:{name}"], cwd=root, env=env))
@@ -362,6 +375,18 @@ def source_build_requirements(text: str, locked: str | None = None) -> str:
     return requirement_block(text if locked is None else locked, "setuptools")
 
 
+def feed_requirements(provider: str, text: str) -> tuple[str, str, str | None]:
+    """Split the requirements into those installed from the usual indexes and the one package
+    the server's lock takes from its own index: (the rest, that package's block, its index)."""
+    if provider not in FEED_PACKAGES:
+        return text, "", None
+    name, index = FEED_PACKAGES[provider]
+    block = requirement_block(text, name)
+    if text.count(block) != 1:
+        raise BuildError("runtime_build_tool_not_pinned")
+    return text.replace(block, ""), block, index
+
+
 def dependency_indexes(system: str, architecture: str) -> list[str]:
     # Linux CPU wheels use the dedicated feed; keep Windows/macOS on their locked PyPI wheels.
     indexes = ["--default-index", "https://pypi.org/simple"]
@@ -403,11 +428,22 @@ def build(
     }.get(platform.machine(), "unsupported")
     if f"{system}-{architecture}" not in profile["targets"]:
         raise BuildError("runtime_target_unqualified")
-    # The processor manifest of an accelerated pack is the cpu-ort runtime on the same payload.
+    # The processor manifest of an accelerated pack is the processor provider of the same
+    # payload: the cpu-ort dependency set itself for CoreML, and for CUDA and OpenVINO the
+    # processor provider of their own onnxruntime build, on the same Python.
     if accelerated and (
-        base.get("provider") != CPU_PROVIDER
+        (system, architecture)
+        not in ACCELERATED_TARGETS.get(profile["provider"], set())
+        or base.get("provider") != CPU_PROVIDER
         or f"{system}-{architecture}" not in base.get("targets", [])
-        or any(base.get(key) != profile[key] for key in ("python", "uv", "extra"))
+        or any(
+            base.get(key) != profile[key]
+            for key in (
+                ("python", "uv", "extra")
+                if profile["provider"] == "CoreMLExecutionProvider"
+                else ("python", "uv")
+            )
+        )
     ):
         raise BuildError("runtime_profile_base_mismatch")
     uv = shutil.which("uv")
@@ -558,6 +594,14 @@ def build(
                 cwd=work,
                 env=env,
             )
+        rest, feed_block, feed_index = feed_requirements(
+            profile["provider"], requirements.read_text()
+        )
+        usual, from_feed = requirements, work / "feed-requirements.txt"
+        if feed_index:
+            usual = work / "usual-requirements.txt"
+            usual.write_text(rest)
+            from_feed.write_text(feed_block)
         run(
             [
                 uv,
@@ -583,11 +627,33 @@ def build(
                 ),
                 *dependency_indexes(system, architecture),
                 "-r",
-                requirements,
+                usual,
             ],
             cwd=work,
             env=env,
         )
+        if feed_index:
+            run(
+                [
+                    uv,
+                    "--no-config",
+                    "pip",
+                    "install",
+                    "--python",
+                    executable,
+                    "--break-system-packages",
+                    "--require-hashes",
+                    "--no-deps",
+                    "--only-binary",
+                    ":all:",
+                    "--default-index",
+                    feed_index,
+                    "-r",
+                    from_feed,
+                ],
+                cwd=work,
+                env=env,
+            )
 
         commands = prefix / ("Scripts" if os.name == "nt" else "bin")
         # Console entry points embed the build path; the app uses only fixed Python modules.

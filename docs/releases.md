@@ -258,27 +258,66 @@ runtime in `runtime/profiles.json` is one the server approves.
 
 `runtime/profiles.json` lists only runtimes Desktop can build and the server can
 admit, and every source in it has profiles in the catalogue (the parity check
-fails otherwise). Today that is the CPU runtime on every target and `coreml-ort`
-on Apple Silicon.
+fails otherwise). Today that is the CPU runtime on every target, `coreml-ort` on
+Apple Silicon, and `cuda-ort` and `openvino-ort` on Windows and Linux x86_64.
+The accelerated profiles build their own runtime source (catalogue epoch 15),
+which verifies the model bytes a session loads; the CPU profile is unchanged.
 
 `python tools/build_runtime.py --profile coreml-ort` builds an accelerated pack:
 one payload (the CPU dependency set plus the CoreML device collector from
 `native/coreml_observer.m`, which the server requires) with two manifests,
 `manifest.json` for the processor and `manifest-accelerated.json` for CoreML.
-The factory workflow builds it for `macos-aarch64` only when dispatched with
-`accelerated` checked, and then signs both manifests (`manifest-accelerated.sig`)
-after Apple code signing; packaging ships the second manifest beside the first.
-The app installs the accelerated manifest in its own store, qualifies each
-workload with it and falls back to the processor runtime per workload when the
-provider fails, remembering the failure for that runtime.
+The factory workflow builds it for `macos-aarch64` by default (`accelerated:
+default`; choose `none` for the processor pack alone), and signs both manifests
+(`manifest-accelerated.sig`) after Apple code signing; packaging ships the second
+manifest beside the first. Both manifests of that pack name the accelerated
+profile's source, so the server must already carry catalogue epoch 15: against an
+older server neither manifest is known and that Mac has no AI processing until
+the server is updated. Release the server first. A new pack needs a runtime epoch
+above the released one (the workflow default is 7).
+
+```sh
+gh workflow run factory-runtime.yml --ref main -f platforms=all -f epoch=7 -f accelerated=default
+```
+
+The app installs the accelerated manifest in its own store and qualifies each
+workload with it. The first time with a runtime it also times the same fixtures
+on the processor, without the server: the provider keeps a workload only where
+its warm inference was faster, and that outcome is remembered for the runtime
+(`provider-failures.json`). Slower, failed or not measurable means the processor
+for that workload.
 `cargo test --lib native_runtime::metal::local_pack -- --ignored` qualifies a
 locally built pack against the catalogue under a throwaway key (see the test for
 its three environment variables).
 
-The catalogue also carries CUDA and OpenVINO profiles; Desktop ignores them.
-Neither is buildable: the locked `cuda` extra has no CUDA or cuDNN libraries once
-torch is left out and comes from a package feed the builder does not approve,
-and the runtime source reports every OpenVINO qualification as incompatible.
+`--profile cuda-ort` and `--profile openvino-ort` build the same kind of pack on
+Windows and Linux x86_64, from the runtime source's `desktop-cuda` and
+`desktop-openvino` extras, which lock the libraries each provider library was
+built against: for onnxruntime-gpu 1.29.0 the CUDA 12 runtime 12.9.79 (its
+provider library imports functions the 12.6.77 runtime does not export, which on
+Windows is error 127 at load), cuBLAS, cuFFT, cuRAND, NVRTC and cuDNN 9; for
+onnxruntime-openvino 1.24.1 on Windows the `openvino` 2025.4.1 wheel (the Linux
+wheel contains it). `onnxruntime-gpu`, and nothing else, comes from the feed the
+server's lock names for it; every wheel is checked against the locked hash.
+
+Pull-request CI builds the four packs on hosted runners and checks them without a
+GPU (`tools/smoke_accelerated_runtime.py`). OpenVINO: a session runs on its CPU
+device. CUDA: the bundled CUDA and cuDNN libraries are in the pack and open; on
+Windows the provider library's import table is satisfied by the pack and the
+library loads; on Linux everything it links against resolves from the pack
+except the NVIDIA driver library. No CUDA session is created there. To verify on
+a Windows or Linux computer with an NVIDIA card and driver, build the pack and
+run the same script with the pack's interpreter; it must print `CUDA session ran
+on the card`:
+
+```sh
+python tools/build_runtime.py --source <frameleaf-app checkout at the profile's sourceRevision> --output candidate --revision <that revision> --epoch 7 --profile cuda-ort
+candidate/payload/python/python.exe -I -B tools/smoke_accelerated_runtime.py CUDAExecutionProvider   # Linux: candidate/payload/python/bin/python3.12
+```
+
+Neither provider has run on NVIDIA or Intel hardware. A CUDA pack is about 3 GB
+and no installer carries either: the factory builds one only when `accelerated`
+names it.
 
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval

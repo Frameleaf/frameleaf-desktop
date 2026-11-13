@@ -11,6 +11,7 @@ class Collector:
         self.expected = None
         self.spoof = False
         self.verified = []
+        self.loaded = []
         self.changed = False
 
     def facts(self):
@@ -27,7 +28,10 @@ class Collector:
         self.verified.append((path, digest))
 
     @contextmanager
-    def observe(self, path, digest):
+    def observe(self, path, digest, loaded=None):
+        if loaded is not None and loaded != digest:
+            raise ValueError("metal_model_changed")
+        self.loaded.append(loaded)
         self.expected = digest
         self.identifier += 1
         yield
@@ -124,6 +128,37 @@ class MetalInferenceTests(unittest.TestCase):
         self.assertNotIn(other, self.adapter.bindings)
         with self.assertRaises(ValueError), self.adapter.observe(self.model):
             pass
+
+    def test_a_model_held_in_memory_is_not_read_again_when_it_is_bound(self):
+        digest = "c" * 64
+        self.adapter.bind({self.model: digest})
+        self.assertEqual(len(self.collector.verified), 1)
+        # The session reports the digest of the bytes it was created from.
+        with self.adapter.observe(self.model, digest):
+            pass
+        self.assertEqual(self.collector.loaded, [digest])
+        for _ in range(3):
+            self.adapter.bind({self.model: digest})
+        self.assertEqual(len(self.collector.verified), 1)
+        # A model whose session reads a file is still hashed at every binding.
+        other = self.model.with_name("other.onnx")
+        self.adapter.bind({other: "d" * 64})
+        with self.adapter.observe(other):
+            pass
+        self.adapter.bind({other: "d" * 64})
+        self.assertEqual(
+            self.collector.verified,
+            [(self.model, digest), (other, "d" * 64), (other, "d" * 64)],
+        )
+
+    def test_a_session_holding_other_bytes_is_refused_and_never_trusted(self):
+        self.adapter.bind({self.model: "c" * 64})
+        with self.assertRaises(ValueError), self.adapter.observe(self.model, "d" * 64):
+            pass
+        self.assertEqual(self.collector.identifier, 0)
+        self.assertEqual(self.adapter.held, {})
+        with self.assertRaises(ValueError):
+            self.adapter.evidence()
 
 
 if __name__ == "__main__":

@@ -154,15 +154,65 @@ class RuntimeBuilderTests(unittest.TestCase):
                     metal_observer=True,
                 )
 
-    def test_providers_without_a_build_recipe_are_refused(self):
+    def test_cuda_and_openvino_manifests_are_limited_to_their_approved_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "python").write_bytes(b"fixture")
-            for provider in ["CUDAExecutionProvider", "OpenVINOExecutionProvider"]:
+            arguments = (root, "python", "a" * 40, 7)
+            for provider, systems in [
+                ("CUDAExecutionProvider", ["windows", "linux"]),
+                ("OpenVINOExecutionProvider", ["windows", "linux"]),
+            ]:
+                for system in systems:
+                    value = builder.manifest(
+                        *arguments, system, "x86_64", provider, "frameleaf_ml"
+                    )
+                    self.assertEqual(value["provider"], provider)
+                    # Only CoreML has a device collector.
+                    self.assertNotIn("deviceObserver", value)
+                for system, architecture in [
+                    ("macos", "aarch64"),
+                    ("macos", "x86_64"),
+                    ("linux", "aarch64"),
+                ]:
+                    with self.assertRaises(builder.BuildError):
+                        builder.manifest(*arguments, system, architecture, provider)
                 with self.assertRaises(builder.BuildError):
                     builder.manifest(
-                        root, "python", "a" * 40, 7, "linux", "x86_64", provider
+                        *arguments,
+                        "linux",
+                        "x86_64",
+                        provider,
+                        "frameleaf_ml",
+                        metal_observer=True,
                     )
+            # A provider nobody approved has no recipe.
+            with self.assertRaises(builder.BuildError):
+                builder.manifest(
+                    *arguments, "linux", "x86_64", "MIGraphXExecutionProvider"
+                )
+
+    def test_only_the_gpu_wheel_comes_from_the_cuda_feed(self):
+        def block(name):
+            return (
+                f"{name}==1.0 \\\n"
+                f"    --hash=sha256:{'a' * 64} \\\n"
+                f"    --hash=sha256:{'b' * 64}\n"
+            )
+
+        locked = block("numpy") + block("onnxruntime-gpu") + block("nvidia-cudnn-cu12")
+        # The feed also mirrors other packages at other versions, so nothing else may be
+        # resolved against it.
+        rest, feed, index = builder.feed_requirements("CUDAExecutionProvider", locked)
+        self.assertEqual(feed, block("onnxruntime-gpu"))
+        self.assertEqual(rest, block("numpy") + block("nvidia-cudnn-cu12"))
+        self.assertEqual(index, builder.CUDA_FEED)
+        for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"]:
+            self.assertEqual(
+                builder.feed_requirements(provider, locked), (locked, "", None)
+            )
+        with self.assertRaises(builder.BuildError):
+            builder.feed_requirements("CUDAExecutionProvider", block("numpy"))
 
     def test_collector_is_staged_only_with_the_hashes_its_build_recorded(self):
         import hashlib
@@ -381,6 +431,11 @@ class RuntimeFailureReceiptTests(unittest.TestCase):
                 builder.dependency_indexes(system, architecture),
                 ["--default-index", "https://pypi.org/simple"],
             )
+        self.assertTrue(
+            builder.CUDA_FEED.startswith(
+                "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/"
+            )
+        )
 
     def test_windows_system_root_survives_uppercase_environment_keys(self):
         import os

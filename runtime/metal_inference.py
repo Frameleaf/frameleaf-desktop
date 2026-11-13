@@ -21,6 +21,8 @@ class MetalInference:
         self.collector = collector
         self.initial_facts = collector.facts()
         self.bindings: dict[Path, str] = {}
+        # Models a session holds in memory, by the digest of the bytes it was created from.
+        self.held: dict[Path, str] = {}
         self.totals: dict[str, dict] = {}
         self.failed = False
         self.lock = Lock()
@@ -47,9 +49,11 @@ class MetalInference:
                     and self.bindings[path] != digest
                 ):
                     raise ValueError("native_device_model_bindings_invalid")
-            # Binding reads every byte, before any run is observed.
+            # Binding reads every byte, before any run is observed. A model whose session
+            # already runs these bytes from memory has nothing left on disk to prove.
             for path, digest in models.items():
-                self.collector.verify(path, digest)
+                if self.held.get(path) != digest:
+                    self.collector.verify(path, digest)
             self.bindings.update(models)
         except BaseException:
             self.failed = True
@@ -58,14 +62,14 @@ class MetalInference:
             self.lock.release()
 
     @contextmanager
-    def observe(self, model: Path) -> Iterator[None]:
+    def observe(self, model: Path, loaded_sha256: str | None = None) -> Iterator[None]:
         if not self.lock.acquire(blocking=False):
             raise ValueError("native_device_parallel_call_refused")
         try:
             if self.failed or model not in self.bindings:
                 raise ValueError("native_device_model_not_bound")
             digest = self.bindings[model]
-            with self.collector.observe(model, digest):
+            with self.collector.observe(model, digest, loaded_sha256):
                 yield
             proof = self.collector.evidence(drain=True)
             if proof["facts"] != self.facts() or len(proof["calls"]) != 1:
@@ -95,6 +99,9 @@ class MetalInference:
             ) or not math.isfinite(current["gpuNanoseconds"]):
                 raise ValueError("native_device_evidence_overflow")
             self.totals[digest] = current
+            if loaded_sha256 is not None:
+                # The collector accepted it, so it is the bound digest.
+                self.held[model] = digest
         except BaseException:
             self.failed = True
             raise
