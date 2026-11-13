@@ -732,6 +732,15 @@ impl HostSetup {
             self.stop_proven(true).await
         }
     }
+    /// Installing an update on Windows ends this app, and with it Manager's job, which holds the
+    /// photo server and database. Close them in order through Manager first, on the same
+    /// journal proof Stop needs, then stop Manager. A failure is the reason nothing was
+    /// installed, and leaves the library as it was. This opens nothing by itself: the update
+    /// gate is taken afterwards and decides alone, so evidence it cannot read still blocks.
+    #[cfg(any(windows, test))]
+    pub(crate) async fn stop_for_update(&self) -> Result<(), String> {
+        self.stop_proven(true).await.map(|_| ())
+    }
     /// Windows is ending the session and ends this app, and with it Manager's job, when this
     /// returns. Close the photo server and database in order first. Whatever this cannot do
     /// (an operation in flight, no saved grant, a stop that fails) is left to the job's
@@ -3003,6 +3012,86 @@ mod tests {
         let view = setup.stop_proven(true).await.unwrap();
         assert_eq!(view.state, "idle");
         assert!(!setup.background_active());
+    }
+
+    /// The Windows update path on a stand-in Manager: the library is stopped in order before
+    /// the gate is taken, a stop that cannot be proven installs nothing and stops nothing, and
+    /// the gate still refuses whatever the stop did not prove.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_update_stops_the_library_in_order_and_installs_nothing_without_the_idle_proof() {
+        // Nothing hosted: nothing to stop, and the gate opens.
+        let idle = HostSetup::default();
+        idle.stop_for_update().await.unwrap();
+        assert!(idle.lock_for_update().is_ok());
+
+        // A controller holds the journal and Manager cannot be asked to stop it: the reason
+        // comes back, Manager and the library keep running, and the gate stays closed.
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["30"]);
+        let controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        assert_eq!(
+            setup.stop_for_update().await.unwrap_err(),
+            "native_manager_not_ready"
+        );
+        assert!(live(&mut setup.owner.try_lock().unwrap()));
+        assert_eq!(setup.lock_for_update().err().unwrap(), "update_host_active");
+        // A journal that cannot prove a clean stop is refused as it is, without asking.
+        drop(controller);
+        let mut journal = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        journal
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        drop(journal);
+        assert!(setup.stop_for_update().await.is_err());
+        assert!(live(&mut setup.owner.try_lock().unwrap()));
+        assert!(setup.lock_for_update().is_err());
+        // With the journal's proof of a clean stop, Manager is stopped and the gate opens.
+        cleanly_stopped(&fixture.state());
+        setup.stop_for_update().await.unwrap();
+        assert!(setup.owner.try_lock().unwrap().is_none());
+        assert!(!setup.background_active());
+        assert!(setup.lock_for_update().is_ok());
+    }
+
+    /// A Manager that already exited leaves nothing to stop, which proves nothing about its
+    /// controller: the stop succeeds and the gate still refuses until the journal proves idle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_update_stop_that_had_nothing_to_stop_does_not_open_the_gate() {
+        let fixture = OwnedFixture::new();
+        let setup = fixture.own("/bin/sleep", &["0.2"]);
+        // Its controller still holds the journal and runs the database.
+        let mut controller = crate::host_state::Owner::acquire(&fixture.state(), true).unwrap();
+        controller
+            .activate(
+                "aaaaaaaaaaaa",
+                &"a".repeat(64),
+                crate::host_runtime::HostMode::Server,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while setup.background_active() {
+            assert!(std::time::Instant::now() < deadline, "Manager did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        setup.stop_for_update().await.unwrap();
+        assert_eq!(
+            setup.lock_for_update().err().unwrap(),
+            "update_library_not_idle"
+        );
+        drop(controller);
+        // Released, but never cleanly stopped: unknown, which blocks exactly as running does.
+        assert_eq!(
+            setup.lock_for_update().err().unwrap(),
+            "update_library_not_idle"
+        );
+        cleanly_stopped(&fixture.state());
+        assert!(setup.lock_for_update().is_ok());
     }
 
     #[cfg(unix)]

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install the built Desktop .deb in clean distribution containers and fail on unmet dependencies.
+# Install the built Desktop .deb in clean distribution containers, fail on unmet dependencies, and
+# run the installed binaries there.
 #
 #   qualify_linux_deb_install.sh PACKAGE.deb [IMAGE...]
 #
@@ -7,6 +8,11 @@
 # dependencies with apt. The tray is loaded at run time (libayatana-appindicator3.so.1 first), so the
 # package must depend on libayatana-appindicator3-1, which all three distributions ship; the older
 # libappindicator3-1 is not in Debian 12.
+#
+# Every binary the package puts in /usr/bin is then run with --version in that container. A binary
+# linked against a newer C library than the distribution has (GLIBC_2.39 on Ubuntu 22.04) fails to
+# load, and that fails this check. tools/check_linux_glibc.py reports the same requirement from the
+# package alone.
 set -euo pipefail
 [[ $# -ge 1 ]] || { echo 'usage: qualify_linux_deb_install.sh PACKAGE.deb [IMAGE...]' >&2; exit 2; }
 package=$(realpath -- "$1")
@@ -47,19 +53,23 @@ for image in "${images[@]}"; do
       apt-get install -y --no-install-recommends /install/package.deb
       [[ "$(dpkg-query --show --showformat="\${db:Status-Abbrev}" "$PACKAGE_NAME")" == "ii " ]]
       ls /usr/lib/*/libayatana-appindicator3.so.1 > /dev/null
-      # Installing proves the dependencies resolve; whether this distribution can also load the
-      # binaries depends on the C library of the build machine, reported here without failing.
-      status=0
+      # Installing proves the dependencies resolve. Running each installed binary proves this
+      # distribution can load it: the dynamic loader refuses a binary that needs a newer C library
+      # or a library that is missing, before --version is ever read.
+      ran=0
       while IFS= read -r file; do
         [[ -f "$file" && -x "$file" ]] || continue
-        if missing=$(ldd "$file" 2>&1 | grep "not found"); then
-          status=1
-          echo "::warning::$file cannot be loaded here: $(echo "$missing" | head -n 3 | tr "\n" " ")"
+        if ! answer=$("$file" --version 2>&1); then
+          echo "::error::$file does not run here: $(echo "$answer" | head -n 3 | tr "\n" " ")"
+          ldd "$file" 2>&1 | grep -E "not found" || true
+          exit 1
         fi
+        echo "$file --version: $answer"
+        ran=$((ran + 1))
       done < <(dpkg-query --listfiles "$PACKAGE_NAME" | grep -E "^/usr/bin/")
-      [[ $status == 0 ]] && echo "Installed binaries load in this distribution."
-      exit 0
+      [[ $ran -gt 0 ]] || { echo "::error::The package installed no binary in /usr/bin"; exit 1; }
+      echo "Installed binaries run in this distribution."
     '
   echo '::endgroup::'
 done
-echo "Installed $name with apt in: ${images[*]}"
+echo "Installed and ran $name in: ${images[*]}"

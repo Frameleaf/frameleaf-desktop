@@ -13,21 +13,27 @@
   let { options, native, computer, cloudAccount, autostart = false, deviceName = $bindable('My computer'), onconnected, onlocked, oncloudsignin, onback }: {
     options: SignInOptions; native: boolean; computer: string; cloudAccount: CloudAccount | null; autostart?: boolean; deviceName?: string;
     onconnected: (connection: Connection) => void; onlocked: () => void;
-    oncloudsignin: () => void; onback: () => void;
+    oncloudsignin: () => Promise<boolean>; onback: () => void;
   } = $props();
   let email = $state('');
   let password = $state('');
   let busy = $state(false);
   let failure = $state('');
   const methods = $derived(signInMethods(options));
+  // Sign in with Frameleaf is the standard way in wherever the server takes it. The server's own
+  // Password stays one click away, and is shown straight away on a server that takes nothing else.
+  let ownPassword = $state(false);
+  const passwordShown = $derived(methods.password && (!methods.frameleaf || ownPassword));
+  let emailField = $state<HTMLInputElement>();
+  function showPassword() { ownPassword = true; void tick().then(() => emailField?.focus()); }
   const route = $derived(options.local ? `On this network · ${new URL(options.server).host}` : `Over the internet · ${new URL(options.server).host}`);
 
   async function withFrameleaf() {
     if (!native || busy) return;
     busy = true; failure = '';
     try {
-      // No Frameleaf account yet: sign in to it first, then this screen comes back and finishes.
-      if (!cloudAccount) { oncloudsignin(); return; }
+      // No Frameleaf account yet: sign in to it in the browser first, then carry on here.
+      if (!cloudAccount && !(await oncloudsignin())) return;
       // The server may ask for its own Password or authenticator before it gives a session.
       settle(await invoke<SignInOutcome>('connect_cloud_server', { instanceId: options.id, deviceName, server: options.server }), 'frameleaf');
     } catch (error) { if (savedSignInNeedsRecovery(error)) onlocked(); failure = connectionError(error); }
@@ -131,10 +137,13 @@
       <button class="btn" class:primary={!methods.frameleaf && !methods.password} type="button" disabled={busy || !native} onclick={withProvider}>{busy ? 'Signing in…' : methods.oauth}</button>
       {#if !methods.frameleaf && !methods.password}<p class="sub">A sign-in window opens for {methods.oauth}. It stores nothing after you finish.</p>{/if}
     {/if}
-    {#if methods.password}
+    {#if methods.password && !passwordShown}
+      <button class="btn quiet" type="button" aria-expanded="false" disabled={busy} onclick={showPassword}>Sign In with a Server Password Instead</button>
+    {/if}
+    {#if passwordShown}
       {#if methods.frameleaf || methods.oauth}<div class="or" role="separator">{methods.oauth ? 'or with email and Password' : 'or use this server’s sign-in'}</div>{:else}<h3>This server’s sign-in</h3>{/if}
       <form id="server-login" aria-label="This server’s sign-in" onsubmit={withPassword}>
-        <div class="form-row"><label for="sl-em">Account</label><span class="two"><input id="sl-em" type="email" placeholder="Email" bind:value={email} required disabled={busy} autocomplete="username" /><input id="sl-pw" type="password" placeholder="Password" aria-label="Password" bind:this={passwordField} bind:value={password} required disabled={busy} autocomplete="current-password" /></span></div>
+        <div class="form-row"><label for="sl-em">Account</label><span class="two"><input id="sl-em" type="email" placeholder="Email" bind:this={emailField} bind:value={email} required disabled={busy} autocomplete="username" /><input id="sl-pw" type="password" placeholder="Password" aria-label="Password" bind:this={passwordField} bind:value={password} required disabled={busy} autocomplete="current-password" /></span></div>
       </form>
     {/if}
     {#if !options.linked}
@@ -148,7 +157,7 @@
     {/if}
   </div>
   <div class="wfoot">
-    <p>No account on this server? The person who runs it adds you on the server’s web page; you can’t make one here.{methods.password ? ' Your Password is used only to sign in and is never saved.' : ''}</p>
-    {#if methods.password}<button class="btn" class:primary={!methods.frameleaf} type="submit" form="server-login" disabled={busy || !native || !email || !password}>{busy ? 'Signing in…' : 'Sign In'}</button>{/if}
+    <p>No account on this server? The person who runs it adds you on the server’s web page; you can’t make one here.{passwordShown ? ' Your Password is used only to sign in and is never saved.' : ''}</p>
+    {#if passwordShown}<button class="btn" class:primary={!methods.frameleaf} type="submit" form="server-login" disabled={busy || !native || !email || !password}>{busy ? 'Signing in…' : 'Sign In'}</button>{/if}
   </div>
 {/if}

@@ -147,6 +147,8 @@ export function workerView({ connectionState, workerSupported, computer, setup }
     case 'setup-needs-attention': {
       const history = runtimeRecoveryMessage(code);
       if (history) return needs('AI processing needs recovery', history, 'retry-setup');
+      // Only a newer macOS changes this, so there is nothing to retry.
+      if (code === 'runtime_os_unsupported') return needs('This Mac’s macOS is too old for AI processing', errorCopy(code)!);
       const reason = workerReason(code);
       // This build ships without a runtime: installing it again would not change that.
       const known = code === 'runtime_pack_unavailable' ? null : reason && needsYou[reason];
