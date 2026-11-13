@@ -28,8 +28,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      # The oldest macOS the app runs on: bundle.macOS.minimumSystemVersion in src-tauri/tauri.conf.json.
-      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # The oldest macOS the app itself runs on: `app` in packaging/macos/minimum-versions.json.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -202,7 +202,7 @@ jobs:
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build unsigned shell smoke-test candidate
         run: npm run desktop:build:shell -- --debug
-      - name: Check no bundled macOS binary needs a newer macOS than declared
+      - name: Check no app binary needs a newer macOS than declared
         if: runner.os == 'macOS'
         run: python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" src-tauri/target/debug/bundle/macos/Frameleaf.app
       - name: Install the unsigned Linux package in clean Ubuntu and Debian containers

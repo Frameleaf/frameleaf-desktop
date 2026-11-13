@@ -70,35 +70,51 @@ installed bytes.
 
 ## Supported systems
 
-### macOS minimum version
+### macOS minimum versions
 
-Frameleaf Desktop requires macOS 15.0 or later. The value is declared once, as
-`bundle.macOS.minimumSystemVersion` in `src-tauri/tauri.conf.json`, and the
-macOS build jobs in `desktop.yml` and `release.yml` set
-`MACOSX_DEPLOYMENT_TARGET` to the same value.
+Two floors are declared in `packaging/macos/minimum-versions.json`:
 
-The floor is the highest minimum recorded in the binaries the app ships, read
-with `tools/check_macos_minimum.py` from the installed 0.1.6 Apple silicon app:
+| Key | Value | Meaning |
+| --- | --- | --- |
+| `app` | 11.0 | The oldest macOS the app installs and runs on: photos, imports, Manager and local hosting. |
+| `aiRuntime` | 15.0 | The oldest macOS the optional AI runtime pack runs on. AI processing needs it; nothing else does. |
 
-| Shipped binary | Minimum macOS |
-| --- | --- |
-| Rust toolchain default for `aarch64-apple-darwin` (`rustc --print deployment-target`) | 11.0 |
-| Rust toolchain default for `x86_64-apple-darwin` | 10.12 |
-| Tauri default when no minimum is declared (the 0.1.6 `LSMinimumSystemVersion`) | 10.13 |
-| AI runtime: Python interpreter and most libraries | 11.0 |
-| AI runtime: OpenCV (`cv2`) and its libraries | 13.0 |
-| AI runtime: NumPy, ONNX Runtime | 14.0 |
-| AI runtime: `orjson` | 15.0 |
+`bundle.macOS.minimumSystemVersion` in `src-tauri/tauri.conf.json` and
+`MACOSX_DEPLOYMENT_TARGET` in the macOS build jobs of `desktop.yml` and
+`release.yml` carry the `app` value. The AI runtime floor is never written
+into the bundle, so an older Mac still installs and opens the app.
+
+Both values are the highest minimum recorded in the binaries of each part,
+read with `tools/check_macos_minimum.py` from the installed 0.1.6 Apple
+silicon app:
+
+| Part | Shipped binary | Minimum macOS |
+| --- | --- | --- |
+| App | `frameleaf-desktop` and the `frameleaf-native-host` sidecar | 11.0 |
+| App | Rust default for `aarch64-apple-darwin` (`rustc --print deployment-target`) | 11.0 |
+| App | Rust default for `x86_64-apple-darwin` | 10.12 |
+| App | Tauri default when no minimum is declared (the 0.1.6 `LSMinimumSystemVersion`) | 10.13 |
+| AI runtime | Python interpreter and most libraries | 11.0 |
+| AI runtime | protobuf | 12.0 |
+| AI runtime | OpenCV (`cv2`) and its libraries | 13.0 |
+| AI runtime | NumPy, ONNX Runtime | 14.0 |
+| AI runtime | `orjson` | 15.0 |
 
 `python3 tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" Frameleaf.app`
-fails when any Mach-O file in the bundle, including the AI runtime under
-`Contents/Resources/native-runtime`, needs a newer macOS than declared, when a
-loaded binary records no minimum, or when the bundle's `LSMinimumSystemVersion`
-differs from the declaration. `Desktop candidate` runs it on the unsigned shell
-and `Desktop release` runs it on the app with its runtime before signing. To
-lower the floor, rebuild the runtime libraries above for an older macOS first;
-to raise it, change `tauri.conf.json` and both workflows together
-(`tools/test_check_macos_minimum.py` fails when they disagree).
+treats the `native-runtime` folder as the AI runtime and everything else as
+the app. It fails when an app binary needs a newer macOS than `app`, when a
+runtime binary needs a newer macOS than `aiRuntime`, when a loaded binary
+records no minimum, when the bundle's `LSMinimumSystemVersion` or
+`tauri.conf.json` differs from `app`, or when `MACOSX_DEPLOYMENT_TARGET`
+does. `--report FILE` writes the declared and measured values as JSON.
+`Desktop candidate` runs the check on the unsigned shell. `Desktop release`
+runs it on the app with its runtime before signing and adds the report to the
+run summary. A runtime rebuilt for an older macOS lets `aiRuntime` be lowered;
+to change `app`, change the declaration, `tauri.conf.json` and both workflows
+together (`tools/test_check_macos_minimum.py` fails when they disagree).
+
+The app does not yet tell someone on macOS 11 to 14 why AI processing cannot
+start there; see the follow-up noted in FD-54.
 
 ### Linux tray library
 

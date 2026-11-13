@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Fail when a bundled macOS binary needs a newer macOS than the app declares.
+"""Fail when a bundled macOS binary needs a newer macOS than is declared for it.
 
-Reads `bundle.macOS.minimumSystemVersion` from tauri.conf.json and the minimum
-macOS version recorded in every Mach-O file under the given paths
-(LC_BUILD_VERSION, or LC_VERSION_MIN_MACOSX in older binaries). The files are
-parsed directly, so the check also runs where Xcode's vtool is not installed.
+Two floors are declared in packaging/macos/minimum-versions.json:
+
+- `app`: the oldest macOS the app itself runs on. It must equal
+  `bundle.macOS.minimumSystemVersion` in tauri.conf.json, and no app binary may
+  need a newer macOS.
+- `aiRuntime`: the oldest macOS the optional AI runtime pack runs on (the
+  `native-runtime` folder in the bundle). No runtime binary may need a newer one.
+
+The minimum of every Mach-O file is read from LC_BUILD_VERSION (or
+LC_VERSION_MIN_MACOSX in older binaries). The files are parsed directly, so the
+check also runs where Xcode's vtool is not installed.
 """
 import argparse
 import json
@@ -26,6 +33,7 @@ PLATFORM_MACOS = 1
 # Executables, dynamic libraries and loadable bundles are what macOS refuses to load when too new.
 LOADED_FILE_TYPES = {2, 6, 8}
 MAX_HEADER = 1 << 20
+RUNTIME_FOLDER = "native-runtime"
 
 
 def parse_version(text):
@@ -123,11 +131,20 @@ def scan(roots):
     return found, unknown, unreadable
 
 
-def declared_minimum(config):
-    value = json.loads(Path(config).read_text(encoding="utf-8")).get("bundle", {}).get("macOS", {}).get("minimumSystemVersion")
-    if value is None:
+def declared_minimums(declaration, config):
+    """(app, aiRuntime) floors; the app floor must be the one tauri.conf.json gives the bundle."""
+    values = json.loads(Path(declaration).read_text(encoding="utf-8"))
+    if not isinstance(values, dict) or set(values) != {"app", "aiRuntime"}:
+        raise ValueError(f"{declaration} must declare exactly app and aiRuntime")
+    app, runtime = parse_version(values["app"]), parse_version(values["aiRuntime"])
+    bundle = json.loads(Path(config).read_text(encoding="utf-8")).get("bundle", {}).get("macOS", {}).get("minimumSystemVersion")
+    if bundle is None:
         raise ValueError(f"{config} declares no bundle.macOS.minimumSystemVersion")
-    return parse_version(value)
+    if parse_version(bundle) != app:
+        raise ValueError(f"{config} declares macOS {bundle}, but {declaration} declares {values['app']} for the app")
+    if runtime < app:
+        raise ValueError("the AI runtime minimum cannot be older than the app minimum")
+    return app, runtime
 
 
 def bundle_minimums(roots):
@@ -141,33 +158,46 @@ def bundle_minimums(roots):
     return declared
 
 
+def in_runtime(path):
+    """The AI runtime pack is the `native-runtime` folder, in a bundle or given on its own."""
+    return RUNTIME_FOLDER in Path(path).parts
+
+
 def main(arguments=None):
+    tools = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("paths", nargs="+", help="app bundles, runtime folders or single binaries")
-    parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "src-tauri" / "tauri.conf.json"))
-    parser.add_argument("--deployment-target", help="also require this value (MACOSX_DEPLOYMENT_TARGET) to equal the declared minimum")
+    parser.add_argument("paths", nargs="+", help="app bundles, native-runtime folders or single binaries")
+    parser.add_argument("--config", default=str(tools.parent / "src-tauri" / "tauri.conf.json"))
+    parser.add_argument("--declaration", default=str(tools.parent / "packaging" / "macos" / "minimum-versions.json"))
+    parser.add_argument("--deployment-target", help="also require this value (MACOSX_DEPLOYMENT_TARGET) to equal the app minimum")
+    parser.add_argument("--report", help="write the declared and measured minimums to this JSON file")
     options = parser.parse_args(arguments)
     try:
-        declared = declared_minimum(options.config)
-        target = parse_version(options.deployment_target) if options.deployment_target is not None else declared
+        app, runtime = declared_minimums(options.declaration, options.config)
+        target = parse_version(options.deployment_target) if options.deployment_target is not None else app
         found, unknown, unreadable = scan(options.paths)
         bundles = {plist: None if value is None else parse_version(value) for plist, value in bundle_minimums(options.paths).items()}
     except (OSError, ValueError, plistlib.InvalidFileException) as error:
         print(f"macOS minimum check could not run: {error}", file=sys.stderr)
         return 2
     failed = False
-    if target != declared:
-        print(f"MACOSX_DEPLOYMENT_TARGET {format_version(target)} differs from the declared minimum {format_version(declared)}", file=sys.stderr)
+    if target != app:
+        print(f"MACOSX_DEPLOYMENT_TARGET {format_version(target)} differs from the declared app minimum {format_version(app)}", file=sys.stderr)
         failed = True
     # macOS reads the bundle's own value, so a build that dropped or changed it is refused here.
     for plist, value in bundles.items():
-        if value != declared:
-            print(f"{plist} declares macOS {format_version(value) if value else 'no minimum'}, expected {format_version(declared)}", file=sys.stderr)
+        if value != app:
+            print(f"{plist} declares macOS {format_version(value) if value else 'no minimum'}, expected {format_version(app)}", file=sys.stderr)
             failed = True
-    for path, minimum in sorted(found.items()):
-        if minimum > declared:
-            print(f"{path} requires macOS {format_version(minimum)}, newer than the declared {format_version(declared)}", file=sys.stderr)
-            failed = True
+    report = {}
+    for name, label, declared, wanted in (("app", "app", app, False), ("aiRuntime", "AI runtime", runtime, True)):
+        files = {path: minimum for path, minimum in found.items() if in_runtime(path) == wanted}
+        for path, minimum in sorted(files.items()):
+            if minimum > declared:
+                print(f"{path} requires macOS {format_version(minimum)}, newer than the declared {label} minimum {format_version(declared)}", file=sys.stderr)
+                failed = True
+        highest = max(files.values()) if files else None
+        report[name] = {"declared": format_version(declared), "highest": format_version(highest) if highest else None, "files": len(files)}
     # A binary whose requirement cannot be read is not known to run on the declared minimum.
     for path in unknown:
         print(f"{path} records no minimum macOS version", file=sys.stderr)
@@ -178,10 +208,16 @@ def main(arguments=None):
     if not found and not failed:
         print("No Mach-O binaries were found to check", file=sys.stderr)
         return 2
+    if options.report:
+        Path(options.report).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if failed:
         return 1
-    highest = max(found.values())
-    print(f"{len(found)} Mach-O files checked; highest requirement macOS {format_version(highest)}, declared minimum {format_version(declared)}")
+    for name, label in (("app", "App"), ("aiRuntime", "AI runtime")):
+        entry = report[name]
+        if entry["files"]:
+            print(f"{label}: {entry['files']} Mach-O files checked; highest requirement macOS {entry['highest']}, declared minimum {entry['declared']}")
+        else:
+            print(f"{label}: no Mach-O files in the given paths; declared minimum {entry['declared']}")
     return 0
 
 

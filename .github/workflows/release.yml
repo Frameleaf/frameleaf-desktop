@@ -76,8 +76,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      # The oldest macOS the app runs on: bundle.macOS.minimumSystemVersion in src-tauri/tauri.conf.json.
-      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # The oldest macOS the app itself runs on: `app` in packaging/macos/minimum-versions.json.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     permissions:
       contents: read
       actions: read
@@ -159,9 +159,14 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
         run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
-      - name: Check no bundled macOS binary or runtime library needs a newer macOS than declared
+      - name: Check the app and its AI runtime need no newer macOS than each declares
         if: runner.os == 'macOS'
-        run: python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" src-tauri/target/release/bundle/macos/Frameleaf.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" \
+            --report "$RUNNER_TEMP/macos-minimum-versions.json" src-tauri/target/release/bundle/macos/Frameleaf.app
+          { echo '### macOS minimum versions'; echo '```json'; cat "$RUNNER_TEMP/macos-minimum-versions.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Sign the macOS GUI with its provisioned Keychain identity and package the DMG
         if: runner.os == 'macOS'
         env:

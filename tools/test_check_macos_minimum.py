@@ -46,12 +46,14 @@ class CheckMacosMinimum(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.config = self.root / "tauri.conf.json"
+        self.declaration = self.root / "minimum-versions.json"
         self.declare("13.0")
         self.app = self.root / "Frameleaf.app"
         (self.app / "Contents" / "MacOS").mkdir(parents=True)
 
-    def declare(self, minimum):
+    def declare(self, minimum, runtime="15.0", app=None):
         self.config.write_text(json.dumps({"bundle": {"macOS": {"minimumSystemVersion": minimum}} if minimum else {}}))
+        self.declaration.write_text(json.dumps({"app": app or minimum or "13.0", "aiRuntime": runtime}))
 
     def binary(self, name, data):
         path = self.app / "Contents" / "MacOS" / name
@@ -62,7 +64,7 @@ class CheckMacosMinimum(unittest.TestCase):
     def run_check(self, *extra):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = check.main(["--config", str(self.config), str(self.app), *extra])
+            code = check.main(["--config", str(self.config), "--declaration", str(self.declaration), str(self.app), *extra])
         return code, out.getvalue(), err.getvalue()
 
     def test_accepts_binaries_at_or_below_the_declared_minimum(self):
@@ -71,14 +73,59 @@ class CheckMacosMinimum(unittest.TestCase):
         self.binary("notes.txt", b"not a binary")
         code, out, _ = self.run_check("--deployment-target", "13.0")
         self.assertEqual(code, 0)
-        self.assertIn("2 Mach-O files checked; highest requirement macOS 13.0", out)
+        self.assertIn("App: 2 Mach-O files checked; highest requirement macOS 13.0, declared minimum 13.0", out)
+        self.assertIn("AI runtime: no Mach-O files in the given paths; declared minimum 15.0", out)
 
     def test_refuses_a_binary_that_needs_a_newer_macos(self):
         self.binary("app", macho(build_version(version(11, 0))))
-        newer = self.binary("lib/orjson.so", macho(build_version(version(15, 0)), file_type=8))
+        newer = self.binary("lib/helper.dylib", macho(build_version(version(15, 0)), file_type=6))
         code, _, err = self.run_check()
         self.assertEqual(code, 1)
-        self.assertIn(f"{newer} requires macOS 15.0, newer than the declared 13.0", err)
+        self.assertIn(f"{newer} requires macOS 15.0, newer than the declared app minimum 13.0", err)
+
+    def runtime(self, name, data):
+        path = self.app / "Contents" / "Resources" / "native-runtime" / "payload" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def test_the_ai_runtime_is_held_to_its_own_minimum_not_the_apps(self):
+        self.binary("app", macho(build_version(version(11, 0))))
+        self.runtime("orjson.so", macho(build_version(version(15, 0)), file_type=8))
+        self.runtime("numpy.so", macho(build_version(version(14, 0)), file_type=8))
+        report = self.root / "report.json"
+        code, out, _ = self.run_check("--report", str(report))
+        self.assertEqual(code, 0)
+        self.assertIn("App: 1 Mach-O files checked; highest requirement macOS 11.0, declared minimum 13.0", out)
+        self.assertIn("AI runtime: 2 Mach-O files checked; highest requirement macOS 15.0, declared minimum 15.0", out)
+        self.assertEqual(json.loads(report.read_text()), {
+            "app": {"declared": "13.0", "highest": "11.0", "files": 1},
+            "aiRuntime": {"declared": "15.0", "highest": "15.0", "files": 2},
+        })
+
+    def test_refuses_a_runtime_that_needs_more_than_its_declared_minimum(self):
+        self.binary("app", macho(build_version(version(11, 0))))
+        newer = self.runtime("torch.so", macho(build_version(version(15, 4)), file_type=8))
+        report = self.root / "report.json"
+        code, _, err = self.run_check("--report", str(report))
+        self.assertEqual(code, 1)
+        self.assertIn(f"{newer} requires macOS 15.4, newer than the declared AI runtime minimum 15.0", err)
+        self.assertEqual(json.loads(report.read_text())["aiRuntime"]["highest"], "15.4")
+        self.runtime("torch.so", macho(file_type=8))
+        code, _, err = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("records no minimum macOS version", err)
+
+    def test_the_declaration_and_the_bundle_configuration_must_agree(self):
+        self.binary("app", macho(build_version(version(11, 0))))
+        self.declare("13.0", app="11.0")
+        code, _, err = self.run_check()
+        self.assertEqual(code, 2)
+        self.assertIn("declares 11.0 for the app", err)
+        self.declare("13.0", runtime="12.0")
+        self.assertEqual(self.run_check()[0], 2)
+        self.declaration.write_text(json.dumps({"app": "13.0"}))
+        self.assertEqual(self.run_check()[0], 2)
 
     def test_checks_every_architecture_of_a_universal_binary(self):
         self.binary("universal", fat(macho(build_version(version(11, 0))), macho(build_version(version(14, 2)))))
@@ -113,7 +160,7 @@ class CheckMacosMinimum(unittest.TestCase):
         self.binary("app", macho(build_version(version(13, 0))))
         code, _, err = self.run_check("--deployment-target", "12.0")
         self.assertEqual(code, 1)
-        self.assertIn("MACOSX_DEPLOYMENT_TARGET 12.0 differs from the declared minimum 13.0", err)
+        self.assertIn("MACOSX_DEPLOYMENT_TARGET 12.0 differs from the declared app minimum 13.0", err)
         self.assertEqual(self.run_check("--deployment-target", "latest")[0], 2)
         self.declare(None)
         code, _, err = self.run_check()
@@ -133,7 +180,9 @@ class CheckMacosMinimum(unittest.TestCase):
         self.assertEqual(self.run_check()[0], 1)
 
     def test_workflows_build_macos_with_the_declared_minimum(self):
-        declared = check.format_version(check.declared_minimum(ROOT / "src-tauri" / "tauri.conf.json"))
+        app, runtime = check.declared_minimums(ROOT / "packaging" / "macos" / "minimum-versions.json", ROOT / "src-tauri" / "tauri.conf.json")
+        self.assertGreaterEqual(runtime, app)
+        declared = check.format_version(app)
         targets = {}
         for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
             values = re.findall(r"^\s*MACOSX_DEPLOYMENT_TARGET:\s*['\"]?([0-9.]+)['\"]?\s*$", workflow.read_text(encoding="utf-8"), re.MULTILINE)
