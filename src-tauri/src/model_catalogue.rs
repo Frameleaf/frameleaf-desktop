@@ -1281,6 +1281,18 @@ mod tests {
             "2ce10598215ef4ab45f4fcc38c3ae39c7bea261e742a21d10f7c67f7579f4095",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
+        // FD-56: an epoch 14 twin has its original's specification, so its digest: only the
+        // runtime source differs.
+        let twins: Vec<&str> = profiles
+            .iter()
+            .zip(expected)
+            .filter(|(profile, _)| {
+                profile.runtime_source_revision == "f2c451a6bf71ca3f3aec986e07f0852937268e2f"
+            })
+            .map(|(_, digest)| digest)
+            .collect();
+        assert_eq!(twins.len(), 60);
+        let expected: Vec<&str> = expected.into_iter().chain(twins).collect();
         assert_eq!(profiles.len(), expected.len());
         for (profile, expected) in profiles.iter().zip(expected) {
             let (spec, _) = profile
