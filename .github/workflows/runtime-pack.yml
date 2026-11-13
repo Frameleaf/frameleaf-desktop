@@ -161,12 +161,12 @@ jobs:
           grep -A1 '^onnxruntime==' candidate/payload/requirements.txt
           candidate/payload/python/bin/python3.12 -I -B desktop/tools/smoke_cpu_runtime.py x86_64 | tee -a "$GITHUB_STEP_SUMMARY"
       # The older onnxruntime must still give the catalogue's expected output for real models:
-      # the two smallest (text recognition, faces) are staged and qualified as the app does.
+      # the smallest of each kind (text recognition, faces, search) is staged and qualified as the app does.
       - name: Qualify catalogue models with the Intel pack
         shell: bash
         run: |
           set -euo pipefail
-          python desktop/tools/qualify_runtime_models.py candidate "$RUNNER_TEMP/qualification" PP-OCRv5_mobile buffalo_s | tee -a "$GITHUB_STEP_SUMMARY"
+          python desktop/tools/qualify_runtime_models.py candidate "$RUNNER_TEMP/qualification" PP-OCRv5_mobile buffalo_s ViT-B-32__openai | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Check no Intel runtime binary needs a newer macOS than the AI runtime minimum
         shell: bash
         run: |
