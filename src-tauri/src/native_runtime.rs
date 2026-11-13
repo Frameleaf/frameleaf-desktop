@@ -312,11 +312,29 @@ pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> R
 }
 
 const START: &[u8] = b"frameleaf-native-start\n";
-const GATE: &str = r#"import os,sys,runpy,threading,signal
+/// FD-71: on Windows the watch for a lost parent must never sit in a read of the pipe. The C
+/// runtime holds its lock on descriptor 0 for as long as a read of it is pending, and every other
+/// use of that descriptor in the process (`lseek`, `fstat`, a library setting up its standard
+/// streams as it loads) then waits for a read that never ends. onnxruntime's native module did
+/// exactly that while loading, under the loader lock, so the runtime could not even exit: every
+/// Windows runtime start hung importing onnxruntime and qualification timed out. There the pipe
+/// is looked at instead, which returns at once, until the parent's end closes or writes.
+const GATE: &str = r#"import os,sys,runpy,threading,signal,time
 expected=b'frameleaf-native-start\n'
 assert sys.stdin.buffer.read(len(expected))==expected
 def lost_parent():
-    os.read(sys.stdin.fileno(),1)
+    if os.name=='nt':
+        import msvcrt,_winapi
+        pipe=msvcrt.get_osfhandle(sys.stdin.fileno())
+        while True:
+            try:
+                if _winapi.PeekNamedPipe(pipe,0)[0]:
+                    break
+            except OSError:
+                break
+            time.sleep(0.2)
+    else:
+        os.read(sys.stdin.fileno(),1)
     if os.name=='posix':
         os.killpg(os.getpgrp(),signal.SIGKILL)
     os._exit(125)
@@ -1153,6 +1171,48 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+    /// FD-71: with the pipe held open, as the app holds it for as long as the runtime runs, the
+    /// runtime may still use its standard input: `lseek` and `fstat` on it (as onnxruntime's
+    /// native module does when it loads) and hand it to a child process. On Windows these waited
+    /// forever behind the gate's own read of the pipe.
+    #[test]
+    fn python_gate_leaves_the_standard_input_usable_while_the_parent_holds_the_pipe() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut command = Command::new(python);
+        command
+            .args(["-I", "-B", "-c", GATE, "timeit", "-n", "1", "-r", "1"])
+            // The gate's watch is started before this runs; give it time to be waiting.
+            // `lseek` takes the C runtime's lock on the descriptor, which a pending read held.
+            .arg("import os, subprocess, sys, time\ntime.sleep(1)\ntry: os.lseek(0, 0, 1)\nexcept OSError: pass\nos.fstat(0)\nsubprocess.run([sys.executable, '-I', '-B', '-c', 'pass'], check=True)")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(START).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= end {
+                tree.terminate();
+                let _ = child.wait();
+                panic!("the runtime hung using its standard input while the parent held the pipe");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(pipe);
+        tree.terminate();
+        assert!(status.success());
     }
     #[test]
     fn python_gate_terminates_when_parent_pipe_closes() {
