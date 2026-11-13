@@ -3813,7 +3813,7 @@ mod tests {
 
         // Manager started something that is still running in its job: neither Stop nor
         // quitting ends the job, and the app stays protected.
-        let busy = fixture.own("cmd.exe", &["/c", "ping -n 120 127.0.0.1"]);
+        let busy = fixture.own("cmd.exe", &["/c", "waitfor /t 120 FrameleafStandIn"]);
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while alone(&busy) != Evidence::Running {
             assert!(
@@ -3834,7 +3834,7 @@ mod tests {
         drop(busy);
 
         // Manager alone in its job.
-        let setup = fixture.own("ping.exe", &["-n", "120", "127.0.0.1"]);
+        let setup = fixture.own("waitfor.exe", &["/t", "120", "FrameleafStandIn"]);
         assert_eq!(alone(&setup), Evidence::Clear);
         // Update: refused with the journal's reason, and nothing is stopped for it.
         assert_eq!(
@@ -3851,6 +3851,7 @@ mod tests {
         assert!(setup.background_active());
         drop(controller);
         // Stop and quit.
+        assert_eq!(alone(&setup), Evidence::Clear);
         setup.quit(None, false).await.unwrap();
         assert!(!setup.background_active());
         assert!(setup.owner.try_lock().unwrap().is_none());
@@ -3860,7 +3861,7 @@ mod tests {
         );
 
         // Stop local management.
-        let setup = fixture.own("ping.exe", &["-n", "120", "127.0.0.1"]);
+        let setup = fixture.own("waitfor.exe", &["/t", "120", "FrameleafStandIn"]);
         assert_eq!(setup.stop().await.unwrap().state, "idle");
         assert!(!setup.background_active());
         assert_eq!(
