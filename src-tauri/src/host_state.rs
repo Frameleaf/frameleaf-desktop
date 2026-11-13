@@ -10,10 +10,19 @@ use std::{
 use uuid::Uuid;
 
 mod activation;
+#[cfg(any(windows, test))]
+pub mod media_move;
 pub(crate) use activation::SafetySnapshot;
 
 const NAME: &str = "controller-state.json";
 const ACTIVATION: &str = "restore-activation.json";
+const MEDIA_MOVE: &str = "media-move.pending";
+fn no_media_move(root: &Dir) -> Result<(), String> {
+    match root.symlink_metadata(MEDIA_MOVE) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_media_move_pending".into()),
+    }
+}
 fn no_activation(root: &Dir) -> Result<(), String> {
     match root.symlink_metadata(ACTIVATION) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -39,6 +48,9 @@ pub(crate) struct Marker {
     restore_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     database_reference: Option<crate::host_database::Reference>,
+    #[cfg(any(windows, test))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_reference: Option<media_move::MediaReference>,
 }
 pub(crate) struct Owner {
     #[cfg(windows)]
@@ -268,12 +280,15 @@ impl Owner {
         sha: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(), String> {
+        no_media_move(&self.root)?;
         if mode == crate::host_runtime::HostMode::RestorePrepare {
             self.reconcile_restore(id, sha)?;
         }
         if mode == crate::host_runtime::HostMode::Server {
             no_activation(&self.root)?;
         }
+        #[cfg(any(windows, test))]
+        let media_reference;
         let (database_reference, restore_pending) = match self.read()? {
             Some(marker) => {
                 self.binding(&marker, id, sha)?;
@@ -292,6 +307,16 @@ impl Owner {
                         reference.resolve(&self.path)?;
                     }
                 }
+                #[cfg(any(windows, test))]
+                {
+                    if let Some(reference) = &marker.media_reference {
+                        if mode != crate::host_runtime::HostMode::Server {
+                            return Err("host_external_media_maintenance_unavailable".into());
+                        }
+                        reference.resolve(&self.path)?;
+                    }
+                    media_reference = marker.media_reference;
+                }
                 (marker.database_reference, marker.restore_pending)
             }
             None => {
@@ -308,6 +333,10 @@ impl Owner {
                         return Err("host_recovery_requires_manager".into());
                     }
                 }
+                #[cfg(any(windows, test))]
+                {
+                    media_reference = None;
+                }
                 (None, false)
             }
         };
@@ -320,6 +349,8 @@ impl Owner {
             phase: Phase::Active,
             restore_pending,
             database_reference,
+            #[cfg(any(windows, test))]
+            media_reference,
         };
         self.write(&marker)?;
         self.active = Some(marker);
@@ -516,6 +547,7 @@ impl Owner {
         if !crate::native_runtime::digest_valid(next, 64) || previous == next {
             return Err("host_controller_binding_changed".into());
         }
+        no_media_move(&self.root)?;
         self.check_movable(id, previous)?;
         let current = self.read()?.ok_or("host_controller_state_invalid")?;
         let marker = Marker {
@@ -537,6 +569,11 @@ impl Owner {
         self.active = None;
         Ok(())
     }
+    #[cfg(windows)]
+    pub(crate) fn media_reference(&self) -> Option<&media_move::MediaReference> {
+        self.active.as_ref()?.media_reference.as_ref()
+    }
+
     /// Only the active controller can derive the internal host configuration.
     pub(crate) fn launch_state(
         &mut self,
@@ -764,6 +801,56 @@ mod tests {
             drop(inherited);
             next.unlock().unwrap();
         }
+    }
+
+    #[test]
+    fn move_preflight_requires_exact_stopped_owner_and_no_unfinished_recovery() {
+        let fixture = Fixture::new();
+        let manifest = sha();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &manifest, crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(
+            owner.check_movable(ID, &manifest).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.clean_stop().unwrap();
+        // Read through the held lease: Windows refuses a second handle on the locked journal.
+        let stopped = owner.read().unwrap();
+
+        for (id, digest) in [("bbbbbbbbbbbb", manifest.clone()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.check_movable(id, &digest).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+
+        let database = fixture.0.join("database");
+        crate::runtime_store::private_directory(&database).unwrap();
+        let pid = database.join("postmaster.pid");
+        fs::write(&pid, b"synthetic").unwrap();
+        assert_eq!(
+            owner.check_movable(ID, &manifest).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        fs::remove_file(pid).unwrap();
+
+        for name in ["checkpoints", "restore-input", "restore-targets"] {
+            let directory = fixture.0.join(name);
+            crate::runtime_store::private_directory(&directory).unwrap();
+            let operation = directory.join("unfinished");
+            fs::write(&operation, b"synthetic").unwrap();
+            assert_eq!(
+                owner.check_movable(ID, &manifest).unwrap_err(),
+                "host_upgrade_operation_pending"
+            );
+            assert_eq!(fs::read(&operation).unwrap(), b"synthetic");
+            fs::remove_file(operation).unwrap();
+        }
+
+        owner.check_movable(ID, &manifest).unwrap();
+        assert_eq!(owner.read().unwrap(), stopped);
     }
 
     #[test]
