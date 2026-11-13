@@ -9,7 +9,6 @@ import math
 import platform
 import re
 import stat
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,22 +46,6 @@ def file_hash(path: Path, limit: int) -> str:
         return digest.hexdigest()
     except OSError as error:
         raise ValueError("metal_file_unavailable") from error
-
-
-# A file changed after it was hashed gets a change time at or after that moment. So a hash can
-# stand for later calls only when every timestamp of the file was already this much older than
-# the moment hashing began: a later write then cannot leave the recorded identity in place.
-SETTLED_NANOSECONDS = 2_000_000_000
-
-
-def file_identity(path: Path) -> tuple[int, int, int, int, int]:
-    try:
-        info = path.lstat()
-    except OSError as error:
-        raise ValueError("metal_file_unavailable") from error
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("metal_file_invalid")
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def unique_object(pairs: list[tuple[str, object]]) -> dict:
@@ -132,7 +115,6 @@ class MetalObserver:
         self.check_library()
         self.lock = Lock()
         self.calls: list[tuple[int, str]] = []
-        self.verified: dict[Path, tuple[str, tuple[int, int, int, int, int]]] = {}
         self.next_identifier = 1
         self.failed = False
         self.installed = False
@@ -143,31 +125,19 @@ class MetalObserver:
             raise ValueError("metal_library_changed")
 
     def check_model(self, model: Path, expected_sha256: str) -> None:
-        """Every byte is hashed the first time and again whenever the file's identity (device,
-        inode, size, modification and change time) differs from the one that was hashed, so a
-        changed model still stops the run without reading the whole file around every call.
+        """Hash every byte of the model, through a path none of whose directories is a link.
 
-        Only the digest is remembered: the path is checked for links on every call, and a digest
-        is remembered only for a file whose timestamps were already settled when it was hashed
-        (see SETTLED_NANOSECONDS). A file inside that window, with a timestamp in the future, or
-        on a clock that went backwards is hashed every time."""
+        Hashing around every run is deliberate. Remembering a digest would need a way to know
+        the contents have not changed since, and no file identity or timestamp the platform
+        offers guarantees that (coarse or adjustable clocks, filesystems that differ). If CoreML
+        is ever considered for shipping, the sound way to drop this cost is to hash once the
+        read-only, memory-mapped bytes the session itself loads, not to trust metadata."""
         checked_parents(model)
-        identity = file_identity(model)
-        if self.verified.get(model) == (expected_sha256, identity):
-            return
-        self.verified.pop(model, None)
-        started = time.time_ns()
-        if (
-            file_hash(model, 16 * 1024**3) != expected_sha256
-            or file_identity(model) != identity
-        ):
+        if file_hash(model, 16 * 1024**3) != expected_sha256:
             raise ValueError("metal_model_changed")
-        if started - max(identity[3], identity[4]) > SETTLED_NANOSECONDS:
-            self.verified[model] = (expected_sha256, identity)
 
     def verify(self, model: Path, expected_sha256: str) -> None:
-        """Hash every byte now, whatever was remembered (used when a session is bound)."""
-        self.verified.pop(model, None)
+        """The same check when a session is bound, before any run is observed."""
         self.check_model(model, expected_sha256)
 
     def device_facts(self) -> dict:

@@ -47,8 +47,7 @@ class MetalInference:
                     and self.bindings[path] != digest
                 ):
                     raise ValueError("native_device_model_bindings_invalid")
-            # Binding always reads every byte; later calls may rely on the collector's
-            # change detection instead of hashing the model around each inference.
+            # Binding reads every byte, before any run is observed.
             for path, digest in models.items():
                 self.collector.verify(path, digest)
             self.bindings.update(models)
