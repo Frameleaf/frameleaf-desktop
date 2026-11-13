@@ -240,6 +240,11 @@ jobs:
           esac
           if [ "$RUNNER_OS" = Windows ]; then python=candidate/payload/python/python.exe; else python=candidate/payload/python/bin/python3.12; fi
           du -sh candidate/payload || true
+          # FD-60: a downloaded pack restores exactly these bits from its signed delivery manifest.
+          if [ "$RUNNER_OS" != Windows ]; then
+            echo "Payload files with an executable bit: $(find candidate/payload -type f -perm -u+x | wc -l) of $(find candidate/payload -type f | wc -l)"
+            find candidate/payload -type f -perm -u+x ! -name '*.so' ! -name '*.so.*' | sort
+          fi
           "$python" -I -B desktop/tools/smoke_accelerated_runtime.py "$provider"
       - name: Retain private failure diagnostics
         if: failure()

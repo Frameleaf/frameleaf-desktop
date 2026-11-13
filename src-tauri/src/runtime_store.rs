@@ -82,7 +82,7 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

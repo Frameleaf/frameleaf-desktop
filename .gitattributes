@@ -9,3 +9,4 @@ src-tauri/src/host_state/activation/manager-safety-recovery.fixture.json -text
 
 # Parts of a signed pack, cut by tools/deliver_runtime.mjs: every byte is covered by a digest.
 src-tauri/src/accelerated_pack/fixture/** -text
+src-tauri/src/accelerated_pack/fixture-linux/** -text
