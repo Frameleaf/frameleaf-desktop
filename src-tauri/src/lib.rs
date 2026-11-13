@@ -972,6 +972,7 @@ pub fn run() {
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");
             }
+            updates::observe_restart(app.handle());
             #[cfg(target_os = "macos")]
             if let Err(error) = window_close::guard_app_quit(app.handle()) {
                 eprintln!("app menu unavailable: {error}");
