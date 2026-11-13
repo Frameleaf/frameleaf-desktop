@@ -18,6 +18,10 @@ on:
         description: 'Qualify hidden-window watched folder import with the signed Desktop at this main revision'
         type: boolean
         default: false
+      release_package:
+        description: 'Sign the controller and installer with Azure Artifact Signing and retain them as the release companion package'
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -27,6 +31,12 @@ concurrency:
 jobs:
   qualify:
     if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    # The signing variables and the Azure identity exist only inside the release environment.
+    environment: ${{ inputs.release_package && 'desktop-release' || '' }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     runs-on: windows-2022
     timeout-minutes: 120
     env:
@@ -43,6 +53,16 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: '26.11.1'
+      - name: Require the Windows signing configuration before anything is built
+        if: inputs.release_package
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: node tools/release_prerequisites.mjs windows-signing
       - run: npm ci
       - run: npm run build
       - name: Rust stable
@@ -89,12 +109,32 @@ jobs:
           if ($result.qualification -ne 'passed' -or $result.manifestSha256 -ne $staged.manifestSha256 -or $result.signatureSha256 -ne $staged.signatureSha256) {
             throw 'Compiled host authority receipt does not match the admitted candidate'
           }
+      - name: Create the file the signing action writes its Tauri command into
+        if: inputs.release_package
+        shell: pwsh
+        run: Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'companion-signing.json') -Value '{"bundle":{}}'
+      - name: Configure Azure Artifact Signing
+        if: inputs.release_package
+        uses: ./.github/actions/windows-signing
+        with:
+          config: ${{ runner.temp }}/companion-signing.json
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
+          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
       - name: Build the native server installer from the verified host
         shell: pwsh
+        env:
+          RELEASE_PACKAGE: ${{ inputs.release_package }}
         run: |
+          $ErrorActionPreference = 'Stop'
           cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin frameleaf-native-host
           if ($LASTEXITCODE) { throw 'Controller build failed' }
           $env:HOST_CONTROLLER = (Resolve-Path 'src-tauri/target/release/frameleaf-native-host.exe').Path
+          # The controller is identified by its bytes, so it is signed before its digest is taken.
+          if ($env:RELEASE_PACKAGE -eq 'true') { & ./tools/windows_sign.ps1 -Path $env:HOST_CONTROLLER }
           $env:HOST_CONTROLLER_SHA256 = (Get-FileHash $env:HOST_CONTROLLER).Hash.ToLowerInvariant()
           $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
           $env:HOST_MANIFEST = (Get-Content (Join-Path $root 'compiled-authority.json') -Raw | ConvertFrom-Json).manifestSha256
@@ -108,6 +148,10 @@ jobs:
           $env:HOST_OUTPUT = Join-Path $root 'installer'
           & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /Q tools/windows/native-host.iss
           if ($LASTEXITCODE) { throw 'Installer build failed' }
+          if ($env:RELEASE_PACKAGE -eq 'true') {
+            $setup = (Get-Item "$env:HOST_OUTPUT/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe").FullName
+            & ./tools/windows_sign.ps1 -Path $setup
+          }
       - name: Install the actual package twice and verify its protected receipt
         shell: pwsh
         run: |
@@ -146,7 +190,45 @@ jobs:
           & $helper --verify-installed-program $receipt.manifestSha256 $receipt.controllerSha256 invalid
           if ($LASTEXITCODE -ne 1) { throw 'Unknown program was not refused' }
           $global:LASTEXITCODE = 0
+      - name: Record the signed, installed package for the release
+        if: inputs.release_package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'windows-compiled-host'
+          $receipt = Get-Content (Join-Path $root 'protected-install.json') -Raw | ConvertFrom-Json
+          $setup = (Get-Item "$root/installer/FrameleafNativeServer_0.1.0_x64-setup-unsigned.exe").FullName
+          $helper = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) "Frameleaf/Controllers/$($receipt.manifestSha256)/$($receipt.controllerSha256)/frameleaf-native-host.exe"
+          # The publisher signature on the installer that was installed and on the controller it installed.
+          foreach ($file in $setup, $helper) { & ./tools/windows_sign.ps1 -Path $file -VerifyOnly }
+          if ((Get-FileHash $setup).Hash.ToLowerInvariant() -cne $receipt.installerSha256) { throw 'The installer changed after it was installed' }
+          $version = (Get-Content (Join-Path $root 'candidate/payload/server/package.json') -Raw | ConvertFrom-Json).version
+          if ($version -isnot [string] -or $version -cnotmatch '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}$') { throw 'The host has no Library version' }
+          $package = Join-Path $env:RUNNER_TEMP 'companion-package'
+          New-Item -ItemType Directory $package | Out-Null
+          # Only a signed installer is ever given the release name.
+          Copy-Item -LiteralPath $setup -Destination (Join-Path $package "FrameleafCompanion_${version}_x64-setup.exe")
+          # Writes SHA256SUMS beside the installer and fails if the release would refuse this package.
+          node tools/release_prerequisites.mjs companion-record .github/workflows/windows-compiled-host.yml $version $receipt.controllerSha256 `
+            (Join-Path $root 'candidate/manifest.json') (Join-Path $root 'candidate/manifest.sig') $package (Join-Path $env:RUNNER_TEMP 'companion-identity')
+          if ($LASTEXITCODE) { throw 'The release would refuse this companion package' }
+      - name: Retain the exact signed installer
+        if: inputs.release_package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-x64-companion-installed
+          compression-level: 0
+          path: ${{ runner.temp }}/companion-package/
+          if-no-files-found: error
+      - name: Retain the signed manifest the release checks before it builds
+        if: inputs.release_package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-windows-x64-companion-installed-identity
+          path: ${{ runner.temp }}/companion-identity/
+          if-no-files-found: error
       - name: Retain private Windows installer candidate
+        if: ${{ !inputs.release_package }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-windows-native-server-installer

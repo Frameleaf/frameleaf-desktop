@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       approval:
-        description: 'Approved draft asset ID, package SHA-256, manifest SHA-256, and controller SHA-256'
+        description: 'Approved draft release ID and asset ID, package SHA-256, manifest SHA-256 and controller SHA-256 as JSON'
         required: true
         type: string
 permissions: {}
@@ -25,22 +25,31 @@ jobs:
     env:
       APPROVAL: ${{ inputs.approval }}
     steps:
-      - name: Verify the exact signed package on the private draft
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Verify the exact signed package on the approved draft
         env:
           GH_TOKEN: ${{ github.token }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           jq -e '
-            keys == ["assetId","controllerSha256","manifestSha256","packageSha256"] and
-            (.assetId|type=="number" and .>0 and .==floor) and
+            keys == ["assetId","controllerSha256","manifestSha256","packageSha256","releaseId"] and
+            ([.assetId,.releaseId] | all(type=="number" and .>0 and .==floor)) and
             ([.controllerSha256,.manifestSha256,.packageSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
           ' <<< "$APPROVAL" >/dev/null
-          PACKAGE="$RUNNER_TEMP/FrameleafCompanion_1.2.4_arm64.pkg"
+          mkdir -m 700 "$RUNNER_TEMP/companion-package"
+          # Named for the Library version it carries once that is read from the installed package.
+          PACKAGE="$RUNNER_TEMP/companion-package/FrameleafCompanion_arm64.pkg"
           printf 'PACKAGE=%s\n' "$PACKAGE" >> "$GITHUB_ENV"
+          release=$(jq -r .releaseId <<< "$APPROVAL")
           asset=$(jq -r .assetId <<< "$APPROVAL")
           digest=$(jq -r .packageSha256 <<< "$APPROVAL")
-          gh api "repos/$GITHUB_REPOSITORY/releases/419477762" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
             .draft==true and any(.assets[]; .id==$asset and .digest==$digest and .state=="uploaded" and .size>0 and .size<2147483648)
           ' >/dev/null
           gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$PACKAGE"
@@ -142,17 +151,31 @@ jobs:
           for leaf in state manager; do
             test "$(stat -f '%u:%Lp' "$base/Profiles/$uid/$leaf")" = "$uid:700"
           done
-          shasum -a 256 "$PACKAGE" | sed "s|  .*/|  |" > "$RUNNER_TEMP/SHA256SUMS"
+      - name: Record the installed package for the release
+        run: |
+          set -euo pipefail
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          runtime="/Library/Application Support/Frameleaf/Runtimes/$manifest"
+          version=$(jq -er '.version | select(type == "string" and test("^(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){2}$"))' "$runtime/payload/server/package.json")
+          package="$RUNNER_TEMP/companion-package"
+          mv "$PACKAGE" "$package/FrameleafCompanion_${version}_arm64.pkg"
+          # Writes SHA256SUMS beside the package and fails if the release would refuse this package.
+          node tools/release_prerequisites.mjs companion-record .github/workflows/macos-host-package.yml "$version" "$controller" \
+            "$runtime/manifest.json" "$runtime/manifest.sig" "$package" "$RUNNER_TEMP/companion-identity"
+          mv "$RUNNER_TEMP/installed-receipt.json" "$RUNNER_TEMP/installed-package-retry.json" "$package/"
       - name: Retain the exact notarized installer and verification receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frameleaf-macos-arm64-companion-installed
           compression-level: 0
-          path: |
-            ${{ runner.temp }}/FrameleafCompanion_1.2.4_arm64.pkg
-            ${{ runner.temp }}/SHA256SUMS
-            ${{ runner.temp }}/installed-receipt.json
-            ${{ runner.temp }}/installed-package-retry.json
+          path: ${{ runner.temp }}/companion-package/
+          if-no-files-found: error
+      - name: Retain the signed manifest the release checks before it builds
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: frameleaf-macos-arm64-companion-installed-identity
+          path: ${{ runner.temp }}/companion-identity/
           if-no-files-found: error
       - name: Retain Apple's request on a failed wait
         if: failure()
