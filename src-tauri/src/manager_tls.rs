@@ -590,6 +590,8 @@ mod tests {
             "credential_store_unavailable"
         );
         let other = std::cell::RefCell::new(None::<TlsIdentity>);
+        // Minted before the move: the move holds the identity lock while it saves.
+        let another = identity();
         assert_eq!(
             TlsIdentity::carry_forward_with(
                 &old,
@@ -600,7 +602,7 @@ mod tests {
                     _ => from_old(account),
                 },
                 |_, _| {
-                    *other.borrow_mut() = Some(identity());
+                    *other.borrow_mut() = Some(clone(&another));
                     Ok(())
                 },
             )

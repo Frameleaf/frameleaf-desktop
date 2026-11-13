@@ -296,7 +296,8 @@ fn directory(path: &Path, user: &[u8], mode: DirectoryMode) -> Result<Vec<File>,
         if file.metadata().map_err(|_| ERROR)?.is_dir() {
             // The library directory itself was just inspected like any other entry.
             let library = library || super::library_directory(state, path.file_name());
-            let state = super::state_directory(depth + 1, path.file_name());
+            // A `state` inside the admitted state directory is not the state directory.
+            let state = !state && super::state_directory(depth + 1, path.file_name());
             let (pin, entries) = scan(&path, file)?;
             pending.push(Frame {
                 _pin: pin,
@@ -496,16 +497,23 @@ mod tests {
             "negative control: this much state outside the library is still refused"
         );
         // A `media` that is not directly inside the state directory is state like any other.
-        let home = state.join("home");
-        fs::create_dir(&home).unwrap();
-        fs::rename(&bulk, home.join("media")).unwrap();
-        assert_eq!(
-            private_directory(&state).unwrap_err(),
-            "runtime_store_privacy_inventory_limit"
-        );
+        // That includes a directory called `state` inside the state directory.
         let media = state.join("media");
-        fs::rename(home.join("media"), &media).unwrap();
-        fs::remove_dir(&home).unwrap();
+        fs::rename(&bulk, &media).unwrap();
+        for nested in ["home", "state"] {
+            let nested = state.join(nested);
+            fs::create_dir(&nested).unwrap();
+            fs::rename(&media, nested.join("media")).unwrap();
+            for admitted in [&state, &root.0] {
+                assert_eq!(
+                    private_directory(admitted).unwrap_err(),
+                    "runtime_store_privacy_inventory_limit",
+                    "{nested:?}"
+                );
+            }
+            fs::rename(nested.join("media"), &media).unwrap();
+            fs::remove_dir(&nested).unwrap();
+        }
         // The same tree as the photo library is admitted, through the profile root too.
         let walked = std::time::Instant::now();
         private_directory(&state).unwrap();
