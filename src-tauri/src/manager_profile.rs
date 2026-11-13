@@ -428,6 +428,8 @@ fn binding_sha256(
     state: &cap_std::fs::Dir,
     data: &cap_std::fs::Dir,
 ) -> Result<String, String> {
+    // The ports are chosen per start and are not part of what a profile is bound to.
+    let config = &config.binding_form();
     #[cfg(not(windows))]
     let binding = serde_json::json!({"schemaVersion":1,"configuration":config,"candidate":candidate,"manifestSha256":manifest,
         "stateIdentity":crate::copy_source::root_identity(state)?,"managerIdentity":crate::copy_source::root_identity(data)?});
@@ -894,7 +896,26 @@ mod tests {
                     .any(|v| v == expected.as_bytes()));
             }
         }
-        f.1.api_port = 2284;
+        // The ports are chosen per start: the same profile, and the same secrets, on any of them.
+        let binding = serde_json::from_str::<Profile>(&saved)
+            .unwrap()
+            .binding()
+            .to_owned();
+        (f.1.api_port, f.1.database_port) = (2284, 54400);
+        f.1.origin = "https://127.0.0.1:9444".into();
+        let moved = Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"b".repeat(64),
+            reload,
+            |_account, _profile| panic!("must not replace"),
+        )
+        .unwrap();
+        assert_eq!(moved.binding(), binding);
+        assert_eq!(expected.as_str(), moved.password().as_str());
+        drop(moved);
+        // Everything else the profile names is still what it is bound to.
+        let release = std::mem::replace(&mut f.1.release, "frameleaf-v3.0.0-2".into());
         assert!(Profile::load_or_create(
             &f.1,
             &f.0.join("runtime"),
@@ -903,7 +924,15 @@ mod tests {
             |_account, _profile| panic!("must not replace")
         )
         .is_err());
-        f.1.api_port = 2283;
+        f.1.release = release;
+        assert!(Profile::load_or_create(
+            &f.1,
+            &f.0.join("runtime"),
+            &"c".repeat(64),
+            reload,
+            |_account, _profile| panic!("must not replace")
+        )
+        .is_err());
         std::fs::rename(&f.1.state, f.0.join("old-state")).unwrap();
         std::fs::create_dir(&f.1.state).unwrap();
         assert!(Profile::load_or_create(

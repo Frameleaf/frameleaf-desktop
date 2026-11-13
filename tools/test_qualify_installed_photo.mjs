@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -44,3 +45,56 @@ for (const status of [404, 500]) {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+test('watched readback rejects two assets for the same synthetic original', () => {
+  const loader = `
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    globalThis.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/') return new Response('<html>fixture</html>');
+      if (path === '/api/auth/login') return Response.json({ accessToken: 'synthetic-token' }, { status: 201 });
+      if (path === '/api/search/metadata') {
+        const first = { originalFileName: 'synthetic-watched-photo.png', id: '12345678-1234-4234-8234-123456789abc' };
+        return Response.json({ assets: { items: [first, { ...first, id: '22345678-1234-4234-8234-123456789abc' }] } });
+      }
+      throw Error('Unexpected fixture request');
+    };
+  `;
+  const result = spawnSync(process.execPath, [
+    '--import', 'data:text/javascript,' + encodeURIComponent(loader),
+    'tools/qualify_installed_photo.mjs', 'watch-verify',
+  ], { encoding: 'utf8', timeout: 10_000, env: {
+    ...process.env, RUNNER_ENVIRONMENT: 'github-hosted', GITHUB_ACTIONS: 'true',
+    FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD: 'synthetic-password-long-enough-for-qualification',
+  } });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Watcher imported duplicate originals/);
+});
+
+test('interactive watcher refuses a writable executable path before contacting Library', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'frameleaf-watch-cli-')));
+  const source = join(root, 'frameleaf-watch-source-' + randomUUID());
+  const executable = join(root, 'frameleaf-desktop');
+  mkdirSync(source);
+  writeFileSync(executable, 'synthetic executable candidate', { mode: 0o700 });
+  const loader = `
+    Object.defineProperty(process.stdin, 'isTTY', { value: true });
+    Object.defineProperty(process.stderr, 'isTTY', { value: true });
+    Object.defineProperty(process, 'getuid', { value: () => 501 });
+    Object.defineProperty(process, 'geteuid', { value: () => 501 });
+    globalThis.fetch = async () => { throw Error('Unexpected Library request'); };
+  `;
+  try {
+    const result = spawnSync(process.execPath, [
+      '--import', 'data:text/javascript,' + encodeURIComponent(loader),
+      'tools/qualify_installed_photo.mjs', 'watch-interactive', source, executable, '0'.repeat(64),
+    ], { encoding: 'utf8', timeout: 10_000, env: { ...process.env, FRAMELEAF_WATCH_DISPOSABLE: '1' } });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /administrator-protected Desktop installation|qualification account can modify/);
+    assert.doesNotMatch(result.stderr, /Unexpected Library request/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

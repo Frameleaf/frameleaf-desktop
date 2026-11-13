@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "frameleaf-desktop"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -1350,6 +1350,7 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -1895,6 +1896,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3672,6 +3674,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",

@@ -56,6 +56,8 @@ fn config(raw: &[u8]) -> Result<Config, String> {
         || config.database_port == 0
         || config.api_port == 0
         || config.database_port == config.api_port
+        // Manager never asks for a carry-forward step: only this app starts one, in its own process.
+        || config.mode.carries()
     {
         return Err("host_control_config_invalid".into());
     }
@@ -932,6 +934,9 @@ mod tests {
             ("apiPort", json!(54321)),
             ("trustedKeys", json!(["untrusted"])),
             ("command", json!("arbitrary command")),
+            // Only this app starts a carry-forward step; Manager can never ask for one.
+            ("mode", json!("carry-export")),
+            ("mode", json!("carry-restore")),
         ] {
             let mut value_config = good.clone();
             value_config[field] = value;

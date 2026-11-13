@@ -162,7 +162,7 @@ fn actual_native_nas_library_jobs() {
         .build()
         .unwrap();
     let (saved, initial_worker) = tauri::async_runtime::block_on(async {
-        let (mut saved, view) = crate::sign_in(
+        let signed_in = crate::sign_in(
             &client,
             &configuration.server,
             &configuration.email,
@@ -180,8 +180,11 @@ fn actual_native_nas_library_jobs() {
                 Ok(())
             },
         )
-        .await
-        .unwrap();
+        .await;
+        let Ok(crate::SignIn::Done(saved, view)) = signed_in else {
+            panic!("the fixture account signs in with its password alone");
+        };
+        let mut saved = *saved;
         assert_eq!(view.state, "preparing");
         let device = saved.device_id.clone().unwrap();
         let repeated = crate::prepare_with_client(&client, &mut saved).await;

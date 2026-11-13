@@ -12,6 +12,11 @@ fn main() {
                 }
             }
         }
+        // Touches nothing: lets a packaging check prove the installed controller loads.
+        [mode] if mode == "--version" => {
+            println!("frameleaf-native-host {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         [mode] if mode == "--owner-pipe" => frameleaf_desktop::host_control::run(),
         #[cfg(windows)]
         [mode] if mode == "--media-move-owner" => {
