@@ -212,12 +212,26 @@ gh workflow run installer-candidates.yml --repo Frameleaf/frameleaf-desktop \
 ```
 
 `Signed desktop release` is manually dispatched from `main`. A supplied tag must
-point to that exact workflow commit and match `package.json`, `Cargo.toml` and
-`tauri.conf.json`. An empty tag retains installer artifacts and skips draft staging.
+point to that exact workflow commit and match the version in `package.json`,
+`package-lock.json`, `Cargo.toml`, `Cargo.lock` and `tauri.conf.json`
+(`node tools/release_inputs.mjs v<version>` checks all five). An empty tag retains
+installer artifacts and skips draft staging.
 The default selection requests macOS ARM64/Intel DMG and Linux x86-64/ARM64 DEB/AppImage.
 Intel macOS runtime dependencies are tracked in [FD-6](https://heroit.atlassian.net/browse/FD-6).
-Choose `all` to include Windows x86-64 NSIS/MSI after Azure Artifact Signing is configured,
-or `linux` to build both Linux architectures independently.
+
+Every platform can be released by itself, so one that cannot build or be signed
+does not hold back the others. `platforms` is one of:
+
+| Choice | Targets |
+| --- | --- |
+| `macos-linux` (default) | Both macOS and both Linux architectures |
+| `all` | Everything, including Windows |
+| `macos`, `linux` | Both architectures of that system |
+| `macos-aarch64`, `macos-x86_64`, `linux-x86_64`, `linux-aarch64`, `windows` | That one target |
+
+The factory workflow takes the same choices. Runs for the same tag add to one
+draft (see [Staging](#staging-one-draft-per-tag)); the full order is in
+[Publishing a release](#publishing-a-release-owner-checklist).
 
 The installer pipeline consumes factory-signed ML runtimes rather than exposing
 the Infisical Ed25519 release key to app-build jobs. Specify a successful
@@ -273,11 +287,31 @@ default`; choose `none` for the processor pack alone), and signs both manifests
 manifest beside the first. Both manifests of that pack name the accelerated
 profile's source, so the server must already carry catalogue epoch 15: against an
 older server neither manifest is known and that Mac has no AI processing until
-the server is updated. Release the server first. A new pack needs a runtime epoch
-above the released one (the workflow default is 7).
+the server is updated. Release the server first: a tagged release run stops in
+`prepare` with `catalogue_ahead_of_server` when `runtime/model-catalogue.json` has
+a higher epoch than the catalogue in the latest published `frameleaf-v<version>`
+release of `Frameleaf/frameleaf-app`, unless `allow_unreleased_catalogue` is set.
+
+### Runtime epoch
+
+An installed app remembers the highest runtime epoch it accepted for its
+platform. It refuses a pack with a lower epoch (`runtime_epoch_rollback`) and a
+different pack with the same epoch (`runtime_epoch_reused`), so an epoch is
+never used twice for different bytes on one platform, and never goes down.
+
+`runtime/factory-epochs.json` records `highestUsedEpoch`: the highest epoch any
+pack was built with for a release or a draft. It is 8 (the 0.1.6 draft pack; the
+packs built on November 9 for 0.1.5 used 6), so the next epoch to use is **9**. The factory workflow
+has no default epoch: `epoch` must be given and must be above the record, and a
+tagged release refuses a pack whose epoch is not above it. Every platform of one
+release uses the same new epoch, in one factory run or several. After the
+release is published, raise `highestUsedEpoch` to that epoch (and the number in
+this paragraph) in the next version change. A pack rebuilt after an earlier one
+with the same epoch reached a draft or a tester needs the next epoch: raise the
+record first.
 
 ```sh
-gh workflow run factory-runtime.yml --ref main -f platforms=all -f epoch=7 -f accelerated=default
+gh workflow run factory-runtime.yml --ref main -f platforms=all -f epoch=9 -f accelerated=default
 ```
 
 The app installs the accelerated manifest in its own store and qualifies each
@@ -337,19 +371,89 @@ Users on builds that predate the updater need one manual install. Publish a rele
 covering all supported formats when promoting it to Latest so each can receive
 the update.
 
+### Checks before anything is built
+
+The `prepare` job stops the run, with the reason as the job's error, when:
+
+- the tag is missing, is not the version in the five version files, or does not
+  point at the commit the workflow runs on;
+- the factory run is not a successful manual `factory-runtime.yml` run on `main`,
+  was built from a commit outside this commit's history, or has no unexpired
+  `factory-runtime-<target>` artifact for a selected target
+  (`runtime_run_pack_missing`);
+- a selected pack was built from a source or profile `runtime/profiles.json` on
+  this commit does not approve for that target (`runtime_run_pack_unapproved`),
+  or, for a tagged release, with an epoch that is not above
+  `runtime/factory-epochs.json` (`runtime_run_pack_epoch_used`). Only the pack's
+  manifests are read here; the build job still verifies the whole signed payload;
+- for a tagged release, the model catalogue is newer than the latest server
+  release (`catalogue_ahead_of_server`), or the companion run is missing or not
+  trusted (below).
+
+When Windows is selected, the `signing-preflight` job then reads the
+`desktop-release` variables before any platform builds and fails with
+`windows_signing_unconfigured`, naming each variable that is not set and the
+settings page to set it on.
+
+### Companion packages
+
+The app sends people to the releases page for the Library companion package, so
+a release carries it. `companion_run_ids` names the successful
+`macos-host-package.yml` run (manual, on `main`, from a commit in this commit's
+history) whose `frameleaf-macos-arm64-companion-installed` artifact holds the
+notarized `FrameleafCompanion_<version>_arm64.pkg`. That workflow has already
+checked the installer signature, notarization and Gatekeeper; the release checks
+the package against the checksum the run recorded and adds it to the draft. A
+tagged release that includes `macos-aarch64` needs this input, or `none` to
+stage the draft without it.
+
+No workflow retains a signed, final Linux or Windows companion package: the
+Linux packages are built and signed across `linux-host-signing.yml` and the
+Ubuntu qualification without being uploaded, and the Windows installer is only
+produced unsigned (`-setup-unsigned.exe`). Those, and the `SOURCES` files, are
+still added to the draft by hand. The run summary and the draft notes name each
+selected platform whose companion package was not attached.
+
+`macos-host-package.yml` reads its input from the draft with release id
+`419477762`, which no longer exists: producing a new Apple Silicon companion
+package needs that workflow pointed at a current draft first. The run that
+produced 1.2.4 is `42148037724`; its artifact expires on February 4, 2027.
+
+### Staging: one draft per tag
+
 Only after every selected target passes does a separate job receive repository
-write permission and create a **draft prerelease** with installers, signed updater
-packages, `latest.json` and `SHA256SUMS`. The run summary and the draft notes list
-the targets in `latest.json` and state when Windows was excluded from the update
-feed; the default selection excludes it until Azure Artifact Signing is qualified,
-and Windows entries from an earlier release are not carried forward. The same job
-stamps the AUR and Chocolatey files from those checksums (see
+write permission. It verifies the updater signatures, then:
+
+- when the tag has no release, creates a **draft prerelease** with the
+  installers, signed updater packages, `latest.json` and `SHA256SUMS`;
+- when the tag already has a draft, **adds** this run's assets to it and
+  replaces `latest.json` and `SHA256SUMS` with ones rebuilt from everything on
+  the draft. `latest.json` then offers every platform any run staged; each
+  signature is carried through exactly as it was written.
+
+`tools/release_draft.mjs` decides this (`tools/test_release_draft.mjs`). It
+refuses, changing nothing, when the release for the tag is already published
+(`release_not_draft`), when more than one release exists for the tag
+(`release_tag_ambiguous`; GitHub allows two drafts for one tag, which is how
+both 0.1.5 runs staged a partial draft each), and when the draft already has an
+asset of the same name with different bytes (`release_asset_conflict`). A
+rebuild never has the same bytes: to replace a platform, delete its assets and
+their `.sig` files from the draft, then run again. Re-running only the failed
+`stage` job reuses the built installers and is safe. Files added to the draft by
+hand are kept and listed in the next run's `SHA256SUMS`.
+
+The run summary and the draft notes list the targets in `latest.json` and state
+when Windows was excluded from the update feed; Windows entries from an earlier
+release are not carried forward. The same job stamps the AUR and Chocolatey
+files from the checksums of the whole draft (see
 [`packaging/README.md`](../packaging/README.md)). The updater sees the manifest after the
-release is published as Latest. The workflow never publishes automatically or
-replaces an existing release.
-If a draft already exists for the tag, the create step fails; inspect/remove the
-draft deliberately before retrying. Successful CI or code signing does not prove
-installed-device, NAS-job, GPU or native-host acceptance.
+release is published as Latest. The workflow never publishes or deletes a
+release. Successful CI or code signing does not prove installed-device, NAS-job,
+GPU or native-host acceptance.
+
+Release runs share one concurrency group: they run one at a time, and GitHub
+keeps only one waiting. Dispatch the next run when no other is waiting, or the
+waiting one is cancelled.
 
 ## Signing credentials
 
@@ -441,28 +545,76 @@ The macOS factory signer verifies the unsigned inventory, signs the interpreter 
 embedded Mach-O libraries with Developer ID and secure timestamps, then seals the
 final bytes with the factory key. The installer verifies that inventory again.
 
-## Dispatch
+## Publishing a release: owner checklist
 
-For an Apple Silicon installer artifact, run the factory and signed desktop
-workflows on `main` with `platforms=macos-aarch64`. Pass the successful factory
-run ID to the signed workflow and leave the tag empty. After signing, notarization
-and embedded runtime verification, the workflow submits the signed DMG to Apple,
-retains the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`,
+Steps 1 to 4 can be done ahead of time. Only Windows needs Microsoft's identity
+validation; macOS and Linux ship without it.
+
+1. **Windows only, once: finish Microsoft's identity validation.** When Microsoft
+   approves Frameleaf Inc., create the Public Trust certificate profile, assign
+   the signer role, and set `AZURE_SIGNING_PROFILE` and `WINDOWS_SIGNING_SUBJECT`
+   as variables of the `desktop-release` environment
+   ([Azure Artifact Signing setup](#azure-artifact-signing-setup)). Until then
+   skip every Windows step below; a Windows run stops in `signing-preflight`.
+2. **Release the server first** when `runtime/model-catalogue.json` has a higher
+   epoch than the latest `frameleaf-v<version>` server release (today: Desktop
+   15, `frameleaf-v1.2.21` 14).
+3. **Merge everything that ships, including the version change**, to `main`.
+   The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
+   on it prints the tag.
+4. **Build the runtime packs** on `main`, at or before `<commit>`, with the next
+   epoch ([Runtime epoch](#runtime-epoch): 9), for every platform being
+   released. Separate runs per platform are fine; note each run id.
+
+   ```sh
+   gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f platforms=macos-linux -f epoch=9 -f accelerated=default
+   gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f platforms=windows -f epoch=9 -f accelerated=default   # Windows only
+   ```
+5. **Have the companion packages ready** ([Companion packages](#companion-packages)):
+   the run id of the notarized Apple Silicon package (`42148037724` for 1.2.4),
+   and the Linux, Windows and `SOURCES` files to add by hand (the same 1.2.4
+   files are on the 0.1.5 release).
+6. **Tag the commit and push the tag.** A pushed tag is never moved.
+
+   ```sh
+   git tag v<version> <commit>
+   git push origin v<version>
+   ```
+7. **Run the release once per platform group**, each with the factory run that
+   built those platforms. Every run adds to the same draft.
+
+   ```sh
+   gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f tag=v<version> -f platforms=macos-aarch64 \
+     -f runtime_run_id=<factory run> -f companion_run_ids=<macos-host-package run>
+   gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f tag=v<version> -f platforms=linux -f runtime_run_id=<factory run>
+   gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
+     -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run>   # needs step 1
+   ```
+
+   Add `-f platforms=macos-x86_64` as its own run once the Intel runtime builds
+   ([FD-6](https://heroit.atlassian.net/browse/FD-6)). A platform left out stays
+   on its installed version; the draft notes say which.
+8. **Add the hand-attached files to the draft** (step 5) before the last run of
+   step 7, so the final `SHA256SUMS` lists them; or re-run the `stage` job of the
+   last run afterwards.
+9. **Review the draft**: one draft for the tag, the commit, the targets listed
+   under "Update feed" in its notes, `SHA256SUMS`, the companion packages, and
+   installed-device acceptance on each platform.
+10. **Publish**: clear "pre-release", set it as the latest release and publish.
+    From then the updater offers it to every target in `latest.json`.
+11. **Afterwards**: publish the AUR files, and Chocolatey only when the release
+    has the signed MSI (Windows; the `package-manager-files` artifact of the last
+    run, [`packaging/README.md`](../packaging/README.md)); raise
+    `highestUsedEpoch` in `runtime/factory-epochs.json` to the epoch released.
+
+For an installer to try without publishing, run step 7 with no `tag`: the
+installers are kept as `signed-installers-<target>` artifacts and nothing is
+staged. For Apple Silicon the workflow submits the signed DMG to Apple, retains
+the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`,
 staples the accepted ticket, and checks Gatekeeper. If Apple outlasts the
-runner, use the recorded request ID with `notarytool info` and staple the retained
-DMG after acceptance. The verified DMG is available in the workflow artifact
-`signed-installers-macos-aarch64`. Draft release staging requires a tag.
-
-After the workflow is merged, factory packs and credentials are available, and
-the chosen version is ready for a candidate:
-
-```sh
-git tag v0.1.0 <reviewed-main-commit>
-git push origin v0.1.0
-gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
-  -f tag=v0.1.0 -f runtime_run_id=<successful-factory-run-id> \
-  -f platforms=macos-linux
-```
-
-Review the draft's exact commit, signatures, checksums and installed-device
-acceptance before publishing. No tag or public release is created by this change.
+runner, use the recorded request ID with `notarytool info` and staple the
+retained DMG after acceptance.

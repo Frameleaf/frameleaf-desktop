@@ -1,4 +1,5 @@
 name: Signed desktop release
+run-name: Signed desktop release ${{ inputs.tag || 'artifacts only' }} (${{ inputs.platforms }})
 on:
   workflow_dispatch:
     inputs:
@@ -11,10 +12,18 @@ on:
         required: true
         type: string
       platforms:
-        description: 'Release targets (Windows uses Azure Artifact Signing)'
+        description: 'Release targets; each platform can be released alone and joins the same draft (Windows uses Azure Artifact Signing)'
         type: choice
         default: macos-linux
-        options: [macos-linux, all, linux, macos-aarch64]
+        options: [macos-linux, all, macos, linux, windows, macos-aarch64, macos-x86_64, linux-x86_64, linux-aarch64]
+      companion_run_ids:
+        description: 'With a tag and Apple Silicon selected: the macos-host-package.yml run holding the notarized companion package, or none'
+        required: false
+        type: string
+      allow_unreleased_catalogue:
+        description: 'Release although the model catalogue is newer than the latest server release (normally: release the server first)'
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -30,6 +39,7 @@ jobs:
     outputs:
       revision: ${{ steps.source.outputs.revision }}
       matrix: ${{ steps.source.outputs.matrix }}
+      companions: ${{ steps.companions.outputs.plan }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -48,27 +58,141 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
           revision="$GITHUB_SHA"
           if [[ -n "$RELEASE_TAG" ]]; then
-            node tools/release_inputs.mjs "$RELEASE_TAG"
-            test "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")" = "$revision"
+            node tools/release_inputs.mjs "$RELEASE_TAG" ||
+              fail "Tag $RELEASE_TAG is not the version recorded in package.json, package-lock.json, src-tauri/Cargo.toml, src-tauri/Cargo.lock and src-tauri/tauri.conf.json on this commit."
+            tagged=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}") || fail "Tag $RELEASE_TAG does not exist. Create it on $revision and push it first."
+            [[ "$tagged" == "$revision" ]] ||
+              fail "Tag $RELEASE_TAG points at $tagged, not at the commit this workflow runs on ($revision). A pushed tag is never moved: bump the version and tag the new commit."
           fi
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
             appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS)) + "\n");
           '
-          [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "runtime_run_id must be the numeric id of a factory-runtime.yml run."
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
           factory_revision=$(node --input-type=module -e '
             import { readFileSync } from "node:fs";
             import { validateFactoryRun } from "./tools/release_inputs.mjs";
             console.log(validateFactoryRun(JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json")), process.env.GITHUB_REPOSITORY));
-          ')
-          git merge-base --is-ancestor "$factory_revision" "$revision"
+          ') || fail "Run $RUNTIME_RUN_ID is not a successful manual factory-runtime.yml run on main in this repository."
+          git merge-base --is-ancestor "$factory_revision" "$revision" ||
+            fail "Factory run $RUNTIME_RUN_ID was built from $factory_revision, which is not in the history of $revision."
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | {name, expired}' > "$RUNNER_TEMP/runtime-artifacts.jsonl"
+          node tools/release_prerequisites.mjs factory-artifacts "$RUNNER_TEMP/runtime-artifacts.jsonl" "$RELEASE_PLATFORMS" "$RUNTIME_RUN_ID"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
-  build:
+      - name: Check every selected pack's source, profile and epoch before anything is built
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RELEASE_MATRIX: ${{ steps.source.outputs.matrix }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '### Factory runtime packs' >> "$GITHUB_STEP_SUMMARY"
+          for target in $(jq -r '.include[].target' <<< "$RELEASE_MATRIX"); do
+            pack="$RUNNER_TEMP/pack-$target"
+            gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$target" --dir "$pack"
+            # Read the two manifests only; the payload is verified against its signature by the build job.
+            python3 -I - "$pack/runtime.tar" "$pack/manifests" <<'PY'
+          import sys, tarfile
+          from pathlib import Path
+          archive, output = sys.argv[1:]
+          Path(output).mkdir()
+          with tarfile.open(archive) as tar:
+              for member in tar:
+                  if member.name == 'payload' or member.name.startswith('payload/'):
+                      break
+                  if member.name in ('manifest.json', 'manifest-accelerated.json'):
+                      if not member.isfile() or member.size > 8 * 1024 * 1024:
+                          raise SystemExit('::error::The factory pack has an invalid manifest')
+                      Path(output, member.name).write_bytes(tar.extractfile(member).read())
+          PY
+            node tools/release_prerequisites.mjs factory-pack "$target" "$pack/manifests" "${RELEASE_TAG:+release}" | tee -a "$GITHUB_STEP_SUMMARY"
+            rm -rf "$pack"
+          done
+      - name: Check the model catalogue against the latest server release
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          ALLOW_UNRELEASED_CATALOGUE: ${{ inputs.allow_unreleased_catalogue }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo 'Installer artifacts only: nothing is published, so the server release is not checked.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh api 'repos/Frameleaf/frameleaf-app/releases?per_page=100' --jq '.[] | {tag_name, draft, prerelease}' > "$RUNNER_TEMP/server-releases.jsonl"
+          server_tag=$(node tools/release_prerequisites.mjs server-release "$RUNNER_TEMP/server-releases.jsonl")
+          gh api "repos/Frameleaf/frameleaf-app/contents/server/resources/desktop/model-catalogue.json?ref=$server_tag" \
+            -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/server-catalogue.json"
+          { echo '### Model catalogue'; node tools/release_prerequisites.mjs catalogue "$server_tag" "$RUNNER_TEMP/server-catalogue.json" "$ALLOW_UNRELEASED_CATALOGUE"; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Validate the companion package runs
+        id: companions
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          COMPANION_RUN_IDS: ${{ inputs.companion_run_ids }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo 'plan={"attach":[],"manual":[]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          runs="$RUNNER_TEMP/companion-runs"
+          mkdir "$runs"
+          ids=$(node tools/release_prerequisites.mjs companion-ids "$COMPANION_RUN_IDS")
+          for id in $ids; do gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" > "$runs/$id.json"; done
+          plan=$(node tools/release_prerequisites.mjs companions "$RELEASE_PLATFORMS" "$COMPANION_RUN_IDS" "$runs")
+          while read -r run revision artifact; do
+            git merge-base --is-ancestor "$revision" "$GITHUB_SHA" ||
+              { echo "::error::Companion run $run was built from $revision, which is not in the history of $GITHUB_SHA."; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$artifact\" and .expired == false) | .id" | grep -q . ||
+              { echo "::error::Companion run $run no longer has its $artifact artifact (it expired or was deleted). Run that workflow again and pass the new run."; exit 1; }
+          done < <(jq -r '.attach[] | "\(.run) \(.revision) \(.artifact)"' <<< "$plan")
+          printf '%s' "$plan" > "$RUNNER_TEMP/companions.json"
+          node tools/release_prerequisites.mjs companion-summary "$RUNNER_TEMP/companions.json" >> "$GITHUB_STEP_SUMMARY"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+  signing-preflight:
+    # Environment variables are only readable inside the environment, so this small job reads them
+    # before any platform starts its build.
     needs: prepare
+    if: needs.prepare.result == 'success' && contains(needs.prepare.outputs.matrix, '"windows-x86_64"')
+    environment: desktop-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Require the Windows signing configuration before any platform builds
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: node tools/release_prerequisites.mjs windows-signing
+  build:
+    needs: [prepare, signing-preflight]
+    # The preflight is skipped when Windows is not selected; a failed one stops every platform.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.signing-preflight.result == 'success' || needs.signing-preflight.result == 'skipped') }}
     environment: desktop-release
     strategy:
       fail-fast: false
@@ -329,11 +453,13 @@ jobs:
           rm -f "$RUNNER_TEMP/developer-id.p12"
           if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
   stage:
-    if: inputs.tag != ''
+    # `build` has a skipped ancestor when Windows is not selected, so its result is tested explicitly.
+    if: ${{ !cancelled() && inputs.tag != '' && needs.build.result == 'success' }}
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -351,33 +477,69 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y minisign
-      - name: Verify updater signatures and create the manifest
+      - name: Verify updater signatures and create this run's manifest
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
           node --input-type=module <<'JS'
-          import { appendFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-          import { updateFeedSummary, updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
+          import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+          import { updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
           const dir = "release-assets";
           const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
           const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
           const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
           const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
           for (const name of packages) verifyUpdaterAsset(`${dir}/${name}`, signatures[name], updater.pubkey, manifest.version);
-          writeFileSync(`${dir}/latest.json`, JSON.stringify(manifest, null, 2) + "\n");
-          const summary = updateFeedSummary(manifest);
-          writeFileSync(`${process.env.RUNNER_TEMP}/update-feed.md`, summary);
-          appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          writeFileSync(`${process.env.RUNNER_TEMP}/incoming-latest.json`, JSON.stringify(manifest));
           JS
-      - name: Create checksums and stamp the package manager files from them
+      - name: Add the companion packages from their validated runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPANIONS: ${{ needs.prepare.outputs.companions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r run workflow artifact; do
+            download="$RUNNER_TEMP/companion-$run"
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir "$download"
+            name=$(node tools/release_prerequisites.mjs companion-artifact "$workflow" "$download")
+            mv "$download/$name" "release-assets/$name"
+            rm -rf "$download"
+          done < <(jq -r '.attach[] | "\(.run) \(.workflow) \(.artifact)"' <<< "$COMPANIONS")
+      - name: Merge this run into the draft for the tag
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          COMPANIONS: ${{ needs.prepare.outputs.companions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | {id, tag_name, draft, body, assets: [.assets[] | {id, name, state, digest}]}' > "$RUNNER_TEMP/releases.jsonl"
+          node tools/release_draft.mjs find "$RELEASE_TAG" "$RUNNER_TEMP/releases.jsonl" "$RUNNER_TEMP/draft.json" | tee "$RUNNER_TEMP/draft.env"
+          cat "$RUNNER_TEMP/draft.env" >> "$GITHUB_OUTPUT"
+          existing=-
+          asset=$(sed -n 's/^manifest_asset=//p' "$RUNNER_TEMP/draft.env")
+          if [[ -n "$asset" ]]; then
+            existing="$RUNNER_TEMP/existing-latest.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$existing"
+          fi
+          printf '%s' "$COMPANIONS" > "$RUNNER_TEMP/companions.json"
+          note="Signed installer candidate for $RELEASE_PLATFORMS from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID $(node tools/release_prerequisites.mjs companion-note "$RUNNER_TEMP/companions.json")"
+          node tools/release_draft.mjs merge "$RELEASE_TAG" "$GITHUB_REPOSITORY" release-assets "$RUNNER_TEMP/incoming-latest.json" \
+            "$RUNNER_TEMP/draft.json" "$existing" "$RUNNER_TEMP/draft" "$note"
+          cat "$RUNNER_TEMP/draft/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Stamp the package manager files from the checksums of the whole draft
         if: ${{ !contains(inputs.tag, '-') }}
         shell: bash
         run: |
           set -euo pipefail
-          (cd release-assets && sha256sum -- *) > "$RUNNER_TEMP/SHA256SUMS"
-          node tools/release_packaging.mjs "$RUNNER_TEMP/SHA256SUMS" | tee -a "$GITHUB_STEP_SUMMARY"
+          node tools/release_packaging.mjs "$RUNNER_TEMP/draft/SHA256SUMS" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: ${{ !contains(inputs.tag, '-') }}
         with:
@@ -388,22 +550,26 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
-      - name: Create checksums and a draft release after every target succeeds
+      - name: Create the draft release, or add this run's assets to it
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
+          draft="$RUNNER_TEMP/draft"
           cd release-assets
-          sha256sum -- * > SHA256SUMS
-          {
-            echo "Signed installer candidate from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo
-            cat "$RUNNER_TEMP/update-feed.md"
-          } > "$RUNNER_TEMP/release-notes.md"
-          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
-            --title "Frameleaf $RELEASE_TAG candidate" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
-            -- ./*
+          mapfile -t files < "$draft/upload.txt"
+          if [[ -z "$RELEASE_ID" ]]; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+              --title "Frameleaf $RELEASE_TAG candidate" \
+              --notes-file "$draft/notes.md" \
+              -- "${files[@]}" "$draft/latest.json" "$draft/SHA256SUMS"
+          else
+            # Without --clobber an asset that already exists is refused, never replaced.
+            if (( ${#files[@]} )); then gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -- "${files[@]}"; fi
+            # Only the two files rebuilt from the whole draft are replaced.
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber -- "$draft/latest.json" "$draft/SHA256SUMS"
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$draft/notes.md"
+          fi

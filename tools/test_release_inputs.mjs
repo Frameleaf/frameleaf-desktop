@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { releaseMatrix, updateFeedSummary, updateManifest, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
+import { applicationVersions, releaseMatrix, releasePlatformChoices, updateFeedSummary, updateManifest, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
 
 test("release tags must match all application versions", () => {
   assert.equal(validateReleaseTag("v0.1.0", ["0.1.0", "0.1.0", "0.1.0"]), "v0.1.0");
@@ -33,7 +33,27 @@ test("release selections cover the supported architectures without adding Window
   ]);
   assert.deepEqual(releaseMatrix("macos-aarch64").include, [macos[0]]);
   assert.deepEqual(releaseMatrix("linux").include, linux);
-  assert.throws(() => releaseMatrix("anything"), /release_platforms_invalid/);
+  assert.deepEqual(releaseMatrix("macos").include, macos);
+  for (const value of ["anything", "", undefined, "toString", "__proto__"]) assert.throws(() => releaseMatrix(value), /release_platforms_invalid/);
+});
+
+// One platform that cannot build or be signed must never hold back another: each has its own choice.
+test("every platform can be released and built by the factory alone", () => {
+  const every = releaseMatrix("all").include;
+  for (const item of every) assert.deepEqual(releaseMatrix(item.target === "windows-x86_64" ? "windows" : item.target).include, [item]);
+  for (const name of ["release.yml", "factory-runtime.yml"]) {
+    const workflow = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8");
+    const options = /\n      platforms:\n(?: {8}.*\n)*? {8}options: \[([^\]]+)\]\n/.exec(workflow)?.[1].split(", ");
+    assert.deepEqual(options, releasePlatformChoices, name);
+  }
+});
+
+test("the release tag is checked against the lock files too", () => {
+  const versions = applicationVersions();
+  assert.deepEqual(Object.keys(versions), ["package.json", "package-lock.json", "package-lock.json (root package)",
+    "src-tauri/tauri.conf.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock"]);
+  assert.deepEqual([...new Set(Object.values(versions))], [versions["package.json"]]);
+  assert.match(versions["package.json"], /^\d+\.\d+\.\d+/);
 });
 
 // Windows joins a release only when someone selects it: Azure Artifact Signing is not qualified yet (docs/releases.md).
@@ -47,9 +67,10 @@ test("the release workflow defaults to the platforms that can be signed today", 
     ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"]);
   for (const option of options.split(", ")) assert.doesNotThrow(() => releaseMatrix(option));
   assert.ok(options.split(", ").includes(selected));
-  // The staging job must report what the default leaves out, in both the run summary and the draft notes.
-  assert.match(workflow, /appendFileSync\(process\.env\.GITHUB_STEP_SUMMARY, summary\)/);
-  assert.match(workflow, /cat "\$RUNNER_TEMP\/update-feed\.md"/);
+  // The staging job must report what the default leaves out, in both the run summary and the draft notes:
+  // tools/release_draft.mjs writes both from the merged manifest (tools/test_release_draft.mjs).
+  assert.match(workflow, /cat "\$RUNNER_TEMP\/draft\/summary\.md" >> "\$GITHUB_STEP_SUMMARY"/);
+  assert.match(workflow, /--notes-file "\$draft\/notes\.md"/);
 });
 
 test("the release summary says plainly when Windows is left out of the update feed", () => {
