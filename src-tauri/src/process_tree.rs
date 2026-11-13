@@ -218,6 +218,13 @@ impl ProcessTree {
     /// Whether every process in the owned job has exited.
     #[cfg(windows)]
     pub(crate) fn is_empty(&self) -> Result<bool, String> {
+        self.active().map(|active| active == 0)
+    }
+
+    /// How many live processes the owned job holds, whatever started them: a job that does
+    /// not allow breakaway keeps every descendant, including those in jobs nested inside it.
+    #[cfg(windows)]
+    pub(crate) fn active(&self) -> Result<u32, String> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::{
             JobObjectBasicAccountingInformation, QueryInformationJobObject,
@@ -236,7 +243,74 @@ impl ProcessTree {
         {
             return Err("runtime_process_state_unavailable".to_string());
         }
-        Ok(info.ActiveProcesses == 0)
+        Ok(info.ActiveProcesses)
+    }
+
+    /// Every process the owned job holds now, with the program each one runs. A program is
+    /// reported only for a process that could be opened and is confirmed to be in this job
+    /// through that handle, so an ID reused meanwhile is never mistaken for a member.
+    #[cfg(windows)]
+    pub(crate) fn members(&self) -> Result<Vec<(u32, Option<String>)>, String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::{
+            JobObjects::{IsProcessInJob, JobObjectBasicProcessIdList, QueryInformationJobObject},
+            Threading::{
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two 32-bit counts, then pointer-sized process IDs.
+        // A job with more processes than fit fails the query, which is reported as unreadable.
+        const LIMIT: usize = 256;
+        let first = 8 / std::mem::size_of::<usize>();
+        let mut list = vec![0usize; first + LIMIT];
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                list.as_mut_ptr().cast(),
+                std::mem::size_of_val(list.as_slice()) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("runtime_process_state_unavailable".into());
+        }
+        let (assigned, listed) = unsafe {
+            let counts = list.as_ptr().cast::<u32>();
+            (*counts as usize, *counts.add(1) as usize)
+        };
+        if listed != assigned || listed > LIMIT {
+            return Err("runtime_process_state_unavailable".into());
+        }
+        Ok(list[first..first + listed]
+            .iter()
+            .map(|id| {
+                let id = *id as u32;
+                let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
+                if raw.is_null() {
+                    return (id, None);
+                }
+                let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+                let mut member = 0;
+                let mut name = [0u16; 1024];
+                let mut length = name.len() as u32;
+                let known = unsafe {
+                    IsProcessInJob(process.as_raw_handle(), self.0.as_raw_handle(), &mut member)
+                        != 0
+                        && member != 0
+                        && QueryFullProcessImageNameW(
+                            process.as_raw_handle(),
+                            0,
+                            name.as_mut_ptr(),
+                            &mut length,
+                        ) != 0
+                };
+                let program = known
+                    .then(|| String::from_utf16(&name[..length as usize]).ok())
+                    .flatten();
+                (id, program)
+            })
+            .collect())
     }
 
     pub fn attach(child: &Child) -> Result<Self, String> {

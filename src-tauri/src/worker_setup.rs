@@ -411,6 +411,7 @@ pub(crate) fn bundled_runtime(resources: &Path) -> PathBuf {
 pub(crate) struct SetupPaths {
     pub data: PathBuf,
     pub bundle: PathBuf,
+    pub app_version: String,
 }
 async fn cancellable<T>(
     future: impl Future<Output = Result<T, String>>,
@@ -1186,6 +1187,18 @@ async fn prepare_on(
                     }
                     Err(code) => return Err(code),
                 };
+                check_cancel(&progress.cancelled)?;
+                if let Err(code) = installed.runtime(profile.provider()).and_then(|runtime| {
+                    accepted.write_evidence(
+                        &paths.data.join("qualification-evidence"),
+                        &paths.app_version,
+                        profile,
+                        runtime,
+                        &qualified,
+                    )
+                }) {
+                    eprintln!("worker_qualification_evidence_failed: {code}");
+                }
                 group_prepared.push((qualified, accepted));
             }
             // FD-56: an accelerated provider keeps a workload only where it measured faster than
@@ -2251,6 +2264,7 @@ mod tests {
                 SetupPaths {
                     data: data.clone(),
                     bundle: root.join("absent"),
+                    app_version: "test".into(),
                 },
                 true,
                 progress.clone(),
@@ -2334,6 +2348,7 @@ mod tests {
         let paths = SetupPaths {
             data: root.clone(),
             bundle: root.join("absent"),
+            app_version: "test".into(),
         };
         let setup = WorkerSetup::default();
         // The worker starting by itself keeps what it remembered.
@@ -2382,6 +2397,7 @@ mod tests {
             SetupPaths {
                 data: data.clone(),
                 bundle: root.join("absent"),
+                app_version: "test".into(),
             },
             false,
             progress,
