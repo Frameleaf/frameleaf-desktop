@@ -9,10 +9,9 @@
   import Sheet from './Sheet.svelte';
   import PhotoImportDestination from './PhotoImportDestination.svelte';
   import type { AlbumDestination } from './import-destination';
-  import { formatBytes, percent, importProgress, importProgressText, type OverallProgress } from './ui-state';
+  import { availabilityText, formatBytes, oneDriveDiscovery, percent, importProgress, importProgressText, platformFromUserAgent, type Availability, type OverallProgress } from './ui-state';
   import { explainError, skipSummary } from './errors';
   type Hint = { label: string; path: string };
-  type Availability = { available: number; needsDownload: number; notReady: number; unknown: number; pinned: number; downloadBytes: number };
   type Inventory = { selectionId: string; path: string; photos: number; logicalBytes: number; skipped: number; truncated: boolean; availability: Availability };
   let hints = $state<Hint[]>([]);
   let folder = $state<Inventory | null>(null);
@@ -77,9 +76,7 @@
     return () => { alive = false; unlisten?.(); };
   });
   const size = formatBytes;
-  function availabilityText(value: Availability) {
-    return `${value.available.toLocaleString()} OS-reported available; ${value.needsDownload.toLocaleString()} need downloading (${size(value.downloadBytes)} in originals); ${value.notReady.toLocaleString()} provider not ready; ${value.unknown.toLocaleString()} unknown. ${value.pinned.toLocaleString()} request pinning. These are metadata snapshots; pinning does not prove a complete local original. Unknown files may also need downloading.`;
-  }
+  const findOneDrive = oneDriveDiscovery(platformFromUserAgent(navigator.userAgent));
   async function prepareCopy() {
     busy = true; message = '';
     try { job = await invoke<CopyJob>('prepare_photo_import'); }
@@ -151,7 +148,7 @@
     <h1 id="photo-sources-heading">Photo sources</h1>
     {#if consent}<span class="pill {job ? jobTone : consent.registered ? 'ok' : 'wait'}"><i aria-hidden="true"></i>{job ? jobLabel : consent.registered ? 'Folder registered' : 'Registration pending'}</span>{/if}
     <span class="sp"></span>
-    <button class="btn quiet" disabled={busy || !native || !!consent || blockedConsent} onclick={discover}>Find OneDrive Folders</button>
+    {#if findOneDrive}<button class="btn quiet" disabled={busy || !native || !!consent || blockedConsent} onclick={discover}>Find OneDrive Folders</button>{/if}
     <button class="btn" disabled={busy || !native || !!consent || blockedConsent} onclick={() => choose()}><Icon name="plus" />Add Folder…</button>
   </header>
   <div class="body">
@@ -225,7 +222,7 @@
             <span class="l">
               <b>{folder.path}</b>
               <small>{folder.photos.toLocaleString()} photo or video filenames found{folder.truncated ? ' in a partial preview' : ''}. {folder.skipped ? `${folder.skipped} unavailable, linked or excluded entries skipped. ` : ''}Counts use filenames and metadata. Original contents have not been read, downloaded or imported. Availability can change; this folder does not inventory your entire cloud account.</small>
-              {#if folder.availability}<small aria-label="Preview file availability">{availabilityText(folder.availability)}</small>{/if}
+              {#if folder.availability && availabilityText(folder.availability)}<small aria-label="Where these files are">{availabilityText(folder.availability)}</small>{/if}
               <PhotoImportDestination bind:albumMode bind:destination disabled={busy} onchange={() => { allowReads = false; }} />
               {#if watchAvailable && !folder.truncated}
                 <label class="check muted" style="margin-top:10px"><input type="checkbox" bind:checked={watchFolder} onchange={() => { allowReads = false; }} disabled={busy} /> Watch this folder and automatically copy photos and videos to the selected destination.</label>
@@ -256,7 +253,7 @@
   <Sheet title="Copy details" wide onclose={() => { detailsOpen = false; }}>
     <p>Prepared originals: {size(job.logicalBytes)}. {job.skipped ? `${job.skipped.toLocaleString()} ${job.skipped === 1 ? 'item was' : 'items were'} skipped and not imported${skipSummary(job.skippedReasons) ? ` (${skipSummary(job.skippedReasons)})` : ''}. ` : ''}Original files stay in this folder. A copy is confirmed only after your server verifies its stored bytes.</p>
     <p>{job.uploadRemaining === null ? 'No upload allowance approved.' : `${size(job.uploadRemaining)} of original upload data remaining, including retries.`} Protocol overhead and downloads from your cloud provider are separate. Interrupted sends count in full; resuming does not reset this allowance.</p>
-    {#if job.availability}<p aria-label="Prepared file availability">{availabilityText(job.availability)}</p>{/if}
+    {#if job.availability && availabilityText(job.availability)}<p aria-label="Where these files are">{availabilityText(job.availability)}</p>{/if}
     {#snippet actions()}<button class="btn" type="button" onclick={() => { detailsOpen = false; }}>Done</button>{/snippet}
   </Sheet>
 {/if}

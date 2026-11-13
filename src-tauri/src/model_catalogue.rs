@@ -699,13 +699,28 @@ pub(crate) fn shared_cache(
         .map(|(path, (_, bytes, hash))| (path, bytes, hash))
         .collect();
     let scope = digest(&serde_json::to_vec(&identity).map_err(|_| invalid())?);
-    let active = root.join(scope);
+    let active = root.join(&scope);
     private_directory(root)?;
     if active.exists() {
-        for (relative, (_, bytes, hash)) in &files {
-            verify_file(&active.join(relative), *bytes, hash, cancel)?;
+        let verified = files.iter().try_for_each(|(relative, (_, bytes, hash))| {
+            verify_file(&active.join(relative), *bytes, hash, cancel)
+        });
+        match verified {
+            Ok(()) => return Ok(active),
+            // FD-64: the set links each model file, so a file its cache has since repaired
+            // (replaced) leaves the set holding the old bytes, and one removed from the set is
+            // simply missing. Discard the set and compose it again from the caches, which are
+            // verified below before anything is linked.
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "model_file_changed" | "model_file_unavailable" | "runtime_file_unavailable"
+                ) =>
+            {
+                crate::model_cache::remove_contained(root, &scope)?;
+            }
+            Err(code) => return Err(code),
         }
-        return Ok(active);
     }
     let staging = Staging::create(root.join(format!(".composition-{}", Uuid::new_v4())))?;
     for (relative, (source, bytes, hash)) in &files {
@@ -848,6 +863,37 @@ mod tests {
             shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap_err(),
             "model_file_changed"
         );
+        // FD-64: the cache repairs a changed file by replacing it (the right bytes, in a new
+        // file). The set, which still links the changed one, is composed again from the caches
+        // instead of failing for ever.
+        let repaired = caches[1].join("facial-recognition/buffalo_l/detection/model.onnx");
+        let linked = active.join("facial-recognition/buffalo_l/detection/model.onnx");
+        for _ in 0..2 {
+            std::fs::remove_file(&repaired).unwrap();
+            std::fs::write(&repaired, b"fixture weights 1").unwrap();
+            let again = shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+            assert_eq!(again, active);
+            assert_eq!(std::fs::read(&linked).unwrap(), b"fixture weights 1");
+            // Changed again, through the set this time: the cache's file is the same one.
+            std::fs::write(&linked, b"changed").unwrap();
+            assert_eq!(std::fs::read(&repaired).unwrap(), b"changed");
+        }
+        std::fs::remove_file(&repaired).unwrap();
+        std::fs::write(&repaired, b"fixture weights 1").unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"changed");
+        shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"fixture weights 1");
+        // A file or a folder missing from the set is composed again the same way.
+        std::fs::remove_file(&linked).unwrap();
+        shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"fixture weights 1");
+        std::fs::remove_dir_all(active.join("ocr/PP-OCRv5_mobile/detection")).unwrap();
+        shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        assert!(active
+            .join("ocr/PP-OCRv5_mobile/detection/model.onnx")
+            .is_file());
+        // Nothing but the one set is left behind.
+        assert_eq!(std::fs::read_dir(root.join("sets")).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]

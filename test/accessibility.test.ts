@@ -65,7 +65,8 @@ test('the reconnecting screen takes focus on its title and keeps it on Try now',
   assert.match(app, /\$effect\(\(\) => \{ if \(keptSignIn && !connection\) void tick\(\)\.then\(\(\) => keptTitle\?\.focus\(\)\); \}\);/);
   assert.match(app, /<h2 tabindex="-1" bind:this=\{keptTitle\}>\{kept\.panel\.title\}<\/h2>\s*<p class="sub" role="status">\{kept\.panel\.detail\}<\/p>/);
   assert.match(app, /if \(keptSignIn === before && button\.isConnected\) button\.focus\(\);/);
-  assert.match(app, /<button class="btn primary" disabled=\{busy\} onclick=\{retryKept\}>\{kept\.panel\.retry\}<\/button>/);
+  // The leading button, except on the Two-Step Verification screen once it is known how to carry on there.
+  assert.match(app, /<button class="btn" class:primary=\{!verify\?\.verifyHere && !verify\?\.signOutFirst\} disabled=\{busy\} onclick=\{retryKept\}>\{kept\.panel\.retry\}<\/button>/);
 });
 
 test('the worker status card is a named group, says its state in words and announces when it needs the person', () => {

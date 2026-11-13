@@ -20,7 +20,8 @@
   } = $props();
   const platform = platformFromUserAgent(navigator.userAgent);
   const computer = computerWord(platform);
-  const version = (import.meta.env?.VITE_APP_VERSION as string | undefined) || '0.1.0';
+  // Set from package.json by vite.config.ts.
+  const version = import.meta.env.VITE_APP_VERSION as string;
   let mode = $state<'client-worker' | 'local-server'>('client-worker');
   // start: Welcome (or your servers); address: enter an address; server: that server's sign-in.
   let step = $state<'start' | 'address' | 'server' | 'account'>('start');
@@ -224,7 +225,7 @@
         onback={() => { step = 'start'; }} />
     {:else if step === 'address'}
       <form class="form" id="address-form" aria-label="Server address" onsubmit={lookUp}>
-        <div class="form-row"><label for="srv">Server address</label><span class="with-button"><input id="srv" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={lookingUp} autocomplete="url" /><button class="btn" type="button" disabled={lookingUp || discovering || !native} onclick={findServer}><Icon name="radar" />{discovering ? 'Searching…' : 'Find My Server'}</button></span></div>
+        <div class="form-row"><label for="srv">Server address</label><span class="with-button"><!-- Plain text, not type="url": an address with no scheme, such as 192.168.1.20:2283, must be accepted. --><input id="srv" type="text" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="192.168.1.20:2283 or https://photos.example.com" bind:value={server} required disabled={lookingUp} autocomplete="url" /><button class="btn" type="button" disabled={lookingUp || discovering || !native} onclick={findServer}><Icon name="radar" />{discovering ? 'Searching…' : 'Find My Server'}</button></span></div>
       </form>
       <div class="wfoot">
         <p>Copy it from your browser’s address bar when you have your server’s page open, or ask whoever runs the server.</p>
