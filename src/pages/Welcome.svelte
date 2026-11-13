@@ -24,9 +24,6 @@
   let mode = $state<'client-worker' | 'local-server'>('client-worker');
   // start: Welcome (or your servers); address: enter an address; server: that server's sign-in.
   let step = $state<'start' | 'address' | 'server' | 'account'>('start');
-  let accountStart = $state<'sign-in' | 'create'>('sign-in');
-  // A server sign-in that went to the Frameleaf account first, to finish once signed in.
-  let resume = $state<SignInOptions | null>(null);
   let resumeFrameleaf = $state(false);
   let signIn = $state<SignInOptions | null>(null);
   let looking = $state(false);
@@ -80,13 +77,11 @@
     catch (error) { failure = explain(error); }
     finally { lookingUp = false; }
   }
-  function openAccount(start: 'sign-in' | 'create') { accountStart = start; resume = null; failure = ''; notice = ''; step = 'account'; }
-  /** Signed in to the Frameleaf account: finish the server sign-in that asked for it, or show the account's servers. */
-  function accountSignedIn(account: CloudAccount) {
-    oncloudaccount(account); failure = ''; notice = '';
-    if (resume) { signIn = resume; resume = null; resumeFrameleaf = true; step = 'server'; }
-    else { step = 'start'; void loadServers(); }
-  }
+  function createAccount() { failure = ''; notice = ''; step = 'account'; }
+  /** Signed in to the Frameleaf account: show the account's servers. */
+  function accountSignedIn(account: CloudAccount) { oncloudaccount(account); failure = ''; notice = ''; step = 'start'; void loadServers(); }
+  /** The server's own sign-in, for a server that has no Frameleaf account behind it: its address comes first. */
+  function ownSignIn() { step = 'address'; failure = ''; notice = ''; }
   function lookUp(event: SubmitEvent) { event.preventDefault(); void openServer(server); }
   async function loadServers() {
     loadingServers = true; failure = '';
@@ -96,8 +91,8 @@
     nearby = lan.status === 'fulfilled' ? lan.value ?? [] : [];
     loadingServers = false;
   }
-  // The browser path: Frameleaf Cloud's own sign-in page, which takes a Passkey and every other way to
-  // sign in. FrameleafAccount hands off here when a step needs a Passkey.
+  // Sign in with Frameleaf, the standard way in: Frameleaf Cloud's own sign-in page in the browser, which
+  // takes a Passkey and every other way to sign in. Every sign-in entry point starts here.
   async function cloudSignIn(create = false, stay = false): Promise<CloudAccount | null> {
     if (!native || cloudBusy) return null;
     cloudBusy = true; failure = '';
@@ -219,14 +214,14 @@
       </div>
     {:else if step === 'server' && signIn}
       <ServerSignIn options={signIn} {native} {computer} {cloudAccount} {onconnected} {onlocked} autostart={resumeFrameleaf} bind:deviceName
-        oncloudsignin={() => { resume = signIn; resumeFrameleaf = false; accountStart = 'sign-in'; step = 'account'; }}
+        oncloudsignin={async () => !!(await cloudSignIn(false, true))}
         onback={() => { step = 'start'; signIn = null; resumeFrameleaf = false; failure = ''; }} />
     {:else if step === 'account'}
-      <FrameleafAccount start={accountStart} {native}
+      <FrameleafAccount start="create" {native}
         onsignedin={account => accountSignedIn(account)}
         onbrowser={async () => { const account = await cloudSignIn(false, true); if (account) accountSignedIn(account); }}
-        onownlogin={() => { resume = null; step = 'start'; }}
-        onback={() => { if (resume) { signIn = resume; resume = null; step = 'server'; } else step = 'start'; }} />
+        onownlogin={ownSignIn}
+        onback={() => { step = 'start'; }} />
     {:else if step === 'address'}
       <form class="form" id="address-form" aria-label="Server address" onsubmit={lookUp}>
         <div class="form-row"><label for="srv">Server address</label><span class="with-button"><input id="srv" type="url" placeholder="https://photos.home.example" bind:value={server} required disabled={lookingUp} autocomplete="url" /><button class="btn" type="button" disabled={lookingUp || discovering || !native} onclick={findServer}><Icon name="radar" />{discovering ? 'Searching…' : 'Find My Server'}</button></span></div>
@@ -238,9 +233,10 @@
       </div>
     {:else}
       <div class="start">
-        <button class="btn primary" type="button" disabled={cloudBusy || !native} onclick={() => openAccount('create')}>Create a Frameleaf Account</button>
-        <button class="btn" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : openAccount('sign-in')}><Icon name="cloud" />{cloudLocked ? 'Restore Saved Frameleaf Sign-In' : 'Sign In with Frameleaf'}</button>
+        <button class="btn primary" type="button" disabled={cloudBusy || !native} onclick={() => cloudLocked ? restoreCloud(true) : cloudSignIn()}><Icon name="cloud" />{cloudLocked ? 'Restore Saved Frameleaf Sign-In' : 'Sign In with Frameleaf'}</button>
+        <button class="btn" type="button" disabled={cloudBusy || !native} onclick={createAccount}>Create a Frameleaf Account</button>
         <p class="sub">One free Frameleaf account signs you in to your servers from home or away. Your photos stay on your own server. Accounts are made at Frameleaf, never on someone’s server.</p>
+        <button class="btn quiet" type="button" onclick={ownSignIn}>Sign In with a Server Password Instead</button>
       </div>
       <div class="list" role="list" aria-label="Servers on this network" aria-busy={looking}>
         <div class="sec">Servers on this network{looking ? ' · Looking…' : ''}</div>
@@ -256,7 +252,7 @@
         <div class="srv" role="listitem">
           <span class="ic" aria-hidden="true"><Icon name="globe" /></span>
           <span class="l"><b>Another server</b><small>Enter its address</small></span>
-          <button class="btn" type="button" onclick={() => { step = 'address'; failure = ''; notice = ''; }}>Enter Address…</button>
+          <button class="btn" type="button" onclick={ownSignIn}>Enter Address…</button>
         </div>
       </div>
       <div class="wfoot">
