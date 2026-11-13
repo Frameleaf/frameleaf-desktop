@@ -18,6 +18,18 @@ fn main() {
             Ok(())
         }
         [mode] if mode == "--owner-pipe" => frameleaf_desktop::host_control::run(),
+        #[cfg(windows)]
+        [mode] if mode == "--media-move-owner" => {
+            frameleaf_desktop::host_control::media_move_owner()
+        }
+        #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+        [mode] if mode == "--qualify-media-move" => {
+            frameleaf_desktop::host_control::qualify_media_move()
+        }
+        #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+        [mode] if mode == "--qualify-media-move-manager" => {
+            frameleaf_desktop::host_control::qualify_media_move_manager()
+        }
         [mode] if mode == "--inspect-owner" => frameleaf_desktop::host_control::inspect_owner(),
         [mode, manifest, controller]
             if mode == "--prepare-install"
