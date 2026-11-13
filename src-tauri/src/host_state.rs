@@ -806,7 +806,8 @@ mod tests {
             "host_recovery_requires_manager"
         );
         owner.clean_stop().unwrap();
-        let stopped = fs::read(fixture.0.join(NAME)).unwrap();
+        // Read through the held lease: Windows refuses a second handle on the locked journal.
+        let stopped = owner.read().unwrap();
 
         for (id, digest) in [("bbbbbbbbbbbb", manifest.clone()), (ID, "d".repeat(64))] {
             assert_eq!(
@@ -839,7 +840,7 @@ mod tests {
         }
 
         owner.check_movable(ID, &manifest).unwrap();
-        assert_eq!(fs::read(fixture.0.join(NAME)).unwrap(), stopped);
+        assert_eq!(owner.read().unwrap(), stopped);
     }
 
     #[cfg(unix)]
