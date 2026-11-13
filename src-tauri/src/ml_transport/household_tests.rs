@@ -330,6 +330,7 @@ impl FakeServer {
             manifest_sha256: "b".repeat(64),
             runtime_fingerprint: "c".repeat(64),
             report_sha256: "d".repeat(64),
+            qualified_at: millis(&expires).unwrap() - 600_000,
             expires_at: millis(&expires).unwrap(),
         }
     }
