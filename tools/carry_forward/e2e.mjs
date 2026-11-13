@@ -85,13 +85,13 @@ async function previousCounts(state) {
   try { return await counts(PREVIOUS, PREVIOUS.databasePort); } finally { await stopPostgres(PREVIOUS, data, child); }
 }
 /** One digest over every path, size and byte under a directory. */
-async function treeDigest(directory) {
+async function treeDigest(directory, only = () => true) {
   const hash = createHash("sha256"), pending = [directory], files = [];
   while (pending.length) {
     const current = pending.pop();
     for (const entry of await fs.readdir(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
-      if (entry.isDirectory()) pending.push(path); else files.push(path);
+      if (entry.isDirectory()) pending.push(path); else if (only(entry.name)) files.push(path);
     }
   }
   for (const path of files.sort()) {
@@ -184,7 +184,8 @@ test("a library moves from the previous Postgres to the new one, and both the ol
   const original = await previousCounts(state);
   t.diagnostic(`library: ${Object.keys(original).length} tables, ${Object.values(original).reduce((a, b) => a + b, 0)} rows; asset ${original.asset}, smart_search ${original.smart_search}, face_search ${original.face_search}, album_asset ${original.album_asset}`);
   assert.equal(original.asset, 6000);
-  const media = await treeDigest(join(state, "media")), originals = await treeDigest(join(state, "media/library"));
+  const media = await treeDigest(join(state, "media")), isOriginal = name => name.startsWith("IMG_"),
+    originals = await treeDigest(join(state, "media"), isOriginal);
 
   // Export: the previous Postgres, read-only, loopback only, no photo server; then it is stopped.
   const exporting = agentProcess(exportConfig(state, permitId));
@@ -275,7 +276,7 @@ test("a library moves from the previous Postgres to the new one, and both the ol
   assert.deepEqual(await treeDigest(join(state, "database")), old);
   assert.deepEqual(await previousCounts(state), original);
   // (The photo server adds its own folder markers beside them when it starts, as on any start.)
-  assert.deepEqual(await treeDigest(join(state, "media/library")), originals);
+  assert.deepEqual(await treeDigest(join(state, "media"), isOriginal), originals);
   t.diagnostic(`restored ${receipt.validation.rows} rows in ${receipt.validation.tables} tables; old directory ${old.files} files unchanged; ${originals.files} originals unchanged`);
 });
 
