@@ -27,6 +27,41 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+/// A server address as a person types or pastes it: `192.168.1.20:2283`, `tower.local`, or a page
+/// address copied from the browser. It is reduced to its origin: what follows the host and port
+/// names a page of the server, not the server. With no scheme, a host on the local network is
+/// reached over plain HTTP (a home server is often just an address and a port) and any other
+/// host over HTTPS. A scheme the person typed is kept and `normalize_server` decides, so plain
+/// HTTP to a public host is still refused.
+pub fn typed_server(value: &str) -> Result<Url, String> {
+    let typed = value.trim();
+    if typed.is_empty() || typed.contains('\\') || typed.chars().any(char::is_whitespace) {
+        return Err("server_address_invalid".into());
+    }
+    let parse = |address: &str| {
+        Url::parse(address)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+    };
+    let url = if typed.contains("://") {
+        parse(typed)
+    } else {
+        parse(&format!("http://{typed}")).and_then(|url| {
+            if url.host().is_some_and(is_local_network) {
+                Some(url)
+            } else {
+                parse(&format!("https://{typed}"))
+            }
+        })
+    }
+    .ok_or("server_address_invalid")?;
+    // Credentials in an address are never dropped silently.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("server_requires_https_origin".into());
+    }
+    normalize_server(&url.origin().ascii_serialization())
+}
+
 /// A host on this computer or the local network, where servers answer over plain HTTP: loopback,
 /// private and link-local addresses, single-label names and the local-only DNS suffixes. Tailscale
 /// counts as local: its 100.64.0.0/10 addresses, its fd7a:115c:a1e0::/48 ULAs and `*.ts.net` names.
@@ -317,5 +352,79 @@ mod local_http_tests {
             assert!(normalize_server(remote).is_err(), "{remote}");
         }
         assert!(normalize_server("https://photos.example.com").is_ok());
+    }
+
+    #[test]
+    fn a_typed_address_becomes_the_origin_with_plain_http_for_local_hosts() {
+        for (typed, origin) in [
+            // Just an address and a port, as most home servers are reached.
+            ("192.168.1.20:2283", "http://192.168.1.20:2283/"),
+            ("192.168.1.20", "http://192.168.1.20/"),
+            // Copied from the browser's address bar with a page open.
+            ("192.168.1.20:2283/photos", "http://192.168.1.20:2283/"),
+            (
+                "http://192.168.1.20:2283/photos?at=1#top",
+                "http://192.168.1.20:2283/",
+            ),
+            ("  http://192.168.1.20:2283/  ", "http://192.168.1.20:2283/"),
+            ("tower.local", "http://tower.local/"),
+            ("tower.local:2283/albums", "http://tower.local:2283/"),
+            ("tower", "http://tower/"),
+            ("localhost:2283", "http://localhost:2283/"),
+            ("[fd00::7]:2283", "http://[fd00::7]:2283/"),
+            ("100.64.0.1:2283", "http://100.64.0.1:2283/"),
+            ("nas.tail1234.ts.net", "http://nas.tail1234.ts.net/"),
+            // A local server that does have a certificate keeps the scheme that was typed.
+            (
+                "https://tower.local:8443/photos",
+                "https://tower.local:8443/",
+            ),
+            // Anything else is public: HTTPS when no scheme was typed.
+            ("photos.example.com", "https://photos.example.com/"),
+            ("photos.example.com/albums", "https://photos.example.com/"),
+            (
+                "photos.example.com:8443",
+                "https://photos.example.com:8443/",
+            ),
+            ("8.8.8.8:2283", "https://8.8.8.8:2283/"),
+            (
+                "https://photos.example.com/photos",
+                "https://photos.example.com/",
+            ),
+        ] {
+            assert_eq!(
+                typed_server(typed).map(String::from),
+                Ok(origin.to_string()),
+                "{typed}"
+            );
+        }
+        // Plain HTTP that was typed for a public host is refused, never upgraded or sent.
+        for refused in [
+            "http://photos.example.com",
+            "http://8.8.8.8:2283/photos",
+            "user:secret@192.168.1.20:2283",
+            "https://user@photos.example.com",
+        ] {
+            assert_eq!(
+                typed_server(refused).map(String::from),
+                Err("server_requires_https_origin".to_string()),
+                "{refused}"
+            );
+        }
+        for invalid in [
+            "",
+            "   ",
+            "ftp://192.168.1.20",
+            "file:///etc/hosts",
+            "192.168.1.20 2283",
+            "tower\\share",
+            "://",
+        ] {
+            assert_eq!(
+                typed_server(invalid).map(String::from),
+                Err("server_address_invalid".to_string()),
+                "{invalid:?}"
+            );
+        }
     }
 }

@@ -47,8 +47,8 @@
       if (data) data = { ...data, wallet: updated && typeof updated === 'object' ? { ...(wallet ?? {}), ...updated } : wallet };
       notice = change.dailyCapUsd !== undefined ? `Daily cap set to ${formatUsdShort(change.dailyCapUsd)}.` : change.autoTopUp ? 'Auto-reload turned on.' : 'Auto-reload turned off.';
     } catch (error) {
+      // `wallet_step_up_required` is explained once, by the error message, which carries Open Settings.
       failed(error, () => { void update(change); });
-      if (String(error) === 'wallet_step_up_required' && wallet?.settingsUrl) notice = 'Open your account settings on frameleaf.cloud to raise the cap or turn on auto-reload.';
     } finally { saving = false; }
   }
   async function open(url: string | null | undefined, amount?: number) {

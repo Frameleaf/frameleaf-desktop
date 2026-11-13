@@ -1,7 +1,7 @@
 # Maintainer: Frameleaf <support at frameleaf dot app>
 pkgname=frameleaf-desktop-bin
 _pkgname=frameleaf-desktop
-pkgver=0.1.6
+pkgver=0.1.7
 pkgrel=1
 pkgdesc="Desktop app for Frameleaf, a self-hosted photo and video library"
 arch=('x86_64' 'aarch64')

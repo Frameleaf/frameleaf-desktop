@@ -1,10 +1,10 @@
 $ErrorActionPreference = 'Stop'
-throw 'No signed Windows installer exists for Frameleaf 0.1.6, so this package must not be published.'
+throw 'No signed Windows installer exists for Frameleaf 0.1.7, so this package must not be published.'
 
 $packageArgs = @{
   packageName    = $env:ChocolateyPackageName
   fileType       = 'msi'
-  url64bit       = 'https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.6/Frameleaf_0.1.6_x64_en-US.msi'
+  url64bit       = 'https://github.com/Frameleaf/frameleaf-desktop/releases/download/v0.1.7/Frameleaf_0.1.7_x64_en-US.msi'
   checksum64     = 'checksum-pending-release'
   checksumType64 = 'sha256'
   softwareName   = 'Frameleaf'

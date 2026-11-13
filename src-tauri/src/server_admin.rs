@@ -253,6 +253,35 @@ async fn session(state: &State<'_, DesktopState>) -> Result<Session, String> {
     Session::open(saved)
 }
 
+/// The session a Two-Step Verification is for: the connection in use, or, when none is in use
+/// because the server refused the saved sign-in until that verification, the saved sign-in.
+fn verifying(
+    held: Option<&SavedConnection>,
+    saved: impl FnOnce() -> Result<Option<SavedConnection>, String>,
+) -> Result<Session, String> {
+    match held {
+        Some(held) => Session::open(held),
+        None => Session::open(&saved()?.ok_or("sign_in_required")?),
+    }
+}
+async fn verifying_session(state: &State<'_, DesktopState>) -> Result<Session, String> {
+    verifying(state.0.lock().await.as_ref(), || {
+        crate::credentials::load::<SavedConnection>("connection")
+    })
+}
+
+/// Asks the server about the saved sign-in it refused until Two-Step Verification. The refusal
+/// carries what `server_step_up` needs (methods and a transaction), so the window can verify in
+/// place. `Ok` means the server no longer asks: restoring the sign-in again will succeed.
+#[tauri::command]
+pub(crate) async fn saved_sign_in_verification(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+) -> Result<(), Refused> {
+    crate::require_local(&window)?;
+    verifying_session(&state).await?.me().await.map(|_| ())
+}
+
 #[tauri::command]
 pub(crate) async fn server_summary(
     window: WebviewWindow,
@@ -498,7 +527,8 @@ pub(crate) async fn server_step_up(
     crate::require_local(&window)?;
     let transaction = zeroize::Zeroizing::new(transaction);
     let proof = zeroize::Zeroizing::new(proof);
-    let session = session(&state).await?;
+    // Also answers for a saved sign-in that is waiting for exactly this verification.
+    let session = verifying_session(&state).await?;
     crate::server_steps::step_up(
         &session.client,
         &session.base,
@@ -782,6 +812,78 @@ mod summary_tests {
             client: client(),
             base,
             token: "session".into(),
+        }
+    }
+
+    fn saved(server: &Url, token: &str) -> SavedConnection {
+        SavedConnection {
+            server: server.to_string(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Test".into(),
+            token: token.into(),
+            device_name: "Fixture".into(),
+            mode: "client-worker".into(),
+            device_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saved_sign_in_refused_until_two_step_verification_is_verified_in_place() {
+        let (base, requests) = server(|request| match request.path.as_str() {
+            "/api/users/me" => (
+                403,
+                json!({
+                    "code": "verification_required", "methods": ["totp", "recovery_code"],
+                    "transaction": "txn",
+                }),
+            ),
+            "/api/auth/step-up" => (200, json!({})),
+            _ => (404, json!({})),
+        });
+        // No connection is in use while the saved sign-in waits: the saved one is asked about.
+        let kept = saved(&base, "kept");
+        let mut session = verifying(None, || Ok(Some(kept))).unwrap();
+        session.client = client();
+        let Err(Refused::Verification {
+            methods,
+            transaction,
+            ..
+        }) = session.me().await
+        else {
+            panic!("the saved sign-in's refusal should carry the offer");
+        };
+        assert_eq!(methods, ["totp", "recovery_code"]);
+        assert_eq!(transaction, "txn");
+        crate::server_steps::step_up(
+            &session.client,
+            &session.base,
+            &session.token,
+            &transaction,
+            "totp",
+            "123456",
+        )
+        .await
+        .unwrap();
+        {
+            let sent = requests.lock().unwrap();
+            assert_eq!(sent[1].path, "/api/auth/step-up");
+            assert_eq!(sent[1].bearer.as_deref(), Some("kept"));
+            assert_eq!(sent[1].body["transaction"], "txn");
+        }
+        // A connection in use is the one verified, and the saved sign-in is not read for it.
+        let held = saved(&base, "held");
+        let session = verifying(Some(&held), || panic!("not read")).unwrap();
+        assert_eq!(session.token, "held");
+        // Nothing saved, or a store that cannot be read: there is no sign-in to verify.
+        for (stored, code) in [
+            (Ok(None), "sign_in_required"),
+            (
+                Err("credential_unlock_required".to_string()),
+                "credential_unlock_required",
+            ),
+        ] {
+            assert_eq!(verifying(None, || stored).err().as_deref(), Some(code));
         }
     }
 

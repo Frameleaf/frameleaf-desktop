@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>frameleaf</id>
-    <version>0.1.6</version>
+    <version>0.1.7</version>
     <packageSourceUrl>https://github.com/Frameleaf/frameleaf-desktop/tree/main/packaging/chocolatey</packageSourceUrl>
     <owners>Frameleaf</owners>
     <title>Frameleaf Desktop</title>
@@ -22,7 +22,7 @@ Frameleaf Desktop for Windows connects to your Frameleaf server and to Frameleaf
 
 The server is open source (AGPLv3) and a fork of Immich. Frameleaf is in beta, and the Windows installer is not code-signed yet.
 ]]></description>
-    <releaseNotes>https://github.com/Frameleaf/frameleaf-desktop/releases/tag/v0.1.6</releaseNotes>
+    <releaseNotes>https://github.com/Frameleaf/frameleaf-desktop/releases/tag/v0.1.7</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

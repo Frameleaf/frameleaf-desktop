@@ -41,6 +41,9 @@
     const [status, link] = await Promise.allSettled([invoke<RemoteStatus>('remote_status'), invoke<CloudStatus>('cloud_status')]);
     if (status.status === 'fulfilled') data = status.value; else failed(status.reason, () => { void load(); });
     cloud = link.status === 'fulfilled' ? link.value : null;
+    // The relay and sign-in switches need this answer: say why they are off, or ask to verify. When both
+    // requests were refused, the first one's message or prompt already covers it and its retry reloads both.
+    if (link.status === 'rejected' && status.status === 'fulfilled') failed(link.reason, () => { void load(); });
     busy = false;
   }
   onMount(() => { void load(); });

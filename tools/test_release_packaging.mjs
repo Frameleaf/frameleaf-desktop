@@ -19,7 +19,7 @@ function withTree(run) {
   const root = mkdtempSync(join(tmpdir(), "frameleaf-packaging-test-"));
   try {
     mkdirSync(join(root, "src-tauri"));
-    for (const file of ["package.json", "src-tauri/tauri.conf.json", "src-tauri/Cargo.toml", "packaging"]) {
+    for (const file of ["package.json", "package-lock.json", "src-tauri/tauri.conf.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "packaging"]) {
       cpSync(join(repository, file), join(root, file), { recursive: true });
     }
     const read = (file) => readFileSync(join(root, file), "utf8");
@@ -27,15 +27,23 @@ function withTree(run) {
     // A prerelease tree keeps the last stable packaging, so the fixture states that stable version throughout.
     const current = JSON.parse(read("package.json")).version;
     const stable = /^pkgver=(.*)$/m.exec(read("packaging/aur/PKGBUILD"))[1];
-    if (current.includes("-")) {
-      edit("package.json", (text) => text.replace(`"version": "${current}"`, `"version": "${stable}"`));
-      edit("src-tauri/tauri.conf.json", (text) => text.replace(`"version": "${current}"`, `"version": "${stable}"`));
-      edit("src-tauri/Cargo.toml", (text) => text.replace(`version = "${current}"`, `version = "${stable}"`));
-    }
+    if (current.includes("-")) for (const change of Object.entries(applicationEdits(current, stable))) edit(...change);
     return run(root, read, edit);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+// How each application file, lock files included, is rewritten from one version to another.
+function applicationEdits(from, to) {
+  return {
+    "package.json": (text) => text.replace(`"version": "${from}"`, `"version": "${to}"`),
+    "package-lock.json": (text) => text.replaceAll(`"name": "@frameleaf/desktop",\n  "version": "${from}"`, `"name": "@frameleaf/desktop",\n  "version": "${to}"`)
+      .replace(`"name": "@frameleaf/desktop",\n      "version": "${from}"`, `"name": "@frameleaf/desktop",\n      "version": "${to}"`),
+    "src-tauri/tauri.conf.json": (text) => text.replace(`"version": "${from}"`, `"version": "${to}"`),
+    "src-tauri/Cargo.toml": (text) => text.replace(`version = "${from}"`, `version = "${to}"`),
+    "src-tauri/Cargo.lock": (text) => text.replace(`name = "frameleaf-desktop"\nversion = "${from}"`, `name = "frameleaf-desktop"\nversion = "${to}"`),
+  };
 }
 
 const digest = (text) => createHash("sha256").update(text).digest("hex");
@@ -47,6 +55,9 @@ test("the application and every packaging file state one version", () => {
     "package.json": (text) => text.replace(`"version": "${version}"`, '"version": "9.9.9"'),
     "src-tauri/tauri.conf.json": (text) => text.replace(`"version": "${version}"`, '"version": "9.9.9"'),
     "src-tauri/Cargo.toml": (text) => text.replace(`version = "${version}"`, 'version = "9.9.9"'),
+    // A stale lock file fails `npm ci` and `cargo --locked` in the release build, long after the tag is pushed.
+    "package-lock.json": (text) => text.replace(`"name": "@frameleaf/desktop",\n  "version": "${version}"`, '"name": "@frameleaf/desktop",\n  "version": "9.9.9"'),
+    "src-tauri/Cargo.lock": (text) => text.replace(`name = "frameleaf-desktop"\nversion = "${version}"`, 'name = "frameleaf-desktop"\nversion = "9.9.9"'),
     "packaging/aur/PKGBUILD": (text) => text.replace(`pkgver=${version}`, "pkgver=9.9.9"),
     "packaging/aur/.SRCINFO": (text) => text.replace(`/download/v${version}/`, "/download/v9.9.9/"),
     "packaging/chocolatey/frameleaf.nuspec": (text) => text.replace(`<version>${version}</version>`, "<version>9.9.9</version>"),
@@ -66,11 +77,7 @@ test("the application and every packaging file state one version", () => {
 test("a prerelease application version leaves the packaging at the last stable version", () => {
   withTree((root, read, edit) => {
     const version = consistentVersion(root);
-    const application = {
-      "package.json": (text) => text.replace(`"version": "${version}"`, `"version": "${version}-rc.1"`),
-      "src-tauri/tauri.conf.json": (text) => text.replace(`"version": "${version}"`, `"version": "${version}-rc.1"`),
-      "src-tauri/Cargo.toml": (text) => text.replace(`version = "${version}"`, `version = "${version}-rc.1"`),
-    };
+    const application = applicationEdits(version, `${version}-rc.1`);
     for (const [file, change] of Object.entries(application)) edit(file, change);
     assert.equal(consistentVersion(root), `${version}-rc.1`);
     assert.throws(() => stampPackaging(root, `${version}-rc.1`), /packaging_version_unsupported/);
