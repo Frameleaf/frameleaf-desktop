@@ -496,6 +496,23 @@ pub(crate) fn settle(current: Ports, idle: Evidence, probes: &Probes<'_>) -> Res
     Ok(chosen)
 }
 
+/// What a plain-HTTP server does with a connection, for tests: read what the client sent,
+/// refuse it in plain text, and close in order. Closing with the client's bytes unread resets
+/// the connection instead, and on Windows a reset discards a reply the client has not read yet.
+#[cfg(test)]
+pub(crate) fn answer_in_plain_text(stream: &mut std::net::TcpStream) {
+    // A TLS hello is one record: a five-byte header, then as many bytes as the header says.
+    let mut header = [0u8; 5];
+    if stream.read_exact(&mut header).is_ok() && header[0] == 22 {
+        let mut hello = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+        let _ = stream.read_exact(&mut hello);
+    }
+    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // Whatever else the client sends, until it hangs up or the caller's read timeout passes.
+    let _ = std::io::copy(stream, &mut std::io::sink());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,9 +1073,10 @@ mod tests {
         let port = plain.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = plain.accept().unwrap();
-            let mut hello = [0u8; 16];
-            let _ = stream.read(&mut hello);
-            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            answer_in_plain_text(&mut stream);
         });
         assert_eq!(tls_peer(port, &[fingerprint(&ours)]), Peer::Foreign);
         server.join().unwrap();
@@ -1077,5 +1095,29 @@ mod tests {
         let port = closed.local_addr().unwrap().port();
         drop(closed);
         assert_eq!(tls_peer(port, &[fingerprint(&ours)]), Peer::Unknown);
+    }
+
+    /// A reset says only that the connection ended. Whatever sent it, a plain-text program
+    /// included, is not named by it: the port stays unidentified, which is the safe answer.
+    #[test]
+    fn a_connection_reset_names_nobody() {
+        let ours = crate::manager::certificate_fingerprint(identity().certificate()).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The client is now waiting for an answer to its hello.
+            stream.read_exact(&mut [0u8; 5]).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            // Zero linger: closing sends a reset, on every system.
+            tauri::async_runtime::block_on(async {
+                tokio::net::TcpStream::from_std(stream)
+                    .unwrap()
+                    .set_zero_linger()
+                    .unwrap();
+            });
+        });
+        assert_eq!(tls_peer(port, &[ours]), Peer::Unknown);
+        server.join().unwrap();
     }
 }
