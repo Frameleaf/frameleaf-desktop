@@ -485,6 +485,14 @@ impl Admission<'_> {
             }
         }
     }
+    /// Separate media belongs only to the library the controller admitted.
+    #[cfg(windows)]
+    fn media_reference(&self) -> Option<&crate::host_state::media_move::MediaReference> {
+        match self {
+            Self::Controller(owner) => owner.media_reference(),
+            Self::Direct => None,
+        }
+    }
     fn carry(&self) -> Option<&serde_json::Value> {
         #[cfg(unix)]
         if let Self::Carry(_, carry) = self {
@@ -536,6 +544,11 @@ pub(crate) struct CheckpointReceipt {
     dump: CheckpointDump,
 }
 impl CheckpointReceipt {
+    #[cfg(any(windows, test))]
+    pub(crate) fn matches_manifest(&self, manifest: &str) -> bool {
+        self.manifest_sha256 == manifest
+    }
+
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }
@@ -1208,6 +1221,15 @@ impl HostMode {
     }
 }
 
+#[cfg(windows)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalMedia<'a> {
+    path: &'a Path,
+    identity: &'a str,
+    path_binding: crate::windows_protection::StatePathBinding,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostStart<'a> {
@@ -1215,6 +1237,9 @@ struct HostStart<'a> {
     state: &'a Path,
     #[cfg(windows)]
     state_path_binding: crate::windows_protection::StatePathBinding,
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_media: Option<ExternalMedia<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     database_reference: Option<&'a crate::host_database::Reference>,
     runtime: &'a Path,
@@ -1233,6 +1258,8 @@ struct HostOwner {
     tree: crate::process_tree::ProcessTree,
     terminated: Mutex<bool>,
     _code_lease: crate::package_lease::CodeLease,
+    #[cfg(windows)]
+    _external_media: Option<crate::host_state::media_move::PinnedMedia>,
 }
 impl HostOwner {
     fn terminate(&self) {
@@ -1405,6 +1432,23 @@ impl VerifiedHostRuntime {
         }
         let (database_reference, controller_generation) =
             admission.launch_state(&self.manifest_sha256, mode, requested_state, state)?;
+        #[cfg(windows)]
+        let external_media = admission
+            .media_reference()
+            .map(|reference| reference.resolve(requested_state))
+            .transpose()?;
+        #[cfg(windows)]
+        let external_config = external_media
+            .as_ref()
+            .map(|media| {
+                crate::host_control::separate_paths(&self.root, &media.path)?;
+                Ok::<_, String>(ExternalMedia {
+                    path: &media.path,
+                    identity: &media.identity,
+                    path_binding: crate::windows_protection::state_path_binding(&media.path)?,
+                })
+            })
+            .transpose()?;
         self.check_files()?;
         if password.len() < 24
             || password.len() > 512
@@ -1454,6 +1498,8 @@ impl VerifiedHostRuntime {
                 #[cfg(windows)]
                 state_path_binding: crate::windows_protection::state_path_binding(state)
                     .map_err(|_| "host_state_not_private")?,
+                #[cfg(windows)]
+                external_media: external_config,
                 // The restore step is told which directory is the original only to size it.
                 database_reference: if mode.uses_database() || mode == HostMode::CarryRestore {
                     database_reference.as_ref()
@@ -1532,6 +1578,8 @@ impl VerifiedHostRuntime {
             tree,
             terminated: Mutex::new(false),
             _code_lease: code_lease,
+            #[cfg(windows)]
+            _external_media: external_media,
         });
         let pid = child.id();
         let (input_sender, pending_input) = mpsc::channel();
@@ -1960,6 +2008,8 @@ mod checkpoint_tests {
                 tree: crate::process_tree::ProcessTree::attach(&child).unwrap(),
                 terminated: Mutex::new(false),
                 _code_lease: crate::package_lease::CodeLease::acquire(&profile).unwrap(),
+                #[cfg(windows)]
+                _external_media: None,
             });
             let (_, ready) = mpsc::channel();
             let (exit_sender, exited) = mpsc::channel();
@@ -2070,6 +2120,8 @@ mod checkpoint_tests {
             tree: crate::process_tree::ProcessTree::attach(&child).unwrap(),
             terminated: Mutex::new(false),
             _code_lease: crate::package_lease::CodeLease::acquire(&profile).unwrap(),
+            #[cfg(windows)]
+            _external_media: None,
         });
         let (_, ready) = mpsc::channel();
         let (_, exited) = mpsc::channel();

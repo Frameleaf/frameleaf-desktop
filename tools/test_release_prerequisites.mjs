@@ -361,7 +361,8 @@ test("an unsigned Windows installer is never a release companion package", async
   const order = ["node tools/release_prerequisites.mjs windows-signing", "npm ci", "uses: ./.github/actions/windows-signing",
     "windows_sign.ps1 -Path $env:HOST_CONTROLLER", "ISCC.exe", "windows_sign.ps1 -Path $setup", "companion-record"].map((text) => source.indexOf(text));
   assert.ok(order.every((at, index) => at > 0 && (index === 0 || at > order[index - 1])), `windows-compiled-host.yml signing order ${order}`);
-  assert.match(source, /environment: \$\{\{ inputs\.release_package && 'desktop-release' \|\| '' \}\}/);
+  // The release package and the private media move qualification are the two signed selections.
+  assert.match(source, /environment: \$\{\{ \(inputs\.release_package \|\| inputs\.media_move\) && 'desktop-release' \|\| '' \}\}/);
 });
 
 test("only the one run from before identity records may be attached without one", () => {
