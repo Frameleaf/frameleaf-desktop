@@ -141,9 +141,11 @@ runs it on every pull request.
 
 A Linux binary needs at least the glibc of the machine it was linked on.
 Ubuntu 22.04 has glibc 2.35 and Debian 12 has 2.36, so the Linux jobs that
-build what ships (`Desktop candidate`, `Desktop release`, the installer
-candidates and the runtime factory, through `releaseMatrix` in
-`tools/release_inputs.mjs`) run on `ubuntu-22.04`. Ubuntu 22.04 ships
+build what ships run on `ubuntu-22.04`: the `linux-package` job of `Desktop
+candidate`, and `Desktop release`, the installer candidates and the runtime
+factory through `releaseMatrix` in `tools/release_inputs.mjs`. The `check` job
+of `Desktop candidate` stays on `ubuntu-24.04`, which the host package
+qualification needs; its package is not shipped. Ubuntu 22.04 ships
 WebKitGTK 4.1 and `libayatana-appindicator3`, so nothing else changes.
 
 `tools/check_linux_glibc.py --max 2.35 PATH...` reads the `GLIBC_x.y` versions

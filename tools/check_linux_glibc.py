@@ -22,6 +22,10 @@ from pathlib import Path
 
 DEFAULT_MAXIMUM = "2.35"
 NEED = re.compile(r"\bName: GLIBC_(\d+(?:\.\d+)+)\b")
+# Requirements glibc records by name instead of by number, and the first glibc that has them.
+# A binary linked with packed relative relocations needs GLIBC_ABI_DT_RELR and nothing newer.
+NAMED_NEEDS = {"GLIBC_ABI_DT_RELR": (2, 36)}
+NAMED_NEED = re.compile(r"\bName: (GLIBC_ABI_[A-Z0-9_]+)\b")
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -48,6 +52,10 @@ def needed_versions(version_info: str) -> set[tuple[int, ...]]:
             needs = False
         elif needs:
             found.update(parse_version(match) for match in NEED.findall(line))
+            for name in NAMED_NEED.findall(line):
+                if name not in NAMED_NEEDS:
+                    raise ValueError(f"unknown glibc requirement {name}: add the glibc version that introduced it")
+                found.add(NAMED_NEEDS[name])
     return found
 
 
@@ -73,7 +81,11 @@ def read_version_info(path: Path) -> str:
 
 
 def measure(roots: list[Path], read=None) -> dict[str, tuple[int, ...]]:
-    """The newest GLIBC version each ELF file under `roots` needs; files that need none are left out."""
+    """The newest GLIBC version each ELF file under `roots` needs; files that need none are left out.
+
+    With several roots each name starts with its root, so the same relative path in two of them
+    stays two findings.
+    """
     read = read or read_version_info
     measured: dict[str, tuple[int, ...]] = {}
     for root in roots:
@@ -85,7 +97,8 @@ def measure(roots: list[Path], read=None) -> dict[str, tuple[int, ...]]:
         for path in files:
             versions = needed_versions(read(path))
             if versions:
-                measured[str(path.relative_to(root)) if root.is_dir() else path.name] = max(versions)
+                name = path.relative_to(root).as_posix() if root.is_dir() else path.name
+                measured[name if len(roots) == 1 else f"{root.as_posix()}: {name}"] = max(versions)
     return measured
 
 

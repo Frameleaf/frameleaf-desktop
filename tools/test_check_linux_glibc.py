@@ -88,6 +88,29 @@ class CheckLinuxGlibc(unittest.TestCase):
         # A limit that covers the build machine passes.
         self.assertEqual(self.run_check(outputs, "--max", "2.39", str(self.root))[0], 0)
 
+    def test_a_named_requirement_counts_as_the_glibc_that_introduced_it(self):
+        relr = LIBC_ITSELF.replace("Name: GLIBC_2.35  Flags", "Name: GLIBC_2.34  Flags") + "  0x0020:   Name: GLIBC_ABI_DT_RELR  Flags: none  Version: 4\n"
+        self.assertEqual(check.needed_versions(relr), {(2, 34), (2, 36)})
+        self.elf("frameleaf-desktop")
+        code, out, _ = self.run_check({"frameleaf-desktop": relr}, str(self.root))
+        self.assertEqual(code, 1)
+        self.assertIn("::error::frameleaf-desktop needs GLIBC_2.36, newer than 2.35", out)
+        self.assertEqual(self.run_check({"frameleaf-desktop": relr}, "--max", "2.36", str(self.root))[0], 0)
+        # A named requirement this tool does not know is an error, never a pass.
+        with self.assertRaises(ValueError):
+            check.needed_versions(relr.replace("GLIBC_ABI_DT_RELR", "GLIBC_ABI_SOMETHING_NEW"))
+
+    def test_the_same_path_under_two_roots_is_two_findings(self):
+        for root in ("first", "second"):
+            self.elf(f"{root}/usr/bin/frameleaf-desktop")
+        first, second = self.root / "first", self.root / "second"
+        outputs = {first: BUILT_ON_NOBLE, second: LIBC_ITSELF}
+        read = lambda path: next(text for root, text in outputs.items() if root in path.parents)
+        for roots in ([first, second], [second, first]):
+            measured = check.measure(roots, read)
+            self.assertEqual(len(measured), 2)
+            self.assertEqual(list(check.too_new(measured, (2, 35))), [f"{first.as_posix()}: usr/bin/frameleaf-desktop"])
+
     def test_binaries_within_the_limit_pass(self):
         self.elf("frameleaf-desktop")
         code, out, _ = self.run_check({"frameleaf-desktop": LIBC_ITSELF}, str(self.root))
@@ -107,9 +130,11 @@ class CheckLinuxGlibc(unittest.TestCase):
         self.assertEqual(check.parse_version(check.DEFAULT_MAXIMUM), (2, 35))
         # Ubuntu 22.04 has glibc 2.35; 24.04 has 2.39.
         desktop = (workflows / "desktop.yml").read_text(encoding="utf-8")
-        check_job = desktop[desktop.index("\n  check:"):desktop.index("\n  directory-probe:")]
-        self.assertRegex(check_job, r"os: \[macos-latest, windows-latest, ubuntu-22\.04\]")
-        self.assertNotIn("ubuntu-24.04", check_job)
+        check_job = desktop[desktop.index("\n  linux-package:"):desktop.index("\n  directory-probe:")]
+        self.assertIn("runs-on: ubuntu-22.04\n", check_job)
+        self.assertIn("qualify_linux_deb_install.sh", check_job)
+        # The package from the Ubuntu 24.04 check job is not the one that is installed and run.
+        self.assertNotIn("qualify_linux_deb_install.sh", desktop[desktop.index("\n  check:"):desktop.index("\n  linux-package:")])
         checked = r'packages=\(src-tauri/target/%s/bundle/deb/\*\.deb\)\n[^\n]*\n\s*python tools/check_linux_glibc\.py --max 2\.35 "\$\{packages\[0\]\}"'
         self.assertRegex(check_job, checked % "debug")
         matrix = (ROOT / "tools" / "release_inputs.mjs").read_text(encoding="utf-8")

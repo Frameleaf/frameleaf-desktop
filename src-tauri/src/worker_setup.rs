@@ -2180,7 +2180,9 @@ mod tests {
             mode: "client-worker".into(),
             device_id: Some(uuid::Uuid::new_v4().to_string()),
         };
-        let result = prepare(
+        // Not the macOS this suite happens to run on: an older one is refused before the pack.
+        let result = prepare_on(
+            None,
             saved,
             SetupPaths {
                 data: data.clone(),
