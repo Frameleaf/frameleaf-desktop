@@ -15,7 +15,9 @@
 use crate::{
     model_cache::{acquire_file_with_progress, check_cancel},
     native_runtime::{digest_valid, relative, Artifact},
-    provider_selection::{device_eligible, Probe, ACCELERATED_MANIFEST, ACCELERATED_SIGNATURE},
+    provider_selection::{
+        device_eligible, driver_outdated, Probe, ACCELERATED_MANIFEST, ACCELERATED_SIGNATURE,
+    },
     runtime_store::{private_directory, read_bounded},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -219,7 +221,8 @@ fn installable_with(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ready_matches(data, &delivery).then(|| ready(data))
 }
-fn offer_with(
+/// The pack the installer describes for a device this computer has, whatever its driver.
+fn candidate_with(
     bundle: &Path,
     keys: &[VerifyingKey],
     floor: u64,
@@ -241,10 +244,40 @@ fn offer_with(
             .cloned()
     })
 }
-/// The pack this computer may download: one the installer describes, for a device it has.
-pub(crate) fn offer(bundle: &Path, probe: &dyn Probe) -> Option<Delivery> {
-    let (floor, keys) = crate::release_policy::trust().ok()?;
-    offer_with(
+/// The pack this computer may download and install, or why there is none. FD-63: a device whose
+/// driver is known to be too old for the pack is told so instead: downloading it, or installing
+/// one already downloaded, could only be refused until the driver is updated.
+fn offer_or_reason_with(
+    bundle: &Path,
+    keys: &[VerifyingKey],
+    floor: u64,
+    os: &str,
+    arch: &str,
+    probe: &dyn Probe,
+) -> Result<Delivery, String> {
+    let delivery = candidate_with(bundle, keys, floor, os, arch, probe)
+        .ok_or("accelerated_pack_unavailable")?;
+    if driver_outdated(delivery.provider(), os, probe) {
+        return Err("provider_driver_outdated".into());
+    }
+    Ok(delivery)
+}
+fn offer_with(
+    bundle: &Path,
+    keys: &[VerifyingKey],
+    floor: u64,
+    os: &str,
+    arch: &str,
+    probe: &dyn Probe,
+) -> Option<Delivery> {
+    offer_or_reason_with(bundle, keys, floor, os, arch, probe).ok()
+}
+/// The pack this computer may download: one the installer describes, for a device it has, with
+/// a driver that can run it. Otherwise the reason there is none.
+fn offer_or_reason(bundle: &Path, probe: &dyn Probe) -> Result<Delivery, String> {
+    let (floor, keys) =
+        crate::release_policy::trust().map_err(|_| "accelerated_pack_unavailable")?;
+    offer_or_reason_with(
         bundle,
         &keys,
         floor,
@@ -252,6 +285,9 @@ pub(crate) fn offer(bundle: &Path, probe: &dyn Probe) -> Option<Delivery> {
         std::env::consts::ARCH,
         probe,
     )
+}
+pub(crate) fn offer(bundle: &Path, probe: &dyn Probe) -> Option<Delivery> {
+    offer_or_reason(bundle, probe).ok()
 }
 
 fn root(data: &Path) -> PathBuf {
@@ -391,7 +427,8 @@ fn declined(data: &Path, delivery: &Delivery) -> bool {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PackStatus {
     /// `none` (nothing to offer here), `available`, `downloading`, `unpacking`, `ready` (the
-    /// worker installs and qualifies it when it next starts) or `failed`.
+    /// worker installs and qualifies it when it next starts), `failed` or `outdated`
+    /// (FD-63: nothing is offered or installed until the device's driver is updated).
     pub state: String,
     pub provider: Option<String>,
     pub bytes: u64,
@@ -425,6 +462,34 @@ fn status_of(data: &Path, delivery: Option<&Delivery>) -> PackStatus {
         code: failure.filter(|_| state == "failed"),
         declined: state == "available" && declined(data, delivery),
         metered: false,
+    }
+}
+
+/// What the AI page shows for this computer. FD-63: a device whose driver is too old for the pack
+/// is offered no download and the page says to update the driver. A pack already downloaded
+/// stays where it is and is installed once the driver is updated.
+fn status_with(
+    bundle: &Path,
+    data: &Path,
+    keys: &[VerifyingKey],
+    floor: u64,
+    os: &str,
+    arch: &str,
+    probe: &dyn Probe,
+) -> PackStatus {
+    match offer_or_reason_with(bundle, keys, floor, os, arch, probe) {
+        Ok(delivery) => status_of(data, Some(&delivery)),
+        Err(code) if code == "provider_driver_outdated" => {
+            let delivery = candidate_with(bundle, keys, floor, os, arch, probe);
+            PackStatus {
+                state: "outdated".into(),
+                provider: delivery.as_ref().map(|d| d.provider().into()),
+                bytes: delivery.as_ref().map_or(0, Delivery::bytes),
+                code: Some(code),
+                ..PackStatus::default()
+            }
+        }
+        Err(_) => status_of(data, None),
     }
 }
 
@@ -701,7 +766,18 @@ impl AcceleratedPack {
         if let Some(active) = self.active.lock().unwrap().clone() {
             return active;
         }
-        status_of(data, offer(bundle, probe).as_ref())
+        match crate::release_policy::trust() {
+            Ok((floor, keys)) => status_with(
+                bundle,
+                data,
+                &keys,
+                floor,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                probe,
+            ),
+            Err(_) => status_of(data, None),
+        }
     }
     /// Not now: nothing is ever downloaded without the person asking, so this only quiets the offer.
     pub(crate) fn decline(&self, bundle: &Path, data: &Path, probe: &dyn Probe) -> PackStatus {
@@ -725,7 +801,9 @@ impl AcceleratedPack {
         notify: impl Fn(PackStatus) + Send + Sync + 'static,
     ) -> Result<PackStatus, String> {
         let probe = crate::provider_selection::Host;
-        let delivery = offer(&bundle, &probe).ok_or("accelerated_pack_unavailable")?;
+        // The device and its driver are checked again now: either may have changed since the
+        // page offered the download.
+        let delivery = offer_or_reason(&bundle, &probe)?;
         if ready_matches(&data, &delivery) {
             return Ok(status_of(&data, Some(&delivery)));
         }

@@ -1285,3 +1285,107 @@ fn a_pack_from_an_older_installer_is_not_installable_after_an_update() {
     let _ = fs::remove_dir_all(bundle);
     let _ = fs::remove_dir_all(data);
 }
+
+/// An NVIDIA card on Windows whose driver Windows records as the version given.
+struct NvidiaDriver(&'static str);
+impl Probe for NvidiaDriver {
+    fn exists(&self, path: &str) -> bool {
+        nvidia().exists(path)
+    }
+    fn read(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn list(&self, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn variable(&self, name: &str) -> Option<String> {
+        nvidia().variable(name)
+    }
+    fn adapters(&self) -> Vec<(String, String)> {
+        vec![(
+            "pci\\ven_10de&dev_2684&subsys_16f310de".into(),
+            self.0.into(),
+        )]
+    }
+}
+/// 526.47: older than the 527.41 the pack's CUDA 12 needs.
+const OUTDATED: NvidiaDriver = NvidiaDriver("31.0.15.2647");
+/// 560.94.
+const CURRENT: NvidiaDriver = NvidiaDriver("32.0.15.6094");
+
+#[test]
+fn a_driver_too_old_for_the_pack_is_named_instead_of_offering_the_download() {
+    let (bundle, data) = (scratch(), scratch());
+    fs::create_dir(bundle.join(DELIVERIES)).unwrap();
+    let built = build(Recipe::default());
+    fs::write(bundle.join(DELIVERIES).join("cuda-ort.json"), &built.raw).unwrap();
+    fs::write(
+        bundle.join(DELIVERIES).join("cuda-ort.sig"),
+        built.signature,
+    )
+    .unwrap();
+    let delivery = built.delivery().unwrap();
+    let status =
+        |probe: &dyn Probe| status_with(&bundle, &data, &keys(), 2, "windows", "x86_64", probe);
+    let reason = |probe: &dyn Probe| {
+        offer_or_reason_with(&bundle, &keys(), 2, "windows", "x86_64", probe)
+            .map(|delivery| delivery.provider().to_owned())
+    };
+    let offered = |probe: &dyn Probe| {
+        offer_with(&bundle, &keys(), 2, "windows", "x86_64", probe)
+            .map(|delivery| delivery.provider().to_owned())
+    };
+    let installable = |probe: &dyn Probe| {
+        installable_with(&bundle, &data, &keys(), 2, "windows", "x86_64", probe)
+    };
+
+    // A driver too old for the pack: no download is offered (the download asks the same
+    // question again when it starts), and the page says why.
+    assert_eq!(reason(&OUTDATED), Err("provider_driver_outdated".into()));
+    assert_eq!(offered(&OUTDATED), None);
+    let outdated = status(&OUTDATED);
+    assert_eq!(outdated.state, "outdated");
+    assert_eq!(outdated.code.as_deref(), Some("provider_driver_outdated"));
+    assert_eq!(outdated.provider.as_deref(), Some(CUDA));
+    assert_eq!(outdated.bytes, delivery.bytes());
+    assert!(
+        !root(&data).exists(),
+        "nothing is written for an offer not made"
+    );
+
+    // A driver that runs it, or one whose version is not known: offered as before.
+    assert_eq!(reason(&CURRENT), Ok(CUDA.into()));
+    assert_eq!(offered(&CURRENT).as_deref(), Some(CUDA));
+    assert_eq!(status(&CURRENT).state, "available");
+    assert_eq!(reason(&nvidia()), Ok(CUDA.into()));
+    // No NVIDIA card at all is still no offer, not an outdated driver.
+    assert_eq!(
+        reason(&Device::default()),
+        Err("accelerated_pack_unavailable".into())
+    );
+    assert_eq!(status(&Device::default()).state, "none");
+
+    // Downloaded while the driver was new enough, then the driver is older: the worker is not
+    // handed a pack it could only refuse at every start, the page names the driver each time,
+    // and the pack stays on disk without a failure recorded against it.
+    built.place(&data);
+    unpack(&delivery, &data, &keys(), &AtomicBool::new(false)).unwrap();
+    assert_eq!(installable(&CURRENT), Some(ready(&data)));
+    for _ in 0..2 {
+        assert_eq!(installable(&OUTDATED), None);
+        let status = status(&OUTDATED);
+        assert_eq!(
+            (status.state.as_str(), status.code.as_deref()),
+            ("outdated", Some("provider_driver_outdated"))
+        );
+        assert!(ready_matches(&data, &delivery));
+        assert!(!root(&data).join("failure.json").exists());
+    }
+
+    // The driver is updated: the pack already downloaded is handed to the worker to install,
+    // without downloading it again.
+    assert_eq!(installable(&CURRENT), Some(ready(&data)));
+    assert_eq!(status(&CURRENT).state, "ready");
+    let _ = fs::remove_dir_all(bundle);
+    let _ = fs::remove_dir_all(data);
+}

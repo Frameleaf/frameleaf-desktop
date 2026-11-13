@@ -94,6 +94,12 @@ test('the GPU pack is offered with its size, shows progress and failure, and say
   assert.equal(failed.detail, '[accelerated_pack_download_interrupted] AI processing continues on the processor.');
   assert.deepEqual(failed.actions, ['download']);
 
+  // FD-63: a driver too old for the pack offers no download and says to update the driver.
+  const outdated = view({ state: 'outdated', code: 'provider_driver_outdated' })!;
+  assert.equal(outdated.title, 'Update the driver for your NVIDIA graphics card');
+  assert.equal(outdated.detail, '[provider_driver_outdated] AI processing continues on the processor.');
+  assert.deepEqual(outdated.actions, []);
+
   // Downloaded: "Using NVIDIA graphics" only once a workload actually runs on it.
   assert.equal(view({ state: 'ready' })!.title, 'Support for your NVIDIA graphics card is downloaded');
   const using = view({ state: 'ready' }, [
@@ -115,4 +121,6 @@ test('every code the GPU pack download can report has its own words', async () =
     'accelerated_pack_disk_space', 'accelerated_pack_epoch_mismatch', 'accelerated_pack_missing', 'accelerated_pack_busy', 'accelerated_pack_unavailable',
     'accelerated_pack_signature_invalid', 'accelerated_pack_manifest_invalid'])
     assert.match(errorCopy(code) ?? '', /graphics card/, code);
+  // FD-63: an outdated driver is named with what to do about it.
+  assert.match(errorCopy('provider_driver_outdated') ?? '', /Update the NVIDIA driver/);
 });
