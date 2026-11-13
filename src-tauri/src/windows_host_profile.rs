@@ -73,6 +73,8 @@ pub(crate) fn paths() -> Result<(PathBuf, PathBuf), String> {
 }
 /// Where this account's controller state is kept, whether or not a profile exists there or
 /// could be used: for asking what an earlier run left on disk.
+// Its only caller (the update gate in host_setup.rs) is not compiled into test builds.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn state_path() -> Result<PathBuf, String> {
     Ok(known_folder()?.join(ROOT).join("state"))
 }
