@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // Browser qualification uses synthetic IPC. It never installs or starts a real companion.
 if (process.env.FRAMELEAF_MANAGER_UI_TEST !== '1') process.exit(0);
 const { FRAMELEAF_TEST_BROWSER: executablePath, FRAMELEAF_TEST_PLAYWRIGHT: playwright } = process.env;
-assert.ok(executablePath && isAbsolute(executablePath) && playwright && isAbsolute(playwright));
+assert.ok((!executablePath || isAbsolute(executablePath)) && playwright && isAbsolute(playwright));
 const { chromium } = await import(pathToFileURL(playwright));
 const root = fileURLToPath(new URL('..', import.meta.url));
 const socket = createServer();
@@ -16,7 +16,7 @@ const address = socket.address();
 assert.ok(address && typeof address !== 'string');
 await new Promise(resolve => socket.close(resolve));
 const origin = `http://127.0.0.1:${address.port}`;
-const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
+const vite = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(address.port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' } });
 const ended = new Promise(resolve => vite.once('close', resolve));
 let browser;
 const installed = { manifestSha256: 'a'.repeat(64), controllerSha256: 'b'.repeat(64), version: '1.2.4', library: true };
@@ -27,7 +27,7 @@ try {
     vite.stdout.on('data', chunk => { if (chunk.includes('Local:')) { clearTimeout(timeout); resolve(); } });
     vite.once('error', reject);
   });
-  browser = await chromium.launch({ executablePath, headless: true, args: ['--disable-gpu'] });
+  browser = await chromium.launch({ ...(executablePath ? { executablePath } : {}), headless: true, args: ['--disable-gpu'] });
   const page = await browser.newPage();
   const calls = [];
   const errors = [];
@@ -95,8 +95,19 @@ try {
   const select = setup.getByLabel('Installed server package');
   assert.equal(await select.inputValue(), installed.manifestSha256);
   await select.selectOption(update.manifestSha256);
-  await setup.getByText('Moving an existing library to another package is unavailable on this computer.').waitFor();
+  // A backend that cannot move a library to another package: no offer to, and one press back to its own.
+  await setup.getByText('Your library can’t move to this package yet', { exact: true }).waitFor();
   assert.equal(await setup.getByRole('button', { name: 'Review package change' }).count(), 0);
+  await setup.getByRole('button', { name: 'Use My Library’s Package' }).click();
+  await setup.getByRole('button', { name: 'Prepare local Manager' }).waitFor();
+  assert.equal(await select.inputValue(), installed.manifestSha256);
+  // A backend that says it can is offered the change, whatever the platform.
+  status.packageChangeAvailable = true;
+  await setup.getByRole('button', { name: 'Check installation' }).click();
+  await select.selectOption(update.manifestSha256);
+  await setup.getByRole('button', { name: 'Review package change' }).waitFor();
+  // One that says nothing can only on macOS and Linux.
+  delete status.packageChangeAvailable;
   status.companionPlatform = 'linux';
   await setup.getByRole('button', { name: 'Check installation' }).click();
   compatibility = 'refused';

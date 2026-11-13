@@ -1,11 +1,13 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import Sheet from './Sheet.svelte';
   import PhotoImportDestination from './PhotoImportDestination.svelte';
-  import { albumErrors, type AlbumDestination } from './import-destination';
+  import type { AlbumDestination } from './import-destination';
   import { formatBytes, percent } from './ui-state';
+  import { errorCopy, explainError } from './errors';
 
   type Preview = { selectionId: string; path: string; count: number; bytes: number; skipped: number; folder: boolean; names: string[] };
   type Job = { sourceId: string; state: string; total: number; completed: number; code: string | null; uploadRemaining: number | null; additionalUploadAllowance: number; albumPending: boolean };
@@ -34,16 +36,13 @@
   const job = $derived(status?.job);
   const terminal = $derived(job?.state === 'complete' || job?.state === 'cancelled');
   const allowance = $derived(!!job && !job.albumPending && !terminal && !['copying', 'queued'].includes(job.state) && (job.uploadRemaining === null || job.code === 'source_upload_budget_exhausted'));
+  // A dropped or sent selection has no saved folder permission and is started again by sending it again, so
+  // these codes need different advice here than their shared copy in errors.ts gives for a folder copy.
   const messages: Record<string, string> = {
-    ...albumErrors,
-    source_drop_limit: 'Select one folder or up to 100 photos and videos from the same folder.',
-    source_drop_mixed: 'Select one folder or choose photos and videos from the same folder.',
-    source_drop_existing: 'Finish or remove the current import before starting another.',
     source_selection_changed: 'This preview has changed. Send or drop the folder or files again.',
     source_root_changed: 'This folder was replaced after the preview. Send or drop the items again.',
     source_item_changed: 'A file changed after the preview. Remove this import and select the items again to approve the new version.',
     source_item_invalid: 'Choose ordinary local photos or videos. Links and cloud-only files cannot be copied this way.',
-    source_item_unavailable: 'A selected file is unavailable. Check the folder before resuming.',
     source_watch_local_required: 'Choose a folder or files stored on this computer.',
     sign_in_required: 'Sign in to your Frameleaf library, then send the selection again.',
     source_no_media: 'No available photos or videos were found.',
@@ -55,7 +54,7 @@
     metered_network: 'Copying is paused until you resume on an unmetered connection.',
     network_unknown: 'Could not confirm an unmetered connection. Try again when connected.',
   };
-  const explain = (code: unknown) => messages[String(code)] ?? 'This import could not finish. Check your library connection and try again.';
+  const explain = (code: unknown) => messages[String(code)] ?? explainError(code, 'This import could not finish. Check your library connection and try again.');
 
   async function refresh() {
     status = await invoke<Status | null>('photo_drop_status');
@@ -65,7 +64,7 @@
       open = true;
       allowed = false;
       preview = null;
-      message = messages.source_drop_limit!;
+      message = errorCopy('source_drop_limit')!;
       return;
     }
     busy = true;
@@ -186,7 +185,7 @@
 
 {#if open}
   <Sheet title={preview ? (preview.folder ? 'Review selected folder' : 'Review selected files') : 'File import'} {busy} onclose={close} onsubmit={preview ? approve : undefined}>
-    {#if message}<p role="status">{message}</p>{/if}
+    {#if message}<p role="status"><ErrorText text={message} /></p>{/if}
     {#if preview}
       <p><strong>{preview.path}</strong></p>
       <p>{preview.count.toLocaleString()} photos or videos · {formatBytes(preview.bytes)}{preview.skipped ? ` · ${preview.skipped} unavailable or excluded entries skipped` : ''}</p>

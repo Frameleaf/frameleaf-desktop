@@ -12,7 +12,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { signCandidate } from "./sign_runtime.mjs";
+import {
+  signCandidate,
+  verifySignedAccelerated,
+  verifyUnsignedAccelerated,
+} from "./sign_runtime.mjs";
 
 async function fixture(t) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "frameleaf-sign-"));
@@ -96,55 +100,9 @@ test("signs exact verified manifest bytes with only the configured release autho
   );
 });
 
-test("signs only the declared CoreML Apple-silicon profile and binds its provenance", async (t) => {
-  const f = await fixture(t);
-  const provenance = JSON.parse(
-    await readFile(join(f.root, "payload/provenance.json"), "utf8"),
-  );
-  provenance.profile = "coreml-ort";
-  const authored = JSON.parse(
-    await readFile(
-      new URL("../runtime/profiles.json", import.meta.url),
-      "utf8",
-    ),
-  ).profiles["coreml-ort"];
-  provenance.sourceRevision = authored.sourceRevision;
-  const bytes = Buffer.from(JSON.stringify(provenance));
-  await writeFile(join(f.root, "payload/provenance.json"), bytes);
-  f.manifest.files["provenance.json"] = {
-    bytes: bytes.length,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-  };
-  Object.assign(f.manifest, {
-    provider: "CoreMLExecutionProvider",
-    platform: "macos",
-    architecture: "aarch64",
-    sourceRevision: authored.sourceRevision,
-  });
-  await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
-  await signCandidate(
-    f.root,
-    join(f.root, "manifest.sig"),
-    f.privatePem,
-    f.policy,
-  );
-  assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
-  const { packageConfiguration } = await import("./package_desktop.mjs");
-  if (process.platform === "darwin" && process.arch === "arm64") {
-    const config = await packageConfiguration(f.root, f.policy);
-    assert.equal(
-      config.bundle.resources[join(f.root, "payload")],
-      "native-runtime/payload",
-    );
-  } else {
-    await assert.rejects(
-      packageConfiguration(f.root, f.policy),
-      /runtime_bundle_target_mismatch/,
-    );
-  }
-});
-
-test("rejects CoreML on other targets and mismatched CPU provenance", async (t) => {
+// FD-52: CoreML is signed only as the accelerated manifest of an Apple Silicon pack that carries
+// the device collector; a bare CoreML manifest is refused on every target.
+test("rejects a CoreML manifest without its collector on every target", async (t) => {
   for (const [platform, architecture] of [
     ["windows", "x86_64"],
     ["linux", "aarch64"],
@@ -165,7 +123,7 @@ test("rejects CoreML on other targets and mismatched CPU provenance", async (t) 
         f.privatePem,
         f.policy,
       ),
-      /runtime_(manifest|profile|provenance)_/,
+      /runtime_(manifest|profile|provenance|device_observer)_/,
     );
   }
 });
@@ -372,15 +330,14 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
   );
   assert.deepEqual(profiles["cpu-ort"].additionalSources, {
     "macos-aarch64": [source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
-    "linux-aarch64": [
-      "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
-      "f93c34d196955da3e2760c095c08b27ccbf53315",
-    ],
+    "linux-aarch64": ["f93c34d196955da3e2760c095c08b27ccbf53315"],
   });
-  assert.equal(
-    profiles["coreml-ort"].sourceRevision,
-    "25b22c16e47a27a2eb50017d838497abce850d11",
-  );
+  assert.deepEqual(Object.keys(profiles), [
+    "cpu-ort",
+    "coreml-ort",
+    "cuda-ort",
+    "openvino-ort",
+  ]);
   const f = await fixture(t);
   const provenance = JSON.parse(
     await readFile(join(f.root, "payload/provenance.json"), "utf8"),
@@ -417,7 +374,6 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
 
 for (const [source, platforms] of [
   ["f93c34d196955da3e2760c095c08b27ccbf53315", ["linux", "darwin"]],
-  ["94d52a8244da0edfa9f680a3b357fdccbc0ad7e8", ["linux"]],
 ]) {
   test(`CPU source ${source.slice(0, 7)} packages only on its approved ARM64 targets`, async (t) => {
     const { packageConfiguration } = await import("./package_desktop.mjs");
@@ -447,7 +403,8 @@ for (const [source, platforms] of [
       )
         assert(!sources.includes(source));
     }
-    assert.equal(profiles["coreml-ort"].additionalSources, undefined);
+    // FD-52: the only accelerated runtime Desktop builds is CoreML on Apple Silicon.
+    assert.deepEqual(profiles["coreml-ort"].targets, ["macos-aarch64"]);
     const f = await fixture(t);
     const provenance = JSON.parse(
       await readFile(join(f.root, "payload/provenance.json"), "utf8"),
@@ -486,3 +443,239 @@ for (const [source, platforms] of [
     }
   });
 }
+
+// FD-52: an accelerated pack is one payload with a processor manifest and a CoreML manifest.
+async function acceleratedFixture(t) {
+  const f = await fixture(t);
+  const provenance = Buffer.from(
+    JSON.stringify({
+      schemaVersion: 1,
+      sourceRevision: "a".repeat(40),
+      sourceRepository: "Frameleaf/frameleaf-app",
+      profile: "coreml-ort",
+      python: "3.12.13",
+    }),
+  );
+  const artifact = (bytes) => ({
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+  await writeFile(join(f.root, "payload/provenance.json"), provenance);
+  f.manifest.files["provenance.json"] = artifact(provenance);
+  await mkdir(join(f.root, "payload/private/frameleaf_desktop_ml"), {
+    recursive: true,
+  });
+  for (const name of [
+    "__init__.py",
+    "entry.py",
+    "metal_observer.py",
+    "metal_inference.py",
+    "_frameleaf_coreml_observer.dylib",
+  ]) {
+    const bytes = Buffer.from(`fixture ${name}`);
+    await writeFile(
+      join(f.root, "payload/private/frameleaf_desktop_ml", name),
+      bytes,
+    );
+    f.manifest.files[`private/frameleaf_desktop_ml/${name}`] = artifact(bytes);
+  }
+  Object.assign(f.manifest, {
+    platform: "macos",
+    architecture: "aarch64",
+    moduleNamespace: "frameleaf_ml",
+  });
+  f.accelerated = {
+    ...f.manifest,
+    provider: "CoreMLExecutionProvider",
+    deviceObserver: { kind: "metal-v1" },
+  };
+  f.write = async () => {
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(f.manifest));
+    await writeFile(
+      join(f.root, "manifest-accelerated.json"),
+      JSON.stringify(f.accelerated),
+    );
+  };
+  f.sign = (accelerated) =>
+    signCandidate(
+      f.root,
+      join(f.root, accelerated ? "manifest-accelerated.sig" : "manifest.sig"),
+      f.privatePem,
+      f.policy,
+      accelerated,
+    );
+  await f.write();
+  return f;
+}
+
+test("an accelerated pack signs its processor and CoreML manifests over one payload", async (t) => {
+  // A pack without an accelerated manifest has nothing to verify.
+  assert.equal(await verifySignedAccelerated((await fixture(t)).root), null);
+  const f = await acceleratedFixture(t);
+  await f.sign(false);
+  await assert.rejects(
+    verifySignedAccelerated(f.root, f.policy),
+    /runtime_signature_invalid/,
+  );
+  await f.sign(true);
+  const signature = await readFile(join(f.root, "manifest-accelerated.sig"));
+  assert(
+    verify(
+      null,
+      await readFile(join(f.root, "manifest-accelerated.json")),
+      f.keys.publicKey,
+      signature,
+    ),
+  );
+  const verified = await verifySignedAccelerated(f.root, f.policy);
+  assert.equal(verified.manifest.provider, "CoreMLExecutionProvider");
+  assert.equal(verified.keyId, "fixture");
+  // The processor signature never vouches for the accelerated manifest.
+  await writeFile(
+    join(f.root, "manifest-accelerated.sig"),
+    await readFile(join(f.root, "manifest.sig")),
+  );
+  await assert.rejects(
+    verifySignedAccelerated(f.root, f.policy),
+    /runtime_signature_invalid/,
+  );
+});
+
+for (const [label, change, code] of [
+  [
+    "names no collector",
+    (f) => delete f.accelerated.deviceObserver,
+    /runtime_device_observer_invalid/,
+  ],
+  [
+    "names another collector kind",
+    (f) => (f.accelerated.deviceObserver = { kind: "os" }),
+    /runtime_device_observer_invalid/,
+  ],
+  [
+    "selects a module beside the collector kind",
+    (f) => (f.accelerated.deviceObserver = { kind: "metal-v1", module: "os" }),
+    /runtime_device_observer_invalid/,
+  ],
+  [
+    "uses the upstream namespace",
+    (f) => {
+      delete f.accelerated.moduleNamespace;
+      delete f.manifest.moduleNamespace;
+    },
+    /runtime_device_observer_invalid/,
+  ],
+  [
+    "is for an Intel Mac",
+    (f) => {
+      f.accelerated.architecture = "x86_64";
+      f.manifest.architecture = "x86_64";
+    },
+    /runtime_(profile_unapproved|device_observer_invalid)/,
+  ],
+  [
+    "names a provider Desktop builds no runtime for",
+    (f) => {
+      f.accelerated.provider = "CUDAExecutionProvider";
+      delete f.accelerated.deviceObserver;
+    },
+    /runtime_profile_unapproved/,
+  ],
+  [
+    "is a second processor manifest",
+    (f) => {
+      f.accelerated.provider = "CPUExecutionProvider";
+      delete f.accelerated.deviceObserver;
+    },
+    /runtime_accelerated_manifest_mismatch/,
+  ],
+  [
+    "has another epoch than the processor manifest",
+    (f) => (f.accelerated.epoch = 3),
+    /runtime_accelerated_manifest_mismatch/,
+  ],
+  [
+    "has another interpreter than the processor manifest",
+    (f) => (f.accelerated.python = "provenance.json"),
+    /runtime_accelerated_manifest_mismatch/,
+  ],
+]) {
+  test(`an accelerated manifest that ${label} is never signed`, async (t) => {
+    const f = await acceleratedFixture(t);
+    change(f);
+    await f.write();
+    await assert.rejects(f.sign(true), code);
+    await assert.rejects(verifyUnsignedAccelerated(f.root, f.policy), code);
+    await assert.rejects(readFile(join(f.root, "manifest-accelerated.sig")), {
+      code: "ENOENT",
+    });
+  });
+}
+
+test("the collector is sealed by both manifests and a processor manifest never names it", async (t) => {
+  const f = await acceleratedFixture(t);
+  await writeFile(
+    join(
+      f.root,
+      "payload/private/frameleaf_desktop_ml/_frameleaf_coreml_observer.dylib",
+    ),
+    "changed",
+  );
+  await assert.rejects(f.sign(false), /runtime_artifact_changed/);
+  await assert.rejects(f.sign(true), /runtime_artifact_changed/);
+  const g = await acceleratedFixture(t);
+  g.manifest.deviceObserver = { kind: "metal-v1" };
+  await g.write();
+  await assert.rejects(g.sign(false), /runtime_device_observer_invalid/);
+});
+
+test("packaging ships the accelerated manifest beside the processor one only when both are signed", async (t) => {
+  const { packageConfiguration } = await import("./package_desktop.mjs");
+  const f = await acceleratedFixture(t);
+  // FD-56: both manifests of an accelerated pack are built from the accelerated profile's source.
+  const source = JSON.parse(
+    await readFile(new URL("../runtime/profiles.json", import.meta.url), "utf8"),
+  ).profiles["coreml-ort"].sourceRevision;
+  assert.notEqual(source, "f2c451a6bf71ca3f3aec986e07f0852937268e2f");
+  const provenance = Buffer.from(
+    JSON.stringify({
+      schemaVersion: 1,
+      sourceRevision: source,
+      sourceRepository: "Frameleaf/frameleaf-app",
+      profile: "coreml-ort",
+      python: "3.12.13",
+    }),
+  );
+  await writeFile(join(f.root, "payload/provenance.json"), provenance);
+  for (const manifest of [f.manifest, f.accelerated]) {
+    manifest.sourceRevision = source;
+    manifest.files["provenance.json"] = {
+      bytes: provenance.length,
+      sha256: createHash("sha256").update(provenance).digest("hex"),
+    };
+  }
+  await f.write();
+  await f.sign(false);
+  if (process.platform !== "darwin" || process.arch !== "arm64") {
+    await assert.rejects(
+      packageConfiguration(f.root, f.policy),
+      /runtime_bundle_target_mismatch/,
+    );
+    return;
+  }
+  await assert.rejects(
+    packageConfiguration(f.root, f.policy),
+    /runtime_signature_invalid/,
+  );
+  await f.sign(true);
+  const { resources } = (await packageConfiguration(f.root, f.policy)).bundle;
+  assert.equal(
+    resources[join(f.root, "manifest-accelerated.json")],
+    "native-runtime/manifest-accelerated.json",
+  );
+  assert.equal(
+    resources[join(f.root, "manifest-accelerated.sig")],
+    "native-runtime/manifest-accelerated.sig",
+  );
+  assert.equal(resources[join(f.root, "payload")], "native-runtime/payload");
+});

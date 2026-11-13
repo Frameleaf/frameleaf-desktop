@@ -47,6 +47,25 @@ const gone = async (pids) => {
   } while (Date.now() < deadline);
   assert.fail("browser group still running");
 };
+// Kills a detached group this test owns, after the test body or its failure. Once every member has
+// exited, the group lingers until the system reaps them; macOS answers EPERM for such a group, where
+// Linux answers ESRCH. Which one the test met depended on timing, so EPERM is accepted only when ps
+// confirms that nothing in the group is still running.
+const killGroup = async (group) => {
+  try {
+    process.kill(-group, "SIGKILL");
+  } catch (error) {
+    if (error.code === "ESRCH") return;
+    if (error.code !== "EPERM") throw error;
+    const { stdout } = await exec("/bin/ps", ["-axo", "pgid=,stat="]);
+    const running = stdout
+      .trim()
+      .split("\n")
+      .map((row) => row.trim().split(/\s+/))
+      .filter(([pgid, state]) => Number(pgid) === group && !state.startsWith("Z"));
+    assert.deepEqual(running, [], "browser group could not be stopped");
+  }
+};
 
 test(
   "guard refuses shared groups, orphan startup and recursive launch",
@@ -126,11 +145,7 @@ test(
       await gone([pids.browser, pids.child]);
     } finally {
       // The test always owns this detached group, including on assertion failure.
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
+      await killGroup(child.pid);
       child.stdio[3].destroy();
       child.stdio[4].destroy();
       await bounded(exited);
@@ -186,13 +201,7 @@ test(
       await gone([pids.guardian, pids.browser]);
     } finally {
       owner.kill("SIGKILL");
-      if (group) {
-        try {
-          process.kill(-group, "SIGKILL");
-        } catch (error) {
-          if (error.code !== "ESRCH") throw error;
-        }
-      }
+      if (group) await killGroup(group);
       await bounded(exited);
       await rm(root, { recursive: true, force: true });
     }
@@ -260,11 +269,7 @@ for (const disposition of ["normal browser exit", "watchdog death"]) {
         }
         await gone([pids.browser, pids.child]);
       } finally {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch (error) {
-          if (error.code !== "ESRCH") throw error;
-        }
+        await killGroup(child.pid);
         child.stdio[3].destroy();
         child.stdio[4].destroy();
         await bounded(exited);

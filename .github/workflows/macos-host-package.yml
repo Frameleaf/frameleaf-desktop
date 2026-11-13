@@ -65,7 +65,7 @@ jobs:
           fi
           xcrun stapler validate "$PACKAGE"
           spctl --assess --type install --verbose=2 "$PACKAGE"
-      - name: Install twice and provision the private profile on a fresh Mac
+      - name: Install on a fresh Mac and recover an interrupted package retry
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
@@ -83,10 +83,61 @@ jobs:
             .schemaVersion==1 and .manifestSha256==$manifest and .controllerSha256==$controller
           ' "$receipt" >/dev/null
           cp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          printf '%s  %s\n' "$controller" "$helper" | shasum -a 256 -c
+          codesign --verify --strict "$helper"
+          runtime="$base/Runtimes/$manifest"
+          fence="$runtime/.package-maintenance"
+          test ! -e "$fence"
+          test ! -L "$fence"
+          # Stop at the exact preinstall boundary, before the signed package's postinstall.
+          sudo "$helper" --prepare-install "$manifest" "$controller" |
+            jq -e '. == {protocolVersion:1,state:"install-prepared",serverStarted:false}' >/dev/null
+          test -f "$fence"
+          test ! -L "$fence"
+          test ! -s "$fence"
+          cmp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          python3 - "$helper" "$runtime" "$manifest" "$RUNNER_TEMP" <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          helper, runtime, manifest, scratch = sys.argv[1:]
+          with tempfile.TemporaryDirectory(dir=scratch) as path:
+              state = str(Path(path).resolve())
+              # A valid request must reach package admission. Cleanup mode also
+              # requires a pre-existing host marker, so it cannot start a server.
+              request = {"protocolVersion": 1, "mode": "checkpoint-cleanup",
+                         "installationId": "a" * 12, "candidate": runtime, "state": state,
+                         "manifestSha256": manifest, "password": "synthetic qualification password",
+                         "databasePort": 33951, "apiPort": 33952}
+              with subprocess.Popen([helper, "--owner-pipe"], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE) as probe:
+                  try:
+                      probe.stdin.write((json.dumps(request) + "\n").encode())
+                      probe.stdin.flush()
+                      # Keep stdin open so EOF cannot cancel the controller before admission.
+                      status = probe.wait(timeout=90)
+                      reply = probe.stdout.read(1025)
+                  finally:
+                      if probe.poll() is None:
+                          probe.kill()
+                          probe.wait()
+              expected = {"protocolVersion": 1, "state": "failed", "code": "host_package_maintenance"}
+              if status != 1 or len(reply) > 1024 or json.loads(reply) != expected:
+                  raise SystemExit("The interrupted package did not block the installed controller")
+          PY
           sudo installer -pkg "$PACKAGE" -target /
+          test ! -e "$fence"
+          test ! -L "$fence"
           cmp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
           printf '%s  %s\n' "$controller" "$helper" | shasum -a 256 -c
           codesign --verify --strict "$helper"
+          jq -n --arg manifest "$manifest" --arg controller "$controller" '
+            {state:"interrupted-package-retry-passed",manifestSha256:$manifest,controllerSha256:$controller,
+             ownerBlockedWhileFenced:true,fenceClearedAfterRetry:true,receiptUnchanged:true}
+          ' > "$RUNNER_TEMP/installed-package-retry.json"
           test "$(stat -f '%u:%Lp' "$receipt")" = 0:644
           for leaf in state manager; do
             test "$(stat -f '%u:%Lp' "$base/Profiles/$uid/$leaf")" = "$uid:700"
@@ -101,6 +152,7 @@ jobs:
             ${{ runner.temp }}/FrameleafCompanion_1.2.4_arm64.pkg
             ${{ runner.temp }}/SHA256SUMS
             ${{ runner.temp }}/installed-receipt.json
+            ${{ runner.temp }}/installed-package-retry.json
           if-no-files-found: error
       - name: Retain Apple's request on a failed wait
         if: failure()

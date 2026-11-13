@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  factoryProfileFor,
   factorySourceRevision,
   factorySourceRevisionFor,
   signFactoryRuntime,
@@ -148,18 +149,14 @@ test("factory CLI never prints private-key parser input", async (t) => {
   });
 });
 
-test("factory accepts the published target-scoped Linux ARM source", async (t) => {
+test("factory builds Linux ARM from the common catalogue source, not a source without profiles", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
   const arch = Object.getOwnPropertyDescriptor(process, "arch");
   try {
     Object.defineProperty(process, "platform", { ...platform, value: "linux" });
     Object.defineProperty(process, "arch", { ...arch, value: "arm64" });
-    const profiles = JSON.parse(
-      await readFile(new URL("../runtime/profiles.json", import.meta.url)),
-    );
-    const sourceRevision =
-      profiles.profiles["cpu-ort"].additionalSources["linux-aarch64"][0];
-    assert.equal(sourceRevision, "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8");
+    const sourceRevision = factorySourceRevisionFor("linux-aarch64");
+    assert.equal(sourceRevision, factorySourceRevision);
     const f = await fixture(t, { sourceRevision });
     const receipt = await signFactoryRuntime(
       f.root,
@@ -169,7 +166,10 @@ test("factory accepts the published target-scoped Linux ARM source", async (t) =
       f.policy,
     );
     assert.equal(receipt.sourceRevision, sourceRevision);
-    const old = await fixture(t, { sourceRevision: factorySourceRevision });
+    // 94d52a82 has no catalogue profile on the server or here: a runtime built from it runs no model.
+    const old = await fixture(t, {
+      sourceRevision: "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
+    });
     await assert.rejects(
       signFactoryRuntime(old.root, old.target, 2, old.privatePem, old.policy),
       /runtime_factory_candidate_unapproved/,
@@ -195,4 +195,137 @@ test("factory keeps the common source outside the explicit ARM recipe", () => {
     () => factorySourceRevisionFor("windows-aarch64"),
     /runtime_factory_source_invalid/,
   );
+});
+
+// FD-56: the accelerated pack is the factory's normal output where exactly one profile is
+// approved (Apple Silicon); a CUDA or OpenVINO pack is built only when it is named.
+test("factory picks the accelerated profile only where one is approved or named", () => {
+  for (const choice of [true, "default"])
+    assert.equal(factoryProfileFor("macos-aarch64", choice), "coreml-ort");
+  for (const choice of [false, "none"])
+    assert.equal(factoryProfileFor("macos-aarch64", choice), "cpu-ort");
+  for (const target of ["macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64"])
+    for (const choice of [true, "default", false, "none"])
+      assert.equal(factoryProfileFor(target, choice), "cpu-ort");
+  for (const [name, targets] of [
+    ["cuda-ort", ["linux-x86_64", "windows-x86_64"]],
+    ["openvino-ort", ["linux-x86_64", "windows-x86_64"]],
+  ]) {
+    for (const target of targets)
+      assert.equal(factoryProfileFor(target, name), name);
+    // Targets that do not approve it keep their usual pack.
+    assert.equal(factoryProfileFor("macos-aarch64", name), "coreml-ort");
+    assert.equal(factoryProfileFor("linux-aarch64", name), "cpu-ort");
+  }
+  for (const choice of ["cpu-ort", "unknown", "constructor", "", undefined, 1])
+    assert.throws(
+      () => factoryProfileFor("linux-x86_64", choice),
+      /runtime_factory_profile_invalid/,
+    );
+  assert.throws(
+    () => factoryProfileFor("windows-aarch64", true),
+    /runtime_factory_source_invalid/,
+  );
+});
+
+test("an accelerated pack builds its own profile's source and the processor pack the common one", () => {
+  const coreml = factorySourceRevisionFor("macos-aarch64", "coreml-ort");
+  assert.match(coreml, /^[a-f0-9]{40}$/);
+  assert.equal(factorySourceRevisionFor("linux-x86_64", "cuda-ort"), coreml);
+  assert.equal(factorySourceRevisionFor("linux-x86_64", "openvino-ort"), coreml);
+  assert.equal(factorySourceRevisionFor("windows-x86_64", "cuda-ort"), coreml);
+  assert.equal(factorySourceRevisionFor("macos-aarch64"), factorySourceRevision);
+  // A profile is never built for a target that does not approve it.
+  for (const [target, name] of [
+    ["linux-x86_64", "coreml-ort"],
+    ["macos-aarch64", "cuda-ort"],
+    ["linux-aarch64", "openvino-ort"],
+    ["linux-x86_64", "unknown"],
+    ["linux-x86_64", "constructor"],
+  ])
+    assert.throws(
+      () => factorySourceRevisionFor(target, name),
+      /runtime_factory_source_invalid/,
+    );
+});
+
+test("factory signs both manifests of an accelerated pack and refuses a foreign accelerated source", async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const arch = Object.getOwnPropertyDescriptor(process, "arch");
+  const pack = async (acceleratedSource, source = "coreml-ort") => {
+    const f = await fixture(t, {
+      moduleNamespace: "frameleaf_ml",
+      sourceRevision: factorySourceRevisionFor("macos-aarch64", source),
+    });
+    const manifest = JSON.parse(await readFile(join(f.root, "manifest.json")));
+    const add = async (name, bytes) => {
+      await mkdir(join(f.root, "payload", name, ".."), { recursive: true });
+      await writeFile(join(f.root, "payload", name), bytes);
+      manifest.files[name] = {
+        bytes: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    };
+    await add(
+      "provenance.json",
+      Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          sourceRepository: "Frameleaf/frameleaf-app",
+          sourceRevision: manifest.sourceRevision,
+          profile: "coreml-ort",
+          python: "3.12.13",
+        }),
+      ),
+    );
+    for (const name of [
+      "__init__.py",
+      "entry.py",
+      "metal_observer.py",
+      "metal_inference.py",
+      "_frameleaf_coreml_observer.dylib",
+    ])
+      await add(`private/frameleaf_desktop_ml/${name}`, Buffer.from(name));
+    await writeFile(join(f.root, "manifest.json"), JSON.stringify(manifest));
+    await writeFile(
+      join(f.root, "manifest-accelerated.json"),
+      JSON.stringify({
+        ...manifest,
+        ...acceleratedSource,
+        provider: "CoreMLExecutionProvider",
+        deviceObserver: { kind: "metal-v1" },
+      }),
+    );
+    return f;
+  };
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    Object.defineProperty(process, "arch", { ...arch, value: "arm64" });
+    const f = await pack({});
+    const receipt = await signFactoryRuntime(f.root, f.target, 2, f.privatePem, f.policy);
+    assert.equal((await readFile(join(f.root, "manifest.sig"))).length, 64);
+    assert.equal((await readFile(join(f.root, "manifest-accelerated.sig"))).length, 64);
+    assert.notEqual(receipt.accelerated.manifestSha256, receipt.manifestSha256);
+    const foreign = await pack({ epoch: 3 });
+    await assert.rejects(
+      signFactoryRuntime(foreign.root, foreign.target, 2, foreign.privatePem, foreign.policy),
+      /runtime_accelerated_manifest_mismatch/,
+    );
+    for (const name of ["manifest.sig", "manifest-accelerated.sig"])
+      await assert.rejects(readFile(join(foreign.root, name)), { code: "ENOENT" });
+    // FD-56: an accelerated pack built from the processor profile's source is not the approved
+    // CoreML runtime (the catalogue has no reason to trust that source for it).
+    if (factorySourceRevisionFor("macos-aarch64") !== factorySourceRevisionFor("macos-aarch64", "coreml-ort")) {
+      const stale = await pack({}, "cpu-ort");
+      await assert.rejects(
+        signFactoryRuntime(stale.root, stale.target, 2, stale.privatePem, stale.policy),
+        /runtime_factory_candidate_unapproved/,
+      );
+      for (const name of ["manifest.sig", "manifest-accelerated.sig"])
+        await assert.rejects(readFile(join(stale.root, name)), { code: "ENOENT" });
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    Object.defineProperty(process, "arch", arch);
+  }
 });
