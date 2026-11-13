@@ -792,7 +792,13 @@ mod tests {
         // A tie is not faster.
         assert_eq!(measured_faster(Some(20.0), Some(20.0)), Some(false));
         // A time that is missing, zero, negative or not a number decides nothing.
-        for unusable in [None, Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+        for unusable in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
             assert_eq!(measured_faster(unusable, Some(20.0)), None);
             assert_eq!(measured_faster(Some(20.0), unusable), None);
         }

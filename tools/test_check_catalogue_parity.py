@@ -127,7 +127,8 @@ class CatalogueParity(unittest.TestCase):
             "provider": "CoreMLExecutionProvider",
             "sourceRevision": "c" * 40,
         }
-        cpu = runtime["profiles"]["cpu-ort"]["sourceRevision"]
+        cpu = "d" * 40
+        runtime["profiles"]["cpu-ort"]["sourceRevision"] = cpu
         accelerated = profile(provider="CoreMLExecutionProvider")
         accelerated["runtimeSourceRevision"] = "c" * 40
         base = profile()
