@@ -203,8 +203,10 @@ test('each worker failure family shows its own reason and the action that fixes 
     seen.add(view.headline);
   }
   assert.equal(seen.size, 12, 'the two storage codes share a headline; every other family has its own');
-  // A build without a runtime cannot be repaired by reinstalling it, and says so.
-  assert.equal((await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' })).detail, 'This build does not include a signed AI runtime yet. Photos remain available.');
+  // A build without a runtime cannot be repaired by reinstalling it or by retrying, and says so.
+  const absent = await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' });
+  assert.equal(absent.detail, errorCopy('runtime_pack_unavailable'));
+  assert.equal(absent.action, null);
 });
 
 test('a Windows update stops the library itself, and says why when that cannot be proven', () => {
