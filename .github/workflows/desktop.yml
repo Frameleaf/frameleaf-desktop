@@ -205,15 +205,6 @@ jobs:
       - name: Check no app binary needs a newer macOS than declared
         if: runner.os == 'macOS'
         run: python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" src-tauri/target/debug/bundle/macos/Frameleaf.app
-      - name: Install the unsigned Linux package in clean Ubuntu and Debian containers
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          packages=(src-tauri/target/debug/bundle/deb/*.deb)
-          [[ ${#packages[@]} == 1 ]]
-          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
       - name: Install the unsigned Windows shell and exercise Welcome
         if: runner.os == 'Windows'
         shell: pwsh
@@ -234,6 +225,57 @@ jobs:
           path: src-tauri/target/debug/bundle/
           retention-days: 1
           if-no-files-found: error
+
+  # What ships for Linux is built on Ubuntu 22.04 (glibc 2.35), as the release builds it, so the
+  # binaries also load on Debian 12. The check job above stays on Ubuntu 24.04, which the host
+  # package qualification needs. The steps before the build are the ones the release runs there.
+  linux-package:
+    if: ${{ !inputs.directory_probe && !inputs.keystore_probe }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - name: Reuse Rust dependencies from successful main checks
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build unsigned shell smoke-test candidate
+        run: npm run desktop:build:shell -- --debug
+      - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/debug/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          python tools/check_linux_glibc.py --max 2.35 "${packages[0]}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install and run the unsigned Linux package in clean Ubuntu and Debian containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/debug/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
 
   directory-probe:
     if: ${{ inputs.directory_probe && !inputs.keystore_probe }}

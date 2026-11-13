@@ -24,7 +24,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-24.04]
+        # The same Linux image the factory builds the runtime on (tools/release_inputs.mjs).
+        os: [macos-latest, windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -60,6 +61,12 @@ jobs:
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
         run: python desktop/tools/build_runtime.py --source server --output candidate --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --epoch 6
+      - name: Check no Linux runtime binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/check_linux_glibc.py --max 2.35 candidate/payload | tee -a "$GITHUB_STEP_SUMMARY"
       # FD-52: the accelerated pack (processor and CoreML manifests over one payload) must build on
       # the hosted Apple Silicon runner; it is not signed, published or run on a GPU here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

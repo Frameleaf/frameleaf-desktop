@@ -18,8 +18,8 @@ test("release tags must match all application versions", () => {
 
 test("release selections cover the supported architectures without adding Windows implicitly", () => {
   const linux = [
-    { os: "ubuntu-24.04", target: "linux-x86_64" },
-    { os: "ubuntu-24.04-arm", target: "linux-aarch64" },
+    { os: "ubuntu-22.04", target: "linux-x86_64" },
+    { os: "ubuntu-22.04-arm", target: "linux-aarch64" },
   ];
   const macos = [
     { os: "macos-15", target: "macos-aarch64" },

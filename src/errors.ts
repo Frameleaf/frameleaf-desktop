@@ -1,6 +1,8 @@
 // User-facing copy for the error and status codes the Rust side returns. test/errors.test.ts reads the codes
 // from src-tauri/src and fails when one has no copy here. A component keeps its own wording only where its
 // screen needs different words for a code (a small override table that says why).
+import macosMinimums from '../packaging/macos/minimum-versions.json' with { type: 'json' };
+
 const messages: Record<string, string> = {
   media_copy_exit_blocked: 'Finish or cancel the media copy, or wait for the update before quitting Frameleaf.',
   local_host_active: 'Stop local management before connecting to another server.',
@@ -272,6 +274,8 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['update', 'Your server sent AI model details this app could not use. Update Frameleaf and your server, then try again.', 'model_catalogue_invalid model_plan_invalid model_challenge_invalid worker_model_inventory_invalid worker_model_binding_invalid worker_models_ambiguous worker_models_unavailable'],
   // ---- AI processing: the runtime that comes with Frameleaf ----
   ['runtime', 'This build does not include a signed AI runtime yet. Photos remain available.', 'runtime_pack_unavailable'],
+  // The declared floor of the AI runtime pack, the same value the backend compares with ("15.0" reads "15").
+  ['', `AI processing needs macOS ${macosMinimums.aiRuntime.replace(/\.0$/, '')} or later. Photos remain available.`, 'runtime_os_unsupported'],
   ['runtime', 'The AI runtime that comes with Frameleaf is missing or could not be verified. Install Frameleaf again, then try again. Photos remain available.', 'app_resources_unavailable release_policy_invalid runtime_file_unavailable runtime_manifest_invalid runtime_manifest_incompatible runtime_signature_invalid runtime_artifact_changed runtime_artifact_invalid runtime_interpreter_unapproved runtime_inventory_failed runtime_inventory_limit runtime_inventory_mismatch runtime_link_forbidden runtime_path_invalid runtime_root_invalid runtime_size_invalid runtime_special_file_forbidden runtime_read_failed runtime_release_identity_changed runtime_device_observer_invalid runtime_device_entrypoint_invalid'],
   ['', 'GPU acceleration could not be used on this computer, so AI processing runs on the processor instead.', 'provider_device_ineligible provider_failed provider_slower provider_speed_unknown worker_provider_unavailable'],
   ['restart', 'The AI runtime could not start, or stopped unexpectedly, on this computer. Quit and reopen Frameleaf, then try again.', 'runtime_start_failed runtime_gate_failed runtime_port_invalid runtime_port_unavailable runtime_process_invalid runtime_process_owner_failed runtime_process_shutdown_unconfirmed runtime_process_status_failed runtime_process_state_unavailable runtime_process_stop_failed runtime_process_stopped runtime_not_ready runtime_health_invalid runtime_client_failed runtime_prediction_interrupted runtime_prediction_invalid runtime_prediction_refused runtime_activation_failed runtime_preparation_failed'],
@@ -395,6 +399,8 @@ const built: readonly (readonly [string, (rest: string) => string])[] = [
   ['worker_resume_', () => messages.worker_setup_unavailable!],
   ['workload_', rest => errorCopy(rest) ?? 'Your server is not ready to check this AI task on this computer yet. Other tasks can continue.'],
   ['local_port_in_use_', port => `Another program on this computer is using port ${port}, which Frameleaf needs. Close that program, then try again.`],
+  // Windows stops the library on this computer before an update; the rest is why that did not work.
+  ['update_library_stop_', rest => `Frameleaf did not install the update, because your library on this computer could not be stopped first. ${errorCopy(rest) ?? 'Stop the photo server in Manager, then update Frameleaf.'}`],
   ['resource_', rest => errorCopy(rest) ?? 'This computer’s power, network and memory could not be checked. AI processing is paused.'],
 ];
 
