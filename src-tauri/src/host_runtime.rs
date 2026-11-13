@@ -121,6 +121,32 @@ impl VerifiedHostRuntime {
         trusted: &[VerifyingKey],
         minimum_epoch: u64,
     ) -> Result<Self, String> {
+        Self::verify_pinned(root, raw, signature, trusted, minimum_epoch, None)
+    }
+    /// The package a library last ran with, when this build's pins have moved on from it. The
+    /// signature, the release floor, the platform and every file are checked exactly as for
+    /// the current package; only the database pins may differ, and only to a pair this build
+    /// declares it can carry a library forward from. What comes back can take one export and
+    /// do nothing else.
+    pub(crate) fn verify_carry_source(
+        root: &Path,
+        raw: &[u8],
+        signature: &[u8; 64],
+        trusted: &[VerifyingKey],
+        minimum_epoch: u64,
+        sources: &[CarrySource],
+    ) -> Result<CarrySourceRuntime, String> {
+        Self::verify_pinned(root, raw, signature, trusted, minimum_epoch, Some(sources))
+            .map(CarrySourceRuntime)
+    }
+    fn verify_pinned(
+        root: &Path,
+        raw: &[u8],
+        signature: &[u8; 64],
+        trusted: &[VerifyingKey],
+        minimum_epoch: u64,
+        carry_sources: Option<&[CarrySource]>,
+    ) -> Result<Self, String> {
         if raw.is_empty()
             || raw.len() > 16 * 1024 * 1024
             || !trusted.iter().any(|key| {
@@ -143,8 +169,15 @@ impl VerifiedHostRuntime {
             || manifest.architecture != std::env::consts::ARCH
             || !digest_valid(&manifest.source_revision, 40)
             || manifest.node_version != "26.11.1"
-            || Some(manifest.postgres_version.as_str()) != pins["postgresVersion"].as_str()
-            || Some(manifest.vector_version.as_str()) != pins["pgvectorVersion"].as_str()
+            || !database_pins_admitted(
+                &manifest.postgres_version,
+                &manifest.vector_version,
+                (
+                    pins["postgresVersion"].as_str(),
+                    pins["pgvectorVersion"].as_str(),
+                ),
+                carry_sources,
+            )
             || Some(manifest.certified) != pins["certified"].as_bool()
             || manifest.files.is_empty()
             || manifest.files.len() > 100_000
@@ -219,6 +252,18 @@ impl VerifiedHostRuntime {
     pub fn certified(&self) -> bool {
         self.manifest.certified
     }
+    /// The Postgres major this package's own database build writes into `PG_VERSION`.
+    pub(crate) fn postgres_major(&self) -> Result<&str, String> {
+        postgres_major(&self.manifest.postgres_version)
+    }
+    /// The database build this package carries: Postgres and pgvector versions.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub(crate) fn database_build(&self) -> (&str, &str) {
+        (
+            &self.manifest.postgres_version,
+            &self.manifest.vector_version,
+        )
+    }
     pub fn backup_engine(&self) -> Result<BackupEngine, String> {
         let role = &self.manifest.entry_points.backup_engine;
         let artifact = self
@@ -243,6 +288,219 @@ impl VerifiedHostRuntime {
     }
     pub fn check_files(&self) -> Result<(), String> {
         verify_files(&self.root, &self.manifest.files)
+    }
+}
+
+/// The leading digits of a Postgres version: `19` for `19beta4`, `18` for `18.7`.
+fn postgres_major(version: &str) -> Result<&str, String> {
+    let digits = version.bytes().take_while(u8::is_ascii_digit).count();
+    if digits != 2 || version.starts_with('0') {
+        return Err("host_manifest_incompatible".into());
+    }
+    Ok(&version[..digits])
+}
+
+/// A database build this app's package can take a library forward from.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CarrySource {
+    pub(crate) postgres_version: String,
+    pub(crate) pgvector_version: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CarryPaths {
+    schema_version: u32,
+    from: Vec<CarrySource>,
+}
+/// Parse the declared upgrade paths. Anything that cannot be read declares none.
+fn carry_sources(raw: &str, current: (&str, &str)) -> Vec<CarrySource> {
+    let Ok(paths) = serde_json::from_str::<CarryPaths>(raw) else {
+        return Vec::new();
+    };
+    let valid = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 32
+            && text.starts_with(|first: char| first.is_ascii_digit())
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+    };
+    if paths.schema_version != 1
+        || paths.from.len() > 16
+        || paths.from.iter().any(|source| {
+            !valid(&source.postgres_version)
+                || !valid(&source.pgvector_version)
+                || (source.postgres_version == current.0 && source.pgvector_version == current.1)
+                // A dump is only ever read by the same or a newer Postgres.
+                || !matches!(
+                    (postgres_major(&source.postgres_version), postgres_major(current.0)),
+                    (Ok(from), Ok(to)) if from <= to
+                )
+        })
+    {
+        return Vec::new();
+    }
+    paths.from
+}
+/// The database builds this app's own package declares it can carry a library forward from.
+pub(crate) fn declared_carry_sources() -> Vec<CarrySource> {
+    let Ok(pins) =
+        serde_json::from_str::<serde_json::Value>(include_str!("../../runtime/host-database.json"))
+    else {
+        return Vec::new();
+    };
+    match (
+        pins["postgresVersion"].as_str(),
+        pins["pgvectorVersion"].as_str(),
+    ) {
+        (Some(postgres), Some(vector)) => carry_sources(
+            include_str!("../../runtime/host-carry-forward.json"),
+            (postgres, vector),
+        ),
+        _ => Vec::new(),
+    }
+}
+/// The current package carries exactly this build's pins. A carry source carries a declared
+/// earlier pair and never the current one, so it cannot stand in for the current package.
+fn database_pins_admitted(
+    postgres: &str,
+    vector: &str,
+    current: (Option<&str>, Option<&str>),
+    carry_sources: Option<&[CarrySource]>,
+) -> bool {
+    let is_current = Some(postgres) == current.0 && Some(vector) == current.1;
+    match carry_sources {
+        None => is_current,
+        Some(sources) => {
+            !is_current
+                && current.0.is_some()
+                && current.1.is_some()
+                && sources.iter().any(|source| {
+                    source.postgres_version == postgres && source.pgvector_version == vector
+                })
+        }
+    }
+}
+
+/// A verified earlier package. It exposes its identity and one thing it can do: the export run.
+pub(crate) struct CarrySourceRuntime(VerifiedHostRuntime);
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+impl CarrySourceRuntime {
+    pub(crate) fn manifest_sha256(&self) -> &str {
+        self.0.manifest_sha256()
+    }
+    pub(crate) fn source_revision(&self) -> &str {
+        self.0.source_revision()
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.0.epoch()
+    }
+    pub(crate) fn postgres_version(&self) -> &str {
+        &self.0.manifest.postgres_version
+    }
+    pub(crate) fn vector_version(&self) -> &str {
+        &self.0.manifest.vector_version
+    }
+    pub(crate) fn postgres_major(&self) -> Result<&str, String> {
+        self.0.postgres_major()
+    }
+    /// The descriptor Manager last stored for this package, which the move must start from.
+    #[cfg(unix)]
+    pub(crate) fn descriptor_fingerprint(
+        &self,
+        config: &crate::manager_host::Configuration,
+        candidate: &Path,
+        controller_sha256: &str,
+        certificate_pem: &str,
+    ) -> Result<String, String> {
+        crate::manager_host::descriptor_fingerprint(
+            config,
+            candidate,
+            &self.0,
+            controller_sha256,
+            certificate_pem,
+        )
+    }
+    /// Start this package's database for the one export its permit allows: read-only, on
+    /// loopback, with no photo server. The journal stays as it is and is held throughout.
+    #[cfg(unix)]
+    pub(crate) fn start_export(
+        &self,
+        state: &Path,
+        password: &Zeroizing<String>,
+        ports: (u16, u16),
+        journal: CarryJournal<'_>,
+        carry: &serde_json::Value,
+    ) -> Result<HostProcess, String> {
+        self.0.start_admitted(
+            state,
+            password,
+            ports.0,
+            ports.1,
+            HostMode::CarryExport,
+            Admission::Carry(journal, carry),
+        )
+    }
+}
+/// The held journal of a library that is being carried forward, and the package it names.
+#[cfg(unix)]
+pub(crate) struct CarryJournal<'a> {
+    pub(crate) owner: &'a mut crate::host_state::Owner,
+    pub(crate) installation_id: &'a str,
+    pub(crate) manifest_sha256: &'a str,
+}
+/// Who admitted a host start, and so where its database selection comes from.
+enum Admission<'a> {
+    /// A profile no controller manages.
+    Direct,
+    /// The controller, with its journal active for this package.
+    Controller(&'a mut crate::host_state::Owner),
+    /// A carry-forward step: the journal is held, stopped and left exactly as it is.
+    #[cfg(unix)]
+    Carry(CarryJournal<'a>, &'a serde_json::Value),
+}
+impl Admission<'_> {
+    fn launch_state(
+        &mut self,
+        manifest_sha256: &str,
+        mode: HostMode,
+        requested_state: &Path,
+        state: &Path,
+    ) -> Result<(Option<crate::host_database::Reference>, Option<uuid::Uuid>), String> {
+        match self {
+            Self::Direct => {
+                direct_profile(state)?;
+                Ok((None, None))
+            }
+            Self::Controller(owner) => {
+                let (profile, reference, generation) = owner.launch_state(manifest_sha256, mode)?;
+                if profile != requested_state {
+                    return Err("host_controller_binding_changed".into());
+                }
+                Ok((reference, Some(generation)))
+            }
+            #[cfg(unix)]
+            Self::Carry(journal, _) => {
+                if !mode.carries() {
+                    return Err("host_carry_config_invalid".into());
+                }
+                let (profile, reference) = journal
+                    .owner
+                    .carry_state(journal.installation_id, journal.manifest_sha256)?;
+                if profile != requested_state {
+                    return Err("host_controller_binding_changed".into());
+                }
+                Ok((reference, None))
+            }
+        }
+    }
+    fn carry(&self) -> Option<&serde_json::Value> {
+        #[cfg(unix)]
+        if let Self::Carry(_, carry) = self {
+            return Some(carry);
+        }
+        None
     }
 }
 
@@ -935,10 +1193,18 @@ pub(crate) enum HostMode {
     Database,
     CheckpointCleanup,
     RestorePrepare,
+    /// The one export run of a library's previous package. Never accepted from Manager.
+    CarryExport,
+    /// The new package restoring that export into a fresh directory. Never accepted from Manager.
+    CarryRestore,
 }
 impl HostMode {
     pub(crate) fn uses_database(self) -> bool {
-        matches!(self, Self::Server | Self::Database)
+        matches!(self, Self::Server | Self::Database | Self::CarryExport)
+    }
+    /// The carry-forward steps, which only this app starts and only with a held journal.
+    pub(crate) fn carries(self) -> bool {
+        matches!(self, Self::CarryExport | Self::CarryRestore)
     }
     pub(crate) fn ready_state(self) -> &'static str {
         match self {
@@ -946,6 +1212,8 @@ impl HostMode {
             Self::Database => "database-ready",
             Self::CheckpointCleanup => "checkpoint-cleanup-ready",
             Self::RestorePrepare => "restore-prepare-ready",
+            Self::CarryExport => "carry-exported",
+            Self::CarryRestore => "carry-restored",
         }
     }
 }
@@ -967,6 +1235,8 @@ struct HostStart<'a> {
     database_port: u16,
     api_port: u16,
     entry_points: &'a EntryPoints,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carry: Option<&'a serde_json::Value>,
 }
 
 struct HostOwner {
@@ -1081,9 +1351,57 @@ impl VerifiedHostRuntime {
         database_port: u16,
         api_port: u16,
         mode: HostMode,
-        mut owner: Option<&mut crate::host_state::Owner>,
+        owner: Option<&mut crate::host_state::Owner>,
         #[cfg(windows)] supervisor: &Path,
     ) -> Result<HostProcess, String> {
+        if mode.carries() {
+            return Err("host_carry_config_invalid".into());
+        }
+        self.start_admitted(
+            state,
+            password,
+            database_port,
+            api_port,
+            mode,
+            owner.map_or(Admission::Direct, Admission::Controller),
+            #[cfg(windows)]
+            supervisor,
+        )
+    }
+    /// Restore the export of this library's previous package into a fresh directory beside the
+    /// original and prove it. The journal stays as it is and is held throughout.
+    #[cfg(unix)]
+    pub(crate) fn start_carry_restore(
+        &self,
+        state: &Path,
+        password: &Zeroizing<String>,
+        ports: (u16, u16),
+        journal: CarryJournal<'_>,
+        carry: &serde_json::Value,
+    ) -> Result<HostProcess, String> {
+        self.start_admitted(
+            state,
+            password,
+            ports.0,
+            ports.1,
+            HostMode::CarryRestore,
+            Admission::Carry(journal, carry),
+        )
+    }
+    #[cfg_attr(windows, allow(clippy::too_many_arguments))]
+    fn start_admitted(
+        &self,
+        state: &Path,
+        password: &Zeroizing<String>,
+        database_port: u16,
+        api_port: u16,
+        mode: HostMode,
+        mut admission: Admission<'_>,
+        #[cfg(windows)] supervisor: &Path,
+    ) -> Result<HostProcess, String> {
+        if mode.carries() != admission.carry().is_some() {
+            return Err("host_carry_config_invalid".into());
+        }
         let requested_state = state;
         #[cfg(windows)]
         let stable_state = crate::windows_protection::stable_state_path(state)
@@ -1095,17 +1413,8 @@ impl VerifiedHostRuntime {
         if agent_source.len() > 262144 {
             return Err("host_agent_source_invalid".into());
         }
-        let (database_reference, controller_generation) = if let Some(owner) = owner.as_mut() {
-            let (profile, reference, generation) =
-                owner.launch_state(&self.manifest_sha256, mode)?;
-            if profile != requested_state {
-                return Err("host_controller_binding_changed".into());
-            }
-            (reference, Some(generation))
-        } else {
-            direct_profile(state)?;
-            (None, None)
-        };
+        let (database_reference, controller_generation) =
+            admission.launch_state(&self.manifest_sha256, mode, requested_state, state)?;
         self.check_files()?;
         if password.len() < 24
             || password.len() > 512
@@ -1155,7 +1464,8 @@ impl VerifiedHostRuntime {
                 #[cfg(windows)]
                 state_path_binding: crate::windows_protection::state_path_binding(state)
                     .map_err(|_| "host_state_not_private")?,
-                database_reference: if mode.uses_database() {
+                // The restore step is told which directory is the original only to size it.
+                database_reference: if mode.uses_database() || mode == HostMode::CarryRestore {
                     database_reference.as_ref()
                 } else {
                     None
@@ -1163,18 +1473,19 @@ impl VerifiedHostRuntime {
                 runtime: &self.root,
                 manifest_sha256: &self.manifest_sha256,
                 source_revision: &self.manifest.source_revision,
-                postgres_major: "19",
+                postgres_major: self.postgres_major()?,
                 password,
                 database_port,
                 api_port,
                 entry_points: &self.manifest.entry_points,
+                carry: admission.carry(),
             })
             .map_err(|_| "host_config_invalid")?,
         );
-        if let Some(owner) = owner.as_mut() {
-            owner.launch_state(&self.manifest_sha256, mode)?;
-        } else {
-            direct_profile(state)?;
+        if admission.launch_state(&self.manifest_sha256, mode, requested_state, state)?
+            != (database_reference.clone(), controller_generation)
+        {
+            return Err("host_controller_binding_changed".into());
         }
         let node = self.root.join(relative(&self.manifest.entry_points.node)?);
         #[cfg(not(windows))]
@@ -2145,5 +2456,364 @@ mod checkpoint_tests {
         assert!(ready.recv().unwrap().is_ok());
         assert!(rx.try_recv().is_ok());
         assert!(!protocol.failed.load(Ordering::Acquire));
+    }
+}
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const CURRENT: (&str, &str) = ("19beta4", "0.8.7");
+    fn declared(postgres: &str, vector: &str) -> Vec<CarrySource> {
+        vec![CarrySource {
+            postgres_version: postgres.into(),
+            pgvector_version: vector.into(),
+        }]
+    }
+
+    #[test]
+    fn this_build_declares_no_upgrade_path_so_no_package_is_a_carry_source() {
+        // Until a second database build is pinned and the move has been qualified between
+        // two signed packages, nothing is declared and the whole flow stays inert.
+        assert_eq!(declared_carry_sources(), Vec::new());
+        assert_eq!(
+            include_str!("../../runtime/host-carry-forward.json").trim(),
+            "{\n  \"schemaVersion\": 1,\n  \"from\": []\n}"
+        );
+    }
+
+    #[test]
+    fn a_declaration_names_earlier_builds_only_and_one_that_cannot_be_read_declares_nothing() {
+        let good = r#"{"schemaVersion":1,"from":[{"postgresVersion":"18.7","pgvectorVersion":"0.8.7"},{"postgresVersion":"19beta3","pgvectorVersion":"0.8.6"}]}"#;
+        assert_eq!(carry_sources(good, CURRENT).len(), 2);
+        for raw in [
+            "",
+            "{",
+            r#"{"schemaVersion":2,"from":[]}"#,
+            r#"{"schemaVersion":1,"from":[],"extra":true}"#,
+            // The current build is not a source for itself.
+            r#"{"schemaVersion":1,"from":[{"postgresVersion":"19beta4","pgvectorVersion":"0.8.7"}]}"#,
+            // A newer Postgres: its dump could not be read here.
+            r#"{"schemaVersion":1,"from":[{"postgresVersion":"20.1","pgvectorVersion":"0.8.7"}]}"#,
+            r#"{"schemaVersion":1,"from":[{"postgresVersion":"../18","pgvectorVersion":"0.8.7"}]}"#,
+            r#"{"schemaVersion":1,"from":[{"postgresVersion":"9.6","pgvectorVersion":"0.8.7"}]}"#,
+            r#"{"schemaVersion":1,"from":[{"postgresVersion":"18.7","pgvectorVersion":""}]}"#,
+            r#"{"schemaVersion":1,"from":[{"postgresVersion":"18.7","pgvectorVersion":"0.8.7","path":"/x"}]}"#,
+        ] {
+            assert_eq!(carry_sources(raw, CURRENT), Vec::new(), "{raw}");
+        }
+        assert_eq!(postgres_major("19beta4"), Ok("19"));
+        assert_eq!(postgres_major("18.7"), Ok("18"));
+        for version in ["9.6", "beta", "", "190", "07.1"] {
+            assert!(postgres_major(version).is_err(), "{version}");
+        }
+    }
+
+    #[test]
+    fn the_current_package_carries_the_pins_exactly_and_a_carry_source_never_does() {
+        let current = (Some(CURRENT.0), Some(CURRENT.1));
+        let sources = declared("18.7", "0.8.7");
+        assert!(database_pins_admitted("19beta4", "0.8.7", current, None));
+        assert!(!database_pins_admitted("18.7", "0.8.7", current, None));
+        assert!(database_pins_admitted(
+            "18.7",
+            "0.8.7",
+            current,
+            Some(&sources)
+        ));
+        // The current package cannot be passed off as a carry source, nor an undeclared build.
+        assert!(!database_pins_admitted(
+            "19beta4",
+            "0.8.7",
+            current,
+            Some(&sources)
+        ));
+        assert!(!database_pins_admitted(
+            "18.6",
+            "0.8.7",
+            current,
+            Some(&sources)
+        ));
+        assert!(!database_pins_admitted(
+            "18.7",
+            "0.8.6",
+            current,
+            Some(&sources)
+        ));
+        assert!(!database_pins_admitted("18.7", "0.8.7", current, Some(&[])));
+        // Pins that cannot be read admit nothing.
+        assert!(!database_pins_admitted(
+            "18.7",
+            "0.8.7",
+            (None, current.1),
+            Some(&sources)
+        ));
+        assert!(!database_pins_admitted(
+            "19beta4",
+            "0.8.7",
+            (current.0, None),
+            None
+        ));
+    }
+
+    /// A complete stand-in package on disk, signed with a key made for this test.
+    struct Package {
+        root: PathBuf,
+        raw: Vec<u8>,
+        signature: [u8; 64],
+        key: VerifyingKey,
+    }
+    impl Drop for Package {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.root.parent().unwrap());
+        }
+    }
+    fn package(postgres: &str, vector: &str) -> Package {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-carry-package-{}", uuid::Uuid::new_v4()));
+        let root = base.join("payload");
+        let roles = [
+            "node",
+            "server",
+            "postgres",
+            "initdb",
+            "pgDump",
+            "pgRestore",
+            "pgIsready",
+            "pgChecksums",
+            "pgCtl",
+            "createdb",
+            "psql",
+            "vector",
+            "hdr",
+            "ffmpeg",
+            "ffprobe",
+            "exiftool",
+            "rawRenderer",
+            "rawDecoder",
+            "webIndex",
+            "studio",
+            "studioBrowser",
+            "studioBrowserGuard",
+            "corePlugin",
+            "mlManifest",
+            "manager",
+            "managerWebIndex",
+            "backupEngine",
+        ];
+        let mut names: Vec<String> = roles.iter().map(|role| format!("bin/{role}")).collect();
+        names.extend(
+            [
+                "backup/LICENSE",
+                "backup/component.json",
+                "studio/engine-build.json",
+                "studio/guard/studio-browser-guard.mjs",
+                "studio/tools/bundled-worker-fonts.mjs",
+                "studio/tools/render-worker-font-inputs.mjs",
+                "studio/runtime/admission-font.json",
+                "studio/runtime/admission-font.ttf",
+                "build/geodata/geodata-date.txt",
+                "build/geodata/cities500.txt",
+                "build/geodata/admin1CodesASCII.txt",
+                "build/geodata/admin2Codes.txt",
+                "build/geodata/countryInfo.txt",
+                "build/geodata/ne_10m_admin_0_countries.geojson",
+                "build/geodata/landmarks.ndjson.gz",
+                "manager/app/release-worker.cjs",
+                "manager/app/media-copy.cjs",
+                "manager/.github/frameleaf-release.cjs",
+                "manager/.github/verify-release-bundle.cjs",
+                "manager/cosign.pub",
+                "manager/component.json",
+                "manager/package.json",
+                "manager/LICENSE",
+                "manager/node_modules/@nestjs/common/package.json",
+                "manager/node_modules/@nestjs/core/package.json",
+                "manager/node_modules/@nestjs/platform-express/package.json",
+                "manager/node_modules/express/package.json",
+                "manager/node_modules/js-yaml/package.json",
+                "manager/node_modules/reflect-metadata/package.json",
+                "manager/node_modules/rxjs/package.json",
+                "manager/node_modules/zod/package.json",
+            ]
+            .map(String::from),
+        );
+        let mut files = serde_json::Map::new();
+        for name in &names {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("synthetic {name}");
+            std::fs::write(&path, &bytes).unwrap();
+            files.insert(
+                name.clone(),
+                serde_json::json!({"sha256": format!("{:x}", Sha256::digest(&bytes)), "bytes": bytes.len()}),
+            );
+        }
+        let entry_points: serde_json::Map<String, serde_json::Value> = roles
+            .iter()
+            .map(|role| (role.to_string(), serde_json::json!(format!("bin/{role}"))))
+            .collect();
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1, "protocolVersion": 2, "epoch": 7,
+            "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH,
+            "sourceRevision": "1".repeat(40), "nodeVersion": "26.11.1",
+            "postgresVersion": postgres, "vectorVersion": vector, "certified": false,
+            "entryPoints": entry_points, "files": files,
+        }))
+        .unwrap();
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        Package {
+            signature: signing.sign(&raw).to_bytes(),
+            key: signing.verifying_key(),
+            root,
+            raw,
+        }
+    }
+
+    #[test]
+    fn an_earlier_signed_package_verifies_only_as_a_declared_carry_source_and_only_while_intact() {
+        let earlier = package("18.7", "0.8.7");
+        let keys = [earlier.key];
+        let current = |package: &Package| {
+            VerifiedHostRuntime::verify(&package.root, &package.raw, &package.signature, &keys, 1)
+                .map(|_| ())
+        };
+        let source = |package: &Package, sources: &[CarrySource]| {
+            VerifiedHostRuntime::verify_carry_source(
+                &package.root,
+                &package.raw,
+                &package.signature,
+                &keys,
+                1,
+                sources,
+            )
+        };
+        // Today's refusal is unchanged: an earlier build is never the current package.
+        assert_eq!(current(&earlier).unwrap_err(), "host_manifest_incompatible");
+        // Undeclared, or declared for some other build: not a carry source either.
+        for sources in [
+            Vec::new(),
+            declared("18.6", "0.8.7"),
+            declared("18.7", "0.8.6"),
+        ] {
+            assert_eq!(
+                source(&earlier, &sources).err().unwrap(),
+                "host_manifest_incompatible"
+            );
+        }
+        let sources = declared("18.7", "0.8.7");
+        let verified = source(&earlier, &sources).unwrap();
+        assert_eq!(verified.postgres_version(), "18.7");
+        assert_eq!(verified.postgres_major(), Ok("18"));
+        assert_eq!(verified.vector_version(), "0.8.7");
+        assert_eq!(verified.epoch(), 7);
+        assert_eq!(
+            verified.manifest_sha256(),
+            format!("{:x}", Sha256::digest(&earlier.raw))
+        );
+        // Every other check still applies to it: the signature, the release floor, every file.
+        let mut signature = earlier.signature;
+        signature[0] ^= 1;
+        assert_eq!(
+            VerifiedHostRuntime::verify_carry_source(
+                &earlier.root,
+                &earlier.raw,
+                &signature,
+                &keys,
+                1,
+                &sources
+            )
+            .err()
+            .unwrap(),
+            "host_signature_invalid"
+        );
+        let other = [SigningKey::from_bytes(&[8; 32]).verifying_key()];
+        assert_eq!(
+            VerifiedHostRuntime::verify_carry_source(
+                &earlier.root,
+                &earlier.raw,
+                &earlier.signature,
+                &other,
+                1,
+                &sources
+            )
+            .err()
+            .unwrap(),
+            "host_signature_invalid"
+        );
+        assert_eq!(
+            VerifiedHostRuntime::verify_carry_source(
+                &earlier.root,
+                &earlier.raw,
+                &earlier.signature,
+                &keys,
+                8,
+                &sources
+            )
+            .err()
+            .unwrap(),
+            "host_manifest_incompatible"
+        );
+        std::fs::write(earlier.root.join("bin/pgDump"), "synthetic bin/pgDumq").unwrap();
+        assert_eq!(
+            source(&earlier, &sources).err().unwrap(),
+            "runtime_artifact_changed"
+        );
+        std::fs::write(earlier.root.join("bin/pgDump"), "synthetic bin/pgDump").unwrap();
+        std::fs::write(earlier.root.join("bin/extra"), "unsigned").unwrap();
+        assert_eq!(
+            source(&earlier, &sources).err().unwrap(),
+            "runtime_inventory_mismatch"
+        );
+        // The current package is itself only ever the current package.
+        let pins: serde_json::Value =
+            serde_json::from_str(include_str!("../../runtime/host-database.json")).unwrap();
+        let latest = package(
+            pins["postgresVersion"].as_str().unwrap(),
+            pins["pgvectorVersion"].as_str().unwrap(),
+        );
+        let keys = [latest.key];
+        VerifiedHostRuntime::verify(&latest.root, &latest.raw, &latest.signature, &keys, 1)
+            .unwrap();
+        assert_eq!(
+            VerifiedHostRuntime::verify_carry_source(
+                &latest.root,
+                &latest.raw,
+                &latest.signature,
+                &keys,
+                1,
+                &declared(
+                    pins["postgresVersion"].as_str().unwrap(),
+                    pins["pgvectorVersion"].as_str().unwrap()
+                ),
+            )
+            .err()
+            .unwrap(),
+            "host_manifest_incompatible"
+        );
+    }
+
+    #[test]
+    fn only_a_carry_step_is_a_carry_mode_and_each_has_its_own_ready_word() {
+        for mode in [
+            HostMode::Server,
+            HostMode::Database,
+            HostMode::CheckpointCleanup,
+            HostMode::RestorePrepare,
+        ] {
+            assert!(!mode.carries());
+        }
+        assert!(HostMode::CarryExport.carries() && HostMode::CarryRestore.carries());
+        // The export run opens the selected database; the restore opens none of the library's.
+        assert!(HostMode::CarryExport.uses_database());
+        assert!(!HostMode::CarryRestore.uses_database());
+        assert_eq!(HostMode::CarryExport.ready_state(), "carry-exported");
+        assert_eq!(HostMode::CarryRestore.ready_state(), "carry-restored");
+        assert_eq!(
+            serde_json::to_value(HostMode::CarryExport).unwrap(),
+            "carry-export"
+        );
     }
 }

@@ -1,6 +1,8 @@
 <script lang="ts">
+  import ErrorText from './ErrorText.svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { albumErrors, type AlbumDestination } from './import-destination';
+  import type { AlbumDestination } from './import-destination';
+  import { explainError } from './errors';
 
   let {
     albumMode = $bindable(false),
@@ -24,7 +26,7 @@
       albums = await invoke<AlbumDestination[]>('list_photo_import_albums', { search: query });
       loaded = true;
     } catch (reason) {
-      error = albumErrors[String(reason)] ?? 'Albums could not be loaded. Check the library connection and try again.';
+      error = explainError(reason, 'Albums could not be loaded. Check the library connection and try again.');
     } finally { loading = false; }
   }
 
@@ -53,7 +55,7 @@
       <button class="btn small" type="button" onclick={search} disabled={disabled || loading}>Search Albums</button>
     </div>
     {#if loading}<small role="status">Loading albums…</small>
-    {:else if error}<small role="status" class="danger-text">{error}</small>
+    {:else if error}<small role="status" class="danger-text"><ErrorText text={error} /></small>
     {:else if loaded && !albums.length}<small role="status">No writable albums found. Try another name.</small>{/if}
     {#if albums.length || destination}
       <label>

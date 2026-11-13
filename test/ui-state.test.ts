@@ -145,8 +145,8 @@ test('sign-in methods follow the server: Frameleaf only when linked, OAuth by it
   assert.deepEqual(signInMethods({ ...base, linked: false }), { frameleaf: false, password: true, oauth: '' });
   assert.deepEqual(signInMethods({ ...base, passwordLogin: false, oauth: true, oauthButtonText: ' Authentik ' }), { frameleaf: true, password: false, oauth: 'Authentik' });
   assert.equal(signInMethods({ ...base, oauth: true }).oauth, 'Sign In with Single Sign-On');
-  assert.equal(nearbySignIn({ linked: true, setup: 'needed' }), 'Frameleaf or its own login');
-  assert.equal(nearbySignIn({ linked: false, setup: 'complete' }), 'Its own login');
+  assert.equal(nearbySignIn({ linked: true, setup: 'needed' }), 'Frameleaf or its own sign-in');
+  assert.equal(nearbySignIn({ linked: false, setup: 'complete' }), 'Its own sign-in');
   assert.equal(nearbySignIn({ linked: false, setup: 'needed' }), 'New server');
 });
 
@@ -160,4 +160,30 @@ test('the country picker names real places and starts at the person’s region',
   assert.equal(defaultCountry('en-CA'), 'CA');
   assert.equal(defaultCountry('fr'), 'FR');
   assert.equal(defaultCountry('not a locale!'), 'US');
+});
+
+test('a folder imported in several batches shows the progress of the whole import', async () => {
+  const { importProgress, importProgressText } = await import('../src/ui-state.ts');
+  const { readFileSync } = await import('node:fs');
+  // The second batch of a 25,001-file folder: the batch has done 2,000 of its 10,000.
+  const job = { completed: 2000, total: 10_000, overall: { total: 25_001, completed: 12_000, totalBytes: 9_000_000_000, completedBytes: 3_100_000_000 } };
+  assert.deepEqual(importProgress(job), { completed: 12_000, total: 25_001, bytes: { completed: 3_100_000_000, total: 9_000_000_000 } });
+  assert.match(importProgressText(job), /^12,000 of 25,001 copies confirmed · \S+ GB of \S+ GB$/);
+  // An ordinary import has one batch and shows it, as before.
+  const single = { completed: 3, total: 40 };
+  assert.deepEqual(importProgress(single), { completed: 3, total: 40, bytes: null });
+  assert.equal(importProgressText({ ...single, overall: null }), '3 of 40 copies confirmed');
+  // The totals never fall below what is already done (the folder changed during the import).
+  assert.deepEqual(importProgress({ completed: 1, total: 1, overall: { total: 10, completed: 12, totalBytes: 5, completedBytes: 8 } }), { completed: 12, total: 12, bytes: { completed: 8, total: 8 } });
+  assert.deepEqual(importProgress({ completed: 1, total: 2, overall: { total: 0, completed: 0, totalBytes: 0, completedBytes: 0 } }), { completed: 1, total: 2, bytes: null });
+  // Both pages that show an import use it for the counts and for the bar.
+  for (const page of ['../src/pages/Overview.svelte', '../src/PhotoSources.svelte']) {
+    const source = readFileSync(new URL(page, import.meta.url), 'utf8');
+    assert.match(source, /\$\{importProgressText\(job\)\}/, page);
+    assert.match(source, /\{@const progress = importProgress\(job\)\}<span class="progress" role="progressbar" aria-valuenow=\{percent\(progress\.completed, progress\.total\)\}/, page);
+    assert.doesNotMatch(source, /percent\(job\.completed, job\.total\)/, page);
+  }
+  // The batches of one import are one history entry: the backend files them under the import's id.
+  const history = readFileSync(new URL('../src-tauri/src/source_import/history.rs', import.meta.url), 'utf8');
+  assert.match(history, /run_id:\s*import\.map_or_else\(\|\|\s*manifest\.id\.clone\(\),\s*\|import\|\s*import\.id\.clone\(\)\)/);
 });

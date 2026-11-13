@@ -1,39 +1,56 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export function validateFactoryRun(run, repository) {
+/** The commit of a finished manual run of `workflow` on main in this repository; anything else is refused with `code`. */
+export function validateDispatchRun(run, repository, workflow, code) {
   if (
     !run || run.status !== "completed" || run.conclusion !== "success" ||
     run.head_branch !== "main" || run.event !== "workflow_dispatch" ||
     typeof run.path !== "string" ||
-    run.path.split("@")[0] !== ".github/workflows/factory-runtime.yml" ||
+    run.path.split("@")[0] !== workflow ||
     run.repository?.full_name !== repository ||
     typeof run.head_sha !== "string" || run.head_sha.length !== 40 ||
     !/^[a-f0-9]{40}$/.test(run.head_sha)
-  ) throw new Error("runtime_run_untrusted");
+  ) throw new Error(code);
   return run.head_sha;
 }
 
+export function validateFactoryRun(run, repository) {
+  return validateDispatchRun(run, repository, ".github/workflows/factory-runtime.yml", "runtime_run_untrusted");
+}
+
+const targets = {
+  "macos-aarch64": { os: "macos-15", target: "macos-aarch64" },
+  "macos-x86_64": { os: "macos-15-intel", target: "macos-x86_64" },
+  "windows-x86_64": { os: "windows-2022", target: "windows-x86_64" },
+  // Ubuntu 22.04 has glibc 2.35: what is built there also loads on Debian 12.
+  "linux-x86_64": { os: "ubuntu-22.04", target: "linux-x86_64" },
+  "linux-aarch64": { os: "ubuntu-22.04-arm", target: "linux-aarch64" },
+};
+const macos = ["macos-aarch64", "macos-x86_64"];
+const linux = ["linux-x86_64", "linux-aarch64"];
+// Every choice the release and factory workflows offer. Each platform can be selected alone,
+// so one platform that cannot build or be signed never holds back the others.
+const selections = {
+  "macos-linux": [...macos, ...linux],
+  all: [...macos, "windows-x86_64", ...linux],
+  macos,
+  linux,
+  windows: ["windows-x86_64"],
+  "macos-aarch64": ["macos-aarch64"],
+  "macos-x86_64": ["macos-x86_64"],
+  "linux-x86_64": ["linux-x86_64"],
+  "linux-aarch64": ["linux-aarch64"],
+};
+export const releasePlatformChoices = Object.keys(selections);
+
 export function releaseMatrix(platforms) {
-  const appleSilicon = { os: "macos-15", target: "macos-aarch64" };
-  if (platforms === "macos-aarch64") return { include: [appleSilicon] };
-  if (!["macos-linux", "all", "linux", "windows"].includes(platforms))
+  if (typeof platforms !== "string" || !Object.hasOwn(selections, platforms))
     throw new Error("release_platforms_invalid");
-  return { include: [
-    ...(platforms !== "linux" && platforms !== "windows" ? [
-      appleSilicon,
-      { os: "macos-15-intel", target: "macos-x86_64" },
-    ] : []),
-    ...(platforms === "all" || platforms === "windows" ? [{ os: "windows-2022", target: "windows-x86_64" }] : []),
-    ...(platforms !== "windows" ? [
-      { os: "ubuntu-24.04", target: "linux-x86_64" },
-      { os: "ubuntu-24.04-arm", target: "linux-aarch64" },
-    ] : []),
-  ] };
+  return { include: selections[platforms].map((target) => ({ ...targets[target] })) };
 }
 
 export function validateReleaseTag(tag, versions) {
@@ -99,11 +116,41 @@ export function verifyUpdaterAsset(file, signature, publicKey, version) {
   }
 }
 
+// Every target Desktop can update in place. A release that omits one leaves those installs on their current version.
+export const updateFeedTargets = [
+  "darwin-aarch64-app", "darwin-x86_64-app",
+  "linux-aarch64-appimage", "linux-aarch64-deb", "linux-x86_64-appimage", "linux-x86_64-deb",
+  "windows-x86_64-msi", "windows-x86_64-nsis",
+];
+
+/** Markdown for the workflow summary and draft notes, so an omitted platform is visible before publication. */
+export function updateFeedSummary(manifest) {
+  const offered = Object.keys(manifest.platforms).sort();
+  const missing = updateFeedTargets.filter((target) => !manifest.platforms[target]);
+  const windows = offered.some((target) => target.startsWith("windows-"));
+  const lines = [`### Update feed for ${manifest.version}`, "", `\`latest.json\` offers ${manifest.version} to: ${offered.join(", ")}.`];
+  if (!windows) {
+    lines.push("", `**Windows was excluded from the update feed.** This release has no signed Windows installers, so Desktop on Windows will not be offered ${manifest.version} and stays on its installed version until a release includes them.`);
+  }
+  const others = windows ? missing : missing.filter((target) => !target.startsWith("windows-"));
+  if (others.length) lines.push("", `Not in the update feed: ${others.join(", ")}.`);
+  return lines.join("\n") + "\n";
+}
+
+/** The version each file records. The lock files are included: `cargo --locked` and `npm ci` fail on a stale one. */
+export function applicationVersions(root = new URL("../", import.meta.url)) {
+  const read = (path) => readFileSync(new URL(path, root), "utf8");
+  const lock = JSON.parse(read("package-lock.json"));
+  return {
+    "package.json": JSON.parse(read("package.json")).version,
+    "package-lock.json": lock.version,
+    "package-lock.json (root package)": lock.packages?.[""]?.version,
+    "src-tauri/tauri.conf.json": JSON.parse(read("src-tauri/tauri.conf.json")).version,
+    "src-tauri/Cargo.toml": read("src-tauri/Cargo.toml").match(/^version\s*=\s*"([^"]+)"/m)?.[1],
+    "src-tauri/Cargo.lock": read("src-tauri/Cargo.lock").match(/^name = "frameleaf-desktop"\r?\nversion = "([^"]+)"/m)?.[1],
+  };
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const root = new URL("../", import.meta.url);
-  const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
-  const config = JSON.parse(await readFile(new URL("src-tauri/tauri.conf.json", root), "utf8"));
-  const cargo = await readFile(new URL("src-tauri/Cargo.toml", root), "utf8");
-  const version = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  console.log(validateReleaseTag(process.argv[2], [pkg.version, config.version, version]));
+  console.log(validateReleaseTag(process.argv[2], Object.values(applicationVersions())));
 }

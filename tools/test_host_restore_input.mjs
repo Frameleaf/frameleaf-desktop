@@ -10,13 +10,24 @@ import subprocess from 'node:child_process';
 import { writeFileSync, rmSync, lstatSync, readdirSync, mkdirSync, renameSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { basename } from 'node:path';
+import { createServer } from 'node:net';
 import filesystem from 'node:fs/promises';
 import * as owner from '../runtime/host-agent.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+// The restore owner really binds its database port to check that it is free. A fixed port made these tests
+// fail whenever anything else on the machine held it for that moment, such as a second run of this file
+// from another checkout or CI job, so each fixture takes a port the system reports as free.
+async function freePort(){
+ const probe=createServer();
+ await new Promise((resolve,reject)=>{probe.once('error',reject);probe.listen(0,'127.0.0.1',resolve);});
+ const {port}=probe.address();
+ await new Promise((resolve,reject)=>probe.close(error=>error?reject(error):resolve()));
+ return port;
+}
 async function fixture(t,run){
  const state=await realpath(await mkdtemp(join(tmpdir(),'Frameleaf Desktop Host ü restore-')));t.after(()=>rm(state,{recursive:true,force:true}));
  const suffix=process.platform==='win32'?'.exe':'';
- const c={state,runtime:join(state,'signed-runtime'),manifestSha256:'a'.repeat(64),sourceRevision:'b'.repeat(40),postgresMajor:'19',databasePort:54329,apiPort:2283,password:'synthetic private database password',entryPoints:Object.fromEntries(['node','server','postgres','initdb','createdb','psql','pgIsready','pgCtl','pgDump','pgRestore','hdr','studioBrowserGuard','studio'].map(name=>[name,'bin/'+name+suffix]))};
+ const c={state,runtime:join(state,'signed-runtime'),manifestSha256:'a'.repeat(64),sourceRevision:'b'.repeat(40),postgresMajor:'19',databasePort:await freePort(),apiPort:2283,password:'synthetic private database password',entryPoints:Object.fromEntries(['node','server','postgres','initdb','createdb','psql','pgIsready','pgCtl','pgDump','pgRestore','hdr','studioBrowserGuard','studio'].map(name=>[name,'bin/'+name+suffix]))};
  Object.assign(c.entryPoints,{ffmpeg:'media/ffmpeg'+suffix,ffprobe:'media/ffprobe'+suffix,rawRenderer:'raw/darktable-cli'+suffix,rawDecoder:'raw/dcraw_emu'+suffix,studioBrowser:'browser/chrome'+suffix});
  await owner.claimState(c);
  const bytes=Buffer.from('PGDMP restore input fixture');

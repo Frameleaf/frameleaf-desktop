@@ -12,6 +12,77 @@ pub const CREDENTIAL: &str = "manager-grant";
 const RECENT: u64 = 300_000;
 const LIFETIME: u64 = 30 * 86_400_000;
 const WINDOW: u64 = 60_000;
+const REPLY_LIMIT: usize = 65_536;
+/// Manager counts every paired request from one address, whatever it asks, against one
+/// allowance: this many in a window that opens with the first of them. Past it Manager answers
+/// `rate_limited` to all of them, status and start included, until the window closes.
+const PAIRED_REQUESTS: u64 = 120;
+const PAIRED_WINDOW: Duration = Duration::from_secs(600);
+/// The first wait between two looks at something Manager is still doing; each later one is
+/// twice the one before, up to `POLL_STEADY`.
+const POLL_FIRST: Duration = Duration::from_millis(250);
+/// The longest wait between two looks: polling that never ends spends half the allowance.
+const POLL_STEADY: Duration =
+    Duration::from_millis(PAIRED_WINDOW.as_millis() as u64 * 2 / PAIRED_REQUESTS);
+/// How long to wait after the look numbered `asked` (from 0) found Manager still at it.
+fn poll_delay(asked: u32) -> Duration {
+    POLL_FIRST
+        .saturating_mul(1 << asked.min(16))
+        .min(POLL_STEADY)
+}
+/// A refused request, with how long Manager asked this app to wait when it said so.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Refused {
+    pub(crate) code: String,
+    pub(crate) retry_after: Option<Duration>,
+}
+impl<T: Into<String>> From<T> for Refused {
+    fn from(code: T) -> Self {
+        Self {
+            code: code.into(),
+            retry_after: None,
+        }
+    }
+}
+/// Ask Manager on a paired route until it answers, inside its request allowance. Every loop
+/// that waits on a paired route goes through here. `Ok(None)` from `ask` is "not yet" and is
+/// asked again after a growing wait. `manager_rate_limited` says nothing about what was
+/// asked: it is waited out, for as long as Manager said or else the steady wait, and asked
+/// again. Any other refusal ends it. When `deadline` passes without an answer the result is
+/// `unanswered`, never an answer; a wait Manager asked for that ends after it is not begun.
+pub(crate) async fn paced<T, E, F>(
+    deadline: tokio::time::Instant,
+    unanswered: &str,
+    ask: impl Fn() -> F,
+) -> Result<T, String>
+where
+    E: Into<Refused>,
+    F: std::future::Future<Output = Result<Option<T>, E>>,
+{
+    let mut asked = 0;
+    loop {
+        let reply = ask().await.map_err(Into::into);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let wait = match reply {
+            Ok(Some(answer)) => return Ok(answer),
+            Ok(None) => poll_delay(asked),
+            Err(Refused { code, retry_after }) if code == "manager_rate_limited" => {
+                if retry_after.is_some_and(|wait| wait > remaining) {
+                    return Err(unanswered.into());
+                }
+                retry_after.unwrap_or(POLL_STEADY).max(poll_delay(asked))
+            }
+            Err(refused) => return Err(refused.code),
+        };
+        if remaining.is_zero() {
+            return Err(unanswered.into());
+        }
+        asked += 1;
+        tokio::time::sleep(wait.min(remaining)).await;
+    }
+}
+/// Status and backup lists grow with history; 1,000 backup entries alone exceed 64 KiB.
+const LIST_LIMIT: usize = 1024 * 1024;
 const SCOPES: [Scope; 5] = [
     Scope::Status,
     Scope::Start,
@@ -84,6 +155,12 @@ pub enum Command {
         action: Action,
         id: Uuid,
     },
+    /// What Manager's controller is doing now. Only for a Manager that declares
+    /// `runtime-status`, and never from the interface.
+    #[serde(skip_deserializing)]
+    Runtime {
+        nonce: Uuid,
+    },
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -126,6 +203,49 @@ impl SavedManager {
         Ok(())
     }
 
+    /// This computer's grant for the Manager it hosts follows that Manager to another loopback
+    /// port and to the certificate that replaced the one the grant pins. Only a grant for this
+    /// installation that pins `certificate` or the certificate it `replaced` is touched, and
+    /// only between loopback origins on the same host. Returns whether anything changed.
+    pub(crate) fn follow_local(
+        &mut self,
+        installation_id: &str,
+        origin: &str,
+        certificate: &str,
+        replaced: Option<&str>,
+    ) -> bool {
+        let fingerprint = |pem: &str| certificate_fingerprint(pem).ok();
+        let Some(pinned) = self.certificate_pem.as_deref().and_then(fingerprint) else {
+            return false;
+        };
+        let loopback = |value: &str| {
+            url::Url::parse(value).ok().filter(|url| {
+                url.scheme() == "https"
+                    && url.origin().ascii_serialization() == value
+                    && matches!(url.host_str(), Some("127.0.0.1" | "[::1]"))
+            })
+        };
+        let same_host = match (loopback(&self.origin), loopback(origin)) {
+            (Some(from), Some(to)) => from.host_str() == to.host_str(),
+            _ => false,
+        };
+        let (Some(current), true, true) = (
+            fingerprint(certificate),
+            self.installation_id == installation_id,
+            same_host,
+        ) else {
+            return false;
+        };
+        if pinned != current && replaced.and_then(fingerprint).as_ref() != Some(&pinned) {
+            return false;
+        }
+        if self.origin == origin && pinned == current {
+            return false;
+        }
+        self.origin = origin.into();
+        self.certificate_pem = Some(certificate.into());
+        true
+    }
     pub fn view(&self) -> View {
         View {
             origin: self.origin.clone(),
@@ -214,6 +334,17 @@ pub fn normalize_manager(value: &str) -> Result<url::Url, String> {
     }
     Ok(url)
 }
+/// A Manager on this computer or the home network is reached over plain HTTP: nobody can get a
+/// certificate for a local host. Only a Manager reached over the internet must use HTTPS, because
+/// HTTP would carry its password across networks the owner does not control.
+pub fn require_encrypted(origin: &str) -> Result<(), String> {
+    let url = normalize_manager(origin)?;
+    let local = url.host().is_some_and(crate::connection::is_local_network);
+    if url.scheme() == "http" && !local {
+        return Err("manager_https_required".into());
+    }
+    Ok(())
+}
 fn canonical_origin(value: &str) -> Result<String, String> {
     let url = normalize_manager(value)?;
     let origin = url.origin().ascii_serialization();
@@ -261,12 +392,14 @@ pub fn manager_client(
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")));
     match (pem, approved) {
+        // System trust: the operating system's trust store, plus the bundled public roots.
         (None, None) => {}
         (Some(pem), Some(approved)) => {
             let der = certificate_der(pem)?;
             if !hex(approved, 64) || format!("{:x}", Sha256::digest(&der)) != approved {
                 return Err("manager_certificate_approval_changed".into());
             }
+            // A pinned Manager trusts only its approved certificate: no bundled or system roots.
             builder = builder.tls_built_in_root_certs(false).add_root_certificate(
                 reqwest::Certificate::from_der(&der).map_err(|_| "manager_certificate_invalid")?,
             );
@@ -277,15 +410,45 @@ pub fn manager_client(
         .build()
         .map_err(|_| "network_client_unavailable".into())
 }
-async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String> {
+/// A short lowercase code Manager may show to people; never a path, sentence or secret.
+fn public_code(value: &str) -> bool {
+    value.len() <= 64
+        && value.starts_with(|first: char| first.is_ascii_lowercase())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+        && !(value.len() >= 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+/// Whether Manager's clock, from its `Date` header, is too far from ours for signed requests.
+fn clock_skewed(date: Option<&str>, now: u64) -> bool {
+    date.and_then(|value| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()
+    })
+    .is_some_and(|server| {
+        // `Date` has one-second resolution, so allow a margin inside Manager's window.
+        (server.unix_timestamp_nanos() / 1_000_000 - i128::from(now)).unsigned_abs()
+            > u128::from(WINDOW - 5_000)
+    })
+}
+async fn reply<T: DeserializeOwned>(response: Response) -> Result<T, String> {
+    reply_limit(response, REPLY_LIMIT).await
+}
+async fn reply_limit<T: DeserializeOwned>(
+    mut response: Response,
+    limit: usize,
+) -> Result<T, String> {
     let status = response.status();
+    let skewed = clock().is_ok_and(|now| {
+        let date = response.headers().get(reqwest::header::DATE);
+        clock_skewed(date.and_then(|value| value.to_str().ok()), now)
+    });
     let mut bytes = Zeroizing::new(Vec::new());
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| "manager_response_interrupted")?
     {
-        if bytes.len() + chunk.len() > 65_536 {
+        if bytes.len() + chunk.len() > limit {
             return Err("manager_response_too_large".into());
         }
         bytes.extend_from_slice(&chunk);
@@ -299,6 +462,9 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             .unwrap_or("");
         return Err(match code {
             "desktop_recent_auth_required" => "manager_recent_auth_required",
+            // Manager refuses a request signed outside its time window with the same code as a
+            // revoked grant; its own clock tells the two apart.
+            "desktop_grant_invalid" if skewed => "manager_clock_skew",
             "desktop_grant_invalid" => "manager_pair_again",
             "desktop_grant_scope_denied" => "manager_scope_denied",
             "desktop_grant_installation_changed" => "manager_installation_changed",
@@ -321,6 +487,8 @@ async fn reply<T: DeserializeOwned>(mut response: Response) -> Result<T, String>
             "native_restore_review_expired"
             | "native_restore_review_not_ready"
             | "native_restore_runtime_change_required" => code,
+            // Manager's own code says more than a generic failure; Desktop's namespace stays ours.
+            _ if public_code(code) && !code.starts_with("manager_") => code,
             _ => "manager_request_failed",
         }
         .into());
@@ -463,11 +631,13 @@ fn validate_pairing(
         || !identifier(&value.pairing_id)
         || !hex(&value.installation_id, 12)
         || !hex(&value.secret, 64)
-        || value.approved_at > now.saturating_add(WINDOW)
-        || value.expires_at <= now
         || value.expires_at.checked_sub(value.approved_at) != Some(RECENT)
     {
         return Err("manager_pairing_binding_changed".into());
+    }
+    // Manager approved this moments ago, so a time outside the window means the clocks disagree.
+    if value.approved_at > now.saturating_add(WINDOW) || value.expires_at <= now {
+        return Err("manager_clock_skew".into());
     }
     Ok(())
 }
@@ -480,6 +650,7 @@ pub async fn pair(
     persist: impl FnOnce(&SavedManager) -> Result<(), String>,
 ) -> Result<View, String> {
     canonical_origin(origin)?;
+    require_encrypted(origin)?;
     let password = Zeroizing::new(password);
     if password.is_empty() || password.len() > 256 {
         return Err("manager_login_details_invalid".into());
@@ -623,6 +794,16 @@ fn prepare(
             "/manager-api/desktop/resume",
             json!({"action":action,"id":id}),
         ),
+        Command::Runtime { nonce } => {
+            if nonce.is_nil() {
+                return Err("manager_request_invalid".into());
+            }
+            (
+                Scope::Status,
+                "/manager-api/desktop/runtime",
+                json!({"nonce":nonce}),
+            )
+        }
     };
     if !saved.scopes.contains(&scope) {
         return Err("manager_scope_denied".into());
@@ -660,25 +841,53 @@ pub async fn send(
     identity: &DeviceIdentity,
     command: Command,
 ) -> Result<Value, String> {
-    let request = prepare(
-        saved,
-        identity,
-        &command,
-        clock()?,
-        &Uuid::new_v4().to_string(),
-    )?;
-    let value = reply(
-        saved_client(saved)?
+    send_paced(saved, identity, command)
+        .await
+        .map_err(|refused| refused.code)
+}
+/// Manager's `Retry-After`, in whole seconds, on the reply that refused a request.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse().ok().map(Duration::from_secs)
+}
+/// `send` for a caller that waits on Manager with `paced`: a refusal keeps how long Manager
+/// asked this app to wait.
+pub(crate) async fn send_paced(
+    saved: &SavedManager,
+    identity: &DeviceIdentity,
+    command: Command,
+) -> Result<Value, Refused> {
+    let mut wait = None;
+    let sent = async {
+        let request = prepare(
+            saved,
+            identity,
+            &command,
+            clock()?,
+            &Uuid::new_v4().to_string(),
+        )?;
+        let limit = if matches!(command, Command::Status {} | Command::Backups {}) {
+            LIST_LIMIT
+        } else {
+            REPLY_LIMIT
+        };
+        let response = saved_client(saved)?
             .post(format!("{}{}", saved.origin, request.path))
             .header("content-type", "application/json")
             .header("x-frameleaf-manager-proof", request.proof)
             .body(request.body)
             .send()
             .await
-            .map_err(|_| "manager_unreachable_or_certificate_invalid")?,
-    )
-    .await?;
-    validate_reply(saved, &command, value)
+            .map_err(|_| "manager_unreachable_or_certificate_invalid")?;
+        wait = retry_after(response.headers());
+        let value = reply_limit(response, limit).await?;
+        validate_reply(saved, &command, value)
+    }
+    .await;
+    sent.map_err(|code: String| Refused {
+        code,
+        retry_after: wait,
+    })
 }
 async fn grant_action(
     saved: &SavedManager,
@@ -720,6 +929,19 @@ pub async fn reauthenticate(saved: &SavedManager, password: String) -> Result<()
 pub async fn disconnect(saved: &SavedManager, password: String) -> Result<(), String> {
     grant_action(saved, password, "desktop-grants/revoke", "revoked").await
 }
+/// Remove a pairing from this computer first, then try to revoke its grant in Manager.
+/// An unreachable Manager is not an error; the result says whether Manager confirmed the revoke.
+pub async fn remove(
+    saved: Option<SavedManager>,
+    password: String,
+    forget: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    forget()?;
+    match saved {
+        Some(saved) if !password.is_empty() => Ok(disconnect(&saved, password).await.is_ok()),
+        _ => Ok(false),
+    }
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Operation<K = Action, const MAX: usize = 32> {
@@ -757,6 +979,17 @@ impl<K, const MAX: usize> Operation<K, MAX> {
             && self.updated_at <= 9_007_199_254_740_991
     }
 }
+/// Operation kinds in a status list; a kind this Desktop does not know stays visible as `other`.
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum StatusKind {
+    Start,
+    Stop,
+    Restart,
+    Backup,
+    #[serde(other)]
+    Other,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum RestoreKind {
@@ -781,7 +1014,7 @@ struct Installation {
 struct Status {
     manager: ManagerIdentity,
     installation: Installation,
-    operations: Vec<Operation>,
+    operations: Vec<Operation<StatusKind>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -818,26 +1051,35 @@ struct ReviewState {
     requires_runtime_change: Option<bool>,
 }
 fn public_error(operation: &mut Value) {
-    if let Some(error) = operation["error"].as_str() {
-        if !matches!(
-            error,
-            "operation_failed"
-                | "operation_interrupted"
-                | "no_installation"
-                | "installation_changed"
-                | "other_media_writer_detected"
-                | "source_not_fenced"
-                | "source_changed_review_again"
-                | "previous_installation_not_fenced"
-                | "previous_autostart_enabled"
-                | "recovery_key_required"
-                | "backup_incomplete"
-                | "invalid_database_path"
-                | "database_path_not_mounted"
-        ) {
-            operation["error"] = json!("manager_operation_failed");
-        }
+    // Manager's own code passes through; anything that is not a plain code stays private.
+    if operation["error"]
+        .as_str()
+        .is_some_and(|error| !public_code(error))
+    {
+        operation["error"] = json!("manager_operation_failed");
     }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Runtime {
+    protocol_version: u32,
+    nonce: String,
+    installation_id: String,
+    capabilities: Vec<String>,
+    ports: RuntimePorts,
+    photo_server: RuntimePhotoServer,
+}
+#[derive(Deserialize)]
+struct RuntimePorts {
+    manager: u16,
+    api: u16,
+    database: u16,
+}
+#[derive(Deserialize)]
+struct RuntimePhotoServer {
+    state: String,
+    #[serde(default)]
+    code: Option<String>,
 }
 fn validate_reply(
     saved: &SavedManager,
@@ -947,7 +1189,11 @@ fn validate_reply(
             {
                 return Err(invalid());
             }
-            for operation in value["operations"].as_array_mut().ok_or_else(invalid)? {
+            let shown = value["operations"].as_array_mut().ok_or_else(invalid)?;
+            for (operation, parsed) in shown.iter_mut().zip(&status.operations) {
+                if parsed.kind == StatusKind::Other {
+                    operation["kind"] = json!("other");
+                }
                 public_error(operation);
             }
         }
@@ -965,6 +1211,32 @@ fn validate_reply(
                 serde_json::from_value(value.clone()).map_err(|_| invalid())?;
             if !identifier(&accepted.id)
                 || matches!(command,Command::Resume{id,..}if accepted.id!=id.to_string())
+            {
+                return Err(invalid());
+            }
+        }
+        Command::Runtime { nonce } => {
+            // A later Manager may add fields here; what is read must be exactly as expected.
+            let runtime: Runtime = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            if runtime.protocol_version != 1
+                || runtime.nonce != nonce.to_string()
+                || runtime.installation_id != saved.installation_id
+                || [
+                    runtime.ports.manager,
+                    runtime.ports.api,
+                    runtime.ports.database,
+                ]
+                .contains(&0)
+                || !matches!(
+                    runtime.photo_server.state.as_str(),
+                    "running" | "starting" | "stopping" | "stopped" | "unknown"
+                )
+                || runtime
+                    .photo_server
+                    .code
+                    .as_deref()
+                    .is_some_and(|code| !public_code(code))
+                || runtime.capabilities.len() > 64
             {
                 return Err(invalid());
             }

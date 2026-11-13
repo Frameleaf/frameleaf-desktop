@@ -1,9 +1,12 @@
 <script lang="ts">
+  import ErrorText from '../ErrorText.svelte';
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '../Icon.svelte';
   import Sheet from '../Sheet.svelte';
   import { connectionError } from '../errors';
+  import StepUp from '../StepUp.svelte';
+  import { verificationRequired, type StepOffer } from '../sign-in-steps';
   import { connectionPath, pathIndicator, formatBytes, formatDate, percent, relativeTime, hostOf, type PathEntry } from '../ui-state';
   import type { RemoteStatus, RemoteUpdate, RemoteTest, CloudStatus, ServerSummary, Connection } from '../server-types';
 
@@ -19,6 +22,12 @@
   let dnsOpen = $state(false);
   let test = $state<RemoteTest | null>(null);
   const explain = connectionError;
+  // A request the server refuses until Two-Step Verification is answered in place, then run again.
+  let stepUp = $state<{ offer: StepOffer; retry: () => void } | null>(null);
+  function failed(error: unknown, retry: () => void) {
+    const offer = verificationRequired(error);
+    if (offer) stepUp = { offer, retry }; else failure = explain(error);
+  }
   const remote = $derived(data?.remote ?? null);
   const usage = $derived(data?.usage ?? null);
   const path = $derived(connectionPath(summary?.connections ?? remote?.candidates ?? null, connection.server));
@@ -30,8 +39,11 @@
     if (!native) return;
     busy = true; failure = '';
     const [status, link] = await Promise.allSettled([invoke<RemoteStatus>('remote_status'), invoke<CloudStatus>('cloud_status')]);
-    if (status.status === 'fulfilled') data = status.value; else failure = explain(status.reason);
+    if (status.status === 'fulfilled') data = status.value; else failed(status.reason, () => { void load(); });
     cloud = link.status === 'fulfilled' ? link.value : null;
+    // The relay and sign-in switches need this answer: say why they are off, or ask to verify. When both
+    // requests were refused, the first one's message or prompt already covers it and its retry reloads both.
+    if (link.status === 'rejected' && status.status === 'fulfilled') failed(link.reason, () => { void load(); });
     busy = false;
   }
   onMount(() => { void load(); });
@@ -43,7 +55,7 @@
       notice = done;
       await load();
       await onrefresh();
-    } catch (error) { failure = explain(error); }
+    } catch (error) { failed(error, () => { void update(settings, done); }); }
     finally { saving = false; }
   }
   async function runTest() {
@@ -56,7 +68,7 @@
       const ok = result?.ok ?? result?.lastTestOk ?? checks.every(check => check.ok);
       notice = ok ? 'Remote access test passed.' : 'Remote access test found a problem. See the checks below.';
       await load();
-    } catch (error) { failure = explain(error); }
+    } catch (error) { failed(error, () => { void runTest(); }); }
     finally { testing = false; }
   }
   async function copy(uri: string) {
@@ -91,7 +103,8 @@
   </header>
   <div class="body">
     {#if !native}<p class="foot" style="margin:0">Open the installed desktop app to see this server’s remote access addresses.</p>{/if}
-    {#if failure}<div class="inline-msg error" role="alert"><p>{failure}</p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if failure}<div class="inline-msg error" role="alert"><p><ErrorText text={failure} /></p><button class="btn small quiet" onclick={() => { failure = ''; }}>Dismiss</button></div>{/if}
+    {#if stepUp}{#key stepUp}<StepUp offer={stepUp.offer} retry={stepUp.retry} onclose={() => { stepUp = null; }} />{/key}{/if}
     {#if notice}<div class="inline-msg" role="status"><p>{notice}</p><button class="btn small quiet" onclick={() => { notice = ''; }}>Dismiss</button></div>{/if}
     {#if remote?.unavailableReason}<div class="inline-msg" role="status"><p>{remote.unavailableReason}</p></div>{:else if remote?.reason && remote.status !== 'ready'}<div class="inline-msg" role="status"><p>{remote.reason}</p></div>{/if}
     {#if test}
