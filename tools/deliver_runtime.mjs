@@ -4,7 +4,9 @@
  * A pack is the concatenation of its accelerated runtime manifest, that manifest's 64-byte
  * signature and the payload files in the byte order of their names, cut into parts small enough
  * for a release. The delivery manifest names every part by size and SHA-256 and the runtime
- * manifest by SHA-256, and is signed with the runtime release key. The app
+ * manifest by SHA-256, lists the payload files that are executable where the pack was built
+ * (the app makes exactly those executable, as a bundled pack keeps its files' modes), and is
+ * signed with the runtime release key. The app
  * (src-tauri/src/accelerated_pack.rs) downloads the parts, checks each against the delivery
  * manifest and rebuilds the pack from what the two signed manifests say. */
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
@@ -37,7 +39,9 @@ export const partLimit = 2 * 1024 ** 3 - 1;
 const defaultPartBytes = 1024 ** 3;
 const cpuProvider = "CPUExecutionProvider";
 const fields =
-  "architecture,bytes,epoch,manifestBytes,manifestSha256,parts,platform,profile,provider,schemaVersion";
+  "architecture,bytes,epoch,executable,manifestBytes,manifestSha256,parts,platform,profile,provider,schemaVersion";
+/** The list of executable files makes a delivery manifest far larger than its parts alone. */
+const deliveryLimit = 2 * 1024 * 1024;
 const namePattern = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const hashPattern = /^[a-f0-9]{64}$/;
 const fail = (code) => {
@@ -99,6 +103,17 @@ function checkedDelivery(raw, signature, trust, approved) {
     !Number.isSafeInteger(delivery.manifestBytes) ||
     delivery.manifestBytes < 1 ||
     delivery.manifestBytes > 8 * 1024 * 1024 ||
+    !Array.isArray(delivery.executable) ||
+    delivery.executable.length > 100000 ||
+    delivery.executable.some(
+      (name, index) =>
+        typeof name !== "string" ||
+        !name ||
+        /[\\:\x00-\x1f\x7f]/.test(name) ||
+        name.split("/").some((part) => !part || part === "." || part === "..") ||
+        (index > 0 &&
+          Buffer.compare(Buffer.from(delivery.executable[index - 1]), Buffer.from(name)) >= 0),
+    ) ||
     !Array.isArray(delivery.parts) ||
     !delivery.parts.length ||
     delivery.parts.length > 64
@@ -153,7 +168,7 @@ export async function verifyDeliveries(candidate, manifest, policy) {
   for (const name of names.filter((item) => item.endsWith(".json"))) {
     const profile = name.slice(0, -".json".length);
     const delivery = checkedDelivery(
-      await boundedFile(join(directory, name), 64 * 1024),
+      await boundedFile(join(directory, name), deliveryLimit),
       await boundedFile(join(directory, `${profile}.sig`), 64),
       trust,
       approved,
@@ -195,7 +210,7 @@ function hashFile(path, bytes) {
 /** A signed delivery manifest and the parts it names, exactly as a release would serve them. */
 export async function verifyDelivery(manifestPath, signaturePath, partsDirectory, policy) {
   const delivery = checkedDelivery(
-    await boundedFile(manifestPath, 64 * 1024),
+    await boundedFile(manifestPath, deliveryLimit),
     await boundedFile(signaturePath, 64),
     await releasePolicy(policy),
     await profiles(),
@@ -299,9 +314,18 @@ export async function deliverRuntime(candidate, output, privatePem, policy, opti
   );
   writer.write(raw);
   writer.write(signature);
-  for (const name of byteOrder(Object.keys(manifest.files)))
-    writer.file_(join(candidate, "payload", name), manifest.files[name].bytes);
+  // A file is executable in the app exactly when it is where the pack was built. Windows has
+  // no such bit, and its packs need none.
+  const executable = [];
+  for (const name of byteOrder(Object.keys(manifest.files))) {
+    const path = join(candidate, "payload", name);
+    if (process.platform !== "win32" && manifest.platform !== "windows" && (await lstat(path)).mode & 0o111)
+      executable.push(name);
+    writer.file_(path, manifest.files[name].bytes);
+  }
   writer.close();
+  if (process.platform !== "win32" && manifest.platform !== "windows" && !executable.includes(manifest.python))
+    fail("accelerated_pack_interpreter_not_executable");
   const delivery = {
     schemaVersion: 1,
     profile,
@@ -312,6 +336,7 @@ export async function deliverRuntime(candidate, output, privatePem, policy, opti
     manifestSha256,
     manifestBytes: raw.length,
     bytes: writer.parts.reduce((total, part) => total + part.bytes, 0),
+    executable,
     parts: writer.parts,
   };
   const body = Buffer.from(JSON.stringify(delivery));
@@ -367,7 +392,8 @@ export async function reassemble(manifestPath, signaturePath, partsDirectory, ou
       manifest.platform !== delivery.platform ||
       manifest.architecture !== delivery.architecture ||
       manifest.provider !== delivery.provider ||
-      manifest.epoch !== delivery.epoch
+      manifest.epoch !== delivery.epoch ||
+      delivery.executable.some((name) => !Object.hasOwn(manifest.files, name))
     )
       fail("accelerated_pack_archive_invalid");
     const buffer = Buffer.alloc(1024 * 1024);
@@ -376,7 +402,7 @@ export async function reassemble(manifestPath, signaturePath, partsDirectory, ou
         fail("accelerated_pack_archive_invalid");
       const path = join(output, "payload", ...name.split("/"));
       mkdirSync(dirname(path), { recursive: true });
-      const target = openSync(path, "wx", name === manifest.python ? 0o700 : 0o600);
+      const target = openSync(path, "wx", delivery.executable.includes(name) ? 0o700 : 0o600);
       const hash = createHash("sha256");
       try {
         for (let left = manifest.files[name].bytes; left > 0; ) {
