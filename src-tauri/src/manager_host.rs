@@ -711,6 +711,9 @@ pub struct NativeManager {
     identity: IdentityChange,
     /// The certificates a renewal replaces, one of which this computer's grant may still pin.
     replaced_certificates: Vec<String>,
+    /// Manager's data directory, for a Manager started from the keystore: where the record of
+    /// this library's ports is kept.
+    local_record: Option<PathBuf>,
     _code_lease: Option<crate::package_lease::CodeLease>,
     _profile_pins: Vec<fs::File>,
 }
@@ -784,36 +787,22 @@ impl Programs<'_> {
         )?);
         validate_configuration(config)?;
         // Durable before the spawn: where this library listens, and what its Manager serves.
-        let record = crate::manager_local::Record::new(config.ports()?, fingerprints);
+        // Ports that were moved stay marked as unconfirmed until Manager is ready on them.
+        let record = crate::manager_local::Record::for_start(
+            &crate::manager_local::recorded(&config.data)?,
+            config.ports()?,
+            fingerprints,
+        );
         if crate::manager_local::stored(&config.data)
             != crate::manager_local::Stored::Present(record.clone())
         {
             crate::runtime_store::private_directory(&config.data)?;
             crate::manager_local::save(&config.data, &record)?;
         }
-        // This lease proves no controller of this library is running, so a listener on any of
-        // its ports belongs to another program.
-        foreign_listener(&[
-            local_origin(&config.origin)?,
-            config.api_port,
-            config.database_port,
-        ])?;
-        let (password, backup_key) = (profile.password(), profile.backup_key()?);
-        // Durable before the spawn: a crash from here on leaves a later run a record that says
-        // a Manager may be running, even before one has bound its port.
-        #[cfg(unix)]
-        record_launch_intent(&config.data)?;
         let started = self
-            .start_owned(
-                config,
-                &password,
-                &backup_key,
-                &tls,
-                Some(lease),
-                profile.installation_transition(),
-                handover.as_ref(),
-            )
+            .spawn_from_keystore(config, &profile, &tls, lease, handover.as_ref())
             .map(|mut manager| {
+                manager.local_record = Some(config.data.clone());
                 let binding = profile.binding().to_owned();
                 manager.identity = if handover.is_some() {
                     IdentityChange::Renewed(binding)
@@ -837,7 +826,40 @@ impl Programs<'_> {
             // was dropped on the way out of `spawn`.
             Err(_) => forget_owned_process(&config.data),
         }
-        started
+        // Nothing of this start is running, so a port it moved to is not kept.
+        started.map_err(|error| crate::manager_local::withdrawn(&config.data, error))
+    }
+    /// The part of a start from the keystore that comes after its ports are recorded. A failure
+    /// here leaves nothing of this start running.
+    fn spawn_from_keystore(
+        &self,
+        config: &Configuration,
+        profile: &crate::manager_profile::Profile,
+        tls: &TlsIdentity,
+        lease: crate::host_state::Owner,
+        handover: Option<&crate::manager_tls::Handover>,
+    ) -> Result<NativeManager, String> {
+        // This lease proves no controller of this library is running, so a listener on any of
+        // its ports belongs to another program.
+        foreign_listener(&[
+            local_origin(&config.origin)?,
+            config.api_port,
+            config.database_port,
+        ])?;
+        let (password, backup_key) = (profile.password(), profile.backup_key()?);
+        // Durable before the spawn: a crash from here on leaves a later run a record that says
+        // a Manager may be running, even before one has bound its port.
+        #[cfg(unix)]
+        record_launch_intent(&config.data)?;
+        self.start_owned(
+            config,
+            &password,
+            &backup_key,
+            tls,
+            Some(lease),
+            profile.installation_transition(),
+            handover,
+        )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
     pub fn start(
@@ -1020,6 +1042,7 @@ impl NativeManager {
             certificate_expires_at: None,
             identity: IdentityChange::None,
             replaced_certificates: Vec::new(),
+            local_record: None,
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
         };
@@ -1148,7 +1171,7 @@ impl NativeManager {
             self.startup_lease.take();
             return Ok(());
         }
-        let result = self.wait_ready_inner(timeout, cancel).await;
+        let mut result = self.wait_ready_inner(timeout, cancel).await;
         if result.is_err() {
             self.verified_ready = false;
             #[cfg(windows)]
@@ -1158,9 +1181,24 @@ impl NativeManager {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
             }
+            // Manager did not come up and has been ended, so a port this start moved to is
+            // not kept: Manager may have refused it.
+            if let Some(data) = &self.local_record {
+                result = result.map_err(|error| crate::manager_local::withdrawn(data, error));
+            }
         }
         self.startup_lease.take();
         result
+    }
+    /// Once this Manager is verified ready: the ports it was started on are this library's.
+    pub(crate) fn confirm_ports(&self) -> Result<(), String> {
+        if !self.verified_ready {
+            return Err("native_manager_not_ready".into());
+        }
+        match &self.local_record {
+            Some(data) => crate::manager_local::confirm(data),
+            None => Ok(()),
+        }
     }
 
     async fn wait_ready_inner(

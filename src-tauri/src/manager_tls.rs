@@ -499,6 +499,17 @@ impl TlsIdentity {
             expires_at: params.not_after.unix_timestamp(),
         })
     }
+    /// An identity as a start at `now` would have made it, for the opt-in end-to-end run to
+    /// stand in for time passing: identities last a year and nothing else can age one.
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn issued_at(installation_id: &str, origin: &str, now: i64) -> Result<Self, String> {
+        Self::mint(
+            installation_id,
+            origin,
+            hostname(installation_id, origin)?,
+            now,
+        )
+    }
     #[cfg(test)]
     pub(crate) fn private_key(&self) -> &str {
         &self.private_key_pem

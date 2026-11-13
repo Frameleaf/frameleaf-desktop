@@ -84,6 +84,11 @@ pub(crate) struct Record {
     schema_version: u32,
     pub ports: Ports,
     pub certificates: Vec<String>,
+    /// The ports this library last ran on, while `ports` are a move its Manager has not yet
+    /// been seen ready with. Manager can refuse a moved port (it admits none while one of its
+    /// operations is unfinished), so until then `ports` are only where a start was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_from: Option<Ports>,
 }
 impl Record {
     pub(crate) fn new(ports: Ports, certificates: Vec<String>) -> Self {
@@ -91,11 +96,24 @@ impl Record {
             schema_version: 1,
             ports,
             certificates,
+            unconfirmed_from: None,
+        }
+    }
+    /// The record for a start on `ports`, after what `before` recorded. Ports that differ from
+    /// the ones Manager was last ready on stay unconfirmed, across any number of starts.
+    pub(crate) fn for_start(before: &Self, ports: Ports, certificates: Vec<String>) -> Self {
+        let confirmed = before.unconfirmed_from.unwrap_or(before.ports);
+        Self {
+            schema_version: 1,
+            ports,
+            certificates,
+            unconfirmed_from: (confirmed != ports).then_some(confirmed),
         }
     }
     fn valid(&self) -> bool {
         self.schema_version == 1
             && self.ports.valid()
+            && self.unconfirmed_from.is_none_or(|ports| ports.valid())
             && self.certificates.len() <= 64
             && self
                 .certificates
@@ -184,6 +202,43 @@ pub(crate) fn save(data: &Path, record: &Record) -> Result<(), String> {
         .sync_all()
         .map_err(failed)?;
     Ok(())
+}
+/// Manager was verified ready on the recorded ports: they are where this library lives now.
+pub(crate) fn confirm(data: &Path) -> Result<(), String> {
+    match stored(data) {
+        Stored::Present(mut record) if record.unconfirmed_from.is_some() => {
+            record.unconfirmed_from = None;
+            save(data, &record)
+        }
+        Stored::Unreadable => Err("local_manager_record_unreadable".into()),
+        _ => Ok(()),
+    }
+}
+/// A start did not bring Manager up and nothing it spawned is running. If its ports were a
+/// move Manager was never ready on, the record goes back to the ports it was ready on, so the
+/// move is not kept, and the start answers as a busy port always did: with that port named.
+/// Why Manager did not come up is not known, so nothing about the move is assumed to be fine.
+/// Any other failure, and a cancelled start, keep their own code.
+pub(crate) fn withdrawn(data: &Path, error: String) -> String {
+    let Stored::Present(mut record) = stored(data) else {
+        return error;
+    };
+    let Some(confirmed) = record.unconfirmed_from.take() else {
+        return error;
+    };
+    let moved = record.ports;
+    record.ports = confirmed;
+    if save(data, &record).is_err() || error == "native_manager_start_cancelled" {
+        return error;
+    }
+    [
+        (confirmed.manager, moved.manager),
+        (confirmed.api, moved.api),
+        (confirmed.database, moved.database),
+    ]
+    .into_iter()
+    .find(|(from, to)| from != to)
+    .map_or(error, |(busy, _)| format!("local_port_in_use_{busy}"))
 }
 
 /// Whose TLS listener answers on a port. Only positive evidence names it: `Ours` is a
@@ -751,6 +806,138 @@ mod tests {
             assert_eq!(recorded(&root).unwrap_err(), "local_manager_record_unreadable");
             assert_eq!(recorded_manager_listener(&root), Evidence::Unknown);
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_moved_port_is_kept_only_once_manager_was_ready_on_it() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-local-move-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let defaults = Ports::default();
+        let moved = Ports {
+            api: 2284,
+            ..defaults
+        };
+        let certificates = vec!["a".repeat(64)];
+        let ran = Record::new(defaults, certificates.clone());
+        // A start on the ports Manager was last ready on writes what it always wrote.
+        let same = Record::for_start(&ran, defaults, certificates.clone());
+        assert_eq!(same, ran);
+        assert_eq!(
+            serde_json::to_string(&same).unwrap(),
+            format!(
+                r#"{{"schemaVersion":1,"ports":{{"manager":9443,"api":2283,"database":54329}},"certificates":["{}"]}}"#,
+                "a".repeat(64)
+            )
+        );
+        // Moved for this start: where it listens, and where it goes back to.
+        let attempt = Record::for_start(&ran, moved, certificates.clone());
+        assert_eq!(attempt.ports, moved);
+        assert_eq!(attempt.unconfirmed_from, Some(defaults));
+
+        // Manager did not come up: the move is not kept, and the busy port is named.
+        save(&root, &attempt).unwrap();
+        assert_eq!(recorded(&root).unwrap().ports, moved);
+        assert_eq!(
+            withdrawn(&root, "native_manager_exited".into()),
+            "local_port_in_use_2283"
+        );
+        assert_eq!(recorded(&root).unwrap(), ran);
+        // Nothing left to withdraw: any later failure keeps its own code and changes nothing.
+        assert_eq!(
+            withdrawn(&root, "native_manager_exited".into()),
+            "native_manager_exited"
+        );
+        assert_eq!(recorded(&root).unwrap(), ran);
+        // A cancelled start is withdrawn too, and still reads as cancelled.
+        save(&root, &attempt).unwrap();
+        assert_eq!(
+            withdrawn(&root, "native_manager_start_cancelled".into()),
+            "native_manager_start_cancelled"
+        );
+        assert_eq!(recorded(&root).unwrap(), ran);
+
+        // Manager came up: the move is kept, and no later failure undoes it.
+        save(&root, &attempt).unwrap();
+        confirm(&root).unwrap();
+        let kept = Record::new(moved, certificates.clone());
+        assert_eq!(recorded(&root).unwrap(), kept);
+        confirm(&root).unwrap();
+        assert_eq!(
+            withdrawn(&root, "native_manager_exited".into()),
+            "native_manager_exited"
+        );
+        assert_eq!(recorded(&root).unwrap(), kept);
+
+        // A run that ended before either happened leaves the move unconfirmed. The next start
+        // on the same ports, or on others, still goes back to where Manager was last ready.
+        let again = Record::for_start(&attempt, moved, certificates.clone());
+        assert_eq!(again, attempt);
+        let further = Ports {
+            api: 2285,
+            ..defaults
+        };
+        assert_eq!(
+            Record::for_start(&attempt, further, certificates.clone()).unconfirmed_from,
+            Some(defaults)
+        );
+        assert_eq!(
+            Record::for_start(&attempt, defaults, certificates.clone()),
+            ran,
+            "back on the confirmed ports there is nothing unconfirmed"
+        );
+        // The first port that differs is the one named: Manager's, then photos, then database.
+        for (ports, named) in [
+            (
+                Ports {
+                    manager: 9444,
+                    api: 2284,
+                    database: 54330,
+                },
+                "local_port_in_use_9443",
+            ),
+            (
+                Ports {
+                    database: 54330,
+                    ..defaults
+                },
+                "local_port_in_use_54329",
+            ),
+        ] {
+            save(&root, &Record::for_start(&ran, ports, certificates.clone())).unwrap();
+            assert_eq!(withdrawn(&root, "native_manager_exited".into()), named);
+            assert_eq!(recorded(&root).unwrap(), ran);
+        }
+        // Ports to go back to that could not be a library's make the record unreadable.
+        let mut invalid = attempt.clone();
+        invalid.unconfirmed_from = Some(Ports {
+            api: 9443,
+            ..defaults
+        });
+        assert_eq!(
+            save(&root, &invalid).unwrap_err(),
+            "local_manager_record_unavailable"
+        );
+        // Without a record, or with one that cannot be read, nothing is withdrawn or confirmed.
+        std::fs::write(root.join(RECORD), b"{").unwrap();
+        assert_eq!(
+            withdrawn(&root, "native_manager_exited".into()),
+            "native_manager_exited"
+        );
+        assert_eq!(
+            confirm(&root).unwrap_err(),
+            "local_manager_record_unreadable"
+        );
+        std::fs::remove_file(root.join(RECORD)).unwrap();
+        assert_eq!(
+            withdrawn(&root, "native_manager_exited".into()),
+            "native_manager_exited"
+        );
+        confirm(&root).unwrap();
+        assert_eq!(stored(&root), Stored::Absent);
         let _ = std::fs::remove_dir_all(root);
     }
 
