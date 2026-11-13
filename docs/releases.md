@@ -355,9 +355,45 @@ python tools/build_runtime.py --source <frameleaf-app checkout at the profile's 
 candidate/payload/python/python.exe -I -B tools/smoke_accelerated_runtime.py CUDAExecutionProvider   # Linux: candidate/payload/python/bin/python3.12
 ```
 
-Neither provider has run on NVIDIA or Intel hardware. A CUDA pack is about 3 GB
-and no installer carries either: the factory builds one only when `accelerated`
-names it.
+Neither provider has run on NVIDIA or Intel hardware.
+
+#### Delivery of the CUDA and OpenVINO packs (FD-60)
+
+A CUDA pack is about 3 GB, too large for an installer and for one release file
+(GitHub: "Each file included in a release must be under 2 GiB"). Installers keep
+carrying the processor pack. The CUDA and OpenVINO packs for `windows-x86_64` and
+`linux-x86_64` are release files the app downloads only when the person chooses
+Download on the AI processing page, and only on a computer with the device.
+
+- Factory: a `default` run (or one naming `cuda-ort` / `openvino-ort`) builds
+  those packs beside each installer pack. The `deliver` job signs only the
+  pack's accelerated manifest, cuts the pack into 1 GiB parts
+  (`tools/deliver_runtime.mjs`: the manifest, its signature, then the payload
+  files in the byte order of their names) and signs a delivery manifest naming
+  every part by size and SHA-256 and the runtime manifest by SHA-256. Artifacts:
+  `factory-accelerated-manifest-<target>-<profile>` and
+  `factory-accelerated-parts-<target>-<profile>`. The installer pack
+  (`factory-runtime-<target>`) carries the delivery manifests in `accelerated/`;
+  packaging refuses one that is unsigned, for another target or of another epoch.
+- Release: the `stage` job verifies every part against its signed delivery
+  manifest and uploads the parts beside the installers. The app fetches them
+  from `releases/download/v<its own version>/`, so they are reachable once the
+  release is published, and a release must be staged from the same factory run
+  as its installers.
+- App (`src-tauri/src/accelerated_pack.rs`): HTTPS only, resumable, each part
+  checked against the delivery manifest the installer carried, then the pack is
+  installed by the runtime store like a bundled one (signature, every file's
+  digest, epoch rules) and qualified. A downloaded pack is admitted only at the
+  processor runtime's own epoch. Any failure leaves the processor in charge and
+  shows the reason with a retry.
+
+To rebuild a pack from factory artifacts on a computer with the device (for the
+hardware check above): `node tools/deliver_runtime.mjs --reassemble <profile>.json
+<profile>.sig <parts folder> <output folder>`.
+
+The processor manifest of a CUDA or OpenVINO pack is never signed (the signer
+refuses it: another dependency set than the processor profile), so such a pack
+cannot become an installer's own runtime.
 
 The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
@@ -582,6 +618,12 @@ validation; macOS and Linux ship without it.
    gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
      -f platforms=<platforms> -f epoch=9 -f accelerated=default
    ```
+
+   With `accelerated=default` a `windows` or `linux` run also builds the CUDA and
+   OpenVINO packs the app downloads on request
+   ([Delivery of the CUDA and OpenVINO packs](#delivery-of-the-cuda-and-openvino-packs-fd-60)):
+   its `deliver` jobs must succeed, or no installer pack is signed. No factory
+   run has built those packs yet, so expect to iterate on the first one.
 5. **Have the companion packages ready** ([Companion packages](#companion-packages)):
    the run id of the notarized Apple Silicon package (`42148037724` for 1.2.4),
    and the Linux, Windows and `SOURCES` files to add by hand (the same 1.2.4
@@ -605,6 +647,11 @@ validation; macOS and Linux ship without it.
      -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run>   # needs step 1
    ```
 
+   Each run also verifies the CUDA and OpenVINO pack parts of its factory run
+   (`frameleaf-accelerated-*.partNN`) and adds them to the draft. Use the same
+   factory run for a platform's installers and its parts: the installer carries
+   the signed list of exactly those parts.
+
    Intel Macs: the Intel runtime now builds with onnxruntime 1.23.2
    ([FD-6](https://heroit.atlassian.net/browse/FD-6)), but no signed factory run
    has produced an Intel pack yet. Until one succeeds, build and release it as
@@ -616,8 +663,12 @@ validation; macOS and Linux ship without it.
    step 7, so the final `SHA256SUMS` lists them; or re-run the `stage` job of the
    last run afterwards.
 9. **Review the draft**: one draft for the tag, the commit, the targets listed
-   under "Update feed" in its notes, `SHA256SUMS`, the companion packages, and
-   installed-device acceptance on each platform.
+   under "Update feed" in its notes, `SHA256SUMS`, the companion packages, the
+   `frameleaf-accelerated-*` parts for Windows and Linux x86_64, and
+   installed-device acceptance on each platform. The app can download the parts
+   only once the release is published, so a GPU pack is accepted on a device
+   after step 10 (or from the factory artifacts with
+   `tools/deliver_runtime.mjs --reassemble` before it).
 10. **Publish**: clear "pre-release", set it as the latest release and publish.
     From then the updater offers it to every target in `latest.json`.
 11. **Afterwards**: publish the AUR files, and Chocolatey only when the release

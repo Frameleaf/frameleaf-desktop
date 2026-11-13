@@ -19,8 +19,8 @@ use std::{
 };
 
 pub(crate) const CPU: &str = "CPUExecutionProvider";
-const ACCELERATED_MANIFEST: &str = "manifest-accelerated.json";
-const ACCELERATED_SIGNATURE: &str = "manifest-accelerated.sig";
+pub(crate) const ACCELERATED_MANIFEST: &str = "manifest-accelerated.json";
+pub(crate) const ACCELERATED_SIGNATURE: &str = "manifest-accelerated.sig";
 const ACCELERATED_STORE: &str = "runtimes-accelerated";
 const REMEMBERED: &str = "provider-failures.json";
 /// How Windows names an Intel or NVIDIA display adapter (the PCI vendor of its hardware id).
@@ -709,22 +709,57 @@ impl Runtimes {
     }
 }
 
-/// Install (or keep) the accelerated runtime the app bundles and load it. `Ok(None)` when the
-/// app ships none. Errors are reasons the processor is used instead, never fatal to the worker.
+/// Install (or keep) the accelerated runtime and load it: the one the app bundles, or (FD-60)
+/// the pack the person downloaded for this computer's device. `Ok(None)` when there is neither.
+/// Errors are reasons the processor is used instead, never fatal to the worker.
 fn install_accelerated(
     bundle: &Path,
     data: &Path,
     cpu_release: &str,
+    cpu_epoch: u64,
     probe: &dyn Probe,
 ) -> Result<Option<Lane>, String> {
-    use crate::release_policy::open_runtime_store;
-    let manifest_path = bundle.join(ACCELERATED_MANIFEST);
-    match std::fs::symlink_metadata(&manifest_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let downloaded = match std::fs::symlink_metadata(bundle.join(ACCELERATED_MANIFEST)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match crate::accelerated_pack::installable(bundle, data, probe) {
+                Some(directory) => Some(directory),
+                None => return Ok(None),
+            }
+        }
         Err(_) => return Err("runtime_store_read_failed".into()),
-        Ok(_) => {}
+        Ok(_) => None,
+    };
+    let Some(directory) = downloaded else {
+        return install_from(bundle, data, cpu_release, None, probe).map(Some);
+    };
+    match install_from(&directory, data, cpu_release, Some(cpu_epoch), probe) {
+        Ok(lane) => {
+            crate::accelerated_pack::installed(&directory);
+            Ok(Some(lane))
+        }
+        Err(code) => {
+            // Another copy of the app holding the store says nothing about the pack. Anything
+            // else discards the downloaded pack with its reason, so it is not tried again at
+            // every start and the person can download it again.
+            if crate::accelerated_pack::install_failure_is_final(&code) {
+                crate::accelerated_pack::discard(data, &directory, &code);
+            }
+            Err(code)
+        }
     }
-    let manifest = read_bounded(&manifest_path, 8 * 1024 * 1024)?;
+}
+
+/// `source` holds the signed accelerated manifest and its payload. `downloaded` is the processor
+/// runtime's epoch when `source` is a downloaded pack rather than the app's own bundle.
+fn install_from(
+    source: &Path,
+    data: &Path,
+    cpu_release: &str,
+    downloaded: Option<u64>,
+    probe: &dyn Probe,
+) -> Result<Lane, String> {
+    use crate::release_policy::open_runtime_store;
+    let manifest = read_bounded(&source.join(ACCELERATED_MANIFEST), 8 * 1024 * 1024)?;
     // Read before trust only to skip a runtime this computer has no device for; the store
     // verifies the signature and every byte before anything runs.
     let provider = serde_json::from_slice::<serde_json::Value>(&manifest)
@@ -741,23 +776,41 @@ fn install_accelerated(
     {
         return Err("provider_device_ineligible".into());
     }
+    if let Some(cpu_epoch) = downloaded {
+        crate::accelerated_pack::epoch_admissible(&manifest, cpu_epoch)?;
+    }
     let store = open_runtime_store(&data.join(ACCELERATED_STORE))?;
     // A stale release (older epoch than the processor runtime) cannot load; the bundle replaces it.
-    let active = store.load_active().ok().flatten();
+    let loaded = store.load_active();
+    let unreadable = loaded.as_ref().err().cloned();
+    let active = loaded.ok().flatten();
     let install = active.as_ref().is_none_or(|active| {
         crate::worker_setup::bundle_supersedes(active.manifest_sha256(), active.epoch(), &manifest)
     });
+    // A downloaded pack's unpacked files are removed once the store holds it. If the store
+    // cannot be read now, that decides nothing about the pack; if it no longer holds it, the
+    // pack has to be downloaded again.
+    if install && downloaded.is_some() && std::fs::symlink_metadata(source.join("payload")).is_err()
+    {
+        return Err(unreadable.unwrap_or_else(|| "accelerated_pack_missing".into()));
+    }
     let installed = match active {
         Some(active) if !install => active,
         active => {
             // Release the shared lease first: activation takes the store's exclusive lock.
             drop(active);
-            let signature: [u8; 64] = read_bounded(&bundle.join(ACCELERATED_SIGNATURE), 64)?
+            let signature: [u8; 64] = read_bounded(&source.join(ACCELERATED_SIGNATURE), 64)?
                 .try_into()
                 .map_err(|_| "runtime_signature_invalid")?;
-            let shared = open_runtime_store(&data.join("runtimes"))?.release_payload(cpu_release);
+            // A bundled pack shares its files with the processor runtime of the same pack. A
+            // downloaded one is linked from where it was unpacked instead of stored twice. The
+            // store checks every byte of the result either way.
+            let shared = match downloaded {
+                Some(_) => source.join("payload"),
+                None => open_runtime_store(&data.join("runtimes"))?.release_payload(cpu_release),
+            };
             store.install_and_activate_sharing(
-                &bundle.join("payload"),
+                &source.join("payload"),
                 &manifest,
                 &signature,
                 Some(&shared),
@@ -769,10 +822,10 @@ fn install_accelerated(
         return Err("runtime_manifest_incompatible".into());
     }
     let attestation = store.attestation(&installed)?;
-    Ok(Some(Lane {
+    Ok(Lane {
         installed,
         attestation,
-    }))
+    })
 }
 
 /// Open the accelerated runtime (if the app ships one this computer can use), ask the server
@@ -783,13 +836,14 @@ pub(crate) async fn open(
     worker: &WorkerTransport,
     cpu_groups: Vec<Vec<ApprovedProfile>>,
 ) -> Result<(Option<Lane>, Plan), String> {
-    let (bundle, data, release) = (
+    let (bundle, data, release, epoch) = (
         paths.bundle.clone(),
         paths.data.clone(),
         cpu.manifest_sha256().to_owned(),
+        cpu.epoch(),
     );
     let opened = tauri::async_runtime::spawn_blocking(move || {
-        install_accelerated(&bundle, &data, &release, &Host).map(|lane| {
+        install_accelerated(&bundle, &data, &release, epoch, &Host).map(|lane| {
             lane.map(|lane| {
                 let device =
                     device_identity(lane.installed.provider(), std::env::consts::OS, &Host);
