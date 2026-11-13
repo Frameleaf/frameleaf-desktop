@@ -220,15 +220,25 @@ impl Profile {
                 && saved.backup_key.as_deref().is_none_or(valid_backup_key)
         };
         let source = load(&format!("{ACCOUNT}-{old}"))?;
-        match load(&format!("{ACCOUNT}-{new}"))? {
+        let target = load(&format!("{ACCOUNT}-{new}"))?;
+        let differs = |saved: &Self| {
+            !valid(saved, &new)
+                || source.as_ref().is_some_and(|prior| {
+                    prior.database_password != saved.database_password
+                        || prior.backup_key != saved.backup_key
+                })
+        };
+        // A fresh move finds an entry for the newer package left by an earlier move that was
+        // taken back; the library has run with the previous package since, so that entry is
+        // stale and is replaced from the previous package's below. A resumed move may already
+        // have been accepted by Manager, so it must find the same secrets it saved before.
+        let target = match target {
+            Some(saved) if differs(&saved) && !resume && source.is_some() => None,
+            target => target,
+        };
+        match target {
             Some(saved) => {
-                // A retried move must find the same secrets it saved before stopping.
-                if !valid(&saved, &new)
-                    || source.as_ref().is_some_and(|prior| {
-                        prior.database_password != saved.database_password
-                            || prior.backup_key != saved.backup_key
-                    })
-                {
+                if differs(&saved) {
                     return Err("native_profile_binding_changed".into());
                 }
                 // Manager has not run with this package while the journal names the previous one,
@@ -914,6 +924,60 @@ mod tests {
         )
         .is_err());
         assert_eq!(marker(), new.as_bytes());
+        // Taken back once more, and the previous package runs and its secrets change. The
+        // newer package's entry is now stale: resuming the unconfirmed move refuses it, and
+        // the next fresh move (Manager has been ready with the previous package since)
+        // replaces it with the previous package's secrets instead of failing on it forever.
+        Profile::return_to_with(
+            (following.0, &following.1, &following.2),
+            (previous.0, &previous.1, &previous.2),
+            load,
+        )
+        .unwrap();
+        let renewed = "a-renewed-password-of-valid-length";
+        {
+            let account = format!("{ACCOUNT}-{old}");
+            let mut saved: serde_json::Value =
+                serde_json::from_str(&store.borrow()[&account]).unwrap();
+            saved["databasePassword"] = renewed.into();
+            store.borrow_mut().insert(account, saved.to_string());
+        }
+        assert_eq!(
+            Profile::carry_forward_with(
+                (previous.0, &previous.1, &previous.2),
+                (following.0, &following.1, &following.2),
+                None,
+                true,
+                load,
+                |_, _| panic!("a resumed move never replaces"),
+            )
+            .unwrap_err(),
+            "native_profile_binding_changed"
+        );
+        assert_eq!(marker(), old.as_bytes());
+        let fresh = crate::manager_host::Transition {
+            operation_id: uuid::Uuid::new_v4(),
+            from_fingerprint: "e".repeat(64),
+        };
+        Profile::carry_forward_with(
+            (previous.0, &previous.1, &previous.2),
+            (following.0, &following.1, &following.2),
+            Some(fresh.clone()),
+            false,
+            load,
+            save,
+        )
+        .unwrap();
+        assert_eq!(marker(), new.as_bytes());
+        let moved =
+            Profile::load_or_create(following.0, &following.1, &following.2, load, |_, _| {
+                panic!("moved profile is complete")
+            })
+            .unwrap();
+        assert_eq!(moved.password().as_str(), renewed);
+        assert_eq!(moved.backup_key().unwrap().as_str(), key.as_str());
+        assert_eq!(moved.installation_transition(), Some(&fresh));
+        drop(moved);
         // Unknown reservations and missing secrets are refused rather than replaced.
         std::fs::write(f.1.data.join(".host-profile"), "f".repeat(64)).unwrap();
         assert!(Profile::carry_forward_with(

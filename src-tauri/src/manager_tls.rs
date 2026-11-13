@@ -116,26 +116,43 @@ impl Vault for Keystore {
         crate::credentials::delete(account)
     }
 }
-/// Copy what the keystore holds under `from` to `to`, unless `to` already holds something:
-/// that is never replaced. The move goes on only once the keystore is seen to hold the same
-/// value under `to`; a store that reports a save it does not hold stops it there.
+/// Make `to` hold what the keystore holds under `from`. A resumed move (`fresh` false) never
+/// replaces what `to` already holds: Manager may already have accepted it. A fresh move finds
+/// under `to` only what an earlier, taken-back move left there, while the library has run with
+/// `from` since, so it makes `to` match `from`, or empty when `from` is. The move goes on only
+/// once the keystore is seen to hold exactly that under `to`; a store that reports a save or
+/// removal it did not make stops it there.
 fn copy_once<T>(
     from: &str,
     to: &str,
+    fresh: bool,
     load: impl Fn(&str) -> Result<Option<T>, String>,
     persist: impl FnOnce(&str, &T) -> Result<(), String>,
+    remove: impl FnOnce(&str) -> Result<(), String>,
     same: impl Fn(&T, &T) -> bool,
 ) -> Result<(), String> {
-    if load(to)?.is_some() {
+    let target = load(to)?;
+    if target.is_some() && !fresh {
         return Ok(());
     }
-    let Some(saved) = load(from)? else {
-        return Ok(());
-    };
-    persist(to, &saved)?;
-    match load(to)? {
-        Some(stored) if same(&saved, &stored) => Ok(()),
-        _ => Err("credential_store_unavailable".into()),
+    let unavailable = || Err("credential_store_unavailable".into());
+    match (load(from)?, target) {
+        (None, None) => Ok(()),
+        (Some(saved), Some(stored)) if same(&saved, &stored) => Ok(()),
+        (None, Some(_)) => {
+            remove(to)?;
+            match load(to)? {
+                None => Ok(()),
+                Some(_) => unavailable(),
+            }
+        }
+        (Some(saved), _) => {
+            persist(to, &saved)?;
+            match load(to)? {
+                Some(stored) if same(&saved, &stored) => Ok(()),
+                _ => unavailable(),
+            }
+        }
     }
 }
 fn pending_account(binding: &str) -> Result<String, String> {
@@ -180,13 +197,16 @@ impl TlsIdentity {
                 .map(|saved| saved.certificate_pem.clone()),
         )
     }
-    /// Keep the paired Manager certificate when a profile moves to a newer package.
-    pub(crate) fn carry_forward(previous: &str, next: &str) -> Result<(), String> {
+    /// Keep the paired Manager certificate when a profile moves to a newer package. `fresh`
+    /// is false when the same unconfirmed move is resumed: see `copy_once`.
+    pub(crate) fn carry_forward(previous: &str, next: &str, fresh: bool) -> Result<(), String> {
         Self::carry_forward_with(
             previous,
             next,
+            fresh,
             crate::credentials::load,
             crate::credentials::save,
+            crate::credentials::delete,
         )?;
         // A renewal Manager may already have accepted moves with the profile.
         let (from, to) = (pending_account(previous)?, pending_account(next)?);
@@ -196,8 +216,10 @@ impl TlsIdentity {
         copy_once(
             &from,
             &to,
+            fresh,
             crate::credentials::load::<Pending>,
             crate::credentials::save,
+            crate::credentials::delete,
             |saved, stored| {
                 saved.schema_version == stored.schema_version
                     && saved.operation_id == stored.operation_id
@@ -224,15 +246,17 @@ impl TlsIdentity {
     fn carry_forward_with(
         previous: &str,
         next: &str,
+        fresh: bool,
         load: impl Fn(&str) -> Result<Option<Self>, String>,
         persist: impl FnOnce(&str, &Self) -> Result<(), String>,
+        remove: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<(), String> {
         let (from, to) = (account_for_profile(previous)?, account_for_profile(next)?);
         let _lock = IDENTITY_LOCK
             .lock()
             .map_err(|_| "credential_store_unavailable")?;
         // No saved certificate means Manager mints one at start; Desktop then asks to pair again.
-        copy_once(&from, &to, load, persist, Self::same)
+        copy_once(&from, &to, fresh, load, persist, remove, Self::same)
     }
     pub fn from_keystore(
         installation_id: &str,
@@ -585,8 +609,10 @@ mod tests {
             Ok((account == account_for_profile(&old).unwrap()).then(|| clone(&saved)))
         };
         // A store that reports a save it does not hold, or holds another key, stops the move.
+        let no_removal = |_: &str| -> Result<(), String> { panic!("nothing to remove") };
         assert_eq!(
-            TlsIdentity::carry_forward_with(&old, &new, from_old, |_, _| Ok(())).unwrap_err(),
+            TlsIdentity::carry_forward_with(&old, &new, true, from_old, |_, _| Ok(()), no_removal)
+                .unwrap_err(),
             "credential_store_unavailable"
         );
         let other = std::cell::RefCell::new(None::<TlsIdentity>);
@@ -596,6 +622,7 @@ mod tests {
             TlsIdentity::carry_forward_with(
                 &old,
                 &new,
+                true,
                 |account| match other.borrow().as_ref() {
                     Some(stored) if account == account_for_profile(&new).unwrap() =>
                         Ok(Some(clone(stored))),
@@ -605,6 +632,7 @@ mod tests {
                     *other.borrow_mut() = Some(clone(&another));
                     Ok(())
                 },
+                no_removal,
             )
             .unwrap_err(),
             "credential_store_unavailable"
@@ -613,6 +641,7 @@ mod tests {
         TlsIdentity::carry_forward_with(
             &old,
             &new,
+            true,
             |account| match copied.borrow().as_ref() {
                 Some(stored) if account == account_for_profile(&new).unwrap() => {
                     Ok(Some(clone(stored)))
@@ -624,23 +653,106 @@ mod tests {
                 *copied.borrow_mut() = Some(clone(value));
                 Ok(())
             },
+            no_removal,
         )
         .unwrap();
         assert!(copied.borrow().as_ref().unwrap().same(&saved));
+        // A resumed move never replaces what the newer package holds: Manager may hold it.
         let existing = identity();
         TlsIdentity::carry_forward_with(
             &old,
             &new,
+            false,
             |_| {
                 Ok(Some(
                     serde_json::from_value(serde_json::to_value(&existing).unwrap()).unwrap(),
                 ))
             },
             |_, _| panic!("an existing certificate is never replaced"),
+            no_removal,
         )
         .unwrap();
-        TlsIdentity::carry_forward_with(&old, &new, |_| Ok(None), |_, _| panic!("nothing to copy"))
+        for fresh in [false, true] {
+            TlsIdentity::carry_forward_with(
+                &old,
+                &new,
+                fresh,
+                |_| Ok(None),
+                |_, _| panic!("nothing to copy"),
+                no_removal,
+            )
             .unwrap();
+        }
+    }
+    /// A move to B that Manager refused, taken back to A, A renews its certificate, and the
+    /// library moves to B again: B must present A's renewed certificate, not the one it was
+    /// given the first time, or Manager refuses B on its certificate check every time.
+    #[test]
+    fn a_fresh_move_replaces_what_a_taken_back_move_left_for_the_newer_package() {
+        use std::{cell::RefCell, collections::BTreeMap};
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let identity = || {
+            TlsIdentity::load_or_create(
+                "aaaaaaaaaaaa",
+                "https://127.0.0.1:9443",
+                || Ok(None),
+                |_| Ok(()),
+            )
+            .unwrap()
+        };
+        let text = |value: &TlsIdentity| serde_json::to_string(value).unwrap();
+        let (first, renewed) = (identity(), identity());
+        let store = RefCell::new(BTreeMap::<String, String>::new());
+        let load = |account: &str| -> Result<Option<TlsIdentity>, String> {
+            Ok(store
+                .borrow()
+                .get(account)
+                .map(|saved| serde_json::from_str(saved).unwrap()))
+        };
+        let save = |account: &str, value: &TlsIdentity| -> Result<(), String> {
+            store.borrow_mut().insert(account.into(), text(value));
+            Ok(())
+        };
+        let remove = |account: &str| -> Result<(), String> {
+            store.borrow_mut().remove(account);
+            Ok(())
+        };
+        let (account_a, account_b) = (
+            account_for_profile(&a).unwrap(),
+            account_for_profile(&b).unwrap(),
+        );
+        store.borrow_mut().insert(account_a.clone(), text(&first));
+        // A -> B. Manager refuses B; the move is taken back to A (nothing is written).
+        TlsIdentity::carry_forward_with(&a, &b, true, load, save, remove).unwrap();
+        assert_eq!(store.borrow()[&account_b], text(&first));
+        // A runs and renews its certificate.
+        store.borrow_mut().insert(account_a.clone(), text(&renewed));
+        // Resuming that same unconfirmed move would keep B's entry...
+        TlsIdentity::carry_forward_with(&a, &b, false, load, save, remove).unwrap();
+        assert_eq!(store.borrow()[&account_b], text(&first));
+        // ...but A was seen ready since, so the next move is fresh and B gets A's renewal.
+        TlsIdentity::carry_forward_with(&a, &b, true, load, save, remove).unwrap();
+        assert_eq!(store.borrow()[&account_b], text(&renewed));
+        assert_eq!(store.borrow()[&account_a], text(&renewed));
+        // Moving fresh again changes nothing.
+        TlsIdentity::carry_forward_with(&a, &b, true, load, |_, _| panic!("unchanged"), remove)
+            .unwrap();
+        // Nothing saved for A: what B holds is stale, and is removed, never left behind.
+        store.borrow_mut().remove(&account_a);
+        TlsIdentity::carry_forward_with(&a, &b, true, load, save, remove).unwrap();
+        assert!(!store.borrow().contains_key(&account_b));
+        // A store that keeps a stale entry it reports replaced or removed stops the move.
+        store.borrow_mut().insert(account_a.clone(), text(&renewed));
+        store.borrow_mut().insert(account_b.clone(), text(&first));
+        assert_eq!(
+            TlsIdentity::carry_forward_with(&a, &b, true, load, |_, _| Ok(()), remove).unwrap_err(),
+            "credential_store_unavailable"
+        );
+        store.borrow_mut().remove(&account_a);
+        assert_eq!(
+            TlsIdentity::carry_forward_with(&a, &b, true, load, save, |_| Ok(())).unwrap_err(),
+            "credential_store_unavailable"
+        );
     }
     /// The real Credential Manager, under bindings of this test's own. Hosted runners only.
     #[cfg(windows)]
@@ -666,11 +778,11 @@ mod tests {
         ]);
         assert_eq!(TlsIdentity::saved_certificate(&old).unwrap(), None);
         // Nothing saved: nothing is moved, and Manager mints a certificate at start.
-        TlsIdentity::carry_forward(&old, &new).unwrap();
+        TlsIdentity::carry_forward(&old, &new, true).unwrap();
         assert_eq!(TlsIdentity::saved_certificate(&new).unwrap(), None);
         let saved =
             TlsIdentity::from_keystore("aaaaaaaaaaaa", "https://127.0.0.1:9443", &old).unwrap();
-        TlsIdentity::carry_forward(&old, &new).unwrap();
+        TlsIdentity::carry_forward(&old, &new, true).unwrap();
         let moved: TlsIdentity = crate::credentials::load(&account_for_profile(&new).unwrap())
             .unwrap()
             .unwrap();
@@ -680,7 +792,7 @@ mod tests {
             TlsIdentity::saved_certificate(&old).unwrap().as_deref(),
             Some(saved.certificate_pem.as_str())
         );
-        TlsIdentity::carry_forward(&old, &new).unwrap();
+        TlsIdentity::carry_forward(&old, &new, true).unwrap();
     }
     #[test]
     fn expiry_is_announced_only_in_its_last_thirty_days_and_never_after() {

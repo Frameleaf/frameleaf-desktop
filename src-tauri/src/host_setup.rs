@@ -1431,6 +1431,12 @@ fn previous_package_refusal(code: String) -> String {
 /// refuse it. Until Manager is ready with one of the two packages the move is recorded as
 /// unconfirmed: the package the library last ran with can be chosen again, which takes the
 /// move back, and choosing the new one again sends Manager the same transition as before.
+/// "Unconfirmed" means only that this app has not seen Manager ready. Manager stores the new
+/// package's fingerprint as soon as it accepts the transition, so after a crash or a slow
+/// start it may have accepted the move; it then refuses the taken-back package
+/// (`native_installation_changed`) and nothing changes. This app cannot read Manager's
+/// refusal (its stderr is not kept outside tests), so the take-back stays available and the
+/// copy for `host_upgrade_move_unconfirmed` says it works only after a refusal.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn carry_forward<U: Serialize>(
     record: &Installation,
@@ -1533,7 +1539,7 @@ fn carry_forward<U: Serialize>(
             crate::package_move::save(&data, &pending)?;
             crate::manager_profile::Profile::carry_forward(previous, next, transition, resume)
         },
-        crate::manager_tls::TlsIdentity::carry_forward,
+        |old, new| crate::manager_tls::TlsIdentity::carry_forward(old, new, !resume),
     )
 }
 
@@ -1806,6 +1812,19 @@ struct CarryPlan {
         crate::host_carry::PackageIdentity,
     ),
 }
+/// A database carry builds its transition from the package the journal names. While a package
+/// move is unconfirmed, Manager may still hold the package before it, so a carry would be
+/// refused by Manager and then leave neither side of the move startable. Only a library with
+/// no unconfirmed move is carried; a record that cannot be read refuses.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn no_unconfirmed_move(data: &std::path::Path) -> Result<(), String> {
+    match crate::package_move::stored(data) {
+        crate::package_move::Stored::Absent => Ok(()),
+        crate::package_move::Stored::Present(_) => Err("host_upgrade_move_unconfirmed".into()),
+        crate::package_move::Stored::Unreadable => Err("host_upgrade_move_unavailable".into()),
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CarryPlan {
     /// Read-only. `host_carry_not_needed` means there is nothing to carry: no library, a
@@ -1843,6 +1862,7 @@ impl CarryPlan {
             }
             Err(code) => return Err(code),
         };
+        no_unconfirmed_move(&next.data)?;
         if runtime.epoch() <= source.epoch() {
             return Err("host_upgrade_downgrade_refused".into());
         }
@@ -1981,6 +2001,7 @@ impl CarryPlan {
         };
         // Held to the end: nothing else can start this library, or move it, meanwhile.
         let mut owner = crate::host_state::Owner::acquire(state, true)?;
+        no_unconfirmed_move(data)?;
         let mut permit = self.permit()?;
         owner.carry_admitted(id, previous_manifest, &permit.permit_id)?;
         let database = self.database(&mut owner)?;
@@ -2150,7 +2171,7 @@ impl CarryPlan {
                         previous, next, transition, false,
                     )
                 },
-                crate::manager_tls::TlsIdentity::carry_forward,
+                |old, new| crate::manager_tls::TlsIdentity::carry_forward(old, new, true),
                 Some(CarriedDatabase {
                     permit: &permit.permit_id,
                     reference: &reference,
@@ -2354,6 +2375,45 @@ mod manager_e2e;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carry from a package whose move is unconfirmed would build its transition from a
+    /// package Manager may not hold, and the move record would then refuse both sides of it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_database_carry_is_refused_while_a_package_move_is_unconfirmed_or_unknown() {
+        let data = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-carry-move-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&data).unwrap();
+        no_unconfirmed_move(&data).unwrap();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        crate::package_move::save(&data, &crate::package_move::Move::new(&a, &b)).unwrap();
+        assert_eq!(
+            no_unconfirmed_move(&data).unwrap_err(),
+            "host_upgrade_move_unconfirmed"
+        );
+        std::fs::write(data.join("desktop-package-move.json"), b"{}").unwrap();
+        assert_eq!(
+            no_unconfirmed_move(&data).unwrap_err(),
+            "host_upgrade_move_unavailable"
+        );
+        crate::package_move::settled(&data);
+        no_unconfirmed_move(&data).unwrap();
+        // Both the read-only plan and the carry itself, with the library held, check it.
+        let source = include_str!("host_setup.rs");
+        let read = &source[source.find("fn read(record: &Installation)").unwrap()..];
+        assert!(
+            read[..read.find("fn permit(").unwrap()].contains("no_unconfirmed_move(&next.data)?")
+        );
+        let run = &source[source
+            .find("progress: &(dyn Fn(&'static str) + Sync),")
+            .unwrap()..];
+        let held = run.find("Owner::acquire(state, true)?").unwrap();
+        let checked = run.find("no_unconfirmed_move(data)?").unwrap();
+        assert!(held < checked && checked < run.find("self.permit()?").unwrap());
+        std::fs::remove_dir_all(&data).unwrap();
+    }
 
     /// A new file only this account can read, as the host agent writes its own.
     fn private_file(path: &std::path::Path, text: &str) {

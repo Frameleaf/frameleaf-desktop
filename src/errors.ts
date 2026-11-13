@@ -370,7 +370,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'Local setup was cancelled.', 'native_manager_start_cancelled'],
   ['', 'This library already uses a newer server package. Choose that package to continue.', 'host_upgrade_downgrade_refused'],
   ['', 'Keep the server package this library last used installed until it has started once with the new package, then try again.', 'host_upgrade_previous_package_missing'],
-  ['', 'This library’s move to another server package has not finished. Start it with that package, or with the one it used before, then choose another. Your library has not been changed.', 'host_upgrade_move_unconfirmed'],
+  ['', 'This library is moving to another server package and has not yet been seen to start with it. Start it with that package to finish the move. Starting it with the package it used before works only if the new package refused it. Your library has not been changed.', 'host_upgrade_move_unconfirmed'],
   ['', 'Frameleaf could not read or save its record of this library’s move between server packages, so nothing was moved. Your library has not been changed. Try again; if this keeps happening, contact Frameleaf support.', 'host_upgrade_move_unavailable'],
   ['', 'This library last ran with a companion built for an earlier version of Frameleaf, and this version cannot move it to the new companion yet. Your library has not been changed. Keep that earlier companion installed. To open the library now, use the version of Frameleaf it last ran with, or contact Frameleaf support.', 'host_upgrade_previous_package_incompatible'],
   // ---- moving a library to a companion with a newer database ----
