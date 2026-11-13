@@ -1098,6 +1098,68 @@ async fn prepare(
                 };
                 group_prepared.push((qualified, accepted));
             }
+            // FD-56: an accelerated provider keeps a workload only where it measured faster than
+            // the processor here. Measured once per runtime epoch, on the same fixtures, without
+            // the server; anything that stops the measurement leaves the processor in charge.
+            if plan.unmeasured(workload) {
+                let accelerated_ms = crate::provider_selection::warm_milliseconds(
+                    group_prepared
+                        .iter()
+                        .map(|(qualified, _)| qualified.report()),
+                );
+                let twins: Vec<_> = plan
+                    .cpu_group(workload)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|profile| {
+                        let index = profiles
+                            .iter()
+                            .position(|item| item.model_key() == profile.model_key())?;
+                        Some((profile.clone(), caches[index].clone()))
+                    })
+                    .collect();
+                let scratch = paths.data.join("scratch");
+                let clock = WakeClock::new();
+                let ((runtime, cpu_ms), interrupted) = monitored_preparation(
+                    move |cancel| {
+                        let mut qualified = Vec::new();
+                        for (profile, cache) in &twins {
+                            let measured = profile
+                                .challenge(&uuid::Uuid::new_v4().to_string())
+                                .and_then(|(spec, fixture)| {
+                                    installed.qualify(
+                                        crate::provider_selection::CPU,
+                                        cache,
+                                        &scratch,
+                                        &spec,
+                                        &fixture,
+                                        &cancel,
+                                    )
+                                });
+                            match measured {
+                                Ok(value) => qualified.push(value),
+                                Err(_) => return (installed, None),
+                            }
+                        }
+                        let total = crate::provider_selection::warm_milliseconds(
+                            qualified.iter().map(|value| value.report()),
+                        );
+                        (installed, total)
+                    },
+                    async { format!("resource_{}", resource_loss(&clock).await) },
+                    || worker.maintain_session(),
+                    &progress.cancelled,
+                )
+                .await?;
+                installed = runtime;
+                check_cancel(&progress.cancelled)?;
+                let interrupted =
+                    interrupted.is_some() || clock.observe(std::time::SystemTime::now());
+                let cpu_ms = if interrupted { None } else { cpu_ms };
+                if plan.measured(workload, accelerated_ms, cpu_ms) {
+                    continue 'qualification;
+                }
+            }
             prepared.extend(group_prepared);
             accepted_profiles.extend(group.iter().cloned());
             accepted_caches.extend(group_caches);

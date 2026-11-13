@@ -13,7 +13,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -106,12 +106,42 @@ pub(crate) fn select_provider(
     }
 }
 
-/// Providers that failed with one accelerated runtime (its signed manifest names the epoch), so
-/// a failure is not retried every time the worker starts. A newer runtime starts clean.
+/// FD-56: an accelerated provider keeps a workload only where it measured faster than the
+/// processor on this computer. The times are the warm inference of the same qualification
+/// fixtures on each provider; a time that is missing or not a positive number decides nothing
+/// (`None`), and the caller then keeps the processor.
+pub(crate) fn measured_faster(accelerated_ms: Option<f64>, cpu_ms: Option<f64>) -> Option<bool> {
+    let usable = |value: f64| value.is_finite() && value > 0.0;
+    match (accelerated_ms, cpu_ms) {
+        (Some(accelerated), Some(cpu)) if usable(accelerated) && usable(cpu) => {
+            Some(accelerated < cpu)
+        }
+        _ => None,
+    }
+}
+
+/// The warm inference time of a workload: the sum over its qualified profiles, or `None` when
+/// any report does not carry one.
+pub(crate) fn warm_milliseconds<'a>(
+    reports: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Option<f64> {
+    let mut total = None;
+    for report in reports {
+        let warm = report.get("warmMilliseconds")?.as_f64()?;
+        total = Some(total.unwrap_or(0.0) + warm);
+    }
+    total
+}
+
+/// What one accelerated runtime (its signed manifest names the epoch) is remembered for on this
+/// computer: the providers that failed or measured slower, so they are not retried every time
+/// the worker starts, and the workloads it measured faster for, so they are not measured again.
+/// A newer runtime starts clean.
 pub(crate) struct Failures {
     path: PathBuf,
     runtime: String,
     codes: BTreeMap<String, String>,
+    faster: BTreeSet<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -119,6 +149,8 @@ struct Remembered {
     schema_version: u32,
     runtime: String,
     failures: BTreeMap<String, String>,
+    #[serde(default)]
+    faster: BTreeSet<String>,
 }
 fn code_shaped(value: &str) -> bool {
     !value.is_empty()
@@ -131,7 +163,7 @@ impl Failures {
     /// A missing, unreadable or foreign record remembers nothing: the provider is tried once
     /// more, and a failure is then held for this run whether or not it can be written.
     pub(crate) fn load(path: &Path, runtime: &str) -> Self {
-        let codes = read_bounded(path, 16 * 1024)
+        let (codes, faster) = read_bounded(path, 16 * 1024)
             .ok()
             .and_then(|raw| serde_json::from_slice::<Remembered>(&raw).ok())
             .filter(|saved| {
@@ -140,21 +172,36 @@ impl Failures {
                     && saved.failures.iter().all(|(workload, code)| {
                         WORKLOADS.contains(&workload.as_str()) && code_shaped(code)
                     })
+                    && saved
+                        .faster
+                        .iter()
+                        .all(|workload| WORKLOADS.contains(&workload.as_str()))
             })
-            .map(|saved| saved.failures)
+            .map(|saved| (saved.failures, saved.faster))
             .unwrap_or_default();
         Self {
             path: path.into(),
             runtime: runtime.into(),
             codes,
+            faster,
         }
     }
     pub(crate) fn get(&self, workload: &str) -> Option<&str> {
         self.codes.get(workload).map(String::as_str)
     }
+    /// Measured faster than the processor with this runtime. A remembered failure wins.
+    pub(crate) fn is_faster(&self, workload: &str) -> bool {
+        self.faster.contains(workload) && !self.codes.contains_key(workload)
+    }
     fn hold(&mut self, workload: &str, code: &str) {
         if WORKLOADS.contains(&workload) && code_shaped(code) {
             self.codes.insert(workload.into(), code.into());
+            self.faster.remove(workload);
+        }
+    }
+    fn hold_faster(&mut self, workload: &str) {
+        if WORKLOADS.contains(&workload) && !self.codes.contains_key(workload) {
+            self.faster.insert(workload.into());
         }
     }
     /// Best effort: the failure already holds for this run.
@@ -163,6 +210,7 @@ impl Failures {
             schema_version: 1,
             runtime: self.runtime.clone(),
             failures: self.codes.clone(),
+            faster: self.faster.clone(),
         };
         let Ok(raw) = serde_json::to_vec(&saved) else {
             return;
@@ -284,6 +332,44 @@ impl Plan {
                 }
             })
             .collect()
+    }
+    /// FD-56: the accelerated provider is chosen for this workload but has not yet been measured
+    /// against the processor with this runtime, so the caller measures before serving with it.
+    pub(crate) fn unmeasured(&self, workload: &str) -> bool {
+        self.choice(workload).0 != CPU
+            && !self
+                .failures
+                .as_ref()
+                .is_some_and(|failures| failures.is_faster(workload))
+    }
+    /// The processor profiles of a workload, the twins of its accelerated ones.
+    pub(crate) fn cpu_group(&self, workload: &str) -> Option<&Vec<ApprovedProfile>> {
+        self.cpu.iter().find(|group| workload_of(group) == workload)
+    }
+    /// Settle a measurement (`measured_faster`). Faster: the provider keeps the workload and
+    /// that is remembered for this runtime epoch. Slower: the processor, remembered the same
+    /// way. Unknown: the processor for this run only, so it is measured again next time.
+    /// Returns whether the workload moved to the processor.
+    pub(crate) fn measured(
+        &mut self,
+        workload: &str,
+        accelerated_ms: Option<f64>,
+        cpu_ms: Option<f64>,
+    ) -> bool {
+        if self.choice(workload).0 == CPU {
+            return false;
+        }
+        match measured_faster(accelerated_ms, cpu_ms) {
+            Some(true) => {
+                if let Some(failures) = &mut self.failures {
+                    failures.hold_faster(workload);
+                    failures.save();
+                }
+                false
+            }
+            Some(false) => self.demote(workload, "provider_slower", true),
+            None => self.demote(workload, "provider_speed_unknown", false),
+        }
     }
     /// The accelerated provider failed for this workload: use the processor from now on. Returns
     /// whether anything changed (false when the workload already ran on the processor, so the
@@ -697,6 +783,123 @@ mod tests {
             provider.into(),
             fallback.map(str::to_owned),
         )
+    }
+
+    #[test]
+    fn an_accelerated_provider_keeps_a_workload_only_where_it_measured_faster() {
+        assert_eq!(measured_faster(Some(20.0), Some(28.0)), Some(true));
+        assert_eq!(measured_faster(Some(28.0), Some(20.0)), Some(false));
+        // A tie is not faster.
+        assert_eq!(measured_faster(Some(20.0), Some(20.0)), Some(false));
+        // A time that is missing, zero, negative or not a number decides nothing.
+        for unusable in [None, Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(measured_faster(unusable, Some(20.0)), None);
+            assert_eq!(measured_faster(Some(20.0), unusable), None);
+        }
+        let reports = [
+            serde_json::json!({"warmMilliseconds": 8.5}),
+            serde_json::json!({"warmMilliseconds": 11}),
+        ];
+        assert_eq!(warm_milliseconds(&reports), Some(19.5));
+        assert_eq!(warm_milliseconds(&reports[..0]), None);
+        let broken = [
+            reports[0].clone(),
+            serde_json::json!({"warmMilliseconds": "fast"}),
+        ];
+        assert_eq!(warm_milliseconds(&broken), None);
+        assert_eq!(warm_milliseconds(&[serde_json::json!({})]), None);
+    }
+
+    #[test]
+    fn a_measurement_is_remembered_for_the_runtime_epoch_and_unknown_keeps_the_processor() {
+        let root = directory();
+        let manifest = "a".repeat(64);
+        let mut first = plan(&root, &manifest);
+        // Chosen but not yet measured with this runtime; the processor's own workload never is.
+        assert!(first.unmeasured("clip") && first.unmeasured("face"));
+        assert!(!first.unmeasured("ocr"));
+        assert_eq!(
+            first
+                .cpu_group("face")
+                .map(|group| group[0].provider().to_owned()),
+            Some(CPU.to_owned())
+        );
+        assert!(first.cpu_group("absent").is_none());
+        // Faster: it keeps the workload and is not measured again.
+        assert!(!first.measured("face", Some(20.0), Some(28.0)));
+        assert!(!first.unmeasured("face"));
+        // Slower: the processor, with the reason.
+        assert!(first.measured("clip", Some(50.0), Some(30.0)));
+        assert!(!first.unmeasured("clip"));
+        // A workload on the processor has nothing to settle.
+        assert!(!first.measured("ocr", Some(1.0), Some(2.0)));
+        assert!(!first.measured("clip", Some(1.0), Some(2.0)));
+        let expected = [
+            row("clip", CPU, Some("provider_slower")),
+            row("ocr", CPU, None),
+            row("face", COREML, None),
+        ];
+        assert_eq!(chosen(&first), expected);
+        // Both outcomes hold for the next start with the same runtime.
+        let again = plan(&root, &manifest);
+        assert_eq!(chosen(&again), expected);
+        assert!(!again.unmeasured("face") && !again.unmeasured("clip"));
+        // A newer runtime is measured from scratch.
+        let newer = plan(&root, &"b".repeat(64));
+        assert!(newer.unmeasured("clip") && newer.unmeasured("face"));
+        assert_eq!(chosen(&newer)[0], row("clip", COREML, None));
+
+        // Unknown (the measurement was interrupted, or a report had no time): the processor for
+        // this run only, and measured again next time.
+        let other = directory();
+        let mut unknown = plan(&other, &manifest);
+        assert!(unknown.measured("face", Some(20.0), None));
+        assert!(unknown.measured("clip", None, Some(30.0)));
+        assert_eq!(
+            chosen(&unknown),
+            [
+                row("clip", CPU, Some("provider_speed_unknown")),
+                row("ocr", CPU, None),
+                row("face", CPU, Some("provider_speed_unknown")),
+            ]
+        );
+        let retried = plan(&other, &manifest);
+        assert!(retried.unmeasured("clip") && retried.unmeasured("face"));
+        assert_eq!(chosen(&retried)[2], row("face", COREML, None));
+
+        // A later failure outranks an earlier "faster", and is what is remembered.
+        let third = directory();
+        let mut failing = plan(&third, &manifest);
+        assert!(!failing.measured("face", Some(20.0), Some(28.0)));
+        assert!(failing.demote("face", "runtime_process_stopped", true));
+        let after = plan(&third, &manifest);
+        assert_eq!(
+            chosen(&after)[2],
+            row("face", CPU, Some("runtime_process_stopped"))
+        );
+        assert!(!after.unmeasured("face"));
+
+        // A record written before measurements existed still loads; one naming an unknown
+        // workload as faster remembers nothing.
+        let legacy = directory();
+        let path = legacy.join("provider-failures.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{"face":"provider_failed"}}}}"#),
+        )
+        .unwrap();
+        let loaded = Failures::load(&path, &manifest);
+        assert_eq!(loaded.get("face"), Some("provider_failed"));
+        assert!(!loaded.is_faster("face") && !loaded.is_faster("clip"));
+        std::fs::write(
+            &path,
+            format!(r#"{{"schemaVersion":1,"runtime":"{manifest}","failures":{{}},"faster":["clip","video"]}}"#),
+        )
+        .unwrap();
+        assert!(!Failures::load(&path, &manifest).is_faster("clip"));
+        for directory in [root, other, third, legacy] {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
