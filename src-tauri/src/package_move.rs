@@ -80,6 +80,16 @@ pub(crate) fn plan(journal: &str, selected: &str, record: &Stored) -> Plan {
     }
 }
 
+/// A library whose media was moved has run with the package its journal names: only that
+/// package's running Manager moves media. So that package was accepted, and going back to the
+/// one before it is refused, as any downgrade is. Everything else is unchanged.
+pub(crate) fn after_media_move(plan: Plan, media_moved: bool) -> Plan {
+    match plan {
+        Plan::Return if media_moved => Plan::Refuse("host_upgrade_downgrade_refused"),
+        plan => plan,
+    }
+}
+
 pub(crate) fn stored(data: &Path) -> Stored {
     let Ok(directory) = crate::host_storage::directory(data) else {
         return Stored::Unreadable;
@@ -200,6 +210,26 @@ mod tests {
                 plan(journal, selected, &pending),
                 Plan::Refuse("host_upgrade_move_unconfirmed")
             );
+        }
+        // Once the library's media was moved under the package the journal names, that
+        // package was accepted: no take-back. Nothing else changes.
+        assert_eq!(
+            after_media_move(plan(&b, &a, &pending), true),
+            Plan::Refuse("host_upgrade_downgrade_refused")
+        );
+        assert_eq!(
+            after_media_move(plan(&b, &a, &pending), false),
+            Plan::Return
+        );
+        for (journal, selected, record) in [
+            (&a, &a, Stored::Absent),
+            (&a, &b, Stored::Absent),
+            (&a, &b, pending.clone()),
+            (&a, &c, pending.clone()),
+            (&a, &b, Stored::Unreadable),
+        ] {
+            let planned = plan(journal, selected, &record);
+            assert_eq!(after_media_move(planned, true), planned);
         }
         // Unknown never moves anything, in either direction.
         for (journal, selected) in [(&a, &b), (&b, &a)] {

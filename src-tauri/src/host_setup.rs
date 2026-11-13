@@ -168,6 +168,19 @@ struct Hosted<'a> {
     #[cfg(unix)]
     process: &'a dyn Fn(u32) -> crate::process_tree::Presence,
 }
+/// The record of an unconfirmed package move, for the update gate. No Manager folder means no
+/// library and no record; a record that is present, confirmed or not, is the next start's to
+/// settle and does not block. One that cannot be read is `Unknown`.
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+fn move_record(data: &std::path::Path) -> Evidence {
+    match std::fs::symlink_metadata(data) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Evidence::Clear,
+        _ => match crate::package_move::stored(data) {
+            crate::package_move::Stored::Unreadable => Evidence::Unknown,
+            _ => Evidence::Clear,
+        },
+    }
+}
 /// From disk alone: `Clear` when no library was ever hosted at `state`, or when its journal
 /// proves it idle and nothing that could be its Manager answers on Manager's port. The port
 /// covers a Manager that left no usable record.
@@ -303,6 +316,13 @@ impl HostSetup {
         });
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows, test)))]
         let journal = Evidence::Clear;
+        // A record of a package move that cannot be read leaves unknown which package Manager
+        // holds: that blocks as unreadable journal evidence does.
+        #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+        let journal = match hosted.map_or(Evidence::Clear, |hosted| move_record(hosted.data)) {
+            Evidence::Clear => journal,
+            unread => unread,
+        };
         #[cfg(unix)]
         let manager = hosted.map_or(Evidence::Clear, |hosted| {
             crate::manager_host::recorded_manager(hosted.data, hosted.process)
@@ -1532,6 +1552,7 @@ fn carry_forward<U: Serialize>(
         &record.manifest_sha256,
         &crate::package_move::stored(&next.data),
     );
+    let plan = crate::package_move::after_media_move(plan, marker.media_moved());
     let resume = match plan {
         Plan::Start => return Ok(()),
         Plan::Refuse(code) => return Err(code.into()),
@@ -1673,7 +1694,7 @@ fn move_library_to(
 ) -> Result<(), String> {
     let id = &previous.config.installation_id;
     match &database {
-        None => owner.check_movable(id, previous.manifest)?,
+        None => owner.check_package_movable(id, previous.manifest)?,
         Some(carried) => owner.check_carriable(id, previous.manifest, carried.permit)?,
     }
     let majors = database
@@ -4634,6 +4655,27 @@ mod tests {
             )
             .unwrap();
         journal.clean_stop().unwrap();
+    }
+
+    /// A record of a package move that cannot be read keeps the update gate of a new run
+    /// closed; a readable one, confirmed or not, and no Manager folder at all, do not.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_new_run_keeps_updates_closed_while_a_package_move_record_cannot_be_read() {
+        let fixture = OwnedFixture::new();
+        let data = fixture.0.join("data");
+        new_run_gate(&fixture).unwrap();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        crate::package_move::save(&data, &crate::package_move::Move::new(&a, &b)).unwrap();
+        new_run_gate(&fixture).unwrap();
+        std::fs::write(data.join("desktop-package-move.json"), b"{}").unwrap();
+        assert_eq!(
+            new_run_gate(&fixture).unwrap_err(),
+            "update_library_not_idle"
+        );
+        crate::package_move::settled(&data);
+        new_run_gate(&fixture).unwrap();
+        assert_eq!(move_record(&fixture.0.join("absent")), Evidence::Clear);
     }
 
     #[cfg(unix)]
