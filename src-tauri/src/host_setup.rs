@@ -906,49 +906,53 @@ async fn stop_photo_server(
             .ok_or("manager_pairing_required")?;
     local_grant(&saved, &identity, configuration, &certificate.sha256)?;
     manager_stop(
-        |command| crate::manager::send(&saved, &identity, command),
+        |command| crate::manager::send_paced(&saved, &identity, command),
         timeout,
     )
     .await
 }
 /// Manager's stop operation, followed until Manager reports it complete. Anything else it
-/// reports, an answer that cannot be read and running out of time are all failures.
-async fn manager_stop<F>(
+/// reports, an answer that cannot be read and running out of time are all failures. Manager
+/// limiting requests is none of those: it says nothing about the stop, so it is waited out
+/// inside the same time (`manager::paced`), and never counts as stopped.
+async fn manager_stop<E, F>(
     send: impl Fn(crate::manager::Command) -> F,
     timeout: Duration,
 ) -> Result<(), String>
 where
-    F: std::future::Future<Output = Result<serde_json::Value, String>>,
+    E: Into<crate::manager::Refused>,
+    F: std::future::Future<Output = Result<serde_json::Value, E>>,
 {
-    use crate::manager::{Action, Command};
-    let deadline = std::time::Instant::now() + timeout;
-    let accepted = send(Command::Control {
-        action: Action::Stop,
-        key: uuid::Uuid::new_v4(),
+    use crate::manager::{paced, Action, Command, Refused};
+    let deadline = tokio::time::Instant::now() + timeout;
+    // One key for every time the request is repeated: Manager accepts it once.
+    let key = uuid::Uuid::new_v4();
+    let accepted = paced(deadline, "manager_rate_limited", || async {
+        let action = Action::Stop;
+        send(Command::Control { action, key }).await.map(Some)
     })
     .await?;
     let id = accepted["id"]
         .as_str()
         .and_then(|id| uuid::Uuid::parse_str(id).ok())
         .ok_or("manager_response_invalid")?;
-    loop {
-        let operation = send(Command::Operation { id }).await?;
+    paced(deadline, "native_manager_shutdown_unconfirmed", || async {
+        let operation: serde_json::Value = match send(Command::Operation { id }).await {
+            Ok(operation) => operation,
+            Err(refused) => return Err(refused.into()),
+        };
         match operation["state"].as_str() {
-            Some("complete") => return Ok(()),
-            Some("running") => {}
-            Some("failed" | "interrupted") => {
-                return Err(operation["error"]
+            Some("complete") => Ok(Some(())),
+            Some("running") => Ok(None),
+            Some("failed" | "interrupted") => Err(Refused::from(
+                operation["error"]
                     .as_str()
-                    .unwrap_or("manager_operation_failed")
-                    .into())
-            }
-            _ => return Err("manager_response_invalid".into()),
+                    .unwrap_or("manager_operation_failed"),
+            )),
+            _ => Err("manager_response_invalid".into()),
         }
-        if std::time::Instant::now() >= deadline {
-            return Err("native_manager_shutdown_unconfirmed".into());
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    })
+    .await
 }
 /// Start local management, renewing Manager's TLS identity when that is due. `attempt` is
 /// given which handover signer to use (None: do not renew), and a counter it sets, once it
@@ -3575,6 +3579,141 @@ mod tests {
             Err("host_recovery_requires_manager".to_string())
         );
         assert_eq!(reads.get(), 2);
+    }
+
+    /// Manager's answers to a stop, in the order it is asked, with how often it was asked and
+    /// how long the stop took. The last answer is repeated for as long as the stop keeps asking.
+    async fn stop_answered(
+        answers: Vec<Result<serde_json::Value, crate::manager::Refused>>,
+        timeout: Duration,
+    ) -> (Result<(), String>, usize, Duration) {
+        use crate::manager::{Action, Command, Refused};
+        use std::cell::{Cell, RefCell};
+        let (asked, keys) = (Cell::new(0), RefCell::new(Vec::new()));
+        let started = tokio::time::Instant::now();
+        let result = manager_stop(
+            |command| {
+                match command {
+                    Command::Control {
+                        action: Action::Stop,
+                        key,
+                    } => keys.borrow_mut().push(key),
+                    Command::Operation { .. } => {}
+                    _ => panic!("only a stop and its own operation are sent"),
+                }
+                let reply = match &answers[asked.get().min(answers.len() - 1)] {
+                    Ok(value) => Ok(value.clone()),
+                    Err(Refused { code, retry_after }) => Err(Refused {
+                        code: code.clone(),
+                        retry_after: *retry_after,
+                    }),
+                };
+                asked.set(asked.get() + 1);
+                async move { reply }
+            },
+            timeout,
+        )
+        .await;
+        let keys = keys.into_inner();
+        assert!(
+            keys.iter().all(|key| !key.is_nil() && *key == keys[0]),
+            "a repeated stop request carries the same key"
+        );
+        (result, asked.get(), started.elapsed())
+    }
+    /// Manager allows a paired device 120 requests in ten minutes, shared by everything paired.
+    const MANAGER_ALLOWANCE: usize = 120;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_that_takes_all_its_time_stays_inside_managers_request_allowance() {
+        use serde_json::json;
+        let id = uuid::Uuid::new_v4().to_string();
+        let (result, asked, took) = stop_answered(
+            vec![Ok(json!({ "id": id })), Ok(json!({"state":"running"}))],
+            ORDERLY_STOP,
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("native_manager_shutdown_unconfirmed".to_string())
+        );
+        assert_eq!(took, ORDERLY_STOP);
+        println!("requests in a stop that runs out of time: {asked}");
+        // Three such stops fit in one of Manager's windows and leave room for everything else.
+        assert!(
+            asked * 4 <= MANAGER_ALLOWANCE,
+            "{asked} requests in one stop"
+        );
+        // A stop that is quick is still seen quickly.
+        let (result, asked, took) = stop_answered(
+            vec![
+                Ok(json!({ "id": id })),
+                Ok(json!({"state":"running"})),
+                Ok(json!({"state":"complete"})),
+            ],
+            ORDERLY_STOP,
+        )
+        .await;
+        assert_eq!((result, asked), (Ok(()), 3));
+        assert!(took <= Duration::from_millis(250));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_waits_out_managers_request_limit_and_never_takes_it_for_stopped() {
+        use crate::manager::Refused;
+        use serde_json::json;
+        let id = uuid::Uuid::new_v4().to_string();
+        let accepted = || Ok(json!({ "id": id }));
+        let running = || Ok(json!({"state":"running"}));
+        let limited = || Err(Refused::from("manager_rate_limited"));
+        let wait = |seconds| {
+            Err(Refused {
+                code: "manager_rate_limited".into(),
+                retry_after: Some(Duration::from_secs(seconds)),
+            })
+        };
+        // Limited before the stop is accepted and again while it runs: neither is a failure,
+        // and the stop is done when Manager later says so.
+        let (result, asked, took) = stop_answered(
+            vec![
+                limited(),
+                accepted(),
+                running(),
+                limited(),
+                wait(45),
+                running(),
+                Ok(json!({"state":"complete"})),
+            ],
+            ORDERLY_STOP,
+        )
+        .await;
+        assert_eq!((result, asked), (Ok(()), 7));
+        // The wait Manager asked for was kept.
+        assert!(took >= Duration::from_secs(45) && took < ORDERLY_STOP);
+        // Limited for as long as the stop may take: not stopped, and still inside the allowance.
+        let (result, asked, took) = stop_answered(vec![accepted(), limited()], ORDERLY_STOP).await;
+        assert_eq!(
+            result,
+            Err("native_manager_shutdown_unconfirmed".to_string())
+        );
+        assert_eq!(took, ORDERLY_STOP);
+        assert!(asked * 4 <= MANAGER_ALLOWANCE, "{asked} requests");
+        // Never accepted: nothing was asked of Manager, and it says why.
+        let (result, asked, took) = stop_answered(vec![limited()], ORDERLY_STOP).await;
+        assert_eq!(result, Err("manager_rate_limited".to_string()));
+        assert_eq!(took, ORDERLY_STOP);
+        assert!(asked * 4 <= MANAGER_ALLOWANCE, "{asked} requests");
+        // A wait Manager asks for that outlasts the stop is not sat through.
+        let (result, asked, took) =
+            stop_answered(vec![accepted(), running(), wait(600)], ORDERLY_STOP).await;
+        assert_eq!(
+            (result, asked),
+            (Err("native_manager_shutdown_unconfirmed".to_string()), 3)
+        );
+        assert!(took < Duration::from_secs(1));
+        // A wait of nothing is not a reason to ask without pause.
+        let (_, asked, _) = stop_answered(vec![accepted(), wait(0)], ORDERLY_STOP).await;
+        assert!(asked * 4 <= MANAGER_ALLOWANCE, "{asked} requests");
     }
 
     #[tokio::test]
