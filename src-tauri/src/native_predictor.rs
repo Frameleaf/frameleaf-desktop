@@ -388,6 +388,9 @@ where
     settle(transport, &task, qualifications[index], outcome).await
 }
 
+/// How long every runtime process may take to answer its first health check.
+const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
+
 pub struct NativePredictor {
     /// One process per runtime in use (the processor runtime, an accelerated one, or both).
     children: Vec<Lane>,
@@ -571,37 +574,53 @@ impl NativePredictor {
         self.failed
             .map(|index| self.children[index].manifest_sha256.as_str())
     }
+    /// A lane is blamed (`failed_lane`) only when it is the reason this returned a startup
+    /// failure: its process had stopped, or it was still not serving at the deadline. A wait
+    /// that is cancelled or dropped while a lane is merely loading blames nothing.
     async fn ready(&mut self, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
-        let (children, roles, failed) = (&mut self.children, &self.roles, &mut self.failed);
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const NONE: usize = usize::MAX;
+        self.failed = None;
+        let waiting = AtomicUsize::new(NONE);
+        let (children, roles) = (&mut self.children, &self.roles);
         let wait = async {
             loop {
-                *failed = None;
+                let mut unready = NONE;
                 for (index, lane) in children.iter_mut().enumerate() {
                     let role = roles.iter().find(|role| role.lane == index);
                     if !lane.child.is_running()? {
-                        *failed = Some(index);
+                        waiting.store(index, Ordering::Release);
                         return Err("runtime_process_stopped".into());
                     }
                     if let Some(role) = role {
                         if !role.client.health().await.unwrap_or(false) {
-                            *failed = Some(index);
+                            unready = index;
                             break;
                         }
                     }
                 }
-                if failed.is_none() {
+                waiting.store(unready, Ordering::Release);
+                if unready == NONE {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        race_prediction(
-            wait,
-            std::future::pending(),
-            cancel,
-            Duration::from_secs(15),
-        )
-        .await
+        let result = race_prediction(wait, std::future::pending(), cancel, READY_DEADLINE).await;
+        if matches!(
+            result.as_ref().map_err(String::as_str),
+            Err("runtime_process_stopped" | "worker_execution_deadline")
+        ) {
+            self.failed = Some(waiting.load(Ordering::Acquire)).filter(|index| *index != NONE);
+        }
+        result
+    }
+    /// After a failed prediction: a lane whose process is gone crashed while inferring (a
+    /// cancelled or refused prediction leaves it running), so the caller can stop using it.
+    fn blame_exited(&mut self, lane: usize) {
+        if !self.children[lane].child.is_running().unwrap_or(false) {
+            self.failed = Some(lane);
+        }
     }
     /// Execute one admitted job; empty NAS model grants cannot claim work.
     pub async fn execute_next(
@@ -679,7 +698,8 @@ impl NativePredictor {
         }
         let qualification = qualifications[index];
         let role = &self.roles[index];
-        let child = &mut self.children[role.lane].child;
+        let lane = role.lane;
+        let child = &mut self.children[lane].child;
         let claimed = &task;
         let outcome = run_claimed(
             transport,
@@ -703,6 +723,10 @@ impl NativePredictor {
             },
         )
         .await;
+        if outcome.is_err() {
+            // Before this owner stops anything itself.
+            self.blame_exited(lane);
+        }
         if outcome.as_ref().is_err_and(|failure| failure.inferring) {
             // Terminate inference before waiting for a failed/cancelled lease acknowledgement.
             self.stop()?;
@@ -1230,6 +1254,45 @@ mod tests {
             failed: None,
         };
         assert!(predictor.is_running().unwrap());
+        // FD-52: nothing listens on the port, so the lane is running but not serving yet.
+        let lane = pack.manifest_sha256().to_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Still not serving at the deadline: that lane failed to start.
+            let (_keep, mut never) = watch::channel(false);
+            assert_eq!(
+                predictor.ready(&mut never).await.unwrap_err(),
+                "worker_execution_deadline"
+            );
+            assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
+            // Cancelled while it is still loading: nothing is blamed (and the old blame is gone).
+            let (stop, mut stopping) = watch::channel(false);
+            {
+                let waiting = predictor.ready(&mut stopping);
+                tokio::pin!(waiting);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                        .await
+                        .is_err()
+                );
+                stop.send(true).unwrap();
+                assert_eq!(waiting.await.unwrap_err(), "worker_cancelled");
+            }
+            assert_eq!(predictor.failed_lane(), None);
+            // The wait is dropped (sign-out drops the whole future): nothing is blamed either.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), predictor.ready(&mut never))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(predictor.failed_lane(), None);
+        });
+        // A failed prediction with the process still alive blames no lane.
+        predictor.blame_exited(0);
+        assert_eq!(predictor.failed_lane(), None);
         let (_sender, mut cancel) = watch::channel(false);
         let mut future = Box::pin(worker_jobs(
             &mut predictor,
@@ -1248,6 +1311,18 @@ mod tests {
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
         drop(future);
         assert!(!predictor.is_running().unwrap());
+        // FD-52: a process that is gone after a failed prediction, or at the next start, is blamed.
+        predictor.blame_exited(0);
+        assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
+        runtime.block_on(async {
+            let (_keep, mut never) = watch::channel(false);
+            predictor.failed = None;
+            assert_eq!(
+                predictor.ready(&mut never).await.unwrap_err(),
+                "runtime_process_stopped"
+            );
+        });
+        assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
         drop(predictor);
         fs::remove_dir_all(root).unwrap();
     }

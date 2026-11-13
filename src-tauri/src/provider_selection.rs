@@ -311,11 +311,16 @@ impl Plan {
     }
     /// The accelerated runtime's process did not serve: every workload on it moves to the
     /// processor, remembered for this runtime epoch.
+    ///
+    /// Stopping the worker, signing out or a pause for power or network is never the provider's
+    /// fault, whatever process happened to be starting at that moment.
     pub(crate) fn demote_runtime(&mut self, manifest_sha256: &str, code: &str) -> bool {
-        if self
-            .offer
-            .as_ref()
-            .is_none_or(|offer| offer.manifest_sha256 != manifest_sha256)
+        if code.ends_with("_cancelled")
+            || code.starts_with("resource_")
+            || self
+                .offer
+                .as_ref()
+                .is_none_or(|offer| offer.manifest_sha256 != manifest_sha256)
         {
             return false;
         }
@@ -742,6 +747,20 @@ mod tests {
         );
         // A process that did not serve moves every workload of that runtime, and only that one.
         assert!(!newer.demote_runtime(&manifest, "runtime_process_stopped"));
+        // Stopping the worker or a resource pause while that process starts is not its failure.
+        for code in [
+            "worker_setup_cancelled",
+            "worker_cancelled",
+            "runtime_cancelled",
+            "resource_system_resumed",
+        ] {
+            assert!(!newer.demote_runtime(&"b".repeat(64), code), "{code}");
+        }
+        assert_eq!(chosen(&newer)[0], row("clip", COREML, None));
+        assert_eq!(
+            chosen(&plan(&root, &"b".repeat(64)))[2],
+            row("face", COREML, None)
+        );
         assert!(newer.demote_runtime(&"b".repeat(64), "runtime_process_stopped"));
         assert_eq!(
             chosen(&newer),

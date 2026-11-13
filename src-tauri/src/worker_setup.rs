@@ -1231,6 +1231,13 @@ async fn prepare(
                         progress.completed();
                     }
                     Ok(Step::Dropped(code)) => {
+                        // FD-52: the accelerated runtime's process died while inferring: its
+                        // workloads move to the processor instead of crashing on every restart.
+                        let lane = predictor.failed_lane().map(str::to_owned);
+                        if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                            predictor.stop()?;
+                            continue 'qualification;
+                        }
                         let delay = match failures.dropped(code) {
                             Ok(delay) => delay,
                             Err(code) => {
@@ -1272,7 +1279,9 @@ async fn prepare(
                     }
                     Err(reason) => {
                         // FD-52: the accelerated runtime's process did not serve: use the
-                        // processor for its workloads instead of failing the worker.
+                        // processor for its workloads instead of failing the worker. A stop
+                        // or sign-out while it was starting is not a provider failure.
+                        check_cancel(&progress.cancelled)?;
                         let lane = predictor.failed_lane().map(str::to_owned);
                         if lane.is_some_and(|lane| plan.demote_runtime(&lane, &reason)) {
                             predictor.stop()?;
