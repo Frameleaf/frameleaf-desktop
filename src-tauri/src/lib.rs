@@ -862,6 +862,11 @@ pub fn run() {
                     let _ = window.set_focus();
                 }
             }
+            // Windows ends a session by exiting this app without asking first.
+            #[cfg(windows)]
+            if matches!(event, tauri::RunEvent::Exit) {
+                host_commands::session_ending(app);
+            }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 app.state::<window_placement::WindowPlacement>().save(app);
                 if app.state::<media_copy::MediaCopy>().is_active() {
