@@ -113,8 +113,11 @@ run summary. A runtime rebuilt for an older macOS lets `aiRuntime` be lowered;
 to change `app`, change the declaration, `tauri.conf.json` and both workflows
 together (`tools/test_check_macos_minimum.py` fails when they disagree).
 
-The app does not yet tell someone on macOS 11 to 14 why AI processing cannot
-start there; see the follow-up noted in FD-54.
+The app reads `aiRuntime` from the same declaration when it is built. On an
+older macOS, AI setup stops before it prepares anything, with the code
+`runtime_os_unsupported`, and the AI processing card says which macOS is
+needed. It does not retry by itself and offers no Retry Setup. Photos and
+everything else keep working.
 
 ### Linux tray library
 

@@ -200,6 +200,25 @@ test('each worker failure family shows its own reason and the action that fixes 
   assert.equal((await card({ state: 'setup-needs-attention', code: 'runtime_pack_unavailable' })).detail, 'This build does not include a signed AI runtime yet. Photos remain available.');
 });
 
+test('a macOS older than the AI runtime needs is a needs-you state with the declared version and no retry', async () => {
+  const declared = JSON.parse(readFileSync(new URL('../packaging/macos/minimum-versions.json', import.meta.url), 'utf8')) as { app: string; aiRuntime: string };
+  const version = declared.aiRuntime.replace(/\.0$/, '');
+  assert.match(version, /^\d+(?:\.\d+)?$/);
+  assert.equal(errorCopy('runtime_os_unsupported'), `AI processing needs macOS ${version} or later. Photos remain available.`);
+  const view = await card({ state: 'setup-needs-attention', code: 'runtime_os_unsupported' });
+  assert.equal(view.headline, 'This Mac’s macOS is too old for AI processing');
+  assert.equal(view.detail, errorCopy('runtime_os_unsupported'));
+  assert.equal(view.attention, 'needs-you');
+  assert.equal(view.action, null, 'retrying cannot change the macOS version');
+  assert.deepEqual(view.pill, { label: 'Needs you', tone: 'bad' });
+  assert.equal(view.reference, null);
+  // The backend reads the same declaration, and refuses before it prepares anything.
+  const backend = readFileSync(new URL('../src-tauri/src/worker_setup.rs', import.meta.url), 'utf8');
+  assert.match(backend, /include_str!\(\s*"\.\.\/\.\.\/packaging\/macos\/minimum-versions\.json"\s*\)/);
+  assert.doesNotMatch(backend.slice(0, backend.indexOf('#[cfg(test)]')), /\(15,\s*0\)|"15(?:\.0)?"/);
+  assert.match(backend, /runtime_os_supported\(macos, ai_runtime_macos_floor\(\)\)\?;\s*progress\.update\(\|status\| status\.models = None\);\s*progress\.set\(\s*"preparing-runtime"/);
+});
+
 test('memory, power and network pauses wait by themselves and say what they wait for', async () => {
   for (const [code, headline, detail] of [
     ['memory_low', 'Waiting for free memory', /enough memory.*continues by itself/],
