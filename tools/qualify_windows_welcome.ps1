@@ -1,7 +1,24 @@
-param([Parameter(Mandatory)][string]$Executable, [switch]$InstalledHost, [string]$WatchedFolder)
+param([Parameter(Mandatory)][string]$Executable, [switch]$InstalledHost, [string]$WatchedFolder,
+    [switch]$InstalledRecovery, [string]$RecoveryVideo)
 
 $ErrorActionPreference = 'Stop'
-if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Requires a disposable Windows runner' }
+if ($InstalledRecovery) {
+    if (!$InstalledHost -or $WatchedFolder -or $env:FRAMELEAF_RECOVERY_DISPOSABLE -cne '1' -or
+        [Console]::IsInputRedirected -or [Console]::IsOutputRedirected -or !$RecoveryVideo -or
+        $env:FRAMELEAF_RECOVERY_DESKTOP_SHA256 -cnotmatch '^[a-f0-9]{64}$' -or
+        $env:FRAMELEAF_INSTALLED_HOST_MANIFEST -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'Requires an interactive disposable Windows profile and approved installed candidate identities'
+    }
+    $candidate = Get-Item -LiteralPath $Executable
+    if ($candidate.Name -cne 'frameleaf-desktop.exe' -or ($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        (Get-AuthenticodeSignature -LiteralPath $candidate.FullName).Status -ne 'Valid' -or
+        (Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:FRAMELEAF_RECOVERY_DESKTOP_SHA256 -or
+        (Get-Process -Name frameleaf-desktop -ErrorAction SilentlyContinue)) {
+        throw 'Expected the approved signed Desktop candidate and no running Desktop app'
+    }
+    $Executable = $candidate.FullName
+    $RecoveryVideo = (Get-Item -LiteralPath $RecoveryVideo).FullName
+} elseif ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Requires a disposable Windows runner' }
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $tree = [System.Windows.Automation.TreeScope]::Descendants
@@ -161,6 +178,86 @@ function Test-WatchedFolder {
     Write-Output 'Installed Desktop watched a synthetic folder while hidden, verified the copy, and reopened with watching still active'
 }
 
+function Test-InstalledRecovery([string]$State, [string]$Root) {
+    $photoTool = Join-Path $PSScriptRoot 'qualify_installed_photo.mjs'
+    $manifest = Get-Content -LiteralPath (Join-Path $State 'host-state.json') -Raw | ConvertFrom-Json
+    if ($manifest.manifestSha256 -cne $env:FRAMELEAF_INSTALLED_HOST_MANIFEST) { throw 'Unexpected installed Library manifest' }
+    $controllerPath = Join-Path $State 'controller-state.json'
+    $controller = Get-Content -LiteralPath $controllerPath -Raw | ConvertFrom-Json
+    $originalDatabase = Join-Path $State 'database/PG_VERSION'
+    if ($controller.databaseReference -or !(Test-Path -LiteralPath $originalDatabase -PathType Leaf)) {
+        throw 'Expected an un-restored synthetic Library'
+    }
+
+    $receipt = Join-Path $Root 'media.json'
+    $source = Join-Path $Root 'media-source'
+    $archive = Join-Path $Root 'independent-media.zip'
+    $destination = Join-Path $Root 'media-restored'
+    $null = New-Item -ItemType Directory -Path $source
+    & node $photoTool recovery-seed $receipt $RecoveryVideo | Out-Host
+    if ($LASTEXITCODE) { throw 'Could not seed and read back the disposable photo and video' }
+    $originals = @((Join-Path $source 'synthetic-recovery-photo.png'), (Join-Path $source 'synthetic-recovery-video.mp4'))
+    Compress-Archive -LiteralPath $originals -DestinationPath $archive
+    Remove-Item -LiteralPath $originals
+
+    if ((Read-Host 'In Desktop, select Back up and wait for the database-only backup to complete. Type yes to continue') -cne 'yes') {
+        throw 'Database backup was not confirmed'
+    }
+    $null = Wait-Control 'Database backup completed. Photos and videos are not included.' -Seconds 15
+    & node $photoTool recovery-change $receipt | Out-Host
+    if ($LASTEXITCODE) { throw 'Could not verify the post-backup metadata change' }
+    if ((Read-Host 'Load backups, review the single database backup, approve its restore, and check until Desktop reports Database restored. Leave the result open and type yes') -cne 'yes') {
+        throw 'Database restore was not confirmed'
+    }
+    $null = Wait-Control 'Done with database restore' -Type Button -Seconds 15
+    $controller = Get-Content -LiteralPath $controllerPath -Raw | ConvertFrom-Json
+    $selected = $controller.databaseReference
+    if (!$selected -or $controller.restorePending -or $selected.operationId -cnotmatch '^[a-f0-9-]{36}$' -or
+        $selected.attemptId -cnotmatch '^[a-f0-9-]{36}$' -or
+        $controller.manifestSha256 -cne $env:FRAMELEAF_INSTALLED_HOST_MANIFEST) { throw 'A separate finalized restore target was not selected' }
+    $target = Join-Path $State ("restore-targets/{0}/{1}" -f $selected.operationId, $selected.attemptId)
+    if (!(Test-Path -LiteralPath $originalDatabase -PathType Leaf) -or
+        !(Test-Path -LiteralPath (Join-Path $target 'database/PG_VERSION') -PathType Leaf) -or
+        (Get-FileHash -LiteralPath (Join-Path $target 'activation-intent.json')).Hash -cne
+        (Get-FileHash -LiteralPath (Join-Path $target 'activation-complete.json')).Hash) {
+        throw 'Original database retention or finalized target evidence is missing'
+    }
+    & node $photoTool recovery-database $receipt | Out-Host
+    if ($LASTEXITCODE) { throw 'Restored database metadata or retained Library originals did not verify' }
+
+    Press 'Done with database restore'
+    Confirm-ServerAction 'Stop' 'Server stop completed.'
+    if (Get-NetTCPConnection -State Listen -LocalPort 2283,54329 -ErrorAction SilentlyContinue) {
+        throw 'The disposable Library and database must be stopped before media recovery'
+    }
+    if (Test-Path -LiteralPath $destination) { throw 'Media recovery destination already exists' }
+    Expand-Archive -LiteralPath $archive -DestinationPath $destination
+    & node $photoTool recovery-media $receipt | Out-Host
+    if ($LASTEXITCODE) { throw 'Separate archive original readback failed' }
+    Write-Host ('Recovered photo: ' + (Join-Path $destination 'synthetic-recovery-photo.png'))
+    Write-Host ('Recovered video: ' + (Join-Path $destination 'synthetic-recovery-video.mp4'))
+    if ((Read-Host 'Open the recovered photo at full size and play the recovered video through the end in local viewers. Keep Library stopped. Type yes if both worked') -cne 'yes') {
+        throw 'Offline viewing of the recovered originals was not confirmed'
+    }
+    if (Get-NetTCPConnection -State Listen -LocalPort 2283,54329 -ErrorAction SilentlyContinue) {
+        throw 'The disposable Library must remain stopped during original readback'
+    }
+    $media = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+    [ordered]@{
+        databaseRestoredToSeparateTarget = $true
+        previousDatabaseRetained = $true
+        existingLibraryOriginalsReadBack = $true
+        independentMediaArchiveRestoredToSeparateFolder = $true
+        recoveredOriginalsOpenedAndPlayedByOperator = $true
+        mediaRestoredByDatabaseRecovery = $false
+        photoSha256 = $media[0].sha256
+        videoSha256 = $media[1].sha256
+        archiveSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        executableSha256 = $env:FRAMELEAF_RECOVERY_DESKTOP_SHA256
+        manifestSha256 = $env:FRAMELEAF_INSTALLED_HOST_MANIFEST
+    } | ConvertTo-Json -Compress
+}
+
 if ($WatchedFolder) {
     if ($InstalledHost -or $env:GITHUB_ACTIONS -ne 'true' -or $env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD.Length -lt 32) {
         throw 'Requires the installed watched-folder fixture on a disposable Windows runner'
@@ -185,7 +282,8 @@ public static class FrameleafSmokeWindow {
 '@
 }
 if ($InstalledHost) {
-    if (Test-Path (Join-Path $env:LOCALAPPDATA 'Frameleaf Desktop Host')) { throw 'Expected a fresh user profile' }
+    $profile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Frameleaf Desktop Host'
+    if (Test-Path -LiteralPath $profile) { throw 'Expected a fresh user profile' }
     if (Get-NetTCPConnection -State Listen -LocalPort 2283,9443,54329 -ErrorAction SilentlyContinue) { throw 'Expected unused local server ports' }
 }
 $app = Start-Process -FilePath $Executable -PassThru
@@ -197,7 +295,7 @@ try {
     Select-Radio (Wait-Control 'Run Frameleaf here' -Radio)
     if ($InstalledHost) {
         $managerPassword = 'Synthetic!' + [guid]::NewGuid().ToString('N')
-        $receipt = Join-Path $env:RUNNER_TEMP ('synthetic-photo-' + [guid]::NewGuid() + '.json')
+        if (!$InstalledRecovery) { $receipt = Join-Path $env:RUNNER_TEMP ('synthetic-photo-' + [guid]::NewGuid() + '.json') }
         Press 'Prepare Profile'
         $null = Wait-Control 'Your private server profile is ready. Check installation to continue.' -Seconds 180
         Write-Output 'Installed desktop prepared the Windows user profile'
@@ -206,12 +304,23 @@ try {
         Fill 'Local Manager password' $managerPassword
         $permissions = Wait-Control 'Permissions Allow this computer to manage this local server.' -Type CheckBox
         $permissions.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+        if ($InstalledRecovery) { Check-Box 'Also allow backup recovery reviews and restore operations.' }
         Press 'Authorize local management'
         $null = Wait-Control 'Open local Photos' -Type Button -Seconds 120
         Write-Output 'Installed desktop started and authorized local Manager'
         Press 'Start'
         $null = Wait-Control 'Start operation completed. Check Photos to confirm it is ready.' -PollOperation -Seconds 360
         $env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD = 'Synthetic!' + [guid]::NewGuid().ToString('N')
+        if ($InstalledRecovery) {
+            $scratch = Join-Path ([IO.Path]::GetTempPath()) ('frameleaf-installed-recovery-' + [guid]::NewGuid().ToString())
+            $recoveryRoot = (New-Item -ItemType Directory -Path $scratch).FullName
+            [Console]::WriteLine("Temporary synthetic Manager password, if reauthorization is requested: $managerPassword")
+            $recoveryReceipt = Test-InstalledRecovery (Join-Path $profile 'state') $recoveryRoot
+            Press 'Stop local management'
+            $null = Wait-Control 'Prepare local Manager' -Type Button
+            Write-Output $recoveryReceipt
+            return
+        }
         & node (Join-Path $PSScriptRoot 'qualify_installed_photo.mjs') upload $receipt
         if ($LASTEXITCODE) { throw 'Installed photo signup/upload/thumbnail failed' }
         Confirm-ServerAction 'Restart' 'Restart operation completed. Check Photos to confirm it is ready.'
@@ -228,9 +337,28 @@ try {
     $null = Wait-Control 'Another server'
     Write-Output 'Installed Welcome, native host discovery, and return to connection passed'
 } finally {
-    if ($InstalledHost) {
-        Remove-Item Env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD -ErrorAction SilentlyContinue
-        if ($receipt -and (Test-Path $receipt)) { Remove-Item -LiteralPath $receipt }
+    try {
+        if (!$app.HasExited) {
+            Stop-Process -Id $app.Id -Force
+            $null = $app.WaitForExit(10000)
+        }
+    } finally {
+        if ($InstalledHost) {
+            Remove-Item Env:FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD -ErrorAction SilentlyContinue
+            if (!$app.HasExited) {
+                Write-Warning 'Desktop did not exit. Temporary recovery files were retained.'
+            } else {
+                foreach ($temporaryPath in @($receipt, $recoveryRoot)) {
+                    if (!$temporaryPath) { continue }
+                    try {
+                        if (Test-Path -LiteralPath $temporaryPath) {
+                            Remove-Item -LiteralPath $temporaryPath -Recurse -ErrorAction Stop
+                        }
+                    } catch {
+                        Write-Warning "Could not remove temporary recovery files at $temporaryPath."
+                    }
+                }
+            }
+        }
     }
-    if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
 }
