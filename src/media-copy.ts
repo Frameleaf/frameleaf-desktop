@@ -10,6 +10,8 @@ type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unkno
 
 const idle: CopyState = { copying: false, cancelling: false, saved: null, message: '' };
 export const mediaCopy = writable<CopyState>(idle);
+// The library session the running copy belongs to; cancelling names it so a switched library cannot be cancelled by mistake.
+let copyEpoch: number | null = null;
 
 const safeDrive: Record<Platform, string> = { mac: 'an APFS drive', windows: 'an NTFS drive', linux: 'an ext4 drive' };
 export function explainCopy(error: unknown, platform: Platform): string {
@@ -25,15 +27,18 @@ export function explainCopy(error: unknown, platform: Platform): string {
   return Object.hasOwn(errors, code) ? errors[code]! : explainError(error, 'The media copy could not be completed. Check your server and drive, then try again.');
 }
 
-export async function saveCopy(invoke: Invoke, packageId: string, platform: Platform): Promise<void> {
+export async function saveCopy(invoke: Invoke, packageId: string, epoch: number, platform: Platform): Promise<void> {
   if (get(mediaCopy).copying) return;
+  copyEpoch = epoch;
   mediaCopy.set({ ...idle, copying: true });
-  try { mediaCopy.set({ ...idle, saved: await invoke('save_preservation_copy', { packageId }) as SavedCopy | null }); }
+  try { mediaCopy.set({ ...idle, saved: await invoke('save_preservation_copy', { packageId, epoch }) as SavedCopy | null }); }
   catch (error) { mediaCopy.set({ ...idle, message: explainCopy(error, platform) }); }
+  finally { copyEpoch = null; }
 }
 
 export async function cancelCopy(invoke: Invoke, platform: Platform): Promise<void> {
+  if (copyEpoch === null) return;
   mediaCopy.update(state => ({ ...state, cancelling: true }));
-  try { await invoke('cancel_preservation_copy'); }
+  try { await invoke('cancel_preservation_copy', { epoch: copyEpoch }); }
   catch (error) { mediaCopy.update(state => ({ ...state, cancelling: false, message: explainCopy(error, platform) })); }
 }

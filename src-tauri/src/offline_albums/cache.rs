@@ -14,7 +14,9 @@ use std::{
 use uuid::Uuid;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
-const KEY: &str = "offline-albums-key";
+const LEGACY_KEY: &str = "offline-albums-key";
+const LEGACY_ROOT: &str = "offline-albums";
+const SCOPED_ROOT: &str = "offline-albums-by-session";
 pub(super) const CAP: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) const GRACE_SECONDS: u64 = 24 * 60 * 60;
 const OVERHEAD: u64 = 12 + 16;
@@ -43,7 +45,28 @@ fn scope(saved: &SavedConnection) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(binding.as_slice()).into())
 }
 
+/// Non-secret selectors for the exact scoped and legacy caches, even after credential loss.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct CleanupScope {
+    id: String,
+    legacy: [u8; 32],
+}
+
+impl CleanupScope {
+    pub(crate) fn from_saved(saved: &SavedConnection) -> Result<Self, String> {
+        Ok(Self {
+            id: crate::connection::photo_session_scope(saved),
+            legacy: scope(saved)?,
+        })
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 pub(super) struct Cache {
+    base: PathBuf,
     root: PathBuf,
     key: Credential,
 }
@@ -106,6 +129,47 @@ impl Manifest {
     }
 }
 
+fn directory_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            runtime_store::private_directory(path)?;
+            Ok(true)
+        }
+        _ => Err(ERROR.into()),
+    }
+}
+
+fn remove_directory(path: &Path) -> Result<(), String> {
+    if directory_exists(path)? {
+        fs::remove_dir_all(path).map_err(|_| ERROR)?;
+    }
+    Ok(())
+}
+
+fn stored_bytes(root: &Path) -> Result<u64, String> {
+    if !directory_exists(root)? {
+        return Ok(0);
+    }
+    let mut bytes = 0u64;
+    // Count abandoned staging data too, even for an inactive library we cannot decrypt.
+    for album in fs::read_dir(root).map_err(|_| ERROR)? {
+        let path = album.map_err(|_| ERROR)?.path();
+        if !directory_exists(&path)? {
+            return Err(ERROR.into());
+        }
+        for entry in fs::read_dir(path).map_err(|_| ERROR)? {
+            let metadata =
+                fs::symlink_metadata(entry.map_err(|_| ERROR)?.path()).map_err(|_| ERROR)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(ERROR.into());
+            }
+            bytes = bytes.checked_add(metadata.len()).ok_or(ERROR)?;
+        }
+    }
+    Ok(bytes)
+}
+
 impl Cache {
     pub fn open(
         base: &Path,
@@ -113,41 +177,85 @@ impl Cache {
         create: bool,
     ) -> Result<Option<Self>, String> {
         let binding = scope(saved)?;
-        let key = match credentials::load::<Credential>(KEY)? {
-            Some(key) if key.scope == binding => key,
-            Some(_) => return Err("offline_album_other_library".into()),
+        let (root, account) = Self::location(base, saved);
+        let mut key = credentials::load::<Credential>(&account)?;
+        if key.as_ref().is_some_and(|key| key.scope != binding) {
+            return Err("offline_album_other_library".into());
+        }
+        if let Some(legacy) =
+            credentials::load::<Credential>(LEGACY_KEY)?.filter(|legacy| legacy.scope == binding)
+        {
+            let old = base.join(LEGACY_ROOT);
+            if directory_exists(&old)? {
+                if directory_exists(&root)? || key.as_ref().is_some_and(|key| key.key != legacy.key)
+                {
+                    return Err(ERROR.into());
+                }
+                if key.is_none() {
+                    credentials::save(&account, &legacy)?;
+                    key = Some(legacy);
+                }
+                runtime_store::private_directory(root.parent().ok_or(ERROR)?)?;
+                fs::rename(old, &root).map_err(|_| ERROR)?;
+            }
+            credentials::delete(LEGACY_KEY)?;
+        }
+        let key = match key {
+            Some(key) => key,
             None if create => {
-                // A key discarded on sign-out cannot make earlier ciphertext readable again.
-                Self::purge(base)?;
+                // Never reuse orphaned ciphertext after its secure key has been discarded.
+                remove_directory(&root)?;
                 let mut key = Credential {
                     scope: binding,
                     key: [0; 32],
                 };
                 rand::rngs::OsRng.fill_bytes(&mut key.key);
-                credentials::save(KEY, &key)?;
+                credentials::save(&account, &key)?;
                 key
             }
             None => return Ok(None),
         };
-        let root = base.join("offline-albums");
+        runtime_store::private_directory(root.parent().ok_or(ERROR)?)?;
         runtime_store::private_directory(&root)?;
-        let cache = Self { root, key };
+        let cache = Self {
+            base: base.to_path_buf(),
+            root,
+            key,
+        };
         cache.clean_stages()?;
         Ok(Some(cache))
     }
 
-    pub fn purge(base: &Path) -> Result<(), String> {
-        let deleted = credentials::delete(KEY);
-        let root = base.join("offline-albums");
-        match fs::symlink_metadata(&root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                runtime_store::private_directory(&root)?;
-                fs::remove_dir_all(root).map_err(|_| ERROR)?;
-            }
-            _ => return Err(ERROR.into()),
+    fn location(base: &Path, saved: &SavedConnection) -> (PathBuf, String) {
+        let id = crate::connection::photo_session_scope(saved);
+        Self::scoped_location(base, &id)
+    }
+
+    fn scoped_location(base: &Path, id: &str) -> (PathBuf, String) {
+        (
+            base.join(SCOPED_ROOT).join(id),
+            format!("offline-albums-key-{id}"),
+        )
+    }
+
+    pub fn purge(base: &Path, saved: &SavedConnection) -> Result<(), String> {
+        Self::purge_scope(base, &CleanupScope::from_saved(saved)?)
+    }
+
+    pub fn purge_scope(base: &Path, binding: &CleanupScope) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(binding.id(), 64) {
+            return Err(ERROR.into());
         }
-        deleted
+        let (root, account) = Self::scoped_location(base, binding.id());
+        let deleted = credentials::delete(&account);
+        let removed = remove_directory(&root);
+        let legacy = credentials::load::<Credential>(LEGACY_KEY)?
+            .filter(|legacy| legacy.scope == binding.legacy);
+        if legacy.is_some() {
+            remove_directory(&base.join(LEGACY_ROOT))?;
+            credentials::delete(LEGACY_KEY)?;
+        }
+        deleted.and(removed)
     }
 
     fn clean_stages(&self) -> Result<(), String> {
@@ -229,6 +337,13 @@ impl Cache {
         let bytes = serde_json::to_vec(manifest).map_err(|_| ERROR)?;
         if bytes.len() as u64 > MAX_MANIFEST {
             return Err(ERROR.into());
+        }
+        if self
+            .storage_used()?
+            .checked_add(bytes.len() as u64 + OVERHEAD)
+            .is_none_or(|used| used > CAP)
+        {
+            return Err("offline_album_storage_limit".into());
         }
         let file = path.join(format!(".manifest-{}", Uuid::new_v4()));
         let result = self
@@ -319,20 +434,34 @@ impl Cache {
     }
 
     fn storage_used(&self) -> Result<u64, String> {
-        let mut bytes = 0u64;
-        for id in self.album_ids()? {
-            let dir = self.directory(id);
-            runtime_store::private_directory(&dir)?;
-            for file in fs::read_dir(dir).map_err(|_| ERROR)? {
-                let file = file.map_err(|_| ERROR)?;
-                let metadata = fs::symlink_metadata(file.path()).map_err(|_| ERROR)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
+        let mut bytes = stored_bytes(&self.base.join(LEGACY_ROOT))?;
+        let parent = self.base.join(SCOPED_ROOT);
+        if directory_exists(&parent)? {
+            for entry in fs::read_dir(parent).map_err(|_| ERROR)? {
+                let entry = entry.map_err(|_| ERROR)?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or(ERROR)?;
+                if name.len() != 64
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                {
                     return Err(ERROR.into());
                 }
-                bytes = bytes.checked_add(metadata.len()).ok_or(ERROR)?;
+                bytes = bytes
+                    .checked_add(stored_bytes(&entry.path())?)
+                    .ok_or(ERROR)?;
             }
         }
         Ok(bytes)
+    }
+
+    fn download_budget(&self, limit: u64) -> Result<u64, String> {
+        // One manifest completes the download, and another can refresh its authorization atomically.
+        limit
+            .checked_sub(self.storage_used()?)
+            .and_then(|bytes| bytes.checked_sub(2 * (MAX_MANIFEST + OVERHEAD)))
+            .ok_or_else(|| "offline_album_storage_limit".into())
     }
 
     pub async fn download(
@@ -357,10 +486,7 @@ impl Cache {
             }
             .into());
         }
-        let mut remaining = CAP
-            .checked_sub(self.storage_used()?)
-            .and_then(|bytes| bytes.checked_sub(MAX_MANIFEST + OVERHEAD))
-            .ok_or("offline_album_storage_limit")?;
+        let mut remaining = self.download_budget(CAP)?;
         let stage = Stage(self.root.join(format!(".stage-{}", Uuid::new_v4())));
         runtime_store::create_private_directory(&stage.0)?;
         let total = plan.items.len();
@@ -716,9 +842,11 @@ mod tests {
             }
         }
         fn cache(&self) -> Cache {
-            let root = self.base.join("offline-albums");
+            let (root, _) = Cache::location(&self.base, &self.saved);
+            runtime_store::private_directory(root.parent().unwrap()).unwrap();
             runtime_store::private_directory(&root).unwrap();
             Cache {
+                base: self.base.clone(),
                 root,
                 key: Credential {
                     scope: scope(&self.saved).unwrap(),
@@ -741,6 +869,114 @@ mod tests {
             self.stop();
             let _ = fs::remove_dir_all(&self.base);
         }
+    }
+
+    #[test]
+    fn quota_counts_inactive_sessions_and_staging_bytes_without_opening_their_keys() {
+        let fixture = Fixture::new();
+        let active = fixture.cache();
+        let mut parked = fixture.saved.clone();
+        parked.account_id = Uuid::new_v4().to_string();
+        let (inactive, _) = Cache::location(&fixture.base, &parked);
+        assert_ne!(active.root, inactive);
+        runtime_store::private_directory(&inactive).unwrap();
+
+        let album = active.directory(fixture.album);
+        runtime_store::private_directory(&album).unwrap();
+        fs::write(album.join("album"), [0u8; 12]).unwrap();
+        let abandoned = inactive.join(format!(".stage-{}", Uuid::new_v4()));
+        runtime_store::private_directory(&abandoned).unwrap();
+        fs::write(abandoned.join(fixture.item.to_string()), [0u8; 40]).unwrap();
+
+        let legacy = fixture.base.join(LEGACY_ROOT);
+        runtime_store::private_directory(&legacy).unwrap();
+        let old = legacy.join(fixture.album.to_string());
+        runtime_store::private_directory(&old).unwrap();
+        fs::write(old.join("album"), [0u8; 15]).unwrap();
+
+        assert_eq!(active.storage_used().unwrap(), 67);
+        let limit = 2 * (MAX_MANIFEST + OVERHEAD) + 60;
+        assert_eq!(
+            active.download_budget(limit).unwrap_err(),
+            "offline_album_storage_limit"
+        );
+        remove_directory(&inactive).unwrap();
+        assert_eq!(active.download_budget(limit).unwrap(), 33);
+        assert!(album.is_dir());
+        assert!(old.is_dir());
+    }
+
+    #[test]
+    #[ignore = "uses a process-local synthetic Keychain; run alone"]
+    fn legacy_migration_and_removal_keep_other_approved_offline_scopes() {
+        crate::ml_transport::native_nas_tests::install_test_keyring();
+        let fixture = Fixture::new();
+        let saved = &fixture.saved;
+        let legacy = fixture.base.join(LEGACY_ROOT);
+        runtime_store::private_directory(&legacy).unwrap();
+        let legacy_key = Credential {
+            scope: scope(saved).unwrap(),
+            key: [87; 32],
+        };
+        credentials::save(LEGACY_KEY, &legacy_key).unwrap();
+        let (_, scoped_account) = Cache::location(&fixture.base, saved);
+        // Resume after interruption between writing the scoped key and renaming the directory.
+        credentials::save(&scoped_account, &legacy_key).unwrap();
+        let old = Cache {
+            base: fixture.base.clone(),
+            root: legacy.clone(),
+            key: legacy_key,
+        };
+        let album = old.directory(fixture.album);
+        runtime_store::private_directory(&album).unwrap();
+        old.write(
+            &album.join("album"),
+            "test-binding",
+            b"approved-original".to_vec(),
+        )
+        .unwrap();
+
+        let mut other = saved.clone();
+        other.account_id = Uuid::new_v4().to_string();
+        let other_cache = Cache::open(&fixture.base, &other, true).unwrap().unwrap();
+        let other_album = other_cache.directory(fixture.album);
+        runtime_store::private_directory(&other_album).unwrap();
+        other_cache
+            .write(
+                &other_album.join("album"),
+                "test-binding",
+                b"other-original".to_vec(),
+            )
+            .unwrap();
+        assert!(legacy.is_dir());
+
+        let restored = Cache::open(&fixture.base, saved, false).unwrap().unwrap();
+        assert!(!legacy.exists());
+        assert!(credentials::load::<Credential>(LEGACY_KEY)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            restored
+                .read(
+                    &restored.directory(fixture.album).join("album"),
+                    "test-binding",
+                    64
+                )
+                .unwrap(),
+            b"approved-original"
+        );
+
+        let removed = CleanupScope::from_saved(saved).unwrap();
+        Cache::purge_scope(&fixture.base, &removed).unwrap();
+        assert!(Cache::open(&fixture.base, saved, false).unwrap().is_none());
+        let parked = Cache::open(&fixture.base, &other, false).unwrap().unwrap();
+        assert_eq!(
+            parked
+                .read(&other_album.join("album"), "test-binding", 64)
+                .unwrap(),
+            b"other-original"
+        );
+        Cache::purge(&fixture.base, &other).unwrap();
     }
 
     #[tokio::test]

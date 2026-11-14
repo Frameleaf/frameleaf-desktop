@@ -9,7 +9,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -26,6 +26,7 @@ const SPACE_RESERVE: u64 = 64 * 1024 * 1024;
 pub(crate) struct MediaCopy {
     active: Arc<tokio::sync::Mutex<()>>,
     cancelled: Arc<AtomicBool>,
+    epoch: AtomicU64,
 }
 
 impl MediaCopy {
@@ -42,6 +43,23 @@ impl MediaCopy {
 
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    // The caller holds DesktopState. Never wait for the copy guard here: publication also needs DesktopState.
+    pub(crate) fn fence_session(&self) {
+        self.cancel();
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn request_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn require_epoch(&self, requested: u64) -> Result<(), String> {
+        if self.request_epoch() != requested {
+            return Err("media_copy_session_changed".into());
+        }
+        Ok(())
     }
 }
 
@@ -108,13 +126,25 @@ async fn client(saved: &SavedConnection) -> Result<(reqwest::Client, url::Url), 
     Ok((client, origin))
 }
 
+#[derive(Serialize)]
+pub(crate) struct PackageList {
+    epoch: u64,
+    packages: Vec<Package>,
+}
+
 #[tauri::command]
 pub(crate) async fn preservation_copy_packages(
     window: WebviewWindow,
     state: State<'_, DesktopState>,
-) -> Result<Vec<Package>, String> {
+    job: State<'_, MediaCopy>,
+) -> Result<PackageList, String> {
     require_local(&window)?;
-    let saved = state.0.lock().await.clone().ok_or("sign_in_required")?;
+    let epoch = job.request_epoch();
+    let saved = {
+        let current = state.0.lock().await;
+        job.require_epoch(epoch)?;
+        current.clone().ok_or("sign_in_required")?
+    };
     let (client, origin) = client(&saved).await?;
     let response = client
         .get(origin.join("api/preservation/packages").unwrap())
@@ -123,11 +153,13 @@ pub(crate) async fn preservation_copy_packages(
         .await
         .map_err(|_| TRANSFER)?;
     let mut packages: Vec<Package> = transport::json_limit(response, 4 * 1024 * 1024).await?;
-    if !same_session(state.0.lock().await.as_ref(), &saved) {
+    let current = state.0.lock().await;
+    job.require_epoch(epoch)?;
+    if !same_session(current.as_ref(), &saved) {
         return Err("media_copy_session_changed".into());
     }
     packages.retain(Package::eligible);
-    Ok(packages)
+    Ok(PackageList { epoch, packages })
 }
 
 #[derive(Serialize)]
@@ -143,6 +175,7 @@ pub(crate) async fn save_preservation_copy(
     app: AppHandle,
     window: WebviewWindow,
     package_id: String,
+    epoch: u64,
     state: State<'_, DesktopState>,
     job: State<'_, MediaCopy>,
 ) -> Result<Option<SavedCopy>, String> {
@@ -151,20 +184,24 @@ pub(crate) async fn save_preservation_copy(
         .ok()
         .filter(|id| id.get_version_num() == 7 && id.to_string() == package_id)
         .ok_or("media_copy_package_unavailable")?;
-    let active = job
-        .active
-        .clone()
-        .try_lock_owned()
-        .map_err(|_| "media_copy_busy")?;
-    let saved = {
+    let (saved, active) = {
         let state = state.0.lock().await;
+        job.require_epoch(epoch)?;
         let saved = state.as_ref().ok_or("sign_in_required")?.clone();
+        let active = job
+            .active
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| "media_copy_busy")?;
         job.cancelled.store(false, Ordering::Release);
-        saved
+        (saved, active)
     };
     let cancelled = job.cancelled.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _active = active;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CANCELLED.into());
+        }
         let Some(path) = app
             .dialog()
             .file()
@@ -184,11 +221,15 @@ pub(crate) async fn save_preservation_copy(
 }
 
 #[tauri::command]
-pub(crate) fn cancel_preservation_copy(
+pub(crate) async fn cancel_preservation_copy(
     window: WebviewWindow,
+    epoch: u64,
+    state: State<'_, DesktopState>,
     job: State<'_, MediaCopy>,
 ) -> Result<(), String> {
     require_local(&window)?;
+    let _current = state.0.lock().await;
+    job.require_epoch(epoch)?;
     job.cancel();
     Ok(())
 }
@@ -199,11 +240,13 @@ async fn chunk(
 ) -> Result<Option<impl AsRef<[u8]>>, &'static str> {
     tokio::select! {
         value = response.chunk() => value.map_err(|_| TRANSFER),
-        _ = async {
-            while !cancelled.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-        } => Err(CANCELLED),
+        _ = wait_for_cancel(cancelled) => Err(CANCELLED),
+    }
+}
+
+async fn wait_for_cancel(cancelled: &AtomicBool) {
+    while !cancelled.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -238,7 +281,11 @@ async fn copy(
     };
     check()?;
     let destination = destination::Destination::open(path)?;
-    let (client, origin) = client(saved).await?;
+    let (client, origin) = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancelled) => return Err(CANCELLED.into()),
+        result = client(saved) => result?,
+    };
     let request = |suffix: &str| {
         client
             .get(
@@ -248,7 +295,11 @@ async fn copy(
             )
             .bearer_auth(&saved.token)
     };
-    let entry: Package = transport::json(send(request(""), cancelled).await?).await?;
+    let entry: Package = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancelled) => return Err(CANCELLED.into()),
+        result = async { transport::json(send(request(""), cancelled).await?).await } => result?,
+    };
     if entry.id != package || !entry.eligible() {
         return Err("media_copy_package_unavailable".into());
     }
@@ -328,6 +379,23 @@ async fn copy(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::MediaCopy;
+
+    #[test]
+    fn session_fence_cancels_the_running_copy_and_refuses_queued_requests() {
+        let copy = MediaCopy::default();
+        let before = copy.request_epoch();
+        let active = copy.active.try_lock().unwrap();
+        copy.fence_session();
+        assert!(copy.cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            copy.require_epoch(before).unwrap_err(),
+            "media_copy_session_changed"
+        );
+        assert!(copy.active.try_lock().is_err());
+        drop(active);
+        assert!(copy.require_epoch(copy.request_epoch()).is_ok());
+        assert!(copy.active.try_lock().is_ok());
+    }
 
     #[test]
     fn update_and_media_copy_cannot_run_together() {

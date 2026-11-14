@@ -79,6 +79,8 @@ await withBrowser(async ({ browser, origin }) => {
   await page.keyboard.press('Tab');
   assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Offline Albums');
   await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Switch library…');
+  await page.keyboard.press('Tab');
   assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Sign out…');
   await page.keyboard.press('Enter');
   const dialog = page.getByRole('dialog');

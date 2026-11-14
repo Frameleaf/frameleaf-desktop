@@ -27,7 +27,7 @@ function mount() {
 test('leaving the Backups page keeps the copy running and a return shows it in progress', async () => {
   const { calls, invoke, finish } = backend();
   const first = mount();
-  const copy = saveCopy(invoke, 'package', 'mac');
+  const copy = saveCopy(invoke, 'package', 7, 'mac');
   assert.equal(first.shown().copying, true);
   first.unmount();
   assert.deepEqual(calls, ['save_preservation_copy']);
@@ -54,8 +54,8 @@ test('the page itself never cancels a copy when it is destroyed', () => {
 
 test('only an explicit cancel reaches the backend, and a second save cannot start alongside', async () => {
   const { calls, invoke, fail } = backend();
-  const copy = saveCopy(invoke, 'package', 'mac');
-  await saveCopy(invoke, 'package', 'mac');
+  const copy = saveCopy(invoke, 'package', 7, 'mac');
+  await saveCopy(invoke, 'package', 7, 'mac');
   assert.deepEqual(calls, ['save_preservation_copy']);
   await cancelCopy(invoke, 'mac');
   assert.deepEqual(calls, ['save_preservation_copy', 'cancel_preservation_copy']);

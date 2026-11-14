@@ -222,6 +222,21 @@ pub struct SavedConnection {
     pub device_id: Option<String>,
 }
 
+/// Binds local authority and browsing data to a single approved Photos sign-in.
+pub(crate) fn photo_session_scope(saved: &SavedConnection) -> String {
+    let mut scope = Sha256::new();
+    for field in [
+        &saved.server,
+        &saved.server_id,
+        &saved.account_id,
+        &saved.token,
+    ] {
+        scope.update((field.len() as u64).to_be_bytes());
+        scope.update(field.as_bytes());
+    }
+    format!("{:x}", scope.finalize())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Features {
