@@ -401,3 +401,51 @@ fn main(){{
         .to_string_lossy()
         .starts_with("inference-")));
 }
+
+#[test]
+fn a_signed_runtime_alone_does_not_admit_the_qwen_description_candidate() {
+    let root = Fixture::new();
+    fs::write(root.0.join("python"), b"fixture").unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&root.manifest()).unwrap();
+    for (path, bytes) in [
+        ("model.gguf", b"synthetic model".as_slice()),
+        ("mmproj.gguf", b"synthetic projector".as_slice()),
+    ] {
+        fs::write(root.0.join(path), bytes).unwrap();
+        manifest["files"][path] = json!({
+            "bytes": bytes.len(), "sha256": format!("{:x}", Sha256::digest(bytes)),
+        });
+    }
+    let raw = serde_json::to_vec(&manifest).unwrap();
+    let signing = key();
+    let runtime = VerifiedRuntime::verify(
+        &root.0,
+        &raw,
+        &signing.sign(&raw).to_bytes(),
+        &[signing.verifying_key()],
+        7,
+    )
+    .unwrap();
+    let entries = json!({
+        "image-description-tagging": {
+            "visual": { "modelName": "Qwen/Qwen3.5-4B", "options": {} }
+        }
+    });
+    assert!(frameleaf_desktop::model_catalogue::approved_profile(
+        "Qwen/Qwen3.5-4B",
+        &entries,
+        runtime.source_revision(),
+        runtime.provider(),
+    )
+    .unwrap()
+    .is_none());
+    fs::write(root.0.join("mmproj.gguf"), b"changed projector").unwrap();
+    assert!(VerifiedRuntime::verify(
+        &root.0,
+        &raw,
+        &signing.sign(&raw).to_bytes(),
+        &[signing.verifying_key()],
+        7,
+    )
+    .is_err());
+}

@@ -1162,24 +1162,35 @@ mod tests {
         server.join().unwrap();
     }
     #[test]
-    fn image_prediction_preserves_binary_bytes_and_uses_a_file_part() {
+    fn description_prediction_preserves_bound_entries_and_binary_image() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let input = [0xff, 0, 0x80];
+        let entries =
+            json!({"image-description-tagging":{"visual":{"modelName":"Qwen3.5-4B","options":{}}}});
+        let config = entries.to_string();
+        let expected_config = config.clone();
+        let result = json!({"image-description-tagging":{"description":"A red square.","people":[],"environment":"","objects":[],"visible_text":[],"context":"","tags":[]}});
+        let response = result.to_string();
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let bytes = read_request(&mut socket);
             assert!(bytes.windows(input.len()).any(|w| w == input));
             assert!(String::from_utf8_lossy(&bytes).contains("name=\"image\"; filename=\"input\""));
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .unwrap();
+            let request = String::from_utf8_lossy(&bytes);
+            assert!(request.contains(&expected_config));
+            assert!(request.contains(&format!("authorization: Bearer {}", "a".repeat(64))));
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
         });
         let mut task = task();
         task.input_kind = InputKind::Image;
         task.input_sha256 = format!("{:x}", Sha256::digest(input));
-        let entries = json!({"clip":{"visual":{"modelName":"fixture"}}});
-        task.config_json = entries.to_string();
+        task.config_json = config;
         task.config_sha256 = format!("{:x}", Sha256::digest(task.config_json.as_bytes()));
         let client = BoundClient::new(
             port,
@@ -1189,7 +1200,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             tauri::async_runtime::block_on(client.predict(&task, &input)).unwrap(),
-            json!({})
+            result
         );
         server.join().unwrap();
     }

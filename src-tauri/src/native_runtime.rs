@@ -494,17 +494,7 @@ impl VerifiedRuntime {
         absolute_directory(cache)?;
         absolute_directory(private_root)?;
         let scratch = private_root.join(format!("inference-{}", uuid::Uuid::new_v4()));
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let mut builder = builder;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&scratch)
-            .map_err(|_| "runtime_scratch_failed")?;
+        crate::runtime_store::create_private_directory(&scratch)?;
         let owner = match own_scratch(&scratch) {
             Ok(owner) => owner,
             Err(error) => {
@@ -831,6 +821,28 @@ impl VerifiedRuntime {
         {
             return Err("runtime_qualification_input_invalid".into());
         }
+        let qwen_binary = if value["engine"] == "qwen-gguf" {
+            let mut candidates = self.manifest.files.iter().filter(|(path, _)| {
+                match self.manifest.platform.as_str() {
+                    "windows" => {
+                        path.as_str()
+                            == "python/Lib/site-packages/frameleaf_ml/native-bin/llama-server.exe"
+                    }
+                    "macos" | "linux" => {
+                        path.starts_with("python/lib/python")
+                            && path.ends_with("/site-packages/frameleaf_ml/native-bin/llama-server")
+                    }
+                    _ => false,
+                }
+            });
+            let (_, artifact) = candidates.next().ok_or("runtime_qwen_binary_unavailable")?;
+            if candidates.next().is_some() {
+                return Err("runtime_qwen_binary_unavailable".into());
+            }
+            Some(artifact.sha256.as_str())
+        } else {
+            None
+        };
         let mut child = self.launch(
             cache,
             private_root,
@@ -882,6 +894,7 @@ impl VerifiedRuntime {
             &format!("{:x}", Sha256::digest(spec)),
             self.provider(),
             metal::collector_hash(&self.manifest),
+            qwen_binary,
         )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
@@ -919,6 +932,7 @@ fn validate_report(
     binding: &str,
     runtime_provider: &str,
     expected_collector: Option<&str>,
+    qwen_binary: Option<&str>,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -938,6 +952,52 @@ fn validate_report(
             .as_str()
             .filter(|s| digest_valid(s, 64))
             .is_none()
+    {
+        return Err(invalid());
+    }
+    if spec["engine"] == "qwen-gguf" {
+        let binary = qwen_binary
+            .filter(|hash| digest_valid(hash, 64))
+            .ok_or_else(invalid)?;
+        let execution = report["qwenExecution"].as_object().ok_or_else(invalid)?;
+        let build = execution
+            .get("build")
+            .and_then(|item| item.as_str())
+            .ok_or_else(invalid)?;
+        let (number, revision) = build
+            .strip_prefix('b')
+            .and_then(|item| item.split_once('-'))
+            .ok_or_else(invalid)?;
+        if report["engine"] != "qwen-gguf"
+            || spec["provider"] != "CPUExecutionProvider"
+            || runtime_provider != "CPUExecutionProvider"
+            || expected_collector.is_some()
+            || report["state"] != "ready-cpu"
+            || execution.len() != 3
+            || execution.get("binarySha256").and_then(|item| item.as_str()) != Some(binary)
+            || number.is_empty()
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || !revision.starts_with("7fe450e19")
+            || revision.len() > 40
+            || !digest_valid(revision, revision.len())
+            || !execution
+                .get("coldMilliseconds")
+                .and_then(|item| item.as_array())
+                .is_some_and(|samples| {
+                    samples.len() == 2
+                        && samples.iter().all(|sample| {
+                            sample
+                                .as_f64()
+                                .is_some_and(|value| (0.0..=600_000.0).contains(&value))
+                        })
+                })
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    if spec.get("engine").is_some_and(|engine| engine != "onnx")
+        || report.get("engine").is_some_and(|engine| engine != "onnx")
         || !["coldMilliseconds", "warmMilliseconds"].iter().all(|key| {
             report[*key]
                 .as_f64()
@@ -1017,6 +1077,39 @@ fn validate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qwen_report_requires_signed_binary_and_exact_cpu_candidate_evidence() {
+        const CPU: &str = "CPUExecutionProvider";
+        let spec = serde_json::json!({"engine":"qwen-gguf","provider":"CPUExecutionProvider","modelKey":"candidate",
+            "fixtureSha256":"a".repeat(64),"preprocessingSha256":"b".repeat(64)});
+        let mut report = spec.clone();
+        report["protocolVersion"] = serde_json::json!(1);
+        report["bindingSha256"] = serde_json::json!("binding");
+        report["runtimeFingerprint"] = serde_json::json!("c".repeat(64));
+        report["state"] = serde_json::json!("ready-cpu");
+        let binary = "d".repeat(64);
+        report["qwenExecution"] = serde_json::json!({"build":"b11146-7fe450e19","binarySha256":binary,"coldMilliseconds":[100.0,120.0]});
+        assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&binary)).is_ok());
+        assert!(validate_report(&report, &spec, "binding", CPU, None, None).is_err());
+        assert!(
+            validate_report(&report, &spec, "binding", CPU, None, Some(&"e".repeat(64))).is_err()
+        );
+        let mut invalid = report.clone();
+        invalid["qwenExecution"]["build"] = serde_json::json!("b11146-000000000");
+        assert!(validate_report(&invalid, &spec, "binding", CPU, None, Some(&binary)).is_err());
+        // A Qwen candidate is CPU-only: never under an accelerated runtime's manifest.
+        assert!(validate_report(
+            &report,
+            &spec,
+            "binding",
+            "CoreMLExecutionProvider",
+            None,
+            Some(&binary)
+        )
+        .is_err());
+        report["qwenExecution"]["coldMilliseconds"] = serde_json::json!([100.0]);
+        assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&binary)).is_err());
+    }
     #[test]
     fn a_refused_qualification_names_its_reason_from_the_report_it_left() {
         let root = std::env::temp_dir()
@@ -1147,7 +1240,7 @@ mod tests {
     }
     fn check(provider: &str, state: &str, cpu_nodes: bool, runtime: &str) -> Result<(), String> {
         let [report, spec] = report_for(provider, state, cpu_nodes);
-        validate_report(&report, &spec, &"c".repeat(64), runtime, None)
+        validate_report(&report, &spec, &"c".repeat(64), runtime, None, None)
     }
     #[test]
     fn report_is_accepted_only_for_the_provider_the_runtime_declares() {

@@ -429,8 +429,41 @@ def dependency_indexes(system: str, architecture: str) -> list[str]:
     return indexes
 
 
+QWEN_LLAMA_REVISION = "7fe450e19305b828c199d602c23a8337aaa1f03b"
+
+
+def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path, system: str) -> Path:
+    executable = "llama-server.exe" if system == "windows" else "llama-server"
+    binary, license_file = (source / name for name in (executable, "LICENSE"))
+    try:
+        source_info = regular(source)
+        binary_info = regular(binary)
+        license_info = regular(license_file)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise BuildError("runtime_qwen_input_invalid") from error
+    if (
+        not stat.S_ISDIR(source_info.st_mode)
+        or not re.fullmatch(r"[a-f0-9]{64}", expected)
+        or not stat.S_ISREG(binary_info.st_mode)
+        or not stat.S_ISREG(license_info.st_mode)
+        or license_info.st_size not in range(1, 64 * 1024)
+        or not (site / "frameleaf_ml/native_qwen.py").is_file()
+        or (system == "windows" and not (site / "frameleaf_ml/native_qwen_windows.py").is_file())
+    ):
+        raise BuildError("runtime_qwen_input_invalid")
+    destination = site / "frameleaf_ml/native-bin" / executable
+    destination.parent.mkdir()
+    shutil.copyfile(binary, destination)
+    if sha256(destination) != expected:
+        raise BuildError("runtime_qwen_binary_digest_mismatch")
+    destination.chmod(0o755)
+    shutil.copyfile(license_file, notices / "llama.cpp-LICENSE.txt")
+    return destination
+
+
 def build(
-    source: Path, output: Path, revision: str, epoch: int, profile_name: str
+    source: Path, output: Path, revision: str, epoch: int, profile_name: str,
+    qwen: tuple[Path, str] | None = None,
 ) -> None:
     source = source.resolve(strict=True)
     output = output.absolute()
@@ -457,6 +490,8 @@ def build(
     }.get(platform.machine(), "unsupported")
     if f"{system}-{architecture}" not in profile["targets"]:
         raise BuildError("runtime_target_unqualified")
+    if qwen is not None and (profile_name != "cpu-ort"):
+        raise BuildError("runtime_qwen_target_unqualified")
     # The processor manifest of an accelerated pack is the processor provider of the same
     # payload: the cpu-ort dependency set itself for CoreML, and for CUDA and OpenVINO the
     # processor provider of their own onnxruntime build, on the same Python.
@@ -758,6 +793,11 @@ def build(
             # What this target installs instead of the version the source locks.
             **({"targetPins": pins} if pins else {}),
         }
+        qwen_relative = None
+        if qwen is not None:
+            qwen_binary = stage_qwen_binary(*qwen, site, notices, system)
+            qwen_relative = qwen_binary.relative_to(payload)
+            receipt["qwenLlama"] = {"sourceRevision": QWEN_LLAMA_REVISION, "inputBinarySha256": qwen[1]}
         (payload / "provenance.json").write_text(
             json.dumps(receipt, sort_keys=True) + "\n"
         )
@@ -788,6 +828,13 @@ def build(
             or not {profile["provider"], CPU_PROVIDER} <= set(smoke["providers"])
         ):
             raise BuildError("runtime_relocation_failed")
+        if qwen_relative is not None:
+            version = subprocess.run(
+                [payload / qwen_relative, "--version"], cwd=work, env=smoke_env,
+                capture_output=True, check=True, timeout=15,
+            )
+            if not re.search(rb"\b" + QWEN_LLAMA_REVISION[:9].encode() + rb"[a-f0-9]*\b", version.stdout + version.stderr):
+                raise BuildError("runtime_qwen_revision_unverified")
         if metal_observer:
             # The collector must load from its relocated place; a device is not required to build.
             loaded = run(
@@ -850,9 +897,14 @@ def main() -> None:
     parser.add_argument("--revision", required=True)
     parser.add_argument("--epoch", type=int, required=True)
     parser.add_argument("--profile", default="cpu-ort")
+    parser.add_argument("--qwen-runtime", type=Path, help="Directory holding an offline-built llama-server and its license")
+    parser.add_argument("--qwen-sha256", help="Expected SHA-256 of the candidate llama-server")
     args = parser.parse_args()
+    if (args.qwen_runtime is None) != (args.qwen_sha256 is None):
+        parser.error("Qwen runtime staging requires both --qwen-runtime and --qwen-sha256")
+    qwen = (args.qwen_runtime, args.qwen_sha256) if args.qwen_runtime is not None else None
     try:
-        build(args.source, args.output, args.revision, args.epoch, args.profile)
+        build(args.source, args.output, args.revision, args.epoch, args.profile, qwen)
     except (BuildError, OSError, subprocess.SubprocessError) as error:
         parser.exit(
             1, f"{error if isinstance(error, BuildError) else 'runtime_build_failed'}\n"
