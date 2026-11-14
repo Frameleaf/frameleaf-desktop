@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -96,5 +96,38 @@ test('interactive watcher refuses a writable executable path before contacting L
     assert.equal(result.status, 1);
     assert.match(result.stderr, /administrator-protected Desktop installation|qualification account can modify/);
     assert.doesNotMatch(result.stderr, /Unexpected Library request/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('recovery verifies the separate photo and video without contacting the Library', () => {
+  const root = join(tmpdir(), 'frameleaf-installed-recovery-' + randomUUID());
+  const restored = join(root, 'media-restored');
+  mkdirSync(restored, { recursive: true });
+  const receipt = join(root, 'media.json');
+  const names = ['synthetic-recovery-photo.png', 'synthetic-recovery-video.mp4'];
+  for (const name of names) writeFileSync(join(restored, name), name);
+  writeFileSync(receipt, JSON.stringify(names.map(name => ({
+    name, id: randomUUID(), sha256: createHash('sha256').update(name).digest('hex'),
+  }))));
+  const loader = `
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    globalThis.fetch = async () => { throw Error('Media verification contacted Library'); };
+  `;
+  const check = () => spawnSync(process.execPath, [
+    '--import', 'data:text/javascript,' + encodeURIComponent(loader),
+    'tools/qualify_installed_photo.mjs', 'recovery-media', receipt,
+  ], { encoding: 'utf8', timeout: 10_000, env: {
+    ...process.env, FRAMELEAF_RECOVERY_DISPOSABLE: '1',
+    FRAMELEAF_SYNTHETIC_PHOTO_PASSWORD: '',
+  } });
+  try {
+    const intact = check();
+    assert.equal(intact.status, 0, intact.stderr);
+    assert.match(intact.stdout, /original photo and video bytes without Library access/);
+    writeFileSync(join(restored, names[1]), 'corrupted synthetic video');
+    const damaged = check();
+    assert.equal(damaged.status, 1, damaged.stderr);
+    assert.match(damaged.stderr, /ERR_ASSERTION/);
+    assert.doesNotMatch(damaged.stdout, /restored and verified/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
