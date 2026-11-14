@@ -471,7 +471,8 @@ fn current(
     identity: &DeviceIdentity,
     source: &str,
 ) -> Result<Consent, String> {
-    let consent = credentials::load::<Consent>(credential)?.ok_or("source_approval_required")?;
+    let consent = credentials::load_source::<Consent>(credential, saved)?
+        .ok_or("source_approval_required")?;
     consent.approval(saved, identity)?;
     if consent.source_id() != source {
         return Err("source_approval_changed".into());
@@ -1397,6 +1398,13 @@ impl SourceJobs {
             let _ = running.task.await;
         }
     }
+    pub(crate) async fn park(&self) {
+        self.stop().await;
+        self.watching.store(false, Ordering::Release);
+        if let Ok(mut status) = self.status.lock() {
+            *status = ImportView::default();
+        }
+    }
     pub fn status(
         &self,
         base: &Path,
@@ -1486,8 +1494,8 @@ impl SourceJobs {
     ) -> Result<ImportView, String> {
         self.stop().await;
         let identity = credentials::identity()?;
-        let consent =
-            credentials::load::<Consent>(self.credential)?.ok_or("source_approval_required")?;
+        let consent = credentials::load_source::<Consent>(self.credential, &saved)?
+            .ok_or("source_approval_required")?;
         consent.approval(&saved, &identity)?;
         let watch = consent.watch && !consent.watch_paused;
         if consent.watch_paused {
@@ -1550,7 +1558,7 @@ impl SourceJobs {
                 };
                 let result = async {
                     let identity = credentials::identity()?;
-                    let source = credentials::load::<Consent>(credential)?
+                    let source = credentials::load_source::<Consent>(credential, &saved)?
                         .ok_or("source_approval_required")?;
                     let journal = Journal::new(&base, source.source_id())?;
                     let network = Mutex::new((

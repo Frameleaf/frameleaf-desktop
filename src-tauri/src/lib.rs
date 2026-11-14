@@ -25,6 +25,7 @@ pub use host_state::media_move as windows_library_move;
 mod host_storage;
 mod identity_anchor;
 mod import_album;
+mod library_switch;
 pub mod lifecycle;
 mod macos_quit;
 pub mod manager;
@@ -83,7 +84,10 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 #[derive(Default)]
-pub(crate) struct DesktopState(pub(crate) Mutex<Option<SavedConnection>>);
+pub(crate) struct DesktopState(
+    pub(crate) Mutex<Option<SavedConnection>>,
+    std::sync::Mutex<Option<String>>,
+);
 
 pub(crate) fn require_local(window: &WebviewWindow) -> Result<(), String> {
     let url = window.url().map_err(|_| "window_origin_invalid")?;
@@ -442,6 +446,31 @@ async fn sign_in_step(
     }
 }
 
+/// The password step for adding another approved library. A library that asks for another
+/// sign-in step is refused here; it can still be signed in to from the start screen.
+async fn request_login(
+    client: &reqwest::Client,
+    server: &str,
+    email: &str,
+    password: String,
+    device_name: &str,
+    identity: impl FnOnce() -> Result<connection::DeviceIdentity, String>,
+) -> Result<(url::Url, LoginResponse), String> {
+    let base = normalize_server(server)?;
+    let password = Zeroizing::new(password);
+    let email = email.trim();
+    if email.is_empty() || email.len() > 320 || password.is_empty() || password.len() > 4096 {
+        return Err("login_details_invalid".into());
+    }
+    // Check secure persistence and the device identity before sending a password.
+    let identity = identity()?;
+    identity.enrollment("validation", "validation", device_name, "client-worker")?;
+    match server_steps::password(client, &base, email, &password).await? {
+        server_steps::Step::Done(login) => Ok((base, login)),
+        server_steps::Step::Next(_) => Err("library_sign_in_steps_required".into()),
+    }
+}
+
 /// A server session from any sign-in method becomes this computer's saved connection.
 pub(crate) async fn keep_login(
     client: &reqwest::Client,
@@ -450,7 +479,13 @@ pub(crate) async fn keep_login(
     device_name: &str,
     confirm: impl FnOnce(&SavedConnection) -> Result<(), String>,
 ) -> Result<(SavedConnection, ConnectionView), String> {
-    let mut saved = SavedConnection {
+    let mut saved = saved_login(base, login, device_name);
+    let view = finish_new_connection(client, &mut saved, confirm).await?;
+    Ok((saved, view))
+}
+
+fn saved_login(base: &url::Url, login: LoginResponse, device_name: &str) -> SavedConnection {
+    SavedConnection {
         server: base.to_string(),
         server_id: String::new(),
         account_id: login.user_id,
@@ -459,9 +494,7 @@ pub(crate) async fn keep_login(
         device_name: device_name.trim().into(),
         mode: "client-worker".into(),
         device_id: None,
-    };
-    let view = finish_new_connection(client, &mut saved, confirm).await?;
-    Ok((saved, view))
+    }
 }
 
 // Persist the verified identity with the very first credential so cancellation is restart-safe.
@@ -479,7 +512,13 @@ async fn finish_new_connection(
         // this sign-in against. It is not saved; the session just minted is ended below.
         Err("server_sign_in_retry_required".into())
     } else {
-        match credentials::save("connection", saved) {
+        let stored = library_switch::already_approved(saved).and_then(|approved| {
+            if approved {
+                return Err("library_already_approved".into());
+            }
+            credentials::save("connection", saved)
+        });
+        match stored {
             Err(error) => Err(error),
             Ok(()) => match confirm(saved) {
                 Ok(()) => return Ok(prepare_with_capabilities(client, saved, capabilities).await),
@@ -541,16 +580,24 @@ pub(crate) async fn restore_saved(
         }
         None => credentials::load::<SavedConnection>("connection"),
     };
+    // Offline copies an earlier sign-out could not clear are cleared before any sign-in is used.
+    app.state::<offline_albums::OfflineAlbums>()
+        .settle_owed(app)
+        .await;
     let Some(mut saved) = loaded? else {
         // The saved sign-in is gone: drop any connection still held so the window and the
         // background agree.
         stop_connection_work(app).await;
-        let held = current.take().is_some();
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(app)
-            .await;
+        let held = current.take();
+        // Only the offline copies of the library that was signed in are cleared.
+        let offline = app.state::<offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        if let Some(saved) = held.as_ref() {
+            let _ = offline.purge(app, saved).await;
+        }
+        app.state::<media_copy::MediaCopy>().fence_session();
         drop(current);
-        if held {
+        if held.is_some() {
             tray::refresh(app).await;
         }
         return Ok(None);
@@ -566,9 +613,9 @@ pub(crate) async fn restore_saved(
         stop_connection_work(app).await;
     }
     if plan.purge_albums {
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(app)
-            .await;
+        let offline = app.state::<offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        let _ = offline.purge(app, &saved).await;
     }
     plan.resume_work?;
     if let Some(window) = window.filter(|_| retry) {
@@ -579,10 +626,12 @@ pub(crate) async fn restore_saved(
     // A sign-in saved before its server was identified learns and saves the identity in
     // `prepare`, from the server its session was just checked against. Until then it is not used.
     saved_sign_in::identified(&saved)?;
+    // Import approvals saved before libraries were kept apart move to this library's scope.
+    credentials::migrate_source_approvals(&saved)?;
     if view.state == "identity-changed" {
-        app.state::<offline_albums::OfflineAlbums>()
-            .clear(app)
-            .await;
+        let offline = app.state::<offline_albums::OfflineAlbums>();
+        offline.deactivate().await;
+        let _ = offline.purge(app, &saved).await;
     }
     if view.state == "preparing" && view.features.worker_session {
         // Starting replaces a running worker with one that holds the session just issued. A
@@ -598,20 +647,53 @@ pub(crate) async fn restore_saved(
     }
     let jobs = app.state::<source_import::SourceJobs>();
     if !(checking && (jobs.watching() || jobs.copying())) {
-        if let Ok(Some(consent)) =
-            credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
-        {
-            if consent.watch && consent.registered && !consent.watch_paused {
-                if let Ok(base) = import_base(app) {
-                    let _ = jobs.start(app.clone(), base, saved.clone()).await;
-                }
-            }
-        }
+        resume_approved_watch(app, &saved).await;
     }
     *current = Some(saved);
+    if !checking {
+        // A different session: media copies listed for the previous one can no longer start.
+        app.state::<media_copy::MediaCopy>().fence_session();
+    }
     drop(current);
     tray::refresh(app).await;
     Ok(Some(view))
+}
+
+async fn verify_photo_account(
+    client: &reqwest::Client,
+    saved: &SavedConnection,
+) -> Result<(), String> {
+    let base = normalize_server(&saved.server)?;
+    #[derive(Deserialize)]
+    struct User {
+        id: String,
+    }
+    let response = client
+        .get(base.join("api/users/me").unwrap())
+        .bearer_auth(&saved.token)
+        .send()
+        .await
+        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+    let user: User = transport::json(response).await?;
+    if user.id != saved.account_id {
+        return Err("account_identity_changed".into());
+    }
+    Ok(())
+}
+
+async fn resume_approved_watch(app: &AppHandle, saved: &SavedConnection) {
+    if let Ok(Some(consent)) =
+        credentials::load::<source_consent::Consent>(source_consent::CREDENTIAL)
+    {
+        if consent.watch && consent.registered && !consent.watch_paused {
+            if let Ok(base) = import_base(app) {
+                let _ = app
+                    .state::<source_import::SourceJobs>()
+                    .start(app.clone(), base, saved.clone())
+                    .await;
+            }
+        }
+    }
 }
 
 /// Ends the imports, media copy and worker that belong to a connection no longer in use.
@@ -648,21 +730,30 @@ async fn sign_out(
         },
     };
     *current = None;
-    let offline = app
-        .state::<offline_albums::OfflineAlbums>()
-        .clear(&app)
-        .await;
+    // Only the signed-in library's offline copies are cleared; other approved libraries keep theirs.
+    let offline = app.state::<offline_albums::OfflineAlbums>();
+    offline.deactivate().await;
+    // A clear that fails stays owed and is made good at the next restore, without the sign-in.
+    let offline_cleared = match saved.as_ref() {
+        Some(saved) => offline.purge_or_owe(&app, saved).await,
+        None => true,
+    };
+    app.state::<media_copy::MediaCopy>().fence_session();
     // Written down before the sign-in goes, so a crash from here on still wipes the Photos data.
     photo_session::mark(&app);
     // The saved sign-in is removed while the connection is still locked: a restore waiting on the
     // lock would otherwise find it, sign in again and leave a live session behind a signed-out
     // window. Every sign-in saves under this lock too, so nothing can bring it back in between.
+    // It is removed even when the library's offline copies could not be cleared: that clear is
+    // owed on its own and reported here.
     let local = {
         let worker = credentials::delete("worker-session").is_ok();
+        let approved = saved
+            .as_ref()
+            .is_none_or(|saved| library_switch::forget_active(saved).is_ok());
+        let sources = credentials::delete_source_approvals(saved.as_ref());
         let connection = credentials::delete("connection").is_ok();
-        let sources = credentials::delete(source_consent::CREDENTIAL).is_ok();
-        let drops = credentials::delete(drop_import::CREDENTIAL).is_ok();
-        worker && connection && sources && drops && offline
+        worker && connection && sources && approved && offline_cleared
     };
     drop(current);
     tray::refresh(&app).await;
@@ -670,47 +761,62 @@ async fn sign_out(
         async { local },
         async {
             // The Photos session lives in the web data store, not in its window: it is wiped
-            // through the window that asked, with the Photos window open or closed.
-            let closed = app
-                .get_webview_window("photos")
-                .is_none_or(|photos| photos.close().is_ok());
+            // through the window that asked, with the Photos window open or closed. Clearing the
+            // window also forgets which library it was opened for.
+            let closed = clear_photos_window(&app).is_ok();
             let cleared = photo_session::clear(&app, &window);
             cleared && closed
         },
         async {
-            let Some(saved) = saved else {
-                return false;
-            };
-            let Ok(base) = normalize_server(&saved.server) else {
-                return false;
-            };
-            let Ok(client) = transport::client() else {
-                return false;
-            };
-            let mut revoked = true;
-            if let Some(device) = &saved.device_id {
-                let Ok(url) = base.join(&format!("api/desktop/devices/{device}/session")) else {
-                    return false;
-                };
-                revoked &= client
-                    .delete(url)
-                    .bearer_auth(&saved.token)
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
+            match saved.as_ref() {
+                Some(saved) => revoke_photo_connection(saved).await,
+                None => false,
             }
-            revoked &= client
-                .post(base.join("api/auth/logout").unwrap())
-                .bearer_auth(&saved.token)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            revoked
         },
     )
     .await)
+}
+
+async fn revoke_photo_connection(saved: &SavedConnection) -> bool {
+    let Ok(base) = normalize_server(&saved.server) else {
+        return false;
+    };
+    let Ok(client) = transport::client() else {
+        return false;
+    };
+    let mut revoked = true;
+    if let Some(device) = &saved.device_id {
+        let Ok(url) = base.join(&format!("api/desktop/devices/{device}/session")) else {
+            return false;
+        };
+        revoked &= client
+            .delete(url)
+            .bearer_auth(&saved.token)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+    }
+    revoked &= client
+        .post(base.join("api/auth/logout").unwrap())
+        .bearer_auth(&saved.token)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    revoked
+}
+
+fn clear_photos_window(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<DesktopState>();
+    let mut scope = state.1.lock().map_err(|_| "library_photos_clear_failed")?;
+    if let Some(photos) = app.get_webview_window("photos") {
+        let cleared = photos.clear_all_browsing_data();
+        let closed = photos.destroy();
+        cleared
+            .and(closed)
+            .map_err(|_| "library_photos_clear_failed")?;
+    }
+    *scope = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -728,59 +834,77 @@ async fn open_photos(
 /// Shows the photo window for the signed-in connection, from the window or the tray alike.
 pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
-    if let Some(photos) = app.get_webview_window("photos") {
-        if photos.url().is_ok_and(|url| url.origin() == base.origin()) {
+    let expected = connection::photo_session_scope(saved);
+    let state = app.state::<DesktopState>();
+    let mut scope = state.1.lock().map_err(|_| "photo_window_unavailable")?;
+    let photos = if let Some(photos) = app.get_webview_window("photos") {
+        if scope.as_ref() != Some(&expected) {
+            return Err("library_photos_clear_failed".into());
+        }
+        if !photos
+            .url()
+            .is_ok_and(|url| offline_albums::local_url(&url))
+        {
             photos.show().map_err(|_| "photo_window_unavailable")?;
             photos.set_focus().map_err(|_| "photo_window_unavailable")?;
             return Ok(());
         }
-    }
+        photos
+    } else {
+        photo_window(app, &base, base.clone(), expected.clone())?
+    };
     // An earlier sign-out that could not wipe its Photos data is made good before a new session.
     photo_session::clear_if_owed(app);
-    let photos = photo_window(app, &base, base.clone())?;
-    let domain = base.host_str().ok_or("server_address_invalid")?;
-    let secure = base.scheme() == "https";
-    let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
-        .domain(domain)
-        .path("/")
-        .secure(secure)
-        .http_only(true)
-        .build();
-    photos
-        .set_cookie(token)
-        .map_err(|_| "photo_session_unavailable")?;
-    for (key, value) in [
-        ("immich_is_authenticated", "true"),
-        ("immich_auth_type", "password"),
-    ] {
+    let result = (|| {
+        let domain = base.host_str().ok_or("server_address_invalid")?;
+        let secure = base.scheme() == "https";
+        let token = tauri::webview::Cookie::build(("immich_access_token", saved.token.clone()))
+            .domain(domain)
+            .path("/")
+            .secure(secure)
+            .http_only(true)
+            .build();
         photos
-            .set_cookie(
-                tauri::webview::Cookie::build((key, value))
-                    .domain(domain)
-                    .path("/")
-                    .secure(secure)
-                    .build(),
-            )
+            .set_cookie(token)
             .map_err(|_| "photo_session_unavailable")?;
+        for (key, value) in [
+            ("immich_is_authenticated", "true"),
+            ("immich_auth_type", "password"),
+        ] {
+            photos
+                .set_cookie(
+                    tauri::webview::Cookie::build((key, value))
+                        .domain(domain)
+                        .path("/")
+                        .secure(secure)
+                        .build(),
+                )
+                .map_err(|_| "photo_session_unavailable")?;
+        }
+        photos
+            .navigate(base.join("photos").unwrap())
+            .map_err(|_| "photo_window_unavailable")?;
+        photos.show().map_err(|_| "photo_window_unavailable")?;
+        photos.set_focus().map_err(|_| "photo_window_unavailable")?;
+        Ok(())
+    })();
+    if result.is_ok() {
+        *scope = Some(expected);
+    } else {
+        *scope = None;
+        let _ = photos.destroy();
     }
-    photos
-        .navigate(base.join("photos").unwrap())
-        .map_err(|_| "photo_window_unavailable")?;
-    photos.show().map_err(|_| "photo_window_unavailable")?;
-    photos.set_focus().map_err(|_| "photo_window_unavailable")?;
-    Ok(())
+    result
 }
 
 pub(crate) fn photo_window(
     app: &AppHandle,
     base: &url::Url,
     initial: url::Url,
+    expected_scope: String,
 ) -> Result<WebviewWindow, String> {
     if connection::native_origin_allowed("main", base, cfg!(debug_assertions)) {
         return Err("photo_window_unavailable".into());
-    }
-    if let Some(window) = app.get_webview_window("photos") {
-        return Ok(window);
     }
     let origin = base.origin();
     let web_origin = serde_json::to_string(&origin.ascii_serialization())
@@ -788,11 +912,13 @@ pub(crate) fn photo_window(
     let handle = app.clone();
     tauri::WebviewWindowBuilder::new(app, "photos", WebviewUrl::External(initial))
         .title("Frameleaf Photos")
+        .incognito(true)
+        .visible(false)
         .inner_size(1280.0, 850.0)
         .initialization_script(format!("if (window.top === window && location.origin === {web_origin}) window.__FRAMELEAF_DESKTOP_OFFLINE_ALBUMS__ = true;"))
         .on_navigation(move |url| {
             offline_albums::local_url(url)
-                || (url.origin() == origin && !offline_albums::intercept(&handle, url))
+                || (url.origin() == origin && !offline_albums::intercept(&handle, url, &expected_scope))
         })
         .build()
         .map_err(|_| "photo_window_unavailable".into())
@@ -878,6 +1004,10 @@ pub fn run() {
             host_commands::stop_local_host_manager,
             host_commands::quit_local_host,
             connect_server,
+            library_switch::approved_libraries,
+            library_switch::add_approved_library,
+            library_switch::activate_approved_library,
+            library_switch::remove_approved_library,
             connect_server_step,
             restore_connection,
             sign_out,

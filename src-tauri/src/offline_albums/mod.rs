@@ -4,6 +4,7 @@ pub(crate) use playback::serve;
 mod remote;
 
 use crate::{connection::SavedConnection, credentials, DesktopState};
+pub(crate) use cache::CleanupScope;
 use cache::{AlbumView, Cache};
 use playback::Playback;
 use serde::Serialize;
@@ -20,6 +21,25 @@ use uuid::Uuid;
 const PATH: &str = "/offline-photos.html";
 const INTENT: &str = "/__frameleaf_desktop__/offline-albums/";
 const BUSY: &str = "offline_album_busy";
+/// Offline copies a sign-out still owes a clear, one non-secret cleanup scope per file.
+const OWED: &str = "offline-cleanup-owed";
+
+fn owe_cleanup(base: &std::path::Path, scope: &CleanupScope) {
+    if !crate::native_runtime::digest_valid(scope.id(), 64) {
+        return;
+    }
+    let directory = base.join(OWED);
+    let _ = std::fs::create_dir_all(&directory);
+    if let Ok(bytes) = serde_json::to_vec(scope) {
+        let _ = std::fs::write(directory.join(format!("{}.json", scope.id())), bytes);
+    }
+}
+
+fn forget_owed(base: &std::path::Path, id: &str) {
+    if crate::native_runtime::digest_valid(id, 64) {
+        let _ = std::fs::remove_file(base.join(OWED).join(format!("{id}.json")));
+    }
+}
 
 pub(crate) struct OfflineAlbums {
     operation: AsyncMutex<()>,
@@ -56,20 +76,75 @@ pub(crate) struct Status {
 }
 
 impl OfflineAlbums {
-    pub async fn clear(&self, app: &AppHandle) -> bool {
+    pub async fn deactivate(&self) {
         self.cancelled.send_replace(());
         self.clear_playback();
         if let Ok(mut session) = self.session.lock() {
             *session = None;
         }
         let _permit = self.operation.lock().await;
+        self.clear_playback();
         if let Ok(mut session) = self.session.lock() {
             *session = None;
         }
         self.set_progress(None);
-        app.path()
-            .app_local_data_dir()
-            .is_ok_and(|base| Cache::purge(&base).is_ok())
+    }
+
+    pub async fn purge(&self, app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
+        let _permit = self.operation.lock().await;
+        Cache::purge(&crate::import_base(app)?, saved)
+    }
+
+    pub async fn purge_scope(&self, app: &AppHandle, scope: &CleanupScope) -> Result<(), String> {
+        let _permit = self.operation.lock().await;
+        Cache::purge_scope(&crate::import_base(app)?, scope)
+    }
+
+    /// Sign-out clears the signed-in library's offline copies. The debt is written down first,
+    /// so a failed or interrupted clear is made good by `settle_owed` without the saved sign-in.
+    pub async fn purge_or_owe(&self, app: &AppHandle, saved: &SavedConnection) -> bool {
+        let Ok(scope) = CleanupScope::from_saved(saved) else {
+            return false;
+        };
+        let base = crate::import_base(app).ok();
+        if let Some(base) = base.as_deref() {
+            owe_cleanup(base, &scope);
+        }
+        let _permit = self.operation.lock().await;
+        let Some(base) = base else {
+            return false;
+        };
+        let cleared = Cache::purge_scope(&base, &scope).is_ok();
+        if cleared {
+            forget_owed(&base, scope.id());
+        }
+        cleared
+    }
+
+    /// Clears the offline copies an earlier sign-out could not. True when none are still owed.
+    pub async fn settle_owed(&self, app: &AppHandle) -> bool {
+        let Ok(base) = crate::import_base(app) else {
+            return false;
+        };
+        let directory = base.join(OWED);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let _permit = self.operation.lock().await;
+        let mut settled = true;
+        for entry in entries.flatten() {
+            let scope = std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CleanupScope>(&bytes).ok());
+            match scope {
+                Some(scope) if Cache::purge_scope(&base, &scope).is_ok() => {
+                    forget_owed(&base, scope.id());
+                }
+                _ => settled = false,
+            }
+        }
+        settled
     }
 
     fn clear_playback(&self) {
@@ -145,18 +220,19 @@ fn intent(url: &Url) -> Option<Uuid> {
     (id == value.to_string()).then_some(value)
 }
 
-pub(crate) fn intercept(app: &AppHandle, url: &Url) -> bool {
+pub(crate) fn intercept(app: &AppHandle, url: &Url, expected_scope: &str) -> bool {
     if !url.path().starts_with(INTENT) {
         return false;
     }
     if let Some(id) = intent(url) {
         let app = app.clone();
         let origin = url.origin();
+        let expected_scope = expected_scope.to_owned();
         tauri::async_runtime::spawn(async move {
             let Some(window) = app.get_webview_window("photos") else {
                 return;
             };
-            let result = request(&app, &window, origin, id).await;
+            let result = request(&app, &window, origin, &expected_scope, id).await;
             if let Err(error) = result {
                 if window.url().is_ok_and(|url| !local_url(&url)) {
                     app.dialog()
@@ -184,7 +260,15 @@ fn show(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
         return Err("photo_window_unavailable".into());
     }
     let base = crate::connection::normalize_server(&saved.server)?;
-    let photos = crate::photo_window(app, &base, url.clone())?;
+    let expected = crate::connection::photo_session_scope(saved);
+    let state = app.state::<DesktopState>();
+    let mut scope = state.1.lock().map_err(|_| "photo_window_unavailable")?;
+    let photos = match app.get_webview_window("photos") {
+        Some(window) if scope.as_ref() == Some(&expected) => window,
+        Some(_) => return Err("library_photos_clear_failed".into()),
+        None => crate::photo_window(app, &base, url.clone(), expected.clone())?,
+    };
+    *scope = Some(expected);
     if !photos.url().is_ok_and(|url| local_url(&url)) {
         photos
             .navigate(url)
@@ -200,6 +284,7 @@ async fn request(
     app: &AppHandle,
     window: &WebviewWindow,
     origin: url::Origin,
+    expected_scope: &str,
     id: Uuid,
 ) -> Result<(), String> {
     let native = app.state::<OfflineAlbums>();
@@ -211,7 +296,8 @@ async fn request(
         .await
         .clone()
         .ok_or("sign_in_required")?;
-    if crate::connection::normalize_server(&saved.server)?.origin() != origin
+    if crate::connection::photo_session_scope(&saved) != expected_scope
+        || crate::connection::normalize_server(&saved.server)?.origin() != origin
         || !window.url().is_ok_and(|url| url.origin() == origin)
     {
         return Err("native_access_denied".into());
@@ -230,7 +316,7 @@ async fn request(
             &plan.name
         };
         let copy = format!(
-            "Keep {count} original photos or videos from “{title}” on this computer? Offline access lasts up to 24 hours after the last Library check. The cache holds up to 2 GB on this computer."
+            "Keep {count} original photos or videos from “{title}” on this computer? Offline access lasts up to 24 hours after the last Library check. Offline copies across all approved libraries share 2 GiB on this computer."
         );
         let (send, receive) = tokio::sync::oneshot::channel();
         app.dialog()
@@ -468,17 +554,19 @@ pub(crate) async fn offline_album_remove(
                 cache.remove(id)?;
             }
         }
-        None => Cache::purge(&base)?,
+        None => Cache::purge(&base, &saved)?,
     }
     native.set_progress(None);
     Ok(())
 }
 
 #[tauri::command]
-pub(crate) fn offline_album_browse_library(
+pub(crate) async fn offline_album_browse_library(
     window: WebviewWindow,
     app: AppHandle,
+    state: State<'_, DesktopState>,
 ) -> Result<(), String> {
+    let _active = state.0.lock().await;
     require_local_photos(&window)?;
     let saved = app.state::<OfflineAlbums>().saved()?;
     crate::open_photos_window(&app, &saved)

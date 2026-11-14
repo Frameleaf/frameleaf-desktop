@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop-setup",
-  "description": "Packaged setup can connect to one server. Remote photo windows receive no native capabilities.",
+  "description": "Packaged setup can switch between approved libraries. Remote photo windows receive no native capabilities.",
   "local": true,
   "windows": [
     "main"
@@ -11,6 +11,10 @@
     "allow-check-desktop-update",
     "allow-install-desktop-update",
     "allow-connect-server",
+    "allow-approved-libraries",
+    "allow-add-approved-library",
+    "allow-activate-approved-library",
+    "allow-remove-approved-library",
     "allow-connect-server-step",
     "allow-restore-connection",
     "allow-sign-out",

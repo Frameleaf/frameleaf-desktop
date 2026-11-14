@@ -106,7 +106,7 @@ impl DropImport {
     }
 
     pub(crate) async fn stop(&self) {
-        self.jobs.stop().await;
+        self.jobs.park().await;
         if let Ok(mut pending) = self.pending.lock() {
             *pending = Pending::default();
         }

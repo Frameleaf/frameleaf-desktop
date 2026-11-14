@@ -23,6 +23,8 @@
   // The other offline album codes take the shared copy in errors.ts; this window names what signing in is for.
   const errorMessages: Record<string, string> = {
     sign_in_required: 'Sign in to Frameleaf to open offline albums.',
+    // Each approved library has its own offline storage, which this window can clear.
+    offline_album_storage_unavailable: 'Frameleaf could not open this Library’s offline storage. You can clear it here and keep the albums again from Photos.',
   };
   const explain = (error: unknown) => errorMessages[String(error)] ?? explainError(error, 'Frameleaf could not verify or open this offline album.');
 

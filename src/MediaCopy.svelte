@@ -8,6 +8,7 @@
   const native = isTauri();
   const platform = platformFromUserAgent(navigator.userAgent);
   let packages = $state<Package[] | null>(null);
+  let packageEpoch = $state<number | null>(null);
   let loading = $state(false);
   let message = $state('');
   // Leaving this page does not cancel a copy: its state is kept in media-copy.ts and shown again here.
@@ -16,13 +17,19 @@
   async function load() {
     loading = true;
     message = '';
-    try { packages = await invoke<Package[]>('preservation_copy_packages'); }
+    try {
+      const result = await invoke<{ epoch: number; packages: Package[] }>('preservation_copy_packages');
+      packages = result.packages;
+      packageEpoch = result.epoch;
+    }
     catch (error) { message = explain(error); }
     finally { loading = false; }
   }
   function save(id: string) {
+    // The copy is fenced to the library session the package list came from.
+    if (packageEpoch === null) return;
     message = '';
-    void saveCopy(invoke, id, platform);
+    void saveCopy(invoke, id, packageEpoch, platform);
   }
   async function openPhotos() {
     message = '';

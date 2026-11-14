@@ -147,7 +147,7 @@ test('a code one screen used to own gets its copy on every screen', () => {
   const moved: Record<string, RegExp> = {
     media_copy_space_insufficient: /enough free space for this archive/, // media-copy.ts
     manager_clock_skew: /clock/, // manager-state.ts
-    offline_album_storage_limit: /2 GB offline cache/, // OfflinePhotos.svelte
+    offline_album_storage_limit: /2 GiB shared by offline copies/, // OfflinePhotos.svelte
     source_capacity_insufficient: /not enough free space for this original/, // PhotoSources.svelte
     // LocalHost.svelte
     host_controller_already_owned: /^Stop the photo server in Manager before stopping local management\./,

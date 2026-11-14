@@ -806,7 +806,8 @@ validation; macOS and Linux ship without it.
    skip every Windows step below; a Windows run stops in `signing-preflight`.
 2. **Release the server first** when `runtime/model-catalogue.json` has a higher
    epoch than the latest `frameleaf-v<version>` server release (today: Desktop
-   15, `frameleaf-v1.2.21` 14).
+   16, `frameleaf-v1.2.22` 15, so a server release carrying catalogue epoch 16
+   comes first).
 3. **Merge everything that ships, including the version change**, to `main`.
    The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
    on it prints the tag.

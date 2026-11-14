@@ -98,7 +98,7 @@ export function workloadProvider(providers: WorkloadProvider[] | null | undefine
 
 /** FD-60: the GPU runtime pack this computer can download, as the backend reports it. */
 export type AcceleratedPack = {
-  state: 'none' | 'available' | 'downloading' | 'unpacking' | 'ready' | 'failed' | string;
+  state: 'none' | 'available' | 'downloading' | 'unpacking' | 'ready' | 'failed' | 'outdated' | string;
   provider: string | null; bytes: number; receivedBytes: number; code: string | null; declined: boolean; metered: boolean;
 };
 export type AcceleratedPackAction = 'download' | 'decline' | 'cancel' | 'retry-provider';
@@ -152,6 +152,13 @@ export function acceleratedPackView(
         title: `Faster processing for your ${device} could not be set up`,
         detail: `${reason(pack.code ?? '')} AI processing continues on the processor.`,
         progress: null, actions: ['download'], tone: 'bad',
+      };
+    // FD-63: nothing is offered while the driver is too old to run it; a pack already downloaded is kept.
+    case 'outdated':
+      return {
+        title: `Update the driver for your ${device}`,
+        detail: `${reason(pack.code ?? '')} AI processing continues on the processor.`,
+        progress: null, actions: [], tone: 'off',
       };
     case 'ready': {
       const chosen = providers ?? [];
