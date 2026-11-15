@@ -24,6 +24,14 @@ both Linux DEB checksums are stamped.
 For the other managers, update the version, URLs and SHA256s (from the release's `SHA256SUMS`) on each release.
 Scoop's `autoupdate` and Homebrew's `livecheck` follow GitHub releases.
 
+## Automatic publishing
+
+When a stable release is published, the `Package managers` workflow stamps these files from that release's
+`SHA256SUMS` and publishes each package that is publishable: AUR when the `AUR_SSH_PRIVATE_KEY` secret holds an AUR
+account's SSH private key, Chocolatey when `CHOCOLATEY_API_KEY` holds a community.chocolatey.org API key. A missing
+secret skips that push and says so in the run summary. Run it by hand with a release tag to publish an existing
+release. The manual steps below remain the fallback.
+
 ## Publishing Chocolatey
 
 Stamp the files first, from the release's `SHA256SUMS`: `node tools/release_packaging.mjs <path to SHA256SUMS>` (or use the
