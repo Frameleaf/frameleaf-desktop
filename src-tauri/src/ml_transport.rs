@@ -577,42 +577,52 @@ impl Connection {
 pub struct WorkerTransport(Mutex<Connection>);
 
 fn qualification_refusal(status: u16, message: &str) -> Option<String> {
-    if status == 409
-        && matches!(
-            message,
-            "desktop_nas_producer_unavailable"
-                | "desktop_nas_face_producer_unavailable"
-                | "desktop_nas_fixture_mismatch"
-                | "desktop_nas_model_unavailable"
-                | "desktop_nas_producer_changed"
-                | "desktop_nas_producer_expired"
-                | "desktop_model_profile_unavailable"
-                | "desktop_model_profile_changed"
-                | "desktop_clip_profile_unavailable"
-                | "desktop_face_profile_unavailable"
-                | "desktop_clip_space_unavailable"
-                | "desktop_clip_index_changed"
-                | "desktop_clip_index_dimensions"
-                | "desktop_clip_index_incompatible"
-                | "desktop_clip_index_invalid"
-                | "desktop_pool_config_changed"
-                | "desktop_pool_destination_changed"
-                | "desktop_pool_model_unavailable"
-                | "desktop_pool_route_changed"
-                | "desktop_route_review_required"
-        )
-    {
-        Some(format!("workload_{message}"))
-    } else {
-        None
+    if status != 409 {
+        return None;
+    }
+    match message {
+        // Only servers from before desktop auto-setup refuse a task over their own AI or its
+        // routing: the fix is a server update, never a setting on this computer.
+        "desktop_nas_producer_unavailable"
+        | "desktop_nas_face_producer_unavailable"
+        | "desktop_nas_fixture_mismatch"
+        | "desktop_nas_model_unavailable"
+        | "desktop_nas_producer_changed"
+        | "desktop_nas_producer_expired"
+        | "desktop_pool_config_changed"
+        | "desktop_pool_destination_changed"
+        | "desktop_pool_route_changed"
+        | "desktop_route_review_required" => Some("workload_server_update_required".into()),
+        "desktop_model_profile_unavailable"
+        | "desktop_model_profile_changed"
+        | "desktop_clip_profile_unavailable"
+        | "desktop_face_profile_unavailable"
+        | "desktop_clip_space_unavailable"
+        | "desktop_clip_index_changed"
+        | "desktop_clip_index_dimensions"
+        | "desktop_clip_index_incompatible"
+        | "desktop_clip_index_invalid"
+        | "desktop_pool_model_unavailable" => Some(format!("workload_{message}")),
+        _ => None,
     }
 }
 #[test]
 fn scopes_only_explicit_model_refusals_to_one_workload() {
     assert_eq!(
-        qualification_refusal(409, "desktop_nas_face_producer_unavailable").as_deref(),
-        Some("workload_desktop_nas_face_producer_unavailable")
+        qualification_refusal(409, "desktop_model_profile_unavailable").as_deref(),
+        Some("workload_desktop_model_profile_unavailable")
     );
+    // An older server's refusals over its own AI or routing ask for a server update.
+    for message in [
+        "desktop_nas_face_producer_unavailable",
+        "desktop_route_review_required",
+        "desktop_pool_route_changed",
+    ] {
+        assert_eq!(
+            qualification_refusal(409, message).as_deref(),
+            Some("workload_server_update_required")
+        );
+    }
     for (status, message) in [
         (401, "desktop_nas_face_producer_unavailable"),
         (403, "desktop_pool_policy_required"),
@@ -633,8 +643,24 @@ fn worker_refusal(status: u16, message: &str) -> String {
         (403, "desktop_pool_policy_required") => "worker_policy_required".into(),
         (403, "desktop_worker_lan_required") => "worker_lan_required".into(),
         (409, "desktop_pool_policy_changed") => "worker_policy_changed".into(),
+        (400, "desktop_runtime_attestation_invalid") => "worker_runtime_unsigned".into(),
+        (400, "desktop_qualification_report_invalid") => {
+            "worker_qualification_report_refused".into()
+        }
         _ => format!("server_http_{status}"),
     }
+}
+#[test]
+fn names_runtime_and_report_refusals() {
+    assert_eq!(
+        worker_refusal(400, "desktop_runtime_attestation_invalid"),
+        "worker_runtime_unsigned"
+    );
+    assert_eq!(
+        worker_refusal(400, "desktop_qualification_report_invalid"),
+        "worker_qualification_report_refused"
+    );
+    assert_eq!(worker_refusal(400, "other"), "server_http_400");
 }
 /// The status and named reason of a refused request. Anything but a small JSON error (a proxy's
 /// page, a cut connection) has no name and stays an opaque `server_http_*`.

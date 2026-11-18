@@ -65,7 +65,7 @@ const needsYou: Partial<Record<WorkerReason, readonly [string, string]>> = {
   storage: ['AI files could not be saved', 'Frameleaf could not save AI files on this computer, usually because the disk is full. Free up disk space, then choose Retry Setup. Photos remain available.'],
   download: ['The AI model download failed', 'The selected models could not be downloaded. Check your connection, then choose Retry Setup.'],
   network: ['Your server did not answer', 'This computer could not reach your server. If the server is only reachable on your home network, connect to that network, then choose Retry Setup.'],
-  'not-enabled': ['AI work is not shared with this computer', 'Your server’s owner has not turned on AI processing for computers, or changed how it is shared. A server administrator can change this in the server’s machine learning settings. Then choose Retry Setup.'],
+  'not-enabled': ['AI work is not shared with this computer', 'Your server’s owner has not turned on AI processing for computers, or has no AI task turned on that this computer can run. A server administrator can change this in the server’s machine learning settings. Then choose Retry Setup.'],
   removed: ['Your server no longer accepts this computer', 'This computer may have been removed from your server, or its date and time may be wrong. Signing out will not fix this. Check the date and time, then choose Retry Setup. If it still fails, ask the person who runs your server to allow this computer again.'],
   runtime: ['The AI runtime is missing', 'The AI runtime that comes with Frameleaf is missing or could not be verified. Install Frameleaf again, then choose Retry Setup. Photos remain available.'],
   restart: ['The AI runtime could not start', 'The AI runtime could not start, or stopped unexpectedly, on this computer. Quit and reopen Frameleaf, then choose Retry Setup.'],
@@ -141,6 +141,7 @@ export function workerView({ connectionState, workerSupported, computer, setup }
       return waits(headline, detail);
     }
     case 'no-eligible-work':
+      if (code === 'server_update_required') return waits('Your server needs an update', errorCopy(code)!);
       return waits(label, `${errorCopy('worker_no_eligible_workloads')!} Frameleaf checks again every few minutes.`);
     case 'model-download-required':
       return needs(label, 'The selected models need downloading. Downloading waits for your permission on metered or unclassified networks. Choose Download Models to allow it.', 'download-models');

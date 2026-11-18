@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-import { workerStatus, safeMode } from '../src/mode-state.ts';
+import { workerStatus, safeMode, workloadReason } from '../src/mode-state.ts';
 import { errorCopy } from '../src/errors.ts';
 
 test('local setup commands are registered and permitted only in the packaged main window', () => {
@@ -179,13 +179,39 @@ const card = async (setup: { state: string; code?: string | null; control?: stri
   return workerView({ connectionState, workerSupported: true, computer: 'Mac', setup });
 };
 
+test('automatic setup names the exact reason it stopped, never the general model-check message', async () => {
+  const checks = (await card({ state: 'setup-needs-attention', code: 'worker_no_qualified_workloads' })).detail;
+  for (const [code, words] of [
+    ['runtime_output_mismatch', /different answer than expected/],
+    ['runtime_out_of_memory', /ran out of memory/],
+    ['runtime_model_missing', /files on this computer are missing or changed/],
+    ['worker_runtime_unsigned', /not signed by Frameleaf/],
+    ['worker_qualification_report_refused', /did not accept this computer’s model check/],
+    ['model_disk_space_insufficient', /enough free disk space/],
+    ['desktop_model_profile_unavailable', /turned this AI task off, or changed its model/],
+    ['desktop_clip_index_incompatible', /built with a different model/],
+  ] as const) {
+    const view = await card({ state: 'setup-needs-attention', code });
+    assert.match(view.detail, words, code);
+    assert.notEqual(view.detail, checks, code);
+    assert.equal(view.action, 'retry-setup', code);
+  }
+  // An older server: the fix is updating it, and this computer keeps checking by itself.
+  const update = await card({ state: 'no-eligible-work', code: 'server_update_required' });
+  assert.equal(update.headline, 'Your server needs an update');
+  assert.match(update.detail, /Update Frameleaf on your server.*checks again/);
+  assert.equal(update.attention, 'waiting');
+  for (const code of ['workload_server_update_required', 'workload_desktop_nas_producer_unavailable'])
+    assert.match(workloadReason(code)!, /server needs an update/, code);
+});
+
 test('each worker failure family shows its own reason and the action that fixes it', async () => {
   const families: [code: string, headline: RegExp, detail: RegExp][] = [
     ['model_file_write_failed', /could not be saved/, /disk is full.*Free up disk space.*Retry Setup/],
     ['runtime_store_write_failed', /could not be saved/, /Free up disk space/],
     ['model_download_hash_mismatch', /model download failed/, /Check your connection.*Retry Setup/],
     ['server_response_interrupted', /did not answer/, /home network.*Retry Setup/],
-    ['workload_desktop_pool_route_changed', /not shared with this computer/, /server’s owner.*machine learning settings/],
+    ['worker_no_eligible_workloads', /not shared with this computer/, /server’s owner.*machine learning settings/],
     ['server_http_401', /no longer accepts this computer/, /removed from your server.*Signing out will not fix this/],
     ['runtime_manifest_invalid', /runtime is missing/, /Install Frameleaf again.*Retry Setup/],
     ['runtime_start_failed', /runtime could not start/, /Quit and reopen Frameleaf.*Retry Setup/],

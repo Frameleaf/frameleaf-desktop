@@ -224,7 +224,9 @@ impl WorkerSetup {
                     let state = match code.as_str() {
                         "model_download_permission_required" => "model-download-required",
                         // Server configuration, not a fault here: retrying cannot change it.
-                        "worker_no_eligible_workloads" => "no-eligible-work",
+                        "worker_no_eligible_workloads" | "server_update_required" => {
+                            "no-eligible-work"
+                        }
                         _ => "setup-needs-attention",
                     };
                     let safe = if code.len() <= 128
@@ -319,8 +321,13 @@ where
         let result = reconnect(progress, fresh, &mut attempt).await;
         fresh = false;
         match result {
-            // An administrator can assign work at any time: ask the server again later.
-            Err(code) if code == "worker_no_eligible_workloads" => {
+            // An administrator can assign work, or update the server, at any time: ask again later.
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "worker_no_eligible_workloads" | "server_update_required"
+                ) =>
+            {
                 progress.set("no-eligible-work", Some(code));
                 recheck_after(progress, NO_WORK_RECHECK).await?;
             }
@@ -699,6 +706,37 @@ async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), 
     let value = task.await.map_err(|_| "runtime_qualification_failed")?;
     Ok((value, reason))
 }
+/// A model file that could not be written, on a volume with less free space than the model
+/// needs, is a full disk: say so instead of a general write failure.
+fn disk_shortfall(code: String, models: &Path, needed: u64) -> String {
+    let write_failed = matches!(
+        code.as_str(),
+        "model_file_create_failed"
+            | "model_file_write_failed"
+            | "model_file_publish_failed"
+            | "model_cache_publish_failed"
+    );
+    if write_failed && crate::host_storage::available_bytes(models).is_ok_and(|free| free < needed)
+    {
+        return "model_disk_space_insufficient".into();
+    }
+    code
+}
+
+/// Why no workload qualified: the first one's reason, or the general code when none was given.
+fn first_failure(workloads: &[WorkloadStatus]) -> String {
+    workloads
+        .iter()
+        .filter(|item| item.state == "unavailable")
+        .find_map(|item| item.code.clone())
+        .map(|code| {
+            code.strip_prefix("workload_")
+                .map(str::to_owned)
+                .unwrap_or(code)
+        })
+        .unwrap_or_else(|| "worker_no_qualified_workloads".into())
+}
+
 pub(crate) fn inventory_profiles(
     value: &serde_json::Value,
     source: &str,
@@ -797,11 +835,15 @@ pub(crate) fn inventory_profiles(
         } else if !entry.model_keys.is_empty() {
             return Err(invalid());
         }
+        // Routing states come only from servers older than desktop auto-setup, which decide desktop
+        // work by their own routes: updating the server is what makes the task available here.
+        let code = matches!(state.as_str(), "pinned" | "legacy" | "unavailable")
+            .then(|| "server_update_required".to_string());
         statuses.push(WorkloadStatus {
             workload: entry.workload,
             state,
             model_names: entry.model_names,
-            code: None,
+            code,
         });
     }
     Ok((groups, statuses))
@@ -988,7 +1030,14 @@ async fn prepare_on(
     )?;
     progress.workloads(statuses);
     if groups.is_empty() {
-        return Err("worker_no_eligible_workloads".into());
+        // An older server offers desktops work only through its routes, and often none: the fix
+        // is updating it, not a setting. A current server offers every enabled task it can.
+        return Err(if caps.features.worker_auto_setup {
+            "worker_no_eligible_workloads"
+        } else {
+            "server_update_required"
+        }
+        .into());
     }
     // FD-52: an accelerated runtime beside the processor one, where the app ships one this
     // computer can use. Any fault on that side leaves every workload on the processor.
@@ -1044,7 +1093,8 @@ async fn prepare_on(
             }),
             &progress.cancelled,
         )
-        .await?;
+        .await
+        .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
         caches.push(cache);
     }
     let mut failures = TaskFailures::default();
@@ -1134,6 +1184,10 @@ async fn prepare_on(
                             "runtime_qualification_failed"
                                 | "runtime_qualification_timeout"
                                 | "runtime_qualification_report_invalid"
+                                | "runtime_output_mismatch"
+                                | "runtime_out_of_memory"
+                                | "runtime_model_missing"
+                                | "runtime_provider_unavailable"
                         ) =>
                     {
                         if plan.demote(workload, &code, true) {
@@ -1274,9 +1328,9 @@ async fn prepare_on(
             progress.workload(workload, "ready", None);
         }
         if prepared.is_empty() {
-            // The server offered work but none qualified here (timeout, refusal): a local fault
-            // that Retry Setup can clear, not the server-configuration state.
-            return Err("worker_no_qualified_workloads".into());
+            // The server offered work but none qualified here: say why (wrong answer, out of
+            // memory, server refusal…), a fault Retry Setup can clear, not a server setting.
+            return Err(first_failure(&progress.status.lock().unwrap().workloads));
         }
         let mut memory_by_cache = std::collections::BTreeMap::new();
         for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
@@ -1586,6 +1640,9 @@ mod tests {
             inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
         assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(statuses[2].state, "pinned");
+        // Only an older server sends a routing state: updating it is the fix.
+        assert_eq!(statuses[2].code.as_deref(), Some("server_update_required"));
+        assert_eq!(statuses[0].code, None);
         value["workloads"][1]["modelKeys"][0] =
             serde_json::json!(format!("ocr:{}", "0".repeat(64)));
         let (groups, statuses) =
@@ -1593,6 +1650,54 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(statuses[1].state, "unsupported");
         assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
+    }
+    #[test]
+    fn reports_the_first_specific_reason_nothing_qualified() {
+        let status = |workload: &str, state: &str, code: Option<&str>| WorkloadStatus {
+            workload: workload.into(),
+            state: state.into(),
+            model_names: vec![],
+            code: code.map(Into::into),
+        };
+        assert_eq!(
+            first_failure(&[
+                status("clip", "disabled", None),
+                status("ocr", "unavailable", Some("runtime_out_of_memory")),
+                status("face", "unavailable", Some("runtime_output_mismatch")),
+            ]),
+            "runtime_out_of_memory"
+        );
+        assert_eq!(
+            first_failure(&[status(
+                "clip",
+                "unavailable",
+                Some("workload_server_update_required")
+            )]),
+            "server_update_required"
+        );
+        assert_eq!(
+            first_failure(&[status("clip", "unavailable", None)]),
+            "worker_no_qualified_workloads"
+        );
+    }
+    #[test]
+    fn names_a_full_disk_when_a_model_file_cannot_be_written() {
+        let models = std::env::temp_dir().canonicalize().unwrap();
+        for (code, needed, expected) in [
+            (
+                "model_file_write_failed",
+                u64::MAX,
+                "model_disk_space_insufficient",
+            ),
+            ("model_file_write_failed", 0, "model_file_write_failed"),
+            (
+                "model_download_interrupted",
+                u64::MAX,
+                "model_download_interrupted",
+            ),
+        ] {
+            assert_eq!(disk_shortfall(code.into(), &models, needed), expected);
+        }
     }
     #[test]
     fn inventory_selects_each_new_clip_model_and_rejects_mixed_model_groups() {
