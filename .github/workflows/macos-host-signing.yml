@@ -16,7 +16,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sign:
-    # Not available on Forgejo yet: it reads GitHub release assets with the desktop-release secrets, and Forgejo has no disposable runner for it.
+    # Not available on Forgejo: its only Mac runner is the owner's own Mac, where signing and notarizing
+    # would use the owner's own keychain; it needs a disposable Mac runner.
     if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     permissions:

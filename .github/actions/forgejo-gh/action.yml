@@ -1,0 +1,27 @@
+name: gh on Forgejo
+description: >-
+  On Forgejo only: makes `gh` read this repository's Actions runs and artifacts from Forgejo
+  (tools/forgejo_gh.mjs), while every other gh call still goes to GitHub with GH_TOKEN.
+  Nothing happens on GitHub.
+inputs:
+  token:
+    description: A token that reads this repository's Actions runs on Forgejo
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - if: github.server_url != 'https://github.com'
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        real=$(command -v gh || true)
+        tool="$GITHUB_WORKSPACE/tools/forgejo_gh.mjs"
+        if command -v cygpath > /dev/null; then
+          tool=$(cygpath -w "$tool")
+          [[ -z "$real" ]] || real=$(cygpath -w "$real")
+        fi
+        [[ -f "$tool" ]] || { echo "::error::tools/forgejo_gh.mjs is missing from the checkout"; exit 1; }
+        { echo "GH_SHIM_REAL=$real"; echo "GH_SHIM_TOOL=$tool"; echo "GH_SHIM_FORGEJO_TOKEN=$TOKEN"; } >> "$GITHUB_ENV"
+        echo "$GITHUB_ACTION_PATH/bin" >> "$GITHUB_PATH"

@@ -31,8 +31,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
-    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
+    # On Forgejo only once the owner sets the repository variable DESKTOP_RELEASE_ON_FORGEJO to true:
+    # Forgejo has no environment approval, and these jobs use the desktop-release secrets.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -46,16 +47,31 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
+      - name: Refuse targets Forgejo has no runner for
+        if: github.server_url != 'https://github.com'
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node --input-type=module -e '
+            import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            for (const problem of problems) console.log(`::error::${problem}`);
+            process.exitCode = problems.length ? 1 : 0;
+          '
       - name: Validate immutable release source and runtime run
         id: source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -91,7 +107,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           RELEASE_MATRIX: ${{ steps.source.outputs.matrix }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -121,7 +137,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           ALLOW_UNRELEASED_CATALOGUE: ${{ inputs.allow_unreleased_catalogue }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -140,7 +156,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
           COMPANION_RUN_IDS: ${{ inputs.companion_run_ids }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -171,37 +187,9 @@ jobs:
           printf '%s' "$plan" > "$RUNNER_TEMP/companions.json"
           node tools/release_prerequisites.mjs companion-summary "$RUNNER_TEMP/companions.json" >> "$GITHUB_STEP_SUMMARY"
           echo "plan=$plan" >> "$GITHUB_OUTPUT"
-  signing-preflight:
-    # Environment variables are only readable inside the environment, so this small job reads them
-    # before any platform starts its build.
-    needs: prepare
-    if: needs.prepare.result == 'success' && contains(needs.prepare.outputs.matrix, '"windows-x86_64"')
-    environment: desktop-release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ needs.prepare.outputs.revision }}
-          persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
-        with:
-          node-version: 22
-      - name: Require the Windows signing configuration before any platform builds
-        env:
-          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
-          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
-        run: node tools/release_prerequisites.mjs windows-signing
   build:
-    needs: [prepare, signing-preflight]
-    # The preflight is skipped when Windows is not selected; a failed one stops every platform.
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.signing-preflight.result == 'success' || needs.signing-preflight.result == 'skipped') }}
+    needs: prepare
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     environment: desktop-release
     strategy:
       fail-fast: false
@@ -214,12 +202,15 @@ jobs:
     permissions:
       contents: read
       actions: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -237,11 +228,20 @@ jobs:
       - run: npm run check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           name: factory-runtime-${{ matrix.target }}
           path: runtime-download
+      - name: Download the factory runtime from its Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$RUNTIME_TARGET" --dir runtime-download
       - name: Extract factory runtime without allowing archive path escapes
         shell: python
         run: |
@@ -276,17 +276,6 @@ jobs:
           set -euo pipefail
           : "${APPLE_ID:?Missing Apple ID}" "${APPLE_PASSWORD:?Missing app-specific password}" "${APPLE_TEAM_ID:?Missing Apple team}"
           bash tools/import_apple_certificate.sh
-      - name: Configure Azure Artifact Signing
-        if: runner.os == 'Windows'
-        uses: ./.github/actions/windows-signing
-        with:
-          config: release-config.json
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
-          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
       - name: Build signed installers (macOS app bundle)
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -376,19 +365,17 @@ jobs:
           xcrun stapler staple "${images[0]}"
           xcrun stapler validate "${images[0]}"
           spctl --assess --type open --context context:primary-signature --verbose=2 "${images[0]}"
-      - name: Verify Windows executable and installer signatures
+      # Windows installers ship unsigned by design (owner, 2026-11-18): no Authenticode signature is
+      # made or checked, and they are published with an -unsigned suffix.
+      - name: Check the Windows installers and that the factory runtime survived bundling
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           node --input-type=module -e "import { packageConfiguration } from './tools/package_desktop.mjs'; await packageConfiguration('release-runtime');"
           if ($LASTEXITCODE) { throw 'Factory runtime changed during bundling' }
-          $files = @(Get-Item src-tauri/target/release/frameleaf-desktop.exe)
           $installers = @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.exe', '.msi' })
           if ($installers.Count -ne 2 -or @($installers.Extension | Sort-Object -Unique).Count -ne 2) { throw 'Expected NSIS and MSI installers' }
-          foreach ($file in ($files + $installers)) {
-            & ./tools/windows_sign.ps1 -Path $file.FullName -VerifyOnly
-          }
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
@@ -422,7 +409,9 @@ jobs:
               raise SystemExit('Missing or ambiguous release installers')
           Path('release-assets').mkdir()
           for path in files:
-              shutil.copy2(path, Path('release-assets') / path.name)
+              # Unsigned Windows installers say so in their names, as every release has published them.
+              name = f'{path.stem}-unsigned{path.suffix}' if sys.platform == 'win32' else path.name
+              shutil.copy2(path, Path('release-assets') / name)
       - name: Sign verified updater packages
         if: inputs.tag != ''
         env:
@@ -444,6 +433,8 @@ jobs:
           fi
           for file in release-assets/*; do
             case "$file" in
+              # Unsigned Windows installers never enter the update feed (updateManifest refuses them).
+              *-unsigned.*) ;;
               *.app.tar.gz|*.AppImage|*.deb|*.msi|*.exe)
                 npm run tauri -- signer sign --app-version "$version" "$file"
                 ;;
@@ -474,6 +465,10 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -496,7 +491,7 @@ jobs:
           import { readFileSync, readdirSync, writeFileSync } from "node:fs";
           import { updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
           const dir = "release-assets";
-          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
+          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name) && !/-unsigned\./.test(name));
           const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
           const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
           const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
@@ -505,7 +500,7 @@ jobs:
           JS
       - name: Add the companion packages from their validated runs
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           COMPANIONS: ${{ needs.prepare.outputs.companions }}
         shell: bash
         run: |
@@ -522,11 +517,19 @@ jobs:
       # its signed delivery manifest (the one the installers carry) before its parts join this
       # run's assets; the draft merge below uploads them like any other asset.
       - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           pattern: factory-accelerated-*
           path: accelerated-packs
+      - name: Download the downloadable GPU packs from the factory's Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'factory-accelerated-*' --dir accelerated-packs
       - name: Verify the downloadable GPU runtime parts and stage them as release files
         shell: bash
         run: |
@@ -535,7 +538,7 @@ jobs:
       - name: Merge this run into the draft for the tag
         id: draft
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
@@ -554,7 +557,9 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$existing"
           fi
           printf '%s' "$COMPANIONS" > "$RUNNER_TEMP/companions.json"
-          note="Signed installer candidate for $RELEASE_PLATFORMS from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID $(node tools/release_prerequisites.mjs companion-note "$RUNNER_TEMP/companions.json")"
+          run=$GITHUB_RUN_ID
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]] || run=$GITHUB_RUN_NUMBER
+          note="Signed installer candidate for $RELEASE_PLATFORMS from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run $(node tools/release_prerequisites.mjs companion-note "$RUNNER_TEMP/companions.json")"
           node tools/release_draft.mjs merge "$RELEASE_TAG" "$GITHUB_REPOSITORY" release-assets "$RUNNER_TEMP/incoming-latest.json" \
             "$RUNNER_TEMP/draft.json" "$existing" "$RUNNER_TEMP/draft" "$note"
           cat "$RUNNER_TEMP/draft/summary.md" >> "$GITHUB_STEP_SUMMARY"
@@ -576,7 +581,7 @@ jobs:
           retention-days: 14
       - name: Create the draft release, or add this run's assets to it
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_ID: ${{ steps.draft.outputs.release_id }}
         shell: bash

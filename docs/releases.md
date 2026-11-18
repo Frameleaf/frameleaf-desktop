@@ -264,9 +264,9 @@ on Windows, macOS and Linux. Those omit the ML runtime and are not release build
 repository. The factory commit must be an ancestor of the candidate commit.
 It reuses the approved signed runtimes. The default `linux` selection builds
 Ubuntu 24 x86-64 and ARM64 DEB/AppImage installers, one architecture at a time.
-Choose `windows` for Windows x86-64 NSIS/MSI installers. Windows candidates use Azure Artifact Signing for the application, NSIS
-uninstaller and both installers through Tauri's custom signing command. The
-Windows build uses the main-only `desktop-release` environment and GitHub OIDC. Runtime signature, inventory,
+Choose `windows` for Windows x86-64 NSIS/MSI installers. Windows installers are
+unsigned by design (owner, 2026-11-18): no Authenticode signature is made or
+checked, and the candidate records `osSigned: false`. Runtime signature, inventory,
 source approval and target checks run before native compilation. Linux packages
 keep the signed runtime under `/usr/share/Frameleaf/native-runtime`, outside the
 AppImage bundler's library rewrite scan. Both finished Linux installers are
@@ -484,10 +484,11 @@ The pipeline safely extracts the tar and reuses `packageConfiguration` to verify
 the complete signed payload, compiled public authority, epoch, source approval
 and native target before bundling. macOS additionally verifies that the embedded
 runtime still passes this contract after app signing, plus strict app signature,
-Gatekeeper and stapled notarization checks. Windows verifies Authenticode on the
-app and both installers for a trusted, timestamped signature with the exact
-configured publisher subject. Azure rotates leaf certificates, so verification
-does not pin a leaf thumbprint. Linux packages include
+Gatekeeper and stapled notarization checks. Windows installers are unsigned by
+design and are published as `Frameleaf_<version>_x64-setup-unsigned.exe` and
+`Frameleaf_<version>_x64_en-US-unsigned.msi`; like every release so far they get
+no updater signature and stay out of `latest.json`, so Windows installs update by
+downloading the new installer. Linux packages include
 the same verified runtime. Linux package repositories use their own signing policy.
 
 For a tagged build, the workflow signs the verified NSIS, MSI, DEB and AppImage
@@ -516,11 +517,6 @@ The `prepare` job stops the run, with the reason as the job's error, when:
 - for a tagged release, the model catalogue is newer than the latest server
   release (`catalogue_ahead_of_server`), or the companion run is missing or not
   trusted (below).
-
-When Windows is selected, the `signing-preflight` job then reads the
-`desktop-release` variables before any platform builds and fails with
-`windows_signing_unconfigured`, naming each variable that is not set and the
-settings page to set it on.
 
 ### Companion packages
 
@@ -798,12 +794,9 @@ final bytes with the factory key. The installer verifies that inventory again.
 Steps 1 to 4 can be done ahead of time. Only Windows needs Microsoft's identity
 validation; macOS and Linux ship without it.
 
-1. **Windows only, once: finish Microsoft's identity validation.** When Microsoft
-   approves Frameleaf Inc., create the Public Trust certificate profile, assign
-   the signer role, and set `AZURE_SIGNING_PROFILE` and `WINDOWS_SIGNING_SUBJECT`
-   as variables of the `desktop-release` environment
-   ([Azure Artifact Signing setup](#azure-artifact-signing-setup)). Until then
-   skip every Windows step below; a Windows run stops in `signing-preflight`.
+1. **Windows installers need no signing setup**: they ship unsigned by design.
+   (The Library companion's `windows-compiled-host.yml` release package still
+   uses Azure Artifact Signing; see below.)
 2. **Release the server first** when `runtime/model-catalogue.json` has a higher
    epoch than the latest `frameleaf-v<version>` server release (today: Desktop
    16, `frameleaf-v1.2.22` 15, so a server release carrying catalogue epoch 16
@@ -903,3 +896,23 @@ the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`
 staples the accepted ticket, and checks Gatekeeper. If Apple outlasts the
 runner, use the recorded request ID with `notarytool info` and staple the
 retained DMG after acceptance.
+
+## Releasing from Forgejo
+
+CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop; GitHub
+keeps git, tags and the releases the app downloads from. The release workflows also run there,
+with these differences:
+
+- They are off until the owner sets the repository variable `DESKTOP_RELEASE_ON_FORGEJO` to `true`.
+  Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
+- The signing secrets must be added to the Forgejo repository: `DESKTOP_RELEASE_ED25519_PRIVATE_KEY`
+  (runtime packs; the app refuses unsigned ones) and `TAURI_SIGNING_PRIVATE_KEY` (updater
+  signatures). The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
+- Run ids (`runtime_run_id`, `companion_run_ids`, approvals) are Forgejo's API ids, which a job
+  sees as `GITHUB_RUN_ID`; the number in a run's web address is a different one. `gh` reads those
+  runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
+  read them, add a repository secret `RUNS_READ_TOKEN` with read access to the repository.
+- A target runs only where Forgejo has a runner it can safely use (`forgejoTargetProblems` in
+  `tools/release_inputs.mjs`). Today that is Windows only (runtime packs and the unsigned
+  installers): there is no Intel Mac or Ubuntu 22.04 runner, and the one Mac runner is the
+  owner's own Mac.

@@ -12,14 +12,15 @@ concurrency:
   cancel-in-progress: false
 jobs:
   qualify:
-    # Not available on Forgejo, which has no Windows runner.
-    if: github.server_url == 'https://github.com'
+    # On Forgejo only when dispatched: its Windows runner is the owner's PC, so pull requests never run there.
+    if: (github.server_url == 'https://github.com' || github.event_name == 'workflow_dispatch')
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # Its fixed approvals name GitHub runs and artifacts, so they are read from GitHub on Forgejo too.
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
@@ -29,7 +30,7 @@ jobs:
       - name: Verify the approved archive and qualify its relocated database
         shell: python
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         run: |
           import json
           import os

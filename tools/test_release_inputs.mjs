@@ -56,7 +56,7 @@ test("the release tag is checked against the lock files too", () => {
   assert.match(versions["package.json"], /^\d+\.\d+\.\d+/);
 });
 
-// Windows joins a release only when someone selects it: Azure Artifact Signing is not qualified yet (docs/releases.md).
+// Windows joins a release only when someone selects it (its installers are unsigned; docs/releases.md).
 test("the release workflow defaults to the platforms that can be signed today", () => {
   const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
   const input = /\n      platforms:\n(?: {8}.*\n)*? {8}default: (\S+)\n {8}options: \[([^\]]+)\]\n/.exec(workflow);
@@ -191,4 +191,14 @@ test("updater verification requires the embedded key, exact bytes and release ve
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("on Forgejo only Windows has a runner to build on", async () => {
+  const { forgejoTargetProblems } = await import("./release_inputs.mjs");
+  assert.deepEqual(forgejoTargetProblems("windows", "runtime"), []);
+  assert.deepEqual(forgejoTargetProblems("windows", "installer"), []);
+  const all = forgejoTargetProblems("all", "runtime");
+  assert.deepEqual(all.map((problem) => problem.split(":")[0]), ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"]);
+  assert.throws(() => forgejoTargetProblems("all", "publish"), /forgejo_stage_invalid/);
+  assert.throws(() => forgejoTargetProblems("everything", "runtime"), /release_platforms_invalid/);
 });

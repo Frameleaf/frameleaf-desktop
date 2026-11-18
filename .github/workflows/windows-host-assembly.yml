@@ -19,8 +19,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   assemble:
-    # Not available on Forgejo, which has no Windows runner.
-    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
+    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -32,9 +31,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           ref: ${{ env.HOST_SOURCE_REVISION }}
           path: application-source
           persist-credentials: false
@@ -63,7 +68,7 @@ jobs:
       - name: Assemble and qualify current Windows consumers serially
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           CANDIDATE_EPOCH: ${{ inputs.epoch }}
         run: |
           python tools/build_windows_host.py --source "$env:GITHUB_WORKSPACE/application-source" --approvals "$env:RUNNER_TEMP/host-component-approvals.json" --output "$env:RUNNER_TEMP/windows-complete-host" --epoch $env:CANDIDATE_EPOCH

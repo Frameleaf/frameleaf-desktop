@@ -8,8 +8,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   raw:
-    # Not available on Forgejo, which has no Windows runner.
-    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -23,6 +22,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           ref: 3e5d58be808a8b48cf69f32e59d2f54c6ddf25c4
           fetch-depth: 2
           path: server-source

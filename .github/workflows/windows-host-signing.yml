@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sign:
-    # Not available on Forgejo yet: it admits GitHub Actions run evidence and signs with the desktop-release Azure credentials.
+    # Not available on Forgejo: it signs with Azure Artifact Signing, which is not configured (Windows hosts ship unsigned).
     if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     runs-on: ubuntu-24.04

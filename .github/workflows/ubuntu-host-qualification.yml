@@ -9,7 +9,8 @@ on:
 permissions: {}
 jobs:
   installed-browser:
-    # Not available on Forgejo yet: it reads GitHub release assets with the desktop-release secrets, and Forgejo has no disposable runner for it.
+    # Not available on Forgejo: it installs the packages with sudo and requires a disposable GitHub-hosted
+    # runner (RUNNER_ENVIRONMENT), which Forgejo's persistent job slots are not.
     if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     permissions:
