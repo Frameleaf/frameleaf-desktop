@@ -63,6 +63,15 @@ A job whose admission lands on a home destination (Local or LAN) can go to a rea
 approved account, whatever the route's origin (default, pinned or legacy) and whether or not that
 destination's AI is up. Work an administrator sends to Frameleaf Cloud stays on Frameleaf Cloud.
 
+### Several desktops at once
+
+Any number of desktops can work the same queue. Each desktop holds at most one lease. `claim` takes
+the oldest task its qualified models can run, with `FOR UPDATE SKIP LOCKED`, so whichever desktop
+asks first gets the next item. To keep them all busy, the server starts one extra job in that
+queue (`smartSearch`, `faceDetection`, `ocr`) for each desktop that is online (seen in the last
+90 seconds) and holds a model for it. That is on top of the administrator's own concurrency setting.
+The broker still holds at most 32 open tasks.
+
 ## Refusal codes
 
 The server logs every refusal (`warn`, with device, model key and code). The desktop shows a
