@@ -12,8 +12,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sign:
-    # On Forgejo only once the owner sets the repository variable DESKTOP_RELEASE_ON_FORGEJO to true:
-    # Forgejo has no environment approval, and these jobs use the desktop-release secrets.
+    # Release signing runs on GitHub (docs/releases.md, Releasing from Forgejo). On Forgejo this is off
+    # unless the repository variable DESKTOP_RELEASE_ON_FORGEJO is true, which it is not.
     if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     permissions:

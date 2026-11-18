@@ -899,15 +899,19 @@ retained DMG after acceptance.
 
 ## Releasing from Forgejo
 
-CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop; GitHub
-keeps git, tags and the releases the app downloads from. The release workflows also run there,
-with these differences:
+CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop. **Release
+signing and publishing stay on GitHub** (owner, 2026-11-18): the release keys
+(`DESKTOP_RELEASE_ED25519_PRIVATE_KEY` for runtime packs, `TAURI_SIGNING_PRIVATE_KEY` for updates,
+and the Apple set) live only in GitHub's `desktop-release` environment and are not copied to
+Forgejo. `factory-runtime.yml`, `installer-candidates.yml`, `release.yml` and the host signing
+workflows are run on GitHub, and GitHub keeps git, tags and the releases the app downloads from.
 
-- They are off until the owner sets the repository variable `DESKTOP_RELEASE_ON_FORGEJO` to `true`.
-  Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
-- The signing secrets must be added to the Forgejo repository: `DESKTOP_RELEASE_ED25519_PRIVATE_KEY`
-  (runtime packs; the app refuses unsigned ones) and `TAURI_SIGNING_PRIVATE_KEY` (updater
-  signatures). The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
+The release workflows can also run on Forgejo, but that path is off: they skip there unless the
+repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`, and it is not set. Turning it on would
+also need the keys above on Forgejo. For reference, if that ever changes:
+
+- Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
+  The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
 - Run ids (`runtime_run_id`, `companion_run_ids`, approvals) are Forgejo's API ids, which a job
   sees as `GITHUB_RUN_ID`; the number in a run's web address is a different one. `gh` reads those
   runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
