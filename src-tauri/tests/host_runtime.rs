@@ -1,3 +1,5 @@
+#[path = "common/catalogue.rs"]
+mod catalogue;
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::host_runtime::VerifiedHostRuntime;
 use serde_json::{json, Value};
@@ -831,7 +833,8 @@ fn factory_signed_host_starts_and_restarts_through_compiled_authority() {
 #[test]
 #[ignore = "requires factory-signed host, approved model cache and new FRAMELEAF_TEST_HOST_ML_STATE"]
 fn factory_host_nested_ml_installs_qualifies_and_predicts() {
-    use frameleaf_desktop::{model_catalogue::approved_profile, release_policy};
+    use catalogue::approved_profile;
+    use frameleaf_desktop::release_policy;
     use std::{
         net::TcpListener,
         sync::atomic::AtomicBool,

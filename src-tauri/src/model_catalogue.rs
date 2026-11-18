@@ -1,11 +1,16 @@
-//! Approved model identities are compiled into the app; a NAS can request a profile but cannot replace it.
+//! Model profiles come from the server's catalogue, the only one: the server sends the profile of each model
+//! it selected, and this computer validates, downloads (from Frameleaf's model mirror, hash-checked) and runs
+//! exactly that profile in its factory-signed runtime. `runtime/model-catalogue.json` is a copy of the server's
+//! catalogue for tests and release tools only; the app never reads it.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
+#[cfg(test)]
 const DATA: &str = include_str!("../../runtime/model-catalogue.json");
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Catalogue {
@@ -27,13 +32,19 @@ struct ProfileData {
     fixture_base64: String,
     artifact_bytes: BTreeMap<String, u64>,
 }
-/// Only the compiled-catalogue selector can construct this authority-bearing type.
+/// Built only from a validated profile the server served (`from_served`), never deserialized directly.
 /// ```compile_fail
 /// let _: frameleaf_desktop::model_catalogue::ApprovedProfile = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Clone)]
 pub struct ApprovedProfile(ProfileData);
 impl ApprovedProfile {
+    /// A profile exactly as the server's catalogue ships it, after the same checks every profile gets.
+    pub fn from_served(value: &Value) -> Result<Self, String> {
+        let profile: ProfileData = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+        profile.validate()?;
+        Ok(Self(profile))
+    }
     pub fn model_key(&self) -> &str {
         self.0.model_key()
     }
@@ -555,6 +566,7 @@ fn validate_ocr_output(output: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     let catalogue: Catalogue = serde_json::from_str(raw).map_err(|_| invalid())?;
     if catalogue.schema_version != 1
@@ -577,6 +589,7 @@ fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     }
     Ok(catalogue.profiles)
 }
+#[cfg(test)]
 pub fn approved_profile(
     model_name: &str,
     entries: &Value,
@@ -594,6 +607,7 @@ pub fn approved_profile(
         .map(ApprovedProfile))
 }
 
+#[cfg(test)]
 pub(crate) fn setup_profiles(
     name: &str,
     source: &str,
@@ -610,39 +624,32 @@ pub(crate) fn setup_profiles(
         .collect())
 }
 
-pub(crate) fn inventory_group(
+/// The profiles the server sent for one task. Each is a valid profile of that workload for this runtime and
+/// provider, carrying exactly the key the server named in the same place.
+pub(crate) fn served_group(
     workload: &str,
     keys: &[String],
+    served: &[Value],
     source: &str,
     provider: &str,
 ) -> Result<Vec<ApprovedProfile>, String> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
+    if served.len() != keys.len() {
+        return Err(invalid());
     }
-    let profiles: Vec<_> = parse_catalogue(DATA)?
-        .into_iter()
-        .filter(|profile| {
-            profile.workload == workload
-                && keys.contains(&profile.model_key)
-                && profile.runtime_source_revision == source
-                && profile.spec["provider"] == provider
+    keys.iter()
+        .zip(served)
+        .map(|(key, value)| {
+            let profile = ApprovedProfile::from_served(value)?;
+            if profile.0.model_key != *key
+                || profile.0.workload != workload
+                || profile.0.runtime_source_revision != source
+                || profile.0.spec["provider"] != provider
+            {
+                return Err(invalid());
+            }
+            Ok(profile)
         })
-        .map(ApprovedProfile)
-        .collect();
-    if profiles.len() != keys.len() {
-        return Ok(Vec::new());
-    }
-    if workload == "clip" {
-        let expected = setup_profiles(&profiles[0].0.model_name, source, provider)?;
-        if expected.len() != 3
-            || expected
-                .iter()
-                .any(|profile| !keys.iter().any(|key| key == profile.model_key()))
-        {
-            return Ok(Vec::new());
-        }
-    }
-    Ok(profiles)
+        .collect()
 }
 
 pub(crate) fn shared_cache(
@@ -1454,39 +1461,70 @@ mod tests {
         assert!(pairs > 0);
     }
     #[test]
-    fn profiles_for_other_providers_and_sources_are_ignored_without_error() {
+    fn a_served_profile_is_used_only_for_the_task_runtime_and_key_the_server_named() {
         let source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
-        let cpu = setup_profiles("buffalo_l", source, "CPUExecutionProvider").unwrap();
-        assert_eq!(cpu.len(), 1);
-        // The CoreML, CUDA and OpenVINO twins share this model key; a CPU runtime selects only its own.
-        let keys = [cpu[0].model_key().to_string()];
-        let selected = inventory_group("face", &keys, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].provider(), "CPUExecutionProvider");
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let served = |provider: &str| {
+            catalogue["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| {
+                    p["modelName"] == "buffalo_l"
+                        && p["runtimeSourceRevision"] == source
+                        && p["spec"]["provider"] == provider
+                })
+                .unwrap()
+                .clone()
+        };
+        let cpu = served("CPUExecutionProvider");
+        let keys = [cpu["modelKey"].as_str().unwrap().to_string()];
         for provider in [
+            "CPUExecutionProvider",
             "CoreMLExecutionProvider",
             "CUDAExecutionProvider",
             "OpenVINOExecutionProvider",
         ] {
-            let twin = inventory_group("face", &keys, source, provider).unwrap();
-            assert_eq!(twin.len(), 1, "{provider}");
-            assert_eq!(twin[0].provider(), provider);
+            let group = served_group("face", &keys, &[served(provider)], source, provider).unwrap();
+            assert_eq!(group[0].provider(), provider);
         }
-        // A runtime source no profile names, or a provider no profile has, selects nothing.
-        for (source, provider) in [
+        let other_source = "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8";
+        for (workload, key, value, source, provider) in [
             (
-                "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8",
+                "face",
+                &keys[0],
+                cpu.clone(),
+                source,
+                "CUDAExecutionProvider",
+            ),
+            (
+                "face",
+                &keys[0],
+                cpu.clone(),
+                other_source,
                 "CPUExecutionProvider",
             ),
-            (source, "MIGraphXExecutionProvider"),
+            ("ocr", &keys[0], cpu.clone(), source, "CPUExecutionProvider"),
+            (
+                "face",
+                &format!("face:{}", "0".repeat(64)),
+                cpu.clone(),
+                source,
+                "CPUExecutionProvider",
+            ),
         ] {
-            assert!(inventory_group("face", &keys, source, provider)
-                .unwrap()
-                .is_empty());
-            assert!(setup_profiles("buffalo_l", source, provider)
-                .unwrap()
-                .is_empty());
+            assert!(served_group(workload, &[key.clone()], &[value], source, provider).is_err());
         }
+        // One missing, a changed field, or a profile that fails validation is refused too.
+        assert!(served_group("face", &keys, &[], source, "CPUExecutionProvider").is_err());
+        let mut changed = cpu.clone();
+        changed["spec"]["fixtureSha256"] = json!("0".repeat(64));
+        assert!(ApprovedProfile::from_served(&changed)
+            .and_then(|p| p.challenge(&Uuid::new_v4().to_string()))
+            .is_err());
+        changed = cpu;
+        changed["unexpected"] = json!(true);
+        assert!(ApprovedProfile::from_served(&changed).is_err());
     }
     #[test]
     fn challenge_digest_does_not_depend_on_how_a_whole_number_is_written() {

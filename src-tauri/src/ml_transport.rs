@@ -741,8 +741,9 @@ impl WorkerTransport {
     ) -> Result<serde_json::Value, String> {
         let mut connection = self.0.lock().await;
         connection.ensure_current().await?;
-        let payload =
-            serde_json::json!({"runtimeSourceRevision":source,"provider":provider}).to_string();
+        // Protocol 2: the reply carries the server's catalogue profile of each model it selected.
+        let payload = serde_json::json!({"runtimeSourceRevision":source,"provider":provider,"protocolVersion":2})
+            .to_string();
         let response = connection
             .request(
                 Method::POST,
@@ -751,7 +752,8 @@ impl WorkerTransport {
                 &payload,
             )
             .await?;
-        worker_json(response, 65_536).await
+        // Each profile carries its fixture (up to 2 MiB, base64): room for every task's profiles.
+        worker_json(response, 32 * 1024 * 1024).await
     }
     pub(crate) async fn maintain_session(&self) -> Result<(), String> {
         self.0.lock().await.ensure_current().await

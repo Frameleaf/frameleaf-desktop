@@ -1,3 +1,5 @@
+#[path = "common/catalogue.rs"]
+mod catalogue;
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::native_runtime::VerifiedRuntime;
 use serde_json::json;
@@ -431,7 +433,7 @@ fn a_signed_runtime_alone_does_not_admit_the_qwen_description_candidate() {
             "visual": { "modelName": "Qwen/Qwen3.5-4B", "options": {} }
         }
     });
-    assert!(frameleaf_desktop::model_catalogue::approved_profile(
+    assert!(catalogue::approved_profile(
         "Qwen/Qwen3.5-4B",
         &entries,
         runtime.source_revision(),

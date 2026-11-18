@@ -723,16 +723,6 @@ fn disk_shortfall(code: String, models: &Path, needed: u64) -> String {
     code
 }
 
-/// Why the server offers no work: an older server that held a task back by its routing needs an
-/// update; any other server simply has no task turned on that this computer can run.
-fn no_work(auto_setup_server: bool, routed: bool) -> &'static str {
-    if !auto_setup_server && routed {
-        "server_update_required"
-    } else {
-        "worker_no_eligible_workloads"
-    }
-}
-
 /// Why no workload qualified: the first one's reason, or the general code when none was given.
 fn first_failure(workloads: &[WorkloadStatus]) -> String {
     workloads
@@ -774,10 +764,13 @@ pub(crate) fn inventory_profiles(
         state: String,
         model_names: Vec<String>,
         model_keys: Vec<String>,
+        /// The server's catalogue profile of each model key, in the same order.
+        #[serde(default)]
+        profiles: Vec<serde_json::Value>,
     }
     let invalid = || "worker_model_inventory_invalid".to_string();
     let inventory: Inventory = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-    if inventory.protocol_version != 1
+    if inventory.protocol_version != 2
         || inventory.provider != provider
         || inventory.runtime_source_revision != source
         || inventory.workloads.len() != 4
@@ -807,7 +800,7 @@ pub(crate) fn inventory_profiles(
         {
             return Err(invalid());
         }
-        let mut state = entry.state;
+        let state = entry.state;
         if state == "eligible" {
             let expected = match entry.workload.as_str() {
                 "clip" => 3,
@@ -831,18 +824,14 @@ pub(crate) fn inventory_profiles(
             {
                 return Err(invalid());
             }
-            let profiles = crate::model_catalogue::inventory_group(
+            groups.push(crate::model_catalogue::served_group(
                 &entry.workload,
                 &entry.model_keys,
+                &entry.profiles,
                 source,
                 provider,
-            )?;
-            if profiles.is_empty() {
-                state = "unsupported".into();
-            } else {
-                groups.push(profiles);
-            }
-        } else if !entry.model_keys.is_empty() {
+            )?);
+        } else if !entry.model_keys.is_empty() || !entry.profiles.is_empty() {
             return Err(invalid());
         }
         // Routing states come only from servers older than desktop auto-setup, which decide desktop
@@ -1027,6 +1016,10 @@ async fn prepare_on(
     if !caps.features.worker_session {
         return Err("desktop_worker_session_unavailable".into());
     }
+    // This computer runs only the server's catalogue, which servers before desktop auto-setup don't send.
+    if !caps.features.worker_auto_setup {
+        return Err("server_update_required".into());
+    }
     let worker = WorkerTransport::load(&saved)?;
     let inventory = cancellable(
         worker.model_inventory(installed.source_revision(), installed.provider()),
@@ -1038,14 +1031,10 @@ async fn prepare_on(
         installed.source_revision(),
         installed.provider(),
     )?;
-    let routed = statuses
-        .iter()
-        .any(|item| item.code.as_deref() == Some("server_update_required"));
     progress.workloads(statuses);
     if groups.is_empty() {
-        // An older server offers desktops work only through its routes, and often none: the fix
-        // is updating it, not a setting. A current server offers every enabled task it can.
-        return Err(no_work(caps.features.worker_auto_setup, routed).into());
+        // The server offers every enabled task it can: none means none is turned on for computers.
+        return Err("worker_no_eligible_workloads".into());
     }
     // FD-52: an accelerated runtime beside the processor one, where the app ships one this
     // computer can use. Any fault on that side leaves every workload on the processor.
@@ -1636,9 +1625,11 @@ mod tests {
             let profiles: Vec<_> = profiles.into_iter().filter(|p| Some(&p["modelName"]) == default.as_ref()).collect();
             serde_json::json!({"workload":workload,"state":if workload == "enrichment" {"unsupported"} else {"eligible"},
                 "modelNames":profiles.first().map(|p| vec![p["modelName"].clone()]).unwrap_or_default(),
-                "modelKeys":profiles.iter().map(|p|p["modelKey"].clone()).collect::<Vec<_>>()})
+                "modelKeys":profiles.iter().map(|p|p["modelKey"].clone()).collect::<Vec<_>>(),
+                // protocol 2: the server's own profile for each key
+                "profiles":if workload == "enrichment" {vec![]} else {profiles.into_iter().cloned().collect::<Vec<_>>()}})
         });
-        serde_json::json!({"protocolVersion":1,"provider":"CPUExecutionProvider",
+        serde_json::json!({"protocolVersion":2,"provider":"CPUExecutionProvider",
             "runtimeSourceRevision":"25b22c16e47a27a2eb50017d838497abce850d11","workloads":workloads})
     }
     #[test]
@@ -1647,6 +1638,7 @@ mod tests {
         let mut value = inventory_fixture();
         value["workloads"][2]["state"] = serde_json::json!("pinned");
         value["workloads"][2]["modelKeys"] = serde_json::json!([]);
+        value["workloads"][2]["profiles"] = serde_json::json!([]);
         let (groups, statuses) =
             inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
         assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
@@ -1654,20 +1646,16 @@ mod tests {
         // Only an older server sends a routing state: updating it is the fix.
         assert_eq!(statuses[2].code.as_deref(), Some("server_update_required"));
         assert_eq!(statuses[0].code, None);
+        // A key the server's own profile does not carry, or a profile for another provider, is refused:
+        // the desktop runs exactly what the server sent.
+        assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
         value["workloads"][1]["modelKeys"][0] =
             serde_json::json!(format!("ocr:{}", "0".repeat(64)));
-        let (groups, statuses) =
-            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(statuses[1].state, "unsupported");
-        assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
-    }
-    #[test]
-    fn asks_for_a_server_update_only_when_routing_held_work_back() {
-        assert_eq!(no_work(false, true), "server_update_required");
-        // An older server with every task off or unsupported: an administrator turns one on.
-        assert_eq!(no_work(false, false), "worker_no_eligible_workloads");
-        assert_eq!(no_work(true, false), "worker_no_eligible_workloads");
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+        // Protocol 1 (no profiles) comes only from older servers.
+        let mut old = inventory_fixture();
+        old["protocolVersion"] = serde_json::json!(1);
+        assert!(inventory_profiles(&old, source, "CPUExecutionProvider").is_err());
     }
     #[test]
     fn reports_the_first_specific_reason_nothing_qualified() {
@@ -1718,7 +1706,7 @@ mod tests {
         }
     }
     #[test]
-    fn inventory_selects_each_new_clip_model_and_rejects_mixed_model_groups() {
+    fn inventory_runs_each_clip_model_the_server_selects_and_refuses_mismatched_keys() {
         let source = "25b22c16e47a27a2eb50017d838497abce850d11";
         let models = ["ViT-B-32__openai", "ViT-SO400M-16-SigLIP2-384__webli"];
         for model in models {
@@ -1737,14 +1725,11 @@ mod tests {
             expected.sort();
             assert_eq!(selected, expected);
         }
-        // one key from the other model leaves no complete group: search is unsupported, the rest stay
+        // A key that does not match the profile the server sent beside it is refused, not guessed at.
         let mut value = inventory_fixture_with(models[0]);
         value["workloads"][0]["modelKeys"][0] =
             inventory_fixture_with(models[1])["workloads"][0]["modelKeys"][0].clone();
-        let (groups, statuses) =
-            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(statuses[0].state, "unsupported");
-        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
     }
     #[test]
     fn inventory_rejects_partial_clip_groups_and_invalid_authority_shapes() {

@@ -9,6 +9,18 @@ Both repositories implement this document: `frameleaf-desktop` (client) and `fra
 (server). The endpoints are the existing `/api/desktop/worker/*` ones. This revision changes what
 the server checks, not the wire format, so older desktops keep working.
 
+## One catalogue: the server's
+
+The server's model catalogue (`server/resources/desktop/model-catalogue.json` in frameleaf-app) is the
+only one. The desktop runs exactly the profile the server sends for each model the server selected, and
+keeps no catalogue of its own. Downloads come only from Frameleaf's model mirror and are hash-checked
+against that profile. The model runs in the factory-signed runtime and must reproduce the profile's
+`expectedOutput`. `runtime/model-catalogue.json` in this repository is a copy kept for tests and
+release tools. The app never reads it, and the release check keeps it equal to the paired server tag.
+
+When the desktop is the server (local-server mode), the packaged Frameleaf server reads its own
+catalogue like any other server. That is still the one catalogue.
+
 ## Version signal
 
 `GET /api/desktop/capabilities` → `features.workerAutoSetup: true` on servers that follow this
@@ -18,8 +30,8 @@ document. Older servers omit the key. The desktop reads a missing key as `false`
 
 | Step | Desktop | Server |
 |---|---|---|
-| 1 | `POST /api/desktop/worker/models` `{runtimeSourceRevision, provider}` | For each enabled task, returns the catalogue profile(s) for the configured model on this runtime. |
-| 2 | Downloads and hash-checks each profile's files against its own catalogue copy. | — |
+| 1 | `POST /api/desktop/worker/models` `{runtimeSourceRevision, provider, protocolVersion: 2}` | For each enabled task, returns the model keys and the full catalogue profile of each. |
+| 2 | Validates each served profile, then downloads its files from the model mirror and hash-checks them against that profile. | — |
 | 3 | `POST /api/desktop/worker/challenges` `{requestId, modelKey, provider, runtimeSourceRevision, runtime}` | Checks the factory signature on the runtime attestation, then issues the catalogue profile's fixture bound to a nonce. |
 | 4 | Runs the fixture in the signed runtime, which compares the result with the profile's `expectedOutput`. | — |
 | 5 | `POST /api/desktop/worker/challenges/{id}/report` `{report}` | Validates the report against the profile and runtime, then grants the model to this worker. |
@@ -30,15 +42,19 @@ session authentication (`x-frameleaf-desktop-proof`) is unchanged.
 
 ### Inventory (`/models`)
 
-The response shape is unchanged (`protocolVersion: 1`, four workloads). On a `workerAutoSetup`
-server, `state` is one of:
+With `protocolVersion: 2` in the request, the reply is `protocolVersion: 2`, still with four workloads.
+Each `eligible` entry also has `profiles`: the server's catalogue profile for each of `modelKeys`, in
+the same order and exactly as the server ships it. The desktop refuses the whole reply if a profile
+fails validation or does not carry the key, workload, provider and runtime source it is listed for.
+Without `protocolVersion`, current desktops get the `protocolVersion: 1` reply, unchanged.
+
+On a `workerAutoSetup` server, `state` is one of:
 
 - `eligible`: the task is enabled and the catalogue has its model for this runtime. `modelKeys` holds 3 keys for `clip` (image + text encoders), 1 for `ocr` and `face`.
 - `disabled`: AI, or this task, is turned off on the server.
 - `unsupported`: the configured model has no catalogue profile for this runtime/provider, or the task is `enrichment`.
 
-`pinned`, `legacy` and `unavailable` describe routing. Only older servers send them; the desktop
-reads them as **update your server** (`server_update_required`).
+`pinned`, `legacy` and `unavailable` describe routing, and only older servers send them.
 
 ## What the server checks
 
@@ -97,7 +113,7 @@ These come from the desktop itself, before anything reaches the server:
 | `runtime_provider_unavailable` | GPU provider could not run; the desktop falls back to the processor |
 | `runtime_signature_invalid` | Bundled runtime fails its signature check |
 | `model_disk_space_insufficient` | Not enough free disk for the model download |
-| `server_update_required` | Server lacks `workerAutoSetup` and refused on routing grounds |
+| `server_update_required` | Server lacks `workerAutoSetup`, so it can't send its catalogue |
 
 ## Compatibility
 
@@ -105,9 +121,9 @@ These come from the desktop itself, before anything reaches the server:
 |---|---|---|
 | old | new | Works. Same endpoints and payloads; the server no longer refuses on routing or its own AI. |
 | new | new | Works, with specific messages. |
-| new | old | Works when the old server's routing allows it. Otherwise each refused task shows **update your server** (`server_update_required`), not a generic failure. |
+| new | old | **Update your server** (`server_update_required`). The old server can't send its catalogue, and the desktop has none of its own. It checks again every few minutes. |
 | old | old | Unchanged. |
 
 Server-side NAS-producer codes (`desktop_nas_*`, `desktop_route_review_required`,
 `desktop_pool_route_changed`) only come from older servers. A new desktop maps them to
-`server_update_required`.
+`server_update_required` if it ever sees one.
