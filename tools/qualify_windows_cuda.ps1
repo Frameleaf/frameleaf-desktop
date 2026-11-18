@@ -264,7 +264,15 @@ $pad = $installPrefix - ($Work.Length + 1 + $name.Length + '\releases\'.Length +
 if ($pad -gt 1) { $name = $name + ' ' + ('x' * ($pad - 1)) } else { Write-Host "note: -Work is already deep; the pack path is longer than an installed one by $(-$pad) characters" }
 $home_ = Join-Path $Work $name
 $pack = Join-Path (Join-Path $home_ 'releases') ('a' * 64)
-foreach ($stale in @($built, $home_)) { if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Recurse -Force } }
+# The pack holds files deeper than MAX_PATH; without long-path support in Windows (a PC's default)
+# Remove-Item can not reach them, so an earlier run's pack is removed through the extended-length
+# form. `rd` removes a junction or link itself, never what it leads to.
+foreach ($stale in @($built, $home_)) {
+    if (Test-Path -LiteralPath $stale) {
+        & cmd.exe /d /c "rd /s /q `"\\?\$stale`""
+        if (Test-Path -LiteralPath $stale) { Fail "could not remove the earlier run's $stale" }
+    }
+}
 $code = Invoke-Logged (Join-Path $Output 'build.txt') 'python' @((Join-Path $Desktop 'tools\build_runtime.py'), '--source', $ServerSource, '--output', $built, '--revision', $revision, '--epoch', '7', '--profile', 'cuda-ort')
 if ($code -ne 0) {
     $errorLog = Join-Path $Work '.pack.error.log'

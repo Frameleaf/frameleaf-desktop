@@ -85,6 +85,9 @@ fn known_folder(id: &windows_sys::core::GUID, token: HANDLE) -> Result<PathBuf, 
     }));
     crate::windows_protection::stable_path(&path).map_err(|_| ERROR.into())
 }
+pub(super) fn program_files() -> Result<PathBuf, String> {
+    known_folder(&FOLDERID_ProgramFilesX64, std::ptr::null_mut())
+}
 pub(super) fn base() -> Result<PathBuf, String> {
     let physical = known_folder(&FOLDERID_ProgramFilesX64, std::ptr::null_mut())?;
     crate::windows_protection::protect(&physical, &mut BTreeSet::new()).map_err(|_| ERROR)?;

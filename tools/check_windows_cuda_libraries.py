@@ -219,6 +219,15 @@ def child(site: Path, stage: str) -> dict:
             problems.append(f"the session is not on {PROVIDER}: {created.get_providers()} (onnxruntime fell back)")
         elif not np.allclose(created.run(None, {"input": feed})[0], feed @ weights):
             problems.append("the CUDA session returned a wrong result")
+        # Qualification refuses CUDA unless the runtime itself sees a card (native_qualification's
+        # `accelerator_present`, from the snapshot's nvidia-smi query). A session can run on the
+        # card while that query fails in the app's environment, so check it here too.
+        from frameleaf_ml.native_hardware import snapshot
+
+        cards = snapshot()["facts"]["gpus"]
+        result["runtimeCards"] = len(cards)
+        if not cards:
+            problems.append("the runtime sees no NVIDIA card in the app's environment (nvidia-smi failed): CUDA qualification would be refused")
         interesting = re.compile(r"(cudart|cudnn|cublas|cufft|curand|nvrtc|nvjitlink|nvcuda|nvapi|onnxruntime)", re.I)
         result["loadedLibraries"] = sorted(
             {entry.path for entry in psutil.Process().memory_maps() if interesting.search(Path(entry.path).name)}
@@ -277,6 +286,11 @@ def app_environment(scratch: str, folders: list[Path], home: bool = True) -> dic
     }
     if home:
         environment["USERPROFILE"] = scratch
+        # Added with the home directory's successors: NVML (nvidia-smi, the runtime's view of the
+        # card) does not initialize without them. The app gives the OS's registered folder.
+        programs = os.environ.get("ProgramW6432") or os.environ["ProgramFiles"]
+        environment["ProgramFiles"] = programs
+        environment["ProgramW6432"] = programs
     return environment
 
 
@@ -321,7 +335,11 @@ def changed(pack: Path, manifest: dict) -> list[str]:
 
     names = []
     for name, artifact in sorted(manifest["files"].items()):
-        path = pack / "payload" / name
+        # The pack carries files deeper than MAX_PATH (onnx test data, onnxruntime tools: the
+        # "files over the path budget"). Without long-path support in Windows (the default on a
+        # PC; GitHub's runners turn it on) a plain path does not open them, and every one of them
+        # would be reported as changed. The extended-length form opens them on any Windows.
+        path = Path("\\\\?\\" + str((pack / "payload" / name).resolve())) if os.name == "nt" else pack / "payload" / name
         if not path.is_file() or path.stat().st_size != artifact["bytes"]:
             names.append(name)
             continue
