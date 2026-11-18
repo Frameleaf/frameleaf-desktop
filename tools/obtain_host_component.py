@@ -78,8 +78,9 @@ def gh() -> list[str]:
 
 
 def api(path: str) -> dict:
+    # On Forgejo the artifact metadata includes measuring its archive (the shim keeps it for download).
     data = subprocess.check_output([*gh(), "api", f"repos/{REPOSITORY}/{path}"],
-                                   stderr=subprocess.DEVNULL, timeout=30)
+                                   stderr=subprocess.DEVNULL, timeout=600 if os.environ.get("GH_SHIM_TOOL") else 30)
     if len(data) > 2 * 1024**2:
         raise BuildError("host_component_metadata_limit")
     return json.loads(data)

@@ -16,6 +16,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   database:
+    # On Forgejo only when dispatched: its Windows runner is the owner's PC, so pull requests never run there.
+    if: (github.server_url == 'https://github.com' || github.event_name == 'workflow_dispatch')
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -29,6 +31,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           ref: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
           path: server-source
           sparse-checkout: docker/postgres

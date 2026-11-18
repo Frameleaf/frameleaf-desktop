@@ -8,7 +8,7 @@
 // .github/actions/forgejo-gh puts this first on PATH; it is never used on GitHub.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -97,16 +97,35 @@ async function artifactsOf(id, request) {
   }
 }
 
+/** Where measured archives are kept for the job, so an archive crosses the network once. */
+export function archives(env = process.env) {
+  return join(env.RUNNER_TEMP || tmpdir(), "forgejo-gh-archives");
+}
+
 // Forgejo records no artifact digest; GitHub's is the SHA-256 of the archive it serves, so it is
-// measured from the same bytes (Forgejo serves an artifact's archive unchanged on every download).
-async function measure(id, request) {
-  const hash = createHash("sha256");
-  for await (const chunk of (await request(`actions/artifacts/${id}/zip`, { raw: true })).body) hash.update(chunk);
+// measured from the bytes Forgejo serves, and those bytes are kept: a later `.../zip` call returns
+// exactly what was measured (the tools hash their download against the approval again).
+async function measure(id, request, cache) {
+  mkdirSync(cache, { recursive: true, mode: 0o700 });
+  const kept = join(cache, `${id}.zip`), partial = `${kept}.partial`;
+  const hash = createHash("sha256"), output = createWriteStream(partial, { flags: "wx", mode: 0o600 });
+  try {
+    for await (const chunk of (await request(`actions/artifacts/${id}/zip`, { raw: true })).body) {
+      hash.update(chunk);
+      if (!output.write(chunk)) await new Promise((resolve) => output.once("drain", resolve));
+    }
+    await new Promise((resolve, reject) => output.end((error) => (error ? reject(error) : resolve())));
+    renameSync(partial, kept);
+  } catch (error) {
+    output.destroy();
+    rmSync(partial, { force: true });
+    throw error;
+  }
   return hash.digest("hex");
 }
 
 /** The answer to `gh api repos/<this repo>/actions/<endpoint>`: JSON, or a response to stream. */
-export async function answer(endpoint, request = forgejo) {
+export async function answer(endpoint, request = forgejo, cache = archives()) {
   const [path] = endpoint.split("?");
   let match = /^runs\/(\d+)$/.exec(path);
   if (match) return runOf(match[1], request);
@@ -125,10 +144,13 @@ export async function answer(endpoint, request = forgejo) {
   match = /^artifacts\/(\d+)$/.exec(path);
   if (match) {
     const artifact = await request(`actions/artifacts/${match[1]}`);
-    return githubArtifact(artifact, await runOf(artifact.run_id, request), await measure(match[1], request));
+    return githubArtifact(artifact, await runOf(artifact.run_id, request), await measure(match[1], request, cache));
   }
   match = /^artifacts\/(\d+)\/zip$/.exec(path);
-  if (match) return request(`actions/artifacts/${match[1]}/zip`, { raw: true });
+  if (match) {
+    const kept = join(cache, `${match[1]}.zip`);
+    return existsSync(kept) ? new Response(Readable.toWeb(createReadStream(kept))) : request(`actions/artifacts/${match[1]}/zip`, { raw: true });
+  }
   throw new Error(`forgejo_gh_unsupported: actions/${endpoint}`);
 }
 

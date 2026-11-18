@@ -18,6 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-24.04]
+        # On Forgejo, Windows runs only when dispatched: the runner is the owner's PC.
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && github.event_name != 'workflow_dispatch' && 'windows-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:

@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GITHUB_REPOSITORY_ID, REPOSITORY, answer, apiCall, downloads, githubRun } from "./forgejo_gh.mjs";
 import { validateDispatchRun } from "./release_inputs.mjs";
@@ -74,8 +76,15 @@ test("every page of a run's artifacts is listed", async () => {
 
 test("an artifact carries the digest of the archive Forgejo serves and passes the component producer check", async () => {
   const digest = createHash("sha256").update(bytes).digest("hex");
-  const mapped = await answer("artifacts/110", fake().request);
+  const cache = mkdtempSync(join(tmpdir(), "forgejo-gh-test-"));
+  const { request, asked } = fake();
+  const mapped = await answer("artifacts/110", request, cache);
   assert.equal(mapped.digest, `sha256:${digest}`);
+  // The archive crosses the network once: the download serves the measured bytes.
+  const kept = await answer("artifacts/110/zip", request, cache);
+  assert.deepEqual(Buffer.from(await kept.arrayBuffer()), bytes);
+  assert.equal(asked.filter((path) => path === "actions/artifacts/110/zip").length, 1);
+  rmSync(cache, { recursive: true, force: true });
   const producer = await answer("runs/507/attempts/1", fake().request);
   const approved = { artifactId: 110, runId: 507, runAttempt: 1, headSha: SHA, workflow: ".github/workflows/factory-runtime.yml", archiveSha256: digest };
   const check = spawnSync("python3", ["-I", "-c", [
@@ -90,7 +99,7 @@ test("an artifact carries the digest of the archive Forgejo serves and passes th
 });
 
 test("the archive endpoint streams the bytes; other Actions endpoints are refused", async () => {
-  const response = await answer("artifacts/110/zip", fake().request);
+  const response = await answer("artifacts/110/zip", fake().request, join(tmpdir(), "forgejo-gh-none"));
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
   await assert.rejects(answer("workflows/release.yml/runs", fake().request), /unsupported/);
 });

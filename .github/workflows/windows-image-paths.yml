@@ -9,6 +9,8 @@ permissions:
   contents: read
 jobs:
   image-paths:
+    # On Forgejo only when dispatched: its Windows runner is the owner's PC, so pull requests never run there.
+    if: (github.server_url == 'https://github.com' || github.event_name == 'workflow_dispatch')
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
