@@ -31,7 +31,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
+    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -235,7 +236,7 @@ jobs:
       - run: npm test
       - run: npm run check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
@@ -349,7 +350,7 @@ jobs:
           jq -er '.id' src-tauri/target/release/bundle/dmg/dmg-submission.json
       - name: Retain the exact submitted image and request ID before waiting for Apple
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: notarization-pending-${{ matrix.target }}
           path: |
@@ -448,7 +449,7 @@ jobs:
                 ;;
             esac
           done
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: signed-installers-${{ matrix.target }}
           path: release-assets/
@@ -476,7 +477,7 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           pattern: signed-installers-*
           merge-multiple: true
@@ -520,7 +521,7 @@ jobs:
       # FD-60: the CUDA and OpenVINO packs the app downloads on demand. Each is verified against
       # its signed delivery manifest (the one the installers carry) before its parts join this
       # run's assets; the draft merge below uploads them like any other asset.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
@@ -563,7 +564,7 @@ jobs:
         run: |
           set -euo pipefail
           node tools/release_packaging.mjs "$RUNNER_TEMP/draft/SHA256SUMS" | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         if: ${{ !contains(inputs.tag, '-') }}
         with:
           name: package-manager-files

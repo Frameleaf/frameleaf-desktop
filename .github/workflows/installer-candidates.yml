@@ -19,7 +19,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
+    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -83,7 +84,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
@@ -145,7 +146,7 @@ jobs:
           npm run tauri -- build --verbose --config "$GITHUB_WORKSPACE/candidate-config.json" -- --locked 2>&1 | tee "$RUNNER_TEMP/frameleaf-installer-build.log"
       - name: Retain bundler diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-installer-diagnostics-${{ matrix.target }}
           path: |
@@ -223,7 +224,7 @@ jobs:
           }, indent=2) + '\n')
           with tarfile.open('installer-candidates.tar.gz', 'w:gz') as archive:
               archive.add(output, arcname='installers')
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-installer-candidates-${{ matrix.target }}
           path: installer-candidates.tar.gz

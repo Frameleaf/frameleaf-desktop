@@ -25,6 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-24.04]
+        # Forgejo has no Windows runner; its macOS runner is the Mac host.
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -38,9 +41,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: '3.12'
+      - uses: ./.github/actions/python
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
@@ -55,6 +56,19 @@ jobs:
           echo "a6818fef80128fb354423234ecacdcca3e993913d774e5d8346bc63f70fed4cf  $tool_dir/patchelf.tar.gz" | sha256sum --check --strict
           tar -xzf "$tool_dir/patchelf.tar.gz" -C "$tool_dir"
           echo "$tool_dir/bin" >> "$GITHUB_PATH"
+      # Forgejo's macOS runner is a shared Mac host without rustup: use a runner-owned toolchain,
+      # and a temporary folder of the job's own (tests check that nothing lands beside theirs).
+      - name: Runner-owned rustup and temporary folder on the Forgejo Mac host
+        if: github.server_url != 'https://github.com' && runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/Library/Caches/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/Library/Caches/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Rust stable
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - name: Reuse Rust dependencies from successful main checks
@@ -219,7 +233,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Installed Welcome check failed' }
       - name: Retain private candidate artifacts
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-desktop-shell-${{ runner.os }}
           path: src-tauri/target/debug/bundle/
@@ -230,7 +244,8 @@ jobs:
   # binaries also load on Debian 12. The check job above stays on Ubuntu 24.04, which the host
   # package qualification needs. The steps before the build are the ones the release runs there.
   linux-package:
-    if: ${{ !inputs.directory_probe && !inputs.keystore_probe }}
+    # Not available on Forgejo, which has no Ubuntu 22.04 runner.
+    if: ${{ github.server_url == 'https://github.com' && !inputs.directory_probe && !inputs.keystore_probe }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
@@ -278,7 +293,8 @@ jobs:
           bash tools/qualify_linux_deb_install.sh "${packages[0]}"
 
   directory-probe:
-    if: ${{ inputs.directory_probe && !inputs.keystore_probe }}
+    # Not available on Forgejo, which has no Windows runner.
+    if: ${{ github.server_url == 'https://github.com' && inputs.directory_probe && !inputs.keystore_probe }}
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -353,6 +369,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-24.04]
+        # Forgejo has no Windows runner, and its macOS runner is the owner's Mac, not a disposable
+        # host whose keychain a credential probe may write to.
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
+          - os: ${{ github.server_url != 'https://github.com' && 'macos-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     env:

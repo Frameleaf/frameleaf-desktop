@@ -25,7 +25,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   assets:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # Not available on Forgejo, which has no Windows runner.
+    if: ${{ github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -154,7 +155,7 @@ jobs:
                   archive.add(root / name / directory, arcname=name + '/' + directory)
                   archive.add(root / name / 'qualification.json', arcname=name + '/qualification.json')
       - name: Retain the qualified asset components
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-host-assets
           path: ${{ runner.temp }}/fl-windows-assets/host-assets.tar.gz
@@ -162,7 +163,7 @@ jobs:
           if-no-files-found: error
       - name: Retain bounded asset diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-host-assets-diagnostics
           path: |

@@ -12,7 +12,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sign:
-    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    # Not available on Forgejo yet: it reads GitHub release assets with the desktop-release secrets, and Forgejo has no disposable runner for it.
+    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     permissions:
       # GitHub requires repository write access to read unpublished release assets.
@@ -65,7 +66,7 @@ jobs:
           diff <(jq -S . "$evidence/signature.json") <(jq -S . "$evidence/verification.json")
           cp "$candidate/manifest.sig" "$evidence/"
       - name: Retain only the detached signature and verification
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-linux-x64-host-signature
           path: ${{ runner.temp }}/linux-host-evidence/
