@@ -616,7 +616,13 @@ impl VerifiedRuntime {
                 ) {
                     folders.push(self.root.join(relative(&folder)?));
                 }
-                command.envs(windows_environment(&root, &scratch, &folders)?);
+                let program_files = crate::host_install::windows_program_files()?;
+                command.envs(windows_environment(
+                    &root,
+                    &scratch,
+                    &folders,
+                    program_files.as_os_str(),
+                )?);
             }
         }
         crate::process_tree::configure(&mut command);
@@ -696,12 +702,18 @@ fn device_library_folders<'a>(
 /// settings name a default folder under the home directory when they are imported, and Python on
 /// Windows has no home directory without this variable, so the import failed and nothing
 /// qualified. The process's own scratch stands in; the user's profile stays out of reach.
+/// `ProgramFiles` and `ProgramW6432`: NVML, which `nvidia-smi` uses and through which
+/// the runtime learns there is a card, finds itself through them. Without them `nvidia-smi`
+/// ends with "Failed to initialize NVML: Unknown Error", the runtime reports no card, and every
+/// CUDA qualification is refused (`native_device_execution_evidence_required`) on a computer
+/// whose CUDA works. The OS's registered folder is given, never an inherited value.
 #[cfg(any(windows, test))]
 fn windows_environment(
     system_root: &std::ffi::OsStr,
     scratch: &Path,
     library_folders: &[PathBuf],
-) -> Result<[(&'static str, std::ffi::OsString); 3], String> {
+    program_files: &std::ffi::OsStr,
+) -> Result<[(&'static str, std::ffi::OsString); 5], String> {
     let mut search = vec![Path::new(system_root).join("System32")];
     search.extend(library_folders.iter().cloned());
     Ok([
@@ -711,6 +723,8 @@ fn windows_environment(
         ),
         ("SystemRoot", system_root.to_owned()),
         ("USERPROFILE", scratch.as_os_str().to_owned()),
+        ("ProgramFiles", program_files.to_owned()),
+        ("ProgramW6432", program_files.to_owned()),
     ])
 }
 
@@ -1182,8 +1196,13 @@ mod tests {
     fn a_windows_runtime_searches_the_os_directory_then_the_pack_and_has_a_home() {
         let scratch = Path::new("scratch folder");
         let folders = [PathBuf::from("pack").join("cudnn"), PathBuf::from("nvrtc")];
-        let environment =
-            windows_environment(std::ffi::OsStr::new("root"), scratch, &folders).unwrap();
+        let environment = windows_environment(
+            std::ffi::OsStr::new("root"),
+            scratch,
+            &folders,
+            std::ffi::OsStr::new("programs"),
+        )
+        .unwrap();
         let search: Vec<PathBuf> = std::env::split_paths(&environment[0].1).collect();
         assert_eq!(environment[0].0, "PATH");
         assert_eq!(
@@ -1196,6 +1215,48 @@ mod tests {
         );
         assert_eq!(environment[1], ("SystemRoot", "root".into()));
         assert_eq!(environment[2], ("USERPROFILE", scratch.into()));
+        assert_eq!(environment[3], ("ProgramFiles", "programs".into()));
+        assert_eq!(environment[4], ("ProgramW6432", "programs".into()));
+    }
+    /// NVML (and so `nvidia-smi`, through which the runtime learns there is a card) does not
+    /// initialize without the Program Files variables: with the environment before them, a
+    /// computer whose CUDA works reported no card and refused every CUDA qualification.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_runtime_process_can_see_the_nvidia_card() {
+        use std::process::Command;
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let smi = Path::new(&root).join("System32").join("nvidia-smi.exe");
+        if !smi.is_file() {
+            eprintln!("no NVIDIA driver here; nothing to check");
+            return;
+        }
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        let program_files = crate::host_install::windows_program_files().unwrap();
+        let sees = |with: bool| {
+            let mut command = Command::new(&smi);
+            command
+                .env_clear()
+                .args(["--query-gpu=index", "--format=csv,noheader"]);
+            for (name, value) in
+                windows_environment(&root, &scratch, &[], program_files.as_os_str()).unwrap()
+            {
+                if with || !name.starts_with("Program") {
+                    command.env(name, value);
+                }
+            }
+            command.output().unwrap().status.success()
+        };
+        if !sees(true) {
+            eprintln!(
+                "nvidia-smi reports no card even with the full environment; nothing to check"
+            );
+            return;
+        }
+        assert!(
+            !sees(false),
+            "NVML initialized without the Program Files variables"
+        );
     }
     /// Python on Windows finds no home directory in an emptied environment; the runtime's
     /// settings ask for one when they are imported.
@@ -1211,7 +1272,8 @@ mod tests {
                 .env_clear()
                 .args(["-I", "-B", "-c"])
                 .arg("from pathlib import Path; Path.home()");
-            for (name, value) in windows_environment(&root, &scratch, &[]).unwrap() {
+            let programs = std::ffi::OsStr::new(r"C:\Program Files");
+            for (name, value) in windows_environment(&root, &scratch, &[], programs).unwrap() {
                 if with || name != "USERPROFILE" {
                     command.env(name, value);
                 }

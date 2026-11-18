@@ -15,6 +15,11 @@ pub struct Layout {
 pub(crate) fn windows_local_app_data() -> Result<PathBuf, String> {
     windows::local_app_data()
 }
+/// The 64-bit Program Files folder as the OS registers it, never from an inherited variable.
+#[cfg(windows)]
+pub(crate) fn windows_program_files() -> Result<PathBuf, String> {
+    windows::program_files()
+}
 #[cfg(windows)]
 pub(crate) fn windows_profiles_root() -> Result<PathBuf, String> {
     Ok(windows::base()?.join("Profiles"))

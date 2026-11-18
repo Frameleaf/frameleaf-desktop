@@ -61,6 +61,10 @@ def app_environment(scratch: str, folders: list[Path] = ()) -> dict[str, str]:
         environment["SystemRoot"] = os.environ["SystemRoot"]
         environment["PATH"] = os.pathsep.join(str(folder) for folder in [system, *folders])
         environment["USERPROFILE"] = scratch
+        # NVML (nvidia-smi) finds itself through these; the app gives the OS's registered folder.
+        programs = os.environ.get("ProgramW6432") or os.environ["ProgramFiles"]
+        environment["ProgramFiles"] = programs
+        environment["ProgramW6432"] = programs
     else:
         environment["PATH"] = "/usr/bin:/bin"
     return environment
