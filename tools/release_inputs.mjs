@@ -61,15 +61,11 @@ const noForgejoRunner = {
   "linux-x86_64": "Forgejo has no Ubuntu 22.04 runner (Linux builds need its glibc 2.35)",
   "linux-aarch64": "Forgejo has no Ubuntu 22.04 Arm runner (Linux builds need its glibc 2.35)",
 };
-const unsignedWindowsInstallers =
-  "Windows installers ship unsigned, but this workflow still builds them with Azure Artifact Signing, which is not configured; " +
-  "build them unsigned before releasing Windows from Forgejo";
-
 /** Why each selected target cannot build on Forgejo: `stage` is "runtime" (factory packs) or "installer". */
 export function forgejoTargetProblems(platforms, stage) {
   if (stage !== "runtime" && stage !== "installer") throw new Error("forgejo_stage_invalid");
   return releaseMatrix(platforms).include.flatMap(({ target }) => {
-    const reason = noForgejoRunner[target] ?? (stage === "installer" && target === "windows-x86_64" ? unsignedWindowsInstallers : undefined);
+    const reason = noForgejoRunner[target];
     return reason ? [`${target}: ${reason}`] : [];
   });
 }

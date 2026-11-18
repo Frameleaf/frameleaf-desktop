@@ -39,26 +39,22 @@ test("a Windows release names each missing signing variable and where to set it"
   }
 });
 
-test("the Windows signing check runs before any build and reads every variable the signing action needs", () => {
+test("Windows release installers are unsigned by design; the companion host keeps its signing check", () => {
+  for (const name of [".github/workflows/release.yml", ".github/workflows/installer-candidates.yml"]) {
+    const workflow = read(name);
+    for (const signing of ["signing-preflight", "windows-signing", "windows_sign.ps1", "AZURE_", "WINDOWS_SIGNING_SUBJECT", "id-token: write"])
+      assert.ok(!workflow.includes(signing), `${name} still has ${signing}`);
+  }
   const workflow = read(".github/workflows/release.yml");
-  const action = read(".github/actions/windows-signing/action.yml");
-  const preflight = /\n  signing-preflight:\n([^]*?)\n  build:\n/.exec(workflow)?.[1];
-  assert.ok(preflight, "release.yml must have the signing preflight job before build");
-  assert.match(preflight, /\n    if: needs\.prepare\.result == 'success' && contains\(needs\.prepare\.outputs\.matrix, '"windows-x86_64"'\)\n/);
-  // The condition reads the matrix text, so it must find Windows exactly when the matrix has it.
-  for (const choice of releasePlatformChoices) {
-    const matrix = JSON.stringify(releaseMatrix(choice));
-    assert.equal(matrix.includes('"windows-x86_64"'), ["all", "windows"].includes(choice), choice);
-  }
-  assert.match(preflight, /\n    environment: desktop-release\n/);
-  assert.match(preflight, /node tools\/release_prerequisites\.mjs windows-signing/);
-  for (const name of windowsSigningVariables) {
-    assert.ok(preflight.includes(`${name}: \${{ vars.${name} }}`), name);
-    assert.ok(action.includes(`'${name}'`), `the signing action no longer requires ${name}`);
-  }
-  // Every platform waits for it, and a failed preflight stops them all.
-  assert.match(workflow, /\n  build:\n    needs: \[prepare, signing-preflight\]\n(?:    #.*\n)*    if: \$\{\{ !cancelled\(\) && needs\.prepare\.result == 'success' && \(needs\.signing-preflight\.result == 'success' \|\| needs\.signing-preflight\.result == 'skipped'\) \}\}\n/);
+  // Published with an -unsigned suffix, which keeps them out of the update feed and package managers.
+  assert.match(workflow, /name = f'\{path\.stem\}-unsigned\{path\.suffix\}' if sys\.platform == 'win32' else path\.name/);
+  assert.match(workflow, /\*-unsigned\.\*\) ;;/);
+  assert.match(workflow, /!\/-unsigned\\\.\/\.test\(name\)/);
+  assert.match(workflow, /\n  build:\n    needs: prepare\n    if: \$\{\{ !cancelled\(\) && needs\.prepare\.result == 'success' \}\}\n/);
   assert.match(workflow, /\n  stage:\n(?:    #.*\n)*    if: \$\{\{ !cancelled\(\) && inputs\.tag != '' && needs\.build\.result == 'success' \}\}\n/);
+  assert.match(read(".github/workflows/installer-candidates.yml"), /'osSigned': False,/);
+  // windows-compiled-host.yml still signs the companion host's release package and checks first.
+  assert.match(read(".github/workflows/windows-compiled-host.yml"), /node tools\/release_prerequisites\.mjs windows-signing/);
   const missing = call(["windows-signing"], { GITHUB_REPOSITORY: repository, ...Object.fromEntries(windowsSigningVariables.map((name) => [name, name.startsWith("AZURE_SIGNING_P") ? "" : "set"])) });
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /^::error::windows_signing_unconfigured: AZURE_SIGNING_PROFILE is not set\./);
@@ -495,7 +491,7 @@ test("each producing workflow retains its package and identity record, and the r
   const workflow = read(".github/workflows/release.yml");
   assert.match(workflow, /COMPANION_RUN_IDS: \$\{\{ inputs\.companion_run_ids \}\}/);
   // The identity is checked in `prepare`, before the build; `stage` holds the download to it.
-  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  signing-preflight:"));
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  build:"));
   assert.match(prepare, /node tools\/release_prerequisites\.mjs companion-identity "\$workflow" "\$run" "\$identity"/);
   const stage = workflow.slice(workflow.indexOf("\n  stage:"));
   assert.match(stage, /node tools\/release_prerequisites\.mjs companion-artifact "\$workflow" "\$download" "\$files"/);

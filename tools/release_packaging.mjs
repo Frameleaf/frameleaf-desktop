@@ -16,8 +16,8 @@ const files = {
   install: "packaging/chocolatey/tools/chocolateyinstall.ps1",
 };
 
-// The release workflow only produces these names from Authenticode-verified builds;
-// installers published without a signature carry an `-unsigned` suffix and never match.
+// Windows installers are published unsigned, with an `-unsigned` suffix, so the MSI name below never
+// matches and Chocolatey stays unpublished: it would only take an Authenticode-signed MSI.
 const assets = (version) => ({
   x86_64: `Frameleaf_${version}_amd64.deb`,
   aarch64: `Frameleaf_${version}_arm64.deb`,
