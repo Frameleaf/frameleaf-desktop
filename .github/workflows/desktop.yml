@@ -56,8 +56,9 @@ jobs:
           echo "a6818fef80128fb354423234ecacdcca3e993913d774e5d8346bc63f70fed4cf  $tool_dir/patchelf.tar.gz" | sha256sum --check --strict
           tar -xzf "$tool_dir/patchelf.tar.gz" -C "$tool_dir"
           echo "$tool_dir/bin" >> "$GITHUB_PATH"
-      # Forgejo's macOS runner is a shared Mac host without rustup: use a runner-owned toolchain.
-      - name: Runner-owned rustup on the Forgejo Mac host
+      # Forgejo's macOS runner is a shared Mac host without rustup: use a runner-owned toolchain,
+      # and a temporary folder of the job's own (tests check that nothing lands beside theirs).
+      - name: Runner-owned rustup and temporary folder on the Forgejo Mac host
         if: github.server_url != 'https://github.com' && runner.os == 'macOS'
         run: |
           set -euo pipefail
@@ -67,6 +68,7 @@ jobs:
           [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
           { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Rust stable
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - name: Reuse Rust dependencies from successful main checks
