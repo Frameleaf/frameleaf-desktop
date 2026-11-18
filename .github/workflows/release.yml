@@ -31,8 +31,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
-    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
+    # On Forgejo only once the owner sets the repository variable DESKTOP_RELEASE_ON_FORGEJO to true:
+    # Forgejo has no environment approval, and these jobs use the desktop-release secrets.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -46,16 +47,31 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
+      - name: Refuse targets Forgejo has no runner for
+        if: github.server_url != 'https://github.com'
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node --input-type=module -e '
+            import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            for (const problem of problems) console.log(`::error::${problem}`);
+            process.exitCode = problems.length ? 1 : 0;
+          '
       - name: Validate immutable release source and runtime run
         id: source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -91,7 +107,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           RELEASE_MATRIX: ${{ steps.source.outputs.matrix }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -121,7 +137,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           ALLOW_UNRELEASED_CATALOGUE: ${{ inputs.allow_unreleased_catalogue }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -140,7 +156,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
           COMPANION_RUN_IDS: ${{ inputs.companion_run_ids }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -220,6 +236,10 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -237,11 +257,20 @@ jobs:
       - run: npm run check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           name: factory-runtime-${{ matrix.target }}
           path: runtime-download
+      - name: Download the factory runtime from its Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$RUNTIME_TARGET" --dir runtime-download
       - name: Extract factory runtime without allowing archive path escapes
         shell: python
         run: |
@@ -474,6 +503,10 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -505,7 +538,7 @@ jobs:
           JS
       - name: Add the companion packages from their validated runs
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           COMPANIONS: ${{ needs.prepare.outputs.companions }}
         shell: bash
         run: |
@@ -522,11 +555,19 @@ jobs:
       # its signed delivery manifest (the one the installers carry) before its parts join this
       # run's assets; the draft merge below uploads them like any other asset.
       - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           pattern: factory-accelerated-*
           path: accelerated-packs
+      - name: Download the downloadable GPU packs from the factory's Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'factory-accelerated-*' --dir accelerated-packs
       - name: Verify the downloadable GPU runtime parts and stage them as release files
         shell: bash
         run: |
@@ -535,7 +576,7 @@ jobs:
       - name: Merge this run into the draft for the tag
         id: draft
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
@@ -554,7 +595,9 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$existing"
           fi
           printf '%s' "$COMPANIONS" > "$RUNNER_TEMP/companions.json"
-          note="Signed installer candidate for $RELEASE_PLATFORMS from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID $(node tools/release_prerequisites.mjs companion-note "$RUNNER_TEMP/companions.json")"
+          run=$GITHUB_RUN_ID
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]] || run=$GITHUB_RUN_NUMBER
+          note="Signed installer candidate for $RELEASE_PLATFORMS from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run $(node tools/release_prerequisites.mjs companion-note "$RUNNER_TEMP/companions.json")"
           node tools/release_draft.mjs merge "$RELEASE_TAG" "$GITHUB_REPOSITORY" release-assets "$RUNNER_TEMP/incoming-latest.json" \
             "$RUNNER_TEMP/draft.json" "$existing" "$RUNNER_TEMP/draft" "$note"
           cat "$RUNNER_TEMP/draft/summary.md" >> "$GITHUB_STEP_SUMMARY"
@@ -576,7 +619,7 @@ jobs:
           retention-days: 14
       - name: Create the draft release, or add this run's assets to it
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_ID: ${{ steps.draft.outputs.release_id }}
         shell: bash

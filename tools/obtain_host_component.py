@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -70,8 +71,14 @@ def validate_producer(approved: dict, artifact: dict, run: dict) -> None:
         raise BuildError("host_component_producer_mismatch")
 
 
+def gh() -> list[str]:
+    """`gh`, or on Forgejo the shim that answers Actions calls from there (Windows cannot run its launcher)."""
+    tool = os.environ.get("GH_SHIM_TOOL")
+    return ["node", tool] if tool else ["gh"]
+
+
 def api(path: str) -> dict:
-    data = subprocess.check_output(["gh", "api", f"repos/{REPOSITORY}/{path}"],
+    data = subprocess.check_output([*gh(), "api", f"repos/{REPOSITORY}/{path}"],
                                    stderr=subprocess.DEVNULL, timeout=30)
     if len(data) > 2 * 1024**2:
         raise BuildError("host_component_metadata_limit")
@@ -80,7 +87,7 @@ def api(path: str) -> dict:
 
 def download(approved: dict, archive: Path, size: int) -> None:
     """Bound the actual downloaded stream and deadline before validating its hash."""
-    with subprocess.Popen(["gh", "api", f"repos/{REPOSITORY}/actions/artifacts/{approved['artifactId']}/zip"],
+    with subprocess.Popen([*gh(), "api", f"repos/{REPOSITORY}/actions/artifacts/{approved['artifactId']}/zip"],
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL) as process:
         deadline = threading.Timer(300, process.kill)

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# FL-1699: on Forgejo, `gh` is tools/forgejo_gh.mjs (see ../action.yml).
+exec node "$GH_SHIM_TOOL" "$@"

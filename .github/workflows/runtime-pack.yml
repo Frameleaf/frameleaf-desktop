@@ -38,9 +38,8 @@ jobs:
       matrix:
         # The same Linux image the factory builds the runtime on (tools/release_inputs.mjs).
         os: [macos-latest, windows-latest, ubuntu-22.04]
-        # Forgejo has no Windows or Ubuntu 22.04 runner.
+        # Forgejo has no Ubuntu 22.04 runner.
         exclude:
-          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
           - os: ${{ github.server_url != 'https://github.com' && 'ubuntu-22.04' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -223,9 +222,6 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-24.04]
         profile: [cuda-ort, openvino-ort]
-        # Forgejo has no Windows runner.
-        exclude:
-          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -284,7 +280,7 @@ jobs:
   # processor must qualify every profile from that folder and CUDA must be refused cleanly.
   # A rehearsal never shows CUDA working: .github/workflows/windows-cuda-hardware.yml does that.
   windows-cuda-libraries:
-    # Not available on Forgejo, which has no Windows runner.
+    # Not available on Forgejo: it works in %LOCALAPPDATA%, and Forgejo's Windows runner is the owner's PC.
     if: github.server_url == 'https://github.com'
     runs-on: windows-2022
     timeout-minutes: 120

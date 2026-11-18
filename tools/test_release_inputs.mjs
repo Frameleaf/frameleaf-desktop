@@ -192,3 +192,13 @@ test("updater verification requires the embedded key, exact bytes and release ve
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("on Forgejo only the Windows runtime packs have a runner to build on", async () => {
+  const { forgejoTargetProblems } = await import("./release_inputs.mjs");
+  assert.deepEqual(forgejoTargetProblems("windows", "runtime"), []);
+  assert.match(forgejoTargetProblems("windows", "installer")[0], /^windows-x86_64: Windows installers ship unsigned/);
+  const all = forgejoTargetProblems("all", "runtime");
+  assert.deepEqual(all.map((problem) => problem.split(":")[0]), ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"]);
+  assert.throws(() => forgejoTargetProblems("all", "publish"), /forgejo_stage_invalid/);
+  assert.throws(() => forgejoTargetProblems("everything", "runtime"), /release_platforms_invalid/);
+});

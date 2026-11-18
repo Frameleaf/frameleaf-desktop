@@ -19,8 +19,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
-    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
+    # On Forgejo only once the owner sets the repository variable DESKTOP_RELEASE_ON_FORGEJO to true:
+    # Forgejo has no environment approval, and these jobs use the desktop-release secrets.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -30,15 +31,30 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
+      - name: Refuse targets Forgejo has no runner for
+        if: github.server_url != 'https://github.com'
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node --input-type=module -e '
+            import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            for (const problem of problems) console.log(`::error::${problem}`);
+            process.exitCode = problems.length ? 1 : 0;
+          '
       - name: Validate factory source before allocating build runners
         id: source
         env:
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           CANDIDATE_PLATFORMS: ${{ inputs.platforms }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -77,6 +93,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -85,11 +105,20 @@ jobs:
         with:
           python-version: '3.12'
       - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           name: factory-runtime-${{ matrix.target }}
           path: runtime-download
+      - name: Download the factory runtime from its Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$RUNTIME_TARGET" --dir runtime-download
       - name: Extract runtime without archive path escapes
         shell: python
         run: |

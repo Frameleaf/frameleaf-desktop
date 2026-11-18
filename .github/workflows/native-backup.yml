@@ -18,9 +18,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-24.04]
-        # Forgejo has no Windows runner.
-        exclude:
-          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:

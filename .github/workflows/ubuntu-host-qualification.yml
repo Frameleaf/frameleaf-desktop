@@ -9,8 +9,9 @@ on:
 permissions: {}
 jobs:
   installed-browser:
-    # Not available on Forgejo yet: it reads GitHub release assets with the desktop-release secrets, and Forgejo has no disposable runner for it.
-    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
+    # On Forgejo only once the owner sets the repository variable DESKTOP_RELEASE_ON_FORGEJO to true:
+    # Forgejo has no environment approval, and these jobs use the desktop-release secrets.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     permissions:
       # GitHub requires write access to retrieve unpublished release assets.
@@ -26,7 +27,7 @@ jobs:
           node-version: '26.11.1'
       - name: Verify and install the approved companion packages
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           APPROVAL: ${{ inputs.approval }}
         run: |
           set -euo pipefail

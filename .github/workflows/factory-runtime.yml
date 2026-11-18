@@ -25,8 +25,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
-    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
+    # On Forgejo only once the owner sets the repository variable DESKTOP_RELEASE_ON_FORGEJO to true:
+    # Forgejo has no environment approval, and these jobs use the desktop-release secrets.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.inputs.outputs.matrix }}
@@ -40,6 +41,17 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
+      - name: Refuse targets Forgejo has no runner for
+        if: github.server_url != 'https://github.com'
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node --input-type=module -e '
+            import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "runtime");
+            for (const problem of problems) console.log(`::error::${problem}`);
+            process.exitCode = problems.length ? 1 : 0;
+          '
       - id: inputs
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}

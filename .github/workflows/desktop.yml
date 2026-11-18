@@ -25,7 +25,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-24.04]
-        # Forgejo has no Windows runner; its macOS runner is the Mac host.
+        # On Forgejo every push to main runs this, and its Windows runner is the owner's PC, online only
+        # while they are signed in (and the shell install below would register an app there).
         exclude:
           - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
@@ -293,7 +294,7 @@ jobs:
           bash tools/qualify_linux_deb_install.sh "${packages[0]}"
 
   directory-probe:
-    # Not available on Forgejo, which has no Windows runner.
+    # Not available on Forgejo: its Windows runner is the owner's PC, not a disposable machine.
     if: ${{ github.server_url == 'https://github.com' && inputs.directory_probe && !inputs.keystore_probe }}
     runs-on: windows-latest
     timeout-minutes: 20
@@ -369,8 +370,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-24.04]
-        # Forgejo has no Windows runner, and its macOS runner is the owner's Mac, not a disposable
-        # host whose keychain a credential probe may write to.
+        # On Forgejo the Windows and macOS runners are the owner's own machines, not disposable hosts
+        # whose credential store a probe may write to.
         exclude:
           - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
           - os: ${{ github.server_url != 'https://github.com' && 'macos-latest' || 'none' }}

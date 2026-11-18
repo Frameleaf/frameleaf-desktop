@@ -903,3 +903,23 @@ the submitted bytes and Apple request ID as `notarization-pending-macos-aarch64`
 staples the accepted ticket, and checks Gatekeeper. If Apple outlasts the
 runner, use the recorded request ID with `notarytool info` and staple the
 retained DMG after acceptance.
+
+## Releasing from Forgejo
+
+CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop; GitHub
+keeps git, tags and the releases the app downloads from. The release workflows also run there,
+with these differences:
+
+- They are off until the owner sets the repository variable `DESKTOP_RELEASE_ON_FORGEJO` to `true`.
+  Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
+- The signing secrets must be added to the Forgejo repository: `DESKTOP_RELEASE_ED25519_PRIVATE_KEY`
+  (runtime packs; the app refuses unsigned ones) and `TAURI_SIGNING_PRIVATE_KEY` (updater
+  signatures). The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
+- Run ids (`runtime_run_id`, `companion_run_ids`, approvals) are Forgejo's API ids, which a job
+  sees as `GITHUB_RUN_ID`; the number in a run's web address is a different one. `gh` reads those
+  runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
+  read them, add a repository secret `RUNS_READ_TOKEN` with read access to the repository.
+- A target runs only where Forgejo has a runner it can safely use (`forgejoTargetProblems` in
+  `tools/release_inputs.mjs`). Today that is the Windows runtime pack only: there is no Intel Mac
+  or Ubuntu 22.04 runner, the one Mac runner is the owner's own Mac, and the Windows installers,
+  which ship unsigned, are still built with Azure Artifact Signing by these workflows.

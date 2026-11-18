@@ -17,8 +17,6 @@ concurrency:
   cancel-in-progress: true
 jobs:
   hdr:
-    # Not available on Forgejo, which has no Windows runner.
-    if: github.server_url == 'https://github.com'
     runs-on: windows-2022
     timeout-minutes: 120
     env:

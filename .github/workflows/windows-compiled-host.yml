@@ -38,7 +38,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   qualify:
-    # Not available on Forgejo, which has no Windows runner.
+    # Not available on Forgejo: it installs the host into Program Files, and Forgejo's Windows runner
+    # is the owner's PC, not a disposable machine.
     if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     # The signing variables and the Azure identity exist only inside the release environment.
     environment: ${{ (inputs.release_package || inputs.media_move) && 'desktop-release' || '' }}

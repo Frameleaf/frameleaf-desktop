@@ -8,8 +8,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   inventory:
-    # Not available on Forgejo, which has no Windows runner.
-    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 20
     env:
