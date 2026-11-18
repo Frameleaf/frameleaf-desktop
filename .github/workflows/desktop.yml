@@ -41,12 +41,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
-        env:
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
-        with:
-          python-version: '3.12'
+      - uses: ./.github/actions/python
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
@@ -260,9 +255,6 @@ jobs:
           node-version: 22
           cache: npm
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
-        env:
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
         with:
           python-version: '3.12'
       - name: Linux native dependencies
@@ -401,9 +393,6 @@ jobs:
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
-        env:
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
         with:
           python-version: '3.12'
       - name: Verify the real credential fixture is compiled

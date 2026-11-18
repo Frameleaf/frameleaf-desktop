@@ -27,12 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
-        env:
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
-        with:
-          python-version: '3.12'
+      - uses: ./.github/actions/python
       - run: python -m unittest discover -s tools -p test_build_host_backup.py
       - run: python tools/build_host_backup.py --output "${{ runner.temp }}/frameleaf-backup-engine"
       - name: Archive the qualified backup component with executable modes
