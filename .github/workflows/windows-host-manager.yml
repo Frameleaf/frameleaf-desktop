@@ -18,7 +18,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   manager:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # Not available on Forgejo, which has no Windows runner.
+    if: ${{ github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
     runs-on: windows-2022
     timeout-minutes: 20
     env:
@@ -104,7 +105,7 @@ jobs:
           node tools/check_manager_transition.mjs "$env:RUNNER_TEMP/fl-windows-manager/manager/app/build"
           if ($LASTEXITCODE) { throw 'The real Manager does not accept the Windows package transition Desktop computes' }
       - name: Retain the qualified private Manager component
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-manager-component
           path: ${{ runner.temp }}/fl-windows-manager/manager-component.tar.gz
@@ -112,7 +113,7 @@ jobs:
           if-no-files-found: error
       - name: Retain bounded Manager diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-manager-diagnostics
           path: |

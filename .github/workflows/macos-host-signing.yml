@@ -16,7 +16,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sign:
-    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    # Not available on Forgejo yet: it reads GitHub release assets with the desktop-release secrets, and Forgejo has no disposable runner for it.
+    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     permissions:
       # Only the draft release is used for unpublished installer bytes.

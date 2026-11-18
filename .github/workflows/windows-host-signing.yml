@@ -14,7 +14,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sign:
-    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    # Not available on Forgejo yet: it admits GitHub Actions run evidence and signs with the desktop-release Azure credentials.
+    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     environment: desktop-release
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -84,14 +85,14 @@ jobs:
               for name in sorted(expected):
                   archive.add(candidate / name, arcname=name)
       - name: Retain signed CI test candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-complete-host-signed
           path: ${{ runner.temp }}/host-signing/windows-complete-host-signed.tar.gz
           retention-days: 7
           if-no-files-found: error
       - name: Retain bounded signature and original producer evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-complete-host-signature-evidence
           path: |

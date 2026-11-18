@@ -25,7 +25,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    # Not available on Forgejo yet: its runner labels, the desktop-release secrets and the run evidence it reads through GitHub's API exist only on GitHub.
+    if: ${{ github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.inputs.outputs.matrix }}
@@ -124,7 +125,7 @@ jobs:
           manifests=(manifest.json)
           if [ -f candidate/manifest-accelerated.json ]; then manifests+=(manifest-accelerated.json); fi
           tar -cf runtime-unsigned.tar -C candidate "${manifests[@]}" payload
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: unsigned-runtime-${{ matrix.pack }}
           path: runtime-unsigned.tar
@@ -132,7 +133,7 @@ jobs:
           if-no-files-found: error
       - name: Retain bounded private build failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: factory-runtime-failure-${{ matrix.pack }}
           path: .candidate.error.log
@@ -160,7 +161,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           name: unsigned-runtime-${{ matrix.pack }}
           path: unsigned-download
@@ -185,13 +186,13 @@ jobs:
           mkdir delivery-manifest
           mv "delivery/$RUNTIME_PROFILE.json" "delivery/$RUNTIME_PROFILE.sig" delivery-manifest/
           { echo "### $RUNTIME_PROFILE for $RUNTIME_TARGET"; echo '```'; ls -l delivery/parts; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: factory-accelerated-manifest-${{ matrix.pack }}
           path: delivery-manifest/
           retention-days: 14
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: factory-accelerated-parts-${{ matrix.pack }}
           path: delivery/parts/
@@ -219,7 +220,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           name: unsigned-runtime-${{ matrix.pack }}
           path: unsigned-download
@@ -231,7 +232,7 @@ jobs:
               archive.extractall('candidate', filter='data')
       # FD-60: the installer carries the signed delivery manifests of this target's
       # downloadable packs; signing below verifies each against this pack's target and epoch.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         if: matrix.deliveries
         with:
           pattern: factory-accelerated-manifest-${{ matrix.target }}-*
@@ -277,7 +278,7 @@ jobs:
           if [ -f candidate/manifest-accelerated.json ]; then manifests+=(manifest-accelerated.json manifest-accelerated.sig); fi
           if [ -d candidate/accelerated ]; then manifests+=(accelerated); fi
           tar -cf runtime.tar -C candidate "${manifests[@]}" payload
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: factory-runtime-${{ matrix.target }}
           path: runtime.tar

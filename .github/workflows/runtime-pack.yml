@@ -38,6 +38,10 @@ jobs:
       matrix:
         # The same Linux image the factory builds the runtime on (tools/release_inputs.mjs).
         os: [macos-latest, windows-latest, ubuntu-22.04]
+        # Forgejo has no Windows or Ubuntu 22.04 runner.
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
+          - os: ${{ github.server_url != 'https://github.com' && 'ubuntu-22.04' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -106,7 +110,7 @@ jobs:
           test -s coreml-candidate/manifest-accelerated.json
           coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
       - name: Retain private validation receipts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: cpu-runtime-receipts-${{ runner.os }}
           path: |
@@ -118,7 +122,7 @@ jobs:
           if-no-files-found: error
       - name: Retain private failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: cpu-runtime-failure-${{ runner.os }}
           path: .candidate.error.log
@@ -129,6 +133,8 @@ jobs:
   # the factory builds, with the one wheel `targetPins` names in place of the locked onnxruntime
   # (which publishes no Intel macOS wheel), and run a model. Nothing is signed or published here.
   intel-macos:
+    # Not available on Forgejo, which has no Intel Mac runner.
+    if: github.server_url == 'https://github.com'
     runs-on: macos-15-intel
     timeout-minutes: 40
     steps:
@@ -191,7 +197,7 @@ jobs:
           python desktop/tools/check_macos_minimum.py --report macos-minimum.json native-runtime | tee -a "$GITHUB_STEP_SUMMARY"
           cat macos-minimum.json
       - name: Retain private validation receipts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: cpu-runtime-receipts-macOS-x86_64
           path: |
@@ -204,7 +210,7 @@ jobs:
           if-no-files-found: error
       - name: Retain private failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: cpu-runtime-failure-macOS-x86_64
           path: .candidate.error.log
@@ -219,6 +225,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-24.04]
         profile: [cuda-ort, openvino-ort]
+        # Forgejo has no Windows runner.
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && 'windows-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -262,7 +271,7 @@ jobs:
           "$python" -I -B desktop/tools/smoke_accelerated_runtime.py "$provider"
       - name: Retain private failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: accelerated-runtime-failure-${{ runner.os }}-${{ matrix.profile }}
           path: .candidate.error.log
@@ -277,6 +286,8 @@ jobs:
   # processor must qualify every profile from that folder and CUDA must be refused cleanly.
   # A rehearsal never shows CUDA working: .github/workflows/windows-cuda-hardware.yml does that.
   windows-cuda-libraries:
+    # Not available on Forgejo, which has no Windows runner.
+    if: github.server_url == 'https://github.com'
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -328,7 +339,7 @@ jobs:
         run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "$env:LOCALAPPDATA\fl" -Output "$env:GITHUB_WORKSPACE\evidence" -WithoutGpuRehearsal
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: windows-cuda-libraries-evidence
           path: evidence

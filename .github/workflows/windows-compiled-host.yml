@@ -38,7 +38,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   qualify:
-    if: github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main'
+    # Not available on Forgejo, which has no Windows runner.
+    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
     # The signing variables and the Azure identity exist only inside the release environment.
     environment: ${{ (inputs.release_package || inputs.media_move) && 'desktop-release' || '' }}
     permissions:
@@ -271,7 +272,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'The release would refuse this companion package' }
       - name: Retain the exact signed installer
         if: inputs.release_package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-x64-companion-installed
           compression-level: 0
@@ -279,14 +280,14 @@ jobs:
           if-no-files-found: error
       - name: Retain the signed manifest the release checks before it builds
         if: inputs.release_package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-x64-companion-installed-identity
           path: ${{ runner.temp }}/companion-identity/
           if-no-files-found: error
       - name: Retain private Windows installer candidate
         if: ${{ !inputs.media_move && !inputs.release_package }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-native-server-installer
           path: ${{ runner.temp }}/windows-compiled-host/installer/*.exe
@@ -412,7 +413,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Installed Manager diagnostic failed' }
       - name: Retain bounded resource qualification evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-compiled-host-authority
           path: |
