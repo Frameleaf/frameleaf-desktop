@@ -723,6 +723,16 @@ fn disk_shortfall(code: String, models: &Path, needed: u64) -> String {
     code
 }
 
+/// Why the server offers no work: an older server that held a task back by its routing needs an
+/// update; any other server simply has no task turned on that this computer can run.
+fn no_work(auto_setup_server: bool, routed: bool) -> &'static str {
+    if !auto_setup_server && routed {
+        "server_update_required"
+    } else {
+        "worker_no_eligible_workloads"
+    }
+}
+
 /// Why no workload qualified: the first one's reason, or the general code when none was given.
 fn first_failure(workloads: &[WorkloadStatus]) -> String {
     workloads
@@ -1028,16 +1038,14 @@ async fn prepare_on(
         installed.source_revision(),
         installed.provider(),
     )?;
+    let routed = statuses
+        .iter()
+        .any(|item| item.code.as_deref() == Some("server_update_required"));
     progress.workloads(statuses);
     if groups.is_empty() {
         // An older server offers desktops work only through its routes, and often none: the fix
         // is updating it, not a setting. A current server offers every enabled task it can.
-        return Err(if caps.features.worker_auto_setup {
-            "worker_no_eligible_workloads"
-        } else {
-            "server_update_required"
-        }
-        .into());
+        return Err(no_work(caps.features.worker_auto_setup, routed).into());
     }
     // FD-52: an accelerated runtime beside the processor one, where the app ships one this
     // computer can use. Any fault on that side leaves every workload on the processor.
@@ -1138,7 +1146,8 @@ async fn prepare_on(
                 .await
                 {
                     Ok(value) => value,
-                    Err(code) if code.starts_with("workload_desktop_") => {
+                    // A refusal of one task (`workload_…`) leaves the others to qualify.
+                    Err(code) if code.starts_with("workload_") => {
                         if plan.demote(workload, &code, false) {
                             continue 'qualification;
                         }
@@ -1216,7 +1225,8 @@ async fn prepare_on(
                         );
                         continue 'workload;
                     }
-                    Err(code) if code.starts_with("workload_desktop_") => {
+                    // A refusal of one task (`workload_…`) leaves the others to qualify.
+                    Err(code) if code.starts_with("workload_") => {
                         if plan.demote(workload, &code, false) {
                             continue 'qualification;
                         }
@@ -1232,7 +1242,8 @@ async fn prepare_on(
                 .await
                 {
                     Ok(value) => value,
-                    Err(code) if code.starts_with("workload_desktop_") => {
+                    // A refusal of one task (`workload_…`) leaves the others to qualify.
+                    Err(code) if code.starts_with("workload_") => {
                         if plan.demote(workload, &code, false) {
                             continue 'qualification;
                         }
@@ -1650,6 +1661,13 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(statuses[1].state, "unsupported");
         assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
+    }
+    #[test]
+    fn asks_for_a_server_update_only_when_routing_held_work_back() {
+        assert_eq!(no_work(false, true), "server_update_required");
+        // An older server with every task off or unsupported: an administrator turns one on.
+        assert_eq!(no_work(false, false), "worker_no_eligible_workloads");
+        assert_eq!(no_work(true, false), "worker_no_eligible_workloads");
     }
     #[test]
     fn reports_the_first_specific_reason_nothing_qualified() {
