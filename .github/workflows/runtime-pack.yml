@@ -56,6 +56,9 @@ jobs:
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
@@ -143,6 +146,9 @@ jobs:
           path: desktop
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
         with:
           python-version: '3.12'
       - id: source
@@ -242,6 +248,9 @@ jobs:
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
@@ -309,6 +318,9 @@ jobs:
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        # Its macOS Python installs to /Users/runner unless told the runner's tool cache (self-hosted Macs).
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
