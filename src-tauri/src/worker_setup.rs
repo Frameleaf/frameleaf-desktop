@@ -224,7 +224,9 @@ impl WorkerSetup {
                     let state = match code.as_str() {
                         "model_download_permission_required" => "model-download-required",
                         // Server configuration, not a fault here: retrying cannot change it.
-                        "worker_no_eligible_workloads" => "no-eligible-work",
+                        "worker_no_eligible_workloads" | "server_update_required" => {
+                            "no-eligible-work"
+                        }
                         _ => "setup-needs-attention",
                     };
                     let safe = if code.len() <= 128
@@ -319,8 +321,13 @@ where
         let result = reconnect(progress, fresh, &mut attempt).await;
         fresh = false;
         match result {
-            // An administrator can assign work at any time: ask the server again later.
-            Err(code) if code == "worker_no_eligible_workloads" => {
+            // An administrator can assign work, or update the server, at any time: ask again later.
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "worker_no_eligible_workloads" | "server_update_required"
+                ) =>
+            {
                 progress.set("no-eligible-work", Some(code));
                 recheck_after(progress, NO_WORK_RECHECK).await?;
             }
@@ -699,6 +706,37 @@ async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), 
     let value = task.await.map_err(|_| "runtime_qualification_failed")?;
     Ok((value, reason))
 }
+/// A model file that could not be written, on a volume with less free space than the model
+/// needs, is a full disk: say so instead of a general write failure.
+fn disk_shortfall(code: String, models: &Path, needed: u64) -> String {
+    let write_failed = matches!(
+        code.as_str(),
+        "model_file_create_failed"
+            | "model_file_write_failed"
+            | "model_file_publish_failed"
+            | "model_cache_publish_failed"
+    );
+    if write_failed && crate::host_storage::available_bytes(models).is_ok_and(|free| free < needed)
+    {
+        return "model_disk_space_insufficient".into();
+    }
+    code
+}
+
+/// Why no workload qualified: the first one's reason, or the general code when none was given.
+fn first_failure(workloads: &[WorkloadStatus]) -> String {
+    workloads
+        .iter()
+        .filter(|item| item.state == "unavailable")
+        .find_map(|item| item.code.clone())
+        .map(|code| {
+            code.strip_prefix("workload_")
+                .map(str::to_owned)
+                .unwrap_or(code)
+        })
+        .unwrap_or_else(|| "worker_no_qualified_workloads".into())
+}
+
 pub(crate) fn inventory_profiles(
     value: &serde_json::Value,
     source: &str,
@@ -726,10 +764,13 @@ pub(crate) fn inventory_profiles(
         state: String,
         model_names: Vec<String>,
         model_keys: Vec<String>,
+        /// The server's catalogue profile of each model key, in the same order.
+        #[serde(default)]
+        profiles: Vec<serde_json::Value>,
     }
     let invalid = || "worker_model_inventory_invalid".to_string();
     let inventory: Inventory = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-    if inventory.protocol_version != 1
+    if inventory.protocol_version != 2
         || inventory.provider != provider
         || inventory.runtime_source_revision != source
         || inventory.workloads.len() != 4
@@ -759,7 +800,7 @@ pub(crate) fn inventory_profiles(
         {
             return Err(invalid());
         }
-        let mut state = entry.state;
+        let state = entry.state;
         if state == "eligible" {
             let expected = match entry.workload.as_str() {
                 "clip" => 3,
@@ -783,25 +824,25 @@ pub(crate) fn inventory_profiles(
             {
                 return Err(invalid());
             }
-            let profiles = crate::model_catalogue::inventory_group(
+            groups.push(crate::model_catalogue::served_group(
                 &entry.workload,
                 &entry.model_keys,
+                &entry.profiles,
                 source,
                 provider,
-            )?;
-            if profiles.is_empty() {
-                state = "unsupported".into();
-            } else {
-                groups.push(profiles);
-            }
-        } else if !entry.model_keys.is_empty() {
+            )?);
+        } else if !entry.model_keys.is_empty() || !entry.profiles.is_empty() {
             return Err(invalid());
         }
+        // Routing states come only from servers older than desktop auto-setup, which decide desktop
+        // work by their own routes: updating the server is what makes the task available here.
+        let code = matches!(state.as_str(), "pinned" | "legacy" | "unavailable")
+            .then(|| "server_update_required".to_string());
         statuses.push(WorkloadStatus {
             workload: entry.workload,
             state,
             model_names: entry.model_names,
-            code: None,
+            code,
         });
     }
     Ok((groups, statuses))
@@ -975,6 +1016,10 @@ async fn prepare_on(
     if !caps.features.worker_session {
         return Err("desktop_worker_session_unavailable".into());
     }
+    // This computer runs only the server's catalogue, which servers before desktop auto-setup don't send.
+    if !caps.features.worker_auto_setup {
+        return Err("server_update_required".into());
+    }
     let worker = WorkerTransport::load(&saved)?;
     let inventory = cancellable(
         worker.model_inventory(installed.source_revision(), installed.provider()),
@@ -988,6 +1033,7 @@ async fn prepare_on(
     )?;
     progress.workloads(statuses);
     if groups.is_empty() {
+        // The server offers every enabled task it can: none means none is turned on for computers.
         return Err("worker_no_eligible_workloads".into());
     }
     // FD-52: an accelerated runtime beside the processor one, where the app ships one this
@@ -1044,7 +1090,8 @@ async fn prepare_on(
             }),
             &progress.cancelled,
         )
-        .await?;
+        .await
+        .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
         caches.push(cache);
     }
     let mut failures = TaskFailures::default();
@@ -1088,7 +1135,8 @@ async fn prepare_on(
                 .await
                 {
                     Ok(value) => value,
-                    Err(code) if code.starts_with("workload_desktop_") => {
+                    // A refusal of one task (`workload_…`) leaves the others to qualify.
+                    Err(code) if code.starts_with("workload_") => {
                         if plan.demote(workload, &code, false) {
                             continue 'qualification;
                         }
@@ -1134,6 +1182,10 @@ async fn prepare_on(
                             "runtime_qualification_failed"
                                 | "runtime_qualification_timeout"
                                 | "runtime_qualification_report_invalid"
+                                | "runtime_output_mismatch"
+                                | "runtime_out_of_memory"
+                                | "runtime_model_missing"
+                                | "runtime_provider_unavailable"
                         ) =>
                     {
                         if plan.demote(workload, &code, true) {
@@ -1162,7 +1214,8 @@ async fn prepare_on(
                         );
                         continue 'workload;
                     }
-                    Err(code) if code.starts_with("workload_desktop_") => {
+                    // A refusal of one task (`workload_…`) leaves the others to qualify.
+                    Err(code) if code.starts_with("workload_") => {
                         if plan.demote(workload, &code, false) {
                             continue 'qualification;
                         }
@@ -1178,7 +1231,8 @@ async fn prepare_on(
                 .await
                 {
                     Ok(value) => value,
-                    Err(code) if code.starts_with("workload_desktop_") => {
+                    // A refusal of one task (`workload_…`) leaves the others to qualify.
+                    Err(code) if code.starts_with("workload_") => {
                         if plan.demote(workload, &code, false) {
                             continue 'qualification;
                         }
@@ -1274,9 +1328,9 @@ async fn prepare_on(
             progress.workload(workload, "ready", None);
         }
         if prepared.is_empty() {
-            // The server offered work but none qualified here (timeout, refusal): a local fault
-            // that Retry Setup can clear, not the server-configuration state.
-            return Err("worker_no_qualified_workloads".into());
+            // The server offered work but none qualified here: say why (wrong answer, out of
+            // memory, server refusal…), a fault Retry Setup can clear, not a server setting.
+            return Err(first_failure(&progress.status.lock().unwrap().workloads));
         }
         let mut memory_by_cache = std::collections::BTreeMap::new();
         for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
@@ -1571,9 +1625,11 @@ mod tests {
             let profiles: Vec<_> = profiles.into_iter().filter(|p| Some(&p["modelName"]) == default.as_ref()).collect();
             serde_json::json!({"workload":workload,"state":if workload == "enrichment" {"unsupported"} else {"eligible"},
                 "modelNames":profiles.first().map(|p| vec![p["modelName"].clone()]).unwrap_or_default(),
-                "modelKeys":profiles.iter().map(|p|p["modelKey"].clone()).collect::<Vec<_>>()})
+                "modelKeys":profiles.iter().map(|p|p["modelKey"].clone()).collect::<Vec<_>>(),
+                // protocol 2: the server's own profile for each key
+                "profiles":if workload == "enrichment" {vec![]} else {profiles.into_iter().cloned().collect::<Vec<_>>()}})
         });
-        serde_json::json!({"protocolVersion":1,"provider":"CPUExecutionProvider",
+        serde_json::json!({"protocolVersion":2,"provider":"CPUExecutionProvider",
             "runtimeSourceRevision":"25b22c16e47a27a2eb50017d838497abce850d11","workloads":workloads})
     }
     #[test]
@@ -1582,20 +1638,75 @@ mod tests {
         let mut value = inventory_fixture();
         value["workloads"][2]["state"] = serde_json::json!("pinned");
         value["workloads"][2]["modelKeys"] = serde_json::json!([]);
+        value["workloads"][2]["profiles"] = serde_json::json!([]);
         let (groups, statuses) =
             inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
         assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(statuses[2].state, "pinned");
+        // Only an older server sends a routing state: updating it is the fix.
+        assert_eq!(statuses[2].code.as_deref(), Some("server_update_required"));
+        assert_eq!(statuses[0].code, None);
+        // A key the server's own profile does not carry, or a profile for another provider, is refused:
+        // the desktop runs exactly what the server sent.
+        assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
         value["workloads"][1]["modelKeys"][0] =
             serde_json::json!(format!("ocr:{}", "0".repeat(64)));
-        let (groups, statuses) =
-            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(statuses[1].state, "unsupported");
-        assert!(inventory_profiles(&value, source, "CUDAExecutionProvider").is_err());
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+        // Protocol 1 (no profiles) comes only from older servers.
+        let mut old = inventory_fixture();
+        old["protocolVersion"] = serde_json::json!(1);
+        assert!(inventory_profiles(&old, source, "CPUExecutionProvider").is_err());
     }
     #[test]
-    fn inventory_selects_each_new_clip_model_and_rejects_mixed_model_groups() {
+    fn reports_the_first_specific_reason_nothing_qualified() {
+        let status = |workload: &str, state: &str, code: Option<&str>| WorkloadStatus {
+            workload: workload.into(),
+            state: state.into(),
+            model_names: vec![],
+            code: code.map(Into::into),
+        };
+        assert_eq!(
+            first_failure(&[
+                status("clip", "disabled", None),
+                status("ocr", "unavailable", Some("runtime_out_of_memory")),
+                status("face", "unavailable", Some("runtime_output_mismatch")),
+            ]),
+            "runtime_out_of_memory"
+        );
+        assert_eq!(
+            first_failure(&[status(
+                "clip",
+                "unavailable",
+                Some("workload_server_update_required")
+            )]),
+            "server_update_required"
+        );
+        assert_eq!(
+            first_failure(&[status("clip", "unavailable", None)]),
+            "worker_no_qualified_workloads"
+        );
+    }
+    #[test]
+    fn names_a_full_disk_when_a_model_file_cannot_be_written() {
+        let models = std::env::temp_dir().canonicalize().unwrap();
+        for (code, needed, expected) in [
+            (
+                "model_file_write_failed",
+                u64::MAX,
+                "model_disk_space_insufficient",
+            ),
+            ("model_file_write_failed", 0, "model_file_write_failed"),
+            (
+                "model_download_interrupted",
+                u64::MAX,
+                "model_download_interrupted",
+            ),
+        ] {
+            assert_eq!(disk_shortfall(code.into(), &models, needed), expected);
+        }
+    }
+    #[test]
+    fn inventory_runs_each_clip_model_the_server_selects_and_refuses_mismatched_keys() {
         let source = "25b22c16e47a27a2eb50017d838497abce850d11";
         let models = ["ViT-B-32__openai", "ViT-SO400M-16-SigLIP2-384__webli"];
         for model in models {
@@ -1614,14 +1725,11 @@ mod tests {
             expected.sort();
             assert_eq!(selected, expected);
         }
-        // one key from the other model leaves no complete group: search is unsupported, the rest stay
+        // A key that does not match the profile the server sent beside it is refused, not guessed at.
         let mut value = inventory_fixture_with(models[0]);
         value["workloads"][0]["modelKeys"][0] =
             inventory_fixture_with(models[1])["workloads"][0]["modelKeys"][0].clone();
-        let (groups, statuses) =
-            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
-        assert_eq!(statuses[0].state, "unsupported");
-        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
     }
     #[test]
     fn inventory_rejects_partial_clip_groups_and_invalid_authority_shapes() {

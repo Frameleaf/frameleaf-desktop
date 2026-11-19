@@ -780,7 +780,9 @@ impl VerifiedRuntime {
         fixture: &[u8],
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<QualifiedRuntime, String> {
-        self.qualify_explained(cache, private_root, spec, fixture, cancel, &mut None)
+        let mut refused = None;
+        self.qualify_explained(cache, private_root, spec, fixture, cancel, &mut refused)
+            .map_err(|code| qualification_failure(code, refused.as_deref()))
     }
     /// `qualify`, also handing back what a refusing process wrote as its reason (`refusal`), so
     /// FD-63's hardware evidence can tell the runtime's own refusal from a process that crashed
@@ -918,6 +920,45 @@ impl VerifiedRuntime {
         })
     }
 }
+/// The specific reason for a failed known-answer check, from the reason the runtime wrote, so the
+/// person sees "wrong answer" or "out of memory" instead of a general failure. Anything else stays
+/// `runtime_qualification_failed`.
+pub(crate) fn qualification_failure(code: String, refused: Option<&str>) -> String {
+    if code != "runtime_qualification_failed" {
+        return code;
+    }
+    let Some(refused) = refused else {
+        return code;
+    };
+    let (reason, detail) = refused.split_once(' ').unwrap_or((refused, ""));
+    match reason {
+        "native_output_value_mismatch"
+        | "native_output_shape_mismatch"
+        | "native_output_schema_mismatch" => "runtime_output_mismatch",
+        "native_memory_insufficient" => "runtime_out_of_memory",
+        "native_staged_model_unavailable" | "native_staged_hash_mismatch" => {
+            "runtime_model_missing"
+        }
+        "native_provider_unavailable"
+        | "native_provider_execution_unproven"
+        | "native_device_execution_evidence_required" => "runtime_provider_unavailable",
+        // ONNX Runtime and Python name an allocation failure only in the detail.
+        _ if [
+            "MemoryError",
+            "Failed to allocate",
+            "out of memory",
+            "bad_alloc",
+        ]
+        .iter()
+        .any(|text| detail.contains(text)) =>
+        {
+            "runtime_out_of_memory"
+        }
+        _ => return code,
+    }
+    .into()
+}
+
 /// Why a qualification process refused: the code, and the short detail, in the report it left.
 /// For a person reading the log only: never trusted, never sent anywhere.
 fn refusal(report: &Path) -> Option<String> {
@@ -1090,6 +1131,41 @@ fn validate_report(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn names_the_known_answer_failure() {
+        let failed = || String::from("runtime_qualification_failed");
+        for (refused, expected) in [
+            (
+                Some("native_output_value_mismatch ValueError: x"),
+                "runtime_output_mismatch",
+            ),
+            (Some("native_memory_insufficient"), "runtime_out_of_memory"),
+            (
+                Some("native_qualification_failed RuntimeException: Failed to allocate memory"),
+                "runtime_out_of_memory",
+            ),
+            (Some("native_staged_hash_mismatch"), "runtime_model_missing"),
+            (
+                Some("native_device_execution_evidence_required"),
+                "runtime_provider_unavailable",
+            ),
+            (
+                Some("native_qualification_failed TypeError: x"),
+                "runtime_qualification_failed",
+            ),
+            (None, "runtime_qualification_failed"),
+        ] {
+            assert_eq!(super::qualification_failure(failed(), refused), expected);
+        }
+        // Only a refused run is renamed: a timeout stays a timeout.
+        assert_eq!(
+            super::qualification_failure(
+                "runtime_qualification_timeout".into(),
+                Some("native_memory_insufficient")
+            ),
+            "runtime_qualification_timeout"
+        );
+    }
     use super::*;
     #[test]
     fn qwen_report_requires_signed_binary_and_exact_cpu_candidate_evidence() {

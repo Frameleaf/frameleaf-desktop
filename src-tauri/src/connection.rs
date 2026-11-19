@@ -244,6 +244,10 @@ pub struct Features {
     pub worker: bool,
     #[serde(default)]
     pub worker_session: bool,
+    /// The server sets workers up from its machine-learning settings alone
+    /// (docs/desktop-worker-setup-protocol.md). Older servers omit it.
+    #[serde(default)]
+    pub worker_auto_setup: bool,
     pub sources: bool,
     pub native_host: bool,
 }

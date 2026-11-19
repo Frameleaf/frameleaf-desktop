@@ -112,6 +112,7 @@ async fn prepare(saved: &mut SavedConnection, keep_worker_session: bool) -> (Con
         enrollment: false,
         worker: false,
         worker_session: false,
+        worker_auto_setup: false,
         sources: false,
         native_host: false,
     };
@@ -192,6 +193,7 @@ async fn prepare_view(
         enrollment: false,
         worker: false,
         worker_session: false,
+        worker_auto_setup: false,
         sources: false,
         native_host: false,
     };

@@ -118,6 +118,7 @@ fn navigation_scope_binds_server_origin_identity_and_account_without_using_crede
                 enrollment: true,
                 worker: false,
                 worker_session: false,
+                worker_auto_setup: false,
                 sources: false,
                 native_host: false,
             },
