@@ -8,12 +8,21 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::ZeroizeOnDrop;
 
+/// The origin of a server this app talks to: HTTPS anywhere, or plain HTTP on the home network.
+///
+/// Plain HTTP to an address must be to a local one. Plain HTTP to a *name* is accepted here
+/// without looking the name up: a home server saved as `http://nas.fritz.box:2283` stays a
+/// valid server when the laptop is away or the router's DNS is down, and failing to reach it is
+/// an ordinary network error. That such a name leads only to the home network is enforced where
+/// it matters, when connecting (`HomeResolver`), and checked once when a person types it
+/// (`typed_servers`).
 pub fn normalize_server(value: &str) -> Result<Url, String> {
     if value.contains('\\') {
         return Err("server_address_invalid".into());
     }
     let url = Url::parse(value.trim()).map_err(|_| "server_address_invalid")?;
-    let local_http = url.scheme() == "http" && url.host().is_some_and(is_local_network);
+    let named = matches!(url.host(), Some(url::Host::Domain(_)));
+    let local_http = url.scheme() == "http" && (named || url.host().is_some_and(is_local_network));
     if !(url.scheme() == "https" || local_http)
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -24,15 +33,67 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
     {
         return Err("server_requires_https_origin".into());
     }
+    if let Some(name) = looked_up_name(&url) {
+        // The scheme in use for this name decides whether its connections are held to the
+        // home network.
+        let mut names = PLAIN_HTTP_NAMES.lock().unwrap();
+        if url.scheme() == "http" {
+            names.insert(name);
+        } else {
+            names.remove(&name);
+        }
+    }
     Ok(url)
+}
+
+/// The host of `url` when it is a name that says nothing by itself about where it leads
+/// (`nas.fritz.box`, `photos.example.com`), unlike `tower.local` or an address.
+fn looked_up_name(url: &Url) -> Option<String> {
+    match url.host()? {
+        host @ url::Host::Domain(name) if !is_local_network(host.clone()) => {
+            Some(name.trim_end_matches('.').to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
+/// Names this app reaches over plain HTTP (`normalize_server`).
+static PLAIN_HTTP_NAMES: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The addresses a connection to `name` may use. A name reached over plain HTTP may lead only
+/// to this computer or the home network: if it resolves anywhere else (the same name on
+/// another network, a hijacked answer), nothing is sent.
+fn home_addresses(
+    name: &str,
+    found: Vec<std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>, &'static str> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let plain_http = PLAIN_HTTP_NAMES.lock().unwrap().contains(&name);
+    if plain_http && !found.iter().all(|address| local_address(address.ip())) {
+        return Err("plain HTTP is only for the home network");
+    }
+    Ok(found)
+}
+
+/// The resolver of every client that talks to a server (`transport::streaming_client_builder`).
+pub(crate) struct HomeResolver;
+impl reqwest::dns::Resolve for HomeResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let found: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            let allowed = home_addresses(name.as_str(), found)?;
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// A server address as a person types or pastes it: `192.168.1.20:2283`, `tower.local`, or a page
 /// address copied from the browser. It is reduced to its origin: what follows the host and port
 /// names a page of the server, not the server. With no scheme, a host on the local network is
 /// reached over plain HTTP (a home server is often just an address and a port) and any other
-/// host over HTTPS. A scheme the person typed is kept and `normalize_server` decides, so plain
-/// HTTP to a public host is still refused.
+/// host over HTTPS. A scheme the person typed is kept, and plain HTTP to a public address or to
+/// a name not known to be local is refused here, without a lookup (`typed_servers` adds one).
 pub fn typed_server(value: &str) -> Result<Url, String> {
     let typed = value.trim();
     if typed.is_empty() || typed.contains('\\') || typed.chars().any(char::is_whitespace) {
@@ -59,10 +120,64 @@ pub fn typed_server(value: &str) -> Result<Url, String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("server_requires_https_origin".into());
     }
+    if url.scheme() == "http" && looked_up_name(&url).is_some() {
+        return Err("server_requires_https_origin".into());
+    }
     normalize_server(&url.origin().ascii_serialization())
 }
 
-/// A host on this computer or the local network, where servers answer over plain HTTP: loopback,
+/// The origins to try, in order, for an address a person typed. As `typed_server`, plus what a
+/// lookup of the name allows: `resolves_home` says the name resolves, and only to this computer
+/// or the home network.
+///
+/// - `http://nas.fritz.box:2283`: plain HTTP, as typed, when the name is a home one.
+/// - `nas.fritz.box:2283` with no scheme: HTTPS first (a home server behind a reverse proxy),
+///   then plain HTTP when the name is a home one.
+fn typed_candidates(value: &str, resolves_home: bool) -> Result<Vec<Url>, String> {
+    let typed = value.trim();
+    let plain = || -> Option<Url> {
+        let address = match typed.contains("://") {
+            true => typed.to_owned(),
+            false => format!("http://{typed}"),
+        };
+        let url = Url::parse(&address).ok()?;
+        let named = url.scheme() == "http" && looked_up_name(&url).is_some();
+        let bare = url.username().is_empty() && url.password().is_none();
+        (named && bare && resolves_home)
+            .then(|| normalize_server(&url.origin().ascii_serialization()).ok())?
+    };
+    match typed_server(typed) {
+        Ok(url) if typed.contains("://") => Ok(vec![url]),
+        Ok(url) => Ok(std::iter::once(url).chain(plain()).collect()),
+        Err(code) if code == "server_requires_https_origin" => {
+            plain().map(|url| vec![url]).ok_or(code)
+        }
+        Err(code) => Err(code),
+    }
+}
+
+/// `typed_candidates`, looking the name up when the answer depends on it. The lookup runs off
+/// the async threads and is given three seconds; no answer means "not known to be home".
+pub(crate) async fn typed_servers(value: &str) -> Result<Vec<Url>, String> {
+    let typed = value.trim();
+    let name = [typed.to_owned(), format!("http://{typed}")]
+        .iter()
+        .find_map(|address| Url::parse(address).ok().filter(|url| url.host().is_some()))
+        .and_then(|url| looked_up_name(&url));
+    let resolves_home = match name {
+        Some(name) => {
+            let lookup = tokio::net::lookup_host((name.clone(), 0));
+            match tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await {
+                Ok(Ok(found)) => name_is_local(&name, |_| found.map(|a| a.ip()).collect()),
+                _ => false,
+            }
+        }
+        None => false,
+    };
+    typed_candidates(typed, resolves_home)
+}
+
+/// A host that is on this computer or the local network by its own shape, with no lookup: loopback,
 /// private and link-local addresses, single-label names and the local-only DNS suffixes. Tailscale
 /// counts as local: its 100.64.0.0/10 addresses, its fd7a:115c:a1e0::/48 ULAs and `*.ts.net` names.
 pub fn is_local_network(host: url::Host<&str>) -> bool {
@@ -91,11 +206,7 @@ pub fn is_local_network(host: url::Host<&str>) -> bool {
                         ".ts.net",
                     ]
                     .iter()
-                    .any(|suffix| name.ends_with(suffix))
-                    // Any other name a home router hands out (`nas.fritz.box`, `photos.home`):
-                    // local when every address it resolves to is. Names accepted above are
-                    // never looked up.
-                    || resolves_locally(&name))
+                    .any(|suffix| name.ends_with(suffix)))
         }
     }
 }
@@ -115,32 +226,6 @@ fn local_address(address: std::net::IpAddr) -> bool {
 fn name_is_local(name: &str, resolve: impl FnOnce(&str) -> Vec<std::net::IpAddr>) -> bool {
     let addresses = resolve(name);
     !addresses.is_empty() && addresses.into_iter().all(local_address)
-}
-
-/// `name_is_local` by this computer's resolver. The answer is kept for a short time only: a
-/// name can resolve to a home address at home and a public one elsewhere, and plain HTTP must
-/// not follow it there.
-fn resolves_locally(name: &str) -> bool {
-    use std::{
-        net::ToSocketAddrs,
-        sync::Mutex,
-        time::{Duration, Instant},
-    };
-    static LAST: Mutex<Option<(String, bool, Instant)>> = Mutex::new(None);
-    if let Some((known, local, at)) = LAST.lock().unwrap().as_ref() {
-        let fresh = Duration::from_secs(if *local { 30 } else { 5 });
-        if known == name && at.elapsed() < fresh {
-            return *local;
-        }
-    }
-    let local = name_is_local(name, |name| {
-        (name, 0)
-            .to_socket_addrs()
-            .map(|found| found.map(|address| address.ip()).collect())
-            .unwrap_or_default()
-    });
-    *LAST.lock().unwrap() = Some((name.to_owned(), local, Instant::now()));
-    local
 }
 
 #[derive(Serialize, Deserialize)]
@@ -405,6 +490,97 @@ mod local_http_tests {
     use super::*;
 
     #[test]
+    fn a_saved_plain_http_name_is_a_valid_server_without_any_lookup() {
+        // `.invalid` never resolves: the laptop is away, or the router's DNS is down. The saved
+        // server is still a server; reaching it fails as a network error, not as "use HTTPS".
+        for saved in [
+            "http://nas.fritz.invalid:2283",
+            "http://photos.home.invalid/",
+            "http://nas.fritz.box:2283",
+        ] {
+            assert!(normalize_server(saved).is_ok(), "{saved}");
+        }
+        // Plain HTTP to a public address is still refused outright.
+        for refused in ["http://8.8.8.8:2283", "http://[2001:db8::1]:2283"] {
+            assert_eq!(
+                normalize_server(refused).map(String::from),
+                Err("server_requires_https_origin".to_string()),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_http_name_only_ever_connects_to_the_home_network() {
+        let addresses = |list: &[&str]| -> Vec<std::net::SocketAddr> {
+            list.iter()
+                .map(|address| std::net::SocketAddr::new(address.parse().unwrap(), 0))
+                .collect()
+        };
+        normalize_server("http://nas.split.test:2283").unwrap();
+        assert!(home_addresses("nas.split.test", addresses(&["192.168.178.20"])).is_ok());
+        assert!(home_addresses("NAS.split.test.", addresses(&["10.0.0.2", "fd00::2"])).is_ok());
+        // The same name elsewhere, or a hijacked answer: nothing is sent.
+        assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
+        assert!(home_addresses(
+            "nas.split.test",
+            addresses(&["192.168.178.20", "203.0.113.7"])
+        )
+        .is_err());
+        // A name reached over HTTPS goes wherever it resolves, also after it was plain HTTP.
+        assert!(home_addresses("photos.public.test", addresses(&["203.0.113.7"])).is_ok());
+        normalize_server("https://nas.split.test").unwrap();
+        assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_ok());
+    }
+
+    #[test]
+    fn a_typed_home_name_tries_https_first_and_plain_http_only_when_it_resolves_home() {
+        let tried = |typed: &str, home: bool| {
+            typed_candidates(typed, home)
+                .map(|urls| urls.iter().map(Url::to_string).collect::<Vec<_>>())
+        };
+        // No scheme: HTTPS as before (a reverse proxy on 443), then plain HTTP for a home name.
+        assert_eq!(
+            tried("nas.fritz.box:2283", true).unwrap(),
+            ["https://nas.fritz.box:2283/", "http://nas.fritz.box:2283/"]
+        );
+        assert_eq!(
+            tried("photos.example.com", false).unwrap(),
+            ["https://photos.example.com/"]
+        );
+        // Plain HTTP as typed: only for a home name.
+        assert_eq!(
+            tried("http://nas.fritz.box:2283/photos", true).unwrap(),
+            ["http://nas.fritz.box:2283/"]
+        );
+        assert_eq!(
+            tried("http://photos.example.com", false),
+            Err("server_requires_https_origin".to_string())
+        );
+        // Unchanged: names and addresses local by shape, HTTPS as typed, public addresses.
+        assert_eq!(
+            tried("tower.local:2283", false).unwrap(),
+            ["http://tower.local:2283/"]
+        );
+        assert_eq!(
+            tried("192.168.1.20:2283", true).unwrap(),
+            ["http://192.168.1.20:2283/"]
+        );
+        assert_eq!(
+            tried("https://nas.fritz.box", true).unwrap(),
+            ["https://nas.fritz.box/"]
+        );
+        assert_eq!(
+            tried("http://8.8.8.8:2283", true),
+            Err("server_requires_https_origin".to_string())
+        );
+        assert_eq!(
+            tried("http://user:secret@nas.fritz.box", true),
+            Err("server_requires_https_origin".to_string())
+        );
+    }
+
+    #[test]
     fn a_name_is_local_when_everything_it_resolves_to_is() {
         use std::net::IpAddr;
         let answers = |addresses: &[&str]| -> Vec<IpAddr> {
@@ -450,6 +626,10 @@ mod local_http_tests {
         ] {
             assert!(is_local_network(url::Host::Domain(name)), "{name}");
         }
+        // Any other name says nothing by its shape, and is never looked up to find out.
+        for name in ["nas.fritz.box", "photos.home", "photos.example.com"] {
+            assert!(!is_local_network(url::Host::Domain(name)), "{name}");
+        }
         // This computer's own name resolves to itself.
         assert!(name_is_local("localhost", |name| {
             use std::net::ToSocketAddrs;
@@ -485,15 +665,20 @@ mod local_http_tests {
             assert!(normalize_server(local).is_ok(), "{local}");
         }
         for remote in [
-            "http://photos.example.com",
             "http://8.8.8.8",
             "http://100.63.255.255",
             "http://100.128.0.1",
-            "http://ts.net.example.com",
             "http://[2001:db8::1]",
             "http://192.168.1.20/photos",
         ] {
             assert!(normalize_server(remote).is_err(), "{remote}");
+        }
+        // Plain HTTP to a name that is not local by its shape: never accepted as typed without
+        // a lookup that shows it is a home name (`typed_candidates`), and a connection to it
+        // only ever reaches the home network (`home_addresses`).
+        for named in ["http://photos.example.com", "http://ts.net.example.com"] {
+            assert!(typed_server(named).is_err(), "{named}");
+            assert!(typed_candidates(named, false).is_err(), "{named}");
         }
         assert!(normalize_server("https://photos.example.com").is_ok());
     }

@@ -138,17 +138,25 @@ pub(crate) async fn server_sign_in_options(
 ) -> Result<SignInOptions, String> {
     crate::require_local(&window)?;
     // The one place an address is typed: every later step is given the origin this returns.
-    let base = crate::connection::typed_server(&server)?;
+    let candidates = crate::connection::typed_servers(&server).await?;
     let client = transport::client()?;
-    let ping: Ping = get(&client, &base, "api/server/ping")
-        .await
-        .map_err(|code| {
-            if code.starts_with("server_http_") || code == "server_response_invalid" {
-                "server_not_frameleaf".into()
-            } else {
-                code
-            }
-        })?;
+    // A home name typed without a scheme is tried over HTTPS, then over plain HTTP.
+    let mut reached = Err("server_unreachable_or_certificate_invalid".to_string());
+    let mut base = candidates[0].clone();
+    for candidate in candidates {
+        reached = get::<Ping>(&client, &candidate, "api/server/ping").await;
+        base = candidate;
+        if !matches!(&reached, Err(code) if code == "server_unreachable_or_certificate_invalid") {
+            break;
+        }
+    }
+    let ping: Ping = reached.map_err(|code| {
+        if code.starts_with("server_http_") || code == "server_response_invalid" {
+            "server_not_frameleaf".into()
+        } else {
+            code
+        }
+    })?;
     // The ping proves who answered; a missing or older config only narrows to the defaults.
     let config = get(&client, &base, "api/public/config").await.ok();
     options(&base, ping, config)

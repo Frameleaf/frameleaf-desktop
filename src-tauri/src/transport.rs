@@ -28,6 +28,8 @@ pub(crate) fn streaming_client_builder() -> ClientBuilder {
         // Operating-system roots are loaded only for Manager's system-trust option.
         .tls_built_in_native_certs(false)
         .redirect(reqwest::redirect::Policy::none())
+        // A name reached over plain HTTP may connect only to the home network.
+        .dns_resolver(std::sync::Arc::new(crate::connection::HomeResolver))
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
