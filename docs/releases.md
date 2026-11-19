@@ -914,6 +914,12 @@ own copies as repository secrets:
   new key only once it updates to a release that lists it, which the updater key above still
   delivers. The owner's copy is the keychain item `app.frameleaf.desktop.runtime-signing` (base64
   of the PKCS8 PEM; decode it before use).
+- Pull requests stay on GitHub, but their checks come from Forgejo. `github-bridge` on Unraid
+  (`/mnt/shaganappi/appdata/forgejo/github-bridge`) runs once a minute: it fast-forwards Forgejo
+  `main` to GitHub's, pushes each open same-repository pull request's branch to Forgejo and opens a
+  mirror pull request there (fork pull requests are never run: the runners are host-mode slots and
+  the owner's machines), and posts each Forgejo job back to GitHub as a commit status named
+  `Forgejo / <workflow> / <job>`. Posting needs a GitHub token in that folder's `github-token` file.
 - The repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`. GitHub keeps git tags and the
   releases the app downloads from, written with `GH_PUBLISH_TOKEN`.
 
