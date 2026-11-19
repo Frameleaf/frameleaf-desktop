@@ -154,7 +154,9 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   still `{"accepted": true}`, and `/models` still lists the model, so a new challenge and report
   grant it again. The desktop keeps the same count the same way (for each model, the failures it
   reported as `inference-failed` or `model-unavailable` since that model's last result) and, at
-  the third, qualifies again without being told.
+  the third, qualifies again without being told. The server keeps its count per device and model
+  (a new session does not reset it) and answers that qualification with
+  `409 desktop_qualification_hold` for 5 minutes, which the desktop waits out for that model.
 - On a stop the desktop gives the task in hand up to 3 seconds to send `cancelled`, and a claim
   already sent up to 2 seconds to answer so a task leased in that moment is handed straight back.
 - Signed requests are sent one at a time, in sequence order.
@@ -182,10 +184,11 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 | 401 | `desktop_challenge_invalid` / `desktop_qualification_invalid` / `desktop_worker_activation_invalid` | Challenge or qualification expired, or not this session's | `worker_qualification_restart` | New challenge for that model, after a short wait. Shown as waiting, with the reason |
 | 409 | `desktop_challenge_conflict` / `_capacity`, `desktop_qualification_capacity`, `desktop_clip_publication_isolation` | Challenge and grant bookkeeping | `worker_challenge_busy` | Same; never stops. Shown as waiting, with the reason |
 | 409 | `desktop_challenge_too_large` / `_runtime_invalid` | The fixture is too large, or the runtime is not the one this device enrolled: the same answer every time | `worker_challenge_rejected` | Asked again twice, then: GPU runtime falls back to the processor; processor runtime leaves that task off with this reason (and stops with it when no task is left) |
-| 401 | `desktop_proof_expired` | The request's timestamp is more than 2 minutes from the server's clock | `clock_invalid` | Waits 5 minutes and tries again, reading the server's clock again each time |
+| 401 | `desktop_proof_expired` (session issue and every signed endpoint) | The request's timestamp is more than 2 minutes from the server's clock; not a refused device | `clock_invalid` | Waits 5 minutes and tries again, reading the server's clock again each time |
 | 409 | `desktop_model_profile_unavailable` | Task turned off, or model changed, since inventory | `workload_desktop_model_profile_unavailable` | Reads `/models` again and follows it |
 | 409 | `desktop_model_profile_changed` | Profile changed between challenge and report | `workload_desktop_model_profile_changed` | Same |
 | 409 | `desktop_pool_model_unavailable` (report only) | The qualification is for another key than the one being granted | `workload_<message>` | Same |
+| 409 | `desktop_qualification_hold` (challenge, report) | The server withdrew this model after three failed tasks in a row and takes no new qualification for it from this device for 5 minutes | `workload_<message>` | That task waits, the others work; qualified again after 5½ minutes |
 | 409 | `desktop_clip_index_changed` / `_dimensions` | An administrator changed the search model and the server is still resetting the index (seconds to a minute) | `workload_<message>` | That task waits, the others work; tried again after 2 minutes |
 | 409 | `desktop_clip_index_incompatible` / `_invalid`, `desktop_clip_space_unavailable` | The library holds vectors tagged with another model's key, or the stored index does not match the release | `workload_<message>` | That task stays off, the others work; tried again every 30 minutes |
 | 400 | `desktop_result_invalid` / `desktop_result_too_large` (result) | The result is not what the task's model returns, or is over 4 MB. Nothing is staged and the lease stays | `server_http_400` | Fails that task with `inference-failed`, claims the next |

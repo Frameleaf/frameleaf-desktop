@@ -343,6 +343,10 @@ const MODEL_RECHECK: Duration = Duration::from_secs(5 * 60);
 /// on the server the wait is short; a library built with another model is a long one.
 fn refused_task_retry(code: &str) -> Duration {
     let code = code.strip_prefix("workload_").unwrap_or(code);
+    if code == "desktop_qualification_hold" {
+        // The server's hold lasts five minutes.
+        return Duration::from_secs(5 * 60 + 30);
+    }
     Duration::from_secs(
         if matches!(
             code,
@@ -362,7 +366,9 @@ fn server_task_refusal(code: &str) -> bool {
         || code.starts_with("desktop_model_profile_")
         || matches!(
             code,
-            "desktop_pool_model_unavailable" | "desktop_face_profile_unavailable"
+            "desktop_pool_model_unavailable"
+                | "desktop_face_profile_unavailable"
+                | "desktop_qualification_hold"
         )
 }
 /// The server withdraws a model from this computer after this many failed tasks in a row
@@ -3564,6 +3570,17 @@ mod tests {
                 refusal("workload_desktop_clip_index_incompatible", provider),
                 Refusal::Task
             );
+            // A model the server holds back after failed tasks: that task waits out the hold
+            // (five minutes) while the others work, and is then qualified again.
+            assert_eq!(
+                refusal("workload_desktop_qualification_hold", provider),
+                Refusal::Task
+            );
+            assert_eq!(
+                refused_task_retry("workload_desktop_qualification_hold"),
+                Duration::from_secs(330)
+            );
+            assert!(server_task_refusal("desktop_qualification_hold"));
             // Nothing a different provider would change.
             for code in ["worker_policy_required", "worker_device_refused"] {
                 assert_eq!(refusal(code, provider), Refusal::Stop, "{code}");

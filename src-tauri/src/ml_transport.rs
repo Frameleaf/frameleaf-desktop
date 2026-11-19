@@ -622,7 +622,10 @@ fn qualification_refusal(message: &str) -> Option<String> {
         | "desktop_clip_index_dimensions"
         | "desktop_clip_index_incompatible"
         | "desktop_clip_index_invalid"
-        | "desktop_pool_model_unavailable" => Some(format!("workload_{message}")),
+        | "desktop_pool_model_unavailable"
+        // The server withdrew this model after failed tasks and takes no new check for it
+        // for five minutes. The other tasks carry on.
+        | "desktop_qualification_hold" => Some(format!("workload_{message}")),
         _ => None,
     }
 }
@@ -631,6 +634,10 @@ fn scopes_only_explicit_model_refusals_to_one_workload() {
     assert_eq!(
         qualification_refusal("desktop_model_profile_unavailable").as_deref(),
         Some("workload_desktop_model_profile_unavailable")
+    );
+    assert_eq!(
+        qualification_refusal("desktop_qualification_hold").as_deref(),
+        Some("workload_desktop_qualification_hold")
     );
     // An older server's refusals over its own AI or routing ask for a server update.
     for message in [
