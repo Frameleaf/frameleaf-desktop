@@ -1,7 +1,7 @@
 //! How one can sign in to a server at an address, before any credential is sent: its ping
 //! (identity, linked, setup) and its public config (password login, its own OAuth, Sign in with
 //! Frameleaf). The same lookup the mobile apps make (Android `ServerLookup`, iOS `ServerLoginOptions`).
-use crate::connection::{is_local_network, normalize_server};
+use crate::connection::normalize_server;
 use crate::transport;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -9,6 +9,8 @@ use tauri::WebviewWindow;
 use url::Url;
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long the HTTPS try of a home name typed without a scheme may take before plain HTTP.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
 struct Ping {
@@ -91,7 +93,7 @@ fn options(base: &Url, ping: Ping, config: Option<PublicConfig>) -> Result<SignI
         .collect::<String>();
     Ok(SignInOptions {
         server: base.to_string(),
-        local: base.host().is_some_and(is_local_network),
+        local: crate::connection::is_home_server(base),
         // A linked server is joined with Sign in with Frameleaf, never set up again.
         needs_setup: !ping.linked && ping.setup == "needed",
         // An older server without these fields still takes a password; a linked one also Frameleaf.
@@ -143,8 +145,17 @@ pub(crate) async fn server_sign_in_options(
     // A home name typed without a scheme is tried over HTTPS, then over plain HTTP.
     let mut reached = Err("server_unreachable_or_certificate_invalid".to_string());
     let mut base = candidates[0].clone();
-    for candidate in candidates {
-        reached = get::<Ping>(&client, &candidate, "api/server/ping").await;
+    let fallback = candidates.len() > 1;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let ping = get::<Ping>(&client, &candidate, "api/server/ping");
+        reached = if fallback && index == 0 {
+            // With plain HTTP still to try, a port that drops packets is not waited out in full.
+            tokio::time::timeout(PROBE_TIMEOUT, ping)
+                .await
+                .unwrap_or_else(|_| Err("server_unreachable_or_certificate_invalid".into()))
+        } else {
+            ping.await
+        };
         base = candidate;
         if !matches!(&reached, Err(code) if code == "server_unreachable_or_certificate_invalid") {
             break;
@@ -204,7 +215,7 @@ fn provider_page_allowed(url: &Url) -> bool {
         && url.password().is_none()
         && match url.scheme() {
             "https" => url.host().is_some(),
-            "http" => url.host().is_some_and(is_local_network),
+            "http" => crate::connection::is_home_server(url),
             _ => false,
         }
 }

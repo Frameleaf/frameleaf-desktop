@@ -959,9 +959,7 @@ pub(crate) async fn connect_cloud_server(
         // A server found on this network or typed in: an address on this network or one the account
         // lists for this instance, answering as that instance.
         Some(base) => {
-            if !base.host().is_some_and(crate::connection::is_local_network)
-                && !address_listed(&listed.await?, &base)
-            {
+            if !crate::connection::is_home_server(&base) && !address_listed(&listed.await?, &base) {
                 return Err("cloud_server_address_unlisted".into());
             }
             if probe(client.clone(), base.clone()).await? != instance {

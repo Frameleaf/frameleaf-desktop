@@ -88,6 +88,36 @@ pub(crate) fn home_addresses(
     Ok(home)
 }
 
+/// A server or Manager on this computer or the home network, where plain HTTP is allowed:
+/// local by its shape (`is_local_network`), or a plain-HTTP name that leads home. A name
+/// already accepted (typed and checked, or saved) needs no lookup; any other is looked up
+/// once, and from then on its connections are held to home addresses (`home_addresses`).
+pub fn is_home_server(url: &Url) -> bool {
+    use std::net::ToSocketAddrs;
+    if url.host().is_some_and(is_local_network) {
+        return true;
+    }
+    if url.scheme() != "http" {
+        return false;
+    }
+    let Some(name) = looked_up_name(url) else {
+        return false;
+    };
+    if PLAIN_HTTP_NAMES.lock().unwrap().contains(&name) {
+        return true;
+    }
+    let found = (name.as_str(), 0).to_socket_addrs();
+    let home = name_is_local(&name, |_| {
+        found
+            .map(|all| all.map(|a| a.ip()).collect())
+            .unwrap_or_default()
+    });
+    if home {
+        PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
+    }
+    home
+}
+
 /// For what this app does not connect itself (the Photos window is a web view with its own
 /// name lookup): whether a plain-HTTP name leads home right now. Any other server is `true`.
 pub(crate) fn leads_home_now(base: &Url) -> bool {
@@ -423,6 +453,10 @@ pub struct Features {
     /// (docs/desktop-worker-setup-protocol.md). Older servers omit it.
     #[serde(default)]
     pub worker_auto_setup: bool,
+    /// The server answers a claim that names a model it has withdrawn from this computer with
+    /// `409 desktop_qualification_hold`, when the claim asks (`reportWithdrawn`).
+    #[serde(default)]
+    pub worker_withdrawal_notice: bool,
     pub sources: bool,
     pub native_host: bool,
 }
@@ -569,6 +603,19 @@ mod local_http_tests {
         // (the AI worker) may be using the plain-HTTP one.
         normalize_server("https://nas.split.test").unwrap();
         assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
+        // Sign-in and Manager: a name already reached over plain HTTP is a home server without
+        // another lookup; one that resolves nowhere, or an HTTPS name, is not.
+        assert!(is_home_server(
+            &Url::parse("http://nas.split.test:8443").unwrap()
+        ));
+        assert!(is_home_server(&Url::parse("http://tower.local").unwrap()));
+        assert!(is_home_server(&Url::parse("https://192.168.1.20").unwrap()));
+        assert!(!is_home_server(
+            &Url::parse("http://manager.fritz.invalid:9443").unwrap()
+        ));
+        assert!(!is_home_server(
+            &Url::parse("https://photos.example.invalid").unwrap()
+        ));
         // A plain-HTTP name that does not resolve does not lead home; other servers are not asked.
         assert!(!leads_home_now(
             &Url::parse("http://nas.fritz.invalid:2283").unwrap()

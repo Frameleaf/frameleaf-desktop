@@ -339,7 +339,9 @@ pub fn normalize_manager(value: &str) -> Result<url::Url, String> {
 /// HTTP would carry its password across networks the owner does not control.
 pub fn require_encrypted(origin: &str) -> Result<(), String> {
     let url = normalize_manager(origin)?;
-    let local = url.host().is_some_and(crate::connection::is_local_network);
+    // Local by its shape, or a name that leads home (`nas.fritz.box`): connections to such a
+    // name are held to home addresses by this module's client.
+    let local = crate::connection::is_home_server(&url);
     if url.scheme() == "http" && !local {
         return Err("manager_https_required".into());
     }
@@ -388,6 +390,8 @@ pub fn manager_client(
     }
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // A Manager reached over plain HTTP by name is connected to at home addresses only.
+        .dns_resolver(std::sync::Arc::new(crate::connection::HomeResolver))
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")));
