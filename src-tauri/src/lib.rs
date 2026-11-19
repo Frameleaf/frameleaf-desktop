@@ -626,6 +626,9 @@ pub(crate) async fn restore_saved(
     let checking = current
         .as_ref()
         .is_some_and(|held| saved_sign_in::same_session(held, &saved));
+    // The saved server is taken into use before its first client is built: a plain-HTTP home
+    // name is held to the home network, and reached directly, from the first request.
+    let _ = normalize_server(&saved.server);
     let plan = saved_sign_in::check(&transport::client()?, &saved)
         .await
         .plan();

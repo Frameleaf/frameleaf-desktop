@@ -64,7 +64,9 @@ The desktop never needs a restart or **Retry Setup** because the server changed 
   Model files the server no longer lists are removed after the new set has qualified.
 - **Refused tasks.** A task refused for another reason (`desktop_clip_index_*`) stays off while the
   others work, and is tried again 2 minutes after the refusal (a model change still being
-  applied) or 30 minutes after it (a library built with another model).
+  applied) or 30 minutes after it (a library built with another model). Offering it again
+  checks every task once more, so the tasks that are ready first get at least as long to work
+  as the last round of checks took (and never less than 2 minutes).
 - **Policy.** `desktop_pool_policy_required` is waited out on every endpoint, session issue and
   renewal included: the desktop asks again every 5 minutes and when its route to the server
   changes.

@@ -1427,6 +1427,7 @@ async fn prepare_on(
     let mut refused_at = std::collections::BTreeMap::<String, tokio::time::Instant>::new();
     'qualification: loop {
         refused_at.clear();
+        let pass_started = tokio::time::Instant::now();
         // The provider chosen for each workload; a failed provider is demoted and this restarts.
         let groups = plan.groups();
         progress.update(|status| status.providers = plan.providers());
@@ -1742,6 +1743,8 @@ async fn prepare_on(
             crate::release_policy::reclaim_superseded(&data, &bundle, &active_runtime, &set, now)
         })
         .await;
+        // How long this pass took, from the first challenge to here.
+        let pass_took = pass_started.elapsed();
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
             let now = worker.now()?;
@@ -1776,6 +1779,10 @@ async fn prepare_on(
             installed = runtime;
             prepared = proofs;
             check_cancel(&progress.cancelled)?;
+            // The tasks that are ready get at least as long to work as it took to get here,
+            // before a refused task is offered again and everything is checked once more:
+            // however long the checks take, work is never starved by retries.
+            let work_due = tokio::time::Instant::now() + pass_took.max(Duration::from_secs(120));
             // Signalled to make the step in hand give its lease back before it is dropped.
             let (stop, mut cancel) = tokio::sync::watch::channel(false);
             let clock = WakeClock::new();
@@ -1824,7 +1831,7 @@ async fn prepare_on(
                     .any(|(at, code)| {
                         code.starts_with("workload_") && at.elapsed() >= refused_task_retry(code)
                     });
-                if offer_again {
+                if offer_again && tokio::time::Instant::now() >= work_due {
                     predictor.stop()?;
                     return Err("worker_models_changed".into());
                 }

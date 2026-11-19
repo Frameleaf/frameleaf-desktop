@@ -782,3 +782,41 @@ async fn a_claim_learns_of_a_withdrawn_model_only_from_a_server_that_offers_the_
         Some("worker_model_withdrawn")
     );
 }
+
+#[tokio::test]
+async fn after_this_computers_clock_moves_the_server_time_is_read_again_before_any_deadline() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    server.queue(&device, 1);
+    let claimed = worker.claim_many(&[&qualification]).await;
+    let (_, task) = claimed.unwrap().unwrap();
+    // In the middle of the task the OS corrects this computer's clock. The difference the
+    // worker held is now wrong by an hour: judged by it, the lease would look long expired.
+    worker.1.set(3_600_000);
+    worker.1.set_back_an_hour_ago();
+    assert!(worker.1.suspect());
+    // The result is not judged by the stale difference: the server is asked the time first.
+    let result = worker.complete(&task, &json!({}), &qualification).await;
+    assert_eq!(result, Ok(true));
+    assert!(!worker.1.suspect());
+    assert_eq!(worker.1.skew_ms(), 0);
+
+    // When the server can't be asked, nothing is judged by a difference that may not hold: the
+    // call fails like any request that did not get through, not as an expired qualification.
+    let unreachable = WorkerTransport::over(Connection {
+        base: Url::parse("http://127.0.0.1:1/").unwrap(),
+        ..worker.0.into_inner()
+    });
+    unreachable.1.set(3_600_000);
+    unreachable.1.set_back_an_hour_ago();
+    assert_eq!(
+        unreachable
+            .claim_many(&[&qualification])
+            .await
+            .err()
+            .as_deref(),
+        Some("worker_request_interrupted")
+    );
+}

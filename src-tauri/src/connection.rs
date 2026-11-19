@@ -17,6 +17,22 @@ use zeroize::ZeroizeOnDrop;
 /// it matters, when connecting (`HomeResolver`), and checked once when a person types it
 /// (`typed_servers`).
 pub fn normalize_server(value: &str) -> Result<Url, String> {
+    let url = server_origin(value)?;
+    if url.scheme() == "http" {
+        if let Some(name) = looked_up_name(&url) {
+            // From now until the app quits, connections to this name are held to the home
+            // network. It is never taken off again: something still running may be using the
+            // plain-HTTP origin (the AI worker keeps its base address), and an HTTPS address
+            // for the same name appearing elsewhere must not lift the rule under it.
+            PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
+        }
+    }
+    Ok(url)
+}
+
+/// `normalize_server` without taking the origin into use: nothing is held to the home network
+/// yet. For an address that may not be used at all (the plain-HTTP fallback of a typed name).
+fn server_origin(value: &str) -> Result<Url, String> {
     if value.contains('\\') {
         return Err("server_address_invalid".into());
     }
@@ -32,15 +48,6 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
         || !matches!(url.path(), "" | "/")
     {
         return Err("server_requires_https_origin".into());
-    }
-    if url.scheme() == "http" {
-        if let Some(name) = looked_up_name(&url) {
-            // From now until the app quits, connections to this name are held to the home
-            // network. It is never taken off again: something still running may be using the
-            // plain-HTTP origin (the AI worker keeps its base address), and an HTTPS address
-            // for the same name appearing elsewhere must not lift the rule under it.
-            PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
-        }
     }
     Ok(url)
 }
@@ -203,8 +210,9 @@ fn typed_candidates(value: &str, resolves_home: bool) -> Result<Vec<Url>, String
         let url = Url::parse(&address).ok()?;
         let named = url.scheme() == "http" && looked_up_name(&url).is_some();
         let bare = url.username().is_empty() && url.password().is_none();
+        // Not taken into use yet: the HTTPS try before it goes wherever the name resolves.
         (named && bare && resolves_home)
-            .then(|| normalize_server(&url.origin().ascii_serialization()).ok())?
+            .then(|| server_origin(&url.origin().ascii_serialization()).ok())?
     };
     match typed_server(typed) {
         Ok(url) if typed.contains("://") => Ok(vec![url]),
@@ -652,6 +660,17 @@ mod local_http_tests {
             tried("http://photos.example.com", false),
             Err("server_requires_https_origin".to_string())
         );
+        // Listing the plain-HTTP fallback does not yet hold the name to the home network: the
+        // HTTPS try before it may use a public address the name also resolves to.
+        let public = vec![std::net::SocketAddr::new("203.0.113.7".parse().unwrap(), 0)];
+        tried("nas.unused.test:2283", true).unwrap();
+        assert_eq!(
+            home_addresses("nas.unused.test", public.clone()),
+            Ok(public.clone())
+        );
+        // Taking it into use does.
+        normalize_server("http://nas.unused.test:2283").unwrap();
+        assert!(home_addresses("nas.unused.test", public).is_err());
         // Unchanged: names and addresses local by shape, HTTPS as typed, public addresses.
         assert_eq!(
             tried("tower.local:2283", false).unwrap(),

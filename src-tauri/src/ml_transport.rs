@@ -547,6 +547,12 @@ fn clock_moved(wall_elapsed_ms: i64, steady_elapsed_ms: i64) -> bool {
     (wall_elapsed_ms - steady_elapsed_ms).abs() > 30_000
 }
 impl ServerClock {
+    /// As after the OS set this computer's clock an hour forward, with the old difference kept.
+    #[cfg(test)]
+    fn set_back_an_hour_ago(&self) {
+        let hour = std::time::Duration::from_secs(3600);
+        *self.read.lock().unwrap() = Some((SystemTime::now() - hour, std::time::Instant::now()));
+    }
     fn set(&self, skew_ms: i64) {
         self.skew_ms.store(skew_ms, Ordering::Release);
         *self.read.lock().unwrap() = Some((SystemTime::now(), std::time::Instant::now()));
@@ -588,25 +594,30 @@ impl Connection {
         Ok(now()? + self.clock.skew_ms())
     }
     /// After this computer's clock moved, ask the server the time again before judging any
-    /// deadline: one unsigned request whose `Date` header is all that is read.
-    async fn resync(&mut self) {
+    /// deadline: one unsigned request whose `Date` header is all that is read. When the server
+    /// can't be asked, no deadline is judged by a difference that may no longer hold: the
+    /// caller gets the same error as for any request that did not get through.
+    async fn resync(&mut self) -> Result<(), String> {
         if !self.clock.suspect() {
-            return;
+            return Ok(());
         }
-        let Ok(url) = self.base.join("api/server/ping") else {
-            return;
-        };
+        let url = self
+            .base
+            .join("api/server/ping")
+            .map_err(|_| "worker_path_invalid")?;
         let asked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             self.client.get(url).send().await
         });
-        if let Ok(Ok(response)) = asked.await {
-            if let Some(skew) = transport::clock_skew(&response) {
-                self.clock.set(skew);
-            }
-        }
+        let Ok(Ok(response)) = asked.await else {
+            return Err("worker_request_interrupted".into());
+        };
+        // A server that sends no `Date` gives nothing better to go by: keep the difference.
+        let skew = transport::clock_skew(&response).unwrap_or(self.clock.skew_ms());
+        self.clock.set(skew);
+        Ok(())
     }
     async fn ensure_current(&mut self) -> Result<(), String> {
-        self.resync().await;
+        self.resync().await?;
         if renewal_due(&self.worker, self.now()?)? {
             self.renew().await?;
         }
@@ -1174,7 +1185,7 @@ impl WorkerTransport {
         qualifications: &[&AcceptedQualification],
     ) -> Result<Option<(usize, ClaimedTask)>, String> {
         let mut connection = self.0.lock().await;
-        connection.resync().await;
+        connection.resync().await?;
         let at = connection.now()?;
         let keys = claim_models(qualifications, &connection.worker, at)?;
         connection.ensure_current().await?;
@@ -1204,6 +1215,7 @@ impl WorkerTransport {
         qualification: &AcceptedQualification,
     ) -> Result<Vec<u8>, String> {
         let mut connection = self.0.lock().await;
+        connection.resync().await?;
         qualification.validate_task(&connection.worker, task, connection.now()?)?;
         task.validate_at(
             &connection.worker,
@@ -1254,6 +1266,7 @@ impl WorkerTransport {
             return Err("worker_result_too_large".into());
         }
         let mut connection = self.0.lock().await;
+        connection.resync().await?;
         qualification.validate_task(&connection.worker, task, connection.now()?)?;
         task.validate_result_at(
             &connection.worker,
@@ -1296,7 +1309,9 @@ impl WorkerTransport {
         if !result.is_object() {
             return Err("worker_result_invalid".into());
         }
-        // A result is only for a lease still held: the last expiry the server granted must be ahead.
+        // A result is only for a lease still held: the last expiry the server granted must be
+        // ahead, by the server's time (read again first if this computer's clock moved).
+        self.0.lock().await.resync().await?;
         if millis(&task.expires_at)? <= self.now()? {
             return Err("worker_lease_expired".into());
         }

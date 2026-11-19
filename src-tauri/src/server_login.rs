@@ -141,12 +141,15 @@ pub(crate) async fn server_sign_in_options(
     crate::require_local(&window)?;
     // The one place an address is typed: every later step is given the origin this returns.
     let candidates = crate::connection::typed_servers(&server).await?;
-    let client = transport::client()?;
     // A home name typed without a scheme is tried over HTTPS, then over plain HTTP.
     let mut reached = Err("server_unreachable_or_certificate_invalid".to_string());
     let mut base = candidates[0].clone();
     let fallback = candidates.len() > 1;
     for (index, candidate) in candidates.into_iter().enumerate() {
+        // Taken into use only now, and before its client is built: a plain-HTTP name is held
+        // to the home network and reached directly from its first request.
+        let candidate = normalize_server(candidate.as_str())?;
+        let client = transport::client()?;
         let ping = get::<Ping>(&client, &candidate, "api/server/ping");
         reached = if fallback && index == 0 {
             // With plain HTTP still to try, a port that drops packets is not waited out in full.
@@ -168,6 +171,7 @@ pub(crate) async fn server_sign_in_options(
             code
         }
     })?;
+    let client = transport::client()?;
     // The ping proves who answered; a missing or older config only narrows to the defaults.
     let config = get(&client, &base, "api/public/config").await.ok();
     options(&base, ping, config)
