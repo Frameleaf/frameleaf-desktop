@@ -354,9 +354,47 @@ fn refused_task_retry(code: &str) -> Duration {
         },
     )
 }
+/// A refusal by the server of one task, as `first_failure` reports it when every task was
+/// refused (the `workload_` taken off). This app's own `desktop_…` codes (an unsupported
+/// protocol, a missing enrolment) are not among them and stop the worker with their own words.
+fn server_task_refusal(code: &str) -> bool {
+    code.starts_with("desktop_clip_")
+        || code.starts_with("desktop_model_profile_")
+        || matches!(
+            code,
+            "desktop_pool_model_unavailable" | "desktop_face_profile_unavailable"
+        )
+}
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
 const GRANT_STRIKES: u32 = 3;
+/// The server's count, kept the way the server keeps it: for each model, the failed tasks in a
+/// row since that model's last result.
+#[derive(Default)]
+struct GrantStrikes(std::collections::BTreeMap<String, u32>);
+impl GrantStrikes {
+    fn completed(&mut self, model: Option<&str>) {
+        if let Some(model) = model {
+            self.0.remove(model);
+        }
+    }
+    /// Whether the server has now withdrawn this model, so it must be qualified again.
+    fn failed(&mut self, model: Option<&str>, code: &str) -> bool {
+        let Some(model) = model else { return false };
+        if !crate::native_predictor::counts_against_grant(code) {
+            return false;
+        }
+        let strikes = self.0.entry(model.to_owned()).or_default();
+        *strikes += 1;
+        if *strikes < GRANT_STRIKES {
+            return false;
+        }
+        self.0.remove(model);
+        true
+    }
+}
+/// How many times a challenge the server refuses the same way every time is asked for again.
+const CHALLENGE_REJECTED_LIMIT: u32 = 3;
 /// How long a stop waits for the held lease to be handed back to the server.
 const LEASE_RETURN: Duration = Duration::from_secs(3);
 /// How long quitting the app waits for the worker to stop and hand its lease back.
@@ -388,10 +426,16 @@ where
         match result {
             // The server refused every task for a reason of its own (`first_failure` took the
             // `workload_` off): nothing here is broken. Wait and offer again.
-            Err(code) if code.starts_with("desktop_") => {
+            Err(code) if server_task_refusal(&code) => {
                 let wait = refused_task_retry(&code);
                 progress.set("paused", Some(code));
                 recheck_after(progress, wait).await?;
+            }
+            // The server refused this computer's timestamp. Each attempt reads the server's
+            // clock again (`Capabilities::clock_skew_ms`), and the person may correct theirs.
+            Err(code) if code == "clock_invalid" => {
+                progress.set("paused", Some(code));
+                recheck_after(progress, POLICY_RECHECK).await?;
             }
             // An administrator can assign work, or update the server, at any time: ask again later.
             Err(code)
@@ -658,10 +702,9 @@ async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String
             reconnect_delay(crashes, rand::random())
         } else {
             if worked
-                || matches!(
-                    progress.status.lock().unwrap().state.as_str(),
-                    "working" | "waiting-for-work"
-                )
+                // "working" is announced before the server has answered a claim; an answered
+                // claim with no task leaves "waiting-for-work".
+                || progress.status.lock().unwrap().state == "waiting-for-work"
             {
                 retries = 0;
             }
@@ -860,7 +903,7 @@ enum Refusal {
 fn refusal(code: &str, provider: &str) -> Refusal {
     if matches!(
         code,
-        "worker_challenge_busy" | "worker_qualification_restart"
+        "worker_challenge_busy" | "worker_qualification_restart" | "worker_challenge_rejected"
     ) {
         return Refusal::Again;
     }
@@ -1351,7 +1394,7 @@ async fn prepare_on(
     }
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
-    let mut strikes = 0u32;
+    let mut strikes = GrantStrikes::default();
     'qualification: loop {
         // The provider chosen for each workload; a failed provider is demoted and this restarts.
         let groups = plan.groups();
@@ -1376,6 +1419,7 @@ async fn prepare_on(
                 group_caches.push(caches[index].clone());
                 // One model's qualification, from a new challenge to the accepted record. A
                 // refusal the server clears by itself starts this model again, not the others.
+                let mut rejected = 0u32;
                 let (qualified, accepted) = 'attempt: loop {
                     let cache = caches[index].clone();
                     check_cancel(&progress.cancelled)?;
@@ -1394,10 +1438,15 @@ async fn prepare_on(
                             {
                                 return Err(code);
                             }
+                            if code == "worker_challenge_rejected" {
+                                rejected += 1;
+                            }
                             match refusal(&code, profile.provider()) {
-                                Refusal::Again => {
+                                Refusal::Again if rejected < CHALLENGE_REJECTED_LIMIT => {
                                     refusals = refusals.saturating_add(1);
                                     let delay = reconnect_delay(refusals, rand::random());
+                                    // Say why this computer is waiting.
+                                    progress.set("reconnecting", Some(code));
                                     cancellable(
                                         async {
                                             tokio::time::sleep(delay).await;
@@ -1411,12 +1460,15 @@ async fn prepare_on(
                                 Refusal::Models if models_changed().await => {
                                     return Err("worker_models_changed".into());
                                 }
-                                Refusal::Models | Refusal::Task | Refusal::Processor
+                                Refusal::Again
+                                | Refusal::Models
+                                | Refusal::Task
+                                | Refusal::Processor
                                     if plan.demote(workload, &code, false) =>
                                 {
                                     continue 'qualification;
                                 }
-                                Refusal::Models | Refusal::Task => {
+                                Refusal::Again | Refusal::Models | Refusal::Task => {
                                     progress.workload(workload, "unavailable", Some(code));
                                     continue 'workload;
                                 }
@@ -1765,7 +1817,7 @@ async fn prepare_on(
                 match completed {
                     Ok(Step::Completed) => {
                         failures.completed();
-                        strikes = 0;
+                        strikes.completed(predictor.claimed_model());
                         progress.completed();
                     }
                     Ok(step @ (Step::Dropped(_) | Step::Busy(_))) => {
@@ -1774,13 +1826,9 @@ async fn prepare_on(
                             Step::Busy(code) => (code, false),
                             _ => unreachable!(),
                         };
-                        if task_failed && crate::native_predictor::counts_against_grant(&code) {
-                            strikes += 1;
-                        }
-                        if strikes >= GRANT_STRIKES {
+                        if task_failed && strikes.failed(predictor.claimed_model(), &code) {
                             // By now the server has withdrawn the model and will lease nothing
                             // for it: qualify again, which grants it again.
-                            strikes = 0;
                             predictor.stop()?;
                             continue 'qualification;
                         }
@@ -3326,6 +3374,131 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_that_never_answers_or_a_server_that_keeps_failing_is_backed_off() {
+        // The runtime starts and never becomes healthy: counted like a crash, then stopped.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let result = reconnect(&progress, false, |refresh| {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            assert!(!refresh);
+            progress.set("working", None);
+            async { Err("runtime_not_ready".into()) }
+        })
+        .await;
+        assert_eq!(result, Err("runtime_crash_loop".into()));
+        assert_eq!(attempts.load(Ordering::Acquire), CRASH_LIMIT as usize);
+
+        // "working" is announced before the server has answered anything: it does not make the
+        // next wait short again. Five failures in a row wait 1-2, 2-4, 4-8, 8-16 and 16-32 s.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        reconnect(&progress, false, |_| {
+            let failing = attempts.fetch_add(1, Ordering::AcqRel) < 5;
+            progress.set("working", None);
+            async move {
+                match failing {
+                    true => Err("server_http_503".into()),
+                    false => Ok(()),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(31));
+    }
+
+    #[test]
+    fn failed_tasks_are_counted_for_each_model_as_the_server_counts_them() {
+        let (clip, face) = (Some("clip:a"), Some("face:b"));
+        let mut strikes = GrantStrikes::default();
+        // Two failures for one model, with results for another in between: the third still
+        // means the server has withdrawn the first.
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        strikes.completed(face);
+        assert!(!strikes.failed(clip, "server_http_400"));
+        strikes.completed(face);
+        assert!(strikes.failed(clip, "runtime_process_stopped"));
+        // Counted from nothing again after qualifying, and reset by that model's own result.
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        strikes.completed(clip);
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        // What the server does not count is not counted here, nor a step that claimed nothing.
+        for _ in 0..5 {
+            assert!(!strikes.failed(face, "worker_cancelled"));
+            assert!(!strikes.failed(face, "worker_input_invalid"));
+            assert!(!strikes.failed(None, "worker_execution_deadline"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_servers_task_refusals_are_waited_out_as_refused_tasks() {
+        for code in [
+            "desktop_clip_index_changed",
+            "desktop_clip_index_incompatible",
+            "desktop_clip_space_unavailable",
+            "desktop_model_profile_unavailable",
+            "desktop_pool_model_unavailable",
+        ] {
+            assert!(server_task_refusal(code), "{code}");
+        }
+        // This app's own codes stop the worker and say what they mean.
+        for code in [
+            "desktop_protocol_unsupported",
+            "desktop_worker_session_unavailable",
+            "desktop_enrollment_required",
+        ] {
+            assert!(!server_task_refusal(code), "{code}");
+            let attempts = AtomicUsize::new(0);
+            let result = supervise(
+                &quiet(),
+                false,
+                |_| {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    async move { Err(code.into()) }
+                },
+                || async { None },
+                ROUTE_POLL,
+            )
+            .await;
+            assert_eq!(result, Err(code.into()));
+            assert_eq!(attempts.load(Ordering::Acquire), 1);
+        }
+        // A timestamp the server refused: waited out and tried again, with the reason shown.
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let seen = statuses.clone();
+        let progress = Progress {
+            notify: Arc::new(move |status: SetupStatus| {
+                seen.lock().unwrap().push((status.state, status.code))
+            }),
+            ..quiet()
+        };
+        let attempts = AtomicUsize::new(0);
+        let result = supervise(
+            &progress,
+            false,
+            |_| {
+                let first = attempts.fetch_add(1, Ordering::AcqRel) == 0;
+                async move {
+                    match first {
+                        true => Err("clock_invalid".into()),
+                        false => Ok(()),
+                    }
+                }
+            },
+            || async { None },
+            ROUTE_POLL,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            [("paused".to_owned(), Some("clock_invalid".to_owned()))]
+        );
+    }
+
     #[test]
     fn the_models_to_run_are_compared_by_task_state_and_model_keys() {
         let current = inventory_fixture();
@@ -3371,9 +3544,15 @@ mod tests {
         const CUDA: &str = "CUDAExecutionProvider";
         for provider in [CPU, CUDA] {
             // Bookkeeping, and a challenge the server no longer holds: this model again.
-            for code in ["worker_challenge_busy", "worker_qualification_restart"] {
+            for code in [
+                "worker_challenge_busy",
+                "worker_qualification_restart",
+                // The same answer every time: asked again a bounded number of times.
+                "worker_challenge_rejected",
+            ] {
                 assert_eq!(refusal(code, provider), Refusal::Again, "{code}");
             }
+            assert!(!retryable("worker_challenge_rejected"));
             // The model may have changed: ask the server what to run.
             for code in [
                 "workload_desktop_model_profile_unavailable",

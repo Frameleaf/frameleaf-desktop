@@ -675,11 +675,16 @@ pub(crate) fn worker_refusal(status: u16, message: &str) -> String {
         "desktop_challenge_invalid"
         | "desktop_qualification_invalid"
         | "desktop_worker_activation_invalid" => "worker_qualification_restart",
+        // The same answer every time for this model and runtime (its fixture is too large, or
+        // the runtime is not the one this device enrolled): tried a few times, then named.
+        "desktop_challenge_too_large" | "desktop_challenge_runtime_invalid" => {
+            "worker_challenge_rejected"
+        }
+        // The server refuses a request timed more than two minutes from its own clock.
+        "desktop_proof_expired" => "clock_invalid",
         // Challenge bookkeeping the server clears by itself: ask again shortly.
         "desktop_challenge_conflict"
         | "desktop_challenge_capacity"
-        | "desktop_challenge_too_large"
-        | "desktop_challenge_runtime_invalid"
         | "desktop_qualification_capacity"
         // The grant collided with another one being published: the server says to retry.
         | "desktop_clip_publication_isolation" => "worker_challenge_busy",
@@ -750,11 +755,15 @@ fn refusals_are_named_by_message_whatever_the_status() {
         ),
         (409, "desktop_challenge_conflict", "worker_challenge_busy"),
         (409, "desktop_challenge_capacity", "worker_challenge_busy"),
-        (409, "desktop_challenge_too_large", "worker_challenge_busy"),
+        (
+            409,
+            "desktop_challenge_too_large",
+            "worker_challenge_rejected",
+        ),
         (
             409,
             "desktop_challenge_runtime_invalid",
-            "worker_challenge_busy",
+            "worker_challenge_rejected",
         ),
         (
             409,
@@ -811,6 +820,8 @@ fn refusals_are_named_by_message_whatever_the_status() {
             "worker_sign_in_required",
         ),
         (503, "", "server_http_503"),
+        // A timestamp the server refuses, named apart from a refused device.
+        (401, "desktop_proof_expired", "clock_invalid"),
         // The photo sign-in expired: refused by the ordinary sign-in check, with its own words.
         (401, "Authentication required", "worker_sign_in_required"),
         (401, "", "worker_sign_in_required"),

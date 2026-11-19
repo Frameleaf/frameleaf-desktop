@@ -454,6 +454,8 @@ pub struct NativePredictor {
     roles: Vec<BoundRole>,
     /// The process that was not serving when `ready` last failed.
     failed: Option<usize>,
+    /// The model key of the task last claimed.
+    claimed: Option<String>,
 }
 struct Lane {
     child: NativeSidecar,
@@ -612,6 +614,7 @@ impl NativePredictor {
             children: children.into_iter().map(|(lane, _)| lane).collect(),
             roles,
             failed: None,
+            claimed: None,
         })
     }
     /// Stop every process; the first failure is reported after all were asked to stop.
@@ -632,6 +635,10 @@ impl NativePredictor {
             }
         }
         Ok(true)
+    }
+    /// The model key of the task the last step claimed, if it claimed one.
+    pub(crate) fn claimed_model(&self) -> Option<&str> {
+        self.claimed.as_deref()
     }
     /// Why a runtime process ended by itself, if one did (`NativeSidecar::exit_report`).
     pub(crate) fn exit_report(&mut self) -> Option<String> {
@@ -686,7 +693,12 @@ impl NativePredictor {
         ) {
             self.failed = Some(waiting.load(Ordering::Acquire)).filter(|index| *index != NONE);
         }
-        result
+        // The process started and never answered its health check: that is the runtime not
+        // being ready, which the worker counts and backs off from, not a task that ran late.
+        result.map_err(|code| match code.as_str() {
+            "worker_execution_deadline" => "runtime_not_ready".into(),
+            _ => code,
+        })
     }
     /// After a failed prediction: a lane whose process is gone crashed while inferring (a
     /// cancelled or refused prediction leaves it running), so the caller can stop using it.
@@ -761,11 +773,13 @@ impl NativePredictor {
         {
             return Err("worker_predictor_qualification_changed".into());
         }
+        self.claimed = None;
         self.ready(cancel).await?;
         let (index, task) = match next_task(transport, qualifications, cancel).await? {
             Ok(claimed) => claimed,
             Err(step) => return Ok(step),
         };
+        self.claimed = Some(task.model_key.clone());
         if let Some((workload, _)) = task.model_key.split_once(':') {
             on_claim(workload);
         }
@@ -1397,6 +1411,7 @@ mod tests {
                 lane: 0,
             }],
             failed: None,
+            claimed: None,
         };
         assert!(predictor.is_running().unwrap());
         // FD-52: nothing listens on the port, so the lane is running but not serving yet.
@@ -1408,9 +1423,10 @@ mod tests {
         runtime.block_on(async {
             // Still not serving at the deadline: that lane failed to start.
             let (_keep, mut never) = watch::channel(false);
+            // Named as the runtime's failure, which the worker counts and backs off from.
             assert_eq!(
                 predictor.ready(&mut never).await.unwrap_err(),
-                "worker_execution_deadline"
+                "runtime_not_ready"
             );
             assert_eq!(predictor.failed_lane(), Some(lane.as_str()));
             // Cancelled while it is still loading: nothing is blamed (and the old blame is gone).
@@ -1479,12 +1495,13 @@ mod tests {
                 children: vec![lane(19996, "processor"), lane(19997, "accelerated")],
                 roles: vec![role(processor_port, 0), role(accelerated_port, 1)],
                 failed: None,
+                claimed: None,
             };
             runtime.block_on(async {
                 let (_keep, mut never) = watch::channel(false);
                 assert_eq!(
                     pair.ready(&mut never).await.unwrap_err(),
-                    "worker_execution_deadline"
+                    "runtime_not_ready"
                 );
             });
             assert_eq!(pair.failed_lane(), Some("accelerated"));

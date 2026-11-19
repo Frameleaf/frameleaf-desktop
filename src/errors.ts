@@ -362,6 +362,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['checks', 'Your server did not accept this computer’s result for the selected model. Try again. If it keeps happening, update Frameleaf on this computer and on your server.', 'worker_qualification_refused'],
   ['renewing', 'Your server asked this computer to check its models again. Frameleaf does that by itself.', 'worker_qualification_restart'],
   ['renewing', 'Your server is busy checking other computers. Frameleaf asks again by itself.', 'worker_challenge_busy'],
+  ['update', 'Your server would not set a check for the selected model on this computer. Update Frameleaf on this computer and on your server, then try again.', 'worker_challenge_rejected'],
   ['', 'Your server changed which AI models it uses. This computer is setting up the new ones by itself.', 'worker_models_changed'],
   ['', 'Your server is switching its smart search model. This computer tries again in a couple of minutes.', 'desktop_clip_index_changed desktop_clip_index_dimensions'],
   ['removed', 'Your server no longer accepts this computer for AI processing. Ask the person who runs your server to allow this computer again. If this computer’s date and time are wrong, correct them first.', 'worker_device_refused'],

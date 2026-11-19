@@ -152,8 +152,9 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   qualification is deleted, `claim` returns nothing for it and
   `GET /worker/qualifications/{id}` answers `401 desktop_qualification_invalid`. The `fail` reply is
   still `{"accepted": true}`, and `/models` still lists the model, so a new challenge and report
-  grant it again. The desktop counts the same failures itself and, at the third in a row,
-  qualifies again without being told.
+  grant it again. The desktop keeps the same count the same way (for each model, the failures it
+  reported as `inference-failed` or `model-unavailable` since that model's last result) and, at
+  the third, qualifies again without being told.
 - On a stop the desktop gives the task in hand up to 3 seconds to send `cancelled`, and a claim
   already sent up to 2 seconds to answer so a task leased in that moment is handed straight back.
 - Signed requests are sent one at a time, in sequence order.
@@ -178,8 +179,10 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 | 403 | `desktop_worker_photo_session_required` (session issue) | The caller is not a photo session (API key, shared link) | `worker_sign_in_required` | Stops; sign in again |
 | 401 | none, or the server's ordinary sign-in message (session issue) | The photo sign-in expired; refused before the device is looked at | `worker_sign_in_required` | Stops; sign in again |
 | 401 | `desktop_lease_invalid` | Lease no longer held, including a lease lost while its input is read | `worker_lease_refused` | Drops that task, reports nothing more about it, claims the next |
-| 401 | `desktop_challenge_invalid` / `desktop_qualification_invalid` / `desktop_worker_activation_invalid` | Challenge or qualification expired, or not this session's | `worker_qualification_restart` | New challenge for that model, after a short wait |
-| 409 | `desktop_challenge_conflict` / `_capacity` / `_too_large` / `_runtime_invalid`, `desktop_qualification_capacity`, `desktop_clip_publication_isolation` | Challenge and grant bookkeeping | `worker_challenge_busy` | Same; never stops |
+| 401 | `desktop_challenge_invalid` / `desktop_qualification_invalid` / `desktop_worker_activation_invalid` | Challenge or qualification expired, or not this session's | `worker_qualification_restart` | New challenge for that model, after a short wait. Shown as waiting, with the reason |
+| 409 | `desktop_challenge_conflict` / `_capacity`, `desktop_qualification_capacity`, `desktop_clip_publication_isolation` | Challenge and grant bookkeeping | `worker_challenge_busy` | Same; never stops. Shown as waiting, with the reason |
+| 409 | `desktop_challenge_too_large` / `_runtime_invalid` | The fixture is too large, or the runtime is not the one this device enrolled: the same answer every time | `worker_challenge_rejected` | Asked again twice, then: GPU runtime falls back to the processor; processor runtime leaves that task off with this reason (and stops with it when no task is left) |
+| 401 | `desktop_proof_expired` | The request's timestamp is more than 2 minutes from the server's clock | `clock_invalid` | Waits 5 minutes and tries again, reading the server's clock again each time |
 | 409 | `desktop_model_profile_unavailable` | Task turned off, or model changed, since inventory | `workload_desktop_model_profile_unavailable` | Reads `/models` again and follows it |
 | 409 | `desktop_model_profile_changed` | Profile changed between challenge and report | `workload_desktop_model_profile_changed` | Same |
 | 409 | `desktop_pool_model_unavailable` (report only) | The qualification is for another key than the one being granted | `workload_<message>` | Same |
