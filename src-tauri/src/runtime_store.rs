@@ -439,9 +439,15 @@ impl RuntimeStore {
             return Err("runtime_epoch_reused".into());
         }
         let release = self.root.join("releases").join(id);
-        if release.exists() {
-            self.read_release(id, minimum)?;
-        } else {
+        // An installed copy that no longer verifies (a file changed, went missing or was cut
+        // short) could never be used or replaced. Under the exclusive lock nothing runs from
+        // it: move it aside and stage it again from the bundle just verified.
+        if release.exists() && self.read_release(id, minimum).is_err() {
+            let aside = self.root.join(format!(".staging-{}", Uuid::new_v4()));
+            fs::rename(&release, &aside).map_err(|_| "runtime_store_activation_failed")?;
+            let _ = fs::remove_dir_all(&aside);
+        }
+        if !release.exists() {
             let staging = Staging::create(self.root.join(format!(".staging-{}", Uuid::new_v4())))?;
             private_directory(&staging.0.join("payload"))?;
             verified.copy_payload(&staging.0.join("payload"), share)?;

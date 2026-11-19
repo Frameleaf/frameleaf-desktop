@@ -126,11 +126,15 @@ fn is_digest(value: &str, length: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+/// A relative file name that is safe on every system this app runs on, and that is the same
+/// path inside a download address: letters, digits, `.`, `_`, `-` and `/` only, so nothing in it
+/// can be read as an escape (`%2e%2e`), a query (`?`), a fragment (`#`) or another host.
 fn safe_path(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 4096
-        && !value.contains(['\\', ':'])
-        && !value.chars().any(char::is_control)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
         && value.split('/').all(|part| {
             let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
             !part.is_empty()
@@ -757,6 +761,33 @@ pub(crate) fn shared_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_artifact_name_cannot_change_the_address_it_is_downloaded_from() {
+        for name in [
+            "visual/model.onnx",
+            "models--frameleaf--ViT-B-32__openai/refs/main",
+            "detection/model.onnx",
+            "config.json",
+        ] {
+            assert!(safe_path(name), "{name}");
+        }
+        for name in [
+            "%2e%2e/secret",
+            "visual/model.onnx?download=1",
+            "visual/model.onnx#fragment",
+            "visual/%2fmodel.onnx",
+            "a b/model.onnx",
+            "visual;x/model.onnx",
+            "user@host/model.onnx",
+            "../model.onnx",
+            "visual//model.onnx",
+            "C:/model.onnx",
+            "visual\\model.onnx",
+            "",
+        ] {
+            assert!(!safe_path(name), "{name}");
+        }
+    }
     #[test]
     fn admits_the_qualified_face_detector_and_512_value_recognizer() {
         let profile: ProfileData =

@@ -554,6 +554,9 @@ pub(crate) enum CacheProgress {
     Download { received: u64, total: u64 },
 }
 const MIRROR: &str = "https://models.frameleaf.cloud/frameleaf";
+/// Free space kept beyond the bytes still to download: the receipt, the published copy's
+/// directory entries, and whatever else on the computer is writing at the same time.
+const DISK_MARGIN: u64 = 64 * 1024 * 1024;
 pub(crate) async fn prepare(
     plan: CachePlan<'_>,
     root: &Path,
@@ -666,6 +669,29 @@ async fn prepare_once(
         private_directory(&model)?;
     }
     let reference = format!("models--frameleaf--{}/refs/main", plan.name);
+    if !complete {
+        // Before the first request: what is still to download must fit, with room to spare.
+        let remaining: u64 = plan
+            .sizes
+            .iter()
+            .filter(|(name, _)| !model.join(name).exists())
+            .map(|(name, bytes)| {
+                let partial = plan.hashes[name]
+                    .as_str()
+                    .map(|sha256| partial_path(&model.join(name), sha256));
+                let received = partial
+                    .and_then(|path| fs::metadata(path).ok())
+                    .map_or(0, |meta| meta.len());
+                bytes.saturating_sub(received)
+            })
+            .fold(0, u64::saturating_add);
+        if remaining > 0
+            && crate::host_storage::available_bytes(root)
+                .is_ok_and(|free| free < remaining.saturating_add(DISK_MARGIN))
+        {
+            return Err("model_disk_space_insufficient".into());
+        }
+    }
     for (name, bytes) in plan.sizes {
         check_cancel(cancel)?;
         let path = model.join(name);
@@ -999,6 +1025,48 @@ mod tests {
         .await;
         assert_eq!(result.unwrap_err(), "model_download_permission_required");
         assert!(!root.0.join("1".repeat(40)).exists());
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cannot_fit_is_refused_before_anything_is_requested() {
+        let root = Root::new();
+        // Larger than any disk; the mirror would be asked for it first otherwise.
+        let hashes = serde_json::json!({"visual/model.onnx": "a".repeat(64)});
+        let sizes = std::collections::BTreeMap::from([("visual/model.onnx".into(), 1u64 << 60)]);
+        let (mirror, requests) = serve(vec![]);
+        let result = prepare_from(
+            mirror.trim_end_matches('/'),
+            CachePlan {
+                task: "clip",
+                name: "test",
+                revision: &"1".repeat(40),
+                hashes: hashes.as_object().unwrap(),
+                sizes: &sizes,
+            },
+            &root.0,
+            &crate::transport::client().unwrap(),
+            &AtomicBool::new(false),
+            true,
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "model_disk_space_insufficient");
+        assert!(requests.join().unwrap().is_empty());
+        // Nothing half-written is left to take up the space that is missing.
+        let staging = root.0.join(format!(".staging-{}", "1".repeat(40)));
+        let partials = walk(&staging)
+            .into_iter()
+            .filter(|path| path.is_file())
+            .count();
+        assert_eq!(partials, 0);
+    }
+    fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+            found.push(entry.path());
+            found.extend(walk(&entry.path()));
+        }
+        found
     }
 
     #[cfg(unix)]
