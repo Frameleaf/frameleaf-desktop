@@ -423,7 +423,6 @@ jobs:
         run: |
           set -euo pipefail
           : "${TAURI_SIGNING_PRIVATE_KEY:?Missing updater signing key}"
-          : "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?Missing updater signing key password}"
           version="${RELEASE_TAG#v}"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             bundle=src-tauri/target/release/bundle/macos

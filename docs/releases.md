@@ -715,7 +715,7 @@ required values into that environment, never into pull-request jobs:
 | `APPLE_DEVELOPER_ID_PROVISION_PROFILE` | Base64 Developer ID provisioning profile for the desktop GUI’s private Keychain identity |
 | `APPLE_TEAM_ID` | Developer team ID |
 | `TAURI_SIGNING_PRIVATE_KEY` | Signs update packages with the version bound to the signature. The matching public key is embedded in Desktop. |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the encrypted updater signing key |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Optional. Only for an updater key with a password; the current key (`6FC9088C9E7444A4`) has none, so this is not set |
 
 Apple App Store Distribution and Apple Development certificates do not replace
 Developer ID Application for direct downloads. Developer ID Application
