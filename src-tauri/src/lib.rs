@@ -235,7 +235,9 @@ async fn prepare_view(
                         && worker_session_reusable(
                             saved,
                             &credentials::load("worker-session"),
-                            time::OffsetDateTime::now_utc(),
+                            // By the server's clock, which stamped the session's expiry.
+                            time::OffsetDateTime::now_utc()
+                                + time::Duration::milliseconds(caps.clock_skew_ms),
                         );
                     if caps.features.worker_session && enrollment.state == "preparing" && !*kept {
                         // A new photo association must never reuse an earlier worker grant.
@@ -850,6 +852,11 @@ async fn open_photos(
 /// Shows the photo window for the signed-in connection, from the window or the tray alike.
 pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
+    // The window looks the server's name up itself. A plain-HTTP home name that does not lead
+    // home right now (another network) is not opened, and is not handed the session.
+    if !connection::leads_home_now(&base) {
+        return Err("server_unreachable_or_certificate_invalid".into());
+    }
     let expected = connection::photo_session_scope(saved);
     let state = app.state::<DesktopState>();
     let mut scope = state.1.lock().map_err(|_| "photo_window_unavailable")?;

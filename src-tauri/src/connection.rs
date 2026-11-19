@@ -33,14 +33,13 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
     {
         return Err("server_requires_https_origin".into());
     }
-    if let Some(name) = looked_up_name(&url) {
-        // The scheme in use for this name decides whether its connections are held to the
-        // home network.
-        let mut names = PLAIN_HTTP_NAMES.lock().unwrap();
-        if url.scheme() == "http" {
-            names.insert(name);
-        } else {
-            names.remove(&name);
+    if url.scheme() == "http" {
+        if let Some(name) = looked_up_name(&url) {
+            // From now until the app quits, connections to this name are held to the home
+            // network. It is never taken off again: something still running may be using the
+            // plain-HTTP origin (the AI worker keeps its base address), and an HTTPS address
+            // for the same name appearing elsewhere must not lift the rule under it.
+            PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
         }
     }
     Ok(url)
@@ -57,23 +56,54 @@ fn looked_up_name(url: &Url) -> Option<String> {
     }
 }
 
-/// Names this app reaches over plain HTTP (`normalize_server`).
+/// Names this app has reached over plain HTTP since it started (`normalize_server`).
 static PLAIN_HTTP_NAMES: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// The addresses a connection to `name` may use. A name reached over plain HTTP may lead only
-/// to this computer or the home network: if it resolves anywhere else (the same name on
-/// another network, a hijacked answer), nothing is sent.
-fn home_addresses(
+/// Whether a name is being reached over plain HTTP. While one is, the clients that talk to
+/// the server connect directly: a proxy would resolve the name itself, out of this app's sight.
+pub(crate) fn plain_http_names_in_use() -> bool {
+    !PLAIN_HTTP_NAMES.lock().unwrap().is_empty()
+}
+
+/// The addresses a connection to `name` may use. A name reached over plain HTTP connects only
+/// to this computer or the home network: of what it resolves to, the addresses anywhere else
+/// are dropped (a home router answers with a public IPv6 address beside the private one), and
+/// when none is left (the same name on another network, a hijacked answer) nothing is sent.
+pub(crate) fn home_addresses(
     name: &str,
     found: Vec<std::net::SocketAddr>,
 ) -> Result<Vec<std::net::SocketAddr>, &'static str> {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
-    let plain_http = PLAIN_HTTP_NAMES.lock().unwrap().contains(&name);
-    if plain_http && !found.iter().all(|address| local_address(address.ip())) {
+    if !PLAIN_HTTP_NAMES.lock().unwrap().contains(&name) {
+        return Ok(found);
+    }
+    let home: Vec<_> = found
+        .into_iter()
+        .filter(|address| local_address(address.ip()))
+        .collect();
+    if home.is_empty() {
         return Err("plain HTTP is only for the home network");
     }
-    Ok(found)
+    Ok(home)
+}
+
+/// For what this app does not connect itself (the Photos window is a web view with its own
+/// name lookup): whether a plain-HTTP name leads home right now. Any other server is `true`.
+pub(crate) fn leads_home_now(base: &Url) -> bool {
+    use std::net::ToSocketAddrs;
+    if base.scheme() != "http" {
+        return true;
+    }
+    let Some(name) = looked_up_name(base) else {
+        return true;
+    };
+    let found = (name.as_str(), 0).to_socket_addrs();
+    name_is_local(&name, |_| {
+        found
+            .map(|all| all.map(|a| a.ip()).collect())
+            .unwrap_or_default()
+    })
 }
 
 /// The resolver of every client that talks to a server (`transport::streaming_client_builder`).
@@ -221,11 +251,11 @@ fn local_address(address: std::net::IpAddr) -> bool {
     }
 }
 
-/// A name is local when it resolves, and only to addresses on this computer or the local
-/// network. One public address among them, or no answer, is not local.
+/// A name is a home name when it resolves to an address on this computer or the local
+/// network. Connections to it use only those addresses (`home_addresses`). No answer, or only
+/// addresses elsewhere, is not a home name.
 fn name_is_local(name: &str, resolve: impl FnOnce(&str) -> Vec<std::net::IpAddr>) -> bool {
-    let addresses = resolve(name);
-    !addresses.is_empty() && addresses.into_iter().all(local_address)
+    resolve(name).into_iter().any(local_address)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -518,19 +548,37 @@ mod local_http_tests {
                 .collect()
         };
         normalize_server("http://nas.split.test:2283").unwrap();
+        assert!(plain_http_names_in_use());
         assert!(home_addresses("nas.split.test", addresses(&["192.168.178.20"])).is_ok());
         assert!(home_addresses("NAS.split.test.", addresses(&["10.0.0.2", "fd00::2"])).is_ok());
         // The same name elsewhere, or a hijacked answer: nothing is sent.
         assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
-        assert!(home_addresses(
-            "nas.split.test",
-            addresses(&["192.168.178.20", "203.0.113.7"])
-        )
-        .is_err());
-        // A name reached over HTTPS goes wherever it resolves, also after it was plain HTTP.
+        assert!(home_addresses("nas.split.test", addresses(&[])).is_err());
+        // A home router answers with a public IPv6 address beside the private one: only the
+        // home address is connected to.
+        assert_eq!(
+            home_addresses(
+                "nas.split.test",
+                addresses(&["2001:db8::20", "192.168.178.20", "203.0.113.7"])
+            ),
+            Ok(addresses(&["192.168.178.20"]))
+        );
+        // A name only ever reached over HTTPS goes wherever it resolves.
         assert!(home_addresses("photos.public.test", addresses(&["203.0.113.7"])).is_ok());
+        // An HTTPS address for the same name does not lift the rule: something still running
+        // (the AI worker) may be using the plain-HTTP one.
         normalize_server("https://nas.split.test").unwrap();
-        assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_ok());
+        assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
+        // A plain-HTTP name that does not resolve does not lead home; other servers are not asked.
+        assert!(!leads_home_now(
+            &Url::parse("http://nas.fritz.invalid:2283").unwrap()
+        ));
+        assert!(leads_home_now(
+            &Url::parse("https://photos.example.invalid").unwrap()
+        ));
+        assert!(leads_home_now(
+            &Url::parse("http://192.168.1.20:2283").unwrap()
+        ));
     }
 
     #[test]
@@ -602,10 +650,15 @@ mod local_http_tests {
                 "{local:?}"
             );
         }
+        // A public address beside a home one (a router's IPv6 answer) is still a home name;
+        // only the home address is ever connected to (`home_addresses`).
+        assert!(name_is_local("nas.fritz.box", |_| answers(&[
+            "192.168.1.20",
+            "2001:db8::1"
+        ])));
         for public in [
             &["8.8.8.8"][..],
-            // One public address among home ones is enough to refuse.
-            &["192.168.1.20", "203.0.113.7"],
+            &["203.0.113.7", "2001:db8::7"],
             &["2001:db8::1"],
             &["::ffff:8.8.8.8"],
             // No answer says nothing about where the name leads.

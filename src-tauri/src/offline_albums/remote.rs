@@ -373,6 +373,9 @@ impl Resolve for OfflineDns {
                 .await
                 .map_err(dns_unreachable)?
                 .collect();
+            // A name reached over plain HTTP connects only to home-network addresses.
+            let addresses = crate::connection::home_addresses(name.as_str(), addresses)
+                .map_err(|_| io::Error::from(ErrorKind::HostUnreachable))?;
             if addresses.is_empty() {
                 return Err(io::Error::from(ErrorKind::HostUnreachable).into());
             }

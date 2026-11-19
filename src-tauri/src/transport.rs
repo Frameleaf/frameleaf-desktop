@@ -24,7 +24,14 @@ pub(crate) fn client_builder() -> ClientBuilder {
 }
 
 pub(crate) fn streaming_client_builder() -> ClientBuilder {
-    Client::builder()
+    let builder = Client::builder();
+    // A proxy would look a plain-HTTP home name up itself, and be handed the request, without
+    // this app checking where it leads. A home server is reached directly.
+    let builder = match crate::connection::plain_http_names_in_use() {
+        true => builder.no_proxy(),
+        false => builder,
+    };
+    builder
         // Operating-system roots are loaded only for Manager's system-trust option.
         .tls_built_in_native_certs(false)
         .redirect(reqwest::redirect::Policy::none())
@@ -67,11 +74,13 @@ pub(crate) fn clock_skew(response: &Response) -> Option<i64> {
 pub(crate) async fn refused(mut response: Response) -> (u16, String) {
     let status = response.status().as_u16();
     let mut bytes = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
-        if bytes.len() + chunk.len() > 4096 {
-            return (status, String::new());
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len() + chunk.len() <= 4096 => bytes.extend_from_slice(&chunk),
+            Ok(None) => break,
+            // Too long, or cut short: what arrived is not known to be the server's whole reply.
+            _ => return (status, String::new()),
         }
-        bytes.extend_from_slice(&chunk);
     }
     let message = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
