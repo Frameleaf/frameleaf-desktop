@@ -899,16 +899,23 @@ retained DMG after acceptance.
 
 ## Releasing from Forgejo
 
-CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop, and so
-can the release chain (owner, 2026-11-19). The release keys cannot be read back from GitHub and
-installed apps accept only updates and runtime packs signed with them, so they are copied, not
-recreated: `copy-release-keys-to-forgejo.yml`, run once from main on GitHub, writes
-`DESKTOP_RELEASE_ED25519_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY` and
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from the `desktop-release` environment into Forgejo's
-repository secrets and sets the repository variable `DESKTOP_RELEASE_ON_FORGEJO` to `true`. It needs
-the GitHub repository secret `FORGEJO_SECRETS_TOKEN` (a Forgejo token with `write:repository`);
-delete that token and the workflow afterwards. GitHub keeps git, tags and the releases the app
-downloads from, and the keys stay in `desktop-release` too, so macOS can still be released there.
+CI and the release chain run on the self-hosted Forgejo at
+https://code.heroapps.ca/Frameleaf/frameleaf-desktop (owner, 2026-11-19). GitHub Actions is no longer
+used, and the keys in its `desktop-release` environment cannot be read back, so Forgejo holds its
+own copies as repository secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY`: the original updater key (key id `6FC9088C9E7444A4`, the one
+  pinned in `src-tauri/tauri.conf.json`), so installed apps keep updating in place. It has no
+  password. The owner's copy is the login keychain item `app.frameleaf.desktop.updater-signing`.
+- `DESKTOP_RELEASE_ED25519_PRIVATE_KEY`: the runtime-pack key `desktop-release-2026-11`, made on
+  2026-11-19 because `desktop-release-2026-10` was lost with GitHub. Both stay in
+  `runtime/release-trust.json` and in Library's `server/resources/desktop/release-trust.json`.
+  Library must carry the new key before a pack signed with it ships. An installed app trusts the
+  new key only once it updates to a release that lists it, which the updater key above still
+  delivers. The owner's copy is the keychain item `app.frameleaf.desktop.runtime-signing` (base64
+  of the PKCS8 PEM; decode it before use).
+- The repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`. GitHub keeps git tags and the
+  releases the app downloads from, written with `GH_PUBLISH_TOKEN`.
 
 - Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
   The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
@@ -920,5 +927,5 @@ downloads from, and the keys stay in `desktop-release` too, so macOS can still b
   `tools/release_inputs.mjs`). Today that is Windows (runtime packs and the unsigned installers)
   and Linux x86_64, which builds on the Unraid CI slot labelled `ubuntu-22.04` (slot 5, a host-mode
   slot built from `ghcr.io/catthehacker/ubuntu:runner-22.04`). There is no Intel Mac or Arm Linux
-  runner, and the one Mac runner is the owner's own Mac, so macOS and `linux-aarch64` are released
-  on GitHub; choose `linux-x86_64` rather than `linux` on Forgejo.
+  runner, and the one Mac runner is the owner's own Mac, so macOS and `linux-aarch64` cannot be
+  released until such runners exist; choose `linux-x86_64` rather than `linux`.
