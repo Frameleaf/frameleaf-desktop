@@ -91,9 +91,56 @@ pub fn is_local_network(host: url::Host<&str>) -> bool {
                         ".ts.net",
                     ]
                     .iter()
-                    .any(|suffix| name.ends_with(suffix)))
+                    .any(|suffix| name.ends_with(suffix))
+                    // Any other name a home router hands out (`nas.fritz.box`, `photos.home`):
+                    // local when every address it resolves to is. Names accepted above are
+                    // never looked up.
+                    || resolves_locally(&name))
         }
     }
+}
+
+fn local_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(ip) => is_local_network(url::Host::Ipv4(ip)),
+        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => is_local_network(url::Host::Ipv4(ip)),
+            None => is_local_network(url::Host::Ipv6(ip)),
+        },
+    }
+}
+
+/// A name is local when it resolves, and only to addresses on this computer or the local
+/// network. One public address among them, or no answer, is not local.
+fn name_is_local(name: &str, resolve: impl FnOnce(&str) -> Vec<std::net::IpAddr>) -> bool {
+    let addresses = resolve(name);
+    !addresses.is_empty() && addresses.into_iter().all(local_address)
+}
+
+/// `name_is_local` by this computer's resolver. The answer is kept for a short time only: a
+/// name can resolve to a home address at home and a public one elsewhere, and plain HTTP must
+/// not follow it there.
+fn resolves_locally(name: &str) -> bool {
+    use std::{
+        net::ToSocketAddrs,
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+    static LAST: Mutex<Option<(String, bool, Instant)>> = Mutex::new(None);
+    if let Some((known, local, at)) = LAST.lock().unwrap().as_ref() {
+        let fresh = Duration::from_secs(if *local { 30 } else { 5 });
+        if known == name && at.elapsed() < fresh {
+            return *local;
+        }
+    }
+    let local = name_is_local(name, |name| {
+        (name, 0)
+            .to_socket_addrs()
+            .map(|found| found.map(|address| address.ip()).collect())
+            .unwrap_or_default()
+    });
+    *LAST.lock().unwrap() = Some((name.to_owned(), local, Instant::now()));
+    local
 }
 
 #[derive(Serialize, Deserialize)]
@@ -335,6 +382,63 @@ pub fn native_origin_allowed(label: &str, url: &Url, development_build: bool) ->
 #[cfg(test)]
 mod local_http_tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_local_when_everything_it_resolves_to_is() {
+        use std::net::IpAddr;
+        let answers = |addresses: &[&str]| -> Vec<IpAddr> {
+            addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect()
+        };
+        for local in [
+            &["192.168.178.20"][..],
+            &["10.0.0.5", "fd00::5"],
+            &["100.101.102.103"],
+            &["127.0.0.1", "::1"],
+            &["169.254.10.1", "fe80::1"],
+            &["::ffff:192.168.1.20"],
+        ] {
+            assert!(
+                name_is_local("nas.fritz.box", |_| answers(local)),
+                "{local:?}"
+            );
+        }
+        for public in [
+            &["8.8.8.8"][..],
+            // One public address among home ones is enough to refuse.
+            &["192.168.1.20", "203.0.113.7"],
+            &["2001:db8::1"],
+            &["::ffff:8.8.8.8"],
+            // No answer says nothing about where the name leads.
+            &[],
+        ] {
+            assert!(
+                !name_is_local("photos.home", |_| answers(public)),
+                "{public:?}"
+            );
+        }
+        // Names accepted without a lookup stay that way: this resolves nowhere.
+        for name in [
+            "tower",
+            "tower.local",
+            "nas.lan",
+            "box.home.arpa",
+            "nas.tail1234.ts.net",
+        ] {
+            assert!(is_local_network(url::Host::Domain(name)), "{name}");
+        }
+        // This computer's own name resolves to itself.
+        assert!(name_is_local("localhost", |name| {
+            use std::net::ToSocketAddrs;
+            (name, 0)
+                .to_socket_addrs()
+                .unwrap()
+                .map(|a| a.ip())
+                .collect()
+        }));
+    }
 
     #[test]
     fn plain_http_is_accepted_only_on_the_local_network() {
