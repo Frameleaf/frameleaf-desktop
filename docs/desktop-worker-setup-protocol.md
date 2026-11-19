@@ -28,6 +28,10 @@ document. Older servers omit the key. The desktop reads a missing key as `false`
 
 ## Setup sequence
 
+Every signed `POST` has the body `{"payload": "<JSON string>"}`: the fields shown below are the
+JSON inside that string, exactly the bytes the request proof (`x-frameleaf-desktop-proof`) signs.
+`GET` and `DELETE` requests have no body and sign the empty string.
+
 | Step | Desktop | Server |
 |---|---|---|
 | 1 | `POST /api/desktop/worker/models` `{runtimeSourceRevision, provider, protocolVersion: 2}` | For each enabled task, returns the model keys and the full catalogue profile of each. |
@@ -39,6 +43,33 @@ document. Older servers omit the key. The desktop reads a missing key as `false`
 
 The account still has to have **Desktop AI processing** turned on (`desktop_pool` policy). Lease and
 session authentication (`x-frameleaf-desktop-proof`) is unchanged.
+
+A challenge and an accepted qualification are bound to the worker session id and authorization
+epoch, not to the session token: renewing the session (`POST /api/desktop/worker/session`) leaves
+them valid.
+
+### The desktop follows the server
+
+The desktop never needs a restart or **Retry Setup** because the server changed something.
+
+- **Models.** While it works, the desktop reads `/models` again every 5 minutes, and at once when a
+  challenge or report is refused with `desktop_model_profile_unavailable` / `_changed`. It compares
+  each task's `state` and `modelKeys`. On a difference it stops its runtime, downloads and
+  hash-checks the new models, qualifies them, and carries on. A task turned on later starts; a task
+  turned off stops; with no task left it shows "no work assigned" and asks again every 5 minutes.
+  Model files the server no longer lists are removed after the new set has qualified.
+- **Refused tasks.** A task refused for another reason (`desktop_clip_index_*`) stays off while the
+  others work, and is tried again every 30 minutes.
+- **Policy and network.** `desktop_pool_policy_required` and `desktop_worker_lan_required` are waited
+  out on every endpoint, including session issue: the desktop asks again every 5 minutes and when
+  its route to the server changes.
+- **Clock.** Every response's `Date` header tells the desktop the server's time. When the two clocks
+  differ by 30 seconds or more, the desktop times its requests and reads the server's deadlines by
+  the server's clock (the server refuses a request timed more than 2 minutes off). Enrolment that
+  is still refused for its timestamp (`device_proof_expired`) is shown as `clock_invalid`.
+- **New fields.** The desktop ignores fields it does not know in the `/models` reply and its task
+  entries, in a challenge and in an accepted qualification. A catalogue profile is hashed into its
+  model key and stays strict: an unknown field in a profile refuses the reply.
 
 ### Inventory (`/models`)
 
@@ -88,38 +119,75 @@ queue (`smartSearch`, `faceDetection`, `ocr`) for each desktop that is online (s
 90 seconds) and holds a model for it. That is on top of the administrator's own concurrency setting.
 The broker still holds at most 32 open tasks.
 
+### Leases
+
+- Each desktop holds one lease. A heartbeat extends it; the result or a failure ends it.
+- `POST /api/desktop/tasks/{id}/fail` `{code}` takes `inference-failed`, `input-invalid`,
+  `model-unavailable` or `cancelled`, and the server logs the code. The desktop sends `cancelled`
+  when it hands a lease back unfinished (Stop, sign-out, library switch, quitting the app, a pause
+  for power or network, waking from sleep), `input-invalid` when the input does not match its hash
+  or the model refuses that one input, `model-unavailable` when its runtime process stopped, and
+  `inference-failed` otherwise. Pause (the person's own) lets the task in hand finish first.
+- On a stop the desktop gives the task in hand up to 3 seconds to send `cancelled`, and a claim
+  already sent up to 2 seconds to answer so a task leased in that moment is handed straight back.
+- Signed requests are sent one at a time, in sequence order.
+
 ## Refusal codes
 
 The server logs every refusal (`warn`, with device, model key and code). The desktop shows a
 specific message for each.
 
-| HTTP | Server `message` | When | Desktop code |
-|---|---|---|---|
-| 403 | `desktop_pool_policy_required` | Account has not turned on Desktop AI processing | `worker_policy_required` |
-| 400 | `desktop_runtime_attestation_invalid` | Runtime not factory-signed, or epoch below the floor | `worker_runtime_unsigned` |
-| 409 | `desktop_model_profile_unavailable` | Task turned off, or model changed, since inventory | `workload_desktop_model_profile_unavailable` |
-| 409 | `desktop_model_profile_changed` | Profile changed between challenge and report | `workload_desktop_model_profile_changed` |
-| 400 | `desktop_qualification_report_invalid` | Report does not match profile or runtime | `worker_qualification_report_refused` |
-| 409 | `desktop_clip_index_incompatible` / `_dimensions` / `_invalid` / `_changed` | Library already has smart-search vectors from another model | `workload_desktop_clip_index_*` |
-| 409 | `desktop_challenge_conflict` / `_capacity` / `_too_large` / `_runtime_invalid` | Challenge bookkeeping | `server_http_409` (retry) |
+**The `message` is the name.** The desktop matches a refusal by `message` alone, on every endpoint;
+the HTTP status only matters for a refusal with no known name. Servers have sent the same refusal
+under different statuses (policy-off was 401 at session issue and 409 on report before it became
+403 everywhere), and both old and new servers are understood.
+
+| HTTP | Server `message` | When | Desktop code | What the desktop does |
+|---|---|---|---|---|
+| 403 | `desktop_pool_policy_required` | Account has not turned on Desktop AI processing (every endpoint, session issue and report included) | `worker_policy_required` | Waits; asks again every 5 minutes and when the network changes |
+| 403 | `desktop_worker_lan_required` | Not on the server's home network | `worker_lan_required` | Same |
+| 409 | `desktop_pool_policy_changed` | The policy the lease or session ran under changed | `worker_policy_changed` | New session, qualify again, carry on |
+| 401 | `desktop_worker_credential_invalid` (worker endpoints) | Worker session ended (household change) or proof refused | `worker_session_rejected` | New session, qualify again, carry on |
+| 401 | `desktop_worker_credential_invalid` (session issue) | The device itself is refused | `worker_device_refused` | Stops and says so |
+| 409 | `desktop_identity_revoked_or_changed` (session issue) | Device revoked | `worker_device_refused` | Stops and says so |
+| 403 | `desktop_worker_photo_session_required` / `desktop_photo_session_required` (session issue) | The photo sign-in ended | `worker_sign_in_required` | Stops; sign in again |
+| 401 | `desktop_lease_invalid` | Lease no longer held, including a lease lost while its input is read | `worker_lease_refused` | Drops that task, reports nothing more about it, claims the next |
+| 401 | `desktop_challenge_invalid` / `desktop_qualification_invalid` / `desktop_worker_activation_invalid` | Challenge or qualification expired, or not this session's | `worker_qualification_restart` | New challenge for that model, after a short wait |
+| 409 | `desktop_challenge_conflict` / `_capacity` / `_too_large` / `_runtime_invalid`, `desktop_qualification_capacity` | Challenge bookkeeping | `worker_challenge_busy` | Same; never stops |
+| 409 | `desktop_model_profile_unavailable` | Task turned off, or model changed, since inventory | `workload_desktop_model_profile_unavailable` | Reads `/models` again and follows it |
+| 409 | `desktop_model_profile_changed` | Profile changed between challenge and report | `workload_desktop_model_profile_changed` | Same |
+| 409 | `desktop_pool_model_unavailable`, `desktop_clip_profile_unavailable`, `desktop_face_profile_unavailable` | The granted model is no longer the task's model | `workload_<message>` | Same |
+| 409 | `desktop_clip_index_incompatible` / `_dimensions` / `_invalid` / `_changed`, `desktop_clip_space_unavailable` | Library already has smart-search vectors from another model | `workload_<message>` | That task stays off, the others work; tried again every 30 minutes |
+| 400 | `desktop_runtime_attestation_invalid` | Runtime not factory-signed, or epoch below the floor | `worker_runtime_unsigned` | GPU runtime: falls back to the processor runtime. Processor runtime: stops and says so |
+| 400 | `desktop_qualification_report_invalid` | Report does not match profile or runtime | `worker_qualification_report_refused` | Same |
+| 200 | `{"accepted": false}` on report | Report not accepted | `worker_qualification_refused` | GPU: falls back to the processor. Processor: that task is off |
+| 200 | `{"accepted": false}` on heartbeat / result | Lease gone | `worker_lease_lost` / `worker_result_refused` | Drops that task, claims the next |
+| 5xx, 408, 429 | any or none | Server failing or busy (500 is treated like 503) | `server_http_<status>` | Retries with backoff; never stops |
+| other 4xx | unknown, on `tasks/{id}/input`, `/result`, `/fail`, `heartbeat` | — | `server_http_<status>` | Drops that task only (a bare 401 or 403 stops the worker) |
+| other 4xx | unknown, elsewhere | — | `server_http_<status>` | GPU runtime while qualifying: falls back to the processor. Otherwise stops and shows it |
+
+A run of dropped tasks or server errors slows the claims down (up to about a minute apart) and
+shows the reason; it does not stop the worker.
 
 These come from the desktop itself, before anything reaches the server:
 
 | Desktop code | Cause |
 |---|---|
 | `runtime_output_mismatch` | Fixture result differs from `expectedOutput` (`native_output_*_mismatch`) |
-| `runtime_out_of_memory` | Runtime ran out of memory (`native_memory_insufficient`, allocation failure) |
+| `runtime_out_of_memory` | Runtime ran out of memory (`native_memory_insufficient`, allocation failure). On a GPU this, like a check that timed out, moves the task to the processor for this run only; it is not remembered for the runtime epoch |
 | `runtime_model_missing` | Model files missing or changed (`native_staged_model_unavailable`, `native_staged_hash_mismatch`) |
 | `runtime_provider_unavailable` | GPU provider could not run; the desktop falls back to the processor |
+| `runtime_crash_loop` | The runtime process ended by itself three times in a row with no task finished in between. Its exit status and last error lines are logged and shown |
+| `clock_invalid` | The computer's clock can't be read, or enrolment was refused for its timestamp |
 | `runtime_signature_invalid` | Bundled runtime fails its signature check |
-| `model_disk_space_insufficient` | Not enough free disk for the model download |
+| `model_disk_space_insufficient` | Not enough free disk for what is still to download (checked before the first request, with 64 MB to spare) |
 | `server_update_required` | Server lacks `workerAutoSetup`, so it can't send its catalogue |
 
 ## Compatibility
 
 | Desktop | Server | Result |
 |---|---|---|
-| old | new | Works. Same endpoints and payloads; the server no longer refuses on routing or its own AI. |
+| old | new | Works. Same endpoints and payloads; the server no longer refuses on routing or its own AI. An old desktop matches some refusals by status and name together, so a status that changed (policy-off at session issue: 401 → 403; on report: 409 → 403) shows it a general message instead of a named one. |
 | new | new | Works, with specific messages. |
 | new | old | **Update your server** (`server_update_required`). The old server can't send its catalogue, and the desktop has none of its own. It checks again every few minutes. |
 | old | old | Unchanged. |
