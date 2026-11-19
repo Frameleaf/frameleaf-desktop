@@ -32,6 +32,51 @@ pub(crate) fn streaming_client_builder() -> ClientBuilder {
         .retry(reqwest::retry::never())
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
 }
+/// Clocks closer than this are treated as equal: the server accepts requests timed within two
+/// minutes of its own clock, and `Date` only counts whole seconds.
+const CLOCK_SKEW_IGNORED_MS: i64 = 30_000;
+/// How far the server's clock is ahead of this computer's (negative: behind), from the `Date`
+/// header of one of its responses and this computer's clock when it arrived. Zero when the
+/// clocks agree, so a computer with a correct clock behaves exactly as before; `None` when the
+/// header is missing or unreadable. A real difference is returned so requests can be timed, and the
+/// server's deadlines read, by the server's clock: a wrong clock here must not stop AI work.
+pub(crate) fn clock_skew_from(date: Option<&str>, local_ms: i64) -> Option<i64> {
+    let server =
+        time::OffsetDateTime::parse(date?, &time::format_description::well_known::Rfc2822).ok()?;
+    let skew = (server.unix_timestamp_nanos() / 1_000_000) as i64 - local_ms;
+    if skew.abs() < CLOCK_SKEW_IGNORED_MS {
+        return Some(0);
+    }
+    // `Date` is cut to the second and was written before the response travelled: without this,
+    // the corrected clock would run up to about two seconds behind the server's.
+    Some(skew + 2_000)
+}
+/// `None` when the response says nothing usable about the server's clock.
+pub(crate) fn clock_skew(response: &Response) -> Option<i64> {
+    let local = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let date = response.headers().get(reqwest::header::DATE);
+    clock_skew_from(date.and_then(|value| value.to_str().ok()), local)
+}
+/// The named reason (`message`) of a refused request. Anything but a small JSON error (a
+/// proxy's page, a cut connection) has no name.
+pub(crate) async fn refused(mut response: Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len() + chunk.len() > 4096 {
+            return (status, String::new());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    (status, message)
+}
 pub async fn json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
     json_limit(response, 65_536).await
 }
@@ -69,7 +114,9 @@ pub async fn capabilities(
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let caps: Capabilities = json(response).await?;
+    let clock_skew_ms = clock_skew(&response).unwrap_or(0);
+    let mut caps: Capabilities = json(response).await?;
+    caps.clock_skew_ms = clock_skew_ms;
     if caps.protocol_version != 1 || caps.server_id.is_empty() || caps.server_id.len() > 128 {
         return Err("desktop_protocol_unsupported".into());
     }
@@ -78,56 +125,88 @@ pub async fn capabilities(
     }
     Ok(Some(caps))
 }
-pub async fn enroll(client: &Client, saved: &SavedConnection) -> Result<Enrollment, String> {
-    enroll_with_identity(client, saved, &credentials::identity()?).await
+/// `clock_skew_ms`: from the capabilities just read (`Capabilities::clock_skew_ms`).
+pub async fn enroll(
+    client: &Client,
+    saved: &SavedConnection,
+    clock_skew_ms: i64,
+) -> Result<Enrollment, String> {
+    enroll_with_identity(client, saved, &credentials::identity()?, clock_skew_ms).await
 }
 
 pub(crate) async fn enroll_with_identity(
     client: &Client,
     saved: &SavedConnection,
     identity: &crate::connection::DeviceIdentity,
+    clock_skew_ms: i64,
 ) -> Result<Enrollment, String> {
-    let dto = identity.enrollment(
+    let dto = identity.enrollment_at(
         &saved.server_id,
         &saved.account_id,
         &saved.device_name,
         &saved.mode,
+        clock_skew_ms,
     )?;
     let base = normalize_server(&saved.server)?;
-    json(
-        client
-            .post(base.join("api/desktop/devices/enroll").unwrap())
-            .bearer_auth(&saved.token)
-            .json(&dto)
-            .send()
-            .await
-            .map_err(|_| "desktop_enrollment_interrupted")?,
-    )
-    .await
+    let response = client
+        .post(base.join("api/desktop/devices/enroll").unwrap())
+        .bearer_auth(&saved.token)
+        .json(&dto)
+        .send()
+        .await
+        .map_err(|_| "desktop_enrollment_interrupted")?;
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        // The server refuses a request timed more than two minutes from its own clock.
+        return Err(if message == "device_proof_expired" {
+            "clock_invalid".into()
+        } else {
+            format!("server_http_{status}")
+        });
+    }
+    json(response).await
 }
 
+/// A refusal keeps its name (`ml_transport::worker_refusal`): the worker waits out "AI processing
+/// is off" and "not on the home network" instead of failing with a bare status.
 pub async fn issue_worker_session(
     client: &Client,
     saved: &SavedConnection,
+    clock_skew_ms: i64,
 ) -> Result<crate::worker::SavedWorker, String> {
-    let identity = credentials::identity()?;
+    issue_worker_session_as(client, saved, &credentials::identity()?, clock_skew_ms).await
+}
+
+pub(crate) async fn issue_worker_session_as(
+    client: &Client,
+    saved: &SavedConnection,
+    identity: &crate::connection::DeviceIdentity,
+    clock_skew_ms: i64,
+) -> Result<crate::worker::SavedWorker, String> {
     let device = saved
         .device_id
         .as_ref()
         .ok_or("desktop_enrollment_required")?;
-    let dto =
-        crate::worker::session_request(&identity, &saved.server_id, &saved.account_id, device)?;
+    let dto = crate::worker::session_request_at(
+        identity,
+        &saved.server_id,
+        &saved.account_id,
+        device,
+        clock_skew_ms,
+    )?;
     let base = normalize_server(&saved.server)?;
-    let response: crate::worker::SessionResponse = json(
-        client
-            .post(base.join("api/desktop/devices/session").unwrap())
-            .bearer_auth(&saved.token)
-            .json(&dto)
-            .send()
-            .await
-            .map_err(|_| "worker_session_setup_interrupted")?,
-    )
-    .await?;
+    let response = client
+        .post(base.join("api/desktop/devices/session").unwrap())
+        .bearer_auth(&saved.token)
+        .json(&dto)
+        .send()
+        .await
+        .map_err(|_| "worker_session_setup_interrupted")?;
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        return Err(crate::ml_transport::session_refusal(status, &message));
+    }
+    let response: crate::worker::SessionResponse = json(response).await?;
     crate::worker::bind_session(saved, &response)
 }
 

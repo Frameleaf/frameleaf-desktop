@@ -58,7 +58,7 @@ fn actual_native_folder_copy() {
             .unwrap()
             .server_id;
         saved.device_id = Some(
-            transport::enroll_with_identity(&client, &saved, &identity)
+            transport::enroll_with_identity(&client, &saved, &identity, 0)
                 .await
                 .unwrap()
                 .id,

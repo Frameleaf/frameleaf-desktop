@@ -217,7 +217,7 @@ async fn prepare_view(
             if !caps.features.enrollment {
                 return ConnectionView::new(saved, "unsupported-server".into(), caps.features);
             }
-            match transport::enroll(client, saved).await {
+            match transport::enroll(client, saved, caps.clock_skew_ms).await {
                 Ok(enrollment) => {
                     saved.device_id = Some(enrollment.id);
                     if credentials::save("connection", saved).is_err() {
@@ -246,11 +246,16 @@ async fn prepare_view(
                                 caps.features,
                             );
                         }
-                        let issued = transport::issue_worker_session(client, saved).await;
-                        if issued
-                            .and_then(|worker| credentials::save("worker-session", &worker))
-                            .is_err()
-                        {
+                        // A refusal here is not the end: the worker asks again itself, names
+                        // the reason on the AI processing page, and waits out the ones that
+                        // pass (AI processing off for the account, away from the home network,
+                        // a busy server). Only a session that can't be saved stops it here.
+                        let issued =
+                            transport::issue_worker_session(client, saved, caps.clock_skew_ms)
+                                .await;
+                        if issued.is_ok_and(|worker| {
+                            credentials::save("worker-session", &worker).is_err()
+                        }) {
                             return ConnectionView::new(
                                 saved,
                                 "worker-setup-failed".into(),
@@ -260,7 +265,12 @@ async fn prepare_view(
                     }
                     ConnectionView::new(saved, enrollment.state, caps.features)
                 }
-                Err(_) => ConnectionView::new(saved, "enrollment-failed".into(), caps.features),
+                Err(code) => {
+                    let mut view =
+                        ConnectionView::new(saved, "enrollment-failed".into(), caps.features);
+                    view.code = Some(code);
+                    view
+                }
             }
         }
         Ok(None) => ConnectionView::new(saved, "unsupported-server".into(), unavailable),
@@ -1158,6 +1168,14 @@ pub fn run() {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
+            }
+            // The app is going: hand a held AI lease back to the server (`fail`, `cancelled`) so
+            // another computer gets the task now instead of when the lease runs out.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let setup = app.state::<worker_setup::WorkerSetup>();
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(worker_setup::QUIT_GRACE, setup.stop()).await
+                });
             }
             // Windows ends a session by exiting this app without asking first.
             #[cfg(windows)]

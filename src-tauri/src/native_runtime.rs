@@ -388,8 +388,54 @@ pub struct NativeSidecar {
     lease: Option<std::sync::Arc<File>>,
     /// Released before the scratch is removed.
     owner: Option<File>,
+    /// The last lines the process wrote to its error stream.
+    stderr: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+const STDERR_LINES: usize = 12;
+const STDERR_LINE_LENGTH: usize = 240;
+/// Keep the tail of a process's error stream, so a crash can say why. The thread ends when the
+/// process closes the stream, which it does by exiting.
+fn keep_stderr_tail(
+    stream: impl std::io::Read + Send + 'static,
+) -> std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> {
+    use std::io::BufRead;
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let kept = tail.clone();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stream).split(b'\n').flatten() {
+            let text = String::from_utf8_lossy(&line);
+            let text: String = text
+                .trim_end()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(STDERR_LINE_LENGTH)
+                .collect();
+            if text.is_empty() {
+                continue;
+            }
+            let mut kept = kept.lock().unwrap();
+            if kept.len() == STDERR_LINES {
+                kept.pop_front();
+            }
+            kept.push_back(text);
+        }
+    });
+    tail
 }
 impl NativeSidecar {
+    /// Why the process ended by itself: its exit status and the last lines of its error stream.
+    /// `None` while it runs, and when this app stopped it.
+    pub(crate) fn exit_report(&mut self) -> Option<String> {
+        let _ = self.is_running();
+        let status = self.exit_status?;
+        let lines = self.stderr.lock().unwrap();
+        let tail: Vec<&str> = lines.iter().map(String::as_str).collect();
+        Some(if tail.is_empty() {
+            status.to_string()
+        } else {
+            format!("{status}: {}", tail.join(" | "))
+        })
+    }
     pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
         self.lease = Some(lease);
     }
@@ -417,6 +463,10 @@ impl NativeSidecar {
     }
     pub fn stop(&mut self) -> Result<(), String> {
         if !self.stopped {
+            // A process that had already ended by itself keeps its own exit status.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit_status = Some(status);
+            }
             self.tree.terminate();
             let _ = self.child.kill();
             self.child
@@ -575,7 +625,7 @@ impl VerifiedRuntime {
             .env("MACHINE_LEARNING_REQUEST_THREADS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         match invocation {
             Invocation::Serve { port, qualified } => {
                 if qualified.len() > 1 {
@@ -634,6 +684,11 @@ impl VerifiedRuntime {
             }
         };
         let mut child = child;
+        let stderr = child
+            .stderr
+            .take()
+            .map(keep_stderr_tail)
+            .unwrap_or_default();
         let tree = match crate::process_tree::ProcessTree::attach(&child) {
             Ok(value) => value,
             Err(error) => {
@@ -652,6 +707,7 @@ impl VerifiedRuntime {
             exit_status: None,
             lease: None,
             owner: Some(owner),
+            stderr,
         };
         owner
             .child
@@ -1769,7 +1825,6 @@ mod accepted_qualification_tests {
             ("qualifiedAt", json!("2026-10-15T20:05:00Z")),
             ("expiresAt", json!("2026-10-15T21:00:01Z")),
             ("expiresAt", json!("2026-10-15T19:00:00Z")),
-            ("extra", json!(true)),
         ] {
             let mut changed = response.clone();
             changed[field] = value;
@@ -1785,5 +1840,11 @@ mod accepted_qualification_tests {
                 "{field}"
             );
         }
+        // A field a newer server adds is not evidence of anything: every known field is still
+        // checked and the reply is accepted.
+        let mut newer = response.clone();
+        newer["somethingNew"] = json!(true);
+        let raw = serde_json::to_vec(&newer).unwrap();
+        assert!(AcceptedQualification::bind(&worker, &profile, &qualified, &raw, AT).is_ok());
     }
 }

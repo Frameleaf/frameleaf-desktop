@@ -1,12 +1,16 @@
 use crate::{
     connection::{normalize_server, DeviceIdentity, SavedConnection},
     credentials, transport,
-    worker::{bind_renewal, reserve_proof, SavedWorker, SessionResponse},
+    worker::{bind_renewal, reserve_proof_at, SavedWorker, SessionResponse},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{Client, Method, Response};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::Mutex;
@@ -19,8 +23,10 @@ use crate::{
     runtime_store::{InstalledRuntime, RuntimeAttestation, Staging},
 };
 
+// Every field is compared with what this computer derives itself; a field a newer server adds
+// is not one of them and is ignored.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ChallengeResponse {
     id: String,
     model_key: String,
@@ -163,7 +169,7 @@ impl QualificationChallenge {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct AcceptedResponse {
     id: String,
     device_id: String,
@@ -520,10 +526,18 @@ struct Connection {
     identity: DeviceIdentity,
     /// Durable sequence and token checkpoints; tests keep them out of the OS credential store.
     checkpoint: fn(&SavedWorker, &SavedWorker) -> Result<(), String>,
+    /// How far the server's clock is ahead of this computer's, in milliseconds
+    /// (`transport::clock_skew`), kept current from every response.
+    clock_skew: Arc<AtomicI64>,
 }
 impl Connection {
+    /// The server's time now. Every deadline it sends is read against this, and every request is
+    /// timed by it, so a wrong clock on this computer does not stop the worker.
+    fn now(&self) -> Result<i64, String> {
+        Ok(now()? + self.clock_skew.load(Ordering::Acquire))
+    }
     async fn ensure_current(&mut self) -> Result<(), String> {
-        if renewal_due(&self.worker, now()?)? {
+        if renewal_due(&self.worker, self.now()?)? {
             self.renew().await?;
         }
         Ok(())
@@ -533,7 +547,7 @@ impl Connection {
             .request(Method::POST, "api/desktop/worker/session", "renew", "{}")
             .await?;
         let session: SessionResponse = worker_json(response, 65_536).await?;
-        let worker = renewed_worker(&self.worker, &session, now()?)?;
+        let worker = renewed_worker(&self.worker, &session, self.now()?)?;
         (self.checkpoint)(&self.worker, &worker)?;
         self.worker = worker;
         Ok(())
@@ -547,11 +561,12 @@ impl Connection {
     ) -> Result<Response, String> {
         let expected = self.worker.clone();
         let checkpoint = self.checkpoint;
-        let proof = reserve_proof(
+        let proof = reserve_proof_at(
             &mut self.worker,
             &self.identity,
             operation,
             payload,
+            self.clock_skew.load(Ordering::Acquire),
             |value| checkpoint(&expected, value),
         )?;
         let header =
@@ -567,19 +582,24 @@ impl Connection {
         if method == Method::POST {
             request = request.json(&serde_json::json!({"payload":payload}));
         }
-        request
+        let response = request
             .send()
             .await
-            .map_err(|_| "worker_request_interrupted".into())
+            .map_err(|_| "worker_request_interrupted")?;
+        if let Some(skew) = transport::clock_skew(&response) {
+            self.clock_skew.store(skew, Ordering::Release);
+        }
+        Ok(response)
     }
 }
 
-pub struct WorkerTransport(Mutex<Connection>);
+/// One signed request at a time, in sequence order: the lock is held from the moment a sequence
+/// number is reserved until that request's response has arrived, so a heartbeat and a result can
+/// never reach the server out of order (it refuses the lower sequence).
+pub struct WorkerTransport(Mutex<Connection>, Arc<AtomicI64>);
 
-fn qualification_refusal(status: u16, message: &str) -> Option<String> {
-    if status != 409 {
-        return None;
-    }
+/// A refusal of one task's model, by name. The others carry on.
+fn qualification_refusal(message: &str) -> Option<String> {
     match message {
         // Only servers from before desktop auto-setup refuse a task over their own AI or its
         // routing: the fix is a server update, never a setting on this computer.
@@ -609,7 +629,7 @@ fn qualification_refusal(status: u16, message: &str) -> Option<String> {
 #[test]
 fn scopes_only_explicit_model_refusals_to_one_workload() {
     assert_eq!(
-        qualification_refusal(409, "desktop_model_profile_unavailable").as_deref(),
+        qualification_refusal("desktop_model_profile_unavailable").as_deref(),
         Some("workload_desktop_model_profile_unavailable")
     );
     // An older server's refusals over its own AI or routing ask for a server update.
@@ -619,66 +639,177 @@ fn scopes_only_explicit_model_refusals_to_one_workload() {
         "desktop_pool_route_changed",
     ] {
         assert_eq!(
-            qualification_refusal(409, message).as_deref(),
+            qualification_refusal(message).as_deref(),
             Some("workload_server_update_required")
         );
     }
-    for (status, message) in [
-        (401, "desktop_nas_face_producer_unavailable"),
-        (403, "desktop_pool_policy_required"),
-        (409, "desktop_pool_policy_changed"),
-        (409, "desktop_worker_activation_invalid"),
-        (409, "desktop_runtime_attestation_invalid"),
-        (500, "desktop_nas_face_producer_unavailable"),
+    for message in [
+        "desktop_pool_policy_required",
+        "desktop_pool_policy_changed",
+        "desktop_worker_activation_invalid",
+        "desktop_runtime_attestation_invalid",
+        "Internal server error",
+        "",
     ] {
-        assert!(qualification_refusal(status, message).is_none());
+        assert!(qualification_refusal(message).is_none());
     }
 }
-/// Refusals the worker loop acts on by name. A 401 here is about the worker session or one lease,
-/// never the device: only issuing a new session can show that the device itself is refused.
-fn worker_refusal(status: u16, message: &str) -> String {
-    match (status, message) {
-        (401, "desktop_worker_credential_invalid") => "worker_session_rejected".into(),
-        (401, "desktop_lease_invalid") => "worker_lease_refused".into(),
-        (403, "desktop_pool_policy_required") => "worker_policy_required".into(),
-        (403, "desktop_worker_lan_required") => "worker_lan_required".into(),
-        (409, "desktop_pool_policy_changed") => "worker_policy_changed".into(),
-        (400, "desktop_runtime_attestation_invalid") => "worker_runtime_unsigned".into(),
-        (400, "desktop_qualification_report_invalid") => {
-            "worker_qualification_report_refused".into()
+/// Refusals the worker acts on, by the server's `message`. The HTTP status is not part of the
+/// name: servers have sent the same refusal under different statuses (policy-off as 401, 403 and
+/// 409), and the name is what both sides agree on (docs/desktop-worker-setup-protocol.md).
+/// A refusal without a known name stays `server_http_<status>`.
+///
+/// `desktop_worker_credential_invalid` here is about the worker session, never the device: only
+/// issuing a new session (`session_refusal`) can show that the device itself is refused.
+pub(crate) fn worker_refusal(status: u16, message: &str) -> String {
+    let code = match message {
+        "desktop_worker_credential_invalid" => "worker_session_rejected",
+        "desktop_lease_invalid" => "worker_lease_refused",
+        "desktop_pool_policy_required" => "worker_policy_required",
+        "desktop_worker_lan_required" => "worker_lan_required",
+        "desktop_pool_policy_changed" => "worker_policy_changed",
+        "desktop_runtime_attestation_invalid" => "worker_runtime_unsigned",
+        "desktop_qualification_report_invalid" => "worker_qualification_report_refused",
+        // The challenge or qualification is no longer the server's (it expired, or was issued
+        // to a session since replaced): ask for a new challenge for that model.
+        "desktop_challenge_invalid"
+        | "desktop_qualification_invalid"
+        | "desktop_worker_activation_invalid" => "worker_qualification_restart",
+        // Challenge bookkeeping the server clears by itself: ask again shortly.
+        "desktop_challenge_conflict"
+        | "desktop_challenge_capacity"
+        | "desktop_challenge_too_large"
+        | "desktop_challenge_runtime_invalid"
+        | "desktop_qualification_capacity" => "worker_challenge_busy",
+        _ => return format!("server_http_{status}"),
+    };
+    code.into()
+}
+/// A refusal to issue a worker session (`POST /api/desktop/devices/session`). The policy and
+/// home-network refusals keep the names the worker waits out; a refused credential here is the
+/// device or its sign-in, which a new session cannot cure.
+pub(crate) fn session_refusal(status: u16, message: &str) -> String {
+    match message {
+        "desktop_worker_credential_invalid" | "desktop_identity_revoked_or_changed" => {
+            "worker_device_refused".into()
         }
-        _ => format!("server_http_{status}"),
+        "desktop_worker_photo_session_required" | "desktop_photo_session_required" => {
+            "worker_sign_in_required".into()
+        }
+        _ => worker_refusal(status, message),
     }
 }
 #[test]
-fn names_runtime_and_report_refusals() {
-    assert_eq!(
-        worker_refusal(400, "desktop_runtime_attestation_invalid"),
-        "worker_runtime_unsigned"
-    );
-    assert_eq!(
-        worker_refusal(400, "desktop_qualification_report_invalid"),
-        "worker_qualification_report_refused"
-    );
-    assert_eq!(worker_refusal(400, "other"), "server_http_400");
-}
-/// The status and named reason of a refused request. Anything but a small JSON error (a proxy's
-/// page, a cut connection) has no name and stays an opaque `server_http_*`.
-async fn refused(mut response: Response) -> (u16, String) {
-    let status = response.status().as_u16();
-    let mut bytes = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
-        if bytes.len() + chunk.len() > 4096 {
-            return (status, String::new());
-        }
-        bytes.extend_from_slice(&chunk);
+fn refusals_are_named_by_message_whatever_the_status() {
+    for (status, message, expected) in [
+        (
+            400,
+            "desktop_runtime_attestation_invalid",
+            "worker_runtime_unsigned",
+        ),
+        (
+            400,
+            "desktop_qualification_report_invalid",
+            "worker_qualification_report_refused",
+        ),
+        // Policy-off has been a 401, a 403 and a 409 on different endpoints and servers.
+        (
+            401,
+            "desktop_pool_policy_required",
+            "worker_policy_required",
+        ),
+        (
+            403,
+            "desktop_pool_policy_required",
+            "worker_policy_required",
+        ),
+        (
+            409,
+            "desktop_pool_policy_required",
+            "worker_policy_required",
+        ),
+        (
+            401,
+            "desktop_challenge_invalid",
+            "worker_qualification_restart",
+        ),
+        (
+            401,
+            "desktop_qualification_invalid",
+            "worker_qualification_restart",
+        ),
+        (
+            401,
+            "desktop_worker_activation_invalid",
+            "worker_qualification_restart",
+        ),
+        (409, "desktop_challenge_conflict", "worker_challenge_busy"),
+        (409, "desktop_challenge_capacity", "worker_challenge_busy"),
+        (409, "desktop_challenge_too_large", "worker_challenge_busy"),
+        (
+            409,
+            "desktop_challenge_runtime_invalid",
+            "worker_challenge_busy",
+        ),
+        (
+            409,
+            "desktop_qualification_capacity",
+            "worker_challenge_busy",
+        ),
+        (
+            500,
+            "desktop_qualification_capacity",
+            "worker_challenge_busy",
+        ),
+        (401, "desktop_lease_invalid", "worker_lease_refused"),
+        (400, "other", "server_http_400"),
+        (500, "Internal server error", "server_http_500"),
+    ] {
+        assert_eq!(
+            worker_refusal(status, message),
+            expected,
+            "{status} {message}"
+        );
     }
-    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| value["message"].as_str().map(str::to_owned))
-        .unwrap_or_default();
-    (status, message)
+    // Issuing a session: policy and network keep their names, a refused device is not a
+    // session to reissue, and an ended sign-in is named.
+    for (status, message, expected) in [
+        (
+            401,
+            "desktop_pool_policy_required",
+            "worker_policy_required",
+        ),
+        (
+            403,
+            "desktop_pool_policy_required",
+            "worker_policy_required",
+        ),
+        (403, "desktop_worker_lan_required", "worker_lan_required"),
+        (
+            401,
+            "desktop_worker_credential_invalid",
+            "worker_device_refused",
+        ),
+        (
+            409,
+            "desktop_identity_revoked_or_changed",
+            "worker_device_refused",
+        ),
+        (
+            403,
+            "desktop_worker_photo_session_required",
+            "worker_sign_in_required",
+        ),
+        (503, "", "server_http_503"),
+    ] {
+        assert_eq!(
+            session_refusal(status, message),
+            expected,
+            "{status} {message}"
+        );
+    }
 }
+use transport::refused;
 async fn worker_json<T: serde::de::DeserializeOwned>(
     response: Response,
     limit: usize,
@@ -695,8 +826,9 @@ async fn qualification_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, String> {
     if !response.status().is_success() {
         let (status, message) = refused(response).await;
-        return Err(qualification_refusal(status, &message)
-            .unwrap_or_else(|| worker_refusal(status, &message)));
+        return Err(
+            qualification_refusal(&message).unwrap_or_else(|| worker_refusal(status, &message))
+        );
     }
     transport::json_limit(response, limit).await
 }
@@ -758,6 +890,21 @@ impl WorkerTransport {
     pub(crate) async fn maintain_session(&self) -> Result<(), String> {
         self.0.lock().await.ensure_current().await
     }
+    /// The server's time now, in milliseconds: this computer's clock corrected by what the
+    /// server's own responses say (`transport::clock_skew`).
+    pub(crate) fn now(&self) -> Result<i64, String> {
+        Ok(now()? + self.1.load(Ordering::Acquire))
+    }
+    /// Start from the clock difference a response just showed (`Capabilities::clock_skew_ms`),
+    /// so the first signed request is already timed by the server's clock.
+    pub(crate) fn with_clock_skew(self, clock_skew_ms: i64) -> Self {
+        self.1.store(clock_skew_ms, Ordering::Release);
+        self
+    }
+    fn over(connection: Connection) -> Self {
+        let clock_skew = connection.clock_skew.clone();
+        Self(Mutex::new(connection), clock_skew)
+    }
     pub fn load(saved: &SavedConnection) -> Result<Self, String> {
         let worker: SavedWorker =
             credentials::load("worker-session")?.ok_or("worker_session_required")?;
@@ -769,13 +916,14 @@ impl WorkerTransport {
             return Err("worker_association_changed".into());
         }
         let identity = credentials::load("installation")?.ok_or("installation_identity_missing")?;
-        Ok(Self(Mutex::new(Connection {
+        Ok(Self::over(Connection {
             client: transport::client()?,
             base: normalize_server(&saved.server)?,
             worker,
             identity,
             checkpoint: credentials::save_worker_checkpoint,
-        })))
+            clock_skew: Arc::default(),
+        }))
     }
     pub async fn request_qualification(
         &self,
@@ -804,7 +952,13 @@ impl WorkerTransport {
             .await?;
         let value: serde_json::Value = qualification_json(response, 4 * 1024 * 1024).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
-        QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)
+        QualificationChallenge::bind(
+            &connection.worker,
+            profile,
+            attestation,
+            &raw,
+            connection.now()?,
+        )
     }
     pub async fn read_qualification(
         &self,
@@ -824,8 +978,13 @@ impl WorkerTransport {
             .await?;
         let value: serde_json::Value = worker_json(response, 4 * 1024 * 1024).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
-        let challenge =
-            QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)?;
+        let challenge = QualificationChallenge::bind(
+            &connection.worker,
+            profile,
+            attestation,
+            &raw,
+            connection.now()?,
+        )?;
         if challenge.id() != id {
             return Err("worker_challenge_invalid".into());
         }
@@ -837,7 +996,7 @@ impl WorkerTransport {
         qualified: &QualifiedRuntime,
     ) -> Result<bool, String> {
         let mut connection = self.0.lock().await;
-        challenge.validate_submission(&connection.worker, qualified, now()?)?;
+        challenge.validate_submission(&connection.worker, qualified, connection.now()?)?;
         let payload = serde_json::json!({"report":qualified.report()}).to_string();
         if payload.len() > 4 * 1024 * 1024 {
             return Err("worker_payload_invalid".into());
@@ -871,8 +1030,13 @@ impl WorkerTransport {
             .await?;
         let value: serde_json::Value = qualification_json(response, 65_536).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_qualification_invalid")?;
-        let accepted =
-            AcceptedQualification::bind(&connection.worker, profile, qualified, &raw, now()?)?;
+        let accepted = AcceptedQualification::bind(
+            &connection.worker,
+            profile,
+            qualified,
+            &raw,
+            connection.now()?,
+        )?;
         if accepted.id() != id {
             return Err("worker_qualification_invalid".into());
         }
@@ -893,10 +1057,10 @@ impl WorkerTransport {
         qualifications: &[&AcceptedQualification],
     ) -> Result<Option<(usize, ClaimedTask)>, String> {
         let mut connection = self.0.lock().await;
-        let at = now()?;
+        let at = connection.now()?;
         let keys = claim_models(qualifications, &connection.worker, at)?;
         connection.ensure_current().await?;
-        claim_models(qualifications, &connection.worker, now()?)?;
+        claim_models(qualifications, &connection.worker, connection.now()?)?;
         let payload = serde_json::json!({"modelKeys":keys,"waitMs":20000}).to_string();
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
@@ -906,7 +1070,7 @@ impl WorkerTransport {
             .task
             .map(|task| {
                 Ok((
-                    bind_claim(qualifications, &task, &connection.worker, now()?)?,
+                    bind_claim(qualifications, &task, &connection.worker, connection.now()?)?,
                     task,
                 ))
             })
@@ -918,11 +1082,11 @@ impl WorkerTransport {
         qualification: &AcceptedQualification,
     ) -> Result<Vec<u8>, String> {
         let mut connection = self.0.lock().await;
-        qualification.validate_task(&connection.worker, task, now()?)?;
+        qualification.validate_task(&connection.worker, task, connection.now()?)?;
         task.validate_at(
             &connection.worker,
             std::slice::from_ref(&task.model_key),
-            now()?,
+            connection.now()?,
         )?;
         let mut response = connection
             .request(
@@ -968,11 +1132,11 @@ impl WorkerTransport {
             return Err("worker_result_too_large".into());
         }
         let mut connection = self.0.lock().await;
-        qualification.validate_task(&connection.worker, task, now()?)?;
+        qualification.validate_task(&connection.worker, task, connection.now()?)?;
         task.validate_result_at(
             &connection.worker,
             std::slice::from_ref(&task.model_key),
-            now()?,
+            connection.now()?,
         )?;
         let response = connection
             .request(Method::POST, path, operation, &payload)
@@ -996,7 +1160,7 @@ impl WorkerTransport {
         if ack.accepted {
             task.renew_lease(
                 ack.expires_at.as_deref().ok_or("worker_lease_invalid")?,
-                now()?,
+                self.now()?,
             )?;
         }
         Ok(ack.accepted)
@@ -1011,7 +1175,7 @@ impl WorkerTransport {
             return Err("worker_result_invalid".into());
         }
         // A result is only for a lease still held: the last expiry the server granted must be ahead.
-        if millis(&task.expires_at)? <= now()? {
+        if millis(&task.expires_at)? <= self.now()? {
             return Err("worker_lease_expired".into());
         }
         self.acknowledge(

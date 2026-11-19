@@ -16,7 +16,9 @@ const INPUT: &[u8] = b"fixture input";
 const MODEL: &str = "fixture-model";
 
 fn stamp(seconds: i64) -> String {
-    let d = OffsetDateTime::now_utc() + time::Duration::seconds(seconds);
+    stamp_at(OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
+}
+fn stamp_at(d: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         d.year(),
@@ -50,6 +52,12 @@ struct State {
     /// device → every result or failure report that passed authentication
     reports: HashMap<String, Vec<&'static str>>,
     completed: HashMap<String, u32>,
+    /// Seconds the server's clock is ahead of this computer's.
+    clock_offset: i64,
+    /// Every `fail` code reported, in order.
+    failures: Vec<String>,
+    /// Every authenticated request's path, in the order the server handled it.
+    handled: Vec<String>,
 }
 
 fn refuse(status: u16, message: &str) -> (u16, Vec<u8>) {
@@ -61,6 +69,18 @@ fn reply(value: Value) -> (u16, Vec<u8>) {
 }
 
 impl State {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::now_utc() + time::Duration::seconds(self.clock_offset)
+    }
+    /// A time on the server's own clock, as it stamps every deadline.
+    fn stamp(&self, seconds: i64) -> String {
+        stamp_at(self.now() + time::Duration::seconds(seconds))
+    }
+    /// As the server: a request timed more than two minutes from its clock is refused.
+    fn timely(&self, timestamp: Option<u64>) -> bool {
+        let now = (self.now().unix_timestamp_nanos() / 1_000_000) as i64;
+        timestamp.is_some_and(|at| (now - at as i64).abs() <= 120_000)
+    }
     fn respond(
         &mut self,
         method: &str,
@@ -70,13 +90,27 @@ impl State {
         body: &[u8],
     ) -> (u16, Vec<u8>) {
         let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if (method, path) == ("GET", "/api/desktop/capabilities") {
+            return reply(
+                json!({"protocolVersion":1,"serverId":"fixture-server","features":{
+                "enrollment":true,"worker":true,"workerSession":true,"workerAutoSetup":true,
+                "sources":false,"nativeHost":false}}),
+            );
+        }
         if (method, path) == ("POST", "/api/desktop/devices/session") {
             let device = body["deviceId"].as_str().unwrap_or_default().to_owned();
+            if let Some((_, status, body)) = self.forced.get_mut(&device).and_then(|queue| {
+                let index = queue.iter().position(|(part, _, _)| path.contains(part))?;
+                queue.remove(index)
+            }) {
+                return (status, body.into_bytes());
+            }
             let Some(epoch) = self
                 .epochs
                 .get(&device)
                 .copied()
                 .filter(|_| !self.revoked.contains(&device))
+                .filter(|_| self.timely(body["timestamp"].as_u64()))
             else {
                 return refuse(401, "desktop_worker_credential_invalid");
             };
@@ -85,10 +119,10 @@ impl State {
                 token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
                 sequence: 0,
                 qualification: Uuid::new_v4().to_string(),
-                qualification_expires: stamp(600),
+                qualification_expires: self.stamp(600),
             };
             let response = json!({"sessionId":session.id,"workerToken":session.token,
-                "authorizationEpoch":epoch,"expiresAt":stamp(3600),
+                "authorizationEpoch":epoch,"expiresAt":self.stamp(3600),
                 "scopes":["library-inference"],"modelKeys":[]});
             // As on the server: a new session ends everything the device held under the old one.
             self.leases.retain(|_, (owner, _)| owner != &device);
@@ -103,7 +137,8 @@ impl State {
         let proof: Option<crate::worker::WorkerProof> = proof
             .and_then(|header| STANDARD.decode(header).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let Some((device, session)) = proof.and_then(|proof| {
+        let timely = self.timely(proof.as_ref().map(|proof| proof.timestamp));
+        let Some((device, session)) = proof.filter(|_| timely).and_then(|proof| {
             self.sessions.iter_mut().find_map(|(device, session)| {
                 (session.id == proof.session_id
                     && session.token == token
@@ -116,6 +151,7 @@ impl State {
         }) else {
             return refuse(401, "desktop_worker_credential_invalid");
         };
+        self.handled.push(path.to_owned());
         if let Some(queue) = self.forced.get_mut(&device) {
             if let Some(index) = queue.iter().position(|(part, _, _)| path.contains(part)) {
                 let (_, status, body) = queue.remove(index).unwrap();
@@ -153,12 +189,12 @@ impl State {
                     "qualificationExpiresAt":live.qualification_expires,
                     "modelKey":MODEL,"configJson":"{}","configSha256":hash(b"{}"),
                     "inputSha256":hash(INPUT),"inputKind":"image","maxInputBytes":1024,
-                    "expiresAt":stamp(60),"executionDeadline":stamp(120)}}))
+                    "expiresAt":self.stamp(60),"executionDeadline":self.stamp(120)}}))
             }
             ("POST", "/api/desktop/worker/heartbeat", _) => {
                 let id = payload["id"].as_str().unwrap_or_default();
                 if held(&self.leases, id) == Some(self.revision) {
-                    reply(json!({"accepted":true,"expiresAt":stamp(60)}))
+                    reply(json!({"accepted":true,"expiresAt":self.stamp(60)}))
                 } else {
                     reply(json!({"accepted":false,"expiresAt":null}))
                 }
@@ -173,6 +209,10 @@ impl State {
             ("POST", _, Some((id, kind @ ("result" | "fail")))) => {
                 let kind = if kind == "result" { "result" } else { "fail" };
                 self.reports.entry(device.clone()).or_default().push(kind);
+                if kind == "fail" {
+                    let code = payload["code"].as_str().unwrap_or_default();
+                    self.failures.push(code.to_owned());
+                }
                 match held(&self.leases, id) {
                     None => reply(json!({"accepted":false})),
                     Some(revision) if revision != self.revision => {
@@ -220,15 +260,24 @@ fn serve(mut stream: TcpStream, state: &StdMutex<State>) -> Option<()> {
                 .then(|| value.trim().to_owned())
         })
     };
-    let (status, body) = state.lock().unwrap().respond(
-        method,
-        path,
-        header("authorization"),
-        header("x-frameleaf-desktop-proof"),
-        &bytes[end + 4..],
-    );
+    let (status, body, date) = {
+        let mut state = state.lock().unwrap();
+        let (status, body) = state.respond(
+            method,
+            path,
+            header("authorization"),
+            header("x-frameleaf-desktop-proof"),
+            &bytes[end + 4..],
+        );
+        let date = state
+            .now()
+            .format(&time::format_description::well_known::Rfc2822)
+            .unwrap();
+        (status, body, date)
+    };
+    // As every real server: the response says what time the server thinks it is.
     let head = format!(
-        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Fixture\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).ok()?;
@@ -280,30 +329,24 @@ impl FakeServer {
     /// Issue a worker session the way `transport::issue_worker_session` does, with this device's key.
     pub(crate) async fn session(&self, device: &Device) -> Result<WorkerTransport, String> {
         let saved = &device.saved;
-        let request = crate::worker::session_request(
-            &device.identity,
-            &saved.server_id,
-            &saved.account_id,
-            &device.id,
-        )?;
         let client = transport::client()?;
-        let response: SessionResponse = transport::json(
-            client
-                .post(format!("{}api/desktop/devices/session", self.url))
-                .json(&request)
-                .send()
-                .await
-                .map_err(|_| "worker_session_setup_interrupted")?,
-        )
-        .await?;
-        Ok(WorkerTransport(Mutex::new(Connection {
+        // As `worker_setup::refresh_session`: the capabilities reply shows the server's clock.
+        let skew = transport::capabilities(&client, saved)
+            .await?
+            .ok_or("desktop_protocol_unsupported")?
+            .clock_skew_ms;
+        let worker =
+            transport::issue_worker_session_as(&client, saved, &device.identity, skew).await?;
+        Ok(WorkerTransport::over(Connection {
             client,
             base: normalize_server(&saved.server)?,
-            worker: crate::worker::bind_session(saved, &response)?,
+            worker,
             identity: serde_json::from_value(serde_json::to_value(&device.identity).unwrap())
                 .unwrap(),
             checkpoint: |_, _| Ok(()),
-        })))
+            clock_skew: Arc::default(),
+        })
+        .with_clock_skew(skew))
     }
     /// The qualification the server holds for this worker's session, as `prepare` would obtain it.
     pub(crate) async fn qualification(&self, worker: &WorkerTransport) -> AcceptedQualification {
@@ -314,7 +357,7 @@ impl FakeServer {
             .sessions
             .get(&connection.worker.device_id)
             .filter(|session| session.id == connection.worker.session_id)
-            .map_or((Uuid::new_v4().to_string(), stamp(600)), |session| {
+            .map_or((Uuid::new_v4().to_string(), state.stamp(600)), |session| {
                 (
                     session.qualification.clone(),
                     session.qualification_expires.clone(),
@@ -366,6 +409,20 @@ impl FakeServer {
             .or_default()
             .push_back((path.into(), status, body.to_string()));
     }
+    /// Put the server's clock this many seconds ahead of this computer's (negative: behind).
+    pub(crate) fn set_clock_offset(&self, seconds: i64) {
+        self.state.lock().unwrap().clock_offset = seconds;
+    }
+    /// Every `fail` code the server was sent, in order.
+    pub(crate) fn failures(&self) -> Vec<String> {
+        self.state.lock().unwrap().failures.clone()
+    }
+    /// The last path component of every authenticated request, in the order handled.
+    pub(crate) fn handled(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let last = |path: &String| path.rsplit('/').next().unwrap_or_default().to_owned();
+        state.handled.iter().map(last).collect()
+    }
     pub(crate) fn completed(&self, device: &Device) -> u32 {
         let state = self.state.lock().unwrap();
         state.completed.get(&device.id).copied().unwrap_or(0)
@@ -397,11 +454,10 @@ fn only_named_refusals_are_translated_for_the_worker_loop() {
         ),
         (403, "desktop_worker_lan_required", "worker_lan_required"),
         (409, "desktop_pool_policy_changed", "worker_policy_changed"),
-        // The same words under another status, or anything unnamed, stay opaque.
-        (403, "desktop_worker_credential_invalid", "server_http_403"),
+        // Anything unnamed stays opaque.
         (401, "", "server_http_401"),
         (409, "desktop_pool_route_changed", "server_http_409"),
-        (500, "desktop_pool_policy_changed", "server_http_500"),
+        (500, "Internal server error", "server_http_500"),
     ] {
         assert_eq!(worker_refusal(status, message), expected);
     }
@@ -438,9 +494,10 @@ async fn a_revoked_device_cannot_obtain_a_new_session() {
         worker.claim_many(&[&qualification]).await.err().as_deref(),
         Some("worker_session_rejected")
     );
+    // Named, and not the session refusal the worker answers by asking for another session.
     assert_eq!(
         server.session(&device).await.err().as_deref(),
-        Some("server_http_401")
+        Some("worker_device_refused")
     );
 }
 
@@ -528,4 +585,102 @@ async fn a_result_is_not_sent_once_the_last_granted_lease_has_run_out() {
     let result = worker.complete(&task, &json!({}), &qualification).await;
     assert_eq!(result, Ok(true));
     assert_eq!(server.reports(&device), ["result"]);
+}
+
+#[tokio::test]
+async fn a_wrong_clock_on_this_computer_does_not_stop_the_worker() {
+    // The server's clock is an hour ahead of this computer's, then a day behind it.
+    for offset in [3600, -86_400] {
+        let server = FakeServer::start();
+        server.set_clock_offset(offset);
+        let device = server.enrol();
+        // The server refuses requests timed two minutes from its own clock, and every deadline
+        // it sends is on its own clock.
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let claimed = worker.claim_many(&[&qualification]).await;
+        let (_, mut task) = claimed.unwrap().expect("the queued task");
+        assert_eq!(worker.input(&task, &qualification).await.unwrap(), INPUT);
+        assert!(worker.heartbeat(&mut task, &qualification).await.unwrap());
+        let result = worker.complete(&task, &json!({}), &qualification).await;
+        assert_eq!(result, Ok(true), "{offset}");
+        assert_eq!(server.completed(&device), 1);
+    }
+}
+
+#[test]
+fn the_clock_difference_is_read_from_the_date_header_and_small_ones_are_ignored() {
+    let local = 1_795_118_400_000; // 2026-11-19T20:00:00Z
+    let skew = |date| transport::clock_skew_from(Some(date), local);
+    // As servers write it, and as RFC 2822 does.
+    assert_eq!(skew("Thu, 19 Nov 2026 20:00:00 GMT"), Some(0));
+    assert_eq!(skew("Thu, 19 Nov 2026 20:00:20 GMT"), Some(0));
+    assert_eq!(skew("Thu, 19 Nov 2026 19:59:40 +0000"), Some(0));
+    // A real difference, plus the two seconds `Date` can be behind.
+    assert_eq!(skew("Thu, 19 Nov 2026 21:00:00 GMT"), Some(3_602_000));
+    assert_eq!(skew("Wed, 18 Nov 2026 20:00:00 GMT"), Some(-86_398_000));
+    // Nothing usable: the last known difference stays.
+    assert_eq!(skew("yesterday"), None);
+    assert_eq!(transport::clock_skew_from(None, local), None);
+}
+
+#[tokio::test]
+async fn signed_requests_reach_the_server_one_at_a_time_in_sequence_order() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    server.queue(&device, 1);
+    let claimed = worker.claim_many(&[&qualification]).await;
+    let (_, task) = claimed.unwrap().unwrap();
+    // Heartbeats and the result asked for at the same moment, many times over.
+    let mut beats = Vec::new();
+    for _ in 0..8 {
+        let mut lease = task.clone();
+        let (worker, qualification) = (&worker, &qualification);
+        beats.push(async move { worker.heartbeat(&mut lease, qualification).await });
+    }
+    let later = beats.split_off(4);
+    let (done, all) = (json!({}), [&qualification]);
+    let (first, second, result, third) = tokio::join!(
+        futures_util::future::join_all(beats),
+        futures_util::future::join_all(later),
+        worker.complete(&task, &done, &qualification),
+        worker.claim_many(&all),
+    );
+    // None was refused for arriving after a higher sequence number.
+    assert!(
+        first.iter().chain(&second).all(|beat| beat.is_ok()),
+        "{first:?} {second:?}"
+    );
+    assert_eq!(result, Ok(true));
+    assert!(third.is_ok());
+    // All eleven passed the server's sequence check: the claim, eight heartbeats, the result
+    // and the second claim.
+    let handled = server.handled();
+    assert_eq!(handled.len(), 11, "{handled:?}");
+    assert_eq!(
+        handled.iter().filter(|path| *path == "heartbeat").count(),
+        8
+    );
+}
+
+#[tokio::test]
+async fn a_new_field_in_a_reply_is_ignored() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    // A heartbeat acknowledgement and a claim from a newer server.
+    server.queue(&device, 1);
+    let claimed = worker.claim_many(&[&qualification]).await;
+    let (_, mut task) = claimed.unwrap().unwrap();
+    server.respond_next(
+        &device,
+        "/heartbeat",
+        200,
+        json!({"accepted":true,"expiresAt":stamp(60),"somethingNew":1}),
+    );
+    assert!(worker.heartbeat(&mut task, &qualification).await.unwrap());
 }

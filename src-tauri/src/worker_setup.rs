@@ -26,6 +26,9 @@ pub(crate) struct SetupStatus {
     pub completed_tasks: u64,
     /// FD-52: the provider each workload runs on, and why when the processor stands in.
     pub providers: Vec<crate::provider_selection::WorkloadProvider>,
+    /// What the AI runtime process said when it last ended by itself: its exit status and the
+    /// last lines of its error output. Shown under the stop reason; cleared by a finished task.
+    pub detail: Option<String>,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +80,7 @@ impl Progress {
             }),
             completed_tasks: current.completed_tasks,
             providers: current.providers.clone(),
+            detail: current.detail.clone(),
         };
         if *current == status {
             return;
@@ -99,7 +103,19 @@ impl Progress {
         }
     }
     fn completed(&self) {
-        self.update(|status| status.completed_tasks += 1);
+        self.update(|status| {
+            status.completed_tasks += 1;
+            status.detail = None;
+        });
+    }
+    /// Keep, and log, why the runtime process ended.
+    fn crashed(&self, report: Option<String>) {
+        let Some(report) = report else { return };
+        eprintln!("worker_runtime_exited: {report}");
+        self.update(|status| status.detail = Some(report));
+    }
+    fn completed_tasks(&self) -> u64 {
+        self.status.lock().unwrap().completed_tasks
     }
     fn active(&self, workload: Option<&str>) {
         self.update(|status| status.active_workload = workload.map(str::to_owned));
@@ -120,6 +136,15 @@ impl Progress {
                         total_bytes: total,
                     });
                 }
+            }
+        });
+    }
+    /// A download that starts over reports its verified files again: take the first count back.
+    fn uncredit(&self, bytes: u64) {
+        self.update(|status| {
+            if let Some(models) = &mut status.models {
+                models.verified_bytes = models.verified_bytes.saturating_sub(bytes);
+                models.download = None;
             }
         });
     }
@@ -274,7 +299,10 @@ impl WorkerSetup {
                     let paths = paths.clone();
                     let progress = progress.clone();
                     async move {
-                        if refresh {
+                        // No session saved: the connection check could not get one (AI
+                        // processing off, away from home, server busy). Ask here, where a
+                        // refusal is named, waited out and asked again.
+                        if refresh || !session_saved(&saved) {
                             refresh_session(&saved).await?;
                             check_cancel(&progress.cancelled)?;
                         }
@@ -298,7 +326,28 @@ impl WorkerSetup {
     }
 }
 
+fn session_saved(saved: &SavedConnection) -> bool {
+    matches!(
+        crate::credentials::load::<crate::worker::SavedWorker>("worker-session"),
+        Ok(Some(worker)) if worker.server_id == saved.server_id
+            && worker.account_id == saved.account_id
+            && Some(&worker.device_id) == saved.device_id.as_ref()
+    )
+}
+
 const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
+/// How often a working computer asks the server which models its tasks use now.
+const MODEL_RECHECK: Duration = Duration::from_secs(5 * 60);
+/// How often a task the server refused here (not the model: the library's index, say) is tried
+/// again while the others work.
+const REFUSED_TASK_RECHECK: Duration = Duration::from_secs(30 * 60);
+/// How long a stop waits for the held lease to be handed back to the server.
+const LEASE_RETURN: Duration = Duration::from_secs(3);
+/// How long quitting the app waits for the worker to stop and hand its lease back.
+pub(crate) const QUIT_GRACE: Duration = Duration::from_secs(4);
+/// The AI runtime ending by itself this many times in a row, with no task finished in between,
+/// stops the worker with `runtime_crash_loop`.
+const CRASH_LIMIT: u32 = 3;
 const POLICY_RECHECK: Duration = Duration::from_secs(5 * 60);
 const ROUTE_POLL: Duration = Duration::from_secs(5);
 
@@ -495,20 +544,22 @@ impl WakeClock {
     }
 }
 const TASK_FAILURE_LIMIT: u32 = 5;
-/// One bad task is dropped and the next is claimed; an unbroken run of them parks the worker.
+/// One bad task is dropped and the next is claimed. A run of them slows the claims down and,
+/// from the limit on, shows why; it never stops the worker, because each is a different task or
+/// a server that will recover.
 #[derive(Default)]
 struct TaskFailures(u32);
 impl TaskFailures {
     fn completed(&mut self) {
         self.0 = 0;
     }
-    /// The pause before the next claim, or the code to park with once the run reaches the limit.
-    fn dropped(&mut self, code: String) -> Result<Duration, String> {
-        self.0 += 1;
-        if self.0 >= TASK_FAILURE_LIMIT {
-            return Err(code);
-        }
-        Ok(reconnect_delay(self.0, rand::random()))
+    /// The pause before the next claim, and whether the run is long enough to show its reason.
+    fn dropped(&mut self) -> (Duration, bool) {
+        self.0 = self.0.saturating_add(1);
+        (
+            reconnect_delay(self.0, rand::random()),
+            self.0 >= TASK_FAILURE_LIMIT,
+        )
     }
 }
 fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
@@ -536,11 +587,18 @@ pub(crate) fn retryable(error: &str) -> bool {
             | "runtime_process_stopped"
             | "runtime_not_ready"
             | "runtime_prediction_interrupted"
+            // The server no longer holds the challenge or qualification: qualify again.
+            | "worker_qualification_restart"
+            | "worker_challenge_busy"
             | "server_http_408"
-            | "server_http_429"
-            | "server_http_502"
-            | "server_http_503"
-            | "server_http_504"
+            | "server_http_429" // A failing or busy server, or a proxy in front of it, recovers by itself: 500 like 503.
+    ) || error.starts_with("server_http_5")
+}
+/// The AI runtime process ended or stopped answering while it was serving.
+fn runtime_crash(error: &str) -> bool {
+    matches!(
+        error,
+        "runtime_process_stopped" | "runtime_prediction_interrupted" | "runtime_not_ready"
     )
 }
 async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String>>>(
@@ -549,24 +607,47 @@ async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String
     mut attempt: F,
 ) -> Result<(), String> {
     let mut retries = 0u32;
+    // Kept here, across every restart of the setup: counted inside it, a runtime that dies
+    // every time would be set up again for ever, a few seconds apart.
+    let mut crashes = 0u32;
     loop {
         wait_for_user(progress, || async { Ok(()) }).await?;
+        let finished = progress.completed_tasks();
         let error = match attempt(refresh).await {
             Ok(()) => return Ok(()),
+            // The server changed which models its tasks use: set up again with them, now.
+            Err(error) if error == "worker_models_changed" => {
+                check_cancel(&progress.cancelled)?;
+                (refresh, retries, crashes) = (false, 0, 0);
+                continue;
+            }
             Err(error) if retryable(&error) => error,
             Err(error) => return Err(error),
         };
         check_cancel(&progress.cancelled)?;
-        if matches!(
-            progress.status.lock().unwrap().state.as_str(),
-            "working" | "waiting-for-work"
-        ) {
-            retries = 0;
-        }
+        let worked = progress.completed_tasks() > finished;
+        let delay = if runtime_crash(&error) {
+            crashes = if worked { 1 } else { crashes + 1 };
+            if crashes >= CRASH_LIMIT {
+                return Err("runtime_crash_loop".into());
+            }
+            // The session is not at fault: the same one sets up again, after a longer wait.
+            reconnect_delay(crashes, rand::random())
+        } else {
+            if worked
+                || matches!(
+                    progress.status.lock().unwrap().state.as_str(),
+                    "working" | "waiting-for-work"
+                )
+            {
+                retries = 0;
+            }
+            refresh = true;
+            let delay = reconnect_delay(retries, rand::random());
+            retries = retries.saturating_add(1);
+            delay
+        };
         progress.set("reconnecting", Some(error));
-        let delay = reconnect_delay(retries, rand::random());
-        retries = retries.saturating_add(1);
-        refresh = true;
         cancellable(
             async {
                 tokio::time::sleep(delay).await;
@@ -586,7 +667,8 @@ async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
         return Err("desktop_worker_session_unavailable".into());
     }
     // Issue rechecks the existing device and photo session; recovery must never re-enroll a revoked device.
-    let worker = crate::transport::issue_worker_session(&client, saved).await?;
+    let worker =
+        crate::transport::issue_worker_session(&client, saved, capabilities.clock_skew_ms).await?;
     crate::credentials::save("worker-session", &worker)
 }
 /// FD-64: what stopped a qualification or a measurement, if anything. `Ok` is a pause for power,
@@ -655,26 +737,137 @@ async fn download_network_loss<F: Future<Output = Option<bool>>>(mut sample: imp
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
+/// `paused` ends the download with `user_paused`: what was received stays on disk and the
+/// download continues from there when the person resumes.
 async fn acquisition<T, F: Future<Output = Result<(), String>>>(
     work: impl Future<Output = Result<T, String>>,
     explicit_permission: bool,
     maintain: impl FnMut() -> F,
     network_loss: impl Future<Output = ()>,
+    paused: impl Future<Output = ()>,
     cancelled: &AtomicBool,
 ) -> Result<T, String> {
     maintained(
         work,
         async {
-            if explicit_permission {
-                std::future::pending::<()>().await;
+            tokio::select! {
+                _ = paused => "user_paused".into(),
+                _ = async {
+                    if explicit_permission {
+                        std::future::pending::<()>().await;
+                    }
+                    network_loss.await;
+                } => "model_download_permission_required".into(),
             }
-            network_loss.await;
-            "model_download_permission_required".into()
         },
         maintain,
         cancelled,
     )
     .await
+}
+async fn flag_set(flag: &AtomicBool) {
+    while !flag.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// Why work that holds a lease must stop now: Stop, sign-out or quit; a pause for power or
+/// network; the computer waking from sleep.
+async fn lease_interruption(progress: &Progress, clock: &WakeClock) -> String {
+    tokio::select! {
+        reason = resource_loss(clock) => format!("resource_{reason}"),
+        _ = flag_set(&progress.cancelled) => "worker_setup_cancelled".into(),
+    }
+}
+/// Run one step of work (a claim and its task). When `interrupt` says to stop first, signal
+/// `stop` and give the step `grace` to hand its lease back (`fail` with `cancelled`) before it
+/// is dropped: the server gives the task to another computer at once instead of waiting for the
+/// lease to run out.
+async fn returning_lease<T>(
+    step: impl Future<Output = Result<T, String>>,
+    interrupt: impl Future<Output = String>,
+    stop: &tokio::sync::watch::Sender<bool>,
+    grace: Duration,
+) -> Result<T, String> {
+    tokio::pin!(step);
+    tokio::select! {
+        biased;
+        result = &mut step => result,
+        reason = interrupt => {
+            let _ = stop.send(true);
+            let _ = tokio::time::timeout(grace, &mut step).await;
+            Err(reason)
+        }
+    }
+}
+/// What `/models` says each task runs: its state and model keys. Two replies with the same
+/// signature need the same models on this computer.
+fn inventory_signature(inventory: &serde_json::Value) -> Vec<(String, String, Vec<String>)> {
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
+    let mut signature: Vec<_> = inventory["workloads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let keys = entry["modelKeys"].as_array().into_iter().flatten();
+            (
+                text(&entry["workload"]),
+                text(&entry["state"]),
+                keys.map(text).collect(),
+            )
+        })
+        .collect();
+    signature.sort();
+    signature
+}
+/// What to do about a refusal while qualifying one model.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// The server's bookkeeping, or a challenge it no longer holds: ask for a new challenge for
+    /// this model after a pause.
+    Again,
+    /// The task's model may have changed on the server: read `/models` again.
+    Models,
+    /// The server does not take this provider's result: use the processor.
+    Processor,
+    /// This task can't be done here now; the others carry on.
+    Task,
+    /// Nothing on this computer can change it.
+    Stop,
+}
+fn refusal(code: &str, provider: &str) -> Refusal {
+    if matches!(
+        code,
+        "worker_challenge_busy" | "worker_qualification_restart"
+    ) {
+        return Refusal::Again;
+    }
+    if matches!(
+        code,
+        "workload_desktop_model_profile_unavailable"
+            | "workload_desktop_model_profile_changed"
+            | "workload_desktop_pool_model_unavailable"
+            | "workload_desktop_clip_profile_unavailable"
+            | "workload_desktop_face_profile_unavailable"
+    ) {
+        return Refusal::Models;
+    }
+    if code.starts_with("workload_") {
+        return Refusal::Task;
+    }
+    // The server refused what a GPU runtime sent (its attestation, its report). The processor
+    // runtime is a different signed runtime with its own report: try that before giving up.
+    let about_the_runtime = matches!(
+        code,
+        "worker_runtime_unsigned"
+            | "worker_qualification_report_refused"
+            | "worker_qualification_refused"
+            | "worker_challenge_invalid"
+            | "worker_qualification_invalid"
+    ) || code.starts_with("server_http_4");
+    if about_the_runtime && provider != crate::provider_selection::CPU {
+        return Refusal::Processor;
+    }
+    Refusal::Stop
 }
 async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), String>>>(
     work: impl FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
@@ -749,8 +942,10 @@ pub(crate) fn inventory_profiles(
     String,
 > {
     use serde::Deserialize;
+    // A newer server may add fields to the reply or to a task's entry: they are ignored. The
+    // profiles themselves are hashed into their model keys and stay strict (`model_catalogue`).
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[serde(rename_all = "camelCase")]
     struct Inventory {
         protocol_version: u32,
         provider: String,
@@ -758,7 +953,7 @@ pub(crate) fn inventory_profiles(
         workloads: Vec<Entry>,
     }
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[serde(rename_all = "camelCase")]
     struct Entry {
         workload: String,
         state: String,
@@ -974,7 +1169,13 @@ async fn prepare_on(
             return Err("runtime_pack_unavailable".into());
         }
         let store = open_runtime_store(&data.join("runtimes"))?;
-        let active = store.load_active()?;
+        // An installed runtime that no longer verifies (a file changed or went missing) is
+        // rebuilt from the app's signed bundle below, instead of failing the same way for ever.
+        let active = match store.load_active() {
+            Ok(active) => active,
+            Err(_) if bundle.exists() => None,
+            Err(code) => return Err(code),
+        };
         let bundled = if bundle.exists() {
             Some(read_bounded(&bundle.join("manifest.json"), 8 * 1024 * 1024)?)
         } else {
@@ -1020,12 +1221,28 @@ async fn prepare_on(
     if !caps.features.worker_auto_setup {
         return Err("server_update_required".into());
     }
-    let worker = WorkerTransport::load(&saved)?;
+    let worker = WorkerTransport::load(&saved)?.with_clock_skew(caps.clock_skew_ms);
+    let (source, provider) = (
+        installed.source_revision().to_owned(),
+        installed.provider().to_owned(),
+    );
     let inventory = cancellable(
-        worker.model_inventory(installed.source_revision(), installed.provider()),
+        worker.model_inventory(&source, &provider),
         &progress.cancelled,
     )
     .await?;
+    // The server decides which models run here, and may change its mind at any time: asked
+    // again while working, a different answer sets this computer up again with the new models.
+    let signature = inventory_signature(&inventory);
+    let models_changed = || async {
+        // A question that fails changes nothing; the claims report a server in trouble.
+        worker
+            .model_inventory(&source, &provider)
+            .await
+            .is_ok_and(|value| inventory_signature(&value) != signature)
+    };
+    let prepared_at = std::time::Instant::now();
+    let mut models_checked = prepared_at;
     let (groups, statuses) = inventory_profiles(
         &inventory,
         installed.source_revision(),
@@ -1067,34 +1284,50 @@ async fn prepare_on(
     let mut caches = Vec::new();
     for profile in &profiles {
         let count = counted.insert(profile.cache_identity());
-        wait_for_user(&progress, || worker.maintain_session()).await?;
-        let cache = acquisition(
-            profile.prepare_cache(
-                &paths.data.join("models"),
-                &client,
+        let cache = loop {
+            wait_for_user(&progress, || worker.maintain_session()).await?;
+            progress.set("preparing-models", None);
+            let credited = std::sync::atomic::AtomicU64::new(0);
+            let result = acquisition(
+                profile.prepare_cache(
+                    &paths.data.join("models"),
+                    &client,
+                    &progress.cancelled,
+                    allow_download,
+                    |event| {
+                        if count {
+                            if let CacheProgress::Verified(bytes) = &event {
+                                credited.fetch_add(*bytes, Ordering::AcqRel);
+                            }
+                            progress.cache_progress(event);
+                        }
+                    },
+                ),
+                explicit_permission,
+                || worker.maintain_session(),
+                download_network_loss(|| async {
+                    tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                        .await
+                        .ok()
+                        .and_then(|status| status.unmetered)
+                }),
+                flag_set(&progress.user_paused),
                 &progress.cancelled,
-                allow_download,
-                |event| {
-                    if count {
-                        progress.cache_progress(event);
-                    }
-                },
-            ),
-            explicit_permission,
-            || worker.maintain_session(),
-            download_network_loss(|| async {
-                tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
-                    .await
-                    .ok()
-                    .and_then(|status| status.unmetered)
-            }),
-            &progress.cancelled,
-        )
-        .await
+            )
+            .await;
+            match result {
+                // Paused in the middle of a file: wait, then carry on from what was received.
+                Err(code) if code == "user_paused" => {
+                    progress.uncredit(credited.load(Ordering::Acquire));
+                }
+                result => break result,
+            }
+        }
         .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
         caches.push(cache);
     }
     let mut failures = TaskFailures::default();
+    let mut refusals = 0u32;
     'qualification: loop {
         // The provider chosen for each workload; a failed provider is demoted and this restarts.
         let groups = plan.groups();
@@ -1116,130 +1349,157 @@ async fn prepare_on(
                     .iter()
                     .position(|item| item.model_key() == profile.model_key())
                     .ok_or("worker_model_binding_invalid")?;
-                let cache = caches[index].clone();
-                group_caches.push(cache.clone());
-                check_cancel(&progress.cancelled)?;
-                wait_for_capacity(profile.minimum_memory(), &progress, || {
-                    worker.maintain_session()
-                })
-                .await?;
-                progress.set("qualifying", None);
-                let challenge = match cancellable(
-                    worker.request_qualification(
-                        profile,
-                        installed.attestation(profile.provider())?,
-                        &uuid::Uuid::new_v4().to_string(),
-                    ),
-                    &progress.cancelled,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    // A refusal of one task (`workload_…`) leaves the others to qualify.
-                    Err(code) if code.starts_with("workload_") => {
-                        if plan.demote(workload, &code, false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
+                group_caches.push(caches[index].clone());
+                // One model's qualification, from a new challenge to the accepted record. A
+                // refusal the server clears by itself starts this model again, not the others.
+                let (qualified, accepted) = 'attempt: loop {
+                    let cache = caches[index].clone();
+                    check_cancel(&progress.cancelled)?;
+                    wait_for_capacity(profile.minimum_memory(), &progress, || {
+                        worker.maintain_session()
+                    })
+                    .await?;
+                    progress.set("qualifying", None);
+                    // What a refusal from the server means for this model, task and provider.
+                    macro_rules! refused {
+                        ($code:expr) => {{
+                            let code: String = $code;
+                            if retryable(&code)
+                                && code != "worker_qualification_restart"
+                                && code != "worker_challenge_busy"
+                            {
+                                return Err(code);
+                            }
+                            match refusal(&code, profile.provider()) {
+                                Refusal::Again => {
+                                    refusals = refusals.saturating_add(1);
+                                    let delay = reconnect_delay(refusals, rand::random());
+                                    cancellable(
+                                        async {
+                                            tokio::time::sleep(delay).await;
+                                            Ok(())
+                                        },
+                                        &progress.cancelled,
+                                    )
+                                    .await?;
+                                    continue 'attempt;
+                                }
+                                Refusal::Models if models_changed().await => {
+                                    return Err("worker_models_changed".into());
+                                }
+                                Refusal::Models | Refusal::Task | Refusal::Processor
+                                    if plan.demote(workload, &code, false) =>
+                                {
+                                    continue 'qualification;
+                                }
+                                Refusal::Models | Refusal::Task => {
+                                    progress.workload(workload, "unavailable", Some(code));
+                                    continue 'workload;
+                                }
+                                Refusal::Processor | Refusal::Stop => return Err(code),
+                            }
+                        }};
                     }
-                    Err(code) => return Err(code),
-                };
-                let spec = challenge.specification().to_vec();
-                let fixture = challenge.fixture().to_vec();
-                let scratch = paths.data.join("scratch");
-                let provider = profile.provider().to_owned();
-                let clock = WakeClock::new();
-                let ((runtime, qualified), interrupted) = monitored_preparation(
-                    move |cancel| {
-                        let qualified = installed
-                            .qualify(&provider, &cache, &scratch, &spec, &fixture, &cancel);
-                        (installed, qualified)
-                    },
-                    async { format!("resource_{}", resource_loss(&clock).await) },
-                    || worker.maintain_session(),
-                    &progress.cancelled,
-                )
-                .await?;
-                installed = runtime;
-                check_cancel(&progress.cancelled)?;
-                if clock.observe(std::time::SystemTime::now()) {
-                    progress.set("paused", Some("system_resumed".into()));
-                    continue 'qualification;
-                }
-                if let Some(reason) = interrupted {
-                    if let Some(reason) = reason.strip_prefix("resource_") {
-                        progress.set("paused", Some(reason.into()));
+                    let challenge = match cancellable(
+                        worker.request_qualification(
+                            profile,
+                            installed.attestation(profile.provider())?,
+                            &uuid::Uuid::new_v4().to_string(),
+                        ),
+                        &progress.cancelled,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(code) if code == "worker_setup_cancelled" => return Err(code),
+                        Err(code) => refused!(code),
+                    };
+                    let spec = challenge.specification().to_vec();
+                    let fixture = challenge.fixture().to_vec();
+                    let scratch = paths.data.join("scratch");
+                    let provider = profile.provider().to_owned();
+                    let clock = WakeClock::new();
+                    let ((runtime, qualified), interrupted) = monitored_preparation(
+                        move |cancel| {
+                            let qualified = installed
+                                .qualify(&provider, &cache, &scratch, &spec, &fixture, &cancel);
+                            (installed, qualified)
+                        },
+                        async { format!("resource_{}", resource_loss(&clock).await) },
+                        || worker.maintain_session(),
+                        &progress.cancelled,
+                    )
+                    .await?;
+                    installed = runtime;
+                    check_cancel(&progress.cancelled)?;
+                    if clock.observe(std::time::SystemTime::now()) {
+                        progress.set("paused", Some("system_resumed".into()));
                         continue 'qualification;
                     }
-                    return Err(reason);
-                }
-                let qualified = match qualified {
-                    Ok(value) => value,
-                    Err(code)
-                        if matches!(
-                            code.as_str(),
-                            "runtime_qualification_failed"
-                                | "runtime_qualification_timeout"
-                                | "runtime_qualification_report_invalid"
-                                | "runtime_output_mismatch"
-                                | "runtime_out_of_memory"
-                                | "runtime_model_missing"
-                                | "runtime_provider_unavailable"
-                        ) =>
+                    if let Some(reason) = interrupted {
+                        if let Some(reason) = reason.strip_prefix("resource_") {
+                            progress.set("paused", Some(reason.into()));
+                            continue 'qualification;
+                        }
+                        return Err(reason);
+                    }
+                    let qualified = match qualified {
+                        Ok(value) => value,
+                        Err(code)
+                            if matches!(
+                                code.as_str(),
+                                "runtime_qualification_failed"
+                                    | "runtime_qualification_timeout"
+                                    | "runtime_qualification_report_invalid"
+                                    | "runtime_output_mismatch"
+                                    | "runtime_out_of_memory"
+                                    | "runtime_model_missing"
+                                    | "runtime_provider_unavailable"
+                            ) =>
+                        {
+                            // Memory another program held, or a slow moment, is not remembered
+                            // against the GPU for the whole runtime epoch.
+                            let remember = !crate::provider_selection::passing(&code);
+                            if plan.demote(workload, &code, remember) {
+                                continue 'qualification;
+                            }
+                            progress.workload(workload, "unavailable", Some(code));
+                            continue 'workload;
+                        }
+                        Err(code) => return Err(code),
+                    };
+                    match cancellable(
+                        worker.submit_qualification(&challenge, &qualified),
+                        &progress.cancelled,
+                    )
+                    .await
                     {
-                        if plan.demote(workload, &code, true) {
-                            continue 'qualification;
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if plan.demote(workload, "worker_qualification_refused", false) {
+                                continue 'qualification;
+                            }
+                            progress.workload(
+                                workload,
+                                "unavailable",
+                                Some("worker_qualification_refused".into()),
+                            );
+                            continue 'workload;
                         }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
+                        Err(code) if code == "worker_setup_cancelled" => return Err(code),
+                        Err(code) => refused!(code),
                     }
-                    Err(code) => return Err(code),
-                };
-                match cancellable(
-                    worker.submit_qualification(&challenge, &qualified),
-                    &progress.cancelled,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if plan.demote(workload, "worker_qualification_refused", false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(
-                            workload,
-                            "unavailable",
-                            Some("worker_qualification_refused".into()),
-                        );
-                        continue 'workload;
-                    }
-                    // A refusal of one task (`workload_…`) leaves the others to qualify.
-                    Err(code) if code.starts_with("workload_") => {
-                        if plan.demote(workload, &code, false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
-                    }
-                    Err(code) => return Err(code),
-                }
-                let accepted = match cancellable(
-                    worker.read_accepted_qualification(profile, &qualified, challenge.id()),
-                    &progress.cancelled,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    // A refusal of one task (`workload_…`) leaves the others to qualify.
-                    Err(code) if code.starts_with("workload_") => {
-                        if plan.demote(workload, &code, false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
-                    }
-                    Err(code) => return Err(code),
+                    let accepted = match cancellable(
+                        worker.read_accepted_qualification(profile, &qualified, challenge.id()),
+                        &progress.cancelled,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(code) if code == "worker_setup_cancelled" => return Err(code),
+                        Err(code) => refused!(code),
+                    };
+                    break (qualified, accepted);
                 };
                 check_cancel(&progress.cancelled)?;
                 if let Err(code) = installed.runtime(profile.provider()).and_then(|runtime| {
@@ -1373,7 +1633,7 @@ async fn prepare_on(
         .await;
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
-            let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+            let now = worker.now()?;
             if prepared
                 .iter()
                 .any(|(proof, accepted)| accepted.validate_runtime(proof, now + 60_000).is_err())
@@ -1397,7 +1657,7 @@ async fn prepare_on(
                         .iter()
                         .map(|(proof, accepted)| (proof, accepted))
                         .collect();
-                    let predictor = installed.start(&bindings, &cache, &scratch, port)?;
+                    let predictor = installed.start(&bindings, &cache, &scratch, port, now)?;
                     Ok::<_, String>((installed, prepared, predictor))
                 })
                 .await
@@ -1405,7 +1665,8 @@ async fn prepare_on(
             installed = runtime;
             prepared = proofs;
             check_cancel(&progress.cancelled)?;
-            let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+            // Signalled to make the step in hand give its lease back before it is dropped.
+            let (stop, mut cancel) = tokio::sync::watch::channel(false);
             let clock = WakeClock::new();
             loop {
                 worker.maintain_session().await?;
@@ -1432,22 +1693,50 @@ async fn prepare_on(
                     progress.set("paused", Some(reason.into()));
                     break;
                 }
-                let now =
-                    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+                let now = worker.now()?;
                 if prepared.iter().any(|(proof, accepted)| {
                     accepted.validate_runtime(proof, now + 60_000).is_err()
                 }) {
                     continue 'qualification;
                 }
+                // The server may have changed a task's model, or turned a task on or off.
+                let refused_task = progress
+                    .status
+                    .lock()
+                    .unwrap()
+                    .workloads
+                    .iter()
+                    .any(|item| {
+                        item.state == "unavailable"
+                            && item
+                                .code
+                                .as_deref()
+                                .is_some_and(|code| code.starts_with("workload_"))
+                    });
+                if models_checked.elapsed() >= MODEL_RECHECK {
+                    models_checked = std::time::Instant::now();
+                    // A task the server refused for another reason is offered again in time.
+                    if models_changed().await
+                        || (refused_task && prepared_at.elapsed() >= REFUSED_TASK_RECHECK)
+                    {
+                        predictor.stop()?;
+                        return Err("worker_models_changed".into());
+                    }
+                }
                 progress.set("working", None);
                 let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
-                let completed = cancellable(async {
-                    tokio::select! {
-                        biased;
-                        reason = resource_loss(&clock) => Err(format!("resource_{reason}")),
-                        result = predictor.execute_next_with_activity(&worker, &accepted, &mut cancel, |workload| progress.active(Some(workload))) => result,
-                    }
-                }, &progress.cancelled).await;
+                let completed = returning_lease(
+                    predictor.execute_next_with_activity(
+                        &worker,
+                        &accepted,
+                        &mut cancel,
+                        |workload| progress.active(Some(workload)),
+                    ),
+                    lease_interruption(&progress, &clock),
+                    &stop,
+                    LEASE_RETURN,
+                )
+                .await;
                 progress.active(None);
                 match completed {
                     Ok(Step::Completed) => {
@@ -1459,16 +1748,15 @@ async fn prepare_on(
                         // workloads move to the processor instead of crashing on every restart.
                         let lane = predictor.failed_lane().map(str::to_owned);
                         if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                            progress.crashed(predictor.exit_report());
                             predictor.stop()?;
                             continue 'qualification;
                         }
-                        let delay = match failures.dropped(code) {
-                            Ok(delay) => delay,
-                            Err(code) => {
-                                predictor.stop()?;
-                                return Err(code);
-                            }
-                        };
+                        let (delay, show) = failures.dropped();
+                        if show {
+                            // A long run of failed tasks or server errors: say why while waiting.
+                            progress.set("reconnecting", Some(code));
+                        }
                         cancellable(
                             async {
                                 tokio::time::sleep(delay).await;
@@ -1506,6 +1794,8 @@ async fn prepare_on(
                         // processor for its workloads instead of failing the worker. A stop
                         // or sign-out while it was starting is not a provider failure.
                         check_cancel(&progress.cancelled)?;
+                        // Why the process ended, for the page and the log, before it is cleared.
+                        progress.crashed(predictor.exit_report());
                         let lane = predictor.failed_lane().map(str::to_owned);
                         if lane.is_some_and(|lane| plan.demote_runtime(&lane, &reason)) {
                             predictor.stop()?;
@@ -1740,8 +2030,12 @@ mod tests {
             .unwrap()
             .pop();
         assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+        // A field this app does not know is never used, wherever it claims to point; the same
+        // field inside a profile is refused (the profile is hashed into its key).
         let mut value = inventory_fixture();
         value["workloads"][0]["url"] = serde_json::json!("https://untrusted");
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_ok());
+        value["workloads"][0]["profiles"][0]["url"] = serde_json::json!("https://untrusted");
         assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
         let mut value = inventory_fixture();
         value["workloads"][2] = value["workloads"][1].clone();
@@ -2016,6 +2310,7 @@ mod tests {
                         }
                     },
                     std::future::pending(),
+                    std::future::pending(),
                     &cancelled,
                 )
                 .await
@@ -2092,6 +2387,7 @@ mod tests {
                 .await;
                 assert_eq!(samples.load(Ordering::Acquire), 2);
             },
+            std::future::pending(),
             &cancel,
         )
         .await;
@@ -2117,6 +2413,7 @@ mod tests {
             true,
             || async { Err("worker_session_revoked".into()) },
             async {},
+            std::future::pending(),
             &AtomicBool::new(false),
         )
         .await;
@@ -2127,6 +2424,7 @@ mod tests {
                 true,
                 || async { Ok(()) },
                 async {},
+                std::future::pending(),
                 &AtomicBool::new(false)
             )
             .await
@@ -2159,6 +2457,7 @@ mod tests {
             false,
             || async { Ok(()) },
             async {},
+            std::future::pending(),
             &cancel,
         )
         .await;
@@ -2682,7 +2981,7 @@ mod tests {
             .await?;
             match step {
                 Step::Completed => failures.completed(),
-                Step::Dropped(code) => drop(failures.dropped(code)?),
+                Step::Dropped(_) => drop(failures.dropped()),
                 Step::Idle => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
@@ -2811,21 +3110,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_failed_tasks_in_a_row_park_the_worker_and_fewer_do_not() {
+    async fn failed_tasks_in_a_row_slow_the_claims_down_and_never_stop_the_worker() {
         let mut failures = TaskFailures::default();
-        for _ in 0..3 {
-            for _ in 0..TASK_FAILURE_LIMIT - 1 {
-                let delay = failures.dropped("worker_result_refused".into()).unwrap();
-                assert!(delay >= Duration::from_secs(1) && delay <= Duration::from_secs(64));
-            }
-            failures.completed();
+        for round in 1..=3 * TASK_FAILURE_LIMIT {
+            let (delay, show) = failures.dropped();
+            assert!(delay >= Duration::from_secs(1) && delay <= Duration::from_secs(64));
+            // From the limit on, the reason is shown while waiting.
+            assert_eq!(show, round >= TASK_FAILURE_LIMIT);
         }
+        failures.completed();
+        assert!(!failures.dropped().1);
 
+        // Six refused results in a row: each is a different task, and the seventh is done.
         let server = FakeServer::start();
         let device = server.enrol();
         let saved = SavedSession::default();
-        server.queue(&device, 6);
-        for _ in 0..5 {
+        server.queue(&device, 7);
+        for _ in 0..6 {
             server.respond_next(
                 &device,
                 "/result",
@@ -2833,26 +3134,304 @@ mod tests {
                 serde_json::json!({"accepted":false}),
             );
         }
-        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &|| false).await;
-        assert_eq!(result, Err("worker_result_refused".into()));
+        let done = || server.completed(&device) == 1;
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
         assert_eq!(refreshes, [false]);
-        assert_eq!(server.completed(&device), 0);
+    }
 
-        // Parked is the state Retry Setup is offered in.
-        let setup = WorkerSetup::default();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        setup
-            .start_work(
-                Arc::new(move |status| {
-                    let _ = tx.send(status);
-                }),
-                move |_| async move { result },
-            )
+    #[tokio::test]
+    async fn a_failing_server_and_an_unknown_refusal_of_one_task_never_stop_the_worker() {
+        // 500 is a server in trouble, like 503: retried, whatever it is asked.
+        for code in ["server_http_500", "server_http_503", "server_http_520"] {
+            assert!(retryable(code), "{code}");
+        }
+        for code in ["worker_challenge_busy", "worker_qualification_restart"] {
+            assert!(retryable(code), "{code}");
+        }
+        assert!(!retryable("server_http_400"));
+
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 2);
+        // The claim fails six times over, then a task's input is refused with a status this app
+        // has never heard of, then the next task is done: same session throughout.
+        for _ in 0..6 {
+            server.respond_next(&device, "/claim", 500, serde_json::json!({}));
+        }
+        server.respond_next(
+            &device,
+            "/input",
+            418,
+            serde_json::json!({"message":"teapot"}),
+        );
+        let done = || server.completed(&device) == 1;
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(refreshes, [false]);
+        assert_eq!(server.sessions_issued(&device), 1);
+        // The refused task was handed back; the other was done.
+        assert_eq!(server.reports(&device), ["fail", "result"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_that_keeps_dying_stops_the_worker_instead_of_being_set_up_for_ever() {
+        for error in ["runtime_process_stopped", "runtime_prediction_interrupted"] {
+            let progress = quiet();
+            let attempts = AtomicUsize::new(0);
+            let result = reconnect(&progress, false, |refresh| {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                // The session is not at fault: no new one is asked for.
+                assert!(!refresh);
+                // As the real setup: "working" is announced before the runtime has served.
+                progress.set("working", None);
+                async move { Err(error.into()) }
+            })
             .await;
-        let status = rx.recv().await.unwrap();
-        assert_eq!(status.state, "setup-needs-attention");
-        assert_eq!(status.code.as_deref(), Some("worker_result_refused"));
-        setup.stop().await;
+            assert_eq!(result, Err("runtime_crash_loop".into()), "{error}");
+            assert_eq!(attempts.load(Ordering::Acquire), CRASH_LIMIT as usize);
+        }
+        // A task finished since the last crash: the run of crashes starts again from one.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let result = reconnect(&progress, false, |_| {
+            if attempts.fetch_add(1, Ordering::AcqRel) == 2 {
+                progress.completed();
+            }
+            async { Err("runtime_process_stopped".into()) }
+        })
+        .await;
+        assert_eq!(result, Err("runtime_crash_loop".into()));
+        assert_eq!(attempts.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
+    async fn a_model_change_on_the_server_sets_up_again_at_once_with_the_same_session() {
+        let progress = quiet();
+        let refreshes = Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        reconnect(&progress, false, |refresh| {
+            let mut seen = refreshes.lock().unwrap();
+            seen.push(refresh);
+            let first = seen.len() == 1;
+            async move {
+                if first {
+                    Err("worker_models_changed".into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*refreshes.lock().unwrap(), [false, false]);
+        // No backoff, and nothing shown as a fault.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(progress.status.lock().unwrap().state, "");
+    }
+
+    #[test]
+    fn the_models_to_run_are_compared_by_task_state_and_model_keys() {
+        let current = inventory_fixture();
+        let signature = inventory_signature(&current);
+        assert_eq!(signature.len(), 4);
+        // The same answer, with something new a later server adds and in another order.
+        let mut same = current.clone();
+        same["workloads"].as_array_mut().unwrap().reverse();
+        same["workloads"][0]["somethingNew"] = serde_json::json!(true);
+        assert_eq!(inventory_signature(&same), signature);
+        // Another model for a task.
+        assert_ne!(
+            inventory_signature(&inventory_fixture_with("ViT-B-32__openai")),
+            signature
+        );
+        // A task turned off, and one turned on.
+        let mut disabled = current.clone();
+        disabled["workloads"][1]["state"] = serde_json::json!("disabled");
+        disabled["workloads"][1]["modelKeys"] = serde_json::json!([]);
+        assert_ne!(inventory_signature(&disabled), signature);
+        assert_ne!(
+            inventory_signature(&current),
+            inventory_signature(&disabled)
+        );
+    }
+
+    #[test]
+    fn a_new_field_in_the_inventory_is_ignored_but_a_changed_profile_is_still_refused() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut value = inventory_fixture();
+        value["somethingNew"] = serde_json::json!({"a":1});
+        value["workloads"][0]["somethingNew"] = serde_json::json!("x");
+        let (groups, _) = inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(groups.len(), 3);
+        // The profile is hashed into its model key: nothing may be added to it.
+        value["workloads"][0]["profiles"][0]["somethingNew"] = serde_json::json!(1);
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+    }
+
+    #[test]
+    fn a_refusal_while_qualifying_is_retried_scoped_or_moved_to_the_processor() {
+        use crate::provider_selection::CPU;
+        const CUDA: &str = "CUDAExecutionProvider";
+        for provider in [CPU, CUDA] {
+            // Bookkeeping, and a challenge the server no longer holds: this model again.
+            for code in ["worker_challenge_busy", "worker_qualification_restart"] {
+                assert_eq!(refusal(code, provider), Refusal::Again, "{code}");
+            }
+            // The model may have changed: ask the server what to run.
+            for code in [
+                "workload_desktop_model_profile_unavailable",
+                "workload_desktop_model_profile_changed",
+            ] {
+                assert_eq!(refusal(code, provider), Refusal::Models, "{code}");
+            }
+            assert_eq!(
+                refusal("workload_desktop_clip_index_incompatible", provider),
+                Refusal::Task
+            );
+            // Nothing a different provider would change.
+            for code in ["worker_policy_required", "worker_device_refused"] {
+                assert_eq!(refusal(code, provider), Refusal::Stop, "{code}");
+            }
+        }
+        // The server refused what the GPU runtime sent: the processor runtime is tried, and
+        // only a refusal of that one stops the worker.
+        for code in [
+            "worker_runtime_unsigned",
+            "worker_qualification_report_refused",
+            "server_http_400",
+            "server_http_413",
+        ] {
+            assert_eq!(refusal(code, CUDA), Refusal::Processor, "{code}");
+            assert_eq!(refusal(code, CPU), Refusal::Stop, "{code}");
+        }
+        // Memory or a slow moment is not held against the GPU for the whole runtime epoch.
+        for code in ["runtime_out_of_memory", "runtime_qualification_timeout"] {
+            assert!(crate::provider_selection::passing(code), "{code}");
+        }
+        assert!(!crate::provider_selection::passing(
+            "runtime_output_mismatch"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stop_hands_the_held_lease_back_as_cancelled() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (stop, mut cancel) = tokio::sync::watch::channel(false);
+        let predicting = tokio::sync::Notify::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            returning_lease(
+                // The model is in the middle of this task and would never finish.
+                step_with(&worker, &[&qualification], &mut cancel, |_| async {
+                    predicting.notify_one();
+                    std::future::pending::<Result<serde_json::Value, String>>().await
+                }),
+                async {
+                    predicting.notified().await;
+                    "worker_setup_cancelled".to_owned()
+                },
+                &stop,
+                LEASE_RETURN,
+            ),
+        )
+        .await
+        .expect("the stop waited for the task");
+        assert_eq!(result, Err("worker_setup_cancelled".into()));
+        // The server heard at once that the task is free, and why.
+        assert_eq!(server.reports(&device), ["fail"]);
+        assert_eq!(server.failures(), ["cancelled"]);
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_a_model_download_and_keeps_what_was_received() {
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let download = acquisition(
+            std::future::pending::<Result<(), String>>(),
+            true,
+            || async { Ok(()) },
+            std::future::pending(),
+            async {
+                paused.store(true, Ordering::Release);
+                flag_set(&paused).await
+            },
+            &cancelled,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), download).await;
+        // Ended by the pause, not cancelled: the caller waits and continues the same file.
+        assert_eq!(
+            result.expect("the download ignored the pause"),
+            Err("user_paused".into())
+        );
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_to_issue_a_session_keeps_its_name_and_is_waited_out() {
+        for (status, message, code) in [
+            // Policy-off was a 401 here on older servers and is a 403 now.
+            (
+                401,
+                "desktop_pool_policy_required",
+                "worker_policy_required",
+            ),
+            (
+                403,
+                "desktop_pool_policy_required",
+                "worker_policy_required",
+            ),
+            (403, "desktop_worker_lan_required", "worker_lan_required"),
+        ] {
+            let server = FakeServer::start();
+            let device = server.enrol();
+            let saved = SavedSession::default();
+            server.queue(&device, 1);
+            server.respond_next(
+                &device,
+                "/devices/session",
+                status,
+                serde_json::json!({"message":message}),
+            );
+            let statuses = Arc::new(Mutex::new(Vec::new()));
+            let seen = statuses.clone();
+            let progress = Progress {
+                notify: Arc::new(move |status: SetupStatus| {
+                    seen.lock().unwrap().push((status.state, status.code))
+                }),
+                ..quiet()
+            };
+            let routes = AtomicUsize::new(0);
+            let done = || server.completed(&device) == 1;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                supervise(
+                    &progress,
+                    false,
+                    |refresh| work(&server, &device, &saved, refresh, &|| {}, &done),
+                    || {
+                        let moved = routes.fetch_add(1, Ordering::AcqRel) > 0;
+                        async move { Some(std::net::IpAddr::from([192, 168, 1, 2 + moved as u8])) }
+                    },
+                    Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("the worker stayed parked")
+            .unwrap();
+            // Waited with the reason shown, then set up and worked by itself.
+            assert_eq!(
+                *statuses.lock().unwrap(),
+                [("paused".to_owned(), Some(code.to_owned()))],
+                "{status} {message}"
+            );
+            assert_eq!(server.sessions_issued(&device), 1);
+        }
     }
 
     #[tokio::test]

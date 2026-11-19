@@ -214,6 +214,18 @@ impl DeviceIdentity {
         name: &str,
         mode: &str,
     ) -> Result<EnrollmentRequest, String> {
+        self.enrollment_at(server, account, name, mode, 0)
+    }
+    /// As `enrollment`, timed by the server's clock: `clock_skew_ms` is how far it is ahead of
+    /// this computer's (`transport::clock_skew`).
+    pub fn enrollment_at(
+        &self,
+        server: &str,
+        account: &str,
+        name: &str,
+        mode: &str,
+        clock_skew_ms: i64,
+    ) -> Result<EnrollmentRequest, String> {
         if name.trim().is_empty()
             || name.chars().count() > 128
             || name.chars().any(char::is_control)
@@ -242,10 +254,11 @@ impl DeviceIdentity {
             }
             .into(),
             mode: mode.into(),
-            timestamp: SystemTime::now()
+            timestamp: (SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| "clock_invalid")?
-                .as_millis() as u64,
+                .as_millis() as i64
+                + clock_skew_ms) as u64,
             signature: String::new(),
         };
         dto.signature = STANDARD.encode(
@@ -304,6 +317,10 @@ pub struct Capabilities {
     pub protocol_version: u8,
     pub server_id: String,
     pub features: Features,
+    /// Not from the server's reply: how far its clock is ahead of this computer's, read from the
+    /// `Date` header of the response (`transport::clock_skew`).
+    #[serde(skip)]
+    pub clock_skew_ms: i64,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -320,6 +337,9 @@ pub struct ConnectionView {
     pub mode: String,
     pub state: String,
     pub features: Features,
+    /// Why, when the state alone does not say (`enrollment-failed`): the backend's code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 impl ConnectionView {
     pub fn new(saved: &SavedConnection, state: String, features: Features) -> Self {
@@ -344,6 +364,7 @@ impl ConnectionView {
             mode: saved.mode.clone(),
             state,
             features,
+            code: None,
         }
     }
 }

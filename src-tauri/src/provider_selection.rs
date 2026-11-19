@@ -280,8 +280,15 @@ pub(crate) fn device_identity(provider: &str, os: &str, probe: &dyn Probe) -> St
 /// FD-64: a cause that says nothing lasting about the provider: its process was not serving
 /// in time, which a busy computer explains as well as a faulty provider does. The processor
 /// takes over for this run and the provider is tried again the next time the worker starts.
-fn passing(code: &str) -> bool {
-    matches!(code, "worker_execution_deadline" | "runtime_not_ready")
+pub(crate) fn passing(code: &str) -> bool {
+    matches!(
+        code,
+        "worker_execution_deadline"
+            | "runtime_not_ready"
+            // Memory another program held, or a check that ran out of time on a busy computer.
+            | "runtime_out_of_memory"
+            | "runtime_qualification_timeout"
+    )
 }
 
 /// FD-64: Retry Setup forgets what was remembered, so the provider is tried and measured again.
@@ -748,6 +755,7 @@ impl Runtimes {
         cache: &Path,
         private_root: &Path,
         port: u16,
+        now_ms: i64,
     ) -> Result<NativePredictor, String> {
         let mut runtimes = vec![(&self.cpu.installed, port)];
         if let Some(lane) = &self.accelerated {
@@ -760,7 +768,7 @@ impl Runtimes {
             drop(reservation);
             runtimes.push((&lane.installed, second));
         }
-        NativePredictor::start_lanes(&runtimes, bindings, cache, private_root)
+        NativePredictor::start_lanes_at(&runtimes, bindings, cache, private_root, now_ms)
     }
 }
 
@@ -1284,7 +1292,9 @@ mod tests {
             );
         }
         // A process that died is the provider's failure and is remembered.
-        assert!(!passing("runtime_process_stopped") && !passing("runtime_qualification_timeout"));
+        assert!(!passing("runtime_process_stopped") && !passing("runtime_output_mismatch"));
+        // Memory another program held, or a check that ran out of time, says nothing lasting.
+        assert!(passing("runtime_out_of_memory") && passing("runtime_qualification_timeout"));
         let mut crashed = plan_on(&root, &manifest, "driver-2");
         assert!(crashed.demote_runtime(&manifest, "runtime_process_stopped"));
         let remembered = row("face", CPU, Some("runtime_process_stopped"));

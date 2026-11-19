@@ -25,13 +25,14 @@ struct BoundClient {
     entries: Value,
     kind: String,
 }
-fn execution_duration(task: &ClaimedTask) -> Result<Duration, String> {
+/// `now_ms`: the server's time (`WorkerTransport::now`), which stamped every deadline here.
+fn execution_duration(task: &ClaimedTask, now_ms: i64) -> Result<Duration, String> {
     let parse = |value: &str| -> Result<i128, String> {
         OffsetDateTime::parse(value, &Rfc3339)
             .map(|date| date.unix_timestamp_nanos())
             .map_err(|_| "worker_deadline_invalid".into())
     };
-    let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let now = i128::from(now_ms) * 1_000_000;
     let deadline = parse(&task.execution_deadline)?.min(parse(&task.qualification_expires_at)?);
     let lease = parse(&task.expires_at)?;
     let remaining = deadline - now;
@@ -88,7 +89,12 @@ impl BoundClient {
         }
         Ok(ready)
     }
-    async fn predict(&self, task: &ClaimedTask, input: &[u8]) -> Result<Value, String> {
+    async fn predict(
+        &self,
+        task: &ClaimedTask,
+        input: &[u8],
+        now_ms: i64,
+    ) -> Result<Value, String> {
         let config: Value =
             serde_json::from_str(&task.config_json).map_err(|_| "worker_model_binding_invalid")?;
         if task.model_key != self.model_key
@@ -104,7 +110,7 @@ impl BoundClient {
             return Err("worker_model_binding_invalid".into());
         }
         task.verify_input(input)?;
-        let duration = execution_duration(task)?;
+        let duration = execution_duration(task, now_ms)?;
         let form = Form::new().text("entries", task.config_json.clone());
         let form = match task.input_kind {
             InputKind::Text => form.text(
@@ -209,9 +215,31 @@ fn task_scoped(code: &str) -> bool {
             | "worker_input_interrupted"
             | "worker_input_invalid"
             | "worker_input_too_large"
-            | "runtime_prediction_refused"
-            | "server_http_500"
-    )
+            | "worker_text_invalid"
+            | "runtime_prediction_refused" // A status with no name the worker knows (a 4xx this app has never heard of, a 5xx from a
+                                           // busy server) while fetching, heartbeating or reporting one task says nothing about the
+                                           // session or the next task. A bare 401 or 403 is about who is asking, not about one task.
+    ) || (code.starts_with("server_http_")
+        && !matches!(code, "server_http_401" | "server_http_403"))
+}
+/// The server (or something in front of it) is failing or busy: nothing was refused.
+fn server_unavailable(code: &str) -> bool {
+    code.starts_with("server_http_5") || matches!(code, "server_http_408" | "server_http_429")
+}
+/// What the server is told about a task given up (`fail`), as accurately as this side knows.
+fn failure_report(code: &str) -> WorkerFailure {
+    match code {
+        // The lease is handed back unfinished: stop, pause, sign-out, quit, or a wait for power.
+        "worker_cancelled" => WorkerFailure::Cancelled,
+        "worker_input_invalid"
+        | "worker_input_too_large"
+        | "worker_text_invalid"
+        | "runtime_prediction_refused" => WorkerFailure::InputInvalid,
+        "runtime_process_stopped" | "runtime_prediction_interrupted" | "runtime_not_ready" => {
+            WorkerFailure::ModelUnavailable
+        }
+        _ => WorkerFailure::InferenceFailed,
+    }
 }
 /// The server no longer honours this lease, or the credential behind it: it hears nothing more
 /// about the task, neither a result nor a failure.
@@ -235,9 +263,13 @@ fn heartbeat_undelivered(code: &str) -> bool {
             | "server_http_429"
     ) || code.starts_with("server_http_5")
 }
-fn lease_expired(task: &ClaimedTask) -> bool {
-    OffsetDateTime::parse(&task.expires_at, &Rfc3339)
-        .map_or(true, |expires| expires <= OffsetDateTime::now_utc())
+fn lease_expired(task: &ClaimedTask, now_ms: Result<i64, String>) -> bool {
+    let expires = OffsetDateTime::parse(&task.expires_at, &Rfc3339)
+        .map(|expires| expires.unix_timestamp_nanos() / 1_000_000);
+    match (expires, now_ms) {
+        (Ok(expires), Ok(now)) => expires <= i128::from(now),
+        _ => true,
+    }
 }
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const HEARTBEAT_RETRY: Duration = Duration::from_secs(5);
@@ -264,23 +296,34 @@ async fn hold_lease<F: Future<Output = Result<bool, String>>>(
         }
     }
 }
+/// How long a claim already sent may still be answered after a stop is asked for. A task the
+/// server leased in that moment is handed straight back instead of being left to expire.
+const CLAIM_GRACE: Duration = Duration::from_secs(2);
 async fn next_task(
     transport: &WorkerTransport,
     qualifications: &[&AcceptedQualification],
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Result<(usize, ClaimedTask), Step>, String> {
-    match race_prediction(
-        transport.claim_many(qualifications),
-        std::future::pending(),
-        cancel,
-        Duration::from_secs(30),
-    )
-    .await
-    {
+    let claim = transport.claim_many(qualifications);
+    tokio::pin!(claim);
+    let claimed = tokio::select! {
+        biased;
+        _ = cancelled(cancel) => {
+            if let Ok(Ok(Some((index, task)))) = tokio::time::timeout(CLAIM_GRACE, &mut claim).await {
+                let _ = transport
+                    .fail(&task, WorkerFailure::Cancelled, qualifications[index])
+                    .await;
+            }
+            return Err("worker_cancelled".into());
+        }
+        _ = tokio::time::sleep(Duration::from_secs(30)) => Err("worker_execution_deadline".into()),
+        result = &mut claim => result,
+    };
+    match claimed {
         Ok(Some(claimed)) => Ok(Ok(claimed)),
         Ok(None) => Ok(Err(Step::Idle)),
-        // Nothing was claimed, but a failing server counts toward the same limit as a failing task.
-        Err(code) if code == "server_http_500" => Ok(Err(Step::Dropped(code))),
+        // Nothing was claimed and nothing is wrong with this session: ask again after a pause.
+        Err(code) if server_unavailable(&code) => Ok(Err(Step::Dropped(code))),
         Err(code) => Err(code),
     }
 }
@@ -300,15 +343,16 @@ where
         code,
         inferring: false,
     };
+    let now = || transport.now();
     let input = race_prediction(
         transport.input(task, qualification),
         std::future::pending(),
         cancel,
-        execution_duration(task).map_err(idle)?,
+        execution_duration(task, now().map_err(idle)?).map_err(idle)?,
     )
     .await
     .map_err(idle)?;
-    let duration = execution_duration(task).map_err(idle)?;
+    let duration = execution_duration(task, now().map_err(idle)?).map_err(idle)?;
     let lease = std::sync::Mutex::new(task.clone());
     let value = race_prediction(
         predict(input),
@@ -321,7 +365,7 @@ where
                 }
                 Ok(accepted)
             },
-            || lease_expired(&lease.lock().unwrap()),
+            || lease_expired(&lease.lock().unwrap(), now()),
             HEARTBEAT,
             HEARTBEAT_RETRY,
         ),
@@ -359,7 +403,7 @@ async fn settle(
     };
     if !lease_gone(&failure.code) {
         let _ = transport
-            .fail(task, WorkerFailure::InferenceFailed, qualification)
+            .fail(task, failure_report(&failure.code), qualification)
             .await;
     }
     if task_scoped(&failure.code) {
@@ -477,15 +521,23 @@ impl NativePredictor {
         cache: &Path,
         private_root: &Path,
     ) -> Result<Self, String> {
+        let now = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        Self::start_lanes_at(runtimes, bindings, cache, private_root, now)
+    }
+    /// `now_ms`: the server's time (`WorkerTransport::now`), which stamped the qualifications.
+    pub(crate) fn start_lanes_at(
+        runtimes: &[(&InstalledRuntime, u16)],
+        bindings: &[(&QualifiedRuntime, &AcceptedQualification)],
+        cache: &Path,
+        private_root: &Path,
+        now_ms: i64,
+    ) -> Result<Self, String> {
         if !(1..=64).contains(&bindings.len()) {
             return Err("worker_model_binding_invalid".into());
         }
         let mut keys = std::collections::BTreeSet::new();
         for (qualified, accepted) in bindings {
-            accepted.validate_runtime(
-                qualified,
-                (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
-            )?;
+            accepted.validate_runtime(qualified, now_ms)?;
             let spec: Value = serde_json::from_slice(qualified.specification())
                 .map_err(|_| "worker_model_binding_invalid")?;
             if !keys.insert(
@@ -567,6 +619,12 @@ impl NativePredictor {
             }
         }
         Ok(true)
+    }
+    /// Why a runtime process ended by itself, if one did (`NativeSidecar::exit_report`).
+    pub(crate) fn exit_report(&mut self) -> Option<String> {
+        self.children
+            .iter_mut()
+            .find_map(|lane| lane.child.exit_report())
     }
     /// The signed manifest of the runtime whose process was not serving when work last failed
     /// to start: a provider that did not initialise.
@@ -711,7 +769,7 @@ impl NativePredictor {
             |input| async move {
                 let value = role
                     .client
-                    .predict(claimed, &input)
+                    .predict(claimed, &input, transport.now()?)
                     .await
                     // The local model refused this one input; the process itself is still serving.
                     .map_err(|code| match code.starts_with("server_http_") {
@@ -740,6 +798,9 @@ impl NativePredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn now_ms() -> i64 {
+        (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+    }
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::{
@@ -870,9 +931,9 @@ mod tests {
         let mut task = task();
         task.qualification_expires_at = stamp(5);
         task.expires_at = stamp(2);
-        assert!(execution_duration(&task).unwrap() <= Duration::from_secs(5));
+        assert!(execution_duration(&task, now_ms()).unwrap() <= Duration::from_secs(5));
         task.qualification_expires_at = stamp(-1);
-        assert!(execution_duration(&task).is_err());
+        assert!(execution_duration(&task, now_ms()).is_err());
     }
 
     #[tokio::test]
@@ -946,8 +1007,26 @@ mod tests {
             "worker_input_interrupted",
             "runtime_prediction_refused",
             "server_http_500",
+            "server_http_503",
+            // A refusal of one task this app has no name for.
+            "server_http_404",
+            "server_http_410",
+            "server_http_422",
         ] {
             assert!(task_scoped(code), "{code}");
+        }
+        // What the server hears about a task given up.
+        for (code, report) in [
+            ("worker_cancelled", "cancelled"),
+            ("worker_input_invalid", "input-invalid"),
+            ("runtime_prediction_refused", "input-invalid"),
+            ("runtime_process_stopped", "model-unavailable"),
+            ("runtime_prediction_interrupted", "model-unavailable"),
+            ("worker_execution_deadline", "inference-failed"),
+            ("server_http_500", "inference-failed"),
+        ] {
+            let sent = serde_json::to_value(failure_report(code)).unwrap();
+            assert_eq!(sent, json!(report), "{code}");
         }
         // These end the association or the process, not one task.
         for code in [
@@ -974,11 +1053,11 @@ mod tests {
         assert!(!lease_gone("worker_input_interrupted"));
         assert!(!lease_gone("runtime_prediction_refused"));
         let mut held = task();
-        assert!(!lease_expired(&held));
+        assert!(!lease_expired(&held, Ok(now_ms())));
         held.expires_at = stamp(-1);
-        assert!(lease_expired(&held));
+        assert!(lease_expired(&held, Ok(now_ms())));
         held.expires_at = "invalid".into();
-        assert!(lease_expired(&held));
+        assert!(lease_expired(&held, Ok(now_ms())));
     }
 
     fn client(port: u16) -> BoundClient {
@@ -1020,22 +1099,37 @@ mod tests {
             let mut task = task();
             task.model_key = "other".into();
             assert_eq!(
-                client.predict(&task, "été".as_bytes()).await.unwrap_err(),
+                client
+                    .predict(&task, "été".as_bytes(), now_ms())
+                    .await
+                    .unwrap_err(),
                 "worker_model_binding_invalid"
             );
             task = self::task();
             task.config_json = "{}".into();
-            assert!(client.predict(&task, "été".as_bytes()).await.is_err());
+            assert!(client
+                .predict(&task, "été".as_bytes(), now_ms())
+                .await
+                .is_err());
             task = self::task();
             task.input_kind = InputKind::Image;
-            assert!(client.predict(&task, "été".as_bytes()).await.is_err());
+            assert!(client
+                .predict(&task, "été".as_bytes(), now_ms())
+                .await
+                .is_err());
             task = self::task();
-            assert!(client.predict(&task, b"changed").await.is_err());
+            assert!(client.predict(&task, b"changed", now_ms()).await.is_err());
             task.expires_at = stamp(-1);
-            assert!(client.predict(&task, "été".as_bytes()).await.is_err());
+            assert!(client
+                .predict(&task, "été".as_bytes(), now_ms())
+                .await
+                .is_err());
             task = self::task();
             task.execution_deadline = stamp(800);
-            assert!(client.predict(&task, "été".as_bytes()).await.is_err());
+            assert!(client
+                .predict(&task, "été".as_bytes(), now_ms())
+                .await
+                .is_err());
         });
     }
     #[test]
@@ -1064,8 +1158,12 @@ mod tests {
             )
             .unwrap();
         });
-        let value = tauri::async_runtime::block_on(client(port).predict(&task(), "été".as_bytes()))
-            .unwrap();
+        let value = tauri::async_runtime::block_on(client(port).predict(
+            &task(),
+            "été".as_bytes(),
+            now_ms(),
+        ))
+        .unwrap();
         assert_eq!(value, json!({"clip":"[1,2]"}));
         server.join().unwrap();
     }
@@ -1122,8 +1220,12 @@ mod tests {
                 let _ = write!(socket, "HTTP/1.1 {status}\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             });
             assert_eq!(
-                tauri::async_runtime::block_on(client(port).predict(&task(), "été".as_bytes()))
-                    .unwrap_err(),
+                tauri::async_runtime::block_on(client(port).predict(
+                    &task(),
+                    "été".as_bytes(),
+                    now_ms()
+                ))
+                .unwrap_err(),
                 expected
             );
             server.join().unwrap();
@@ -1151,7 +1253,7 @@ mod tests {
             let client = client(port);
             let task = task();
             let result = race_prediction(
-                client.predict(&task, "été".as_bytes()),
+                client.predict(&task, "été".as_bytes(), now_ms()),
                 std::future::pending(),
                 &mut cancel,
                 Duration::from_secs(10),
@@ -1199,7 +1301,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            tauri::async_runtime::block_on(client.predict(&task, &input)).unwrap(),
+            tauri::async_runtime::block_on(client.predict(&task, &input, now_ms())).unwrap(),
             result
         );
         server.join().unwrap();

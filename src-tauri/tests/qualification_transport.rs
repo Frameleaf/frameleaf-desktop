@@ -104,7 +104,7 @@ fn accepts_only_the_compiled_profile_and_verified_factory_runtime_identity() {
     assert!(bound.report_sha256().is_none());
 }
 #[test]
-fn rejects_changed_specs_fixtures_models_manifests_deadlines_and_unknown_fields() {
+fn rejects_changed_specs_fixtures_models_manifests_and_deadlines_and_ignores_new_fields() {
     let f = fixture();
     let p = profile();
     let attestation = f.store.attestation(&f.installed).unwrap();
@@ -119,7 +119,6 @@ fn rejects_changed_specs_fixtures_models_manifests_deadlines_and_unknown_fields(
         ("expiresAt", json!("2099-01-01T00:00:00Z")),
         ("reportSha256", json!("invalid")),
         ("id", json!("../elsewhere")),
-        ("extra", json!(true)),
     ] {
         let mut changed = original.clone();
         changed[field] = value;
@@ -135,6 +134,13 @@ fn rejects_changed_specs_fixtures_models_manifests_deadlines_and_unknown_fields(
             "{field}"
         );
     }
+    // A field a newer server adds is ignored: everything this computer derives is still compared.
+    let mut newer = original.clone();
+    newer["somethingNew"] = json!(true);
+    let raw = serde_json::to_vec(&newer).unwrap();
+    assert!(
+        QualificationChallenge::bind(&worker(), &p, &attestation, &raw, 1_792_094_400_000).is_ok()
+    );
 }
 
 #[test]

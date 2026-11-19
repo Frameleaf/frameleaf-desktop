@@ -345,13 +345,26 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'The downloaded graphics card support does not belong to this version of Frameleaf, so it was removed. Download it again.', 'accelerated_pack_epoch_mismatch accelerated_pack_missing'],
   ['', 'The graphics card download is already running.', 'accelerated_pack_busy'],
   ['', 'There is no graphics card download for this computer.', 'accelerated_pack_unavailable'],
-  ['restart', 'The AI runtime could not start, or stopped unexpectedly, on this computer. Quit and reopen Frameleaf, then try again.', 'runtime_start_failed runtime_gate_failed runtime_port_invalid runtime_port_unavailable runtime_process_invalid runtime_process_owner_failed runtime_process_shutdown_unconfirmed runtime_process_status_failed runtime_process_state_unavailable runtime_process_stop_failed runtime_process_stopped runtime_not_ready runtime_health_invalid runtime_client_failed runtime_prediction_interrupted runtime_prediction_invalid runtime_prediction_refused runtime_activation_failed runtime_preparation_failed'],
+  ['restart', 'The AI runtime could not start on this computer. Quit and reopen Frameleaf, then try again.', 'runtime_start_failed runtime_gate_failed runtime_port_invalid runtime_port_unavailable runtime_process_invalid runtime_process_owner_failed runtime_process_shutdown_unconfirmed runtime_process_status_failed runtime_process_state_unavailable runtime_process_stop_failed runtime_health_invalid runtime_client_failed runtime_activation_failed runtime_preparation_failed'],
+  ['restart', 'The AI runtime stopped unexpectedly. Frameleaf starts it again by itself.', 'runtime_process_stopped'],
+  ['restart', 'The AI runtime did not answer in time after it started. Frameleaf starts it again by itself.', 'runtime_not_ready'],
+  ['restart', 'The AI runtime stopped answering in the middle of a task. The task went back to your server and Frameleaf starts the runtime again by itself.', 'runtime_prediction_interrupted'],
+  ['', 'The AI runtime returned a result Frameleaf could not use, so the task went back to your server.', 'runtime_prediction_invalid'],
+  ['', 'The AI model could not process one item, so it went back to your server. Other items continue.', 'runtime_prediction_refused'],
+  ['', 'The AI runtime stopped three times in a row on this computer, so AI processing was stopped. Close other apps to free memory, then try again. If it keeps stopping, install Frameleaf again.', 'runtime_crash_loop'],
   ['restart', 'Another copy of Frameleaf is using the AI files on this computer. Close it, then try again.', 'runtime_store_busy runtime_store_lock_failed'],
   ['', 'Frameleaf’s AI folder on this computer is not private to your account, so it was not used. Photos remain available. If this keeps happening, contact Frameleaf support.', 'runtime_store_directory_not_private runtime_store_directory_exists runtime_store_path_invalid runtime_store_lock_invalid runtime_store_privacy_inventory_limit'],
   ['history', 'AI processing needs recovery because this computer’s saved runtime history could not be verified. Photos remain available.', 'runtime_epoch_credential_missing runtime_epoch_identity_changed runtime_epoch_recovery_required runtime_epoch_record_invalid runtime_epoch_binding_invalid runtime_epoch_identity_invalid runtime_epoch_invalid runtime_epoch_operation_missing runtime_active_invalid runtime_active_epoch_changed runtime_store_file_invalid runtime_store_read_failed runtime_attestation_compression_failed runtime_attestation_too_large'],
   ['history', 'This AI runtime was rejected because it does not match this computer’s accepted runtime history. Photos remain available.', 'runtime_epoch_rollback runtime_epoch_reused'],
   // ---- AI processing: checks and tasks ----
-  ['checks', 'This computer did not pass the checks for the selected AI models. Try again. If it keeps failing, this computer may not be able to run them.', 'worker_no_qualified_workloads worker_qualification_refused worker_qualification_invalid worker_predictor_qualification_changed runtime_qualification_binding_invalid runtime_qualification_failed runtime_qualification_input_invalid runtime_qualification_report_invalid runtime_qualification_timeout runtime_qwen_binary_unavailable'],
+  ['checks', 'This computer did not pass the checks for the selected AI models. Try again. If it keeps failing, this computer may not be able to run them.', 'worker_no_qualified_workloads worker_qualification_invalid worker_predictor_qualification_changed runtime_qualification_binding_invalid runtime_qualification_failed runtime_qualification_input_invalid runtime_qualification_report_invalid runtime_qwen_binary_unavailable'],
+  ['checks', 'Checking the selected model took too long on this computer. Close other apps, then try again.', 'runtime_qualification_timeout'],
+  ['checks', 'Your server did not accept this computer’s result for the selected model. Try again. If it keeps happening, update Frameleaf on this computer and on your server.', 'worker_qualification_refused'],
+  ['renewing', 'Your server asked this computer to check its models again. Frameleaf does that by itself.', 'worker_qualification_restart'],
+  ['renewing', 'Your server is busy checking other computers. Frameleaf asks again by itself.', 'worker_challenge_busy'],
+  ['', 'Your server changed which AI models it uses. This computer is setting up the new ones by itself.', 'worker_models_changed'],
+  ['removed', 'Your server no longer accepts this computer for AI processing. Ask the person who runs your server to allow this computer again. If this computer’s date and time are wrong, correct them first.', 'worker_device_refused'],
+  ['setup-mismatch', 'Your sign-in to your server has ended, so AI processing stopped. Sign out and sign in again.', 'worker_sign_in_required'],
   // FD-37: only logged; setup continues without the receipt.
   ['', 'Frameleaf could not save the record of this computer’s AI checks. AI processing continues.', 'worker_qualification_evidence_mismatch worker_qualification_evidence_encode_failed worker_qualification_evidence_write_failed'],
   ['renewing', 'This computer’s approval for AI work ran out or changed. Try again to renew it.', 'worker_qualification_changed_or_expired worker_qualification_association_changed_or_expired worker_qualified_runtime_changed_or_expired worker_task_qualification_changed worker_challenge_association_changed worker_session_renewal_required worker_lease_expired worker_lease_lost worker_lease_refused worker_session_rejected worker_policy_changed worker_execution_deadline'],
@@ -369,7 +382,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['', 'The graphics card could not run the selected model, so this computer uses its processor instead.', 'runtime_provider_unavailable'],
   ['', 'The AI runtime in this copy of Frameleaf is not signed by Frameleaf, so your server won’t use it. Install Frameleaf from frameleaf.com, then try again.', 'worker_runtime_unsigned'],
   ['', 'Your server did not accept this computer’s model check. Update Frameleaf on this computer and on your server, then try again.', 'worker_qualification_report_refused'],
-  ['', 'There isn’t enough free disk space for the selected AI models. Free up disk space, then try again. Photos remain available.', 'model_disk_space_insufficient'],
+  ['storage', 'There isn’t enough free disk space for the selected AI models. Free up disk space, then try again. Photos remain available.', 'model_disk_space_insufficient'],
   // ---- AI processing: why it is paused ----
   ['not-enabled', 'Your server is not using computers for AI processing right now. This computer checks again every few minutes.', 'worker_policy_required'],
   ['network', 'AI processing runs only on your server’s home network. This computer checks again every few minutes and when its network changes.', 'worker_lan_required'],
@@ -582,6 +595,8 @@ export function workerReason(code: string | null | undefined): WorkerReason | nu
   if (Object.hasOwn(workerReasons, code)) return workerReasons[code]!;
   const family = shared.get(code);
   if (family) return family[0] || null;
+  // A failing or busy server (any 5xx) is waited out like one that does not answer.
+  if (/^server_http_5\d\d$/.test(code)) return 'network';
   for (const prefix of ['workload_', 'resource_']) if (code.startsWith(prefix)) return workerReason(code.slice(prefix.length));
   return null;
 }
