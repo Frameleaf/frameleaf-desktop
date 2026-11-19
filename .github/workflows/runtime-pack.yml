@@ -4,8 +4,24 @@ on:
     paths:
       - 'tools/build_runtime.py'
       - 'tools/test_build_runtime.py'
+      - 'tools/build_coreml_observer.py'
+      - 'tools/smoke_accelerated_runtime.py'
+      - 'tools/smoke_cpu_runtime.py'
+      - 'tools/qualify_runtime_models.py'
+      - 'tools/check_macos_minimum.py'
+      - 'packaging/macos/minimum-versions.json'
+      - 'tools/linked_libraries.py'
+      - 'tools/pe_imports.py'
+      - 'tools/check_windows_cuda_libraries.py'
+      - 'tools/test_check_windows_cuda_libraries.py'
+      - 'tools/qualify_windows_cuda.ps1'
+      - 'tools/test_qualify_windows_cuda.ps1'
+      - 'tools/check_runtime_gate.py'
+      - '.github/workflows/windows-cuda-hardware.yml'
+      - 'native/**'
       - 'runtime/**'
       - 'src-tauri/src/native_runtime.rs'
+      - 'src-tauri/src/native_runtime/**'
       - 'src-tauri/src/runtime_store.rs'
       - 'src-tauri/src/process_tree.rs'
       - '.github/workflows/runtime-pack.yml'
@@ -20,7 +36,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-24.04]
+        # The same Linux image the factory builds the runtime on (tools/release_inputs.mjs).
+        os: [macos-latest, windows-latest, ubuntu-22.04]
+        # Forgejo has no Ubuntu 22.04 runner, and runs Windows only when dispatched (the owner's PC).
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && github.event_name != 'workflow_dispatch' && 'windows-latest' || 'none' }}
+          - os: ${{ github.server_url != 'https://github.com' && 'ubuntu-22.04' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -31,12 +52,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           ref: 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8
           path: server
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: '3.12'
+      - uses: ./desktop/.github/actions/python
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
         with:
           version: '0.11.2'
@@ -56,8 +77,42 @@ jobs:
         run: python -m unittest discover -s desktop/tools -p 'test_*.py'
       - name: Construct and relocate the locked private runtime
         run: python desktop/tools/build_runtime.py --source server --output candidate --revision 94d52a8244da0edfa9f680a3b357fdccbc0ad7e8 --epoch 6
+      - name: Check no Linux runtime binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/check_linux_glibc.py --max 2.35 candidate/payload | tee -a "$GITHUB_STEP_SUMMARY"
+      # FD-71: the processor pack's interpreter, started in the app's gate with the pipe held open
+      # as the app holds it, must import onnxruntime and use its standard input (it hung on Windows).
+      - name: Start the processor pack as the app starts it
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate/payload/python/python.exe -I -B desktop/tools/check_runtime_gate.py | tee -a "$GITHUB_STEP_SUMMARY"
+      # FD-52: the accelerated pack (processor and CoreML manifests over one payload) must build on
+      # the hosted Apple Silicon runner; it is not signed, published or run on a GPU here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        with:
+          repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
+          path: coreml-server
+          persist-credentials: false
+      - name: Construct the CoreML pack with its device collector
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile coreml-ort
+          test -s coreml-candidate/manifest.json
+          test -s coreml-candidate/manifest-accelerated.json
+          coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
       - name: Retain private validation receipts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: cpu-runtime-receipts-${{ runner.os }}
           path: |
@@ -69,10 +124,232 @@ jobs:
           if-no-files-found: error
       - name: Retain private failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: cpu-runtime-failure-${{ runner.os }}
           path: .candidate.error.log
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 3
+  # FD-6: the Intel macOS processor pack must build on the factory's Intel image from the source
+  # the factory builds, with the one wheel `targetPins` names in place of the locked onnxruntime
+  # (which publishes no Intel macOS wheel), and run a model. Nothing is signed or published here.
+  intel-macos:
+    # Not available on Forgejo, which has no Intel Mac runner.
+    if: github.server_url == 'https://github.com'
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - id: source
+        name: The source the factory builds the processor pack from
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(python -c "import json; print(json.load(open('desktop/runtime/profiles.json'))['profiles']['cpu-ort']['sourceRevision'])")"
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          ref: ${{ steps.source.outputs.revision }}
+          path: server
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Construct the Intel pack and run a model with it
+        shell: bash
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          python -m unittest discover -s desktop/tools -p 'test_build_runtime.py'
+          python desktop/tools/build_runtime.py --source server --output candidate --revision "$SOURCE_REVISION" --epoch 6
+          python - <<'PY'
+          import json
+          manifest = json.load(open("candidate/manifest.json"))
+          assert (manifest["platform"], manifest["architecture"], manifest["provider"]) == ("macos", "x86_64", "CPUExecutionProvider"), manifest
+          print(json.dumps(json.load(open("candidate/payload/provenance.json")), indent=2))
+          PY
+          grep -A1 '^onnxruntime==' candidate/payload/requirements.txt
+          candidate/payload/python/bin/python3.12 -I -B desktop/tools/smoke_cpu_runtime.py x86_64 | tee -a "$GITHUB_STEP_SUMMARY"
+      # The older onnxruntime must still give the catalogue's expected output for real models:
+      # the smallest of each kind (text recognition, faces, search) is staged and qualified as the app does.
+      - name: Qualify catalogue models with the Intel pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python desktop/tools/qualify_runtime_models.py candidate "$RUNNER_TEMP/qualification" PP-OCRv5_mobile buffalo_s ViT-B-32__openai | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check no Intel runtime binary needs a newer macOS than the AI runtime minimum
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The checker reads a `native-runtime` folder as the AI runtime pack.
+          mkdir native-runtime
+          cp -R candidate/payload native-runtime/payload
+          python desktop/tools/check_macos_minimum.py --report macos-minimum.json native-runtime | tee -a "$GITHUB_STEP_SUMMARY"
+          cat macos-minimum.json
+      - name: Retain private validation receipts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: cpu-runtime-receipts-macOS-x86_64
+          path: |
+            candidate/manifest.json
+            candidate/payload/provenance.json
+            candidate/payload/requirements.txt
+            candidate/payload/build-requirements.txt
+            macos-minimum.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: cpu-runtime-failure-macOS-x86_64
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3
+  # FD-56: the CUDA and OpenVINO packs must build from the locked source on the hosted Windows and
+  # Linux runners and load their provider. Nothing is signed, published or run on a GPU here.
+  accelerated:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+        profile: [cuda-ort, openvino-ort]
+        # On Forgejo, Windows runs only when dispatched: the runner is the owner's PC.
+        exclude:
+          - os: ${{ github.server_url != 'https://github.com' && github.event_name != 'workflow_dispatch' && 'windows-latest' || 'none' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
+          path: server
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - name: Construct the accelerated pack and load its provider
+        shell: bash
+        env:
+          RUNTIME_PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          python desktop/tools/build_runtime.py --source server --output candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile "$RUNTIME_PROFILE"
+          test -s candidate/manifest.json
+          test -s candidate/manifest-accelerated.json
+          case "$RUNTIME_PROFILE" in
+            cuda-ort) provider=CUDAExecutionProvider ;;
+            openvino-ort) provider=OpenVINOExecutionProvider ;;
+          esac
+          if [ "$RUNNER_OS" = Windows ]; then python=candidate/payload/python/python.exe; else python=candidate/payload/python/bin/python3.12; fi
+          du -sh candidate/payload || true
+          # FD-60: a downloaded pack restores exactly these bits from its signed delivery manifest.
+          if [ "$RUNNER_OS" != Windows ]; then
+            echo "Payload files with an executable bit: $(find candidate/payload -type f -perm -u+x | wc -l) of $(find candidate/payload -type f | wc -l)"
+            find candidate/payload -type f -perm -u+x ! -name '*.so' ! -name '*.so.*' | sort
+          fi
+          "$python" -I -B desktop/tools/smoke_accelerated_runtime.py "$provider"
+      - name: Retain private failure diagnostics
+        if: failure()
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: accelerated-runtime-failure-${{ runner.os }}-${{ matrix.profile }}
+          path: .candidate.error.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 3
+  # FD-63: what can be known about Windows CUDA without a card, on the hosted Windows Server 2022
+  # image. The hardware script (tools/qualify_windows_cuda.ps1) runs here as a rehearsal: it builds
+  # the shipped cuda-ort pack, moves it to a folder as deep as an installed one with a space and
+  # non-ASCII characters, and fails if an NVIDIA library the CUDA provider or a bundled library
+  # needs is missing from the pack or is not found the way the app starts the runtime. The
+  # processor must qualify every profile from that folder and CUDA must be refused cleanly.
+  # A rehearsal never shows CUDA working: .github/workflows/windows-cuda-hardware.yml does that.
+  windows-cuda-libraries:
+    # Not available on Forgejo: it works in %LOCALAPPDATA%, and Forgejo's Windows runner is the owner's PC.
+    if: github.server_url == 'https://github.com'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: desktop
+          persist-credentials: false
+      - name: The runtime source revision the app ships for CUDA
+        id: source
+        shell: pwsh
+        run: |
+          $revision = (Get-Content -Raw desktop/runtime/profiles.json | ConvertFrom-Json).profiles.'cuda-ort'.sourceRevision
+          if ($revision -notmatch '^[a-f0-9]{40}$') { throw 'no cuda-ort source revision' }
+          "revision=$revision" | Add-Content -Encoding UTF8 $env:GITHUB_OUTPUT
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          ref: ${{ steps.source.outputs.revision }}
+          path: server
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.11.2'
+          enable-cache: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Rust stable
+        shell: pwsh
+        run: rustup update stable; if ($LASTEXITCODE -ne 0) { exit 1 }; rustup default stable; exit $LASTEXITCODE
+      - name: The hardware script is valid in Windows PowerShell 5.1 as well
+        shell: powershell
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\desktop\tools\qualify_windows_cuda.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count) { $errors | Out-Host; exit 1 }
+      # The evidence folder is emptied only when it is safe, junctions included, in both PowerShells.
+      - name: The hardware script's evidence folder checks (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./desktop/tools/test_qualify_windows_cuda.ps1
+      - name: The hardware script's evidence folder checks (PowerShell 7)
+        shell: pwsh
+        run: ./desktop/tools/test_qualify_windows_cuda.ps1
+      - name: Rehearse the hardware run without a card (libraries, paths, processor qualification, CUDA refusal)
+        shell: pwsh
+        run: ./desktop/tools/qualify_windows_cuda.ps1 -ServerSource "$env:GITHUB_WORKSPACE\server" -Work "$env:LOCALAPPDATA\fl" -Output "$env:GITHUB_WORKSPACE\evidence" -WithoutGpuRehearsal
+      - name: Keep the evidence
+        if: always()
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: windows-cuda-libraries-evidence
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 14

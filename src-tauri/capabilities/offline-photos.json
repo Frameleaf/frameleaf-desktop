@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "offline-photos",
+  "description": "Only the local offline document in the Photos window can request cached albums.",
+  "local": true,
+  "windows": ["photos"],
+  "permissions": [
+    "allow-offline-album-status",
+    "allow-offline-album-original",
+    "allow-offline-album-save-original",
+    "allow-offline-album-close-media",
+    "allow-offline-album-remove",
+    "allow-offline-album-cancel",
+    "allow-offline-album-browse-library"
+  ]
+}

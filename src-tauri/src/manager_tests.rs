@@ -579,3 +579,489 @@ fn manager_http_login_and_browser_calls_use_an_explicit_session_header() {
     });
     server.join().unwrap();
 }
+
+/// Answers one local HTTP connection per raw response, then stops.
+fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for response in responses {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            // A client that stops at its size limit may close before the whole body is written.
+            let _ = socket.write_all(response.as_bytes());
+        }
+    });
+    (origin, server)
+}
+fn http(status: &str, headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+async fn answer<T: DeserializeOwned>(response: String, limit: usize) -> Result<T, String> {
+    let (origin, server) = serve(vec![response]);
+    let received = manager_client(&origin, None, None)
+        .unwrap()
+        .post(&origin)
+        .send()
+        .await
+        .unwrap();
+    let result = reply_limit(received, limit).await;
+    server.join().unwrap();
+    result
+}
+
+#[test]
+fn removing_a_pairing_clears_local_state_even_when_manager_is_unreachable() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unreachable = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    tauri::async_runtime::block_on(async {
+        let forgotten = std::cell::Cell::new(0);
+        let forget = || {
+            forgotten.set(forgotten.get() + 1);
+            Ok(())
+        };
+        let mut stale = saved();
+        stale.origin = unreachable;
+        assert_eq!(
+            remove(Some(stale), "synthetic password".into(), forget).await,
+            Ok(false)
+        );
+        // Without a password, or with a record that could not be read, removal stays local.
+        assert_eq!(
+            remove(Some(saved()), String::new(), forget).await,
+            Ok(false)
+        );
+        assert_eq!(
+            remove(None, "synthetic password".into(), forget).await,
+            Ok(false)
+        );
+        assert_eq!(forgotten.get(), 3);
+
+        let session = format!("X-Frameleaf-Manager-Session: {}\r\n", "a".repeat(64));
+        let (origin, server) = serve(vec![
+            http(
+                "200 OK",
+                &session,
+                &json!({"csrf":"c".repeat(64)}).to_string(),
+            ),
+            http("200 OK", "", r#"{"revoked":true}"#),
+            http("200 OK", "", "{}"),
+        ]);
+        let mut reachable = saved();
+        reachable.origin = origin;
+        assert_eq!(
+            remove(Some(reachable), "synthetic password".into(), forget).await,
+            Ok(true)
+        );
+        server.join().unwrap();
+        assert_eq!(forgotten.get(), 4);
+
+        // Only a credential store that cannot delete the record keeps the pairing.
+        assert_eq!(
+            remove(Some(saved()), String::new(), || Err(
+                "credential_store_locked_or_unavailable".into()
+            ))
+            .await
+            .unwrap_err(),
+            "credential_store_locked_or_unavailable"
+        );
+    });
+}
+
+#[test]
+fn pairing_requires_https_only_for_a_manager_beyond_the_home_network() {
+    for origin in [
+        "http://203.0.113.10",
+        "http://203.0.113.10:2282",
+        "http://manager.example.com:2282",
+        "http://localhost.example.test",
+        "http://[2001:db8::1]:2282",
+    ] {
+        assert_eq!(
+            require_encrypted(origin).unwrap_err(),
+            "manager_https_required",
+            "{origin}"
+        );
+    }
+    for origin in [
+        "http://127.0.0.1",
+        "http://127.0.0.1:2282",
+        "http://[::1]:2282",
+        "http://localhost:2282",
+        // The home network: no certificate can be issued for these.
+        "http://192.168.1.10",
+        "http://192.168.1.10:2282",
+        "http://10.0.0.5:2282",
+        "http://172.16.4.2:2282",
+        "http://169.254.10.20:2282",
+        "http://100.100.20.30:2282",
+        "http://tower.local:2282",
+        "http://tower:2282",
+        "http://nas.lan:2282",
+        "http://nas.home.arpa:2282",
+        "http://tower.tailnet.ts.net:2282",
+        "http://[fd12:3456::1]:2282",
+        "http://127.0.0.2:2282",
+        "https://192.168.1.10",
+        "https://manager.test:9443",
+    ] {
+        assert_eq!(require_encrypted(origin), Ok(()), "{origin}");
+    }
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let loopback = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    tauri::async_runtime::block_on(async {
+        let attempt = |origin: String| async move {
+            pair(
+                &identity(),
+                &origin,
+                "synthetic password".into(),
+                None,
+                false,
+                |_| panic!("nothing is saved"),
+            )
+            .await
+            .err()
+            .unwrap()
+        };
+        // Refused before any password leaves this computer.
+        assert_eq!(
+            attempt("http://203.0.113.10".into()).await,
+            "manager_https_required"
+        );
+        assert_eq!(
+            attempt(loopback).await,
+            "manager_unreachable_or_certificate_invalid"
+        );
+    });
+}
+
+#[test]
+fn an_unknown_operation_kind_does_not_hide_the_rest_of_the_status() {
+    let saved = saved();
+    let operation = |kind: &str| json!({"id":Uuid::new_v4(),"kind":kind,"state":"running","step":null,"completed":[],"error":null,"createdAt":1700000000000u64,"updatedAt":1700000000000u64});
+    let status = json!({"manager":{"id":saved.manager_id,"origin":saved.origin},"installation":{"id":saved.installation_id,"name":"Fixture","release":"frameleaf-v3.0.0-1","port":2283},"operations":[operation("move-library"),operation("stop")]});
+    let reply = validate_reply(&saved, &Command::Status {}, status).unwrap();
+    assert_eq!(reply["operations"][0]["kind"], "other");
+    assert_eq!(reply["operations"][1]["kind"], "stop");
+    assert_eq!(reply["installation"]["name"], "Fixture");
+}
+
+#[test]
+fn manager_error_codes_pass_through_without_private_text() {
+    let id = Uuid::new_v4();
+    let failed = |error: &str| {
+        let operation = json!({"id":id,"kind":"backup","state":"failed","step":null,"completed":[],"error":error,"createdAt":1700000000000u64,"updatedAt":1700000000000u64});
+        validate_reply(&saved(), &Command::Operation { id }, operation).unwrap()["error"].clone()
+    };
+    assert_eq!(failed("repository_locked"), "repository_locked");
+    assert_eq!(failed("recovery_key_required"), "recovery_key_required");
+    assert_eq!(failed(&"c".repeat(40)), "manager_operation_failed");
+    tauri::async_runtime::block_on(async {
+        let refused = |code: &str| {
+            let body = json!({ "code": code }).to_string();
+            async move {
+                answer::<Value>(http("409 Conflict", "", &body), REPLY_LIMIT)
+                    .await
+                    .unwrap_err()
+            }
+        };
+        assert_eq!(
+            refused("desktop_operation_not_authorized").await,
+            "desktop_operation_not_authorized"
+        );
+        assert_eq!(
+            refused("operation_in_progress").await,
+            "manager_operation_in_progress"
+        );
+        // Desktop's own codes drive its interface, and free text is never shown.
+        for code in ["manager_device_changed", "Read /private/data failed", ""] {
+            assert_eq!(refused(code).await, "manager_request_failed", "{code}");
+        }
+    });
+}
+
+#[test]
+fn clock_skew_is_reported_as_clock_skew() {
+    let fixture: Value = serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+    let approval: Pairing = serde_json::from_value(fixture["pairing"].clone()).unwrap();
+    // The approval is valid from 1700000000000 for five minutes.
+    for now in [1700000000000 - WINDOW - 1, 1700000300000] {
+        assert_eq!(
+            validate_pairing(
+                &approval,
+                &identity(),
+                "https://manager.test:9443",
+                now,
+                &SCOPES
+            )
+            .unwrap_err(),
+            "manager_clock_skew"
+        );
+    }
+    let date = Some("Thu, 01 Jan 2015 00:00:00 GMT");
+    assert!(clock_skewed(date, 1420070400000 + WINDOW));
+    assert!(clock_skewed(date, 1420070400000 - WINDOW));
+    assert!(!clock_skewed(date, 1420070400000 + 30_000));
+    assert!(!clock_skewed(None, 1420070400000));
+    tauri::async_runtime::block_on(async {
+        let refused = |headers: &'static str| async move {
+            let body = r#"{"code":"desktop_grant_invalid"}"#;
+            answer::<Value>(http("401 Unauthorized", headers, body), REPLY_LIMIT)
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(
+            refused("Date: Thu, 01 Jan 2015 00:00:00 GMT\r\n").await,
+            "manager_clock_skew"
+        );
+        assert_eq!(refused("").await, "manager_pair_again");
+    });
+}
+
+#[test]
+fn list_and_status_replies_may_exceed_the_small_reply_limit() {
+    let body = json!("a".repeat(200_000)).to_string();
+    tauri::async_runtime::block_on(async {
+        assert_eq!(
+            answer::<Value>(http("200 OK", "", &body), REPLY_LIMIT)
+                .await
+                .unwrap_err(),
+            "manager_response_too_large"
+        );
+        assert!(answer::<Value>(http("200 OK", "", &body), LIST_LIMIT)
+            .await
+            .is_ok());
+        let body = json!("a".repeat(LIST_LIMIT)).to_string();
+        assert_eq!(
+            answer::<Value>(http("200 OK", "", &body), LIST_LIMIT)
+                .await
+                .unwrap_err(),
+            "manager_response_too_large"
+        );
+    });
+}
+
+#[test]
+fn the_runtime_request_is_bound_to_its_nonce_and_never_comes_from_the_interface() {
+    let nonce = uuid::Uuid::parse_str("66666666-6666-4666-8666-666666666666").unwrap();
+    let prepared = prepare(
+        &saved(),
+        &identity(),
+        &Command::Runtime { nonce },
+        1700000000000,
+        "55555555-5555-4555-8555-555555555555",
+    )
+    .unwrap();
+    assert_eq!(prepared.path, "/manager-api/desktop/runtime");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prepared.body).unwrap(),
+        json!({"nonce":"66666666-6666-4666-8666-666666666666"})
+    );
+    assert_eq!(
+        prepare(
+            &saved(),
+            &identity(),
+            &Command::Runtime {
+                nonce: uuid::Uuid::nil()
+            },
+            1700000000000,
+            "55555555-5555-4555-8555-555555555555",
+        )
+        .err()
+        .unwrap(),
+        "manager_request_invalid"
+    );
+    assert!(serde_json::from_value::<Command>(
+        json!({"kind":"runtime","nonce":"66666666-6666-4666-8666-666666666666"})
+    )
+    .is_err());
+
+    let command = Command::Runtime { nonce };
+    let reply = |patch: &dyn Fn(&mut Value)| {
+        let mut value = json!({
+            "protocolVersion":1,"nonce":nonce.to_string(),"installationId":"aaaaaaaaaaaa",
+            "capabilities":["runtime-status","ports","tls-rotation"],
+            "ports":{"manager":9443,"api":2283,"database":54329},
+            "photoServer":{"state":"running"}
+        });
+        patch(&mut value);
+        validate_reply(&saved(), &command, value)
+    };
+    assert!(reply(&|_| {}).is_ok());
+    // A later Manager may say more; what is read stays exact.
+    assert!(reply(&|value| value["later"] = json!({"anything":true})).is_ok());
+    assert!(reply(&|value| value["photoServer"] =
+        json!({"state":"unknown","code":"native_database_maintenance"}))
+    .is_ok());
+    for patch in [
+        (&|value: &mut Value| value["nonce"] = json!("77777777-7777-4777-8777-777777777777"))
+            as &dyn Fn(&mut Value),
+        &|value| value["installationId"] = json!("bbbbbbbbbbbb"),
+        &|value| value["protocolVersion"] = json!(2),
+        &|value| value["photoServer"]["state"] = json!("serving"),
+        &|value| value["photoServer"] = json!({"state":"unknown","code":"A sentence, not a code."}),
+        &|value| value["ports"]["api"] = json!(0),
+        &|value| value["ports"]["api"] = json!(70000),
+        &|value| {
+            value.as_object_mut().unwrap().remove("photoServer");
+        },
+        &|value| {
+            value.as_object_mut().unwrap().remove("ports");
+        },
+        &|value| {
+            value.as_object_mut().unwrap().remove("nonce");
+        },
+        &|value| value["capabilities"] = json!("ports"),
+    ] {
+        assert_eq!(reply(patch).err().unwrap(), "manager_response_invalid");
+    }
+}
+
+#[test]
+fn a_saved_grant_follows_only_its_own_local_manager_to_a_new_port_or_certificate() {
+    let fixture: Value = serde_json::from_str(include_str!("manager_wire.json")).unwrap();
+    let pem = fixture["certificatePem"].as_str().unwrap();
+    let mint = || {
+        crate::manager_tls::TlsIdentity::load_or_create(
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9443",
+            || Ok(None),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .certificate()
+        .to_owned()
+    };
+    let (renewed, stranger) = (mint(), mint());
+    let local = |origin: &str, certificate: Option<&str>| -> SavedManager {
+        let mut value = serde_json::to_value(saved()).unwrap();
+        value["origin"] = json!(origin);
+        value["certificatePem"] = json!(certificate);
+        serde_json::from_value(value).unwrap()
+    };
+    let default = "https://127.0.0.1:9443";
+    // A moved port, same certificate.
+    let mut grant = local(default, Some(pem));
+    assert!(grant.follow_local("aaaaaaaaaaaa", "https://127.0.0.1:9444", pem, None));
+    assert_eq!(grant.view().origin, "https://127.0.0.1:9444");
+    assert_eq!(
+        grant.view().certificate_sha256,
+        Some(certificate_fingerprint(pem).unwrap())
+    );
+    // A renewed certificate, only when it replaced the pinned one.
+    let mut grant = local(default, Some(pem));
+    assert!(grant.follow_local("aaaaaaaaaaaa", default, &renewed, Some(pem)));
+    assert_eq!(
+        grant.view().certificate_sha256,
+        Some(certificate_fingerprint(&renewed).unwrap())
+    );
+    // Already in step: nothing to write.
+    assert!(!grant.follow_local("aaaaaaaaaaaa", default, &renewed, Some(pem)));
+    assert!(!grant.follow_local("aaaaaaaaaaaa", default, &renewed, None));
+    // Never: another installation, a certificate that did not replace the pinned one, a
+    // grant with no pinned certificate, or an origin that is not this computer's loopback.
+    for (mut grant, installation, origin, certificate, replaced) in [
+        (
+            local(default, Some(pem)),
+            "bbbbbbbbbbbb",
+            "https://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            default,
+            renewed.as_str(),
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            default,
+            renewed.as_str(),
+            Some(stranger.as_str()),
+        ),
+        (
+            local(default, None),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local("https://manager.test:9443", Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local("https://192.168.1.20:9443", Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9443",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://[::1]:9443",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            "http://127.0.0.1:9444",
+            pem,
+            None,
+        ),
+        (
+            local(default, Some(pem)),
+            "aaaaaaaaaaaa",
+            "https://127.0.0.1:9444",
+            "not a certificate",
+            None,
+        ),
+    ] {
+        let before = serde_json::to_value(&grant).unwrap();
+        assert!(!grant.follow_local(installation, origin, certificate, replaced));
+        assert_eq!(serde_json::to_value(&grant).unwrap(), before);
+    }
+}
+#[test]
+fn polling_is_sized_from_managers_request_allowance() {
+    // Polling that never ends spends half of what Manager allows in one of its windows.
+    assert_eq!(POLL_STEADY, Duration::from_secs(10));
+    let steady = PAIRED_WINDOW.as_millis() / POLL_STEADY.as_millis();
+    assert_eq!(steady as u64 * 2, PAIRED_REQUESTS);
+    assert_eq!(poll_delay(0), POLL_FIRST);
+    assert_eq!(poll_delay(2), Duration::from_secs(1));
+    assert!([3, 16, 17, 64, u32::MAX]
+        .into_iter()
+        .all(|asked| poll_delay(asked) <= POLL_STEADY));
+}
+#[test]
+fn a_retry_after_is_read_only_as_whole_seconds() {
+    let headers = |value: &str| {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+        headers
+    };
+    assert_eq!(retry_after(&headers("30")), Some(Duration::from_secs(30)));
+    for unread in ["soon", "-1", "1.5", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+        assert_eq!(retry_after(&headers(unread)), None);
+    }
+    assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+}

@@ -1,13 +1,22 @@
 [package]
 name = "frameleaf-desktop"
-version = "0.1.0"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.90"
 default-run = "frameleaf-desktop"
 
+[workspace]
+# The backup engine is its own crate so it builds and tests without Tauri; listed in default-members so
+# `cargo test`, `cargo clippy` and `cargo fmt` here cover it too.
+members = ["backup-core"]
+default-members = [".", "backup-core"]
+
 [lib]
 name = "frameleaf_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+qualify-windows-media-move = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,34 +28,46 @@ cc = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "stream", "blocking"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 ed25519-dalek = "2"
 rand = "0.8"
 base64 = "0.22"
 flate2 = "1"
 url = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+frameleaf-backup-core = { path = "backup-core" }
 sha2 = "0.10"
+sha1 = "0.10"
+ring = "0.17"
 zeroize = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync", "time", "macros"] }
-time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "net"] }
+time = { version = "0.3", features = ["parsing", "formatting", "local-offset"] }
 
 tauri-plugin-single-instance = "2"
 serde_json_canonicalizer = "=0.3.2"
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# Already in the tree through reqwest; used directly to read the certificate a local listener presents.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tauri-plugin-dialog = "=2.8.3"
 tauri-plugin-opener = "=2.7.2"
 mdns-sd = "=0.13.11"
 cap-std = "3"
+zip = { version = "=9.3.0", default-features = false }
 tauri-plugin-updater = "=2.14.1"
+tauri-plugin-notification = "=2.6.0"
+
+[dev-dependencies]
+# Paused time, for tests of waits too long to sit through.
+tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Com", "Win32_System_IO", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_CloudFilters", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Power", "Win32_System_SystemInformation"] }
-windows = { version = "0.62", features = ["Networking_Connectivity", "Win32_System_WinRT"] }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Com", "Win32_System_IO", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_CloudFilters", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Power", "Win32_System_Shutdown", "Win32_System_SystemInformation"] }
+windows = { version = "0.62", features = ["Security_Credentials_UI", "Foundation", "Networking_Connectivity", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

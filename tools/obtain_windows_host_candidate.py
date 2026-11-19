@@ -12,7 +12,7 @@ from build_host_ffmpeg import unpack
 from build_runtime import BuildError, regular
 from obtain_host_component import obtain as obtain_component, validate_approval
 
-SOURCE_REVISION = 'c64039743af7bb0d68b602ff842683906019de52'
+SOURCE_REVISION = '9f22a57adb7a271d97ead305103c094fb3d25ad2'
 
 
 def obtain(approved: dict, output: Path) -> None:

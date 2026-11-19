@@ -1,4 +1,6 @@
-use crate::connection::DeviceIdentity;
+use crate::connection::{photo_session_scope, DeviceIdentity, SavedConnection};
+#[cfg(any(not(target_os = "macos"), test))]
+use crate::credential_parts::Slots;
 use crate::worker::{persist_checkpoint, SavedWorker};
 #[cfg(any(not(target_os = "macos"), test))]
 use keyring::{Entry, Error};
@@ -6,6 +8,7 @@ use keyring::{Entry, Error};
 #[path = "macos_keychain.rs"]
 mod macos;
 use serde::{de::DeserializeOwned, Serialize};
+use std::borrow::Cow;
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
@@ -29,7 +32,7 @@ fn worker_lock(account: &str) -> Result<Option<MutexGuard<'static, ()>>, String>
 const SERVICE: &str = "app.frameleaf.desktop";
 pub fn load<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
     let _lock = worker_lock(account)?;
-    load_record(account)
+    load_record(&source_account(account)?)
 }
 fn load_record<T: DeserializeOwned>(account: &str) -> Result<Option<T>, String> {
     read_record(account, Prompt::Silent)
@@ -86,18 +89,104 @@ fn read_record<T: DeserializeOwned>(account: &str, prompt: Prompt) -> Result<Opt
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn read_record<T: DeserializeOwned>(account: &str, _prompt: Prompt) -> Result<Option<T>, String> {
-    let entry = Entry::new(SERVICE, account).map_err(|_| "credential_store_unavailable")?;
-    match entry.get_password() {
-        Ok(value) => serde_json::from_str(&Zeroizing::new(value))
-            .map(Some)
-            .map_err(|_| "credential_record_invalid".into()),
-        Err(Error::NoEntry) => Ok(None),
-        Err(_) => Err("credential_store_locked_or_unavailable".into()),
+    let Some(value) = stored(account)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&value)
+        .map(Some)
+        .map_err(|_| "credential_record_invalid".into())
+}
+
+/// The operating system's store, one credential per name.
+#[cfg(any(not(target_os = "macos"), test))]
+struct Keyring;
+#[cfg(any(not(target_os = "macos"), test))]
+impl Slots for Keyring {
+    fn get(&self, name: &str) -> Result<Option<Zeroizing<String>>, String> {
+        let entry = Entry::new(SERVICE, name).map_err(|_| "credential_store_unavailable")?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(Zeroizing::new(value))),
+            Err(Error::NoEntry) => Ok(None),
+            Err(_) => Err("credential_store_locked_or_unavailable".into()),
+        }
     }
+    fn set(&self, name: &str, value: &str) -> Result<(), String> {
+        Entry::new(SERVICE, name)
+            .map_err(|_| "credential_store_unavailable")?
+            .set_password(value)
+            .map_err(|_| "credential_store_locked_or_unavailable".into())
+    }
+    fn delete(&self, name: &str) -> Result<(), String> {
+        match Entry::new(SERVICE, name)
+            .map_err(|_| "credential_store_unavailable")?
+            .delete_credential()
+        {
+            Ok(()) | Err(Error::NoEntry) => Ok(()),
+            Err(_) => Err("credential_store_locked_or_unavailable".into()),
+        }
+    }
+}
+
+// A store for the calling test alone, with the Windows size limit, in place of the real one.
+#[cfg(test)]
+thread_local! {
+    static TEST_STORE: std::cell::RefCell<Option<crate::credential_parts::Memory>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn use_test_store() -> crate::credential_parts::Memory {
+    let store = crate::credential_parts::Memory::default();
+    TEST_STORE.with(|slot| *slot.borrow_mut() = Some(store.clone()));
+    store
+}
+
+// Windows holds 1,280 characters in one credential; longer records are stored in parts there.
+#[cfg(any(not(target_os = "macos"), test))]
+fn stored(account: &str) -> Result<Option<Zeroizing<String>>, String> {
+    #[cfg(test)]
+    if let Some(store) = TEST_STORE.with(|slot| slot.borrow().clone()) {
+        return crate::credential_parts::read(&store, account);
+    }
+    #[cfg(windows)]
+    return crate::credential_parts::read(&Keyring, account);
+    #[cfg(not(windows))]
+    Keyring.get(account)
+}
+#[cfg(any(not(target_os = "macos"), test))]
+fn store(account: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(store) = TEST_STORE.with(|slot| slot.borrow().clone()) {
+        return crate::credential_parts::write(
+            &store,
+            account,
+            value,
+            crate::credential_parts::LIMIT,
+        );
+    }
+    #[cfg(windows)]
+    return crate::credential_parts::write(
+        &Keyring,
+        account,
+        value,
+        crate::credential_parts::LIMIT,
+    );
+    #[cfg(not(windows))]
+    Keyring.set(account, value)
+}
+#[cfg(any(not(target_os = "macos"), test))]
+fn remove(account: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(store) = TEST_STORE.with(|slot| slot.borrow().clone()) {
+        return crate::credential_parts::delete(&store, account);
+    }
+    #[cfg(windows)]
+    return crate::credential_parts::delete(&Keyring, account);
+    #[cfg(not(windows))]
+    Keyring.delete(account)
 }
 pub fn save<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     let _lock = worker_lock(account)?;
-    save_record(account, value)
+    save_record(&source_account(account)?, value)
 }
 fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     let data =
@@ -105,24 +194,90 @@ fn save_record<T: Serialize>(account: &str, value: &T) -> Result<(), String> {
     #[cfg(all(target_os = "macos", not(test)))]
     return macos::write(account, data.as_bytes());
     #[cfg(any(not(target_os = "macos"), test))]
-    Entry::new(SERVICE, account)
-        .map_err(|_| "credential_store_unavailable")?
-        .set_password(&data)
-        .map_err(|_| "credential_store_locked_or_unavailable".into())
+    store(account, &data)
 }
 pub fn delete(account: &str) -> Result<(), String> {
     let _lock = worker_lock(account)?;
+    delete_record(&source_account(account)?)
+}
+
+fn delete_record(account: &str) -> Result<(), String> {
     #[cfg(all(target_os = "macos", not(test)))]
     return macos::delete(account);
     #[cfg(any(not(target_os = "macos"), test))]
-    match Entry::new(SERVICE, account)
-        .map_err(|_| "credential_store_unavailable")?
-        .delete_credential()
-    {
-        Ok(()) | Err(Error::NoEntry) => Ok(()),
-        Err(_) => Err("credential_store_locked_or_unavailable".into()),
-    }
+    remove(account)
 }
+const SOURCE_APPROVALS: [&str; 2] = [
+    crate::source_consent::CREDENTIAL,
+    crate::drop_import::CREDENTIAL,
+];
+
+fn scoped_source_account(account: &str, saved: &SavedConnection) -> String {
+    // Consent is signed for the precise photo session, even when the same account signs in again.
+    format!("{account}-{}", photo_session_scope(saved))
+}
+
+/// Re-read approval without opening the user-presence connection item on the job's hot path.
+pub(crate) fn load_source<T: DeserializeOwned>(
+    account: &str,
+    saved: &SavedConnection,
+) -> Result<Option<T>, String> {
+    if saved.server_id.is_empty() {
+        return load_record(account);
+    }
+    load_record(&scoped_source_account(account, saved))
+}
+
+fn source_account(account: &str) -> Result<Cow<'_, str>, String> {
+    if SOURCE_APPROVALS.contains(&account) {
+        if let Some(saved) = load_record::<SavedConnection>("connection")? {
+            if !saved.server_id.is_empty() {
+                return Ok(Cow::Owned(scoped_source_account(account, &saved)));
+            }
+        }
+    }
+    Ok(Cow::Borrowed(account))
+}
+
+pub(crate) fn migrate_source_approvals(saved: &SavedConnection) -> Result<(), String> {
+    if saved.server_id.is_empty() {
+        return Ok(());
+    }
+    for account in SOURCE_APPROVALS {
+        if let Some(consent) = load_record::<crate::source_consent::Consent>(account)? {
+            if consent.require(saved, &identity()?).is_ok() {
+                let scoped = scoped_source_account(account, saved);
+                if load_record::<crate::source_consent::Consent>(&scoped)?.is_none() {
+                    save_record(&scoped, &consent)?;
+                }
+                delete_record(account)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_source_scope(scope: &str) -> Result<(), String> {
+    if !crate::native_runtime::digest_valid(scope, 64) {
+        return Err("credential_record_invalid".into());
+    }
+    for account in SOURCE_APPROVALS {
+        delete_record(&format!("{account}-{scope}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_source_approvals(saved: Option<&SavedConnection>) -> bool {
+    let mut cleared = true;
+    for account in SOURCE_APPROVALS {
+        if let Some(saved) = saved {
+            cleared &= delete_record(&scoped_source_account(account, saved)).is_ok();
+        }
+        cleared &= delete_record(account).is_ok();
+    }
+    cleared
+}
+
 pub fn identity() -> Result<DeviceIdentity, String> {
     identity_with_prompt(Prompt::Silent)
 }
@@ -259,6 +414,36 @@ fn disposable(github: &str, environment: &str, opt_in: &str) -> Result<(), &'sta
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_limit_tests {
+    use super::*;
+    use crate::credential_parts::{delete, read, write, LIMIT};
+
+    /// The real Credential Manager, under a name of this test's own. Hosted runners only.
+    #[test]
+    fn credential_manager_refuses_a_long_record_whole_and_keeps_it_in_parts() {
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+            return;
+        }
+        let account = format!("test-parts-{}", uuid::Uuid::new_v4());
+        let long = format!("{{\"token\":\"{}\"}}", "t".repeat(6000));
+        assert!(
+            Keyring.set(&account, &long).is_err(),
+            "Windows holds 1,280 characters in one credential"
+        );
+        assert!(Keyring.set(&account, &"t".repeat(LIMIT)).is_ok());
+
+        write(&Keyring, &account, &long, LIMIT).unwrap();
+        assert_eq!(*read(&Keyring, &account).unwrap().unwrap(), long);
+        delete(&Keyring, &account).unwrap();
+        assert!(read(&Keyring, &account).unwrap().is_none());
+        assert!(Keyring
+            .get(&format!("{account}#part-a-0"))
+            .unwrap()
+            .is_none());
+    }
+}
+
 #[cfg(test)]
 mod epoch_enrollment_tests {
     use super::*;
@@ -300,5 +485,67 @@ mod epoch_enrollment_tests {
         .unwrap();
         assert_eq!(result.installation_id, id);
         assert!(finished.get());
+    }
+}
+
+#[cfg(test)]
+mod library_switch_source_scope_tests {
+    use super::*;
+
+    #[test]
+    fn source_approvals_follow_only_the_original_library_account_and_session() {
+        let original = SavedConnection {
+            server: "https://example.invalid/".into(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Fixture".into(),
+            token: "fixture".into(),
+            device_name: "Desktop".into(),
+            mode: "client-worker".into(),
+            device_id: None,
+        };
+        let account = crate::source_consent::CREDENTIAL;
+        let original_key = scoped_source_account(account, &original);
+        let mut different = original.clone();
+        different.server_id = "different-library".into();
+        assert_ne!(scoped_source_account(account, &different), original_key);
+        different.server_id = original.server_id.clone();
+        different.account_id = "different-account".into();
+        assert_ne!(scoped_source_account(account, &different), original_key);
+        different.account_id = original.account_id.clone();
+        different.token = "new-session".into();
+        assert_ne!(scoped_source_account(account, &different), original_key);
+        different.token = original.token.clone();
+        assert_eq!(scoped_source_account(account, &different), original_key);
+    }
+
+    #[test]
+    #[ignore = "uses a process-local synthetic Keychain; run alone"]
+    fn job_rereads_only_its_scoped_approval_when_connection_cannot_be_read() {
+        crate::ml_transport::native_nas_tests::install_test_keyring();
+        let mut saved = SavedConnection {
+            server: "https://example.invalid/".into(),
+            server_id: "server".into(),
+            account_id: "account".into(),
+            name: "Fixture".into(),
+            token: "fixture".into(),
+            device_name: "Desktop".into(),
+            mode: "client-worker".into(),
+            device_id: None,
+        };
+        let account = crate::source_consent::CREDENTIAL;
+        let approval = scoped_source_account(account, &saved);
+        save_record("connection", &"unreadable as a saved connection").unwrap();
+        save_record(&approval, &"signed approval fixture").unwrap();
+        assert!(load::<String>(account).is_err());
+        assert_eq!(
+            load_source::<String>(account, &saved).unwrap().as_deref(),
+            Some("signed approval fixture")
+        );
+        saved.token = "different-token".into();
+        assert!(load_source::<String>(account, &saved).unwrap().is_none());
+        saved.token = "fixture".into();
+        delete_record(&approval).unwrap();
+        assert!(load_source::<String>(account, &saved).unwrap().is_none());
     }
 }

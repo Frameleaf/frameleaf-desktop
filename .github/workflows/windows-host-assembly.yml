@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     env:
-      HOST_SOURCE_REVISION: c64039743af7bb0d68b602ff842683906019de52
+      HOST_SOURCE_REVISION: 9f22a57adb7a271d97ead305103c094fb3d25ad2
       UV_THREADPOOL_SIZE: '1'
       OMP_THREAD_LIMIT: '1'
       GOMAXPROCS: '1'
@@ -31,9 +31,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           ref: ${{ env.HOST_SOURCE_REVISION }}
           path: application-source
           persist-credentials: false
@@ -62,7 +68,7 @@ jobs:
       - name: Assemble and qualify current Windows consumers serially
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           CANDIDATE_EPOCH: ${{ inputs.epoch }}
         run: |
           python tools/build_windows_host.py --source "$env:GITHUB_WORKSPACE/application-source" --approvals "$env:RUNNER_TEMP/host-component-approvals.json" --output "$env:RUNNER_TEMP/windows-complete-host" --epoch $env:CANDIDATE_EPOCH
@@ -87,7 +93,7 @@ jobs:
               for name in ['payload', 'manifest.json', 'qualification.json']:
                   archive.add(candidate / name, arcname=name)
       - name: Retain the unsigned complete-host candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-complete-host-unsigned
           path: ${{ runner.temp }}/windows-complete-host/windows-complete-host.tar.gz
@@ -95,7 +101,7 @@ jobs:
           if-no-files-found: error
       - name: Retain bounded qualification evidence separately
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-complete-host-evidence
           path: |

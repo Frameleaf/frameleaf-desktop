@@ -18,7 +18,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   server:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # On Forgejo only when dispatched: its Windows runner is the owner's PC, so pull requests never run there.
+    if: ${{ (github.server_url == 'https://github.com' || github.event_name == 'workflow_dispatch') && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
     runs-on: windows-2022
     timeout-minutes: 45
     env:
@@ -32,7 +33,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: Frameleaf/frameleaf-app
-          ref: c64039743af7bb0d68b602ff842683906019de52
+          github-server-url: https://github.com
+          token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          ref: 9f22a57adb7a271d97ead305103c094fb3d25ad2
           path: server-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -61,7 +64,7 @@ jobs:
         shell: pwsh
         run: |
           $node = (Get-Command node).Source
-          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision c64039743af7bb0d68b602ff842683906019de52 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
+          python tools/build_host_server.py --source "$env:GITHUB_WORKSPACE/server-source" --revision 9f22a57adb7a271d97ead305103c094fb3d25ad2 --node $node --output "$env:RUNNER_TEMP/fl-windows-server"
           if ($LASTEXITCODE) { throw 'Windows production server qualification failed' }
       - name: Bind and qualify private Windows metadata runtime
         shell: pwsh
@@ -89,7 +92,7 @@ jobs:
           with tarfile.open(temporary / 'windows-server-candidate.tar.gz', 'w:gz') as archive:
               archive.add(metadata, arcname='server-candidate')
       - name: Retain qualified component
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-server-candidate
           path: ${{ runner.temp }}/windows-server-candidate.tar.gz
@@ -97,7 +100,7 @@ jobs:
           if-no-files-found: error
       - name: Retain bounded qualification diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-windows-server-diagnostics
           path: |

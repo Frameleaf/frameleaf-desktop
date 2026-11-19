@@ -5,6 +5,7 @@ use std::{
 };
 
 const REQUIRED: &str = "host_install_windows_profile_required";
+const ROOT: &str = "Frameleaf Desktop Host";
 struct Profile {
     root: PathBuf,
     legacy: PathBuf,
@@ -22,13 +23,11 @@ impl Profile {
     }
     fn prepare(&self) -> Result<(), String> {
         self.no_legacy()?;
-        crate::windows_protection::private_directory(&self.root)?;
-        let mut pins = crate::windows_protection::pin_private_directory(&self.root)?;
+        let mut pins = crate::windows_protection::private_directory_pinned(&self.root)?;
         crate::host_storage::check(&self.root)?;
         let (state, data) = self.paths();
         for path in [state, data] {
-            crate::windows_protection::private_directory(&path)?;
-            pins.extend(crate::windows_protection::pin_private_directory(&path)?);
+            pins.extend(crate::windows_protection::private_directory_pinned(&path)?);
             crate::host_storage::check(&path)?;
         }
         Ok(())
@@ -38,9 +37,12 @@ impl Profile {
         if self.paths() != (state.to_owned(), data.to_owned()) {
             return Err(REQUIRED.into());
         }
+        // The root's admission inspects everything inside it, the state and Manager folders
+        // included, and stays pinned; each of those is then checked as a private root of its
+        // own and pinned, without walking the same tree a second and third time.
         let mut pins = crate::windows_protection::pin_private_directory(&self.root)?;
-        pins.extend(crate::windows_protection::pin_private_directory(state)?);
-        pins.extend(crate::windows_protection::pin_private_directory(data)?);
+        pins.extend(crate::windows_protection::pin_private_child(state)?);
+        pins.extend(crate::windows_protection::pin_private_child(data)?);
         for path in [self.root.as_path(), state, data] {
             crate::host_storage::check(path)?;
         }
@@ -55,7 +57,7 @@ fn discover() -> Result<Profile, String> {
     let base = known_folder()?;
     let sid = crate::windows_protection::process_user_sid()?;
     let profile = Profile {
-        root: base.join("Frameleaf Desktop Host"),
+        root: base.join(ROOT),
         legacy: crate::host_install::windows_profiles_root()?.join(sid),
     };
     profile.no_legacy()?;
@@ -70,7 +72,18 @@ pub(crate) fn paths() -> Result<(PathBuf, PathBuf), String> {
     profile.no_legacy()?;
     Ok(profile.paths())
 }
+/// Where this account's controller state is kept, whether or not a profile exists there or
+/// could be used: for asking what an earlier run left on disk.
+// Its only caller (the update gate in host_setup.rs) is not compiled into test builds.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn state_path() -> Result<PathBuf, String> {
+    Ok(known_folder()?.join(ROOT).join("state"))
+}
 pub(crate) fn admit(state: &Path, data: &Path) -> Result<Vec<fs::File>, String> {
+    #[cfg(feature = "qualify-windows-media-move")]
+    if let Some(pins) = crate::host_state::media_move::qualification::pin_profile(state, data)? {
+        return Ok(pins);
+    }
     discover()?.admit(state, data)
 }
 

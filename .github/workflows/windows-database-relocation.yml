@@ -12,12 +12,15 @@ concurrency:
   cancel-in-progress: false
 jobs:
   qualify:
+    # On Forgejo only when dispatched: its Windows runner is the owner's PC, so pull requests never run there.
+    if: (github.server_url == 'https://github.com' || github.event_name == 'workflow_dispatch')
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # Its fixed approvals name GitHub runs and artifacts, so they are read from GitHub on Forgejo too.
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
@@ -27,14 +30,16 @@ jobs:
       - name: Verify the approved archive and qualify its relocated database
         shell: python
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         run: |
           import json
           import os
           from pathlib import Path
           import shutil
+          import socket
           import subprocess
           import sys
+          import time
           sys.path.insert(0, 'tools')
           from bind_host_raw import read_receipt
           from build_host_bundle import host_entries
@@ -112,6 +117,103 @@ jobs:
               host_fixtures = work / 'host-fixtures'
               host_fixtures.mkdir()
               report['hostEnvironmentChecks'] = qualify(relocated, host_fixtures, lock, env)
+              report['phase'] = 'installed-physical-path-environment'
+              print(report['phase'], flush=True)
+              import ctypes
+              from ctypes import wintypes
+              kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+              kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+              kernel.CreateFileW.restype = wintypes.HANDLE
+              kernel.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR,
+                                                          wintypes.DWORD, wintypes.DWORD]
+              kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+              kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+              kernel.CloseHandle.restype = wintypes.BOOL
+              def physical(path, extended=False):
+                  """Keep device-path tests bound to the original directory's OS identity."""
+                  handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
+                  if handle == ctypes.c_void_p(-1).value:
+                      raise ctypes.WinError(ctypes.get_last_error())
+                  try:
+                      buffer = ctypes.create_unicode_buffer(32768)
+                      count = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 2)
+                      if not 0 < count < len(buffer) or not buffer.value.startswith('\\Device\\'):
+                          raise RuntimeError('Expected an OS-resolved physical device path')
+                      prefix = '\\\\?\\GLOBALROOT' if extended else '\\\\.\\GLOBALROOT'
+                      result = Path(prefix + buffer.value)
+                      if not os.path.samefile(path, result):
+                          raise RuntimeError('Physical directory identity mismatch')
+                      return result
+                  finally:
+                      kernel.CloseHandle(handle)
+              installed_fixtures = work / 'installed-fixtures'
+              create_private_directory(installed_fixtures)
+              create_private_directory(installed_fixtures / 'home')
+              installed_script = ("import fs from 'node:fs/promises'; import {join} from 'node:path';"
+                                  "await fs.mkdir(join(process.argv[2],'fixture-data'),{mode:0o700});" + script)
+              clean_parent = {
+                  'SystemRoot': str(physical(Path(os.environ['SystemRoot']))),
+                  'PATH': '',
+                  'HOME': str(installed_fixtures / 'home'),
+                  'FRAMELEAF_BUILD_ERROR_LOG': str(root / 'command-error.log'),
+              }
+              clean_env = json.loads(run([node, '--input-type=module', '--eval', installed_script,
+                                          physical(host), physical(installed_fixtures, extended=True),
+                                          json.dumps(host_entries())], cwd=work, env=clean_parent))
+              clean_env['FRAMELEAF_BUILD_ERROR_LOG'] = str(root / 'command-error.log')
+              report['installedEnvironmentKeys'] = sorted(clean_env)
+              report['installedSystemDrivePresent'] = 'SystemDrive' in clean_env
+              report['installedEnvironmentChecks'] = qualify(
+                  physical(relocated), physical(installed_fixtures, extended=True), lock, clean_env)
+              report['phase'] = 'installed-direct-postgres-start'
+              print(report['phase'], flush=True)
+              with socket.socket() as listener:
+                  listener.bind(('127.0.0.1', 0))
+                  port = listener.getsockname()[1]
+              data = physical(installed_fixtures / 'fixture-data', extended=True)
+              binary = lambda name: physical(relocated / 'bin' / (name + '.exe'))
+              direct_log = root / 'direct-postgres.log'
+              with direct_log.open('wb') as log:
+                  pg = subprocess.Popen([binary('postgres'), '-D', data, '-h', '127.0.0.1', '-p', str(port)],
+                                        cwd=physical(installed_fixtures, extended=True), env=clean_env,
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                  try:
+                      deadline = time.monotonic() + 30
+                      ready = False
+                      while time.monotonic() < deadline:
+                          if pg.poll() is not None:
+                              log.flush()
+                              if pg.returncode != 1 or 'administrative permissions' not in direct_log.read_text():
+                                  raise RuntimeError('Unexpected direct PostgreSQL exit: ' + str(pg.returncode))
+                              report['installedDirectPostgres'] = 'administrator-token-refused'
+                              break
+                          result = subprocess.run([binary('pg_isready'), '-h', '127.0.0.1', '-p', str(port)],
+                                                  cwd=physical(installed_fixtures, extended=True), env=clean_env,
+                                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=10)
+                          if result.returncode == 0:
+                              ready = True
+                              break
+                          time.sleep(0.1)
+                      if not ready and report.get('installedDirectPostgres') != 'administrator-token-refused':
+                          raise RuntimeError('Direct PostgreSQL readiness timed out')
+                      if ready:
+                          report['installedDirectPostgres'] = 'ready'
+                  finally:
+                      try:
+                          if pg.poll() is None:
+                              subprocess.run([binary('pg_ctl'), '-D', data, '-m', 'fast', '-w', '-t', '20', 'stop'],
+                                             cwd=physical(installed_fixtures, extended=True), env=clean_env,
+                                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
+                          elif ready:
+                              raise RuntimeError('Direct PostgreSQL exited before cleanup: ' + str(pg.returncode))
+                      finally:
+                          try:
+                              pg.wait(timeout=10)
+                          except subprocess.TimeoutExpired:
+                              pg.kill()
+                              pg.wait(timeout=10)
+                              raise RuntimeError('Direct PostgreSQL required forced shutdown')
               report['phase'] = 'database-with-raw-path'
               print(report['phase'], flush=True)
               raw_approved = {
@@ -149,6 +251,11 @@ jobs:
                                          cwd=work, env=env, stdout=log, stderr=log, timeout=15)
               raise
           finally:
+              if 'direct_log' in locals() and direct_log.is_file():
+                  with direct_log.open('rb') as log:
+                      log.seek(max(0, direct_log.stat().st_size - 32768))
+                      tail = log.read(32768)
+                  direct_log.write_bytes(tail)
               try:
                   shutil.rmtree(work)
               except BaseException:
@@ -158,12 +265,13 @@ jobs:
                   (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n')
       - name: Retain bounded evidence without database binaries or private fixtures
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: windows-database-relocation-evidence
           path: |
             ${{ runner.temp }}/database-relocation/qualification.json
             ${{ runner.temp }}/database-relocation/command-error.log
             ${{ runner.temp }}/database-relocation/loader.log
+            ${{ runner.temp }}/database-relocation/direct-postgres.log
           retention-days: 7
           if-no-files-found: ignore

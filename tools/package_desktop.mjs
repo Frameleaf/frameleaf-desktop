@@ -3,7 +3,13 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { verifySignedCandidate } from "./sign_runtime.mjs";
+import { deliveryDirectory, verifyDeliveries } from "./deliver_runtime.mjs";
+import {
+  acceleratedManifest,
+  acceleratedSignature,
+  verifySignedAccelerated,
+  verifySignedCandidate,
+} from "./sign_runtime.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 export async function packageConfiguration(candidate, policy) {
@@ -18,7 +24,8 @@ export async function packageConfiguration(candidate, policy) {
   const profiles = JSON.parse(
     await readFile(join(root, "runtime/profiles.json"), "utf8"),
   );
-  const approved = Object.values(profiles.profiles ?? {}).filter(
+  const approvedFor = (manifest) =>
+    Object.values(profiles.profiles ?? {}).filter(
     (profile) =>
       profile.provider === manifest.provider &&
       (profile.sourceRevision === manifest.sourceRevision ||
@@ -30,8 +37,25 @@ export async function packageConfiguration(candidate, policy) {
           ))) &&
       profile.targets?.includes(`${platform}-${architecture}`),
   );
-  if (profiles.schemaVersion !== 1 || approved.length !== 1)
+  // The optional accelerated manifest shares the payload; the app uses it only when it is
+  // signed, approved for this target and qualifies on the device.
+  const accelerated = await verifySignedAccelerated(candidate, policy);
+  if (accelerated && approvedFor(accelerated.manifest).length !== 1)
     throw new Error("runtime_bundle_source_unapproved");
+  // FD-56: the processor manifest of an accelerated pack is the same payload, so it is built
+  // from the accelerated profile's source; alone, it must be the processor profile's.
+  if (
+    profiles.schemaVersion !== 1 ||
+    !(accelerated
+      ? manifest.sourceRevision === accelerated.manifest.sourceRevision
+      : approvedFor(manifest).length === 1)
+  )
+    throw new Error("runtime_bundle_source_unapproved");
+  const extra = accelerated ? [acceleratedManifest, acceleratedSignature] : [];
+  // FD-60: the signed delivery manifests of the packs the app downloads on demand (CUDA,
+  // OpenVINO). Each is a few kilobytes; the packs themselves are release assets.
+  for (const name of await verifyDeliveries(candidate, manifest, policy))
+    extra.push(`${deliveryDirectory}/${name}`);
   if (platform === "linux") {
     // linuxdeploy rewrites ELF files under usr/lib; keep the signed runtime outside that scan.
     const files = {
@@ -39,6 +63,8 @@ export async function packageConfiguration(candidate, policy) {
       "/usr/share/Frameleaf/native-runtime/manifest.sig": join(candidate, "manifest.sig"),
       "/usr/share/Frameleaf/native-runtime/payload": join(candidate, "payload"),
     };
+    for (const name of extra)
+      files[`/usr/share/Frameleaf/native-runtime/${name}`] = join(candidate, name);
     return { bundle: { linux: { deb: { files }, appimage: { files }, rpm: { files } } } };
   }
   return {
@@ -47,6 +73,9 @@ export async function packageConfiguration(candidate, policy) {
         [join(candidate, "manifest.json")]: "native-runtime/manifest.json",
         [join(candidate, "manifest.sig")]: "native-runtime/manifest.sig",
         [join(candidate, "payload")]: "native-runtime/payload",
+        ...Object.fromEntries(
+          extra.map((name) => [join(candidate, name), `native-runtime/${name}`]),
+        ),
       },
     },
   };

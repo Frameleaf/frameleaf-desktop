@@ -1,11 +1,16 @@
-//! Approved model identities are compiled into the app; a NAS can request a profile but cannot replace it.
+//! Model profiles come from the server's catalogue, the only one: the server sends the profile of each model
+//! it selected, and this computer validates, downloads (from Frameleaf's model mirror, hash-checked) and runs
+//! exactly that profile in its factory-signed runtime. `runtime/model-catalogue.json` is a copy of the server's
+//! catalogue for tests and release tools only; the app never reads it.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
+#[cfg(test)]
 const DATA: &str = include_str!("../../runtime/model-catalogue.json");
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Catalogue {
@@ -27,15 +32,27 @@ struct ProfileData {
     fixture_base64: String,
     artifact_bytes: BTreeMap<String, u64>,
 }
-/// Only the compiled-catalogue selector can construct this authority-bearing type.
+/// Built only from a validated profile the server served (`from_served`), never deserialized directly.
 /// ```compile_fail
 /// let _: frameleaf_desktop::model_catalogue::ApprovedProfile = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Clone)]
 pub struct ApprovedProfile(ProfileData);
 impl ApprovedProfile {
+    /// A profile exactly as the server's catalogue ships it, after the same checks every profile gets.
+    pub fn from_served(value: &Value) -> Result<Self, String> {
+        let profile: ProfileData = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+        profile.validate()?;
+        Ok(Self(profile))
+    }
     pub fn model_key(&self) -> &str {
         self.0.model_key()
+    }
+    pub(crate) fn model_name(&self) -> &str {
+        &self.0.model_name
+    }
+    pub(crate) fn model_snapshot_revision(&self) -> &str {
+        &self.0.model_snapshot_revision
     }
     pub fn runtime_source_revision(&self) -> &str {
         &self.0.runtime_source_revision
@@ -56,12 +73,25 @@ impl ApprovedProfile {
     pub fn challenge(&self, id: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         self.0.challenge(id)
     }
+    pub(crate) fn cache_identity(&self) -> (&str, &str, &str) {
+        (
+            self.0.spec["models"][0]["task"]
+                .as_str()
+                .expect("validated model task"),
+            &self.0.model_name,
+            &self.0.model_snapshot_revision,
+        )
+    }
+    pub(crate) fn cache_bytes(&self) -> u64 {
+        self.0.artifact_bytes.values().copied().sum()
+    }
     pub(crate) async fn prepare_cache(
         &self,
         root: &std::path::Path,
         client: &reqwest::Client,
         cancel: &std::sync::atomic::AtomicBool,
         allow_download: bool,
+        progress: impl Fn(crate::model_cache::CacheProgress),
     ) -> Result<std::path::PathBuf, String> {
         crate::model_cache::prepare(
             crate::model_cache::CachePlan {
@@ -79,6 +109,7 @@ impl ApprovedProfile {
             client,
             cancel,
             allow_download,
+            progress,
         )
         .await
     }
@@ -535,6 +566,7 @@ fn validate_ocr_output(output: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     let catalogue: Catalogue = serde_json::from_str(raw).map_err(|_| invalid())?;
     if catalogue.schema_version != 1
@@ -557,6 +589,7 @@ fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     }
     Ok(catalogue.profiles)
 }
+#[cfg(test)]
 pub fn approved_profile(
     model_name: &str,
     entries: &Value,
@@ -574,6 +607,7 @@ pub fn approved_profile(
         .map(ApprovedProfile))
 }
 
+#[cfg(test)]
 pub(crate) fn setup_profiles(
     name: &str,
     source: &str,
@@ -590,39 +624,32 @@ pub(crate) fn setup_profiles(
         .collect())
 }
 
-pub(crate) fn inventory_group(
+/// The profiles the server sent for one task. Each is a valid profile of that workload for this runtime and
+/// provider, carrying exactly the key the server named in the same place.
+pub(crate) fn served_group(
     workload: &str,
     keys: &[String],
+    served: &[Value],
     source: &str,
     provider: &str,
 ) -> Result<Vec<ApprovedProfile>, String> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
+    if served.len() != keys.len() {
+        return Err(invalid());
     }
-    let profiles: Vec<_> = parse_catalogue(DATA)?
-        .into_iter()
-        .filter(|profile| {
-            profile.workload == workload
-                && keys.contains(&profile.model_key)
-                && profile.runtime_source_revision == source
-                && profile.spec["provider"] == provider
+    keys.iter()
+        .zip(served)
+        .map(|(key, value)| {
+            let profile = ApprovedProfile::from_served(value)?;
+            if profile.0.model_key != *key
+                || profile.0.workload != workload
+                || profile.0.runtime_source_revision != source
+                || profile.0.spec["provider"] != provider
+            {
+                return Err(invalid());
+            }
+            Ok(profile)
         })
-        .map(ApprovedProfile)
-        .collect();
-    if profiles.len() != keys.len() {
-        return Ok(Vec::new());
-    }
-    if workload == "clip" {
-        let expected = setup_profiles(&profiles[0].0.model_name, source, provider)?;
-        if expected.len() != 3
-            || expected
-                .iter()
-                .any(|profile| !keys.iter().any(|key| key == profile.model_key()))
-        {
-            return Ok(Vec::new());
-        }
-    }
-    Ok(profiles)
+        .collect()
 }
 
 pub(crate) fn shared_cache(
@@ -685,13 +712,28 @@ pub(crate) fn shared_cache(
         .map(|(path, (_, bytes, hash))| (path, bytes, hash))
         .collect();
     let scope = digest(&serde_json::to_vec(&identity).map_err(|_| invalid())?);
-    let active = root.join(scope);
+    let active = root.join(&scope);
     private_directory(root)?;
     if active.exists() {
-        for (relative, (_, bytes, hash)) in &files {
-            verify_file(&active.join(relative), *bytes, hash, cancel)?;
+        let verified = files.iter().try_for_each(|(relative, (_, bytes, hash))| {
+            verify_file(&active.join(relative), *bytes, hash, cancel)
+        });
+        match verified {
+            Ok(()) => return Ok(active),
+            // FD-64: the set links each model file, so a file its cache has since repaired
+            // (replaced) leaves the set holding the old bytes, and one removed from the set is
+            // simply missing. Discard the set and compose it again from the caches, which are
+            // verified below before anything is linked.
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "model_file_changed" | "model_file_unavailable" | "runtime_file_unavailable"
+                ) =>
+            {
+                crate::model_cache::remove_contained(root, &scope)?;
+            }
+            Err(code) => return Err(code),
         }
-        return Ok(active);
     }
     let staging = Staging::create(root.join(format!(".composition-{}", Uuid::new_v4())))?;
     for (relative, (source, bytes, hash)) in &files {
@@ -834,6 +876,37 @@ mod tests {
             shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap_err(),
             "model_file_changed"
         );
+        // FD-64: the cache repairs a changed file by replacing it (the right bytes, in a new
+        // file). The set, which still links the changed one, is composed again from the caches
+        // instead of failing for ever.
+        let repaired = caches[1].join("facial-recognition/buffalo_l/detection/model.onnx");
+        let linked = active.join("facial-recognition/buffalo_l/detection/model.onnx");
+        for _ in 0..2 {
+            std::fs::remove_file(&repaired).unwrap();
+            std::fs::write(&repaired, b"fixture weights 1").unwrap();
+            let again = shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+            assert_eq!(again, active);
+            assert_eq!(std::fs::read(&linked).unwrap(), b"fixture weights 1");
+            // Changed again, through the set this time: the cache's file is the same one.
+            std::fs::write(&linked, b"changed").unwrap();
+            assert_eq!(std::fs::read(&repaired).unwrap(), b"changed");
+        }
+        std::fs::remove_file(&repaired).unwrap();
+        std::fs::write(&repaired, b"fixture weights 1").unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"changed");
+        shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"fixture weights 1");
+        // A file or a folder missing from the set is composed again the same way.
+        std::fs::remove_file(&linked).unwrap();
+        shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"fixture weights 1");
+        std::fs::remove_dir_all(active.join("ocr/PP-OCRv5_mobile/detection")).unwrap();
+        shared_cache(&profiles, &caches, &root.join("sets"), &cancelled).unwrap();
+        assert!(active
+            .join("ocr/PP-OCRv5_mobile/detection/model.onnx")
+            .is_file());
+        // Nothing but the one set is left behind.
+        assert_eq!(std::fs::read_dir(root.join("sets")).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
@@ -895,6 +968,7 @@ mod tests {
                     &crate::transport::client().unwrap(),
                     &std::sync::atomic::AtomicBool::new(false),
                     false,
+                    |_| {},
                 )
                 .await;
             std::fs::remove_dir_all(&root).unwrap();
@@ -1003,6 +1077,7 @@ mod tests {
                     &client,
                     &std::sync::atomic::AtomicBool::new(false),
                     true,
+                    |_| {},
                 )
                 .await
                 .unwrap();
@@ -1051,35 +1126,40 @@ mod tests {
     fn only_exact_built_in_model_configuration_runtime_and_provider_can_be_selected() {
         let catalogue: Value =
             serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+        let mut runtimes = BTreeSet::new();
         for raw in catalogue["profiles"].as_array().unwrap() {
             let name = raw["modelName"].as_str().unwrap();
             let entries = &raw["spec"]["entries"];
             let source = raw["runtimeSourceRevision"].as_str().unwrap();
-            let selected = approved_profile(name, entries, source, "CPUExecutionProvider")
+            let provider = raw["spec"]["provider"].as_str().unwrap();
+            let selected = approved_profile(name, entries, source, provider)
                 .unwrap()
                 .unwrap();
             assert_eq!(selected.model_key(), raw["modelKey"].as_str().unwrap());
+            assert_eq!(selected.provider(), provider);
+            // The whole catalogue is parsed per lookup; refuse near misses once per runtime.
+            if !runtimes.insert((source, provider)) {
+                continue;
+            }
+            // a selectable model the catalogue has no profile for
             assert!(
-                approved_profile("ViT-B-32__openai", entries, source, "CPUExecutionProvider")
+                approved_profile("ViT-B-16-SigLIP2__webli", entries, source, provider)
                     .unwrap()
                     .is_none()
             );
+            assert!(approved_profile(name, &json!({}), source, provider)
+                .unwrap()
+                .is_none());
+            assert!(approved_profile(name, entries, &"0".repeat(40), provider)
+                .unwrap()
+                .is_none());
             assert!(
-                approved_profile(name, &json!({}), source, "CPUExecutionProvider")
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                approved_profile(name, entries, &"0".repeat(40), "CPUExecutionProvider")
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                approved_profile(name, entries, source, "CUDAExecutionProvider")
+                approved_profile(name, entries, source, "MIGraphXExecutionProvider")
                     .unwrap()
                     .is_none()
             );
         }
+        assert!(runtimes.len() > 1);
     }
     #[test]
     fn challenge_nonce_changes_the_spec_binding_without_changing_model_or_fixture() {
@@ -1132,7 +1212,6 @@ mod tests {
     fn pr274_profiles_preserve_every_legacy_profile_and_use_distinct_new_identities() {
         let catalogue: Value = serde_json::from_str(DATA).unwrap();
         let profiles = catalogue["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 21);
         let legacy = Value::Array(profiles[..11].to_vec());
         assert_eq!(
             digest(&serde_json_canonicalizer::to_vec(&legacy).unwrap()),
@@ -1178,8 +1257,101 @@ mod tests {
             "31337c0063a85bdf957d27ef7ec581b34e65ee4a73f53215c238ff2c9342d40c",
             "75d39bab3c7ce04a0b3864ae8eb420664970faa66ab2f55a82c043a8d4c9ebc1",
             "eae6ee5d7291fec288026e79094c294de27187f769310e373625e80a18bab1c2",
+            "e60c7be1967dfa9f38df396ed3b3f2bcf4e309ba3e02290933a4f6d4e7419165",
+            "b218ecbe1dceac1f7dbe68f3ffd3558ae452964b42a46154c965e474e36a836f",
+            "c89f6440a4462fb75aaab690b76552b817ff7abd8d481df87e5662524eafaab8",
+            "546549421b4d0dc3f4a8601db9207befd4d82e3ecb9e0ad52849ed3199441be4",
+            "b2af0f4cba01a87d6b656a69f4aa7ab3cddba1bfb0bda4d4340c8ce484e16ef0",
+            "7b744d6547e885abcfdd845f914fe858bd5e13321783af9c3b26f679fdf95f76",
+            "05fc08742b2b05cebd5bf54302f1c78f8ba16902a502e4815a8a750ecba02a66",
+            "46fc1b58fd122980ee5de68b62d7c431f8f115bb84e2d19933aa55ba08a89cb1",
+            "fc631cdf02d40fb5a491e6fb0991bf0e5399918b86657e1b9e1ba483d5f02841",
+            "f66eb524b80589047de44409de6a19ffa9ca2de18b7b6d8669a692700a625da6",
+            "4db2580d36114fce59cea7fafb125c4f82ab93f78e82772bd50d888d14c358fe",
+            "6f146c1d05e93818586ed9fcf70e3ae6de1ff195dbfcf15e96cec4f8a93975c4",
+            "a6d03f7df8104794200ac2c6f7734c77634dd0dd4a119fc24a85015730be0fa7",
+            "2d8945f2b72d68508c39e87b2cbc123cf51723d8b302d67a678d4bd00720b582",
+            "0832de93d79c15053749f2f17dddaae95e2a18b00fa0e86d104b6e0d2d14e438",
+            "1f104316fb10128ad1444d40b1de21b968b52459a9096b7f4163b2613f2ec25e",
+            "4f3f460977c87e1155cca9ad4b47e57cc8c3de3832984bcb5c212a4aaf71f7fb",
+            "354abc377aa6c89a573b2c14468eb2fb94e1030ba1ebeae384dde01612adeb00",
+            "d9eecddc9dbbc61ff126beb62ce35b1e45af0b289f568c3a9b6ca219eb75f93c",
+            "40115f6689e12d4b40e2e456dd4f20b527a29795a17d76c1b79b881b6b3b0f34",
+            "420f5d93f9189e42fad015eec0ff2cb19571e1e5f127e68b6e2770b697f15557",
+            "7480057b35520ea85d2bff0fa0fa026df115eabdd51ab87a9ba3ba2211d97b6d",
+            "37a25a170947f424cc0231e279ff5ea5de7dfc0c1a40b056bb60f3c807ef176b",
+            "f4a861ae2fb52c45577f1ab08aa0bdf794628dc11c4e4a2de75909bac6bf68b6",
+            "2a43cd5fb87f155cb03c1d528dad7d560f390654ce7849b4ffa4da45eab5daf2",
+            "bb60ac6ef80bdf0bcc77295364cece4173adad781cd945a7250b47fa2e19ad88",
+            "82bc3cb4ec3204c5f06e0b43e1c3e65666d82bda63381d655c7eb92ab1d56551",
+            "f3dabc2a4bdda94ec954ed297ef9da4ea2ea2b7875d328c508d5ca3d31227e0e",
+            "c07473e7f48fc116ede101ba012f266a7c84c1a79485f8be4f6f80df49153d82",
+            "eb5990f3895a30726bf70f19dca270e14c09325364d0c71085c4334a54912cff",
+            "84a5a8662aab5eac9415ca46b9c25318ba0bd989f4711853c75776614e919f8c",
+            "f27d2e6a303cff1789e855e0f1561a3a04b030639d4ff789800394a6ead51b94",
+            "064de008feb79e0ce67642f2613a17a33479e9238ef0ccc58db3eb5571bd8a77",
+            "a40b7628bbc61c2dbab819e83fae6bc738e4e5d0fba06eed749bede91c1dba70",
+            "207621ca4431e3358137b8ce4a742887b0db1e003b78548ea8fc36209a25512e",
+            "b3c98ec6de5f9e761a62044b8a261dc66d6273eff91f4a40fe7a9f97ea7f1016",
+            "25c77459eda63cc99a54f72320de3d0ef2029ce9a0c7d239eea62e24c499ad24",
+            "5b33ebee9460aa445513f196cc73597daa3f874ea2b527801f18bc67121f0759",
+            "6a1a473fc90069f0b222e697272cb1a78f8fadd4a1c52af7e42ed3d6eb8bb37e",
+            "194ab4b05a9b81e28466bc4341bd26d3c80349f3508f701ae63c9569a11a4d58",
+            "efa3e6033ea6b6c6aa769444ef5e3ba2432f1ed236ed37d919083edf255c5452",
+            "9e8cc701380276c1af1036c3493460904e91b6dc3c49193100f2733b244fed1f",
+            "994248b4729d33ae1dfc09365b7fd56f4949f80f15e1a6d4608b256b5308e54c",
+            "003981e4139fad9a251f21c59a89824c06a109640a358a8367683bd6b865cd4c",
+            "439a10ed09c75b25a0a4e39df0928e4636f6cc71eb73fecffa3eda028cbf4738",
+            "c7d74c2feef0e1abd8ab48c519338f7d2bbebd7b5785544d21729dadb7231742",
+            "8ae4a97bd0e176b44e519bf6c850310979364b986bd0f113913d3fe4df43fcf7",
+            "9c3beed723095dbca064cc7b8af523d703fe249740367b9cb6d1ebc034ae2ab6",
+            "c6af78be57ce709d21297e95b4be5030212ecd52d140899983dbd9f56fef9873",
+            "9b285e797d131b12e0a583a467d11ab107610d4b81c196e6b438f274296d3657",
+            "933b0789ec4350b99e64b3cb3b6d6bccaa850c54868131116a331a751ee60836",
+            "b6a672e4e27b03b749c4a93801f79803ae1faf92eaab9694539c9b1361a0160b",
+            "11ef055a3ba652e3231037eda669596ae0c141d79a19ec5bb255e3f719fc3309",
+            "fdbf9b5a1e0573f59dd0842d2e543e9d71e4a2ce4fcc1ce36082302dcca2a263",
+            "f651de490bf0ca761c0f475a2f4cf72cfa74bf1498cda30e2e12b7c25fbfd615",
+            "b60e9e5b4a848a98ff3732ff961bcde2516d7b915b99299426d9631f36c34d1b",
+            "d1ffb882c8508f0e4d37d03b84ece09a3311ebce7c53324a63b972e17dcf81cf",
+            "69e9528ebf2333b497346eb8a786cbc1e029902a360f66d093396b1d93298105",
+            "9037f282ae92ec3906fd5fd543de5f50954790b80a73a65168bde38633532895",
+            "44138e82b6571ef566be87863442e5496e84dc294107aadf38608db00289d4da",
+            "5c79f0a79976a2febed2381b0ff57e1fe6698947857327ff2d356fe925f736fc",
+            "7131c1c5d18fe4d38ebf2654012e8f224a85e5dfd55aebd276579ee1554a3d5f",
+            "4a42dc6f14a18a1aad75221992118a78aa96259ac0ba2cc686e29c02d684f7b1",
+            "0429e7033b3ff53bf003e5f41514f3e22cdb2a372382f3e54cd8430474d5ff70",
+            "c41e72990bd1faa690e43735707f2ed5191a367cea165c8188c2347243d9a3ce",
+            "88430bcfd76c9853b392e5e99efc6c85bfff348e95e9ddba2ce2fcd5e205bbc8",
+            "f3cec2f18b98eb7b266f19fcbfbf2e768205786813ab32c1877552ea7f8ed969",
+            "f7ec69608f3bbd197f2095305ae237fbb92adefefcbb81427e6f16b7fc07aba4",
+            "e816bfa65037eb5cf31c9f15235a5e62e28afeef93f55cfe067fac0b1f9e69a4",
+            "79f6a6828171d0ac79d0a1b7b46e5bc495707ca354eee47685c0e3990d1a78f3",
+            "3f3a667881b789ee7910f66d642ccb2f2988e31356845bfdaabebee2cca0f475",
+            "988bea3533a79c9092e4ddd093041311fdc94dadcc7929c5418a538b940817e3",
+            "f4fd2d89d61c68add788954f3eaa46e72446e709dee68a67653f54b56ff69c7f",
+            "abc7407292f1b815c9f3694275e3a8bb130adafb0b48d2ad3396580c05f3e552",
+            "b7d1e04824d89660c67265de02b9702c28df5364181318ce9ba6afc9813b75da",
+            "e3a49032696ca9abb0369f90ecc530e3bbc36a371834a20a1250f1b96ec14052",
+            "1904b558975efc5e39f122b7e2203bf750f9b704ac4f1e2136db1b52d474383e",
+            "cdad3bb06fd2d2d90b508cd873dee95956d4da36d9c74b64841e7c502d0dd966",
+            "4b8b16bf798bb5aec952a42b251ef33150e429ef04851f3031fe052a1e5a4996",
+            "02bc91e1c3f4081ad6d1e5e1dc992616ba1c142e5b04c1f9f3f2e78f3e352b5e",
+            "2ce10598215ef4ab45f4fcc38c3ae39c7bea261e742a21d10f7c67f7579f4095",
         ];
         let profiles = parse_catalogue(DATA).unwrap();
+        // FD-56: an epoch 14 twin has its original's specification, so its digest: only the
+        // runtime source differs.
+        let twins: Vec<&str> = profiles
+            .iter()
+            .zip(expected)
+            .filter(|(profile, _)| {
+                profile.runtime_source_revision == "f2c451a6bf71ca3f3aec986e07f0852937268e2f"
+            })
+            .map(|(_, digest)| digest)
+            .collect();
+        assert_eq!(twins.len(), 60);
+        let expected: Vec<&str> = expected.into_iter().chain(twins).collect();
         assert_eq!(profiles.len(), expected.len());
         for (profile, expected) in profiles.iter().zip(expected) {
             let (spec, _) = profile
@@ -1199,8 +1371,20 @@ mod tests {
             "2e8b52cf4107668d2df47eb0564398028cb75502d766a3403b4201a41c7b03a1"
         );
         let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
-        assert_eq!(profiles[16..].len(), 5);
-        for profile in &profiles[16..] {
+        // The other selectable models for the first factory runtime (server order since epoch 13).
+        assert_eq!(profiles[52..62].len(), 10);
+        for profile in &profiles[52..62] {
+            assert_eq!(
+                profile["runtimeSourceRevision"],
+                "25b22c16e47a27a2eb50017d838497abce850d11"
+            );
+            assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
+            assert_eq!(
+                profile["spec"]["preprocessingSha256"],
+                profiles[0]["spec"]["preprocessingSha256"]
+            );
+        }
+        for profile in &profiles[16..21] {
             assert_eq!(profile["runtimeSourceRevision"], source);
             assert_eq!(profile["spec"]["provider"], "CPUExecutionProvider");
             assert_eq!(
@@ -1221,5 +1405,158 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+    fn runtime_profiles() -> Value {
+        serde_json::from_str(include_str!("../../runtime/profiles.json")).unwrap()
+    }
+    #[test]
+    fn factory_source_selects_every_released_group() {
+        let runtime = runtime_profiles();
+        let source = runtime["profiles"]["cpu-ort"]["sourceRevision"]
+            .as_str()
+            .unwrap();
+        for (name, roles) in [
+            ("ViT-B-16-SigLIP-384__webli", 3),
+            ("ViT-B-32__openai", 3),
+            ("ViT-SO400M-16-SigLIP2-384__webli", 3),
+            ("PP-OCRv5_mobile", 1),
+            ("PP-OCRv5_server", 1),
+            ("buffalo_l", 1),
+            ("antelopev2", 1),
+            ("buffalo_s", 1),
+            ("buffalo_m", 1),
+        ] {
+            assert_eq!(
+                setup_profiles(name, source, "CPUExecutionProvider")
+                    .unwrap()
+                    .len(),
+                roles,
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn every_selectable_runtime_source_and_provider_has_a_catalogue_profile() {
+        let runtime = runtime_profiles();
+        let catalogue = parse_catalogue(DATA).unwrap();
+        let mut pairs = 0;
+        for (name, profile) in runtime["profiles"].as_object().unwrap() {
+            let provider = profile["provider"].as_str().unwrap();
+            let additional = profile["additionalSources"]
+                .as_object()
+                .into_iter()
+                .flat_map(|targets| targets.values())
+                .flat_map(|sources| sources.as_array().unwrap());
+            for source in std::iter::once(&profile["sourceRevision"]).chain(additional) {
+                pairs += 1;
+                assert!(
+                    catalogue.iter().any(|item| {
+                        item.runtime_source_revision == source.as_str().unwrap()
+                            && item.spec["provider"] == provider
+                    }),
+                    "{name} {source} {provider}"
+                );
+            }
+        }
+        assert!(pairs > 0);
+    }
+    #[test]
+    fn a_served_profile_is_used_only_for_the_task_runtime_and_key_the_server_named() {
+        let source = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
+        let catalogue: Value = serde_json::from_str(DATA).unwrap();
+        let served = |provider: &str| {
+            catalogue["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| {
+                    p["modelName"] == "buffalo_l"
+                        && p["runtimeSourceRevision"] == source
+                        && p["spec"]["provider"] == provider
+                })
+                .unwrap()
+                .clone()
+        };
+        let cpu = served("CPUExecutionProvider");
+        let keys = [cpu["modelKey"].as_str().unwrap().to_string()];
+        for provider in [
+            "CPUExecutionProvider",
+            "CoreMLExecutionProvider",
+            "CUDAExecutionProvider",
+            "OpenVINOExecutionProvider",
+        ] {
+            let group = served_group("face", &keys, &[served(provider)], source, provider).unwrap();
+            assert_eq!(group[0].provider(), provider);
+        }
+        let other_source = "94d52a8244da0edfa9f680a3b357fdccbc0ad7e8";
+        for (workload, key, value, source, provider) in [
+            (
+                "face",
+                &keys[0],
+                cpu.clone(),
+                source,
+                "CUDAExecutionProvider",
+            ),
+            (
+                "face",
+                &keys[0],
+                cpu.clone(),
+                other_source,
+                "CPUExecutionProvider",
+            ),
+            ("ocr", &keys[0], cpu.clone(), source, "CPUExecutionProvider"),
+            (
+                "face",
+                &format!("face:{}", "0".repeat(64)),
+                cpu.clone(),
+                source,
+                "CPUExecutionProvider",
+            ),
+        ] {
+            assert!(served_group(
+                workload,
+                std::slice::from_ref(key),
+                &[value],
+                source,
+                provider
+            )
+            .is_err());
+        }
+        // One missing, a changed field, or a profile that fails validation is refused too.
+        assert!(served_group("face", &keys, &[], source, "CPUExecutionProvider").is_err());
+        let mut changed = cpu.clone();
+        changed["spec"]["fixtureSha256"] = json!("0".repeat(64));
+        assert!(ApprovedProfile::from_served(&changed)
+            .and_then(|p| p.challenge(&Uuid::new_v4().to_string()))
+            .is_err());
+        changed = cpu;
+        changed["unexpected"] = json!(true);
+        assert!(ApprovedProfile::from_served(&changed).is_err());
+    }
+    #[test]
+    fn challenge_digest_does_not_depend_on_how_a_whole_number_is_written() {
+        // FD-40: Desktop's copy once had 181.0 where the server has 181 in this profile.
+        let source = "f93c34d196955da3e2760c095c08b27ccbf53315";
+        let id = "d621bd72-ad35-4199-95ab-76300756a38e";
+        let mut value: Value = serde_json::from_str(DATA).unwrap();
+        let index = value["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|p| p["modelName"] == "buffalo_l" && p["runtimeSourceRevision"] == source)
+            .unwrap();
+        let expected = parse_catalogue(DATA).unwrap()[index].challenge(id).unwrap();
+        let bounds = &mut value["profiles"][index]["spec"]["expectedOutput"]["facial-recognition"]
+            [0]["boundingBox"];
+        for key in ["x1", "x2", "y1", "y2"] {
+            assert!(bounds[key].is_u64());
+            bounds[key] = json!(bounds[key].as_f64().unwrap());
+        }
+        let raw = value.to_string();
+        assert!(raw.contains("\"x1\":181.0"));
+        assert_eq!(
+            parse_catalogue(&raw).unwrap()[index].challenge(id).unwrap(),
+            expected
+        );
     }
 }

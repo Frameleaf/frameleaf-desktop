@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>Import to Frameleaf</string>
+      </dict>
+      <key>NSMessage</key>
+      <string>importSelection</string>
+      <key>NSPortName</key>
+      <string>Frameleaf</string>
+      <key>NSRestricted</key>
+      <true/>
+      <key>NSSendFileTypes</key>
+      <array>
+        <string>public.image</string>
+        <string>public.movie</string>
+        <string>public.folder</string>
+      </array>
+      <key>NSRequiredContext</key>
+      <dict>
+        <key>NSApplicationIdentifier</key>
+        <string>com.apple.finder</string>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>

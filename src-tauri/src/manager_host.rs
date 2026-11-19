@@ -123,7 +123,7 @@ impl Programs<'_> {
     }
 }
 /// Supplied only by reviewed native setup; not a Tauri/HTTP command or credential record.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     pub installation_id: String,
@@ -135,6 +135,153 @@ pub struct Configuration {
     pub origin: String,
     pub database_port: u16,
     pub api_port: u16,
+}
+impl Configuration {
+    /// The configuration a profile's keystore binding names. The ports are chosen per start,
+    /// so the binding keeps the defaults every existing profile was bound with; the package,
+    /// the paths and the directories' identities are what tie the secrets to this library.
+    pub(crate) fn binding_form(&self) -> Self {
+        let ports = crate::manager_local::Ports::default();
+        Self {
+            origin: ports.origin(),
+            database_port: ports.database,
+            api_port: ports.api,
+            ..self.clone()
+        }
+    }
+    pub(crate) fn ports(&self) -> Result<crate::manager_local::Ports, String> {
+        Ok(crate::manager_local::Ports {
+            manager: local_origin(&self.origin)?,
+            api: self.api_port,
+            database: self.database_port,
+        })
+    }
+    pub(crate) fn set_ports(&mut self, ports: crate::manager_local::Ports) {
+        self.origin = ports.origin();
+        self.api_port = ports.api;
+        self.database_port = ports.database;
+    }
+}
+/// What one start from the keystore may do beyond the first released protocol.
+pub(crate) struct LocalStart<'a> {
+    /// What the package's Manager declares.
+    pub features: crate::manager_local::Features,
+    /// Whether this attempt may present a renewed TLS identity, and which of the identities
+    /// Manager may hold signs its handover.
+    pub renew_identity: Option<usize>,
+    /// Set as soon as this attempt presents a renewed identity, to how many identities could
+    /// sign its handover: a failure is retried with the next, then with the earlier identity.
+    pub signers: &'a std::sync::atomic::AtomicUsize,
+}
+/// Manager accepts a changed package once, from the descriptor it last ran with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Transition {
+    pub operation_id: uuid::Uuid,
+    pub from_fingerprint: String,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Binding<'a> {
+    runtime: &'a str,
+    id: &'a str,
+    secure_installation_id: uuid::Uuid,
+    controller: &'a Path,
+    candidate: &'a Path,
+    state: &'a Path,
+    manifest_sha256: &'a str,
+    source_revision: &'a str,
+    certified: bool,
+    database_port: u16,
+    api_port: u16,
+}
+/// The installation part of the bootstrap and descriptor, in Manager's field order.
+fn binding<'a>(
+    config: &'a Configuration,
+    candidate: &'a Path,
+    runtime: &'a crate::host_runtime::VerifiedHostRuntime,
+) -> Result<Binding<'a>, String> {
+    Ok(Binding {
+        runtime: "native",
+        id: &config.installation_id,
+        secure_installation_id: crate::host_state::secure_installation_id(&config.state)?,
+        controller: &config.controller,
+        candidate,
+        state: &config.state,
+        manifest_sha256: runtime.manifest_sha256(),
+        source_revision: runtime.source_revision(),
+        certified: runtime.certified(),
+        database_port: config.database_port,
+        api_port: config.api_port,
+    })
+}
+/// Same fields and order as Manager's native descriptor, whose fingerprint is sha256(JSON).
+pub(crate) fn descriptor_fingerprint(
+    config: &Configuration,
+    candidate: &Path,
+    runtime: &crate::host_runtime::VerifiedHostRuntime,
+    controller_sha256: &str,
+    certificate_pem: &str,
+) -> Result<String, String> {
+    fingerprint(
+        binding(config, candidate, runtime)?,
+        controller_sha256,
+        runtime.backup_engine()?,
+        &config.name,
+        &config.release,
+        format!("{:x}", Sha256::digest(certificate_pem.as_bytes())),
+    )
+}
+/// Manager on Windows rewrites the one mixed separator this app sends in the backup engine's
+/// path when it reads the bootstrap, and its stored descriptor has the rewritten path.
+#[cfg(any(windows, test))]
+fn manager_backup_path(path: &str) -> Option<String> {
+    path.strip_suffix("\\backup/restic.exe")
+        .map(|head| format!("{head}\\backup\\restic.exe"))
+}
+/// sha256 of the compact JSON Manager computes for its stored descriptor.
+fn fingerprint(
+    installation: Binding,
+    controller_sha256: &str,
+    #[allow(unused_mut)] mut backup_engine: crate::host_runtime::BackupEngine,
+    name: &str,
+    release: &str,
+    tls_certificate_pem_sha256: String,
+) -> Result<String, String> {
+    #[cfg(windows)]
+    if let Some(path) = backup_engine
+        .executable
+        .to_str()
+        .and_then(manager_backup_path)
+    {
+        backup_engine.executable = path.into();
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Descriptor<'a> {
+        protocol_version: u32,
+        installation: Binding<'a>,
+        controller_sha256: &'a str,
+        backup_engine: crate::host_runtime::BackupEngine,
+        name: &'a str,
+        release: &'a str,
+        tls_certificate_pem_sha256: String,
+    }
+    let descriptor = Descriptor {
+        protocol_version: 2,
+        installation,
+        controller_sha256,
+        backup_engine,
+        name,
+        release,
+        tls_certificate_pem_sha256,
+    };
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&descriptor).map_err(|_| "native_manager_config_invalid")?
+        )
+    ))
 }
 fn protect_profile_parents(config: &Configuration) -> Result<Vec<fs::File>, String> {
     #[cfg(windows)]
@@ -217,6 +364,364 @@ fn local_origin(origin: &str) -> Result<u16, String> {
     }
     Ok(port)
 }
+/// What fallible evidence says about something of this library running. `Unknown` is its own
+/// answer and is never read as `Clear`: only `Clear` permits what running would forbid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Evidence {
+    /// Proven not running.
+    Clear,
+    Running,
+    Unknown,
+}
+/// Whether a job holds its leader and nothing that matters besides, from the job's members
+/// (process ID and program). The leader is known by its ID, which cannot be reused while its
+/// process handle is held. Windows also puts the console host of a console program in that
+/// program's job: `console` is that system program, and it holds nothing of a library. Any
+/// other program is `Running`; a member whose program could not be read, or members that
+/// could not be listed, are `Unknown`.
+#[cfg(any(windows, test))]
+pub(crate) fn sole_member(
+    members: Result<Vec<(u32, Option<String>)>, String>,
+    leader: u32,
+    console: &str,
+) -> Evidence {
+    let Ok(members) = members else {
+        return Evidence::Unknown;
+    };
+    let mut evidence = Evidence::Clear;
+    for (id, program) in members {
+        match program {
+            _ if id == leader => {}
+            Some(program) if program.eq_ignore_ascii_case(console) => {}
+            Some(_) => return Evidence::Running,
+            None => evidence = Evidence::Unknown,
+        }
+    }
+    evidence
+}
+/// The console host Windows starts for a console program, by its full path.
+#[cfg(windows)]
+fn console_host() -> Result<String, String> {
+    let mut buffer = vec![0u16; 32768];
+    let size = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    } as usize;
+    if size == 0 || size >= buffer.len() {
+        return Err("native_manager_state_unavailable".into());
+    }
+    let directory =
+        String::from_utf16(&buffer[..size]).map_err(|_| "native_manager_state_unavailable")?;
+    Ok(format!("{directory}\\conhost.exe"))
+}
+/// Only an accepted connection proves a listener and only a refusal proves there is none; a
+/// timeout or any other failure proves neither.
+pub(crate) fn listener_evidence(attempt: std::io::Result<std::net::TcpStream>) -> Evidence {
+    match attempt {
+        Ok(_) => Evidence::Running,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Evidence::Clear,
+        Err(_) => Evidence::Unknown,
+    }
+}
+pub(crate) fn listener(port: u16) -> Evidence {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    listener_evidence(std::net::TcpStream::connect_timeout(
+        &address,
+        Duration::from_millis(250),
+    ))
+}
+/// Refuse with the port's number when a program already accepts connections on a local port.
+pub(crate) fn foreign_listener(ports: &[u16]) -> Result<(), String> {
+    for port in ports {
+        if listener(*port) == Evidence::Running {
+            return Err(format!("local_port_in_use_{port}"));
+        }
+    }
+    Ok(())
+}
+
+/// The Manager this app started, recorded so a later launch can recognise it after a crash.
+/// The record is written before Manager is spawned, as an intent that names no process yet,
+/// and completed with the process once it exists. It is removed only when that Manager is
+/// proven to have exited or was never spawned.
+#[cfg(unix)]
+const OWNED_PROCESS: &str = "desktop-manager-process.json";
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnedProcess {
+    schema_version: u32,
+    /// None: a launch was begun and its process is not known.
+    #[serde(default)]
+    process: Option<crate::process_tree::ProcessIdentity>,
+}
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum Recorded {
+    Nothing,
+    /// A launch was begun; whether a Manager came of it is not known.
+    Intent,
+    Process(crate::process_tree::ProcessIdentity),
+    Unreadable,
+}
+#[cfg(unix)]
+fn recorded(data: &Path) -> Recorded {
+    match fs::symlink_metadata(data.join(OWNED_PROCESS)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Recorded::Nothing,
+        Err(_) => return Recorded::Unreadable,
+        Ok(_) => {}
+    }
+    let read = || -> Option<OwnedProcess> {
+        let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(data).ok()?);
+        let file = directory
+            .open_with(OWNED_PROCESS, &crate::host_state::options(false))
+            .ok()?
+            .into_std();
+        crate::host_state::valid_file(&file).ok()?;
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    match read() {
+        Some(OwnedProcess {
+            schema_version: 1,
+            process,
+        }) => process.map_or(Recorded::Intent, Recorded::Process),
+        _ => Recorded::Unreadable,
+    }
+}
+/// Replace the record in one step, so a crash leaves either the old one or the new one.
+#[cfg(unix)]
+fn write_record(
+    data: &Path,
+    process: Option<crate::process_tree::ProcessIdentity>,
+) -> Result<(), String> {
+    const TEMPORARY: &str = ".desktop-manager-process.json.tmp";
+    let failed = |_: std::io::Error| "native_manager_state_unavailable".to_string();
+    let bytes = serde_json::to_vec(&OwnedProcess {
+        schema_version: 1,
+        process,
+    })
+    .map_err(|_| "native_manager_state_unavailable")?;
+    let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(data)?);
+    match directory.remove_file(TEMPORARY) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(failed(error)),
+        _ => {}
+    }
+    let mut options = crate::host_state::options(true);
+    options.create_new(true);
+    let mut file = directory
+        .open_with(TEMPORARY, &options)
+        .map_err(failed)?
+        .into_std();
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(failed)?;
+    drop(file);
+    directory
+        .rename(TEMPORARY, &directory, OWNED_PROCESS)
+        .map_err(failed)?;
+    crate::host_storage::directory(data)?
+        .sync_all()
+        .map_err(failed)
+}
+/// Before Manager is spawned: from here on, a later run must assume one may be running.
+#[cfg(unix)]
+pub(crate) fn record_launch_intent(data: &Path) -> Result<(), String> {
+    write_record(data, None)
+}
+/// Complete the record with the spawned process.
+#[cfg(unix)]
+pub(crate) fn record_owned_process(data: &Path, pid: u32) -> Result<(), String> {
+    let process =
+        crate::process_tree::ProcessIdentity::of(pid).ok_or("native_manager_state_unavailable")?;
+    write_record(data, Some(process))
+}
+/// Only for a Manager proven to have exited, or never spawned.
+#[cfg(unix)]
+pub(crate) fn forget_owned_process(data: &Path) {
+    if let Ok(directory) = crate::host_storage::directory(data) {
+        let _ = cap_std::fs::Dir::from_std_file(directory).remove_file(OWNED_PROCESS);
+    }
+}
+/// Whether this app's record names exactly the live process `pid`.
+#[cfg(unix)]
+pub(crate) fn owned_process_recorded(data: &Path, pid: u32) -> bool {
+    crate::process_tree::ProcessIdentity::of(pid)
+        .is_some_and(|live| recorded(data) == Recorded::Process(live))
+}
+/// For the update gate: whether a Manager recorded in `data` may still be running.
+/// `Clear` only with no record, or a record whose exact process is gone or replaced by another.
+/// A launch intent with no process, a record that cannot be read, and a process that cannot be
+/// looked up are all `Unknown`.
+#[cfg(unix)]
+pub(crate) fn recorded_manager(
+    data: &Path,
+    lookup: impl FnOnce(u32) -> crate::process_tree::Presence,
+) -> Evidence {
+    use crate::process_tree::Presence;
+    match recorded(data) {
+        Recorded::Nothing => Evidence::Clear,
+        Recorded::Intent | Recorded::Unreadable => Evidence::Unknown,
+        Recorded::Process(process) => match lookup(process.pid) {
+            Presence::Absent => Evidence::Clear,
+            Presence::Present(live) if live == process => Evidence::Running,
+            Presence::Present(_) => Evidence::Clear,
+            Presence::Unknown => Evidence::Unknown,
+        },
+    }
+}
+/// Send the recorded process the same exit request `shutdown` makes. Returns false, without
+/// signalling, when the process with that PID is no longer the recorded one.
+///
+/// Linux binds the signal to a process handle; see `request_exit_through`. Everywhere else
+/// there is no such handle and `signal_after_recheck` is all the platform allows.
+#[cfg(unix)]
+fn request_exit(recorded: &crate::process_tree::ProcessIdentity) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        request_exit_through(recorded, open_process_handle)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        signal_after_recheck(recorded)
+    }
+}
+/// PID-based signal for platforms without a process handle. The identity is read immediately
+/// before `kill`, which narrows the race but does not close it: if the process exits and its
+/// PID is reused within those few instructions, the new holder receives SIGTERM.
+#[cfg(unix)]
+fn signal_after_recheck(recorded: &crate::process_tree::ProcessIdentity) -> Result<bool, String> {
+    if crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() != Some(recorded) {
+        return Ok(false);
+    }
+    match unsafe { libc::kill(recorded.pid as libc::pid_t, libc::SIGTERM) } {
+        0 => Ok(true),
+        _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        _ => Err("native_manager_orphan_running".into()),
+    }
+}
+/// A pidfd for `pid`, or the errno that refused it.
+#[cfg(target_os = "linux")]
+fn open_process_handle(pid: libc::pid_t) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::FromRawFd;
+    let flags: libc::c_uint = 0;
+    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL));
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(opened as libc::c_int) })
+}
+/// The handle is opened first and the identity read afterwards, so a match proves the handle
+/// names the recorded process and a later reuse of the PID cannot redirect the signal.
+///
+/// When no handle can be opened this fails closed, with one intentional exception: ENOSYS
+/// means the kernel has no pidfd at all, and only then is the weaker `signal_after_recheck`
+/// used. ESRCH means the process is already gone. Any other refusal sends no signal.
+#[cfg(target_os = "linux")]
+fn request_exit_through(
+    recorded: &crate::process_tree::ProcessIdentity,
+    open: impl FnOnce(libc::pid_t) -> Result<std::os::fd::OwnedFd, i32>,
+) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+    let handle = match open(recorded.pid as libc::pid_t) {
+        Ok(handle) => handle,
+        Err(libc::ESRCH) => return Ok(false),
+        Err(libc::ENOSYS) => return signal_after_recheck(recorded),
+        Err(_) => return Err("native_manager_orphan_running".into()),
+    };
+    if crate::process_tree::ProcessIdentity::of(recorded.pid).as_ref() != Some(recorded) {
+        return Ok(false);
+    }
+    let flags: libc::c_uint = 0;
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.as_raw_fd(),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            flags,
+        )
+    };
+    match sent {
+        0 => Ok(true),
+        _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        _ => Err("native_manager_orphan_running".into()),
+    }
+}
+/// Stop the Manager an earlier run of this app left behind. Returns whether one was stopped.
+///
+/// A recorded process that is gone, or whose PID now belongs to another process, is forgotten
+/// and not signalled; see `request_exit` for how firmly each platform can hold that.
+///
+/// A record that names no process this app can identify (a launch intent that was never
+/// completed, an unreadable record, a process that cannot be looked up) is never cleared here.
+/// Starting local management is the explicit recovery for it: the start goes ahead only after
+/// Manager's port has definitely refused connections for the whole of `timeout`, and the new
+/// launch then replaces the record with its own. Anything else refuses the start.
+#[cfg(unix)]
+pub(crate) fn stop_orphaned_manager(
+    data: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    listener: &dyn Fn() -> Evidence,
+) -> Result<bool, String> {
+    use crate::process_tree::{Presence, ProcessIdentity};
+    let deadline = Instant::now() + timeout;
+    let wait = || -> Result<(), String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native_manager_start_cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("native_manager_orphan_running".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        Ok(())
+    };
+    let unidentified = || -> Result<bool, String> {
+        loop {
+            if listener() != Evidence::Clear {
+                return Err("native_manager_orphan_running".into());
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            if cancel.load(Ordering::Acquire) {
+                return Err("native_manager_start_cancelled".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let process = match recorded(data) {
+        Recorded::Nothing => return Ok(false),
+        Recorded::Intent | Recorded::Unreadable => return unidentified(),
+        Recorded::Process(process) => process,
+    };
+    // A record naming this app itself names no Manager.
+    if process.pid == std::process::id() {
+        forget_owned_process(data);
+        return Ok(false);
+    }
+    let mut stopped = false;
+    loop {
+        match ProcessIdentity::lookup(process.pid) {
+            Presence::Absent => break,
+            Presence::Present(live) if live != process => break,
+            Presence::Unknown if !stopped => return unidentified(),
+            Presence::Unknown => wait()?,
+            // Manager exits on this request and its controller then stops the database.
+            Presence::Present(_) if !stopped => stopped = request_exit(&process)?,
+            Presence::Present(_) => wait()?,
+        }
+    }
+    forget_owned_process(data);
+    Ok(stopped)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Ready {
@@ -242,11 +747,23 @@ fn ready(bytes: &[u8], id: &str, hash: &str, origin: &str) -> Result<(), String>
     }
     Ok(())
 }
+/// Why a start that did not reach readiness failed. Cancellation is noticed in several
+/// places, one of which reports it as an unverified connection; a cancelled start is always
+/// reported as cancelled, so it is never mistaken for a refusal by Manager.
+fn start_failure(cancelled: bool, error: String) -> String {
+    if cancelled {
+        "native_manager_start_cancelled".into()
+    } else {
+        error
+    }
+}
 pub struct NativeManager {
     child: Child,
     #[cfg(windows)]
     tree: crate::process_tree::ProcessTree,
     receipt: mpsc::Receiver<Result<Vec<u8>, String>>,
+    #[cfg(all(test, windows))]
+    stderr_diagnostic: Option<mpsc::Receiver<()>>,
     installation_id: String,
     manifest_sha256: String,
     origin: String,
@@ -254,8 +771,27 @@ pub struct NativeManager {
     verified_ready: bool,
     startup_lease: Option<crate::host_state::Owner>,
     certificate_pem: String,
+    /// When the TLS identity this Manager serves runs out; None for a Manager given none.
+    certificate_expires_at: Option<i64>,
+    /// What to settle in the keystore once this Manager is verified ready.
+    identity: IdentityChange,
+    /// The certificates a renewal replaces, one of which this computer's grant may still pin.
+    replaced_certificates: Vec<String>,
+    /// Manager's data directory, for a Manager started from the keystore: where the record of
+    /// this library's ports is kept.
+    local_record: Option<PathBuf>,
     _code_lease: Option<crate::package_lease::CodeLease>,
     _profile_pins: Vec<fs::File>,
+}
+/// What a start did with this profile's TLS identity; the string is the profile binding.
+#[derive(Default)]
+enum IdentityChange {
+    #[default]
+    None,
+    /// A renewed identity is presented with a handover.
+    Renewed(String),
+    /// A renewed identity is waiting, and the one it would replace is presented.
+    SetAside(String),
 }
 #[derive(Default)]
 struct Leases {
@@ -264,10 +800,14 @@ struct Leases {
     profiles: Vec<fs::File>,
 }
 impl Programs<'_> {
-    pub fn start_from_keystore(&self, config: &Configuration) -> Result<NativeManager, String> {
+    pub(crate) fn start_from_keystore(
+        &self,
+        config: &mut Configuration,
+        start: &LocalStart<'_>,
+    ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         self.check()?;
-        let _profile_pins = protect_profile_parents(config)?;
+        let profile_pins = protect_profile_parents(config)?;
         protect(&config.controller, &mut BTreeSet::new())?;
         if self.root.file_name() != Some(std::ffi::OsStr::new("payload")) {
             return Err("native_manager_layout_invalid".into());
@@ -280,16 +820,120 @@ impl Programs<'_> {
             candidate,
             self.runtime.manifest_sha256(),
         )?;
-        let tls =
-            TlsIdentity::from_keystore(&config.installation_id, &config.origin, profile.binding())?;
+        let crate::manager_tls::StartIdentity {
+            identity: tls,
+            handover,
+            set_aside,
+            signers,
+            certificates,
+        } = TlsIdentity::for_start(
+            &config.installation_id,
+            &config.origin,
+            profile.binding(),
+            start.features.tls_rotation && start.renew_identity.is_some(),
+            start.renew_identity.unwrap_or(0),
+        )?;
+        if handover.is_some() {
+            start.signers.store(signers, Ordering::Release);
+        }
         profile.require_current(config)?;
-        let lease = crate::host_state::Owner::acquire(&config.state, true)?;
+        let mut lease = crate::host_state::Owner::acquire(&config.state, true)?;
+        let fingerprints = certificates
+            .iter()
+            .map(|pem| crate::manager::certificate_fingerprint(pem))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The lease is held, so no controller runs; the journal then says whether its photo
+        // server and database were closed, or never existed.
+        let idle = lease.idle(&config.installation_id, self.runtime.manifest_sha256());
+        config.set_ports(crate::manager_local::ports_for_start(
+            start.features,
+            config.ports()?,
+            idle,
+            &fingerprints,
+        )?);
+        validate_configuration(config)?;
+        // Durable before the spawn: where this library listens, and what its Manager serves.
+        // Ports that were moved stay marked as unconfirmed until Manager is ready on them.
+        let record = crate::manager_local::Record::for_start(
+            &crate::manager_local::recorded(&config.data)?,
+            config.ports()?,
+            fingerprints,
+        );
+        if crate::manager_local::stored(&config.data)
+            != crate::manager_local::Stored::Present(record.clone())
+        {
+            crate::runtime_store::private_directory(&config.data)?;
+            crate::manager_local::save(&config.data, &record)?;
+        }
+        let started = self
+            .spawn_from_keystore(
+                config,
+                &profile,
+                &tls,
+                lease,
+                handover.as_ref(),
+                profile_pins,
+            )
+            .map(|mut manager| {
+                manager.local_record = Some(config.data.clone());
+                let binding = profile.binding().to_owned();
+                manager.identity = if handover.is_some() {
+                    IdentityChange::Renewed(binding)
+                } else if set_aside {
+                    IdentityChange::SetAside(binding)
+                } else {
+                    IdentityChange::None
+                };
+                // The other certificates of a renewal in progress, in either direction: those
+                // being replaced, or the waiting ones a rolled-back start set aside.
+                manager.replaced_certificates = certificates.iter().skip(1).cloned().collect();
+                manager
+            });
+        #[cfg(unix)]
+        match &started {
+            // If this write fails the intent stays, which a later run reads as "may be running".
+            Ok(manager) => {
+                let _ = record_owned_process(&config.data, manager.process_id());
+            }
+            // Either nothing was spawned, or the child was killed and reaped when its owner
+            // was dropped on the way out of `spawn`.
+            Err(_) => forget_owned_process(&config.data),
+        }
+        // Nothing of this start is running, so a port it moved to is not kept.
+        started.map_err(|error| crate::manager_local::withdrawn(&config.data, error))
+    }
+    /// The part of a start from the keystore that comes after its ports are recorded. A failure
+    /// here leaves nothing of this start running.
+    fn spawn_from_keystore(
+        &self,
+        config: &Configuration,
+        profile: &crate::manager_profile::Profile,
+        tls: &TlsIdentity,
+        lease: crate::host_state::Owner,
+        handover: Option<&crate::manager_tls::Handover>,
+        profile_pins: Vec<fs::File>,
+    ) -> Result<NativeManager, String> {
+        // This lease proves no controller of this library is running, so a listener on any of
+        // its ports belongs to another program.
+        foreign_listener(&[
+            local_origin(&config.origin)?,
+            config.api_port,
+            config.database_port,
+        ])?;
+        let (password, backup_key) = (profile.password(), profile.backup_key()?);
+        // Durable before the spawn: a crash from here on leaves a later run a record that says
+        // a Manager may be running, even before one has bound its port.
+        #[cfg(unix)]
+        record_launch_intent(&config.data)?;
         self.start_owned(
             config,
-            &profile.password(),
-            &profile.backup_key()?,
-            &tls,
+            &password,
+            &backup_key,
+            tls,
             Some(lease),
+            profile.installation_transition(),
+            handover,
+            Some(profile_pins),
         )
     }
     /// Caller must persist the database password before use; it never enters argv/env/logs.
@@ -300,8 +944,9 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
     ) -> Result<NativeManager, String> {
-        self.start_owned(config, password, backup_key, tls, None)
+        self.start_owned(config, password, backup_key, tls, None, None, None, None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn start_owned(
         &self,
         config: &Configuration,
@@ -309,6 +954,9 @@ impl Programs<'_> {
         backup_key: &Zeroizing<String>,
         tls: &TlsIdentity,
         startup_lease: Option<crate::host_state::Owner>,
+        transition: Option<&Transition>,
+        handover: Option<&crate::manager_tls::Handover>,
+        held_profile_pins: Option<Vec<fs::File>>,
     ) -> Result<NativeManager, String> {
         validate_configuration(config)?;
         if !crate::manager_profile::valid_backup_key(backup_key) || backup_key == password {
@@ -323,7 +971,19 @@ impl Programs<'_> {
         let candidate = self.root.parent().ok_or("native_manager_layout_invalid")?;
         validate_paths(candidate, &config.state, &config.data)?;
         self.check()?;
-        let profile_pins = protect_profile_parents(config)?;
+        // On Windows a start from the keystore admitted the profile and has held it pinned
+        // ever since; the same pins go to Manager's owner. Elsewhere the parents are checked
+        // again here, as they always were.
+        #[cfg(windows)]
+        let profile_pins = match held_profile_pins {
+            Some(pins) => pins,
+            None => protect_profile_parents(config)?,
+        };
+        #[cfg(not(windows))]
+        let profile_pins = {
+            drop(held_profile_pins);
+            protect_profile_parents(config)?
+        };
         protect(&config.controller, &mut BTreeSet::new())?;
         let code_lease = crate::package_lease::CodeLease::acquire(candidate)?;
         let controller = crate::runtime_store::read_bounded(&config.controller, 256 * 1024 * 1024)?;
@@ -342,20 +1002,6 @@ impl Programs<'_> {
             .map_err(|_| "native_manager_tls_invalid")?;
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Binding<'a> {
-            runtime: &'a str,
-            id: &'a str,
-            controller: &'a Path,
-            candidate: &'a Path,
-            state: &'a Path,
-            manifest_sha256: &'a str,
-            source_revision: &'a str,
-            certified: bool,
-            database_port: u16,
-            api_port: u16,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
         struct Bootstrap<'a> {
             protocol_version: u32,
             installation: Binding<'a>,
@@ -366,21 +1012,18 @@ impl Programs<'_> {
             password: &'a str,
             backup_key: &'a str,
             tls: crate::manager_tls::BootstrapTls<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            installation_transition: Option<&'a Transition>,
+            #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+            #[serde(skip_serializing_if = "Option::is_none")]
+            media_move_qualification: Option<serde_json::Value>,
+            /// Only for a Manager that declares `tls-rotation`: any other refuses the field.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tls_rotation: Option<&'a crate::manager_tls::Handover>,
         }
         let bootstrap = Bootstrap {
             protocol_version: 2,
-            installation: Binding {
-                runtime: "native",
-                id: &config.installation_id,
-                controller: &config.controller,
-                candidate,
-                state: &config.state,
-                manifest_sha256: self.runtime.manifest_sha256(),
-                source_revision: self.runtime.source_revision(),
-                certified: self.runtime.certified(),
-                database_port: config.database_port,
-                api_port: config.api_port,
-            },
+            installation: binding(config, candidate, self.runtime)?,
             controller_sha256: &controller_hash,
             backup_engine: self.runtime.backup_engine()?,
             name: &config.name,
@@ -388,6 +1031,13 @@ impl Programs<'_> {
             password,
             backup_key,
             tls: tls.wire(),
+            installation_transition: transition,
+            #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+            media_move_qualification: crate::host_state::media_move::qualification::device_for(
+                &config.state,
+            )?
+            .map(|_| serde_json::json!({"manifestSha256": self.runtime.manifest_sha256()})),
+            tls_rotation: handover,
         };
         let mut input = Zeroizing::new(
             serde_json::to_vec(&bootstrap).map_err(|_| "native_manager_config_invalid")?,
@@ -408,7 +1058,9 @@ impl Programs<'_> {
             .env("MANAGER_ORIGIN", &config.origin)
             .env("MANAGER_DATA", &config.data);
         #[cfg(windows)]
-        command.env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS);
+        command
+            .env("NODE_OPTIONS", crate::windows_protection::NODE_PATH_OPTIONS)
+            .env("SystemRoot", crate::windows_protection::system_root()?);
         let mut manager = NativeManager::spawn(
             &mut command,
             input,
@@ -423,10 +1075,12 @@ impl Programs<'_> {
             },
         )?;
         manager.certificate_pem = tls.certificate().into();
+        manager.certificate_expires_at = Some(tls.expires_at());
         Ok(manager)
     }
 }
 impl NativeManager {
+    /// Start the owned Manager and send its bootstrap through private stdin.
     fn spawn(
         command: &mut Command,
         input: Zeroizing<Vec<u8>>,
@@ -442,6 +1096,13 @@ impl NativeManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(all(test, windows))]
+        if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
+            && std::env::var_os("FRAMELEAF_INSTALLED_HOST_MANIFEST").is_some()
+        {
+            command.stderr(Stdio::piped());
+        }
         let child = match &leases.code {
             Some(lease) => lease.spawn(command),
             None => command.spawn(),
@@ -465,6 +1126,8 @@ impl NativeManager {
             #[cfg(windows)]
             tree,
             receipt,
+            #[cfg(all(test, windows))]
+            stderr_diagnostic: None,
             installation_id: id.into(),
             manifest_sha256: hash.into(),
             origin: origin.into(),
@@ -472,9 +1135,90 @@ impl NativeManager {
             verified_ready: false,
             startup_lease: leases.startup,
             certificate_pem: String::new(),
+            certificate_expires_at: None,
+            identity: IdentityChange::None,
+            replaced_certificates: Vec::new(),
+            local_record: None,
             _code_lease: leases.code,
             _profile_pins: leases.profiles,
         };
+        #[cfg(all(test, windows))]
+        if let Some(mut stderr) = owner.child.stderr.take() {
+            let (complete, diagnostic) = mpsc::channel();
+            owner.stderr_diagnostic = Some(diagnostic);
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stderr.by_ref().take(8192).read_to_end(&mut bytes);
+                let output = String::from_utf8_lossy(&bytes);
+                eprintln!("Installed Manager stderr prefix: bytes={}", bytes.len());
+                // Print only known refusal codes and error categories, never child stderr or its paths.
+                for code in [
+                    "ZodError",
+                    "TypeError",
+                    "ReferenceError",
+                    "SyntaxError",
+                    "ERR_SQLITE_ERROR",
+                    "EACCES",
+                    "EPERM",
+                    "ENOENT",
+                    "EINVAL",
+                    "native_installation_invalid",
+                    "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+                    "ERR_INVALID_URL",
+                    "ERR_WORKER_UNSUPPORTED_OPERATION",
+                    "native_bootstrap_unavailable",
+                    "native_bootstrap_invalid",
+                    "native_controller_changed",
+                    "native_controller_unprotected",
+                    "native_backup_engine_changed",
+                    "native_backup_destination_invalid",
+                    "native_tls_invalid",
+                    "native_installation_changed",
+                    "ERR_MODULE_NOT_FOUND",
+                    "ERR_INVALID_ARG_VALUE",
+                    "ERR_INVALID_FILE_URL_HOST",
+                    "ERR_INVALID_FILE_URL_PATH",
+                    "native_library_identity_invalid",
+                    "manager_runtime_changed",
+                    "Frameleaf Manager could not start; check its mounted configuration.",
+                ] {
+                    if output.contains(code) {
+                        eprintln!("Installed Manager diagnostic: {code}");
+                    }
+                }
+                for file in [
+                    "main.js:",
+                    "native-service.js:",
+                    "native.js:",
+                    "store.js:",
+                    "security.js:",
+                    "backups.js:",
+                    "releases.js:",
+                ] {
+                    let line = output
+                        .match_indices(file)
+                        .filter(|(index, _)| {
+                            *index == 0
+                                || matches!(
+                                    output.as_bytes()[index - 1],
+                                    b'/' | b'\\' | b' ' | b'('
+                                )
+                        })
+                        .find_map(|(index, _)| {
+                            output[index + file.len()..]
+                                .split(':')
+                                .next()?
+                                .parse::<u32>()
+                                .ok()
+                        });
+                    if let Some(line) = line {
+                        eprintln!("Installed Manager frame: {file}{line}");
+                    }
+                }
+                let _ = complete.send(());
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            });
+        }
         let stdout = owner
             .child
             .stdout
@@ -523,7 +1267,7 @@ impl NativeManager {
             self.startup_lease.take();
             return Ok(());
         }
-        let result = self.wait_ready_inner(timeout, cancel).await;
+        let mut result = self.wait_ready_inner(timeout, cancel).await;
         if result.is_err() {
             self.verified_ready = false;
             #[cfg(windows)]
@@ -533,9 +1277,26 @@ impl NativeManager {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
             }
+            // A start the person cancelled says so, wherever the cancellation was noticed.
+            result = result.map_err(|error| start_failure(cancel.load(Ordering::Acquire), error));
+            // Manager did not come up and has been ended, so a port this start moved to is
+            // not kept: Manager may have refused it.
+            if let Some(data) = &self.local_record {
+                result = result.map_err(|error| crate::manager_local::withdrawn(data, error));
+            }
         }
         self.startup_lease.take();
         result
+    }
+    /// Once this Manager is verified ready: the ports it was started on are this library's.
+    pub(crate) fn confirm_ports(&self) -> Result<(), String> {
+        if !self.verified_ready {
+            return Err("native_manager_not_ready".into());
+        }
+        match &self.local_record {
+            Some(data) => crate::manager_local::confirm(data),
+            None => Ok(()),
+        }
     }
 
     async fn wait_ready_inner(
@@ -558,8 +1319,24 @@ impl NativeManager {
             }
             match self.receipt.try_recv() {
                 Ok(bytes) => {
+                    let bytes = bytes?;
+                    #[cfg(all(test, windows))]
+                    if self.stderr_diagnostic.is_some() {
+                        let value = serde_json::from_slice::<Ready>(&bytes);
+                        eprintln!(
+                            "Installed Manager receipt: bytes={}, newline={}, decoded={}, binding_matches={}",
+                            bytes.len(),
+                            bytes.ends_with(b"\n"),
+                            value.is_ok(),
+                            value.is_ok_and(|value| value.protocol_version == 2
+                                && value.state == "ready"
+                                && value.installation_id == self.installation_id
+                                && value.manifest_sha256 == self.manifest_sha256
+                                && value.origin == self.origin)
+                        );
+                    }
                     ready(
-                        &bytes?,
+                        &bytes,
                         &self.installation_id,
                         &self.manifest_sha256,
                         &self.origin,
@@ -650,6 +1427,96 @@ impl NativeManager {
             .map(|value| value.is_some())
             .map_err(|_| "native_manager_state_unavailable".into())
     }
+    #[cfg(unix)]
+    pub(crate) fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+    pub(crate) fn certificate_expires_at(&self) -> Option<i64> {
+        self.certificate_expires_at
+    }
+    /// Once this Manager is verified ready: make the identity it accepted the saved one.
+    /// A renewed identity it served is promoted; a waiting one it was not shown is dropped,
+    /// because Manager answering with the earlier identity proves that is what it holds.
+    pub(crate) fn settle_identity(&mut self) -> Result<(), String> {
+        if !self.verified_ready {
+            return Err("native_manager_not_ready".into());
+        }
+        match std::mem::take(&mut self.identity) {
+            IdentityChange::None => Ok(()),
+            IdentityChange::Renewed(binding) => TlsIdentity::promote(&binding),
+            IdentityChange::SetAside(binding) => TlsIdentity::discard_pending(&binding),
+        }
+    }
+    /// The certificates a renewal presented by this Manager replaces, one of which this
+    /// computer's grant may still pin. Only once this Manager is verified ready.
+    pub(crate) fn replaced_certificates(&self) -> &[String] {
+        if self.verified_ready {
+            &self.replaced_certificates
+        } else {
+            &[]
+        }
+    }
+    pub(crate) fn certificate(&self) -> &str {
+        &self.certificate_pem
+    }
+    /// Whether Manager and everything it started under this owner have exited.
+    pub(crate) fn tree_exited(&mut self) -> Result<bool, String> {
+        if !self.has_exited()? {
+            return Ok(false);
+        }
+        // The Windows job also holds the controller and database; they can outlive Manager.
+        #[cfg(windows)]
+        {
+            self.tree
+                .is_empty()
+                .map_err(|_| "native_manager_state_unavailable".into())
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(true)
+        }
+    }
+    /// Whether stopping this Manager can end anything besides Manager. Outside Windows the
+    /// stop signals Manager's own process and nothing else. On Windows it ends Manager's job,
+    /// and with it whatever Manager started: `Clear` only while that job holds Manager and, at /// most, the console host Windows gives it.
+    pub(crate) fn stops_alone(&mut self) -> Evidence {
+        #[cfg(windows)]
+        {
+            match console_host() {
+                Ok(console) => sole_member(self.tree.members(), self.child.id(), &console),
+                Err(_) => Evidence::Unknown,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Evidence::Clear
+        }
+    }
+    /// For a failed test: what Manager's job holds and whether Manager has exited.
+    #[cfg(all(test, windows))]
+    pub(crate) fn job_report(&mut self) -> String {
+        format!(
+            "manager={} exited={:?} console={:?} members={:?}",
+            self.child.id(),
+            self.has_exited(),
+            console_host(),
+            self.tree.members()
+        )
+    }
+    /// A stand-in child for lifecycle tests; it never reports readiness.
+    #[cfg(all(test, any(unix, windows)))]
+    pub(crate) fn test_child(command: &mut Command) -> Self {
+        Self::spawn(
+            command,
+            Zeroizing::new(b"synthetic-private-input\n".to_vec()),
+            "aaaaaaaaaaaa",
+            &"b".repeat(64),
+            "https://127.0.0.1:9443",
+            reqwest::Client::new(),
+            Leases::default(),
+        )
+        .unwrap()
+    }
     pub fn is_running(&mut self) -> Result<bool, String> {
         Ok(self.verified_ready
             && self
@@ -738,6 +1605,10 @@ impl Drop for NativeManager {
                 let _ = self.child.kill();
             }
         }
+        #[cfg(all(test, windows))]
+        if let Some(diagnostic) = self.stderr_diagnostic.take() {
+            let _ = diagnostic.recv_timeout(Duration::from_secs(1));
+        }
         #[cfg(not(windows))]
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let _ = self.child.kill();
@@ -749,6 +1620,386 @@ impl Drop for NativeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_holds_its_leader_alone_only_when_every_other_member_is_a_console_host() {
+        const CONSOLE: &str = r"C:\Windows\System32\conhost.exe";
+        let leader = (7, Some(r"C:\Frameleaf\node.exe".to_string()));
+        let console = (8, Some(r"c:\windows\system32\CONHOST.EXE".to_string()));
+        let named = |id: u32, program: &str| (id, Some(program.to_string()));
+        let alone = |members: Vec<(u32, Option<String>)>| sole_member(Ok(members), 7, CONSOLE);
+        // Manager, with or without its console host, and nothing left at all.
+        assert_eq!(alone(vec![leader.clone()]), Evidence::Clear);
+        assert_eq!(
+            alone(vec![leader.clone(), console.clone()]),
+            Evidence::Clear
+        );
+        assert_eq!(alone(vec![]), Evidence::Clear);
+        // The leader is known by its ID alone, even when its program could not be read.
+        assert_eq!(alone(vec![(7, None), console.clone()]), Evidence::Clear);
+        // Anything else: a controller, a database, a second node, or a console host that is
+        // not the system's.
+        for other in [
+            named(9, r"C:\Frameleaf\frameleaf-native-host.exe"),
+            named(9, r"C:\Frameleaf\postgres.exe"),
+            named(9, r"C:\Frameleaf\node.exe"),
+            named(9, r"C:\Frameleaf\conhost.exe"),
+            named(9, "conhost.exe"),
+        ] {
+            assert_eq!(
+                alone(vec![leader.clone(), console.clone(), other.clone()]),
+                Evidence::Running
+            );
+            // Also once Manager itself has exited, and beside a member that cannot be read.
+            assert_eq!(alone(vec![other.clone()]), Evidence::Running);
+            assert_eq!(alone(vec![(10, None), other]), Evidence::Running);
+        }
+        // A member whose program cannot be read, and members that cannot be listed.
+        assert_eq!(alone(vec![leader, (9, None)]), Evidence::Unknown);
+        assert_eq!(
+            sole_member(Err("runtime_process_state_unavailable".into()), 7, CONSOLE),
+            Evidence::Unknown
+        );
+    }
+    /// Captured from a Library 1.2.3 Manager's stored native-installation binding (synthetic fixture).
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_fingerprint_matches_the_one_manager_stored() {
+        let m = "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435";
+        let controller = format!("/opt/frameleaf/Controllers/{m}/bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b/frameleaf-native-host");
+        let candidate = format!("/opt/frameleaf/Runtimes/{m}");
+        let installation = Binding {
+            runtime: "native",
+            id: "1d0ea3c5161e",
+            secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
+            controller: Path::new(&controller),
+            candidate: Path::new(&candidate),
+            state: Path::new("/opt/frameleaf/Profiles/1001/state"),
+            manifest_sha256: m,
+            source_revision: "c64039743af7bb0d68b602ff842683906019de52",
+            certified: false,
+            database_port: 54329,
+            api_port: 2283,
+        };
+        let backup = crate::host_runtime::BackupEngine {
+            executable: format!("{candidate}/payload/backup/restic").into(),
+            sha256: "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6".into(),
+        };
+        assert_eq!(
+            fingerprint(
+                installation,
+                "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b",
+                backup,
+                "My Frameleaf library",
+                "frameleaf-v1.2.3-native.c64039743af7-1",
+                "9fdf3df9908cdfa7823ee232f00c28e749bd4a5f04cdec60429c3c232b496ec2".into(),
+            )
+            .unwrap(),
+            "4960f7aabe867f695d52ba16515e8f382b6d5b680135a2a5e6904995e634cd86"
+        );
+    }
+    #[test]
+    fn only_the_mixed_separator_manager_rewrites_is_rewritten() {
+        assert_eq!(
+            manager_backup_path(
+                r"\\.\GLOBALROOT\Device\HarddiskVolume3\Host\payload\backup/restic.exe"
+            )
+            .as_deref(),
+            Some(r"\\.\GLOBALROOT\Device\HarddiskVolume3\Host\payload\backup\restic.exe")
+        );
+        for unchanged in [
+            r"C:\Host\payload\backup\restic.exe",
+            r"C:\Host\payload/backup/restic.exe",
+            r"C:\Host\payload\backup/restic.exe.old",
+            "/opt/frameleaf/payload/backup/restic",
+        ] {
+            assert_eq!(manager_backup_path(unchanged), None, "{unchanged}");
+        }
+    }
+    /// The descriptor fingerprints of two packages of one library on Windows. The same two
+    /// values are what `tools/check_manager_transition.mjs` requires the real Manager to store
+    /// for the same descriptors, and to accept as a package transition, on a Windows runner.
+    #[cfg(windows)]
+    #[test]
+    fn windows_descriptor_fingerprints_are_the_ones_manager_stores() {
+        let root = r"\\.\GLOBALROOT\Device\HarddiskVolume3\Program Files\Frameleaf Desktop Host";
+        let state = r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\Zoë\AppData\Local\Frameleaf Desktop Host\state";
+        let engine = "01143daba61a1dc8afb0cb3d03ba83e6b118f55b6b146b27473a09efc3df13d6";
+        let certificate = format!("{:x}", Sha256::digest(b"synthetic certificate"));
+        for (m, c, revision, release, expected) in [
+            (
+                "2047575e52c6bf5f0f1c3a44a56fa7ef0e8982679c4b77848f2c6a3ebc2c6435".to_string(),
+                "bf2c8b0fbb382066895f40f2e7e2e10832db9ba997f99dadf685ab826b5de68b".to_string(),
+                "c64039743af7bb0d68b602ff842683906019de52".to_string(),
+                "frameleaf-v1.2.3-native.c64039743af7-1",
+                "18db0c2f9c9d2c6de9fa7ba619ccae542cb0f4c6509f6aa84dcfb1ce9f20c9e2",
+            ),
+            (
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(40),
+                "frameleaf-v1.2.4-native.dddddddddddd-1",
+                "9e4edbeab516450823bc031af37a5497c90d6a13f45d4eaff2fbf5d3b832ad25",
+            ),
+        ] {
+            let controller = format!(r"{root}\Controllers\{m}\{c}\frameleaf-native-host.exe");
+            let candidate = format!(r"{root}\Runtimes\{m}");
+            let installation = Binding {
+                runtime: "native",
+                id: "1d0ea3c5161e",
+                secure_installation_id: "c6c6b19e-000f-88a2-9241-7571029303a6".parse().unwrap(),
+                controller: Path::new(&controller),
+                candidate: Path::new(&candidate),
+                state: Path::new(state),
+                manifest_sha256: &m,
+                source_revision: &revision,
+                certified: false,
+                database_port: 54329,
+                api_port: 2283,
+            };
+            // As this app builds it: the payload directory joined to the manifest's role.
+            let backup = crate::host_runtime::BackupEngine {
+                executable: Path::new(&candidate)
+                    .join("payload")
+                    .join("backup/restic.exe"),
+                sha256: engine.into(),
+            };
+            assert!(backup
+                .executable
+                .to_str()
+                .unwrap()
+                .ends_with(r"\backup/restic.exe"));
+            // Written out as Manager's `JSON.stringify` does: its schema's field order, and
+            // the backup engine's path with the separator it rewrote.
+            let text = |value: &str| serde_json::to_string(value).unwrap();
+            let stored = format!(
+                concat!(
+                    r#"{{"protocolVersion":2,"installation":{{"runtime":"native","id":"1d0ea3c5161e","#,
+                    r#""secureInstallationId":"c6c6b19e-000f-88a2-9241-7571029303a6","controller":{},"#,
+                    r#""candidate":{},"state":{},"manifestSha256":"{}","sourceRevision":"{}","#,
+                    r#""certified":false,"databasePort":54329,"apiPort":2283}},"controllerSha256":"{}","#,
+                    r#""backupEngine":{{"executable":{},"sha256":"{}"}},"name":"My Frameleaf library","#,
+                    r#""release":"{}","tlsCertificatePemSha256":"{}"}}"#,
+                ),
+                text(&controller),
+                text(&candidate),
+                text(state),
+                m,
+                revision,
+                c,
+                text(&format!(r"{candidate}\payload\backup\restic.exe")),
+                engine,
+                release,
+                certificate,
+            );
+            let computed = fingerprint(
+                installation,
+                &c,
+                backup,
+                "My Frameleaf library",
+                release,
+                certificate.clone(),
+            )
+            .unwrap();
+            assert_eq!(computed, format!("{:x}", Sha256::digest(stored.as_bytes())));
+            assert_eq!(computed, expected);
+        }
+    }
+    /// A start cancelled while its port move was still unconfirmed: the move is taken back,
+    /// and the answer is the cancellation, never a busy port.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_start_with_a_moved_port_reads_as_cancelled_and_does_not_keep_the_move() {
+        use crate::manager_local::{recorded, save, Ports, Record};
+        assert_eq!(
+            start_failure(true, "native_manager_https_unverified".into()),
+            "native_manager_start_cancelled"
+        );
+        assert_eq!(
+            start_failure(false, "native_manager_https_unverified".into()),
+            "native_manager_https_unverified"
+        );
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-cancelled-move-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let ran = Record::new(Ports::default(), vec!["a".repeat(64)]);
+        let moved = Ports {
+            api: 2284,
+            ..Ports::default()
+        };
+        for (cancelled, expected) in [
+            (true, "native_manager_start_cancelled"),
+            // Not cancelled: the child ends without a receipt, and the busy port is named.
+            (false, "local_port_in_use_2283"),
+        ] {
+            save(&root, &Record::for_start(&ran, moved, vec!["a".repeat(64)])).unwrap();
+            let mut manager = NativeManager::test_child(Command::new("/bin/sleep").arg("1"));
+            manager.local_record = Some(root.clone());
+            let cancel = AtomicBool::new(cancelled);
+            assert_eq!(
+                manager
+                    .wait_ready(Duration::from_secs(5), &cancel)
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(recorded(&root).unwrap(), ran, "the move is not kept");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_process_handle_fails_closed_except_on_a_kernel_without_one() {
+        use crate::process_tree::ProcessIdentity;
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let live = ProcessIdentity::of(child.id()).unwrap();
+        // Unexpected refusals must not fall back to signalling a bare PID.
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EINVAL,
+            libc::EPERM,
+        ] {
+            assert_eq!(
+                request_exit_through(&live, |_| Err(errno)).unwrap_err(),
+                "native_manager_orphan_running"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "errno {errno} signalled"
+            );
+        }
+        // The process is already gone: nothing to signal, and that is not an error.
+        assert!(!request_exit_through(&live, |_| Err(libc::ESRCH)).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        // Even the one permitted fallback re-reads the identity first.
+        let mut reused = live.clone();
+        reused.started.push('9');
+        assert!(!request_exit_through(&reused, |_| Err(libc::ENOSYS)).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        // A kernel without process handles is the only case that signals by PID.
+        assert!(request_exit_through(&live, |_| Err(libc::ENOSYS)).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        // A real handle reaches the recorded process.
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let live = ProcessIdentity::of(child.id()).unwrap();
+        assert!(request_exit_through(&live, open_process_handle).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_manager_is_stopped_only_while_the_recorded_process_is_still_the_same_one() {
+        use crate::process_tree::ProcessIdentity;
+        use std::os::unix::{fs::OpenOptionsExt, process::ExitStatusExt};
+        let data = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-owned-manager-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&data).unwrap();
+        let record = data.join(OWNED_PROCESS);
+        let write = |process: &ProcessIdentity| {
+            let _ = fs::remove_file(&record);
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&record)
+                .unwrap()
+                .write_all(
+                    &serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"process":process}))
+                        .unwrap(),
+                )
+                .unwrap();
+        };
+        let cancel = AtomicBool::new(false);
+        let stop_with = |timeout: Duration, listener: &dyn Fn() -> Evidence| {
+            stop_orphaned_manager(&data, timeout, &cancel, listener)
+        };
+        let stop = || stop_with(Duration::from_secs(10), &|| Evidence::Clear).unwrap();
+        assert!(!stop(), "nothing was recorded");
+
+        for pid in [0, 1, u32::MAX] {
+            assert!(ProcessIdentity::of(pid).is_none());
+        }
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let live = ProcessIdentity::of(child.id()).unwrap();
+        assert_eq!(ProcessIdentity::of(child.id()).unwrap(), live);
+        assert_ne!(ProcessIdentity::of(std::process::id()).unwrap(), live);
+
+        // The recorded PID now belongs to a process that started at another time.
+        let mut reused = live.clone();
+        reused.started.push('9');
+        write(&reused);
+        assert!(!stop());
+        assert!(!record.exists(), "a stale record is forgotten");
+        // Same PID and start, but it runs a different program.
+        let mut other = live.clone();
+        other.program = "/bin/echo".into();
+        write(&other);
+        assert!(!stop());
+        // A record naming this app itself is never acted on.
+        write(&ProcessIdentity::of(std::process::id()).unwrap());
+        assert!(!stop());
+        // A record that is not private could have been written by anyone. The mode is set
+        // outright so the check does not depend on the umask this test runs under.
+        fs::write(
+            &record,
+            serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"process":live})).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        assert!(crate::host_state::valid_file(&fs::File::open(&record).unwrap()).is_err());
+        // Neither it nor a launch that recorded no process identifies a Manager to stop, and
+        // neither is cleared. A start may go on only while the port definitely refuses.
+        let brief = Duration::from_millis(200);
+        for intent in [false, true] {
+            if intent {
+                record_launch_intent(&data).unwrap();
+                assert_eq!(recorded(&data), Recorded::Intent);
+            } else {
+                assert_eq!(recorded(&data), Recorded::Unreadable);
+            }
+            assert_eq!(
+                recorded_manager(&data, |_| panic!("no process is named")),
+                Evidence::Unknown
+            );
+            for answering in [Evidence::Running, Evidence::Unknown] {
+                assert_eq!(
+                    stop_with(brief, &|| answering).unwrap_err(),
+                    "native_manager_orphan_running"
+                );
+            }
+            assert!(!stop_with(brief, &|| Evidence::Clear).unwrap());
+            assert!(record.exists(), "an unidentified record is never cleared");
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a process that is not the recorded one must never be signalled"
+        );
+
+        // The exact process this app recorded is asked to exit, and only then forgotten.
+        record_owned_process(&data, child.id()).unwrap();
+        assert_eq!(
+            recorded_manager(&data, ProcessIdentity::lookup),
+            Evidence::Running
+        );
+        assert_eq!(
+            recorded_manager(&data, |_| crate::process_tree::Presence::Unknown),
+            Evidence::Unknown
+        );
+        assert!(stop());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert!(!record.exists());
+        // Its record outliving it changes nothing.
+        write(&live);
+        assert!(!stop());
+        assert!(!record.exists());
+        fs::remove_dir_all(data).unwrap();
+    }
     #[test]
     fn readiness_is_bounded_and_bound_to_this_installation_manifest_and_origin() {
         let good = br#"{"protocolVersion":2,"state":"ready","installationId":"aaaaaaaaaaaa","manifestSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","origin":"https://127.0.0.1:9443"}

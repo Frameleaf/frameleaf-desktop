@@ -41,7 +41,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Actual Windows PE qualification failed' }
       - name: Retain qualification receipt without fixture binaries
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: windows-pe-inspector-qualification
           path: ${{ runner.temp }}/windows-pe-qualification.json

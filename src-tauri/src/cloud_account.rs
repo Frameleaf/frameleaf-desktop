@@ -18,7 +18,10 @@ use std::{
 };
 use tauri::{Manager, State, WebviewWindow};
 use url::Url;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
+
+#[path = "cloud_email.rs"]
+pub(crate) mod email;
 
 pub(crate) const CLIENT_ID: &str = "frameleaf-desktop";
 pub(crate) const SCOPE: &str = "openid email profile offline_access account";
@@ -223,7 +226,7 @@ async fn discover_hosts(client: &Client, cloud: &Url) -> CloudHosts {
     hosts_from_discovery(cloud, document.as_ref())
 }
 
-fn random_token(bytes: usize) -> String {
+pub(crate) fn random_token(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     rand::rngs::OsRng.fill_bytes(&mut buffer);
     URL_SAFE_NO_PAD.encode(buffer)
@@ -326,19 +329,22 @@ fn page(title: &str, text: &str) -> String {
 
 /// One request's target (`GET /callback?… HTTP/1.1`), read with a bound and a read timeout.
 fn request_target(stream: &mut TcpStream) -> Option<String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    // One deadline for the whole request: a per-read timeout alone lets a slow sender hold the
+    // single callback loop for minutes, past the sign-in's own deadline.
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut request = Vec::new();
     let mut byte = [0u8];
     while !request.ends_with(b"\r\n\r\n") {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return None;
+        }
         match stream.read(&mut byte) {
             Ok(1) => request.push(byte[0]),
             _ => return None,
         }
         if request.len() > 8192 {
             return None;
-        }
-        if request.ends_with(b"\r\n") && !request.contains(&b'\n') {
-            break;
         }
     }
     let line = request.split(|b| *b == b'\n').next()?;
@@ -616,6 +622,17 @@ pub(crate) async fn cloud_sign_in(
         ],
     )
     .await?;
+    keep_sign_in(&client, &window, &cloud, &hosts, token).await
+}
+
+/// Saves a new sign-in's tokens and reads the account; a sign-in that can't be kept is revoked.
+async fn keep_sign_in(
+    client: &Client,
+    window: &WebviewWindow,
+    cloud: &Url,
+    hosts: &CloudHosts,
+    token: TokenResponse,
+) -> Result<CloudAccount, String> {
     let refresh_token = token
         .refresh_token
         .ok_or("cloud_sign_in_no_refresh_token")?;
@@ -627,17 +644,33 @@ pub(crate) async fn cloud_sign_in(
         access_token: token.access_token.clone(),
         expires_at: now() + token.expires_in.unwrap_or(600),
     };
-    store(&credential)?;
-    if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, &window) {
+    {
+        // Two sign-ins finishing at once (browser and email code) must not overwrite each other:
+        // the check and the save happen under the same lock sign-out and refresh use.
+        let kept = {
+            let _held = LIFECYCLE.lock().await;
+            match load() {
+                Ok(Some(_)) => Err("cloud_sign_out_before_switching_accounts".into()),
+                Ok(None) => store(&credential),
+                Err(error) => Err(error),
+            }
+        };
+        // A new sign-in that can't be kept is revoked once, after the lock is released.
+        if let Err(error) = kept {
+            let _ = revoke(client, &credential).await;
+            return Err(error);
+        }
+    }
+    if let Err(error) = credentials::confirm_new_sign_in(CREDENTIAL, &credential, window) {
         if error == "credential_confirmation_changed" {
-            let _ = revoke(&client, &credential).await;
+            let _ = revoke(client, &credential).await;
         }
         return Err(error);
     }
-    match profile(&client, &credential, &token.access_token).await {
+    match profile(client, &credential, &token.access_token).await {
         Ok(account) => Ok(account),
         Err(error) => {
-            let _ = revoke(&client, &credential).await;
+            let _ = revoke(client, &credential).await;
             let _ = credentials::delete(CREDENTIAL);
             Err(error)
         }
@@ -830,27 +863,46 @@ async fn probe(client: Client, base: Url) -> Result<String, String> {
     Ok(ping.id)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExchangeResponse {
-    access_token: Option<String>,
-    user_id: Option<String>,
-    name: Option<String>,
+/// A Sign in with Frameleaf the server answered with a step (its local Password or authenticator):
+/// the verified address that asked, kept here until the proof arrives. The window never chooses
+/// where a Password is sent.
+#[derive(Default)]
+pub(crate) struct ServerStep(std::sync::Mutex<Option<(Url, Zeroizing<String>)>>);
+
+impl ServerStep {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(Url, Zeroizing<String>)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Remembers the step and hands it to the window.
+    fn open(&self, base: Url, pending: crate::server_steps::Pending) -> crate::SignInOutcome {
+        let outcome = crate::SignInOutcome::Next {
+            transaction: pending.transaction.as_str().to_owned(),
+            methods: pending.methods,
+            sent_to: None,
+            server: Some(base.to_string()),
+        };
+        *self.slot() = Some((base, pending.transaction));
+        outcome
+    }
+    /// The server the step with this transaction belongs to.
+    fn server_for(&self, transaction: &str) -> Option<Url> {
+        self.slot()
+            .as_ref()
+            .filter(|(_, open)| open.as_str() == transaction)
+            .map(|(base, _)| base.clone())
+    }
+    fn close(&self) {
+        *self.slot() = None;
+    }
 }
 
-#[tauri::command]
-pub(crate) async fn connect_cloud_server(
-    window: WebviewWindow,
-    app: tauri::AppHandle,
-    state: State<'_, crate::DesktopState>,
-    instance_id: String,
-    device_name: String,
-) -> Result<ConnectionView, String> {
-    crate::require_local(&window)?;
-    let instance = uuid::Uuid::parse_str(instance_id.trim())
-        .map_err(|_| "cloud_server_invalid")?
-        .to_string();
-    let mut current = state.0.lock().await;
+/// Nothing may be signed in, and the local server may not be running, before a new sign-in.
+fn ready_to_sign_in(
+    app: &tauri::AppHandle,
+    current: &Option<SavedConnection>,
+) -> Result<(), String> {
     if app
         .state::<crate::host_setup::HostSetup>()
         .background_active()
@@ -860,6 +912,25 @@ pub(crate) async fn connect_cloud_server(
     if current.is_some() || credentials::load::<SavedConnection>("connection")?.is_some() {
         return Err("sign_out_before_switching_servers".into());
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn connect_cloud_server(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, crate::DesktopState>,
+    instance_id: String,
+    device_name: String,
+    server: Option<String>,
+) -> Result<crate::SignInOutcome, String> {
+    crate::require_local(&window)?;
+    let requested = server.as_deref().map(normalize_server).transpose()?;
+    let instance = uuid::Uuid::parse_str(instance_id.trim())
+        .map_err(|_| "cloud_server_invalid")?
+        .to_string();
+    let mut current = state.0.lock().await;
+    ready_to_sign_in(&app, &current)?;
     // Check secure persistence and the device identity before any token is minted.
     let identity = credentials::foreground_identity(&window)?;
     identity.enrollment("validation", "validation", &device_name, "client-worker")?;
@@ -867,20 +938,149 @@ pub(crate) async fn connect_cloud_server(
     let (credential, app_token) = signed_in(&client).await?;
     let issuer = Url::parse(&credential.issuer).map_err(|_| "cloud_address_invalid")?;
 
-    // 1. Where the server answers: every usable candidate is asked at once, the best one wins.
-    let listed = cloud_get(
+    // 1. Where the server answers.
+    let listed = async {
+        let listed = cloud_get(
+            &client,
+            &issuer,
+            &format!("v1/instances/{instance}/connections"),
+            &app_token,
+        )
+        .await?;
+        let candidates: Vec<Candidate> = listed
+            .get("connections")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or("cloud_response_invalid")?;
+        Ok::<_, String>(order_candidates(candidates))
+    };
+    let verify_identity = requested.is_some();
+    let base = match requested {
+        // A server found on this network or typed in: an address on this network or one the account
+        // lists for this instance, answering as that instance.
+        Some(base) => {
+            if !base.host().is_some_and(crate::connection::is_local_network)
+                && !address_listed(&listed.await?, &base)
+            {
+                return Err("cloud_server_address_unlisted".into());
+            }
+            if probe(client.clone(), base.clone()).await? != instance {
+                return Err("server_identity_changed".into());
+            }
+            base
+        }
+        None => choose_listed(&client, listed.await?, &instance).await?,
+    };
+    // FL-430: before a server token goes to an address the account didn't hand us, or over plain
+    // http, the address proves it holds the server's pinned identity key.
+    if verify_identity || base.scheme() == "http" {
+        // The keys this account's instance list pins for the server: only a listed server can prove
+        // who it is, and an unlisted one could not take the account's token anyway.
+        let instances = cloud_get(&client, &issuer, "v1/instances", &app_token).await?;
+        let keys = crate::server_identity::pinned_keys(&instances, &instance)
+            .ok_or("cloud_server_not_on_account")?;
+        if keys.is_empty() {
+            return Err("server_identity_keys_unavailable".into());
+        }
+        crate::server_identity::verify(&client, &base, &instance, &keys).await?;
+    }
+    let outcome = connect_with_token(
+        &app,
+        &window,
+        &mut current,
         &client,
         &issuer,
-        &format!("v1/instances/{instance}/connections"),
         &app_token,
+        &instance,
+        base,
+        device_name,
+    )
+    .await;
+    drop(current);
+    if matches!(outcome, Ok(crate::SignInOutcome::Done { .. })) {
+        crate::tray::refresh(&app).await;
+    }
+    outcome
+}
+
+/// The step `connect_cloud_server` returned: the server's local Password when it listed
+/// `password`, and one authenticator proof (`totp` or `recovery_code`) when it listed those.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_cloud_server_step(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, crate::DesktopState>,
+    step: State<'_, ServerStep>,
+    transaction: String,
+    method: Option<String>,
+    proof: Option<String>,
+    password: Option<String>,
+    device_name: String,
+) -> Result<crate::SignInOutcome, String> {
+    crate::require_local(&window)?;
+    let transaction = Zeroizing::new(transaction);
+    let proof = proof.map(Zeroizing::new);
+    let password = password.map(Zeroizing::new);
+    let mut current = state.0.lock().await;
+    ready_to_sign_in(&app, &current)?;
+    let identity = credentials::foreground_identity(&window)?;
+    identity.enrollment("validation", "validation", &device_name, "client-worker")?;
+    // Only the address this app verified for the step ever receives the proof.
+    let base = step
+        .server_for(&transaction)
+        .ok_or("frameleaf_step_expired")?;
+    let proof = match (method.as_deref(), proof.as_ref()) {
+        (Some(method), Some(proof)) => Some((method, proof.as_str())),
+        (None, None) => None,
+        _ => return Err("sign_in_code_invalid".into()),
+    };
+    let client = transport::client()?;
+    let answer = crate::server_steps::frameleaf_step_up(
+        &client,
+        &base,
+        &transaction,
+        password.as_ref().map(|password| password.as_str()),
+        proof,
     )
     .await?;
-    let candidates: Vec<Candidate> = listed
-        .get("connections")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .ok_or("cloud_response_invalid")?;
-    let ordered = order_candidates(candidates);
+    let outcome = match answer {
+        crate::server_steps::Step::Done(login) => {
+            step.close();
+            keep_server_login(
+                &app,
+                &window,
+                &mut current,
+                &client,
+                &base,
+                login,
+                &device_name,
+            )
+            .await
+            .map(|connection| crate::SignInOutcome::Done { connection })
+        }
+        crate::server_steps::Step::Next(pending) => Ok(step.open(base, pending)),
+    };
+    drop(current);
+    if matches!(outcome, Ok(crate::SignInOutcome::Done { .. })) {
+        crate::tray::refresh(&app).await;
+    }
+    outcome
+}
+
+/// Whether the account's addresses for an instance include `base`'s origin.
+fn address_listed(ordered: &[Candidate], base: &Url) -> bool {
+    ordered.iter().any(|candidate| {
+        Url::parse(&candidate.uri).is_ok_and(|listed| listed.origin() == base.origin())
+    })
+}
+
+/// Every address the account lists is asked at once; the best one answering as `instance` wins.
+async fn choose_listed(
+    client: &Client,
+    ordered: Vec<Candidate>,
+    instance: &str,
+) -> Result<Url, String> {
     if ordered.is_empty() {
         return Err("cloud_server_has_no_https_address".into());
     }
@@ -906,89 +1106,93 @@ pub(crate) async fn connect_cloud_server(
         }
     }
     let chosen =
-        select_candidate(&ordered, &results, &instance).ok_or("cloud_server_unreachable")?;
-    let base = normalize_server(&chosen.uri)?;
+        select_candidate(&ordered, &results, instance).ok_or("cloud_server_unreachable")?;
+    normalize_server(&chosen.uri)
+}
 
+/// The error for a refused server token: Cloud's own reason (`TokenExchangeError`), so the window
+/// can say what to do. `cloud_exchange_interaction_required`: this account has not yet approved
+/// sharing its profile with that server, which only the server's own sign-in in the browser asks.
+fn exchange_refusal(code: String) -> String {
+    code.replacen("cloud_token_", "cloud_exchange_", 1)
+}
+
+/// Steps 2 and 3 of a Frameleaf connection, once `base` is known to answer as `instance`.
+#[allow(clippy::too_many_arguments)]
+async fn connect_with_token(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+    current: &mut Option<SavedConnection>,
+    client: &Client,
+    issuer: &Url,
+    app_token: &str,
+    instance: &str,
+    base: Url,
+    device_name: String,
+) -> Result<crate::SignInOutcome, String> {
     // 2. A 120-second server-audience token, minted only now that the server is known to answer.
     let exchange = token_request(
-        &client,
-        &issuer,
+        client,
+        issuer,
         &[
             ("grant_type", TOKEN_EXCHANGE_GRANT),
             ("client_id", CLIENT_ID),
-            ("subject_token", app_token.as_str()),
+            ("subject_token", app_token),
             ("subject_token_type", ACCESS_TOKEN_TYPE),
-            ("audience", instance.as_str()),
+            ("audience", instance),
             ("requested_token_type", ID_TOKEN_TYPE),
         ],
     )
     .await
-    .map_err(|code| code.replacen("cloud_token_", "cloud_exchange_", 1))?;
+    .map_err(exchange_refusal)?;
 
-    // 3. The server turns it into a session of its own.
-    let response = client
-        .post(base.join("api/oauth/frameleaf/exchange").unwrap())
-        .json(&serde_json::json!({ "token": exchange.access_token, "rememberMe": true }))
-        .send()
-        .await
-        .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.bytes().await.unwrap_or_default();
-        let code = (body.len() <= 65_536)
-            .then(|| serde_json::from_slice::<Value>(&body).ok())
-            .flatten()
-            .and_then(|value| value.get("code")?.as_str().map(str::to_owned));
-        return Err(crate::server_admin::refusal(
-            status.as_u16(),
-            code.as_deref(),
-        ));
-    }
-    let login: ExchangeResponse = transport::json(response).await?;
-    let (Some(token), Some(account_id)) = (login.access_token, login.user_id) else {
-        return Err("cloud_exchange_unsupported".into());
-    };
-    let name = match login.name {
-        Some(name) if !name.trim().is_empty() => name,
-        _ => {
-            #[derive(Deserialize)]
-            struct User {
-                name: String,
-            }
-            let me = client
-                .get(base.join("api/users/me").unwrap())
-                .bearer_auth(&token)
-                .send()
+    // 3. The server turns it into a session of its own, or asks for a local proof first.
+    match crate::server_steps::frameleaf_exchange(client, &base, &exchange.access_token).await? {
+        crate::server_steps::Step::Done(login) => {
+            keep_server_login(app, window, current, client, &base, login, &device_name)
                 .await
-                .map_err(|_| "server_unreachable_or_certificate_invalid")?;
-            transport::json::<User>(me).await?.name
+                .map(|connection| crate::SignInOutcome::Done { connection })
         }
-    };
-    let mut saved = SavedConnection {
-        server: base.to_string(),
-        server_id: String::new(),
-        account_id,
-        name,
-        token,
-        device_name: device_name.trim().into(),
-        mode: "client-worker".into(),
-        device_id: None,
-    };
-    let mut view = crate::finish_new_connection(&client, &mut saved, |saved| {
-        credentials::confirm_new_sign_in("connection", saved, &window)
+        crate::server_steps::Step::Next(pending) => {
+            Ok(app.state::<ServerStep>().open(base, pending))
+        }
+    }
+}
+
+/// A session from Sign in with Frameleaf becomes this computer's saved connection.
+async fn keep_server_login(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+    current: &mut Option<SavedConnection>,
+    client: &Client,
+    base: &Url,
+    mut login: crate::LoginResponse,
+    device_name: &str,
+) -> Result<ConnectionView, String> {
+    if login.name.trim().is_empty() {
+        #[derive(Deserialize)]
+        struct User {
+            name: String,
+        }
+        let me = client
+            .get(base.join("api/users/me").unwrap())
+            .bearer_auth(&login.access_token)
+            .send()
+            .await
+            .map_err(|_| "server_unreachable_or_certificate_invalid")?;
+        login.name = transport::json::<User>(me).await?.name;
+    }
+    let (saved, mut view) = crate::keep_login(client, base, login, device_name, |saved| {
+        credentials::confirm_new_sign_in("connection", saved, window)
     })
     .await?;
     if view.state == "preparing"
         && view.features.worker_session
-        && crate::start_worker_setup(&app, &saved, false)
-            .await
-            .is_err()
+        && crate::start_worker_setup(app, &saved, false).await.is_err()
     {
         view.state = "worker-setup-failed".into();
     }
     *current = Some(saved);
-    drop(current);
-    crate::tray::refresh(&app).await;
     Ok(view)
 }
 
@@ -1332,5 +1536,66 @@ mod tests {
             parse_instances(json!("x")).unwrap_err(),
             "cloud_response_invalid"
         );
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_server_token_keeps_clouds_reason() {
+        assert_eq!(
+            exchange_refusal("cloud_token_interaction_required".into()),
+            "cloud_exchange_interaction_required"
+        );
+        assert_eq!(exchange_refusal("cloud_http_502".into()), "cloud_http_502");
+    }
+
+    #[test]
+    fn a_typed_address_must_be_one_the_account_lists() {
+        let listed = order_candidates(vec![Candidate {
+            kind: "wan".into(),
+            uri: "https://photos.example.com".into(),
+            custom: true,
+            verified: true,
+        }]);
+        let ok = |uri: &str| address_listed(&listed, &Url::parse(uri).unwrap());
+        assert!(ok("https://photos.example.com/"));
+        assert!(ok("https://PHOTOS.example.com"));
+        assert!(!ok("https://photos.example.com:8443/"));
+        assert!(!ok("https://evil.example.com/"));
+        assert!(!ok("http://photos.example.com/"));
+    }
+}
+
+#[cfg(test)]
+mod server_step_tests {
+    use super::*;
+
+    #[test]
+    fn a_step_goes_only_to_the_server_that_asked_for_it() {
+        let step = ServerStep::default();
+        assert!(step.server_for("txn").is_none());
+        let base = Url::parse("http://192.168.1.20:2283/").unwrap();
+        let pending = crate::server_steps::Pending {
+            transaction: Zeroizing::new("txn".into()),
+            methods: vec!["frameleaf".into(), "password".into(), "totp".into()],
+            sent_to: None,
+        };
+        let outcome = serde_json::to_value(step.open(base.clone(), pending)).unwrap();
+        assert_eq!(
+            outcome,
+            serde_json::json!({
+                "status": "next", "transaction": "txn", "sentTo": null,
+                "methods": ["frameleaf", "password", "totp"],
+                "server": "http://192.168.1.20:2283/",
+            })
+        );
+        assert_eq!(step.server_for("txn"), Some(base));
+        // Another transaction, or a step that was finished, has no server to send a Password to.
+        assert!(step.server_for("other").is_none());
+        step.close();
+        assert!(step.server_for("txn").is_none());
     }
 }

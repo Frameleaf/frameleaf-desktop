@@ -1,0 +1,132 @@
+name: Package managers
+run-name: Package managers ${{ inputs.tag || github.event.release.tag_name }}
+# Publishes the AUR and Chocolatey packages once a stable release is published. Each push is skipped,
+# with a note in the run summary, until its secret exists: AUR_SSH_PRIVATE_KEY (an AUR account's key)
+# and CHOCOLATEY_API_KEY (community.chocolatey.org). Homebrew and Scoop follow releases on their own;
+# winget versions are submitted to microsoft/winget-pkgs.
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published stable release tag, for example v0.1.5'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: package-managers
+  cancel-in-progress: false
+jobs:
+  stamp:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    outputs:
+      aur: ${{ steps.stamp.outputs.aur }}
+      chocolatey: ${{ steps.stamp.outputs.chocolatey }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Stamp the package files from the release's checksums
+        id: stamp
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" == v* && "$TAG" != *-* ]] || { echo "::error::$TAG is not a stable release tag"; exit 1; }
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          # shellcheck disable=SC2016
+          # ponytail: main's stamping rules, applied to the tag's version, so older tags publish too.
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { parseChecksums, stampPackaging } from "./tools/release_packaging.mjs";
+            const r = stampPackaging(".", process.argv[1], parseChecksums(readFileSync(process.argv[2], "utf8")));
+            console.log(`### Package manager files for ${r.version}\n\n- AUR: ${r.aur}\n- Chocolatey: ${r.chocolatey}`);
+          ' "${TAG#v}" "$RUNNER_TEMP/SHA256SUMS" | tee report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          for name in aur chocolatey; do
+            label=$([[ $name == aur ]] && echo AUR || echo Chocolatey)
+            status=$(sed -n "s/^- $label: //p" report.md)
+            echo "$name=$([[ $status == publishable ]] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          done
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: package-manager-files
+          path: |
+            packaging/aur/
+            packaging/chocolatey/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  aur:
+    needs: stamp
+    if: needs.stamp.outputs.aur == 'yes'
+    runs-on: ubuntu-24.04
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: package-manager-files
+          path: packaging
+      - name: Push frameleaf-desktop-bin to the AUR
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$AUR_SSH_PRIVATE_KEY" ]]; then
+            echo "AUR: skipped, the AUR_SSH_PRIVATE_KEY secret is not set." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Host key published by Arch Linux (SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4).
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git clone ssh://aur@aur.archlinux.org/frameleaf-desktop-bin.git "$RUNNER_TEMP/aur"
+          cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO "$RUNNER_TEMP/aur/"
+          cd "$RUNNER_TEMP/aur"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR: already up to date." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          version=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          git -c user.name='AJ Taylor' -c user.email='aj@ajtaylor.net' commit -m "Frameleaf Desktop $version"
+          git push origin HEAD:master
+          echo "AUR: pushed frameleaf-desktop-bin $version." >> "$GITHUB_STEP_SUMMARY"
+
+  chocolatey:
+    needs: stamp
+    if: needs.stamp.outputs.chocolatey == 'yes'
+    runs-on: windows-latest
+    env:
+      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+    steps:
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: package-manager-files
+          path: packaging
+      - name: Pack and push frameleaf to Chocolatey
+        shell: pwsh
+        working-directory: packaging/chocolatey
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco pack
+          if ($LASTEXITCODE) { throw 'choco pack failed' }
+          if (-not $env:CHOCOLATEY_API_KEY) {
+            'Chocolatey: packed but skipped, the CHOCOLATEY_API_KEY secret is not set.' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          $package = Get-ChildItem frameleaf.*.nupkg | Select-Object -First 1
+          choco push $package.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY
+          if ($LASTEXITCODE) { throw 'choco push failed' }
+          "Chocolatey: pushed $($package.Name) for moderation." >> $env:GITHUB_STEP_SUMMARY

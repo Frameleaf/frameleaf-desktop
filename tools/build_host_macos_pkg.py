@@ -106,7 +106,7 @@ def build(candidate: Path, controller: Path, output: Path) -> None:
     component = output / 'FrameleafHostComponent.pkg'
     run(['/usr/bin/pkgbuild', '--root', root, '--scripts', output / 'scripts', '--identifier', identifier, '--version', '0.1.0', '--install-location', '/', '--ownership', 'recommended', component], cwd=output, env=env)
     distribution = ET.Element('installer-gui-script', {'minSpecVersion': '2'})
-    ET.SubElement(distribution, 'title').text = 'Frameleaf native host — internal candidate'
+    ET.SubElement(distribution, 'title').text = 'Frameleaf Companion Server'
     ET.SubElement(distribution, 'domains', {'enable_anywhere': 'false', 'enable_currentUserHome': 'false', 'enable_localSystem': 'true'})
     ET.SubElement(distribution, 'options', {'customize': 'never', 'require-scripts': 'true', 'rootVolumeOnly': 'true'})
     outline = ET.SubElement(distribution, 'choices-outline')

@@ -1,0 +1,188 @@
+name: Notarize and qualify the Apple Silicon companion installer
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: 'Approved draft release ID and asset ID, package SHA-256, manifest SHA-256 and controller SHA-256 as JSON'
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: macos-arm64-host-package
+  cancel-in-progress: false
+jobs:
+  qualify:
+    # Not available on Forgejo: its only Mac runner is the owner's own Mac, where signing and notarizing
+    # would use the owner's own keychain; it needs a disposable Mac runner.
+    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
+    environment: desktop-release
+    permissions:
+      # GitHub draft assets require write access even for download.
+      contents: write
+    runs-on: macos-15
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    env:
+      APPROVAL: ${{ inputs.approval }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Verify the exact signed package on the approved draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            keys == ["assetId","controllerSha256","manifestSha256","packageSha256","releaseId"] and
+            ([.assetId,.releaseId] | all(type=="number" and .>0 and .==floor)) and
+            ([.controllerSha256,.manifestSha256,.packageSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
+          ' <<< "$APPROVAL" >/dev/null
+          mkdir -m 700 "$RUNNER_TEMP/companion-package"
+          # Named for the Library version it carries once that is read from the installed package.
+          PACKAGE="$RUNNER_TEMP/companion-package/FrameleafCompanion_arm64.pkg"
+          printf 'PACKAGE=%s\n' "$PACKAGE" >> "$GITHUB_ENV"
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          asset=$(jq -r .assetId <<< "$APPROVAL")
+          digest=$(jq -r .packageSha256 <<< "$APPROVAL")
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+            .draft==true and any(.assets[]; .id==$asset and .digest==$digest and .state=="uploaded" and .size>0 and .size<2147483648)
+          ' >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$PACKAGE"
+          printf '%s  %s\n' "$digest" "$PACKAGE" | shasum -a 256 -c
+          pkgutil --check-signature "$PACKAGE" > "$RUNNER_TEMP/installer-signature.txt"
+          grep -F 'signed by a developer certificate issued by Apple for distribution' "$RUNNER_TEMP/installer-signature.txt"
+          grep -E "^[[:space:]]*1\\. Developer ID Installer:.* \\($APPLE_TEAM_ID\\)$" "$RUNNER_TEMP/installer-signature.txt"
+      - name: Obtain and verify Apple's notarization ticket
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if ! xcrun stapler staple "$PACKAGE"; then
+            xcrun notarytool submit "$PACKAGE" --no-wait --output-format json --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > "$RUNNER_TEMP/installer-submission.json"
+            id=$(jq -er '.id' "$RUNNER_TEMP/installer-submission.json")
+            printf 'Apple submission %s\n' "$id"
+            xcrun notarytool wait "$id" --timeout 65m --output-format json --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > "$RUNNER_TEMP/installer-notary.json"
+            jq -e '.status=="Accepted"' "$RUNNER_TEMP/installer-notary.json" >/dev/null
+            xcrun stapler staple "$PACKAGE"
+          fi
+          xcrun stapler validate "$PACKAGE"
+          spctl --assess --type install --verbose=2 "$PACKAGE"
+      - name: Install on a fresh Mac and recover an interrupted package retry
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          base='/Library/Application Support/Frameleaf'
+          receipt="$base/Runtimes/$manifest/installation.json"
+          helper="$base/Controllers/$manifest/$controller/frameleaf-native-host"
+          test ! -e "$base"
+          uid=$(id -u)
+          test "$uid" -ge 501
+          test "$(stat -f %u /dev/console)" = "$uid"
+          sudo installer -pkg "$PACKAGE" -target /
+          jq -e --arg manifest "$manifest" --arg controller "$controller" '
+            .schemaVersion==1 and .manifestSha256==$manifest and .controllerSha256==$controller
+          ' "$receipt" >/dev/null
+          cp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          printf '%s  %s\n' "$controller" "$helper" | shasum -a 256 -c
+          codesign --verify --strict "$helper"
+          runtime="$base/Runtimes/$manifest"
+          fence="$runtime/.package-maintenance"
+          test ! -e "$fence"
+          test ! -L "$fence"
+          # Stop at the exact preinstall boundary, before the signed package's postinstall.
+          sudo "$helper" --prepare-install "$manifest" "$controller" |
+            jq -e '. == {protocolVersion:1,state:"install-prepared",serverStarted:false}' >/dev/null
+          test -f "$fence"
+          test ! -L "$fence"
+          test ! -s "$fence"
+          cmp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          python3 - "$helper" "$runtime" "$manifest" "$RUNNER_TEMP" <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          helper, runtime, manifest, scratch = sys.argv[1:]
+          with tempfile.TemporaryDirectory(dir=scratch) as path:
+              state = str(Path(path).resolve())
+              # A valid request must reach package admission. Cleanup mode also
+              # requires a pre-existing host marker, so it cannot start a server.
+              request = {"protocolVersion": 1, "mode": "checkpoint-cleanup",
+                         "installationId": "a" * 12, "candidate": runtime, "state": state,
+                         "manifestSha256": manifest, "password": "synthetic qualification password",
+                         "databasePort": 33951, "apiPort": 33952}
+              with subprocess.Popen([helper, "--owner-pipe"], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE) as probe:
+                  try:
+                      probe.stdin.write((json.dumps(request) + "\n").encode())
+                      probe.stdin.flush()
+                      # Keep stdin open so EOF cannot cancel the controller before admission.
+                      status = probe.wait(timeout=90)
+                      reply = probe.stdout.read(1025)
+                  finally:
+                      if probe.poll() is None:
+                          probe.kill()
+                          probe.wait()
+              expected = {"protocolVersion": 1, "state": "failed", "code": "host_package_maintenance"}
+              if status != 1 or len(reply) > 1024 or json.loads(reply) != expected:
+                  raise SystemExit("The interrupted package did not block the installed controller")
+          PY
+          sudo installer -pkg "$PACKAGE" -target /
+          test ! -e "$fence"
+          test ! -L "$fence"
+          cmp "$receipt" "$RUNNER_TEMP/installed-receipt.json"
+          printf '%s  %s\n' "$controller" "$helper" | shasum -a 256 -c
+          codesign --verify --strict "$helper"
+          jq -n --arg manifest "$manifest" --arg controller "$controller" '
+            {state:"interrupted-package-retry-passed",manifestSha256:$manifest,controllerSha256:$controller,
+             ownerBlockedWhileFenced:true,fenceClearedAfterRetry:true,receiptUnchanged:true}
+          ' > "$RUNNER_TEMP/installed-package-retry.json"
+          test "$(stat -f '%u:%Lp' "$receipt")" = 0:644
+          for leaf in state manager; do
+            test "$(stat -f '%u:%Lp' "$base/Profiles/$uid/$leaf")" = "$uid:700"
+          done
+      - name: Record the installed package for the release
+        run: |
+          set -euo pipefail
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          runtime="/Library/Application Support/Frameleaf/Runtimes/$manifest"
+          version=$(jq -er '.version | select(type == "string" and test("^(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){2}$"))' "$runtime/payload/server/package.json")
+          package="$RUNNER_TEMP/companion-package"
+          mv "$PACKAGE" "$package/FrameleafCompanion_${version}_arm64.pkg"
+          # Writes SHA256SUMS beside the package and fails if the release would refuse this package.
+          node tools/release_prerequisites.mjs companion-record .github/workflows/macos-host-package.yml "$version" "$controller" \
+            "$runtime/manifest.json" "$runtime/manifest.sig" "$package" "$RUNNER_TEMP/companion-identity"
+          mv "$RUNNER_TEMP/installed-receipt.json" "$RUNNER_TEMP/installed-package-retry.json" "$package/"
+      - name: Retain the exact notarized installer and verification receipts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: frameleaf-macos-arm64-companion-installed
+          compression-level: 0
+          path: ${{ runner.temp }}/companion-package/
+          if-no-files-found: error
+      - name: Retain the signed manifest the release checks before it builds
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: frameleaf-macos-arm64-companion-installed-identity
+          path: ${{ runner.temp }}/companion-identity/
+          if-no-files-found: error
+      - name: Retain Apple's request on a failed wait
+        if: failure()
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: frameleaf-macos-arm64-companion-notary-request
+          path: ${{ runner.temp }}/installer-submission.json
+          if-no-files-found: ignore

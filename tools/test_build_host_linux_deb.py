@@ -42,6 +42,32 @@ class LinuxHostDebTests(unittest.TestCase):
                 self.assertIn('-xframeleaf-fixture', args)
                 self.assertNotIn('--ignore-missing-info', args)
 
+    def test_only_unused_known_node_prebuilds_are_excluded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            tree = root / 'tree'
+            selected = [
+                'payload/server/node_modules/bcrypt/prebuilds/linux-x64/bcrypt.glibc.node',
+                'payload/server/node_modules/bare-fs/prebuilds/linux-x64/bare-fs.bare',
+                'payload/server/node_modules/other/prebuilds/linux-arm64/other.node',
+            ]
+            ignored = [
+                'payload/server/node_modules/bcrypt/prebuilds/linux-arm64/bcrypt.glibc.node',
+                'payload/server/node_modules/bcrypt/prebuilds/linux-x64/bcrypt.musl.node',
+                'payload/server/node_modules/bare-fs/prebuilds/linux-arm64/bare-fs.bare',
+            ]
+            for name in selected + ignored:
+                path = tree / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'\x7fELFfixture')
+            with patch('build_host_linux_deb.platform.machine', return_value='x86_64'), patch(
+                'build_host_linux_deb.run',
+                side_effect=lambda args, **kwargs: 'shlibs:Depends=libc6' if args[0] == 'dpkg-shlibdeps' else '',
+            ) as call:
+                self.assertEqual(dependencies(tree, 'frameleaf-fixture', root / 'work'), 'libc6')
+            args = call.call_args.args[0]
+            self.assertEqual({arg[2:] for arg in args if arg.startswith('-e')}, {str(tree / name) for name in selected})
+
     def test_native_addon_sonames_keep_dependency_analysis_without_library_version_mapping(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -197,6 +223,26 @@ class LinuxHostDebTests(unittest.TestCase):
             with self.assertRaises(BuildError):
                 stage_packages(candidate, controller, root / 'invalid', 'a' * 64, digest, 'amd64\nDepends: bad')
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX permissions')
+    def test_debian_studio_browser_gets_a_manifest_bound_apparmor_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            candidate, controller, digest = self.fixture(root)
+            browser = candidate / 'payload/browser/chromium-headless-shell'
+            browser.parent.mkdir()
+            browser.write_bytes(b'fixture browser')
+            browser.chmod(0o700)
+            manifest = 'a' * 64
+            bootstrap, runtime = stage_packages(candidate, controller, root / 'out', manifest, digest, 'amd64')
+            policy = Path('etc/apparmor.d') / ('frameleaf-studio-' + manifest)
+            self.assertFalse((bootstrap / policy).exists())
+            self.assertIn(f'/opt/frameleaf/Runtimes/{manifest}/payload/browser/chromium-headless-shell flags=(unconfined)', (runtime / policy).read_text())
+            self.assertIn('userns,', (runtime / policy).read_text())
+            self.assertEqual((runtime / 'DEBIAN/conffiles').read_text(), '/' + policy.as_posix() + '\n')
+            hook = (runtime / 'DEBIAN/postinst').read_text()
+            self.assertLess(hook.index('/usr/sbin/apparmor_parser'), hook.index(' --finalize-install'))
+            subprocess.run(['/bin/sh', '-n', runtime / 'DEBIAN/postinst'], check=True)
+
     @unittest.skipUnless(os.name == 'posix', 'requires POSIX shell')
     def test_hooks_fence_before_replacement_and_preserve_refusals_and_data(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -264,7 +310,9 @@ class LinuxHostDebTests(unittest.TestCase):
             installed.parent.chmod(0o755)
             self.assertNotEqual(run('runtime', 'preinst', 'unknown'), 0)
 
-    @unittest.skipUnless(shutil.which('dpkg-deb') and os.name == 'posix', 'requires Debian archive tool')
+    # The host packages are built on Ubuntu 24.04; dpkg before 1.21.9 (Ubuntu 22.04) has no --threads-max.
+    @unittest.skipUnless(shutil.which('dpkg-deb') and os.name == 'posix' and '--threads-max' in subprocess.run(
+        ['dpkg-deb', '--help'], capture_output=True, text=True).stdout, 'requires a Debian archive tool with --threads-max')
     def test_real_archives_have_root_owners_and_required_bootstrap(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

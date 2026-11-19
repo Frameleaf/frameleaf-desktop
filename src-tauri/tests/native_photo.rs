@@ -50,7 +50,17 @@ async fn actual_native_photo_upload_thumbnail_and_restart() {
         .unwrap();
     let password = Zeroizing::new(format!("Synthetic-{}!", Uuid::new_v4()));
     let mut process = host
-        .start(&state, &password, database_port, api_port)
+        .start(
+            &state,
+            &password,
+            database_port,
+            api_port,
+            #[cfg(windows)]
+            &PathBuf::from(
+                std::env::var_os("FRAMELEAF_TEST_HOST_CONTROLLER")
+                    .expect("measured Windows native controller"),
+            ),
+        )
         .unwrap();
     process.wait_ready(Duration::from_secs(240)).unwrap();
     let web = client.get(&base).send().await.unwrap();
@@ -122,7 +132,17 @@ async fn actual_native_photo_upload_thumbnail_and_restart() {
     process.stop().unwrap();
     drop(process);
     let mut restarted = host
-        .start(&state, &password, database_port, api_port)
+        .start(
+            &state,
+            &password,
+            database_port,
+            api_port,
+            #[cfg(windows)]
+            &PathBuf::from(
+                std::env::var_os("FRAMELEAF_TEST_HOST_CONTROLLER")
+                    .expect("measured Windows native controller"),
+            ),
+        )
         .unwrap();
     restarted.wait_ready(Duration::from_secs(240)).unwrap();
     let client = Client::builder()

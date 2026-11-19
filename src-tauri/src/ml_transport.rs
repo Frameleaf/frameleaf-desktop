@@ -14,8 +14,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    model_catalogue::ApprovedProfile, native_runtime::QualifiedRuntime,
-    runtime_store::RuntimeAttestation,
+    model_catalogue::ApprovedProfile,
+    native_runtime::QualifiedRuntime,
+    runtime_store::{InstalledRuntime, RuntimeAttestation, Staging},
 };
 
 #[derive(Deserialize)]
@@ -197,6 +198,7 @@ pub struct AcceptedQualification {
     manifest_sha256: String,
     runtime_fingerprint: String,
     report_sha256: String,
+    qualified_at: i64,
     expires_at: i64,
 }
 impl AcceptedQualification {
@@ -247,6 +249,7 @@ impl AcceptedQualification {
             manifest_sha256: response.manifest_sha256,
             runtime_fingerprint: response.runtime_fingerprint,
             report_sha256: response.report_sha256,
+            qualified_at,
             expires_at,
         };
         accepted.validate_authority(worker, at)?;
@@ -275,6 +278,60 @@ impl AcceptedQualification {
             return Err("worker_qualified_runtime_changed_or_expired".into());
         }
         Ok(())
+    }
+    /// Record the observed fixture result without persisting association details or raw reports.
+    pub(crate) fn write_evidence(
+        &self,
+        root: &std::path::Path,
+        app_version: &str,
+        profile: &ApprovedProfile,
+        installed: &InstalledRuntime,
+        qualified: &QualifiedRuntime,
+    ) -> Result<(), String> {
+        self.validate_runtime(qualified, now()?)?;
+        let report = qualified.report();
+        let provider = installed.provider();
+        if profile.model_key() != self.model_key
+            || report["provider"] != provider
+            || profile.runtime_source_revision() != installed.source_revision()
+            || installed.manifest_sha256() != self.manifest_sha256
+        {
+            return Err("worker_qualification_evidence_mismatch".into());
+        }
+        let evidence = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "nas-accepted-native-fixture",
+            "targetOs": std::env::consts::OS,
+            "targetArch": std::env::consts::ARCH,
+            "appVersion": app_version,
+            "modelKey": self.model_key,
+            "modelName": profile.model_name(),
+            "modelSnapshotRevision": profile.model_snapshot_revision(),
+            "provider": provider,
+            "executionState": report["state"],
+            "runtimeSourceRevision": installed.source_revision(),
+            "runtimeEpoch": installed.epoch(),
+            "manifestSha256": self.manifest_sha256,
+            "runtimeFingerprint": self.runtime_fingerprint,
+            "qualificationId": self.id,
+            "qualifiedAtUnixMs": self.qualified_at,
+            "expiresAtUnixMs": self.expires_at,
+            "inputKind": self.input_kind,
+            "configSha256": self.config_sha256,
+            "fixtureSha256": report["fixtureSha256"],
+            "preprocessingSha256": report["preprocessingSha256"],
+            "bindingSha256": self.binding_sha256,
+            "reportSha256": self.report_sha256,
+        });
+        let name = hash(format!("{}\0{provider}", self.model_key).as_bytes());
+        crate::runtime_store::private_directory(root)?;
+        let staging = Staging::create(root.join(format!(".pending-{}", Uuid::new_v4())))?;
+        let staged = staging.path().join("evidence.json");
+        let bytes = serde_json::to_vec_pretty(&evidence)
+            .map_err(|_| "worker_qualification_evidence_encode_failed")?;
+        crate::runtime_store::write_new(&staged, &bytes)?;
+        std::fs::rename(staged, root.join(format!("{name}.json")))
+            .map_err(|_| "worker_qualification_evidence_write_failed".into())
     }
     pub fn validate_task(
         &self,
@@ -461,6 +518,8 @@ struct Connection {
     base: Url,
     worker: SavedWorker,
     identity: DeviceIdentity,
+    /// Durable sequence and token checkpoints; tests keep them out of the OS credential store.
+    checkpoint: fn(&SavedWorker, &SavedWorker) -> Result<(), String>,
 }
 impl Connection {
     async fn ensure_current(&mut self) -> Result<(), String> {
@@ -473,9 +532,9 @@ impl Connection {
         let response = self
             .request(Method::POST, "api/desktop/worker/session", "renew", "{}")
             .await?;
-        let session: SessionResponse = transport::json(response).await?;
+        let session: SessionResponse = worker_json(response, 65_536).await?;
         let worker = renewed_worker(&self.worker, &session, now()?)?;
-        credentials::save_worker_checkpoint(&self.worker, &worker)?;
+        (self.checkpoint)(&self.worker, &worker)?;
         self.worker = worker;
         Ok(())
     }
@@ -487,12 +546,13 @@ impl Connection {
         payload: &str,
     ) -> Result<Response, String> {
         let expected = self.worker.clone();
+        let checkpoint = self.checkpoint;
         let proof = reserve_proof(
             &mut self.worker,
             &self.identity,
             operation,
             payload,
-            |value| credentials::save_worker_checkpoint(&expected, value),
+            |value| checkpoint(&expected, value),
         )?;
         let header =
             STANDARD.encode(serde_json::to_vec(&proof).map_err(|_| "worker_proof_invalid")?);
@@ -517,42 +577,52 @@ impl Connection {
 pub struct WorkerTransport(Mutex<Connection>);
 
 fn qualification_refusal(status: u16, message: &str) -> Option<String> {
-    if status == 409
-        && matches!(
-            message,
-            "desktop_nas_producer_unavailable"
-                | "desktop_nas_face_producer_unavailable"
-                | "desktop_nas_fixture_mismatch"
-                | "desktop_nas_model_unavailable"
-                | "desktop_nas_producer_changed"
-                | "desktop_nas_producer_expired"
-                | "desktop_model_profile_unavailable"
-                | "desktop_model_profile_changed"
-                | "desktop_clip_profile_unavailable"
-                | "desktop_face_profile_unavailable"
-                | "desktop_clip_space_unavailable"
-                | "desktop_clip_index_changed"
-                | "desktop_clip_index_dimensions"
-                | "desktop_clip_index_incompatible"
-                | "desktop_clip_index_invalid"
-                | "desktop_pool_config_changed"
-                | "desktop_pool_destination_changed"
-                | "desktop_pool_model_unavailable"
-                | "desktop_pool_route_changed"
-                | "desktop_route_review_required"
-        )
-    {
-        Some(format!("workload_{message}"))
-    } else {
-        None
+    if status != 409 {
+        return None;
+    }
+    match message {
+        // Only servers from before desktop auto-setup refuse a task over their own AI or its
+        // routing: the fix is a server update, never a setting on this computer.
+        "desktop_nas_producer_unavailable"
+        | "desktop_nas_face_producer_unavailable"
+        | "desktop_nas_fixture_mismatch"
+        | "desktop_nas_model_unavailable"
+        | "desktop_nas_producer_changed"
+        | "desktop_nas_producer_expired"
+        | "desktop_pool_config_changed"
+        | "desktop_pool_destination_changed"
+        | "desktop_pool_route_changed"
+        | "desktop_route_review_required" => Some("workload_server_update_required".into()),
+        "desktop_model_profile_unavailable"
+        | "desktop_model_profile_changed"
+        | "desktop_clip_profile_unavailable"
+        | "desktop_face_profile_unavailable"
+        | "desktop_clip_space_unavailable"
+        | "desktop_clip_index_changed"
+        | "desktop_clip_index_dimensions"
+        | "desktop_clip_index_incompatible"
+        | "desktop_clip_index_invalid"
+        | "desktop_pool_model_unavailable" => Some(format!("workload_{message}")),
+        _ => None,
     }
 }
 #[test]
 fn scopes_only_explicit_model_refusals_to_one_workload() {
     assert_eq!(
-        qualification_refusal(409, "desktop_nas_face_producer_unavailable").as_deref(),
-        Some("workload_desktop_nas_face_producer_unavailable")
+        qualification_refusal(409, "desktop_model_profile_unavailable").as_deref(),
+        Some("workload_desktop_model_profile_unavailable")
     );
+    // An older server's refusals over its own AI or routing ask for a server update.
+    for message in [
+        "desktop_nas_face_producer_unavailable",
+        "desktop_route_review_required",
+        "desktop_pool_route_changed",
+    ] {
+        assert_eq!(
+            qualification_refusal(409, message).as_deref(),
+            Some("workload_server_update_required")
+        );
+    }
     for (status, message) in [
         (401, "desktop_nas_face_producer_unavailable"),
         (403, "desktop_pool_policy_required"),
@@ -564,28 +634,69 @@ fn scopes_only_explicit_model_refusals_to_one_workload() {
         assert!(qualification_refusal(status, message).is_none());
     }
 }
-async fn qualification_json<T: serde::de::DeserializeOwned>(
-    mut response: Response,
+/// Refusals the worker loop acts on by name. A 401 here is about the worker session or one lease,
+/// never the device: only issuing a new session can show that the device itself is refused.
+fn worker_refusal(status: u16, message: &str) -> String {
+    match (status, message) {
+        (401, "desktop_worker_credential_invalid") => "worker_session_rejected".into(),
+        (401, "desktop_lease_invalid") => "worker_lease_refused".into(),
+        (403, "desktop_pool_policy_required") => "worker_policy_required".into(),
+        (403, "desktop_worker_lan_required") => "worker_lan_required".into(),
+        (409, "desktop_pool_policy_changed") => "worker_policy_changed".into(),
+        (400, "desktop_runtime_attestation_invalid") => "worker_runtime_unsigned".into(),
+        (400, "desktop_qualification_report_invalid") => {
+            "worker_qualification_report_refused".into()
+        }
+        _ => format!("server_http_{status}"),
+    }
+}
+#[test]
+fn names_runtime_and_report_refusals() {
+    assert_eq!(
+        worker_refusal(400, "desktop_runtime_attestation_invalid"),
+        "worker_runtime_unsigned"
+    );
+    assert_eq!(
+        worker_refusal(400, "desktop_qualification_report_invalid"),
+        "worker_qualification_report_refused"
+    );
+    assert_eq!(worker_refusal(400, "other"), "server_http_400");
+}
+/// The status and named reason of a refused request. Anything but a small JSON error (a proxy's
+/// page, a cut connection) has no name and stays an opaque `server_http_*`.
+async fn refused(mut response: Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len() + chunk.len() > 4096 {
+            return (status, String::new());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    (status, message)
+}
+async fn worker_json<T: serde::de::DeserializeOwned>(
+    response: Response,
     limit: usize,
 ) -> Result<T, String> {
-    if response.status().as_u16() == 409 {
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "server_response_interrupted")?
-        {
-            if bytes.len() + chunk.len() > 4096 {
-                return Err("server_response_too_large".into());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| "server_response_invalid")?;
-        return Err(
-            qualification_refusal(409, value["message"].as_str().unwrap_or(""))
-                .unwrap_or("server_http_409".into()),
-        );
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        return Err(worker_refusal(status, &message));
+    }
+    transport::json_limit(response, limit).await
+}
+async fn qualification_json<T: serde::de::DeserializeOwned>(
+    response: Response,
+    limit: usize,
+) -> Result<T, String> {
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        return Err(qualification_refusal(status, &message)
+            .unwrap_or_else(|| worker_refusal(status, &message)));
     }
     transport::json_limit(response, limit).await
 }
@@ -630,8 +741,9 @@ impl WorkerTransport {
     ) -> Result<serde_json::Value, String> {
         let mut connection = self.0.lock().await;
         connection.ensure_current().await?;
-        let payload =
-            serde_json::json!({"runtimeSourceRevision":source,"provider":provider}).to_string();
+        // Protocol 2: the reply carries the server's catalogue profile of each model it selected.
+        let payload = serde_json::json!({"runtimeSourceRevision":source,"provider":provider,"protocolVersion":2})
+            .to_string();
         let response = connection
             .request(
                 Method::POST,
@@ -640,7 +752,8 @@ impl WorkerTransport {
                 &payload,
             )
             .await?;
-        transport::json_limit(response, 65_536).await
+        // Each profile carries its fixture (up to 2 MiB, base64): room for every task's profiles.
+        worker_json(response, 32 * 1024 * 1024).await
     }
     pub(crate) async fn maintain_session(&self) -> Result<(), String> {
         self.0.lock().await.ensure_current().await
@@ -661,6 +774,7 @@ impl WorkerTransport {
             base: normalize_server(&saved.server)?,
             worker,
             identity,
+            checkpoint: credentials::save_worker_checkpoint,
         })))
     }
     pub async fn request_qualification(
@@ -708,7 +822,7 @@ impl WorkerTransport {
                 "",
             )
             .await?;
-        let value: serde_json::Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
+        let value: serde_json::Value = worker_json(response, 4 * 1024 * 1024).await?;
         let raw = serde_json::to_vec(&value).map_err(|_| "worker_challenge_invalid")?;
         let challenge =
             QualificationChallenge::bind(&connection.worker, profile, attestation, &raw, now()?)?;
@@ -787,7 +901,7 @@ impl WorkerTransport {
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
             .await?;
-        let claim: ClaimResponse = transport::json_limit(response, 256 * 1024).await?;
+        let claim: ClaimResponse = worker_json(response, 256 * 1024).await?;
         claim
             .task
             .map(|task| {
@@ -819,7 +933,8 @@ impl WorkerTransport {
             )
             .await?;
         if !response.status().is_success() {
-            return Err(format!("server_http_{}", response.status().as_u16()));
+            let (status, message) = refused(response).await;
+            return Err(worker_refusal(status, &message));
         }
         if response
             .content_length()
@@ -862,7 +977,7 @@ impl WorkerTransport {
         let response = connection
             .request(Method::POST, path, operation, &payload)
             .await?;
-        transport::json::<Ack>(response).await
+        worker_json::<Ack>(response, 65_536).await
     }
     pub async fn heartbeat(
         &self,
@@ -894,6 +1009,10 @@ impl WorkerTransport {
     ) -> Result<bool, String> {
         if !result.is_object() {
             return Err("worker_result_invalid".into());
+        }
+        // A result is only for a lease still held: the last expiry the server granted must be ahead.
+        if millis(&task.expires_at)? <= now()? {
+            return Err("worker_lease_expired".into());
         }
         self.acknowledge(
             task,
@@ -929,7 +1048,7 @@ impl WorkerTransport {
         let response = connection
             .request(Method::DELETE, "api/desktop/worker/session", "revoke", "")
             .await?;
-        Ok(transport::json::<Ack>(response).await?.accepted)
+        Ok(worker_json::<Ack>(response, 65_536).await?.accepted)
     }
 }
 
@@ -952,6 +1071,7 @@ mod renewal_tests {
             manifest_sha256: "b".repeat(64),
             runtime_fingerprint: "c".repeat(64),
             report_sha256: "d".repeat(64),
+            qualified_at: AT,
             expires_at: AT + 600000,
         };
         let first = accepted("first", "c1a52b82-60da-4fa2-8814-e028a088206f");
@@ -1035,3 +1155,6 @@ mod renewal_tests {
 
 #[cfg(test)]
 pub(crate) mod native_nas_tests;
+
+#[cfg(test)]
+pub(crate) mod household_tests;

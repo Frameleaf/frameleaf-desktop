@@ -17,7 +17,7 @@ from obtain_windows_host_candidate import obtain
 class WindowsHostCandidateTests(unittest.TestCase):
     def fixture(self, root, change=None, extra=None, payload_file=False):
         manifest = {'platform': 'windows', 'architecture': 'x86_64',
-                    'sourceRevision': 'c64039743af7bb0d68b602ff842683906019de52',
+                    'sourceRevision': '9f22a57adb7a271d97ead305103c094fb3d25ad2',
                     'files': {'fixture': {'bytes': 7, 'sha256': hashlib.sha256(b'fixture').hexdigest()}}}
         raw = json.dumps(manifest).encode()
         receipt = {'schemaVersion': 1, 'qualification': 'passed',

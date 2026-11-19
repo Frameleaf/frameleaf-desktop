@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use uuid::Uuid;
@@ -24,6 +25,41 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
         return Err("server_requires_https_origin".into());
     }
     Ok(url)
+}
+
+/// A server address as a person types or pastes it: `192.168.1.20:2283`, `tower.local`, or a page
+/// address copied from the browser. It is reduced to its origin: what follows the host and port
+/// names a page of the server, not the server. With no scheme, a host on the local network is
+/// reached over plain HTTP (a home server is often just an address and a port) and any other
+/// host over HTTPS. A scheme the person typed is kept and `normalize_server` decides, so plain
+/// HTTP to a public host is still refused.
+pub fn typed_server(value: &str) -> Result<Url, String> {
+    let typed = value.trim();
+    if typed.is_empty() || typed.contains('\\') || typed.chars().any(char::is_whitespace) {
+        return Err("server_address_invalid".into());
+    }
+    let parse = |address: &str| {
+        Url::parse(address)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+    };
+    let url = if typed.contains("://") {
+        parse(typed)
+    } else {
+        parse(&format!("http://{typed}")).and_then(|url| {
+            if url.host().is_some_and(is_local_network) {
+                Some(url)
+            } else {
+                parse(&format!("https://{typed}"))
+            }
+        })
+    }
+    .ok_or("server_address_invalid")?;
+    // Credentials in an address are never dropped silently.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("server_requires_https_origin".into());
+    }
+    normalize_server(&url.origin().ascii_serialization())
 }
 
 /// A host on this computer or the local network, where servers answer over plain HTTP: loopback,
@@ -186,6 +222,21 @@ pub struct SavedConnection {
     pub device_id: Option<String>,
 }
 
+/// Binds local authority and browsing data to a single approved Photos sign-in.
+pub(crate) fn photo_session_scope(saved: &SavedConnection) -> String {
+    let mut scope = Sha256::new();
+    for field in [
+        &saved.server,
+        &saved.server_id,
+        &saved.account_id,
+        &saved.token,
+    ] {
+        scope.update((field.len() as u64).to_be_bytes());
+        scope.update(field.as_bytes());
+    }
+    format!("{:x}", scope.finalize())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Features {
@@ -193,6 +244,10 @@ pub struct Features {
     pub worker: bool,
     #[serde(default)]
     pub worker_session: bool,
+    /// The server sets workers up from its machine-learning settings alone
+    /// (docs/desktop-worker-setup-protocol.md). Older servers omit it.
+    #[serde(default)]
+    pub worker_auto_setup: bool,
     pub sources: bool,
     pub native_host: bool,
 }
@@ -212,6 +267,7 @@ pub struct Enrollment {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionView {
+    pub navigation_scope: Option<String>,
     pub server: String,
     pub name: String,
     pub mode: String,
@@ -220,7 +276,22 @@ pub struct ConnectionView {
 }
 impl ConnectionView {
     pub fn new(saved: &SavedConnection, state: String, features: Features) -> Self {
+        let navigation_scope = (!saved.server_id.is_empty()
+            && !saved.account_id.is_empty()
+            && !matches!(
+                state.as_str(),
+                "identity-changed"
+                    | "offline"
+                    | "unsupported-server"
+                    | "credential-store-unavailable"
+            ))
+        .then(|| {
+            let binding = serde_json::to_vec(&(&saved.server, &saved.server_id, &saved.account_id))
+                .expect("serializing strings cannot fail");
+            format!("{:x}", Sha256::digest(binding))
+        });
         Self {
+            navigation_scope,
             server: saved.server.clone(),
             name: saved.name.clone(),
             mode: saved.mode.clone(),
@@ -300,5 +371,79 @@ mod local_http_tests {
             assert!(normalize_server(remote).is_err(), "{remote}");
         }
         assert!(normalize_server("https://photos.example.com").is_ok());
+    }
+
+    #[test]
+    fn a_typed_address_becomes_the_origin_with_plain_http_for_local_hosts() {
+        for (typed, origin) in [
+            // Just an address and a port, as most home servers are reached.
+            ("192.168.1.20:2283", "http://192.168.1.20:2283/"),
+            ("192.168.1.20", "http://192.168.1.20/"),
+            // Copied from the browser's address bar with a page open.
+            ("192.168.1.20:2283/photos", "http://192.168.1.20:2283/"),
+            (
+                "http://192.168.1.20:2283/photos?at=1#top",
+                "http://192.168.1.20:2283/",
+            ),
+            ("  http://192.168.1.20:2283/  ", "http://192.168.1.20:2283/"),
+            ("tower.local", "http://tower.local/"),
+            ("tower.local:2283/albums", "http://tower.local:2283/"),
+            ("tower", "http://tower/"),
+            ("localhost:2283", "http://localhost:2283/"),
+            ("[fd00::7]:2283", "http://[fd00::7]:2283/"),
+            ("100.64.0.1:2283", "http://100.64.0.1:2283/"),
+            ("nas.tail1234.ts.net", "http://nas.tail1234.ts.net/"),
+            // A local server that does have a certificate keeps the scheme that was typed.
+            (
+                "https://tower.local:8443/photos",
+                "https://tower.local:8443/",
+            ),
+            // Anything else is public: HTTPS when no scheme was typed.
+            ("photos.example.com", "https://photos.example.com/"),
+            ("photos.example.com/albums", "https://photos.example.com/"),
+            (
+                "photos.example.com:8443",
+                "https://photos.example.com:8443/",
+            ),
+            ("8.8.8.8:2283", "https://8.8.8.8:2283/"),
+            (
+                "https://photos.example.com/photos",
+                "https://photos.example.com/",
+            ),
+        ] {
+            assert_eq!(
+                typed_server(typed).map(String::from),
+                Ok(origin.to_string()),
+                "{typed}"
+            );
+        }
+        // Plain HTTP that was typed for a public host is refused, never upgraded or sent.
+        for refused in [
+            "http://photos.example.com",
+            "http://8.8.8.8:2283/photos",
+            "user:secret@192.168.1.20:2283",
+            "https://user@photos.example.com",
+        ] {
+            assert_eq!(
+                typed_server(refused).map(String::from),
+                Err("server_requires_https_origin".to_string()),
+                "{refused}"
+            );
+        }
+        for invalid in [
+            "",
+            "   ",
+            "ftp://192.168.1.20",
+            "file:///etc/hosts",
+            "192.168.1.20 2283",
+            "tower\\share",
+            "://",
+        ] {
+            assert_eq!(
+                typed_server(invalid).map(String::from),
+                Err("server_address_invalid".to_string()),
+                "{invalid:?}"
+            );
+        }
     }
 }

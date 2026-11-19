@@ -144,7 +144,16 @@ impl Drop for CodeLease {
 }
 impl CodeLease {
     pub(crate) fn acquire(candidate: &Path) -> Result<Self, String> {
-        let file = open(candidate, LEASE, true)?;
+        Self::acquire_with(candidate, true)
+    }
+
+    /// Read-only inspection can hold a package stable without initializing an incomplete install.
+    pub(crate) fn acquire_existing(candidate: &Path) -> Result<Self, String> {
+        Self::acquire_with(candidate, false)
+    }
+
+    fn acquire_with(candidate: &Path, initialize: bool) -> Result<Self, String> {
+        let file = open(candidate, LEASE, initialize)?;
         file.try_lock_shared().map_err(|_| "host_package_busy")?;
         let lease = Self {
             file,
@@ -254,6 +263,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn inspection_lease_never_initializes_missing_package_files() {
+        let f = Fixture::new();
+        assert!(CodeLease::acquire_existing(&f.0).is_err());
+        assert!(std::fs::read_dir(&f.0).unwrap().next().is_none());
+        drop(CodeLease::acquire(&f.0).unwrap());
+        let reader = CodeLease::acquire_existing(&f.0).unwrap();
+        assert!(Maintenance::acquire(&f.0).is_err());
+        drop(reader);
+        let maintenance = Maintenance::acquire(&f.0).unwrap();
+        maintenance.fence().unwrap();
+        drop(maintenance);
+        assert!(CodeLease::acquire_existing(&f.0).is_err());
     }
     #[test]
     fn readers_exclude_maintenance_and_persistent_fence_excludes_new_readers() {

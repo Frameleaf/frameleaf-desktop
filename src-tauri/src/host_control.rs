@@ -21,6 +21,7 @@ struct Config {
     #[serde(default)]
     mode: crate::host_runtime::HostMode,
     installation_id: String,
+    secure_installation_id: Option<uuid::Uuid>,
     candidate: PathBuf,
     state: PathBuf,
     manifest_sha256: String,
@@ -55,6 +56,8 @@ fn config(raw: &[u8]) -> Result<Config, String> {
         || config.database_port == 0
         || config.api_port == 0
         || config.database_port == config.api_port
+        // Manager never asks for a carry-forward step: only this app starts one, in its own process.
+        || config.mode.carries()
     {
         return Err("host_control_config_invalid".into());
     }
@@ -66,10 +69,21 @@ fn config(raw: &[u8]) -> Result<Config, String> {
 struct Inspection {
     protocol_version: u32,
     installation_id: String,
+    secure_installation_id: Option<uuid::Uuid>,
     candidate: PathBuf,
     state: PathBuf,
     manifest_sha256: String,
 }
+fn check_secure_installation(
+    requested: Option<uuid::Uuid>,
+    owner: &crate::host_state::Owner,
+) -> Result<(), String> {
+    if requested.is_some_and(|value| value != owner.secure_installation_id()) {
+        return Err("host_profile_identity_changed".into());
+    }
+    Ok(())
+}
+
 fn physical_id(path: &Path) -> Result<String, String> {
     let directory = cap_std::fs::Dir::from_std_file(crate::host_storage::directory(path)?);
     crate::copy_source::root_identity(&directory)
@@ -116,7 +130,7 @@ pub(crate) fn separate_paths(candidate: &Path, state: &Path) -> Result<(), Strin
     }
     Ok(())
 }
-fn verify_candidate(
+pub(crate) fn verify_candidate(
     candidate: &Path,
     expected: &str,
 ) -> Result<crate::host_runtime::VerifiedHostRuntime, String> {
@@ -158,16 +172,89 @@ pub fn inspect_owner() -> Result<(), String> {
     }
     separate_paths(&request.candidate, &request.state)?;
     let mut owner = crate::host_state::Owner::acquire(&request.state, false)?;
+    check_secure_installation(request.secure_installation_id, &owner)?;
     let runtime = verify_candidate(&request.candidate, &request.manifest_sha256)?;
     let marker = owner.inspect(&request.installation_id, &request.manifest_sha256)?;
-    emit(
-        json!({"protocolVersion":1,"state":"quiescent","installationId":marker.installation_id,
+    let mut receipt = json!({"protocolVersion":1,"state":"quiescent","installationId":marker.installation_id,
         "manifestSha256":runtime.manifest_sha256(),"sourceRevision":runtime.source_revision(),
-        "certified":runtime.certified(),"profileIdentity":marker.profile_identity,"generation":marker.generation}),
-    )
+        "certified":runtime.certified(),"profileIdentity":marker.profile_identity,"generation":marker.generation});
+    if let Some(id) = request.secure_installation_id {
+        receipt["secureInstallationId"] = json!(id);
+    }
+    emit(receipt)
 }
 
-fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
+#[cfg(windows)]
+pub fn media_move_owner() -> Result<(), String> {
+    use crate::host_state::media_move::{CutoverRequest, Decision};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        installation_id: String,
+        secure_installation_id: uuid::Uuid,
+        candidate: PathBuf,
+        state: PathBuf,
+        manifest_sha256: String,
+        request: CutoverRequest,
+        decision: Option<Decision>,
+        reviewed_backup: Option<serde_json::Value>,
+    }
+
+    let raw = line(&mut BufReader::new(std::io::stdin()), 16 * 1024)?;
+    let request: Request = serde_json::from_slice(&raw).map_err(|_| "host_media_move_invalid")?;
+    if !native_runtime::digest_valid(&request.installation_id, 12)
+        || !native_runtime::digest_valid(&request.manifest_sha256, 64)
+        || !request
+            .request
+            .matches_host(request.secure_installation_id, &request.manifest_sha256)
+    {
+        return Err("host_media_move_invalid".into());
+    }
+    native_runtime::absolute_directory(&request.state)?;
+    if request.decision.is_some() && request.reviewed_backup.is_some() {
+        return Err("host_media_move_invalid".into());
+    }
+    crate::host_storage::check_cleanup(&request.state)?;
+    separate_paths(&request.candidate, &request.state)?;
+    let _code_lease = crate::package_lease::CodeLease::acquire(&request.candidate)?;
+    verify_candidate(&request.candidate, &request.manifest_sha256)?;
+    let owner = crate::host_state::Owner::acquire(&request.state, true)?;
+    check_secure_installation(Some(request.secure_installation_id), &owner)?;
+    #[cfg(not(feature = "qualify-windows-media-move"))]
+    let fixture_device: Option<crate::connection::DeviceIdentity> = None;
+    #[cfg(feature = "qualify-windows-media-move")]
+    let fixture_device = crate::host_state::media_move::qualification::device_for(&request.state)?;
+    let device: crate::connection::DeviceIdentity = match fixture_device {
+        Some(device) => device,
+        None => crate::credentials::load("installation")?
+            .ok_or("host_media_move_credential_unavailable")?,
+    };
+    emit(request.request.apply_or_inspect(
+        owner,
+        &request.installation_id,
+        &device,
+        request.decision,
+        request.reviewed_backup,
+        || false,
+    )?)
+}
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub fn qualify_media_move() -> Result<(), String> {
+    let raw = line(&mut BufReader::new(std::io::stdin()), 16 * 1024)?;
+    emit(crate::host_state::media_move::qualification::run(&raw)?)
+}
+
+#[cfg(all(windows, feature = "qualify-windows-media-move"))]
+pub fn qualify_media_move_manager() -> Result<(), String> {
+    let mut input = BufReader::new(std::io::stdin());
+    tauri::async_runtime::block_on(crate::host_state::media_move::qualification::serve_manager(
+        &mut input,
+    ))
+}
+
+pub(crate) fn line(reader: &mut impl BufRead, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut bytes = Zeroizing::new(Vec::new());
     Read::by_ref(reader)
         .take((limit + 1) as u64)
@@ -218,7 +305,7 @@ fn candidate_file(path: &Path, maximum: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn emit(value: serde_json::Value) -> Result<(), String> {
+pub(crate) fn emit(value: serde_json::Value) -> Result<(), String> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{value}")
         .and_then(|()| output.flush())
@@ -371,6 +458,7 @@ fn read_owner_commands(
     }
 }
 
+/// Serve the owner-pipe protocol for one controller session.
 pub fn run() -> Result<(), String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let invalid = Arc::new(AtomicBool::new(false));
@@ -390,9 +478,21 @@ pub fn run() -> Result<(), String> {
         // A missing owner or malformed command still cancels while a checkpoint is running.
         read_owner_commands(&mut input, commands, &input_cancelled, &input_invalid);
     });
-    let mut config = receiver
+    let config = receiver
         .recv()
         .map_err(|_| "host_control_config_invalid")??;
+    let state = config.state.clone();
+    serve(config, cancelled, invalid, command_receiver)
+        .inspect_err(|code| crate::host_runtime::record_failure(&state, code))
+}
+
+/// Run one admitted controller session; `run` records any refusal code for diagnosis.
+fn serve(
+    mut config: Config,
+    cancelled: Arc<AtomicBool>,
+    invalid: Arc<AtomicBool>,
+    command_receiver: mpsc::Receiver<CheckpointCommand>,
+) -> Result<(), String> {
     let password = Zeroizing::new(std::mem::take(&mut config.password));
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
@@ -409,6 +509,7 @@ pub fn run() -> Result<(), String> {
         candidate_file(&config.state.join("host-state.json"), 4096)?;
     }
     let mut owner = crate::host_state::Owner::acquire(&config.state, true)?;
+    check_secure_installation(config.secure_installation_id, &owner)?;
     if cancelled.load(Ordering::Acquire) {
         return stopped(&invalid);
     }
@@ -429,17 +530,23 @@ pub fn run() -> Result<(), String> {
         config.api_port,
         config.mode,
         Some(&mut owner),
+        #[cfg(windows)]
+        &std::env::current_exe().map_err(|_| "host_agent_start_failed")?,
     )?;
     if !process.wait_ready_or_cancel(Duration::from_secs(240), &cancelled)? {
         owner.clean_stop()?;
         return stopped(&invalid);
     }
-    if emit(
-        json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
-        "sourceRevision":runtime.source_revision(),"certified":runtime.certified()}),
-    )
-    .is_err()
-    {
+    let mut receipt = json!({"protocolVersion":1,"state":config.mode.ready_state(), "manifestSha256":runtime.manifest_sha256(),
+        "sourceRevision":runtime.source_revision(),"certified":runtime.certified()});
+    if let Some(id) = config.secure_installation_id {
+        receipt["secureInstallationId"] = json!(id);
+    }
+    #[cfg(windows)]
+    if let Some(reference) = owner.media_reference() {
+        receipt["activeMediaIdentity"] = json!(reference.identity);
+    }
+    if emit(receipt).is_err() {
         process.stop()?;
         owner.clean_stop()?;
         return Err("host_control_output_unavailable".into());
@@ -827,6 +934,9 @@ mod tests {
             ("apiPort", json!(54321)),
             ("trustedKeys", json!(["untrusted"])),
             ("command", json!("arbitrary command")),
+            // Only this app starts a carry-forward step; Manager can never ask for one.
+            ("mode", json!("carry-export")),
+            ("mode", json!("carry-restore")),
         ] {
             let mut value_config = good.clone();
             value_config[field] = value;
@@ -837,6 +947,30 @@ mod tests {
                 "host_control_config_invalid"
             );
         }
+    }
+
+    #[test]
+    fn manager_identity_is_bound_to_the_controller_profile() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-manager-id-{}", uuid::Uuid::new_v4()));
+        crate::runtime_store::private_directory(&root).unwrap();
+        let state = root.join("state");
+        let other = root.join("other");
+        crate::runtime_store::private_directory(&state).unwrap();
+        crate::runtime_store::private_directory(&other).unwrap();
+        let owner = crate::host_state::Owner::acquire(&state, true).unwrap();
+        let id = crate::host_state::secure_installation_id(&state).unwrap();
+        let wrong = crate::host_state::secure_installation_id(&other).unwrap();
+        assert!(!id.is_nil());
+        assert!(check_secure_installation(Some(id), &owner).is_ok());
+        assert_eq!(
+            check_secure_installation(Some(wrong), &owner),
+            Err("host_profile_identity_changed".into())
+        );
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -143,12 +143,73 @@ fn private_acl(owner: &[u8], acl: &[u8], expected_owner: &[u8], trusted: &[Vec<u
     }
     true
 }
+/// The host's state directory, as admission meets it: the admitted directory itself, or the
+/// one directly inside an admitted profile root. Nowhere deeper.
+fn state_directory(depth: usize, name: Option<&std::ffi::OsStr>) -> bool {
+    depth <= 1
+        && name
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("state"))
+}
+/// The photo library: originals, thumbnails and encoded video, several files per photo, so its
+/// size has no bound. It is the `media` directory directly inside the state directory, and
+/// only that one: a `media` anywhere else is state like any other.
+fn library_directory(parent_is_state: bool, name: Option<&std::ffi::OsStr>) -> bool {
+    parent_is_state
+        && name
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("media"))
+}
+/// How many entries admission opens and inspects in full: everything outside the library,
+/// and separately the library's first entries.
+const INVENTORY_LIMIT: usize = 100_000;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk {
+    /// Open this entry and inspect its owner and ACL; anything but private refuses.
+    Inspect,
+    /// A library entry past the limit: decide from its directory listing. See `listed_entry`.
+    Listed,
+    /// More state outside the library than this app writes: refuse, as before.
+    Refuse,
+}
+/// What admission does with the `count`th entry (from one) of its kind. Enumeration never
+/// stops and does not depend on the clock or the disk: a library's size alone must never
+/// leave it unstartable, and no part of it is skipped.
+fn walk_step(library: bool, count: usize) -> Walk {
+    if count <= INVENTORY_LIMIT {
+        Walk::Inspect
+    } else if library {
+        Walk::Listed
+    } else {
+        Walk::Refuse
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listed {
+    /// A reparse point, or neither file nor directory: refuse, without opening it.
+    Refuse,
+    /// Open and inspect it like any entry, then look inside: a loose directory would expose
+    /// everything in it and let another account replace what is inside.
+    Directory,
+    /// An ordinary file: its own ACL is the one thing left unread past the limit.
+    File,
+}
+/// A library entry past the limit, from the attributes its directory listing already holds.
+fn listed_entry(reparse: bool, directory: bool, file: bool) -> Listed {
+    if reparse || directory == file {
+        Listed::Refuse
+    } else if directory {
+        Listed::Directory
+    } else {
+        Listed::File
+    }
+}
 #[cfg(windows)]
 mod user;
 #[cfg(windows)]
 pub(crate) use user::{
-    create_private_directory, pin_private_directory, private_directory, process_user_sid,
-    require_private_directory,
+    create_private_directory, pin_private_child, pin_private_directory, private_directory,
+    private_directory_pinned, process_user_sid, require_private_directory,
 };
 
 #[cfg(windows)]
@@ -296,6 +357,23 @@ mod native {
         stable_volume_root(&value).ok_or(ERROR)?;
         Ok(PathBuf::from(value))
     }
+    /// Discover the protected OS directory without trusting the parent environment or DOS aliases.
+    pub(crate) fn system_root() -> Result<PathBuf, String> {
+        let mut buffer = vec![0u16; 32768];
+        let size = unsafe {
+            windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW(
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        } as usize;
+        if size == 0 || size >= buffer.len() {
+            return Err(ERROR.into());
+        }
+        let directory = String::from_utf16(&buffer[..size]).map_err(|_| ERROR)?;
+        let directory = stable_path(Path::new(&directory))?;
+        protect(&directory, &mut BTreeSet::new())?;
+        Ok(directory)
+    }
     fn opened_path(file: &File, flags: u32) -> Result<String, String> {
         let mut buffer = vec![0u16; 32768];
         let size = unsafe {
@@ -311,6 +389,7 @@ mod native {
         }
         String::from_utf16(&buffer[..size]).map_err(|_| ERROR.into())
     }
+    /// Bind the extended state spelling to its opened DOS mapping and volume serial.
     pub(crate) fn state_path_binding(path: &Path) -> Result<super::StatePathBinding, String> {
         let file = OpenOptions::new()
             .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
@@ -322,7 +401,7 @@ mod native {
         if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
             return Err(ERROR.into());
         }
-        let physical_root = format!(r"\\.\GLOBALROOT{}", opened_path(&file, VOLUME_NAME_NT)?);
+        let physical_root = format!(r"\\?\GLOBALROOT{}", opened_path(&file, VOLUME_NAME_NT)?);
         stable_volume_root(&physical_root).ok_or(ERROR)?;
         if Path::new(&physical_root) != path {
             return Err(ERROR.into());
@@ -345,6 +424,7 @@ mod native {
         })
     }
 
+    /// Preserve the opened NT volume while allowing long descendant paths in Node and native tools.
     pub(crate) fn stable_state_path(path: &Path) -> Result<PathBuf, String> {
         let captured = match std::fs::symlink_metadata(path) {
             Ok(_) => stable_path(path),
@@ -355,8 +435,10 @@ mod native {
             }
             Err(_) => Err(ERROR.into()),
         }?;
-        stable_volume_root(captured.to_str().ok_or(ERROR)?).ok_or(ERROR)?;
-        Ok(captured)
+        let captured = captured.to_str().ok_or(ERROR)?;
+        stable_volume_root(captured).ok_or(ERROR)?;
+        let physical = captured.strip_prefix(r"\\.\").ok_or(ERROR)?;
+        Ok(PathBuf::from(format!(r"\\?\{physical}")))
     }
     /// Capture identity metadata from an already-open object, never resolve a GUID alias for execution.
     pub(crate) fn durable_name(handle: &impl AsRawHandle) -> Result<String, String> {
@@ -583,6 +665,35 @@ mod native {
             std::fs::remove_dir_all(scratch).unwrap();
         }
         #[test]
+        fn isolated_node_crypto_uses_the_os_discovered_system_root() {
+            let node = std::process::Command::new("node")
+                .args(["-p", "process.execPath"])
+                .output()
+                .unwrap();
+            assert!(node.status.success());
+            let node =
+                stable_path(Path::new(String::from_utf8(node.stdout).unwrap().trim())).unwrap();
+            let output = std::process::Command::new(node)
+                .args([
+                    "-e",
+                    "require('node:crypto').randomBytes(32); console.log('entropy-ready')",
+                ])
+                .env_clear()
+                .env("PATH", "")
+                .env("SystemRoot", system_root().unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                "entropy-ready"
+            );
+        }
+        #[test]
         fn actual_node_keeps_physical_main_and_dependency_paths() {
             let scratch = std::env::temp_dir()
                 .join(format!("frameleaf-node-modules-{}", uuid::Uuid::new_v4()));
@@ -623,12 +734,14 @@ mod native {
                 ]
             );
         }
+        /// Check that Node-created database state retains the native physical-path binding.
         #[test]
         fn captured_state_is_accepted_by_the_actual_node_canonical_check() {
             let scratch =
                 std::env::temp_dir().join(format!("frameleaf-node-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&scratch).unwrap();
             let captured = stable_state_path(&scratch).unwrap();
+            assert!(captured.to_str().unwrap().starts_with(r"\\?\GLOBALROOT\"));
             let binding = state_path_binding(&captured).unwrap();
             let agent = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -636,7 +749,7 @@ mod native {
                 .join("runtime/host-agent.mjs");
             let agent = url::Url::from_file_path(agent).unwrap();
             let script = format!(
-                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); if (!await isCanonicalHostPath(expected, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(expected),expected,binding}}));",
+                "import {{ isCanonicalHostPath }} from {}; import fs from 'node:fs/promises'; import {{spawnSync}} from 'node:child_process'; import {{join}} from 'node:path'; const expected = process.argv[1]; const binding = JSON.parse(process.argv[2]); const spawned=spawnSync(process.execPath,['--eval','process.exit(0)'],{{cwd:expected}}); if(spawned.status!==0) throw new Error('physical state cwd failed'); const child=join(expected,'database',...Array.from({{length:8}},(_,i)=>'attempt-'+i+'-'+'x'.repeat(32))); if(child.length<=260) throw new Error('long-path calibration failed'); await fs.mkdir(child,{{recursive:true,mode:0o700}}); for(const path of [expected,child]) if (!await isCanonicalHostPath(path, binding)) throw new Error(JSON.stringify({{actual:await fs.realpath(path),expected:path,binding}}));",
                 serde_json::to_string(agent.as_str()).unwrap(),
             );
             let output = std::process::Command::new("node")
@@ -682,7 +795,7 @@ mod native {
 }
 #[cfg(windows)]
 pub(crate) use native::{
-    durable_name, protect, stable_path, stable_state_path, state_path_binding,
+    durable_name, protect, stable_path, stable_state_path, state_path_binding, system_root,
 };
 
 #[cfg(test)]
@@ -933,5 +1046,62 @@ mod tests {
             bad[offset] = value;
             assert!(!safe_acl(&system, &bad, &trusted, false), "offset {offset}");
         }
+    }
+    #[test]
+    fn only_media_directly_inside_the_state_directory_is_the_library() {
+        use std::ffi::OsStr;
+        let name = |name: &'static str| Some(OsStr::new(name));
+        // The admitted directory itself, or the one directly inside an admitted profile root.
+        for depth in [0, 1] {
+            for spelling in ["state", "State", "STATE"] {
+                assert!(state_directory(depth, name(spelling)));
+            }
+            for other in ["manager", "media", "state2", "home", ""] {
+                assert!(!state_directory(depth, name(other)), "{other}");
+            }
+            assert!(!state_directory(depth, None));
+        }
+        for depth in [2, 3, 40] {
+            assert!(!state_directory(depth, name("state")));
+        }
+        for spelling in ["media", "Media", "MEDIA"] {
+            assert!(library_directory(true, name(spelling)));
+            // Under `home`, `studio-work`, `database`, a restore target or Manager's folder.
+            assert!(!library_directory(false, name(spelling)));
+        }
+        for other in [
+            "database",
+            "checkpoints",
+            "secrets",
+            "home",
+            "media2",
+            "medi",
+            "media.json",
+            "",
+        ] {
+            assert!(!library_directory(true, name(other)), "{other}");
+        }
+        assert!(!library_directory(true, None));
+    }
+    #[test]
+    fn size_refuses_only_outside_the_library_and_nothing_in_it_is_skipped() {
+        for library in [false, true] {
+            for count in [1, 2, INVENTORY_LIMIT - 1, INVENTORY_LIMIT] {
+                assert_eq!(walk_step(library, count), Walk::Inspect);
+            }
+        }
+        for count in [INVENTORY_LIMIT + 1, INVENTORY_LIMIT * 50, usize::MAX] {
+            assert_eq!(walk_step(false, count), Walk::Refuse);
+            assert_eq!(walk_step(true, count), Walk::Listed);
+        }
+        // Past the limit: a junction or link always refuses, a directory is always opened
+        // and inspected, and only an ordinary file's own ACL goes unread.
+        for (directory, file) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(listed_entry(true, directory, file), Listed::Refuse);
+        }
+        assert_eq!(listed_entry(false, false, false), Listed::Refuse);
+        assert_eq!(listed_entry(false, true, true), Listed::Refuse);
+        assert_eq!(listed_entry(false, true, false), Listed::Directory);
+        assert_eq!(listed_entry(false, false, true), Listed::File);
     }
 }

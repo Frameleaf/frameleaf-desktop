@@ -51,6 +51,10 @@ fn probe(role: &str, root: &Path) {
         browser.wait().unwrap();
     } else if role == "browser" {
         let mut leaf = command("leaf", root).spawn().unwrap();
+        // The leaf also gets a job of its own, nested in the owner's, as the photo server
+        // does inside Manager's job.
+        let nested = ProcessTree::attach(&leaf);
+        record(root, "nested", u32::from(nested.is_ok()));
         record(root, "leaf", leaf.id());
         leaf.wait().unwrap();
     } else {
@@ -103,6 +107,9 @@ fn detached_descendants_remain_owned_until_termination_or_owner_loss() {
         command.stdin(Stdio::piped());
         let mut child = command.spawn().unwrap();
         let tree = ProcessTree::attach(&child).unwrap();
+        // Before the worker starts anything, the job holds it alone.
+        assert_eq!(tree.active().unwrap(), 1);
+        assert!(!tree.is_empty().unwrap());
         child.stdin.take().unwrap().write_all(&[1]).unwrap();
         while ["ready", "browser", "leaf"]
             .iter()
@@ -143,6 +150,13 @@ fn detached_descendants_remain_owned_until_termination_or_owner_loss() {
             assert_ne!(member, 0, "detached descendant escaped the Frameleaf job");
             fixture.processes.push(handle);
         }
+        // The count covers detached descendants and the one in a nested job.
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("nested")).unwrap(),
+            "1",
+            "the leaf's nested job was refused"
+        );
+        assert!(tree.active().unwrap() >= 3);
         // Natural fixture expiry must never satisfy the shutdown assertion.
         assert!(
             Instant::now() < deadline,

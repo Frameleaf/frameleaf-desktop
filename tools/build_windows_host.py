@@ -176,12 +176,17 @@ console.log(JSON.stringify(hostEnvironment({{runtime:process.argv[1],state:proce
         report['consumers']['studio'] = json.loads(run([node,'--input-type=module','--eval',STUDIO_CHECK,host],cwd=work,env=env))
         if any(result.get('qualification') != 'passed' for result in report['consumers'].values()):
             raise BuildError('host_windows_assembly_consumer_failed')
+        (evidence/'current-consumers.json').write_text(json.dumps(report['consumers'],indent=2)+'\n',encoding='utf-8')
         after = inventory(host)
         after.pop('qualification.json')
         if after != before:
+            changed = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+            (evidence/'consumer-inventory-delta.json').write_text(json.dumps({
+                'count': len(changed),
+                'files': {name: {'before': before.get(name), 'after': after.get(name)} for name in changed[:100]},
+            }, indent=2)+'\n',encoding='utf-8')
             raise BuildError('host_windows_assembly_payload_changed_during_consumers')
         shutil.copy2(host/'qualification.json',evidence/'current-consumer-input.json')
-        (evidence/'current-consumers.json').write_text(json.dumps(report['consumers'],indent=2)+'\n',encoding='utf-8')
         # This existing assembler verifies the nested ML signature and inventory before and after copying.
         assemble(host,roots['ml'],roots['manager']/'manager',roots['backup']/'backup',candidate,SOURCE_REVISION,epoch)
         shutil.rmtree(candidate/'work')

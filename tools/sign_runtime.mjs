@@ -14,6 +14,17 @@ import { fileURLToPath } from "node:url";
 const trustPath = new URL("../runtime/release-trust.json", import.meta.url);
 const profilesPath = new URL("../runtime/profiles.json", import.meta.url);
 const digest = (value) => createHash("sha256").update(value).digest("hex");
+// An accelerated pack carries a second manifest (and signature) over the same payload.
+export const acceleratedManifest = "manifest-accelerated.json";
+export const acceleratedSignature = "manifest-accelerated.sig";
+const cpuProvider = "CPUExecutionProvider";
+const metalFiles = [
+  "__init__.py",
+  "entry.py",
+  "metal_observer.py",
+  "metal_inference.py",
+  "_frameleaf_coreml_observer.dylib",
+];
 const hashPattern = /^[a-f0-9]{64}$/;
 const fail = (code) => {
   throw new Error(code);
@@ -142,14 +153,19 @@ export async function releasePolicy(policy) {
     fail("release_policy_invalid");
   return trust;
 }
-async function checkedCandidate(candidate, trust, signature) {
+async function checkedCandidate(
+  candidate,
+  trust,
+  signature,
+  manifestName = "manifest.json",
+) {
   candidate = resolve(candidate);
   for (let path = candidate; ; path = dirname(path)) {
     await directory(path);
     if (dirname(path) === path) break;
   }
   const raw = await boundedFile(
-    join(candidate, "manifest.json"),
+    join(candidate, manifestName),
     8 * 1024 * 1024,
   );
   let authority;
@@ -187,6 +203,7 @@ async function checkedCandidate(candidate, trust, signature) {
   ];
   if (Object.hasOwn(manifest, "moduleNamespace"))
     fields.push("moduleNamespace");
+  if (Object.hasOwn(manifest, "deviceObserver")) fields.push("deviceObserver");
   if (
     Object.keys(manifest).sort().join(",") !== fields.sort().join(",") ||
     (Object.hasOwn(manifest, "moduleNamespace") &&
@@ -202,6 +219,31 @@ async function checkedCandidate(candidate, trust, signature) {
     Array.isArray(manifest.files)
   )
     fail("runtime_manifest_invalid");
+  // The server admits a CoreML report only from a manifest that names its device collector.
+  const observer = manifest.deviceObserver;
+  if (
+    (manifest.provider === "CoreMLExecutionProvider") !==
+      Object.hasOwn(manifest, "deviceObserver") ||
+    (observer !== undefined &&
+      (!observer ||
+        typeof observer !== "object" ||
+        Array.isArray(observer) ||
+        Object.keys(observer).join(",") !== "kind" ||
+        observer.kind !== "metal-v1" ||
+        manifest.platform !== "macos" ||
+        manifest.architecture !== "aarch64" ||
+        manifest.moduleNamespace !== "frameleaf_ml" ||
+        metalFiles.some((name) => {
+          const file = manifest.files[`private/frameleaf_desktop_ml/${name}`];
+          return (
+            !file ||
+            !Number.isSafeInteger(file.bytes) ||
+            file.bytes <= 0 ||
+            file.bytes > 4 * 1024 ** 2
+          );
+        })))
+  )
+    fail("runtime_device_observer_invalid");
   const profiles = JSON.parse(
     await boundedFile(fileURLToPath(profilesPath), 16384),
   );
@@ -225,11 +267,94 @@ async function checkedCandidate(candidate, trust, signature) {
     provenance.schemaVersion !== 1 ||
     provenance.sourceRepository !== "Frameleaf/frameleaf-app" ||
     provenance.sourceRevision !== manifest.sourceRevision ||
-    provenance.profile !== profileName ||
-    provenance.python !== profile.python
+    provenance.python !== profile.python ||
+    !packProfile(profiles, provenance.profile, profileName, profile, manifest)
   )
     fail("runtime_provenance_invalid");
   return { raw, manifest, keyId: authority?.id };
+}
+/** The pack was built for this manifest's profile, or this is the processor manifest of an
+ * approved accelerated pack with the same interpreter and dependency set. */
+function packProfile(profiles, built, name, profile, manifest) {
+  if (built === name) return true;
+  if (typeof built !== "string" || !Object.hasOwn(profiles.profiles, built))
+    return false;
+  const pack = profiles.profiles[built];
+  return (
+    profile.provider === cpuProvider &&
+    pack.provider !== cpuProvider &&
+    Array.isArray(pack.targets) &&
+    pack.targets.includes(`${manifest.platform}-${manifest.architecture}`) &&
+    pack.python === profile.python &&
+    pack.extra === profile.extra
+  );
+}
+async function present(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+/** The accelerated manifest differs from the primary one only in provider and collector. */
+async function checkedAccelerated(candidate, trust, signature) {
+  const checked = await checkedCandidate(
+    candidate,
+    trust,
+    signature,
+    acceleratedManifest,
+  );
+  const primary = JSON.parse(
+    await boundedFile(join(candidate, "manifest.json"), 8 * 1024 * 1024),
+  );
+  const { provider, deviceObserver, ...rest } = checked.manifest;
+  const { provider: primaryProvider, ...primaryRest } = primary;
+  const stable = (value) =>
+    JSON.stringify(value, (_, item) =>
+      item && typeof item === "object" && !Array.isArray(item)
+        ? Object.fromEntries(
+            Object.entries(item).sort(([a], [b]) => (a < b ? -1 : 1)),
+          )
+        : item,
+    );
+  if (
+    provider === cpuProvider ||
+    primaryProvider !== cpuProvider ||
+    stable(rest) !== stable(primaryRest)
+  )
+    fail("runtime_accelerated_manifest_mismatch");
+  return checked;
+}
+/** `null` when the pack has no accelerated manifest. */
+export async function verifyUnsignedAccelerated(candidate, policy) {
+  candidate = resolve(candidate);
+  if (!(await present(join(candidate, acceleratedManifest)))) return null;
+  return checkedAccelerated(candidate, await releasePolicy(policy));
+}
+/** `null` when the pack has no accelerated manifest; a manifest without its signature (or the
+ * reverse) is refused. */
+export async function verifySignedAccelerated(candidate, policy) {
+  candidate = resolve(candidate);
+  const trust = await releasePolicy(policy);
+  const [manifest, signed] = await Promise.all([
+    present(join(candidate, acceleratedManifest)),
+    present(join(candidate, acceleratedSignature)),
+  ]);
+  if (!manifest && !signed) return null;
+  if (!manifest || !signed) fail("runtime_signature_invalid");
+  const signature = await boundedFile(
+    join(candidate, acceleratedSignature),
+    64,
+  );
+  if (signature.length !== 64) fail("runtime_signature_invalid");
+  const checked = await checkedAccelerated(candidate, trust, signature);
+  return {
+    manifest: checked.manifest,
+    keyId: checked.keyId,
+    manifestSha256: digest(checked.raw),
+  };
 }
 export async function verifyUnsignedCandidate(candidate, policy) {
   return checkedCandidate(candidate, await releasePolicy(policy));
@@ -250,6 +375,7 @@ export async function signCandidate(
   signaturePath,
   privatePem,
   policy,
+  accelerated = false,
 ) {
   const trust = await releasePolicy(policy);
   const key = createPrivateKey(privatePem);
@@ -261,7 +387,9 @@ export async function signCandidate(
   const authority = trust.keys.find((key) => key.publicKeyHex === publicHex);
   if (!authority) fail("release_key_untrusted");
   signaturePath = resolve(signaturePath);
-  const { raw, manifest } = await checkedCandidate(candidate, trust);
+  const { raw, manifest } = accelerated
+    ? await checkedAccelerated(resolve(candidate), trust)
+    : await checkedCandidate(candidate, trust);
   await directory(dirname(signaturePath));
   const signature = sign(null, raw, key);
   let output;

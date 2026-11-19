@@ -1,3 +1,5 @@
+#[path = "common/catalogue.rs"]
+mod catalogue;
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::host_runtime::VerifiedHostRuntime;
 use serde_json::{json, Value};
@@ -138,6 +140,8 @@ fn nonreading_bootstrap_does_not_block_startup_cancellation_or_timeout() {
                 &zeroize::Zeroizing::new("synthetic-host-password-long-enough".to_string()),
                 23451,
                 23452,
+                #[cfg(windows)]
+                std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
             )
             .expect("startup must return before the child reads its pipe");
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -198,14 +202,16 @@ fn overlapping_host_state_is_rejected_before_any_directory_is_created() {
     let missing = fixture.0.join("state");
     for state in [&fixture.0, &missing, &fixture.2] {
         assert!(matches!(
-            runtime.start(
-                state,
-                &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()),
-                54321,
-                54322,
-            ),
-            Err(code) if code == "host_state_overlaps_runtime"
-        ));
+                    runtime.start(
+                        state,
+                        &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()),
+                        54321,
+                        54322,
+         #[cfg(windows)]
+         std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
+        ),
+                    Err(code) if code == "host_state_overlaps_runtime"
+                ));
         assert!(!missing.exists());
     }
 }
@@ -303,6 +309,8 @@ for line in sys.stdin:
                 &Zeroizing::new("synthetic-private-checkpoint-password".into()),
                 54321,
                 54322,
+                #[cfg(windows)]
+                std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
             )
             .unwrap();
         assert!(child.request_checkpoint(operation).is_err());
@@ -354,6 +362,8 @@ fn host_start_refuses_a_linked_database_before_launching_any_process() {
         &Zeroizing::new("synthetic-host-password-with-enough-length".into()),
         54321,
         54322,
+        #[cfg(windows)]
+        std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
     );
     assert!(matches!(result, Err(ref code) if code == "runtime_link_forbidden"));
     assert!(!state.join("agent.log").exists());
@@ -371,7 +381,10 @@ fn direct_host_start_cannot_bypass_a_controller_managed_profile() {
     .unwrap();
     let verified = fixture.verify().unwrap();
     assert!(
-        matches!(verified.start(&state, &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()), 54321, 54322), Err(code) if code == "host_controller_required")
+        matches!(verified.start(&state, &zeroize::Zeroizing::new("synthetic-host-password-with-enough-length".into()), 54321, 54322,
+ #[cfg(windows)]
+ std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
+), Err(code) if code == "host_controller_required")
     );
     assert!(!state.join("agent.log").exists());
 }
@@ -388,6 +401,8 @@ fn host_start_refuses_maintenance_before_creating_private_state() {
         &Zeroizing::new("synthetic-host-password-with-enough-length".into()),
         54321,
         54322,
+        #[cfg(windows)]
+        std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
     );
     assert!(matches!(result, Err(ref code) if code == "host_package_maintenance"));
     assert!(!state.exists());
@@ -493,7 +508,7 @@ fn rust_owner_drains_agent_output_and_restarts_without_reinitializing_database()
             }
         }
     }
-    put("pg/initdb",b"#!/bin/sh\nmkdir \"$2\" || exit 1\nprintf 19 >\"$2/PG_VERSION\"\necho init >>init-count\n",true);
+    put("pg/initdb",b"#!/bin/sh\ntest -d \"$2\" || exit 1\nprintf 19 >\"$2/PG_VERSION\"\necho init >>init-count\n",true);
     put("pg/postgres",b"#!/bin/sh\necho $$ >\"$2/postmaster.pid\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",true);
     put("pg/pg_isready", b"#!/bin/sh\nexit 0\n", true);
     put("pg/createdb", b"#!/bin/sh\ntouch db-created\n", true);
@@ -537,7 +552,14 @@ process.on('message',message=>{if(message==='frameleaf:stop')server.close(()=>pr
         drop(database);
         drop(api);
         let mut process = verified
-            .start(&state, &password, database_port, api_port)
+            .start(
+                &state,
+                &password,
+                database_port,
+                api_port,
+                #[cfg(windows)]
+                std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
+            )
             .unwrap();
         if cycle == 1 {
             let cancelled = std::sync::atomic::AtomicBool::new(true);
@@ -575,7 +597,16 @@ process.on('message',message=>{if(message==='frameleaf:stop')server.close(()=>pr
     let ap = api.local_addr().unwrap().port();
     drop(database);
     drop(api);
-    let mut crashed = verified.start(&state, &password, dp, ap).unwrap();
+    let mut crashed = verified
+        .start(
+            &state,
+            &password,
+            dp,
+            ap,
+            #[cfg(windows)]
+            std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
+        )
+        .unwrap();
     crashed.wait_ready(Duration::from_secs(15)).unwrap();
     let pg_pid = fs::read_to_string(state.join("database/postmaster.pid"))
         .unwrap()
@@ -766,7 +797,14 @@ fn factory_signed_host_starts_and_restarts_through_compiled_authority() {
     let password = Zeroizing::new(format!("synthetic-{}", Uuid::new_v4()));
     for _ in 0..2 {
         let mut process = host
-            .start(&state, &password, database_port, api_port)
+            .start(
+                &state,
+                &password,
+                database_port,
+                api_port,
+                #[cfg(windows)]
+                std::path::Path::new(env!("CARGO_BIN_EXE_frameleaf-native-host")),
+            )
             .unwrap();
         process.wait_ready(Duration::from_secs(240)).unwrap();
         #[cfg(unix)]
@@ -795,7 +833,8 @@ fn factory_signed_host_starts_and_restarts_through_compiled_authority() {
 #[test]
 #[ignore = "requires factory-signed host, approved model cache and new FRAMELEAF_TEST_HOST_ML_STATE"]
 fn factory_host_nested_ml_installs_qualifies_and_predicts() {
-    use frameleaf_desktop::{model_catalogue::approved_profile, release_policy};
+    use catalogue::approved_profile;
+    use frameleaf_desktop::release_policy;
     use std::{
         net::TcpListener,
         sync::atomic::AtomicBool,

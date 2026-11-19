@@ -1,0 +1,29 @@
+name: Python 3.12
+description: >-
+  actions/setup-python, except on Forgejo's Mac host: there setup-python's macOS build installs a
+  system-wide Python package, so uv provides a runner-owned Python 3.12 instead.
+runs:
+  using: composite
+  steps:
+    - if: github.server_url == 'https://github.com' || runner.os != 'macOS'
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      with:
+        python-version: '3.12'
+    - if: github.server_url != 'https://github.com' && runner.os == 'macOS'
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      with:
+        version: '0.11.2'
+        enable-cache: false
+    - if: github.server_url != 'https://github.com' && runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        export UV_PYTHON_INSTALL_DIR="$HOME/Library/Caches/forgejo-runner/uv-python"
+        uv python install 3.12
+        python="$(uv python find --managed-python 3.12)"
+        bin="$RUNNER_TEMP/python-3.12/bin"
+        mkdir -p "$bin"
+        ln -sf "$python" "$bin/python"
+        ln -sf "$python" "$bin/python3"
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/python" --version

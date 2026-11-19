@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       platforms:
-        description: 'Candidate targets; Windows installers use Azure Artifact Signing'
+        description: 'Candidate targets; Windows installers are unsigned'
         type: choice
         default: linux
         options: [linux, windows]
@@ -19,7 +19,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    # Release signing runs on GitHub (docs/releases.md, Releasing from Forgejo). On Forgejo this is off
+    # unless the repository variable DESKTOP_RELEASE_ON_FORGEJO is true, which it is not.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -29,15 +31,30 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
+      - name: Refuse targets Forgejo has no runner for
+        if: github.server_url != 'https://github.com'
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node --input-type=module -e '
+            import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            for (const problem of problems) console.log(`::error::${problem}`);
+            process.exitCode = problems.length ? 1 : 0;
+          '
       - name: Validate factory source before allocating build runners
         id: source
         env:
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           CANDIDATE_PLATFORMS: ${{ inputs.platforms }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -56,11 +73,9 @@ jobs:
           '
   build:
     needs: prepare
-    environment: ${{ matrix.target == 'windows-x86_64' && 'desktop-release' || '' }}
     permissions:
       contents: read
       actions: read
-      id-token: write
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -76,6 +91,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -83,12 +102,21 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           name: factory-runtime-${{ matrix.target }}
           path: runtime-download
+      - name: Download the factory runtime from its Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$RUNTIME_TARGET" --dir runtime-download
       - name: Extract runtime without archive path escapes
         shell: python
         run: |
@@ -110,7 +138,7 @@ jobs:
         run: chmod -R u=rwX,go=rX,a-s,a-t release-runtime
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -127,17 +155,6 @@ jobs:
         with:
           node-version: '26.11.1'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - name: Configure Azure Artifact Signing
-        if: runner.os == 'Windows'
-        uses: ./.github/actions/windows-signing
-        with:
-          config: candidate-config.json
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
-          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
       - name: Build installer candidates
         shell: bash
         run: |
@@ -145,7 +162,7 @@ jobs:
           npm run tauri -- build --verbose --config "$GITHUB_WORKSPACE/candidate-config.json" -- --locked 2>&1 | tee "$RUNNER_TEMP/frameleaf-installer-build.log"
       - name: Retain bundler diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-installer-diagnostics-${{ matrix.target }}
           path: |
@@ -156,19 +173,34 @@ jobs:
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
-      - name: Verify Windows executable and installer signatures
+      - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          python tools/check_linux_glibc.py --max 2.35 "${packages[0]}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install and run the Linux package in clean Ubuntu and Debian containers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
+      # Windows installers ship unsigned by design (owner, 2026-11-18): no Authenticode signature is made or checked.
+      - name: Check the Windows installers and that the factory runtime survived bundling
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           node --input-type=module -e "import { packageConfiguration } from './tools/package_desktop.mjs'; await packageConfiguration('release-runtime');"
           if ($LASTEXITCODE) { throw 'Factory runtime changed during bundling' }
-          $files = @(Get-Item src-tauri/target/release/frameleaf-desktop.exe)
           $installers = @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.exe', '.msi' })
           if ($installers.Count -ne 2 -or @($installers.Extension | Sort-Object -Unique).Count -ne 2) { throw 'Expected NSIS and MSI installers' }
-          foreach ($file in ($files + $installers)) {
-            & ./tools/windows_sign.ps1 -Path $file.FullName -VerifyOnly
-          }
       - name: Collect installers and provenance preserving executable modes
         env:
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
@@ -199,13 +231,13 @@ jobs:
           (output / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sorted(hashes.items())))
           (output / 'candidate.json').write_text(json.dumps({
               'sourceRevision': os.environ['GITHUB_SHA'], 'target': os.environ['CANDIDATE_TARGET'],
-              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False, 'osSigned': sys.platform == 'win32',
+              'runtimeRunId': os.environ['RUNTIME_RUN_ID'], 'installedQualified': False, 'osSigned': False,
               'scope': 'GUI and existing-server helper candidate; full native host qualification remains separate',
               'files': hashes,
           }, indent=2) + '\n')
           with tarfile.open('installer-candidates.tar.gz', 'w:gz') as archive:
               archive.add(output, arcname='installers')
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: frameleaf-installer-candidates-${{ matrix.target }}
           path: installer-candidates.tar.gz

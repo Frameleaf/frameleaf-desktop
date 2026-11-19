@@ -1,4 +1,5 @@
 //! Signed private runtimes; no shell, ambient Python or server-selected executable.
+mod metal;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -45,6 +46,8 @@ struct Manifest {
     source_revision: String,
     #[serde(default)]
     module_namespace: ModuleNamespace,
+    #[serde(default)]
+    device_observer: Option<metal::Descriptor>,
     files: BTreeMap<String, Artifact>,
 }
 
@@ -187,6 +190,7 @@ impl VerifiedRuntime {
         {
             return Err("runtime_manifest_incompatible".into());
         }
+        metal::validate(&manifest)?;
         relative(&manifest.python)?;
         if !manifest.files.contains_key(&manifest.python) {
             return Err("runtime_interpreter_unapproved".into());
@@ -205,13 +209,28 @@ impl VerifiedRuntime {
     pub(crate) fn epoch(&self) -> u64 {
         self.manifest.epoch
     }
-    pub(crate) fn copy_payload(&self, destination: &Path) -> Result<(), String> {
+    /// `share` is the payload of an installed release with the same files (the processor and
+    /// accelerated manifests of one pack): its files are linked instead of copied again. The
+    /// caller verifies every byte of the result against this manifest either way.
+    pub(crate) fn copy_payload(
+        &self,
+        destination: &Path,
+        share: Option<&Path>,
+    ) -> Result<(), String> {
         self.check_files()?;
         for (name, artifact) in &self.manifest.files {
             let source = self.root.join(relative(name)?);
             let target = destination.join(relative(name)?);
             fs::create_dir_all(target.parent().ok_or("runtime_path_invalid")?)
                 .map_err(|_| "runtime_copy_failed")?;
+            if let Some(share) = share {
+                let shared = share.join(relative(name)?);
+                if no_link(&shared).is_ok_and(|meta| meta.is_file() && meta.len() == artifact.bytes)
+                    && fs::hard_link(&shared, &target).is_ok()
+                {
+                    continue;
+                }
+            }
             let metadata = no_link(&source)?;
             let input = File::open(source).map_err(|_| "runtime_copy_failed")?;
             let mut options = fs::OpenOptions::new();
@@ -293,18 +312,71 @@ pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> R
 }
 
 const START: &[u8] = b"frameleaf-native-start\n";
-const GATE: &str = r#"import os,sys,runpy,threading,signal
+/// FD-71: on Windows the watch for a lost parent must never sit in a read of the pipe. The C
+/// runtime holds its lock on descriptor 0 for as long as a read of it is pending, and every other
+/// use of that descriptor in the process (`lseek`, `fstat`, a library setting up its standard
+/// streams as it loads) then waits for a read that never ends. onnxruntime's native module did
+/// exactly that while loading, under the loader lock, so the runtime could not even exit: every
+/// Windows runtime start hung importing onnxruntime and qualification timed out. There the pipe
+/// is looked at instead, which returns at once, until the parent's end closes or writes.
+const GATE: &str = r#"import os,sys,runpy,threading,signal,time
 expected=b'frameleaf-native-start\n'
 assert sys.stdin.buffer.read(len(expected))==expected
 def lost_parent():
-    os.read(sys.stdin.fileno(),1)
+    if os.name=='nt':
+        import msvcrt,_winapi
+        pipe=msvcrt.get_osfhandle(sys.stdin.fileno())
+        while True:
+            try:
+                if _winapi.PeekNamedPipe(pipe,0)[0]:
+                    break
+            except OSError:
+                break
+            time.sleep(0.2)
+    else:
+        os.read(sys.stdin.fileno(),1)
     if os.name=='posix':
         os.killpg(os.getpgrp(),signal.SIGKILL)
     os._exit(125)
 threading.Thread(target=lost_parent,daemon=True).start()
 sys.argv=sys.argv[1:]
-runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
+if sys.argv[0]=='frameleaf-desktop-metal-v1':
+    parent,expected_hash,mode=sys.argv[1:4]
+    sys.argv=[mode]+sys.argv[4:]
+    sys.path.insert(0,parent)
+    from frameleaf_desktop_ml.entry import run
+    run(mode,expected_hash)
+else:
+    runpy.run_module(sys.argv[0],run_name='__main__',alter_sys=True)
 "#;
+
+/// Held under an exclusive lock for as long as a process owns an inference scratch, so pruning
+/// can tell an abandoned scratch from one in use (also by another instance of the app).
+pub(crate) const SCRATCH_OWNER: &str = ".owner";
+const SCRATCH_OWNER_PENDING: &str = ".owner-pending";
+fn own_scratch(scratch: &Path) -> Result<File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // The owner record appears under its name only once its lock is held: pruning in another
+    // instance of the app must never see an unlocked owner of a scratch that is in use. Until the
+    // rename the scratch has no owner record, which pruning keeps for a week.
+    let pending = scratch.join(SCRATCH_OWNER_PENDING);
+    // A scratch is created for one sidecar; an owner record already there is never replaced.
+    if fs::symlink_metadata(scratch.join(SCRATCH_OWNER)).is_ok() {
+        return Err("runtime_scratch_failed".into());
+    }
+    let owner = options
+        .open(&pending)
+        .map_err(|_| "runtime_scratch_failed")?;
+    owner.try_lock().map_err(|_| "runtime_scratch_failed")?;
+    fs::rename(&pending, scratch.join(SCRATCH_OWNER)).map_err(|_| "runtime_scratch_failed")?;
+    Ok(owner)
+}
 
 pub struct NativeSidecar {
     child: std::process::Child,
@@ -314,6 +386,8 @@ pub struct NativeSidecar {
     stopped: bool,
     exit_status: Option<std::process::ExitStatus>,
     lease: Option<std::sync::Arc<File>>,
+    /// Released before the scratch is removed.
+    owner: Option<File>,
 }
 impl NativeSidecar {
     pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
@@ -356,6 +430,7 @@ impl NativeSidecar {
 impl Drop for NativeSidecar {
     fn drop(&mut self) {
         let _ = self.stop();
+        drop(self.owner.take());
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
@@ -419,17 +494,14 @@ impl VerifiedRuntime {
         absolute_directory(cache)?;
         absolute_directory(private_root)?;
         let scratch = private_root.join(format!("inference-{}", uuid::Uuid::new_v4()));
-        let builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        let mut builder = builder;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&scratch)
-            .map_err(|_| "runtime_scratch_failed")?;
+        crate::runtime_store::create_private_directory(&scratch)?;
+        let owner = match own_scratch(&scratch) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&scratch);
+                return Err(error);
+            }
+        };
         let mut secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
         let token = zeroize::Zeroizing::new(
@@ -482,10 +554,7 @@ impl VerifiedRuntime {
             .arg("-B")
             .arg("-c")
             .arg(GATE)
-            .arg(format!(
-                "{}.{module}",
-                self.manifest.module_namespace.prefix()
-            ))
+            .args(metal::arguments(&self.manifest, &self.root, module)?)
             .arg("--cache-dir")
             .arg(cache)
             .current_dir(&scratch)
@@ -540,8 +609,20 @@ impl VerifiedRuntime {
         {
             // Windows needs its OS directory for platform DLL discovery, never an inherited PATH.
             if let Some(root) = std::env::var_os("SystemRoot") {
-                command.env("PATH", Path::new(&root).join("System32"));
-                command.env("SystemRoot", root);
+                let mut folders = Vec::new();
+                for folder in device_library_folders(
+                    self.provider(),
+                    self.manifest.files.keys().map(String::as_str),
+                ) {
+                    folders.push(self.root.join(relative(&folder)?));
+                }
+                let program_files = crate::host_install::windows_program_files()?;
+                command.envs(windows_environment(
+                    &root,
+                    &scratch,
+                    &folders,
+                    program_files.as_os_str(),
+                )?);
             }
         }
         crate::process_tree::configure(&mut command);
@@ -570,6 +651,7 @@ impl VerifiedRuntime {
             stopped: false,
             exit_status: None,
             lease: None,
+            owner: Some(owner),
         };
         owner
             .child
@@ -580,6 +662,70 @@ impl VerifiedRuntime {
             .map_err(|_| "runtime_gate_failed")?;
         Ok(owner)
     }
+}
+
+/// FD-63: the folders of a CUDA pack that hold the NVIDIA wheels' Windows libraries
+/// (`.../site-packages/nvidia/<component>/bin`), relative to the payload.
+///
+/// onnxruntime opens a fixed list of them by full path before a session is created. The rest are
+/// opened later by name, by NVIDIA's own libraries: cuDNN's convolution library, the run-time
+/// compiler cuDNN and cuFFT use, cuFFT's linker. Windows looks for a library named that way in
+/// the program's folder, the OS directory and `PATH`, none of which is inside the pack.
+#[cfg(any(windows, test))]
+fn device_library_folders<'a>(
+    provider: &str,
+    files: impl Iterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut folders = BTreeSet::new();
+    if provider != "CUDAExecutionProvider" {
+        return folders;
+    }
+    for name in files {
+        let parts: Vec<&str> = name.split('/').collect();
+        let count = parts.len();
+        if count >= 5
+            && parts[count - 1].to_ascii_lowercase().ends_with(".dll")
+            && parts[count - 2] == "bin"
+            && parts[count - 4] == "nvidia"
+            && parts[count - 5] == "site-packages"
+        {
+            folders.insert(parts[..count - 1].join("/"));
+        }
+    }
+    folders
+}
+
+/// What a runtime process gets on Windows besides the variables every platform sets.
+///
+/// `PATH`: the OS directory, then (FD-63) the pack's own NVIDIA library folders, signed and
+/// verified before this point; never an inherited `PATH`. `USERPROFILE` (FD-63): the runtime's
+/// settings name a default folder under the home directory when they are imported, and Python on
+/// Windows has no home directory without this variable, so the import failed and nothing
+/// qualified. The process's own scratch stands in; the user's profile stays out of reach.
+/// `ProgramFiles` and `ProgramW6432`: NVML, which `nvidia-smi` uses and through which
+/// the runtime learns there is a card, finds itself through them. Without them `nvidia-smi`
+/// ends with "Failed to initialize NVML: Unknown Error", the runtime reports no card, and every
+/// CUDA qualification is refused (`native_device_execution_evidence_required`) on a computer
+/// whose CUDA works. The OS's registered folder is given, never an inherited value.
+#[cfg(any(windows, test))]
+fn windows_environment(
+    system_root: &std::ffi::OsStr,
+    scratch: &Path,
+    library_folders: &[PathBuf],
+    program_files: &std::ffi::OsStr,
+) -> Result<[(&'static str, std::ffi::OsString); 5], String> {
+    let mut search = vec![Path::new(system_root).join("System32")];
+    search.extend(library_folders.iter().cloned());
+    Ok([
+        (
+            "PATH",
+            std::env::join_paths(search).map_err(|_| "runtime_path_invalid")?,
+        ),
+        ("SystemRoot", system_root.to_owned()),
+        ("USERPROFILE", scratch.as_os_str().to_owned()),
+        ("ProgramFiles", program_files.to_owned()),
+        ("ProgramW6432", program_files.to_owned()),
+    ])
 }
 
 enum Invocation<'a> {
@@ -634,6 +780,22 @@ impl VerifiedRuntime {
         fixture: &[u8],
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<QualifiedRuntime, String> {
+        let mut refused = None;
+        self.qualify_explained(cache, private_root, spec, fixture, cancel, &mut refused)
+            .map_err(|code| qualification_failure(code, refused.as_deref()))
+    }
+    /// `qualify`, also handing back what a refusing process wrote as its reason (`refusal`), so
+    /// FD-63's hardware evidence can tell the runtime's own refusal from a process that crashed
+    /// or wrote nothing: both are `runtime_qualification_failed` to the caller.
+    pub(crate) fn qualify_explained(
+        &self,
+        cache: &Path,
+        private_root: &Path,
+        spec: &[u8],
+        fixture: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
+        refused: &mut Option<String>,
+    ) -> Result<QualifiedRuntime, String> {
         use std::{
             sync::atomic::Ordering,
             time::{Duration, Instant},
@@ -675,6 +837,28 @@ impl VerifiedRuntime {
         {
             return Err("runtime_qualification_input_invalid".into());
         }
+        let qwen_binary = if value["engine"] == "qwen-gguf" {
+            let mut candidates = self.manifest.files.iter().filter(|(path, _)| {
+                match self.manifest.platform.as_str() {
+                    "windows" => {
+                        path.as_str()
+                            == "python/Lib/site-packages/frameleaf_ml/native-bin/llama-server.exe"
+                    }
+                    "macos" | "linux" => {
+                        path.starts_with("python/lib/python")
+                            && path.ends_with("/site-packages/frameleaf_ml/native-bin/llama-server")
+                    }
+                    _ => false,
+                }
+            });
+            let (_, artifact) = candidates.next().ok_or("runtime_qwen_binary_unavailable")?;
+            if candidates.next().is_some() {
+                return Err("runtime_qwen_binary_unavailable".into());
+            }
+            Some(artifact.sha256.as_str())
+        } else {
+            None
+        };
         let mut child = self.launch(
             cache,
             private_root,
@@ -698,6 +882,12 @@ impl VerifiedRuntime {
             return Err("runtime_cancelled".into());
         }
         if !child.exit_status.is_some_and(|status| status.success()) {
+            // FD-56: the process leaves its reason in the report it could not pass. Say it, so
+            // a refusal is never silent; the code the caller acts on stays the same.
+            *refused = refusal(&child.scratch.join("report.json"));
+            if let Some(why) = refused {
+                eprintln!("runtime qualification refused: {why}");
+            }
             return Err("runtime_qualification_failed".into());
         }
         let path = child.scratch.join("report.json");
@@ -714,7 +904,14 @@ impl VerifiedRuntime {
         }
         let report: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "runtime_qualification_report_invalid")?;
-        validate_report(&report, &value, &format!("{:x}", Sha256::digest(spec)))?;
+        validate_report(
+            &report,
+            &value,
+            &format!("{:x}", Sha256::digest(spec)),
+            self.provider(),
+            metal::collector_hash(&self.manifest),
+            qwen_binary,
+        )?;
         self.check_files()?;
         Ok(QualifiedRuntime {
             spec: spec.to_vec(),
@@ -723,10 +920,74 @@ impl VerifiedRuntime {
         })
     }
 }
+/// The specific reason for a failed known-answer check, from the reason the runtime wrote, so the
+/// person sees "wrong answer" or "out of memory" instead of a general failure. Anything else stays
+/// `runtime_qualification_failed`.
+pub(crate) fn qualification_failure(code: String, refused: Option<&str>) -> String {
+    if code != "runtime_qualification_failed" {
+        return code;
+    }
+    let Some(refused) = refused else {
+        return code;
+    };
+    let (reason, detail) = refused.split_once(' ').unwrap_or((refused, ""));
+    match reason {
+        "native_output_value_mismatch"
+        | "native_output_shape_mismatch"
+        | "native_output_schema_mismatch" => "runtime_output_mismatch",
+        "native_memory_insufficient" => "runtime_out_of_memory",
+        "native_staged_model_unavailable" | "native_staged_hash_mismatch" => {
+            "runtime_model_missing"
+        }
+        "native_provider_unavailable"
+        | "native_provider_execution_unproven"
+        | "native_device_execution_evidence_required" => "runtime_provider_unavailable",
+        // ONNX Runtime and Python name an allocation failure only in the detail.
+        _ if [
+            "MemoryError",
+            "Failed to allocate",
+            "out of memory",
+            "bad_alloc",
+        ]
+        .iter()
+        .any(|text| detail.contains(text)) =>
+        {
+            "runtime_out_of_memory"
+        }
+        _ => return code,
+    }
+    .into()
+}
+
+/// Why a qualification process refused: the code, and the short detail, in the report it left.
+/// For a person reading the log only: never trusted, never sent anywhere.
+fn refusal(report: &Path) -> Option<String> {
+    let raw = crate::runtime_store::read_bounded(report, 64 * 1024).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let reason = value["reason"].as_str().filter(|reason| {
+        !reason.is_empty()
+            && reason.len() <= 128
+            && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    })?;
+    let detail: String = value["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(500)
+        .collect();
+    Some(format!("{reason} {detail}").trim_end().to_owned())
+}
+
+/// `runtime_provider` is the one provider the installed runtime's signed manifest declares, and
+/// `expected_collector` the device collector that manifest carries (CoreML only).
 fn validate_report(
     report: &serde_json::Value,
     spec: &serde_json::Value,
     binding: &str,
+    runtime_provider: &str,
+    expected_collector: Option<&str>,
+    qwen_binary: Option<&str>,
 ) -> Result<(), String> {
     let invalid = || String::from("runtime_qualification_report_invalid");
     for field in [
@@ -746,6 +1007,52 @@ fn validate_report(
             .as_str()
             .filter(|s| digest_valid(s, 64))
             .is_none()
+    {
+        return Err(invalid());
+    }
+    if spec["engine"] == "qwen-gguf" {
+        let binary = qwen_binary
+            .filter(|hash| digest_valid(hash, 64))
+            .ok_or_else(invalid)?;
+        let execution = report["qwenExecution"].as_object().ok_or_else(invalid)?;
+        let build = execution
+            .get("build")
+            .and_then(|item| item.as_str())
+            .ok_or_else(invalid)?;
+        let (number, revision) = build
+            .strip_prefix('b')
+            .and_then(|item| item.split_once('-'))
+            .ok_or_else(invalid)?;
+        if report["engine"] != "qwen-gguf"
+            || spec["provider"] != "CPUExecutionProvider"
+            || runtime_provider != "CPUExecutionProvider"
+            || expected_collector.is_some()
+            || report["state"] != "ready-cpu"
+            || execution.len() != 3
+            || execution.get("binarySha256").and_then(|item| item.as_str()) != Some(binary)
+            || number.is_empty()
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || !revision.starts_with("7fe450e19")
+            || revision.len() > 40
+            || !digest_valid(revision, revision.len())
+            || !execution
+                .get("coldMilliseconds")
+                .and_then(|item| item.as_array())
+                .is_some_and(|samples| {
+                    samples.len() == 2
+                        && samples.iter().all(|sample| {
+                            sample
+                                .as_f64()
+                                .is_some_and(|value| (0.0..=600_000.0).contains(&value))
+                        })
+                })
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    if spec.get("engine").is_some_and(|engine| engine != "onnx")
+        || report.get("engine").is_some_and(|engine| engine != "onnx")
         || !["coldMilliseconds", "warmMilliseconds"].iter().all(|key| {
             report[*key]
                 .as_f64()
@@ -755,7 +1062,27 @@ fn validate_report(
         return Err(invalid());
     }
     let provider = spec["provider"].as_str().ok_or_else(invalid)?;
-    if !matches!(provider, "CPUExecutionProvider" | "CUDAExecutionProvider") {
+    // The providers a runtime profile can declare (server `runtime-profiles.json`), and only the
+    // one this runtime was signed for.
+    if provider != runtime_provider
+        || !matches!(
+            provider,
+            "CPUExecutionProvider"
+                | "CUDAExecutionProvider"
+                | "CoreMLExecutionProvider"
+                | "OpenVINOExecutionProvider"
+        )
+    {
+        return Err(invalid());
+    }
+    // CoreML can keep work on the processor inside its own nodes, so it never reports
+    // accelerator-only execution (the runtime and the server use the same rule).
+    let always_mixed = provider == "CoreMLExecutionProvider";
+    // The server refuses a CoreML report without the signed collector's device proof, and any
+    // other report that carries one; refuse the same here instead of submitting it.
+    if always_mixed {
+        metal::validate_report(report, spec, expected_collector.ok_or_else(invalid)?)?;
+    } else if expected_collector.is_some() || !report["deviceExecution"].is_null() {
         return Err(invalid());
     }
     let execution = report["execution"]
@@ -779,7 +1106,7 @@ fn validate_report(
         }
         let state = if provider == "CPUExecutionProvider" {
             "ready-cpu"
-        } else if nodes.contains_key("CPUExecutionProvider") {
+        } else if always_mixed || nodes.contains_key("CPUExecutionProvider") {
             mixed = true;
             "ready-mixed"
         } else {
@@ -804,7 +1131,315 @@ fn validate_report(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn names_the_known_answer_failure() {
+        let failed = || String::from("runtime_qualification_failed");
+        for (refused, expected) in [
+            (
+                Some("native_output_value_mismatch ValueError: x"),
+                "runtime_output_mismatch",
+            ),
+            (Some("native_memory_insufficient"), "runtime_out_of_memory"),
+            (
+                Some("native_qualification_failed RuntimeException: Failed to allocate memory"),
+                "runtime_out_of_memory",
+            ),
+            (Some("native_staged_hash_mismatch"), "runtime_model_missing"),
+            (
+                Some("native_device_execution_evidence_required"),
+                "runtime_provider_unavailable",
+            ),
+            (
+                Some("native_qualification_failed TypeError: x"),
+                "runtime_qualification_failed",
+            ),
+            (None, "runtime_qualification_failed"),
+        ] {
+            assert_eq!(super::qualification_failure(failed(), refused), expected);
+        }
+        // Only a refused run is renamed: a timeout stays a timeout.
+        assert_eq!(
+            super::qualification_failure(
+                "runtime_qualification_timeout".into(),
+                Some("native_memory_insufficient")
+            ),
+            "runtime_qualification_timeout"
+        );
+    }
     use super::*;
+    #[test]
+    fn qwen_report_requires_signed_binary_and_exact_cpu_candidate_evidence() {
+        const CPU: &str = "CPUExecutionProvider";
+        let spec = serde_json::json!({"engine":"qwen-gguf","provider":"CPUExecutionProvider","modelKey":"candidate",
+            "fixtureSha256":"a".repeat(64),"preprocessingSha256":"b".repeat(64)});
+        let mut report = spec.clone();
+        report["protocolVersion"] = serde_json::json!(1);
+        report["bindingSha256"] = serde_json::json!("binding");
+        report["runtimeFingerprint"] = serde_json::json!("c".repeat(64));
+        report["state"] = serde_json::json!("ready-cpu");
+        let binary = "d".repeat(64);
+        report["qwenExecution"] = serde_json::json!({"build":"b11146-7fe450e19","binarySha256":binary,"coldMilliseconds":[100.0,120.0]});
+        assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&binary)).is_ok());
+        assert!(validate_report(&report, &spec, "binding", CPU, None, None).is_err());
+        assert!(
+            validate_report(&report, &spec, "binding", CPU, None, Some(&"e".repeat(64))).is_err()
+        );
+        let mut invalid = report.clone();
+        invalid["qwenExecution"]["build"] = serde_json::json!("b11146-000000000");
+        assert!(validate_report(&invalid, &spec, "binding", CPU, None, Some(&binary)).is_err());
+        // A Qwen candidate is CPU-only: never under an accelerated runtime's manifest.
+        assert!(validate_report(
+            &report,
+            &spec,
+            "binding",
+            "CoreMLExecutionProvider",
+            None,
+            Some(&binary)
+        )
+        .is_err());
+        report["qwenExecution"]["coldMilliseconds"] = serde_json::json!([100.0]);
+        assert!(validate_report(&report, &spec, "binding", CPU, None, Some(&binary)).is_err());
+    }
+    #[test]
+    fn a_refused_qualification_names_its_reason_from_the_report_it_left() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-refusal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let report = root.join("report.json");
+        assert_eq!(refusal(&report), None);
+        std::fs::write(
+            &report,
+            r#"{"protocolVersion":1,"modelKey":"m","state":"incompatible","reason":"native_output_value_mismatch"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(&report).as_deref(),
+            Some("native_output_value_mismatch")
+        );
+        std::fs::write(
+            &report,
+            "{\"state\":\"incompatible\",\"reason\":\"native_qualification_failed\",\"detail\":\"RuntimeError: CUDA failure\\n2\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(&report).as_deref(),
+            Some("native_qualification_failed RuntimeError: CUDA failure2")
+        );
+        // Anything that is not a plain code is not repeated.
+        for bad in [
+            r#"{"reason":"Not A Code"}"#,
+            r#"{"reason":""}"#,
+            r#"{"reason":7}"#,
+            "not json",
+        ] {
+            std::fs::write(&report, bad).unwrap();
+            assert_eq!(refusal(&report), None, "{bad}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_cuda_pack_puts_the_folders_of_its_nvidia_libraries_on_the_search_path() {
+        let files = [
+            "python/python.exe",
+            "python/Lib/site-packages/onnxruntime/capi/onnxruntime_providers_cuda.dll",
+            "python/Lib/site-packages/nvidia/cudnn/bin/cudnn64_9.dll",
+            "python/Lib/site-packages/nvidia/cudnn/bin/cudnn_cnn64_9.DLL",
+            "python/Lib/site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll",
+            "python/Lib/site-packages/nvidia/cudnn/include/cudnn.h",
+            "python/Lib/site-packages/other/nvidia/x/bin/planted.dll",
+            "nvidia/cudnn/bin/outside.dll",
+        ];
+        let folders = |provider| {
+            device_library_folders(provider, files.iter().copied())
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            folders("CUDAExecutionProvider"),
+            [
+                "python/Lib/site-packages/nvidia/cuda_nvrtc/bin",
+                "python/Lib/site-packages/nvidia/cudnn/bin"
+            ]
+        );
+        // The processor manifest of the same pack, and every other provider, keep the OS directory alone.
+        for provider in ["CPUExecutionProvider", "OpenVINOExecutionProvider"] {
+            assert!(folders(provider).is_empty(), "{provider}");
+        }
+    }
+    #[test]
+    fn a_windows_runtime_searches_the_os_directory_then_the_pack_and_has_a_home() {
+        let scratch = Path::new("scratch folder");
+        let folders = [PathBuf::from("pack").join("cudnn"), PathBuf::from("nvrtc")];
+        let environment = windows_environment(
+            std::ffi::OsStr::new("root"),
+            scratch,
+            &folders,
+            std::ffi::OsStr::new("programs"),
+        )
+        .unwrap();
+        let search: Vec<PathBuf> = std::env::split_paths(&environment[0].1).collect();
+        assert_eq!(environment[0].0, "PATH");
+        assert_eq!(
+            search,
+            [
+                Path::new("root").join("System32"),
+                folders[0].clone(),
+                folders[1].clone()
+            ]
+        );
+        assert_eq!(environment[1], ("SystemRoot", "root".into()));
+        assert_eq!(environment[2], ("USERPROFILE", scratch.into()));
+        assert_eq!(environment[3], ("ProgramFiles", "programs".into()));
+        assert_eq!(environment[4], ("ProgramW6432", "programs".into()));
+    }
+    /// NVML (and so `nvidia-smi`, through which the runtime learns there is a card) does not
+    /// initialize without the Program Files variables: with the environment before them, a
+    /// computer whose CUDA works reported no card and refused every CUDA qualification.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_runtime_process_can_see_the_nvidia_card() {
+        use std::process::Command;
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let smi = Path::new(&root).join("System32").join("nvidia-smi.exe");
+        if !smi.is_file() {
+            eprintln!("no NVIDIA driver here; nothing to check");
+            return;
+        }
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        let program_files = crate::host_install::windows_program_files().unwrap();
+        let sees = |with: bool| {
+            let mut command = Command::new(&smi);
+            command
+                .env_clear()
+                .args(["--query-gpu=index", "--format=csv,noheader"]);
+            for (name, value) in
+                windows_environment(&root, &scratch, &[], program_files.as_os_str()).unwrap()
+            {
+                if with || !name.starts_with("Program") {
+                    command.env(name, value);
+                }
+            }
+            command.output().unwrap().status.success()
+        };
+        if !sees(true) {
+            eprintln!(
+                "nvidia-smi reports no card even with the full environment; nothing to check"
+            );
+            return;
+        }
+        assert!(
+            !sees(false),
+            "NVML initialized without the Program Files variables"
+        );
+    }
+    /// Python on Windows finds no home directory in an emptied environment; the runtime's
+    /// settings ask for one when they are imported.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_runtime_process_can_name_its_home_directory() {
+        use std::process::Command;
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        let home = |with: bool| {
+            let mut command = Command::new("python");
+            command
+                .env_clear()
+                .args(["-I", "-B", "-c"])
+                .arg("from pathlib import Path; Path.home()");
+            let programs = std::ffi::OsStr::new(r"C:\Program Files");
+            for (name, value) in windows_environment(&root, &scratch, &[], programs).unwrap() {
+                if with || name != "USERPROFILE" {
+                    command.env(name, value);
+                }
+            }
+            // The hosted Python is found through the inherited PATH, which a pack never needs.
+            let python = std::env::var_os("PATH").unwrap();
+            command.env("PATH", python);
+            command.output().unwrap().status.success()
+        };
+        assert!(!home(false), "the environment before FD-63 had a home");
+        assert!(home(true));
+    }
+    fn report_for(provider: &str, state: &str, cpu_nodes: bool) -> [serde_json::Value; 2] {
+        let mut nodes = serde_json::json!({ provider: 12 });
+        if cpu_nodes {
+            nodes["CPUExecutionProvider"] = 3.into();
+        }
+        let spec = serde_json::json!({"modelKey":"clip:model","provider":provider,
+            "preprocessingSha256":"a".repeat(64),"fixtureSha256":"b".repeat(64)});
+        let report = serde_json::json!({"protocolVersion":1,"modelKey":"clip:model","provider":provider,
+            "preprocessingSha256":"a".repeat(64),"fixtureSha256":"b".repeat(64),
+            "bindingSha256":"c".repeat(64),"reason":null,"runtimeFingerprint":"d".repeat(64),
+            "coldMilliseconds":120.0,"warmMilliseconds":8.5,"state":state,
+            "execution":[{"state":state,"reason":null,"nodes":nodes}]});
+        [report, spec]
+    }
+    fn check(provider: &str, state: &str, cpu_nodes: bool, runtime: &str) -> Result<(), String> {
+        let [report, spec] = report_for(provider, state, cpu_nodes);
+        validate_report(&report, &spec, &"c".repeat(64), runtime, None, None)
+    }
+    #[test]
+    fn report_is_accepted_only_for_the_provider_the_runtime_declares() {
+        const CPU: &str = "CPUExecutionProvider";
+        const COREML: &str = "CoreMLExecutionProvider";
+        const OPENVINO: &str = "OpenVINOExecutionProvider";
+        const CUDA: &str = "CUDAExecutionProvider";
+        assert!(check(CPU, "ready-cpu", false, CPU).is_ok());
+        // CoreML is accepted only with its collector's device proof (see `metal`).
+        assert!(check(COREML, "ready-mixed", false, COREML).is_err());
+        assert!(check(COREML, "ready-mixed", true, COREML).is_err());
+        for provider in [OPENVINO, CUDA] {
+            assert!(check(provider, "ready-accelerator", false, provider).is_ok());
+            assert!(check(provider, "ready-mixed", true, provider).is_ok());
+            assert!(check(provider, "ready-accelerator", true, provider).is_err());
+        }
+        // CoreML never counts as accelerator-only, and a CPU runtime cannot pass as accelerated.
+        assert!(check(COREML, "ready-accelerator", false, COREML).is_err());
+        assert!(check(COREML, "ready-cpu", false, COREML).is_err());
+        // A report for another provider than the installed runtime's is refused, either way round.
+        for (provider, state, runtime) in [
+            (COREML, "ready-mixed", CPU),
+            (OPENVINO, "ready-accelerator", CPU),
+            (CUDA, "ready-accelerator", OPENVINO),
+            (CPU, "ready-cpu", COREML),
+        ] {
+            assert_eq!(
+                check(provider, state, false, runtime).unwrap_err(),
+                "runtime_qualification_report_invalid",
+                "{provider} under {runtime}"
+            );
+        }
+        // Providers no runtime profile declares are refused even when the runtime names them.
+        for provider in ["MIGraphXExecutionProvider", "TensorrtExecutionProvider", ""] {
+            assert!(check(provider, "ready-accelerator", false, provider).is_err());
+        }
+    }
+    #[test]
+    fn scratch_owner_is_published_only_with_its_lock_held() {
+        let scratch = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("inference-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&scratch).unwrap();
+        let owner = own_scratch(&scratch).unwrap();
+        assert!(!scratch.join(SCRATCH_OWNER_PENDING).exists());
+        // The published record is the locked handle itself (also after the rename on Windows).
+        let published = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(scratch.join(SCRATCH_OWNER))
+            .unwrap();
+        assert!(published.try_lock().is_err());
+        // A second owner of the same scratch is refused and leaves the first one's record alone.
+        assert!(own_scratch(&scratch).is_err());
+        assert!(published.try_lock().is_err());
+        drop(owner);
+        assert!(published.try_lock().is_ok());
+        drop(published);
+        fs::remove_dir_all(scratch).unwrap();
+    }
     #[test]
     fn qualification_cannot_start_a_different_runtime_manifest() {
         let runtime = VerifiedRuntime {
@@ -919,6 +1554,48 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+    /// FD-71: with the pipe held open, as the app holds it for as long as the runtime runs, the
+    /// runtime may still use its standard input: `lseek` and `fstat` on it (as onnxruntime's
+    /// native module does when it loads) and hand it to a child process. On Windows these waited
+    /// forever behind the gate's own read of the pipe.
+    #[test]
+    fn python_gate_leaves_the_standard_input_usable_while_the_parent_holds_the_pipe() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut command = Command::new(python);
+        command
+            .args(["-I", "-B", "-c", GATE, "timeit", "-n", "1", "-r", "1"])
+            // The gate's watch is started before this runs; give it time to be waiting.
+            // `lseek` takes the C runtime's lock on the descriptor, which a pending read held.
+            .arg("import os, subprocess, sys, time\ntime.sleep(1)\ntry: os.lseek(0, 0, 1)\nexcept OSError: pass\nos.fstat(0)\nsubprocess.run([sys.executable, '-I', '-B', '-c', 'pass'], check=True)")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::process_tree::configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let tree = crate::process_tree::ProcessTree::attach(&child).unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(START).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= end {
+                tree.terminate();
+                let _ = child.wait();
+                panic!("the runtime hung using its standard input while the parent held the pipe");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(pipe);
+        tree.terminate();
+        assert!(status.success());
     }
     #[test]
     fn python_gate_terminates_when_parent_pipe_closes() {

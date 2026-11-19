@@ -1,4 +1,5 @@
 name: Signed desktop release
+run-name: Signed desktop release ${{ inputs.tag || 'artifacts only' }} (${{ inputs.platforms }})
 on:
   workflow_dispatch:
     inputs:
@@ -11,10 +12,18 @@ on:
         required: true
         type: string
       platforms:
-        description: 'Release targets (Windows uses Azure Artifact Signing)'
+        description: 'Release targets; each platform can be released alone and joins the same draft (Windows uses Azure Artifact Signing)'
         type: choice
         default: macos-linux
-        options: [macos-linux, all, linux, macos-aarch64]
+        options: [macos-linux, all, macos, linux, windows, macos-aarch64, macos-x86_64, linux-x86_64, linux-aarch64]
+      companion_run_ids:
+        description: 'With a tag: comma-separated run ids of macos-host-package.yml, ubuntu-host-qualification.yml and windows-compiled-host.yml for the selected platforms, or none'
+        required: false
+        type: string
+      allow_unreleased_catalogue:
+        description: 'Release although the model catalogue is newer than the latest server release (normally: release the server first)'
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -22,7 +31,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    # Release signing runs on GitHub (docs/releases.md, Releasing from Forgejo). On Forgejo this is off
+    # unless the repository variable DESKTOP_RELEASE_ON_FORGEJO is true, which it is not.
+    if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -30,60 +41,176 @@ jobs:
     outputs:
       revision: ${{ steps.source.outputs.revision }}
       matrix: ${{ steps.source.outputs.matrix }}
+      companions: ${{ steps.companions.outputs.plan }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
+      - name: Refuse targets Forgejo has no runner for
+        if: github.server_url != 'https://github.com'
+        env:
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node --input-type=module -e '
+            import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            for (const problem of problems) console.log(`::error::${problem}`);
+            process.exitCode = problems.length ? 1 : 0;
+          '
       - name: Validate immutable release source and runtime run
         id: source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
           revision="$GITHUB_SHA"
           if [[ -n "$RELEASE_TAG" ]]; then
-            node tools/release_inputs.mjs "$RELEASE_TAG"
-            test "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")" = "$revision"
+            node tools/release_inputs.mjs "$RELEASE_TAG" ||
+              fail "Tag $RELEASE_TAG is not the version recorded in package.json, package-lock.json, src-tauri/Cargo.toml, src-tauri/Cargo.lock and src-tauri/tauri.conf.json on this commit."
+            tagged=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}") || fail "Tag $RELEASE_TAG does not exist. Create it on $revision and push it first."
+            [[ "$tagged" == "$revision" ]] ||
+              fail "Tag $RELEASE_TAG points at $tagged, not at the commit this workflow runs on ($revision). A pushed tag is never moved: bump the version and tag the new commit."
           fi
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
             appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS)) + "\n");
           '
-          [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "runtime_run_id must be the numeric id of a factory-runtime.yml run."
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
           factory_revision=$(node --input-type=module -e '
             import { readFileSync } from "node:fs";
             import { validateFactoryRun } from "./tools/release_inputs.mjs";
             console.log(validateFactoryRun(JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/runtime-run.json")), process.env.GITHUB_REPOSITORY));
-          ')
-          git merge-base --is-ancestor "$factory_revision" "$revision"
+          ') || fail "Run $RUNTIME_RUN_ID is not a successful manual factory-runtime.yml run on main in this repository."
+          git merge-base --is-ancestor "$factory_revision" "$revision" ||
+            fail "Factory run $RUNTIME_RUN_ID was built from $factory_revision, which is not in the history of $revision."
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | {name, expired}' > "$RUNNER_TEMP/runtime-artifacts.jsonl"
+          node tools/release_prerequisites.mjs factory-artifacts "$RUNNER_TEMP/runtime-artifacts.jsonl" "$RELEASE_PLATFORMS" "$RUNTIME_RUN_ID"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Check every selected pack's source, profile and epoch before anything is built
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RELEASE_MATRIX: ${{ steps.source.outputs.matrix }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '### Factory runtime packs' >> "$GITHUB_STEP_SUMMARY"
+          for target in $(jq -r '.include[].target' <<< "$RELEASE_MATRIX"); do
+            pack="$RUNNER_TEMP/pack-$target"
+            gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$target" --dir "$pack"
+            # Read the two manifests only; the payload is verified against its signature by the build job.
+            python3 -I - "$pack/runtime.tar" "$pack/manifests" <<'PY'
+          import sys, tarfile
+          from pathlib import Path
+          archive, output = sys.argv[1:]
+          Path(output).mkdir()
+          with tarfile.open(archive) as tar:
+              for member in tar:
+                  if member.name == 'payload' or member.name.startswith('payload/'):
+                      break
+                  if member.name in ('manifest.json', 'manifest-accelerated.json'):
+                      if not member.isfile() or member.size > 8 * 1024 * 1024:
+                          raise SystemExit('::error::The factory pack has an invalid manifest')
+                      Path(output, member.name).write_bytes(tar.extractfile(member).read())
+          PY
+            node tools/release_prerequisites.mjs factory-pack "$target" "$pack/manifests" "${RELEASE_TAG:+release}" | tee -a "$GITHUB_STEP_SUMMARY"
+            rm -rf "$pack"
+          done
+      - name: Check the model catalogue against the latest server release
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          ALLOW_UNRELEASED_CATALOGUE: ${{ inputs.allow_unreleased_catalogue }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo 'Installer artifacts only: nothing is published, so the server release is not checked.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh api 'repos/Frameleaf/frameleaf-app/releases?per_page=100' --jq '.[] | {tag_name, draft, prerelease}' > "$RUNNER_TEMP/server-releases.jsonl"
+          server_tag=$(node tools/release_prerequisites.mjs server-release "$RUNNER_TEMP/server-releases.jsonl")
+          gh api "repos/Frameleaf/frameleaf-app/contents/server/resources/desktop/model-catalogue.json?ref=$server_tag" \
+            -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/server-catalogue.json"
+          { echo '### Model catalogue'; node tools/release_prerequisites.mjs catalogue "$server_tag" "$RUNNER_TEMP/server-catalogue.json" "$ALLOW_UNRELEASED_CATALOGUE"; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Validate the companion package runs
+        id: companions
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          COMPANION_RUN_IDS: ${{ inputs.companion_run_ids }}
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo 'plan={"attach":[],"manual":[]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          runs="$RUNNER_TEMP/companion-runs"
+          mkdir "$runs"
+          ids=$(node tools/release_prerequisites.mjs companion-ids "$COMPANION_RUN_IDS")
+          for id in $ids; do gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" > "$runs/$id.json"; done
+          plan=$(node tools/release_prerequisites.mjs companions "$RELEASE_PLATFORMS" "$COMPANION_RUN_IDS" "$runs")
+          while read -r run revision artifact workflow; do
+            git merge-base --is-ancestor "$revision" "$GITHUB_SHA" ||
+              { echo "::error::Companion run $run was built from $revision, which is not in the history of $GITHUB_SHA."; exit 1; }
+            names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100" --jq '.artifacts[] | select(.expired == false) | .name')
+            grep -qxF "$artifact" <<< "$names" ||
+              { echo "::error::Companion run $run has no $artifact artifact (it expired, was deleted, or the run did not retain a release package). Run that workflow again and pass the new run."; exit 1; }
+            # The signed manifest inside the package, checked as the Desktop built here checks it once installed.
+            identity=-
+            if grep -qxF "$artifact-identity" <<< "$names"; then
+              identity="$RUNNER_TEMP/companion-identity-$run"
+              gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "$artifact-identity" --dir "$identity" < /dev/null
+            fi
+            files=$(node tools/release_prerequisites.mjs companion-identity "$workflow" "$run" "$identity")
+            plan=$(jq -c --arg run "$run" --argjson files "$files" '(.attach[] | select(.run == $run)).files = $files' <<< "$plan")
+          done < <(jq -r '.attach[] | "\(.run) \(.revision) \(.artifact) \(.workflow)"' <<< "$plan")
+          printf '%s' "$plan" > "$RUNNER_TEMP/companions.json"
+          node tools/release_prerequisites.mjs companion-summary "$RUNNER_TEMP/companions.json" >> "$GITHUB_STEP_SUMMARY"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
   build:
     needs: prepare
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     environment: desktop-release
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # The oldest macOS the app itself runs on: `app` in packaging/macos/minimum-versions.json.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     permissions:
       contents: read
       actions: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
@@ -93,19 +220,28 @@ jobs:
           python-version: '3.12'
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
       - name: Rust stable
         run: rustup update stable && rustup default stable
       - run: npm ci
       - run: npm test
       - run: npm run check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run_id }}
           name: factory-runtime-${{ matrix.target }}
           path: runtime-download
+      - name: Download the factory runtime from its Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "factory-runtime-$RUNTIME_TARGET" --dir runtime-download
       - name: Extract factory runtime without allowing archive path escapes
         shell: python
         run: |
@@ -140,22 +276,19 @@ jobs:
           set -euo pipefail
           : "${APPLE_ID:?Missing Apple ID}" "${APPLE_PASSWORD:?Missing app-specific password}" "${APPLE_TEAM_ID:?Missing Apple team}"
           bash tools/import_apple_certificate.sh
-      - name: Configure Azure Artifact Signing
-        if: runner.os == 'Windows'
-        uses: ./.github/actions/windows-signing
-        with:
-          config: release-config.json
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          profile: ${{ vars.AZURE_SIGNING_PROFILE }}
-          subject: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
       - name: Build signed installers (macOS app bundle)
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
         run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
+      - name: Check the app and its AI runtime need no newer macOS than each declares
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/check_macos_minimum.py --deployment-target "$MACOSX_DEPLOYMENT_TARGET" \
+            --report "$RUNNER_TEMP/macos-minimum-versions.json" src-tauri/target/release/bundle/macos/Frameleaf.app
+          { echo '### macOS minimum versions'; echo '```json'; cat "$RUNNER_TEMP/macos-minimum-versions.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Sign the macOS GUI with its provisioned Keychain identity and package the DMG
         if: runner.os == 'macOS'
         env:
@@ -206,7 +339,7 @@ jobs:
           jq -er '.id' src-tauri/target/release/bundle/dmg/dmg-submission.json
       - name: Retain the exact submitted image and request ID before waiting for Apple
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: notarization-pending-${{ matrix.target }}
           path: |
@@ -232,22 +365,38 @@ jobs:
           xcrun stapler staple "${images[0]}"
           xcrun stapler validate "${images[0]}"
           spctl --assess --type open --context context:primary-signature --verbose=2 "${images[0]}"
-      - name: Verify Windows executable and installer signatures
+      # Windows installers ship unsigned by design (owner, 2026-11-18): no Authenticode signature is
+      # made or checked, and they are published with an -unsigned suffix.
+      - name: Check the Windows installers and that the factory runtime survived bundling
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           node --input-type=module -e "import { packageConfiguration } from './tools/package_desktop.mjs'; await packageConfiguration('release-runtime');"
           if ($LASTEXITCODE) { throw 'Factory runtime changed during bundling' }
-          $files = @(Get-Item src-tauri/target/release/frameleaf-desktop.exe)
           $installers = @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.exe', '.msi' })
           if ($installers.Count -ne 2 -or @($installers.Extension | Sort-Object -Unique).Count -ne 2) { throw 'Expected NSIS and MSI installers' }
-          foreach ($file in ($files + $installers)) {
-            & ./tools/windows_sign.ps1 -Path $file.FullName -VerifyOnly
-          }
       - name: Verify signed runtime inside both Linux installers
         if: runner.os == 'Linux'
         run: bash tools/verify_linux_installers.sh
+      - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          python tools/check_linux_glibc.py --max 2.35 "${packages[0]}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install and run the Linux package in clean Ubuntu and Debian containers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#packages[@]} == 1 ]]
+          bash tools/qualify_linux_deb_install.sh "${packages[0]}"
       - name: Collect installers
         shell: python
         run: |
@@ -260,7 +409,9 @@ jobs:
               raise SystemExit('Missing or ambiguous release installers')
           Path('release-assets').mkdir()
           for path in files:
-              shutil.copy2(path, Path('release-assets') / path.name)
+              # Unsigned Windows installers say so in their names, as every release has published them.
+              name = f'{path.stem}-unsigned{path.suffix}' if sys.platform == 'win32' else path.name
+              shutil.copy2(path, Path('release-assets') / name)
       - name: Sign verified updater packages
         if: inputs.tag != ''
         env:
@@ -284,12 +435,14 @@ jobs:
           fi
           for file in release-assets/*; do
             case "$file" in
+              # Unsigned Windows installers never enter the update feed (updateManifest refuses them).
+              *-unsigned.*) ;;
               *.app.tar.gz|*.AppImage|*.deb|*.msi|*.exe)
                 npm run tauri -- signer sign --app-version "$version" "$file"
                 ;;
             esac
           done
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: signed-installers-${{ matrix.target }}
           path: release-assets/
@@ -302,44 +455,152 @@ jobs:
           rm -f "$RUNNER_TEMP/developer-id.p12"
           if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
   stage:
-    if: inputs.tag != ''
+    # `build` has a skipped ancestor when Windows is not selected, so its result is tested explicitly.
+    if: ${{ !cancelled() && inputs.tag != '' && needs.build.result == 'success' }}
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
+      # On Forgejo, this repository's runs and artifacts are read from Forgejo (tools/forgejo_gh.mjs).
+      - uses: ./.github/actions/forgejo-gh
+        with:
+          token: ${{ secrets.RUNS_READ_TOKEN || github.token }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           pattern: signed-installers-*
           merge-multiple: true
           path: release-assets
-      - name: Create checksums and a draft release after every target succeeds
+      - name: Install the updater signature verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - name: Verify updater signatures and create this run's manifest
         env:
-          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
         shell: bash
         run: |
           set -euo pipefail
           node --input-type=module <<'JS'
           import { readFileSync, readdirSync, writeFileSync } from "node:fs";
-          import { updateManifest } from "./tools/release_inputs.mjs";
+          import { updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
           const dir = "release-assets";
-          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name));
+          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name) && !/-unsigned\./.test(name));
           const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
           const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
-          writeFileSync(`${dir}/latest.json`, JSON.stringify(manifest, null, 2) + "\n");
+          const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+          for (const name of packages) verifyUpdaterAsset(`${dir}/${name}`, signatures[name], updater.pubkey, manifest.version);
+          writeFileSync(`${process.env.RUNNER_TEMP}/incoming-latest.json`, JSON.stringify(manifest));
           JS
+      - name: Add the companion packages from their validated runs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          COMPANIONS: ${{ needs.prepare.outputs.companions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r run workflow artifact files; do
+            download="$RUNNER_TEMP/companion-$run"
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir "$download" < /dev/null
+            # Exactly the files, by checksum, that `prepare` read from the run's identity record.
+            names=$(node tools/release_prerequisites.mjs companion-artifact "$workflow" "$download" "$files")
+            while read -r name; do mv "$download/$name" "release-assets/$name"; done <<< "$names"
+            rm -rf "$download"
+          done < <(jq -r '.attach[] | "\(.run) \(.workflow) \(.artifact) \(.files | tojson)"' <<< "$COMPANIONS")
+      # FD-60: the CUDA and OpenVINO packs the app downloads on demand. Each is verified against
+      # its signed delivery manifest (the one the installers carry) before its parts join this
+      # run's assets; the draft merge below uploads them like any other asset.
+      - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        if: github.server_url == 'https://github.com'
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run_id }}
+          pattern: factory-accelerated-*
+          path: accelerated-packs
+      - name: Download the downloadable GPU packs from the factory's Forgejo run
+        if: github.server_url != 'https://github.com'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
+        shell: bash
+        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'factory-accelerated-*' --dir accelerated-packs
+      - name: Verify the downloadable GPU runtime parts and stage them as release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/deliver_runtime.mjs --release accelerated-packs release-assets | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Merge this run into the draft for the tag
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          COMPANIONS: ${{ needs.prepare.outputs.companions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | {id, tag_name, draft, body, assets: [.assets[] | {id, name, state, digest}]}' > "$RUNNER_TEMP/releases.jsonl"
+          node tools/release_draft.mjs find "$RELEASE_TAG" "$RUNNER_TEMP/releases.jsonl" "$RUNNER_TEMP/draft.json" | tee "$RUNNER_TEMP/draft.env"
+          cat "$RUNNER_TEMP/draft.env" >> "$GITHUB_OUTPUT"
+          existing=-
+          asset=$(sed -n 's/^manifest_asset=//p' "$RUNNER_TEMP/draft.env")
+          if [[ -n "$asset" ]]; then
+            existing="$RUNNER_TEMP/existing-latest.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$existing"
+          fi
+          printf '%s' "$COMPANIONS" > "$RUNNER_TEMP/companions.json"
+          run=$GITHUB_RUN_ID
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]] || run=$GITHUB_RUN_NUMBER
+          note="Signed installer candidate for $RELEASE_PLATFORMS from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run $(node tools/release_prerequisites.mjs companion-note "$RUNNER_TEMP/companions.json")"
+          node tools/release_draft.mjs merge "$RELEASE_TAG" "$GITHUB_REPOSITORY" release-assets "$RUNNER_TEMP/incoming-latest.json" \
+            "$RUNNER_TEMP/draft.json" "$existing" "$RUNNER_TEMP/draft" "$note"
+          cat "$RUNNER_TEMP/draft/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Stamp the package manager files from the checksums of the whole draft
+        if: ${{ !contains(inputs.tag, '-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release_packaging.mjs "$RUNNER_TEMP/draft/SHA256SUMS" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        if: ${{ !contains(inputs.tag, '-') }}
+        with:
+          name: package-manager-files
+          path: |
+            packaging/aur/
+            packaging/chocolatey/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Create the draft release, or add this run's assets to it
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          draft="$RUNNER_TEMP/draft"
           cd release-assets
-          sha256sum -- * > SHA256SUMS
-          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
-            --title "Frameleaf $RELEASE_TAG candidate" \
-            --notes "Signed installer candidate from $RELEASE_REVISION. Installed-device acceptance and release approval are required before publication. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            -- ./*
+          mapfile -t files < "$draft/upload.txt"
+          if [[ -z "$RELEASE_ID" ]]; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+              --title "Frameleaf $RELEASE_TAG candidate" \
+              --notes-file "$draft/notes.md" \
+              -- "${files[@]}" "$draft/latest.json" "$draft/SHA256SUMS"
+          else
+            # Without --clobber an asset that already exists is refused, never replaced.
+            if (( ${#files[@]} )); then gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -- "${files[@]}"; fi
+            # Only the two files rebuilt from the whole draft are replaced.
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber -- "$draft/latest.json" "$draft/SHA256SUMS"
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$draft/notes.md"
+          fi

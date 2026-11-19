@@ -78,7 +78,7 @@ class WindowsHostAssemblyTests(unittest.TestCase):
         self.file(host, 'raw/bin/darktable-cli.exe')
         self.file(host, 'raw/bin/dcraw_emu.exe')
         self.file(host, 'work/home/fixture', b'private authoring scratch')
-        binding = {'qualification':'passed','sourceRevision':'c64039743af7bb0d68b602ff842683906019de52',
+        binding = {'qualification':'passed','sourceRevision':'9f22a57adb7a271d97ead305103c094fb3d25ad2',
                    'rawSource':{'fixture':True},'librawSource':{'fixture':True},
                    'files':{name:inventory(host/name) for name in ['server','raw']}}
         self.file(host, 'qualification.json', json.dumps(binding).encode())
@@ -129,7 +129,7 @@ class WindowsHostAssemblyTests(unittest.TestCase):
             if failure == name: raise BuildError('synthetic consumer refusal')
             if failure == 'payload-change' and name == 'qualify_host_raw.mjs':
                 (Path(args[2])/'server/dist/main.js').write_bytes(b'unexpected mutation')
-            result = {'qualification':'passed','sourceRevision':'c64039743af7bb0d68b602ff842683906019de52'}
+            result = {'qualification':'passed','sourceRevision':'9f22a57adb7a271d97ead305103c094fb3d25ad2'}
             if name == 'qualify_host_exiftool.mjs':
                 result['componentReceiptSha256'] = sha256(Path(args[2])/'qualification.json')
             return json.dumps(result)

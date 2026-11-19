@@ -1,7 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort } from '../src/ui-state.ts';
+import { formatUsd, formatMicroUsd, formatUsdShort, formatBytes, percent, relativeTime, formatWhen, countdown, initials, hostOf, connectionTransport, connectionPath, pathIndicator, mergeServers, platformClass, workloadPill, workerTone, fingerprintShort, signInMethods, nearbySignIn, countryOptions, defaultCountry } from '../src/ui-state.ts';
 import type { CloudServer, DiscoveredServer } from '../src/server-types.ts';
+import { verifiedImportCount } from '../src/ui-state.ts';
+
+test('verified import counts exclude duplicates and runs with originals or album work still pending', () => {
+  const complete = { runId: 'first', status: 'complete', verified: 2, albumPending: false };
+  const incomplete = [
+    { ...complete, runId: 'empty', verified: 0 },
+    { ...complete, runId: 'album', albumPending: true },
+    ...['ready', 'running', 'interrupted', 'cancelled'].map(status => ({ ...complete, runId: status, status })),
+  ];
+  assert.equal(verifiedImportCount(incomplete), 0);
+  assert.equal(verifiedImportCount([...incomplete, complete, complete]), 1);
+  assert.equal(verifiedImportCount([...incomplete, complete, { ...complete, runId: 'repeat' }]), 2);
+});
 
 test('money renders USD doubles and micro-USD integers without ever printing NaN', () => {
   assert.equal(formatUsd(31.4), '$31.40');
@@ -137,4 +150,53 @@ test('connection transport reflects the server URL', () => {
   assert.equal(connectionTransport('https://photos.example.com'), 'Encrypted connection');
   assert.equal(connectionTransport(''), 'Connection type unknown');
   assert.equal(connectionTransport('ftp://photos.example.com'), 'Connection type unknown');
+});
+
+test('sign-in methods follow the server: Frameleaf only when linked, OAuth by its name', () => {
+  const base = { frameleafSignIn: true, linked: true, passwordLogin: true, oauth: false, oauthButtonText: '' };
+  assert.deepEqual(signInMethods(base), { frameleaf: true, password: true, oauth: '' });
+  assert.deepEqual(signInMethods({ ...base, linked: false }), { frameleaf: false, password: true, oauth: '' });
+  assert.deepEqual(signInMethods({ ...base, passwordLogin: false, oauth: true, oauthButtonText: ' Authentik ' }), { frameleaf: true, password: false, oauth: 'Authentik' });
+  assert.equal(signInMethods({ ...base, oauth: true }).oauth, 'Sign In with Single Sign-On');
+  assert.equal(nearbySignIn({ linked: true, setup: 'needed' }), 'Frameleaf or its own sign-in');
+  assert.equal(nearbySignIn({ linked: false, setup: 'complete' }), 'Its own sign-in');
+  assert.equal(nearbySignIn({ linked: false, setup: 'needed' }), 'New server');
+});
+
+test('the country picker names real places and starts at the person’s region', () => {
+  const options = countryOptions('en-CA');
+  const codes = options.map(option => option.code);
+  assert.ok(codes.includes('CA') && codes.includes('FR') && codes.includes('JP'));
+  for (const fake of ['EU', 'UN', 'ZZ', 'AA']) assert.ok(!codes.includes(fake), fake);
+  assert.ok(options.length > 200);
+  assert.equal(options.find(option => option.code === 'DE')?.name, 'Germany');
+  assert.equal(defaultCountry('en-CA'), 'CA');
+  assert.equal(defaultCountry('fr'), 'FR');
+  assert.equal(defaultCountry('not a locale!'), 'US');
+});
+
+test('a folder imported in several batches shows the progress of the whole import', async () => {
+  const { importProgress, importProgressText } = await import('../src/ui-state.ts');
+  const { readFileSync } = await import('node:fs');
+  // The second batch of a 25,001-file folder: the batch has done 2,000 of its 10,000.
+  const job = { completed: 2000, total: 10_000, overall: { total: 25_001, completed: 12_000, totalBytes: 9_000_000_000, completedBytes: 3_100_000_000 } };
+  assert.deepEqual(importProgress(job), { completed: 12_000, total: 25_001, bytes: { completed: 3_100_000_000, total: 9_000_000_000 } });
+  assert.match(importProgressText(job), /^12,000 of 25,001 copies confirmed · \S+ GB of \S+ GB$/);
+  // An ordinary import has one batch and shows it, as before.
+  const single = { completed: 3, total: 40 };
+  assert.deepEqual(importProgress(single), { completed: 3, total: 40, bytes: null });
+  assert.equal(importProgressText({ ...single, overall: null }), '3 of 40 copies confirmed');
+  // The totals never fall below what is already done (the folder changed during the import).
+  assert.deepEqual(importProgress({ completed: 1, total: 1, overall: { total: 10, completed: 12, totalBytes: 5, completedBytes: 8 } }), { completed: 12, total: 12, bytes: { completed: 8, total: 8 } });
+  assert.deepEqual(importProgress({ completed: 1, total: 2, overall: { total: 0, completed: 0, totalBytes: 0, completedBytes: 0 } }), { completed: 1, total: 2, bytes: null });
+  // Both pages that show an import use it for the counts and for the bar.
+  for (const page of ['../src/pages/Overview.svelte', '../src/PhotoSources.svelte']) {
+    const source = readFileSync(new URL(page, import.meta.url), 'utf8');
+    assert.match(source, /\$\{importProgressText\(job\)\}/, page);
+    assert.match(source, /\{@const progress = importProgress\(job\)\}<span class="progress" role="progressbar" aria-valuenow=\{percent\(progress\.completed, progress\.total\)\}/, page);
+    assert.doesNotMatch(source, /percent\(job\.completed, job\.total\)/, page);
+  }
+  // The batches of one import are one history entry: the backend files them under the import's id.
+  const history = readFileSync(new URL('../src-tauri/src/source_import/history.rs', import.meta.url), 'utf8');
+  assert.match(history, /run_id:\s*import\.map_or_else\(\|\|\s*manifest\.id\.clone\(\),\s*\|import\|\s*import\.id\.clone\(\)\)/);
 });

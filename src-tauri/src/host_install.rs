@@ -15,9 +15,22 @@ pub struct Layout {
 pub(crate) fn windows_local_app_data() -> Result<PathBuf, String> {
     windows::local_app_data()
 }
+/// The 64-bit Program Files folder as the OS registers it, never from an inherited variable.
+#[cfg(windows)]
+pub(crate) fn windows_program_files() -> Result<PathBuf, String> {
+    windows::program_files()
+}
 #[cfg(windows)]
 pub(crate) fn windows_profiles_root() -> Result<PathBuf, String> {
     Ok(windows::base()?.join("Profiles"))
+}
+/// Where this account's library keeps its `state` and `manager` leaves, whether or not one
+/// exists yet.
+#[cfg(unix)]
+pub(crate) fn account_profile() -> PathBuf {
+    PathBuf::from(BASE)
+        .join("Profiles")
+        .join(unsafe { libc::geteuid() }.to_string())
 }
 impl Layout {
     pub fn new(manifest: &str, controller: &str) -> Result<Self, String> {
@@ -219,6 +232,45 @@ fn verify_resources(layout: &Layout, manifest: &str, controller: &str) -> Result
         return Err("host_install_record_invalid".into());
     }
     Ok(())
+}
+/// Verify a fixed installed executable with the same Windows protections as Desktop.
+pub fn verify_installed_program(
+    manifest: &str,
+    controller: &str,
+    program: &str,
+) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        use std::collections::BTreeSet;
+        let record = Installation::read(manifest)?;
+        if record.controller_sha256 != controller {
+            return Err("host_install_controller_changed".into());
+        }
+        let layout = record.layout()?;
+        let executable = std::env::current_exe().map_err(|_| "host_install_controller_changed")?;
+        if crate::windows_protection::stable_path(&executable)? != layout.controller {
+            return Err("host_install_controller_changed".into());
+        }
+        let target = match program {
+            "controller" => layout.controller,
+            "restic" => layout
+                .runtime
+                .join("payload")
+                .join("backup")
+                .join("restic.exe"),
+            _ => return Err("host_install_program_invalid".into()),
+        };
+        crate::manager_host::protect(&target, &mut BTreeSet::new())?;
+        let system_root = crate::windows_protection::system_root()?;
+        Ok(
+            serde_json::json!({"protocolVersion": 1, "state": "protected", "systemRoot": system_root}),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (manifest, controller, program);
+        Err("host_install_platform_unsupported".into())
+    }
 }
 /// Installer-only fresh Windows package preparation; never starts or replaces a runtime.
 pub fn prepare_windows_package(

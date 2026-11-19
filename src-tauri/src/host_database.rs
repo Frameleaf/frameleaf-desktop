@@ -75,6 +75,10 @@ impl Reference {
         reference.resolve(profile)?;
         Ok(reference)
     }
+    /// The operation whose restore target this names.
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
     pub(crate) fn binds_restore(
         &self,
         operation: &str,

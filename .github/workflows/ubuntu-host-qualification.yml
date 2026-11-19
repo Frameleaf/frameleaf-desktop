@@ -1,0 +1,165 @@
+name: Qualify the installed Ubuntu companion browser
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Approved draft release asset ID, release ID, archive SHA-256, manifest SHA-256 and controller SHA-256 as JSON
+        required: true
+        type: string
+permissions: {}
+jobs:
+  installed-browser:
+    # Not available on Forgejo: it installs the packages with sudo and requires a disposable GitHub-hosted
+    # runner (RUNNER_ENVIRONMENT), which Forgejo's persistent job slots are not.
+    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop' && github.ref == 'refs/heads/main') }}
+    environment: desktop-release
+    permissions:
+      # GitHub requires write access to retrieve unpublished release assets.
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
+      - name: Verify and install the approved companion packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            keys == ["archiveSha256","assetId","controllerSha256","manifestSha256","releaseId"] and
+            ([.assetId,.releaseId] | all(type=="number" and .>0 and .==floor)) and
+            ([.archiveSha256,.controllerSha256,.manifestSha256] | all(type=="string" and test("^[a-f0-9]{64}$")))
+          ' <<< "$APPROVAL" >/dev/null
+          release=$(jq -r .releaseId <<< "$APPROVAL")
+          asset=$(jq -r .assetId <<< "$APPROVAL")
+          digest=$(jq -r .archiveSha256 <<< "$APPROVAL")
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" | jq -e --argjson asset "$asset" --arg digest "sha256:$digest" '
+            .draft == true and any(.assets[]; .id == $asset and .digest == $digest and .size > 0 and .size < 2147483648)
+          ' >/dev/null
+          archive="$RUNNER_TEMP/ubuntu-host-packages.tar.gz"
+          packages="$RUNNER_TEMP/ubuntu-host-packages"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" -H 'Accept: application/octet-stream' > "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
+          mkdir -m 700 "$packages"
+          PYTHONPATH=tools python3 -c 'from pathlib import Path; from build_host_ffmpeg import unpack; import sys; unpack(Path(sys.argv[1]),Path(sys.argv[2]))' "$archive" "$packages"
+          test "$(find "$packages" -mindepth 1 -printf '%P\n' | sort)" = "$(printf 'bootstrap.deb\nruntime.deb')"
+          test "$(dpkg-deb -f "$packages/bootstrap.deb" Package)" = "frameleaf-host-bootstrap-$controller"
+          test "$(dpkg-deb -f "$packages/runtime.deb" Package)" = "frameleaf-host-runtime-$manifest"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test ! -e /opt/frameleaf && test ! -L /opt/frameleaf
+          sudo apt-get update -qq
+          sudo apt-get install -y apparmor
+          # Match stock Ubuntu parent-directory ownership on the disposable runner.
+          for directory in / /opt /etc /etc/apparmor.d; do
+            test -d "$directory" && test ! -L "$directory"
+            stat -c '%U:%G %a %n' "$directory"
+            sudo chown root:root -- "$directory"
+            sudo chmod go-w -- "$directory"
+          done
+          sudo apt-get install -y "$packages/bootstrap.deb" "$packages/runtime.deb"
+          runtime="/opt/frameleaf/Runtimes/$manifest"
+          jq -e --arg manifest "$manifest" --arg controller "$controller"             '.manifestSha256 == $manifest and .controllerSha256 == $controller' "$runtime/installation.json" >/dev/null
+          echo "FRAMELEAF_TEST_RUNTIME=$runtime" >> "$GITHUB_ENV"
+      - name: Recover the approved runtime after an interrupted dpkg retry
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          runtime="$FRAMELEAF_TEST_RUNTIME"
+          manifest=$(jq -r .manifestSha256 <<< "$APPROVAL")
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          test "$runtime" = "/opt/frameleaf/Runtimes/$manifest"
+          package="frameleaf-host-runtime-$manifest"
+          deb="$RUNNER_TEMP/ubuntu-host-packages/runtime.deb"
+          receipt="$runtime/installation.json"
+          fence="$runtime/.package-maintenance"
+          status() { dpkg-query --showformat='${db:Status-Status}' --show "$package"; }
+
+          test "$(status)" = installed
+          test ! -e "$fence" && test ! -L "$fence"
+          cp -- "$receipt" "$RUNNER_TEMP/installed-linux-receipt.json"
+          # Let dpkg finish unpacking the identical reviewed bytes, then stop
+          # before its separate configuration step invokes signed finalization.
+          sudo timeout 5m dpkg --unpack "$deb"
+          test "$(status)" = unpacked
+          test -f "$fence" && test ! -L "$fence" && test ! -s "$fence"
+          test ! -e "$receipt" && test ! -L "$receipt"
+
+          sudo timeout 5m dpkg --configure "$package"
+          test "$(status)" = installed
+          test ! -e "$fence" && test ! -L "$fence"
+          cmp -- "$receipt" "$RUNNER_TEMP/installed-linux-receipt.json"
+          printf '%s  %s\n' "$manifest" "$runtime/manifest.json" | sha256sum --check --status
+          helper="/opt/frameleaf/Controllers/$manifest/$controller/frameleaf-native-host"
+          printf '%s  %s\n' "$controller" "$helper" | sha256sum --check --status
+          test -z "$(find /opt/frameleaf/Profiles -mindepth 1 -print -quit)"
+          jq -nc --arg manifest "$manifest" --arg controller "$controller" '
+            {state:"interrupted-package-retry-passed",manifestSha256:$manifest,controllerSha256:$controller,
+             dpkgStateAfterUnpack:"unpacked",dpkgStateAfterRetry:"installed",
+             fenceClearedAfterRetry:true,receiptUnchanged:true}
+          '
+      - name: Render with the installed Chromium sandbox under AppArmor
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          manifest=${FRAMELEAF_TEST_RUNTIME##*/}
+          payload="$FRAMELEAF_TEST_RUNTIME/payload"
+          sudo aa-enabled --quiet
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo aa-status --json | jq -e --arg name "frameleaf-studio-$manifest" '.profiles | has($name)' >/dev/null
+          test "$(id -u)" -ne 0
+          env -i HOME="$HOME" PATH=/usr/bin:/bin             FRAMELEAF_STUDIO_NODE="$payload/node"             FRAMELEAF_STUDIO_CHROMIUM="$payload/browser/chrome-headless-shell"             FRAMELEAF_STUDIO_BROWSER_GUARD="$payload/studio/guard/studio-browser-guard"             timeout 10m "$payload/node" --input-type=module - "$payload" <<'JS'
+          import assert from 'node:assert/strict';
+          import { join } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const root = process.argv[2];
+          const { createEngineRenderer } = await import(pathToFileURL(join(root, 'studio/tools/bundled-worker-renderer.mjs')));
+          const signal = AbortSignal.timeout(540_000);
+          const renderer = await createEngineRenderer({
+            ffmpeg: join(root, 'media-tools/ffmpeg'),
+            ffprobe: join(root, 'media-tools/ffprobe'),
+            signal,
+          });
+          const result = await renderer.conformance({ signal });
+          assert.ok(result.formats.includes('mp4-h264'));
+          console.log(JSON.stringify(result));
+          JS
+      - name: Record the installed and qualified packages for the release
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          set -euo pipefail
+          runtime="$FRAMELEAF_TEST_RUNTIME"
+          controller=$(jq -r .controllerSha256 <<< "$APPROVAL")
+          version=$(jq -er '.version | select(type == "string" and test("^(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){2}$"))' "$runtime/payload/server/package.json")
+          package="$RUNNER_TEMP/companion-package"
+          mkdir -m 700 "$package"
+          # The exact bytes dpkg installed above, under the names a release carries.
+          for role in bootstrap runtime; do
+            mv "$RUNNER_TEMP/ubuntu-host-packages/$role.deb" "$package/FrameleafCompanion_${version}_amd64_$role.deb"
+          done
+          # Writes SHA256SUMS beside the packages and fails if the release would refuse them.
+          node tools/release_prerequisites.mjs companion-record .github/workflows/ubuntu-host-qualification.yml "$version" "$controller" \
+            "$runtime/manifest.json" "$runtime/manifest.sig" "$package" "$RUNNER_TEMP/companion-identity"
+      - name: Retain the exact qualified packages
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: frameleaf-linux-x64-companion-installed
+          compression-level: 0
+          path: ${{ runner.temp }}/companion-package/
+          if-no-files-found: error
+      - name: Retain the signed manifest the release checks before it builds
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: frameleaf-linux-x64-companion-installed-identity
+          path: ${{ runner.temp }}/companion-identity/
+          if-no-files-found: error

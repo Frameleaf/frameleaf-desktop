@@ -10,10 +10,19 @@ use std::{
 use uuid::Uuid;
 
 mod activation;
+#[cfg(any(windows, test))]
+pub mod media_move;
 pub(crate) use activation::SafetySnapshot;
 
 const NAME: &str = "controller-state.json";
 const ACTIVATION: &str = "restore-activation.json";
+const MEDIA_MOVE: &str = "media-move.pending";
+fn no_media_move(root: &Dir) -> Result<(), String> {
+    match root.symlink_metadata(MEDIA_MOVE) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("host_media_move_pending".into()),
+    }
+}
 fn no_activation(root: &Dir) -> Result<(), String> {
     match root.symlink_metadata(ACTIVATION) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -39,6 +48,19 @@ pub(crate) struct Marker {
     restore_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     database_reference: Option<crate::host_database::Reference>,
+    #[cfg(any(windows, test))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_reference: Option<media_move::MediaReference>,
+}
+impl Marker {
+    /// The library's media was moved, which only a running Manager of the journal's package
+    /// can have done.
+    pub(crate) fn media_moved(&self) -> bool {
+        #[cfg(any(windows, test))]
+        return self.media_reference.is_some();
+        #[cfg(not(any(windows, test)))]
+        false
+    }
 }
 pub(crate) struct Owner {
     #[cfg(windows)]
@@ -68,6 +90,22 @@ fn identity(root: &Dir) -> Result<String, String> {
         crate::copy_source::root_identity(root).map_err(|_| "host_profile_identity_unavailable")?;
     Ok(format!("{:x}", Sha256::digest(value.as_bytes())))
 }
+// Use the same physical profile identity as the controller journal, independent of runtime upgrades.
+fn installation_uuid(profile_identity: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"frameleaf-native-installation:");
+    digest.update(profile_identity.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+pub(crate) fn secure_installation_id(path: &Path) -> Result<Uuid, String> {
+    let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+    Ok(installation_uuid(&identity(&root)?))
+}
+
 pub(crate) fn options(write: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
     options
@@ -126,12 +164,22 @@ fn valid_sized_file(file: &File, maximum: u64) -> Result<(), String> {
     Ok(())
 }
 impl Owner {
+    pub fn secure_installation_id(&self) -> Uuid {
+        installation_uuid(&self.profile_identity)
+    }
+
     pub fn acquire(path: &Path, writable: bool) -> Result<Self, String> {
+        #[cfg(not(windows))]
         if writable {
             crate::runtime_store::private_directory(path)?;
         }
+        // One admission that also pins: admitting and then pinning walked the tree twice.
         #[cfg(windows)]
-        let profile_pins = crate::windows_protection::pin_private_directory(path)?;
+        let profile_pins = if writable {
+            crate::windows_protection::private_directory_pinned(path)?
+        } else {
+            crate::windows_protection::pin_private_directory(path)?
+        };
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         #[cfg(unix)]
         {
@@ -248,16 +296,24 @@ impl Owner {
         sha: &str,
         mode: crate::host_runtime::HostMode,
     ) -> Result<(), String> {
+        no_media_move(&self.root)?;
         if mode == crate::host_runtime::HostMode::RestorePrepare {
             self.reconcile_restore(id, sha)?;
         }
         if mode == crate::host_runtime::HostMode::Server {
             no_activation(&self.root)?;
         }
+        #[cfg(any(windows, test))]
+        let media_reference;
         let (database_reference, restore_pending) = match self.read()? {
             Some(marker) => {
                 self.binding(&marker, id, sha)?;
-                if marker.phase != Phase::Stopped
+                // An active journal under this exclusive lease means its controller died without
+                // a clean stop. A server start may continue from it: the database replays its own
+                // write-ahead log, and the binding, restore and storage checks still apply. Backup
+                // and restore modes keep requiring a clean stop first.
+                let interrupted = marker.phase != Phase::Stopped;
+                if (interrupted && mode != crate::host_runtime::HostMode::Server)
                     || (mode == crate::host_runtime::HostMode::Server && marker.restore_pending)
                 {
                     return Err("host_recovery_requires_manager".into());
@@ -266,6 +322,16 @@ impl Owner {
                     if let Some(reference) = &marker.database_reference {
                         reference.resolve(&self.path)?;
                     }
+                }
+                #[cfg(any(windows, test))]
+                {
+                    if let Some(reference) = &marker.media_reference {
+                        if mode != crate::host_runtime::HostMode::Server {
+                            return Err("host_external_media_maintenance_unavailable".into());
+                        }
+                        reference.resolve(&self.path)?;
+                    }
+                    media_reference = marker.media_reference;
                 }
                 (marker.database_reference, marker.restore_pending)
             }
@@ -283,6 +349,10 @@ impl Owner {
                         return Err("host_recovery_requires_manager".into());
                     }
                 }
+                #[cfg(any(windows, test))]
+                {
+                    media_reference = None;
+                }
                 (None, false)
             }
         };
@@ -295,10 +365,220 @@ impl Owner {
             phase: Phase::Active,
             restore_pending,
             database_reference,
+            #[cfg(any(windows, test))]
+            media_reference,
         };
         self.write(&marker)?;
         self.active = Some(marker);
         Ok(())
+    }
+    /// Read the stopped journal without taking ownership; None means a fresh profile.
+    pub(crate) fn peek(path: &Path) -> Result<Option<Marker>, String> {
+        let root = Dir::from_std_file(crate::host_storage::directory(path)?);
+        match root.symlink_metadata(NAME) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("host_controller_state_invalid".into()),
+            Ok(_) => {}
+        }
+        let mut owner = Self::acquire(path, false)?;
+        let marker = owner.read()?;
+        if let Some(marker) = &marker {
+            owner.binding(marker, &marker.installation_id, &marker.manifest_sha256)?;
+        }
+        Ok(marker)
+    }
+    /// Whether a controller holds this profile's journal lease right now. A profile that never
+    /// started has no journal and no controller.
+    pub(crate) fn controller_running(path: &Path) -> Result<bool, String> {
+        match Self::acquire(path, false) {
+            Ok(_) => Ok(false),
+            Err(error) if error == "host_controller_already_owned" => Ok(true),
+            Err(error) if error == "host_controller_state_unavailable" => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    /// `check_movable` for a package move: a library move that is pending (its fence is held)
+    /// also refuses, here before the move's first change and not only at the journal write
+    /// that commits it. The library move itself checks with `check_movable` under its fence.
+    pub(crate) fn check_package_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
+        no_media_move(&self.root)?;
+        self.check_movable(id, previous)
+    }
+    /// Only a cleanly stopped library with no unfinished backup or restore work may change package.
+    pub(crate) fn check_movable(&mut self, id: &str, previous: &str) -> Result<(), String> {
+        if !self.writable {
+            return Err("host_controller_read_only".into());
+        }
+        if self.active.is_some() {
+            return Err("host_recovery_requires_manager".into());
+        }
+        no_activation(&self.root)?;
+        // Same liveness proof as recovery: no host lease holder and no database PID file.
+        let current = self.inspect(id, previous)?;
+        if current.restore_pending {
+            return Err("host_recovery_requires_manager".into());
+        }
+        self.operations_clear(&current, None)
+    }
+    /// Unfinished backup or restore work names the package that started it and must be
+    /// finished or discarded with it first. Two things are not unfinished work: the directory
+    /// a completed carry-forward restored this library into, which is its database now, with
+    /// the export it came from; and what the carry-forward under way (`permit`) has written.
+    fn operations_clear(&self, current: &Marker, permit: Option<&str>) -> Result<(), String> {
+        let carried = current
+            .database_reference
+            .as_ref()
+            .map(crate::host_database::Reference::operation_id)
+            .filter(|operation| {
+                self.root
+                    .symlink_metadata(
+                        Path::new("carry-forward")
+                            .join(operation)
+                            .join("restore.json"),
+                    )
+                    .is_ok_and(|record| record.is_file())
+            });
+        for name in ["checkpoints", "restore-input", "restore-targets"] {
+            let clear = match self.root.read_dir(name) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(mut entries) => entries.all(|entry| {
+                    name != "restore-input"
+                        && entry.is_ok_and(|entry| {
+                            [carried, permit]
+                                .into_iter()
+                                .flatten()
+                                .any(|allowed| entry.file_name() == allowed)
+                        })
+                }),
+                Err(_) => false,
+            };
+            if !clear {
+                return Err("host_upgrade_operation_pending".into());
+            }
+        }
+        Ok(())
+    }
+    /// The journal of a library that is being carried forward, as a carry-forward step may
+    /// start from it: bound to the package the library last ran with, cleanly stopped, with no
+    /// restore under way. Nothing is written. A database process file is deliberately not
+    /// required to be absent: an export run that was killed leaves one, and only the previous
+    /// Postgres, which refuses a directory another Postgres holds, can clear it.
+    #[cfg(unix)]
+    pub(crate) fn carry_state(
+        &mut self,
+        id: &str,
+        previous: &str,
+    ) -> Result<(PathBuf, Option<crate::host_database::Reference>), String> {
+        if !self.writable {
+            return Err("host_controller_read_only".into());
+        }
+        if self.active.is_some() {
+            return Err("host_recovery_requires_manager".into());
+        }
+        no_activation(&self.root)?;
+        let marker = self.read()?.ok_or("host_recovery_requires_manager")?;
+        self.binding(&marker, id, previous)?;
+        if marker.phase != Phase::Stopped || marker.restore_pending {
+            return Err("host_recovery_requires_manager".into());
+        }
+        if let Some(reference) = &marker.database_reference {
+            reference.resolve(&self.path)?;
+        }
+        self.placement()?;
+        Ok((self.path.clone(), marker.database_reference))
+    }
+    /// `carry_state`, and nothing in the operation directories but this permit's own work.
+    /// This is what an export run needs; the restore and the switch need `check_carriable`.
+    #[cfg(unix)]
+    pub(crate) fn carry_admitted(
+        &mut self,
+        id: &str,
+        previous: &str,
+        permit: &str,
+    ) -> Result<(), String> {
+        if !crate::host_runtime::checkpoint_operation_id(permit) {
+            return Err("host_recovery_requires_manager".into());
+        }
+        self.carry_state(id, previous)?;
+        let current = self.read()?.ok_or("host_recovery_requires_manager")?;
+        self.operations_clear(&current, Some(permit))
+    }
+    /// Whether a library may be carried forward under `permit`: cleanly stopped with nothing
+    /// holding it and no database process file, no restore under way, and nothing in the
+    /// operation directories but this permit's own work.
+    pub(crate) fn check_carriable(
+        &mut self,
+        id: &str,
+        previous: &str,
+        permit: &str,
+    ) -> Result<(), String> {
+        if !self.writable {
+            return Err("host_controller_read_only".into());
+        }
+        if self.active.is_some() || !crate::host_runtime::checkpoint_operation_id(permit) {
+            return Err("host_recovery_requires_manager".into());
+        }
+        no_activation(&self.root)?;
+        let current = self.inspect(id, previous)?;
+        if current.restore_pending {
+            return Err("host_recovery_requires_manager".into());
+        }
+        self.operations_clear(&current, Some(permit))
+    }
+    /// Select the newer package and the directory it restored this library into. Every check
+    /// runs first and this one write commits both; the original directory stays where it is.
+    pub(crate) fn carry_forward_database(
+        &mut self,
+        id: &str,
+        previous: &str,
+        next: &str,
+        permit: &str,
+        reference: &crate::host_database::Reference,
+    ) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(next, 64)
+            || previous == next
+            || reference.operation_id() != permit
+        {
+            return Err("host_controller_binding_changed".into());
+        }
+        self.check_carriable(id, previous, permit)?;
+        let selected = reference.resolve(&self.path)?;
+        match std::fs::symlink_metadata(selected.join("postmaster.pid")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("host_process_state_requires_review".into()),
+        }
+        let current = self.read()?.ok_or("host_controller_state_invalid")?;
+        let marker = Marker {
+            manifest_sha256: next.into(),
+            generation: Uuid::new_v4(),
+            database_reference: Some(reference.clone()),
+            ..current
+        };
+        self.write(&marker)?;
+        if self.read()? != Some(marker) {
+            return Err("host_controller_state_write_failed".into());
+        }
+        Ok(())
+    }
+    /// Repoint a cleanly stopped library at a newer package. This write commits the move.
+    pub(crate) fn carry_forward(
+        &mut self,
+        id: &str,
+        previous: &str,
+        next: &str,
+    ) -> Result<(), String> {
+        if !crate::native_runtime::digest_valid(next, 64) || previous == next {
+            return Err("host_controller_binding_changed".into());
+        }
+        no_media_move(&self.root)?;
+        self.check_movable(id, previous)?;
+        let current = self.read()?.ok_or("host_controller_state_invalid")?;
+        let marker = Marker {
+            manifest_sha256: next.into(),
+            generation: Uuid::new_v4(),
+            ..current
+        };
+        self.write(&marker)
     }
     pub fn clean_stop(&mut self) -> Result<(), String> {
         let mut marker = self.active.clone().ok_or("host_controller_state_invalid")?;
@@ -312,6 +592,11 @@ impl Owner {
         self.active = None;
         Ok(())
     }
+    #[cfg(windows)]
+    pub(crate) fn media_reference(&self) -> Option<&media_move::MediaReference> {
+        self.active.as_ref()?.media_reference.as_ref()
+    }
+
     /// Only the active controller can derive the internal host configuration.
     pub(crate) fn launch_state(
         &mut self,
@@ -346,6 +631,19 @@ impl Owner {
             marker.generation,
         ))
     }
+    /// With this lease held: whether anything of this library other than Manager could be
+    /// listening. `Clear` for a profile that holds nothing but an unwritten journal (no
+    /// controller ever started, so there is no photo server or database), and for a journal
+    /// that proves a clean stop with no database process file. Anything unread, unfinished or
+    /// bound to something else is `Unknown`.
+    pub(crate) fn idle(&mut self, id: &str, sha: &str) -> crate::manager_host::Evidence {
+        use crate::manager_host::Evidence;
+        match self.admit_idle(id, sha) {
+            Ok(()) => Evidence::Clear,
+            Err(code) if code == "host_already_owned" => Evidence::Running,
+            Err(_) => Evidence::Unknown,
+        }
+    }
     /// Keep this lease alive through Manager shutdown so a controller cannot start concurrently.
     pub(crate) fn admit_idle(&mut self, id: &str, sha: &str) -> Result<(), String> {
         if !crate::native_runtime::digest_valid(id, 12)
@@ -375,7 +673,7 @@ impl Owner {
         self.placement()
     }
     /// Package maintenance checks liveness only; this never authorizes starting or restoring a host.
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     pub(crate) fn package_idle(path: &Path) -> Result<(), String> {
         let root = Dir::from_std_file(crate::host_storage::directory(path)?);
         no_activation(&root)?;
@@ -413,6 +711,30 @@ impl Owner {
             }
         }
     }
+    /// The lease an older direct host holds on this library for as long as it runs, taken
+    /// shared for the moment: none when that host never ran here.
+    fn host_lease(&self) -> Result<Option<TransientHostLease>, String> {
+        match self.root.open_with("lease.lock", &options(false)) {
+            Ok(file) => {
+                let file = file.into_std();
+                valid_file(&file)?;
+                file.try_lock_shared().map_err(|_| "host_already_owned")?;
+                Ok(Some(TransientHostLease(file)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err("host_process_state_requires_review".into()),
+        }
+    }
+    /// With this lease held: whether an older direct host still runs this library, whatever
+    /// the journal says. A lease file that cannot be read is `Unknown`.
+    pub(crate) fn older_host(&self) -> crate::manager_host::Evidence {
+        use crate::manager_host::Evidence;
+        match self.host_lease() {
+            Ok(_) => Evidence::Clear,
+            Err(code) if code == "host_already_owned" => Evidence::Running,
+            Err(_) => Evidence::Unknown,
+        }
+    }
     pub fn inspect(&mut self, id: &str, sha: &str) -> Result<Marker, String> {
         let marker = self.read()?.ok_or("host_recovery_requires_manager")?;
         self.binding(&marker, id, sha)?;
@@ -420,16 +742,7 @@ impl Owner {
             return Err("host_recovery_requires_manager".into());
         }
         // Older direct-host ownership must also be absent. The PID file is never read or adopted.
-        let _host_lease = match self.root.open_with("lease.lock", &options(false)) {
-            Ok(file) => {
-                let file = file.into_std();
-                valid_file(&file)?;
-                file.try_lock_shared().map_err(|_| "host_already_owned")?;
-                Some(TransientHostLease(file))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err("host_process_state_requires_review".into()),
-        };
+        let _host_lease = self.host_lease()?;
         let mut databases = vec![self.path.join("database")];
         if let Some(reference) = &marker.database_reference {
             databases.push(reference.resolve(&self.path)?);
@@ -513,7 +826,346 @@ mod tests {
         }
     }
 
+    #[test]
+    fn move_preflight_requires_exact_stopped_owner_and_no_unfinished_recovery() {
+        let fixture = Fixture::new();
+        let manifest = sha();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &manifest, crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(
+            owner.check_movable(ID, &manifest).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.clean_stop().unwrap();
+        // Read through the held lease: Windows refuses a second handle on the locked journal.
+        let stopped = owner.read().unwrap();
+
+        for (id, digest) in [("bbbbbbbbbbbb", manifest.clone()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.check_movable(id, &digest).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+
+        let database = fixture.0.join("database");
+        crate::runtime_store::private_directory(&database).unwrap();
+        let pid = database.join("postmaster.pid");
+        fs::write(&pid, b"synthetic").unwrap();
+        assert_eq!(
+            owner.check_movable(ID, &manifest).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        fs::remove_file(pid).unwrap();
+
+        for name in ["checkpoints", "restore-input", "restore-targets"] {
+            let directory = fixture.0.join(name);
+            crate::runtime_store::private_directory(&directory).unwrap();
+            let operation = directory.join("unfinished");
+            fs::write(&operation, b"synthetic").unwrap();
+            assert_eq!(
+                owner.check_movable(ID, &manifest).unwrap_err(),
+                "host_upgrade_operation_pending"
+            );
+            assert_eq!(fs::read(&operation).unwrap(), b"synthetic");
+            fs::remove_file(operation).unwrap();
+        }
+
+        // A library move that is pending refuses a package move before anything is changed;
+        // the library move's own checks, made under that fence, are not affected.
+        let pending = fixture.0.join(MEDIA_MOVE);
+        fs::write(&pending, b"synthetic").unwrap();
+        assert_eq!(
+            owner.check_package_movable(ID, &manifest).unwrap_err(),
+            "host_media_move_pending"
+        );
+        owner.check_movable(ID, &manifest).unwrap();
+        fs::remove_file(pending).unwrap();
+
+        owner.check_package_movable(ID, &manifest).unwrap();
+        owner.check_movable(ID, &manifest).unwrap();
+        assert_eq!(owner.read().unwrap(), stopped);
+    }
+
+    #[test]
+    fn stopped_library_moves_to_a_newer_package_only_once_and_only_when_cleanly_stopped() {
+        let fixture = Fixture::new();
+        assert!(Owner::peek(&fixture.0).unwrap().is_none());
+        let next = "c".repeat(64);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(
+            owner.carry_forward(ID, &sha(), &next).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.clean_stop().unwrap();
+        drop(owner);
+        let before = Owner::peek(&fixture.0).unwrap().unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        crate::runtime_store::private_directory(&fixture.0.join("database")).unwrap();
+        fs::write(fixture.0.join("database/postmaster.pid"), b"synthetic").unwrap();
+        assert_eq!(
+            owner.carry_forward(ID, &sha(), &next).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+        fs::remove_file(fixture.0.join("database/postmaster.pid")).unwrap();
+        fs::remove_dir(fixture.0.join("database")).unwrap();
+        for (id, previous) in [("bbbbbbbbbbbb", sha()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.carry_forward(id, &previous, &next).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+        owner.carry_forward(ID, &sha(), &next).unwrap();
+        assert!(owner.carry_forward(ID, &sha(), &next).is_err());
+        drop(owner);
+        let after = Owner::peek(&fixture.0).unwrap().unwrap();
+        assert_eq!(after.manifest_sha256, next);
+        assert_eq!(after.installation_id, before.installation_id);
+        assert_eq!(after.phase, Phase::Stopped);
+        assert_ne!(after.generation, before.generation);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &next, crate::host_runtime::HostMode::Server)
+            .unwrap();
+        owner.clean_stop().unwrap();
+    }
+
+    /// A stopped library of package `sha()` with a restore target under `permit`.
     #[cfg(unix)]
+    fn carried(fixture: &Fixture, permit: &str) -> crate::host_database::Reference {
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        owner.clean_stop().unwrap();
+        drop(owner);
+        let attempt = Uuid::new_v4().to_string();
+        let target = fixture
+            .0
+            .join("restore-targets")
+            .join(permit)
+            .join(&attempt);
+        for path in [
+            fixture.0.join("database"),
+            fixture.0.join("restore-targets"),
+            fixture.0.join("restore-targets").join(permit),
+            target.clone(),
+            target.join("database"),
+        ] {
+            crate::runtime_store::private_directory(&path).unwrap();
+        }
+        crate::host_database::Reference::capture(&fixture.0, permit, &attempt).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_library_switches_package_and_directory_in_one_write_and_keeps_the_original() {
+        let fixture = Fixture::new();
+        let (permit, next) = (Uuid::new_v4().to_string(), "c".repeat(64));
+        let reference = carried(&fixture, &permit);
+        fs::write(fixture.0.join("database/PG_VERSION"), b"18\n").unwrap();
+        let before = Owner::peek(&fixture.0).unwrap().unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        // The export run starts from the journal as it is, and changes nothing in it.
+        assert_eq!(
+            owner.carry_state(ID, &sha()).unwrap(),
+            (fixture.0.clone(), None)
+        );
+        owner.carry_admitted(ID, &sha(), &permit).unwrap();
+        for (id, previous) in [("bbbbbbbbbbbb", sha()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.carry_state(id, &previous).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+        assert_eq!(owner.read().unwrap(), Some(before.clone()));
+        // Bound to this permit's own directory and to a different, valid package.
+        let other = Uuid::new_v4().to_string();
+        for (to, permit) in [
+            (sha(), permit.as_str()),
+            ("x".repeat(64), permit.as_str()),
+            (next.clone(), other.as_str()),
+        ] {
+            assert_eq!(
+                owner
+                    .carry_forward_database(ID, &sha(), &to, permit, &reference)
+                    .unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+        owner
+            .carry_forward_database(ID, &sha(), &next, &permit, &reference)
+            .unwrap();
+        // Once: the journal no longer names the previous package.
+        assert_eq!(
+            owner
+                .carry_forward_database(ID, &sha(), &next, &permit, &reference)
+                .unwrap_err(),
+            "host_controller_binding_changed"
+        );
+        drop(owner);
+        let after = Owner::peek(&fixture.0).unwrap().unwrap();
+        assert_eq!(after.manifest_sha256, next);
+        assert_eq!(after.database_reference, Some(reference.clone()));
+        assert_eq!(
+            (after.phase, after.restore_pending),
+            (Phase::Stopped, false)
+        );
+        assert_eq!(after.installation_id, before.installation_id);
+        assert_ne!(after.generation, before.generation);
+        // The original directory is where it was, with what it held.
+        assert_eq!(
+            fs::read(fixture.0.join("database/PG_VERSION")).unwrap(),
+            b"18\n"
+        );
+        // The new package starts from the selected directory.
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &next, crate::host_runtime::HostMode::Server)
+            .unwrap();
+        assert_eq!(
+            owner
+                .launch_state(&next, crate::host_runtime::HostMode::Server)
+                .unwrap()
+                .1,
+            Some(reference)
+        );
+        owner.clean_stop().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_switched_while_anything_about_the_library_is_unknown() {
+        let next = "c".repeat(64);
+        type Spoil = fn(&Fixture, &str, &crate::host_database::Reference);
+        let cases: [(&str, Spoil); 7] = [
+            // A database process file in the original: something may still be running there.
+            ("host_process_state_requires_review", |fixture, _, _| {
+                fs::write(fixture.0.join("database/postmaster.pid"), b"1").unwrap()
+            }),
+            // One in the new directory.
+            (
+                "host_process_state_requires_review",
+                |fixture, _, reference| {
+                    let database = reference.resolve(&fixture.0).unwrap();
+                    fs::write(database.join("postmaster.pid"), b"1").unwrap()
+                },
+            ),
+            // A restore selection under way.
+            ("host_restore_activation_pending", |fixture, _, _| {
+                fs::write(fixture.0.join(ACTIVATION), b"{}").unwrap()
+            }),
+            // Unfinished work of the previous package, in each operation directory.
+            ("host_upgrade_operation_pending", |fixture, _, _| {
+                let other = Uuid::new_v4().to_string();
+                fs::create_dir_all(fixture.0.join("checkpoints").join(other)).unwrap()
+            }),
+            ("host_upgrade_operation_pending", |fixture, permit, _| {
+                fs::create_dir_all(fixture.0.join("restore-input").join(permit)).unwrap()
+            }),
+            ("host_upgrade_operation_pending", |fixture, _, _| {
+                let other = Uuid::new_v4().to_string();
+                fs::create_dir(fixture.0.join("restore-targets").join(other)).unwrap()
+            }),
+            // The directory is no longer the one that was proven.
+            (
+                "host_database_reference_invalid",
+                |fixture, _, reference| {
+                    let database = reference.resolve(&fixture.0).unwrap();
+                    fs::rename(&database, database.with_file_name("moved")).unwrap();
+                    crate::runtime_store::private_directory(&database).unwrap();
+                },
+            ),
+        ];
+        for (index, (code, spoil)) in cases.into_iter().enumerate() {
+            let fixture = Fixture::new();
+            let permit = Uuid::new_v4().to_string();
+            let reference = carried(&fixture, &permit);
+            // This permit's own export is not unfinished work.
+            fs::create_dir_all(fixture.0.join("checkpoints").join(&permit)).unwrap();
+            let before = Owner::peek(&fixture.0).unwrap().unwrap();
+            spoil(&fixture, &permit, &reference);
+            let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+            let refusal = owner
+                .carry_forward_database(ID, &sha(), &next, &permit, &reference)
+                .unwrap_err();
+            assert_eq!(refusal, code, "case {index}");
+            assert_eq!(owner.read().unwrap(), Some(before), "case {index}");
+        }
+        // A library that did not stop cleanly is not carried at all, not even for its export.
+        let fixture = Fixture::new();
+        let permit = Uuid::new_v4().to_string();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        drop(owner);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        for result in [
+            owner.carry_state(ID, &sha()).map(|_| ()),
+            owner.carry_admitted(ID, &sha(), &permit),
+            owner.check_carriable(ID, &sha(), &permit),
+        ] {
+            assert_eq!(result.unwrap_err(), "host_recovery_requires_manager");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_export_run_may_follow_a_killed_one_but_the_restore_and_the_switch_may_not() {
+        let fixture = Fixture::new();
+        let permit = Uuid::new_v4().to_string();
+        carried(&fixture, &permit);
+        // What a killed export run leaves: the previous Postgres's process file.
+        fs::write(fixture.0.join("database/postmaster.pid"), b"1").unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.carry_admitted(ID, &sha(), &permit).unwrap();
+        assert_eq!(
+            owner.check_carriable(ID, &sha(), &permit).unwrap_err(),
+            "host_process_state_requires_review"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_carry_forward_does_not_block_the_next_package_move() {
+        let fixture = Fixture::new();
+        let (permit, next, later) = (Uuid::new_v4().to_string(), "c".repeat(64), "d".repeat(64));
+        let reference = carried(&fixture, &permit);
+        fs::create_dir_all(fixture.0.join("checkpoints").join(&permit)).unwrap();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .carry_forward_database(ID, &sha(), &next, &permit, &reference)
+            .unwrap();
+        // Without the record of a finished restore, what is there is still unfinished work.
+        assert_eq!(
+            owner.carry_forward(ID, &next, &later).unwrap_err(),
+            "host_upgrade_operation_pending"
+        );
+        let records = fixture.0.join("carry-forward").join(&permit);
+        fs::create_dir_all(&records).unwrap();
+        fs::write(records.join("restore.json"), b"{}").unwrap();
+        // Another operation's leftovers still block.
+        let stray = fixture
+            .0
+            .join("checkpoints")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir(&stray).unwrap();
+        assert_eq!(
+            owner.carry_forward(ID, &next, &later).unwrap_err(),
+            "host_upgrade_operation_pending"
+        );
+        fs::remove_dir(&stray).unwrap();
+        owner.carry_forward(ID, &next, &later).unwrap();
+        let after = owner.read().unwrap().unwrap();
+        assert_eq!(after.manifest_sha256, later);
+        assert_eq!(after.database_reference, Some(reference));
+    }
+
     #[test]
     fn owner_drop_releases_fork_style_descriptor_without_claiming_clean_shutdown() {
         let fixture = Fixture::new();
@@ -546,6 +1198,68 @@ mod tests {
         let mut inspector = Owner::acquire(&fixture.0, false).unwrap();
         assert_eq!(
             inspector.inspect(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+    }
+
+    #[test]
+    fn interrupted_server_journal_restarts_through_recovery_without_proving_a_clean_stop() {
+        use crate::host_runtime::HostMode;
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner.activate(ID, &sha(), HostMode::Server).unwrap();
+        let interrupted = owner.active.clone().unwrap();
+        // The controller dies here: nothing writes the stopped phase.
+        drop(owner);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        assert_eq!(owner.read().unwrap().unwrap().phase, Phase::Active);
+        for mode in [
+            HostMode::Database,
+            HostMode::CheckpointCleanup,
+            HostMode::RestorePrepare,
+        ] {
+            assert_eq!(
+                owner.activate(ID, &sha(), mode).unwrap_err(),
+                "host_recovery_requires_manager"
+            );
+        }
+        for (id, manifest) in [("cccccccccccc", sha()), (ID, "d".repeat(64))] {
+            assert_eq!(
+                owner.activate(id, &manifest, HostMode::Server).unwrap_err(),
+                "host_controller_binding_changed"
+            );
+        }
+        // Package moves and Manager shutdown still need a proven clean stop.
+        assert_eq!(
+            owner.inspect(ID, &sha()).unwrap_err(),
+            "host_recovery_requires_manager"
+        );
+        owner.activate(ID, &sha(), HostMode::Server).unwrap();
+        assert_ne!(
+            owner.active.as_ref().unwrap().generation,
+            interrupted.generation
+        );
+        owner.launch_state(&sha(), HostMode::Server).unwrap();
+        owner.clean_stop().unwrap();
+        assert_eq!(owner.inspect(ID, &sha()).unwrap().phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn interrupted_journal_with_a_pending_restore_still_refuses_a_server_start() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        owner
+            .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+            .unwrap();
+        let mut marker = owner.active.clone().unwrap();
+        marker.restore_pending = true;
+        owner.write(&marker).unwrap();
+        drop(owner);
+        let mut owner = Owner::acquire(&fixture.0, true).unwrap();
+        assert_eq!(
+            owner
+                .activate(ID, &sha(), crate::host_runtime::HostMode::Server)
+                .unwrap_err(),
             "host_recovery_requires_manager"
         );
     }

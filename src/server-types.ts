@@ -10,6 +10,11 @@ export type DiscoveredServer = {
   name: string; id: string; url: string; host: string; port: number; addresses: string[];
   setup: 'needed' | 'complete' | string; linked: boolean; cloud: 'available' | 'unavailable' | string;
 };
+/** server_sign_in_options: how one can sign in to the server at an address. */
+export type SignInOptions = {
+  server: string; id: string; name: string; linked: boolean; local: boolean; needsSetup: boolean;
+  passwordLogin: boolean; frameleafSignIn: boolean; oauth: boolean; oauthButtonText: string; loginMessage: string | null;
+};
 export type CloudAccount = { email: string; name: string };
 export type CloudServerConnection = { kind: 'local' | 'wan' | 'relay' | 'ipv6' | string; uri: string; verified: boolean };
 export type CloudServer = {
@@ -20,9 +25,13 @@ export type CloudServer = {
 
 // ---- the photo connection (connect_server / restore_connection / connect_cloud_server) ------------
 export type ConnectionFeatures = { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean };
-export type Connection = { server: string; name: string; mode: string; state: string; features: ConnectionFeatures };
+export type Connection = { navigationScope?: string | null; server: string; name: string; mode: string; state: string; features: ConnectionFeatures };
+/** connect_server / connect_server_step: signed in, or the step that would complete the sign-in. */
+/** `server`: Sign in with Frameleaf only, the address of the server that asked for the step. */
+export type SignInOutcome = { status: 'done'; connection: Connection } | { status: 'next'; transaction: string; methods: string[]; sentTo: string | null; server?: string };
 export type Workload = { workload: string; state: string; modelNames: string[]; code: string | null };
-export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[] };
+export type ModelProgress = { totalBytes: number; verifiedBytes: number; download: { receivedBytes: number; totalBytes: number } | null };
+export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[]; activeWorkload?: string | null; models?: ModelProgress | null; completedTasks?: number; providers?: import('./ai-processing').WorkloadProvider[] };
 
 // ---- server_summary --------------------------------------------------------------------------------
 export type Me = { id?: string; name?: string; email?: string; isAdmin?: boolean };
@@ -37,7 +46,7 @@ export type ServerStorage = {
 export type VersionCheck = { checkedAt?: string | null; releaseVersion?: string | null };
 export type AttentionItem = {
   id: string; kind: 'backup' | 'storage' | 'work' | 'version' | string; reason: string; level: 'now' | 'soon' | string; since?: string | null;
-  storage?: { availableBytes: number; totalBytes: number; usedPercent: number } | null;
+  storage?: { drive?: string; availableBytes: number; totalBytes: number; usedPercent: number } | null;
   backup?: { place: string | null; lastSuccessAt: string | null; days: number | null } | null;
   work?: { count: number; queues: { name: string; count: number }[] } | null;
   version?: { current: string; available: string } | null;
@@ -45,6 +54,8 @@ export type AttentionItem = {
 export type Attention = { checkedAt?: string; items?: AttentionItem[]; checks?: { kind: string; state: string }[]; dismissed?: string[] };
 export type ServerSummary = {
   me: Me; connections: ServerConnections | null; storage: ServerStorage | null; version: VersionCheck | null; attention: Attention | null;
+  /** The server refused the attention list until Two-Step Verification (a `verification_required` refusal). */
+  attentionVerification?: { code: string; methods: string[]; transaction: string };
 };
 
 // ---- cloud_status -----------------------------------------------------------------------------------

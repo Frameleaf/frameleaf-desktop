@@ -1,9 +1,12 @@
+#[path = "common/catalogue.rs"]
+mod catalogue;
 mod common;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use catalogue::approved_profile;
 use ed25519_dalek::{Signer, SigningKey};
 use frameleaf_desktop::{
     ml_transport::{AcceptedQualification, QualificationChallenge},
-    model_catalogue::{approved_profile, ApprovedProfile},
+    model_catalogue::ApprovedProfile,
     runtime_store::{InstalledRuntime, RuntimeStore},
 };
 use serde_json::{json, Value};

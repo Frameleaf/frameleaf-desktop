@@ -5,22 +5,28 @@ pub(crate) struct Snapshot {
     pub available_memory: Option<u64>,
 }
 impl Snapshot {
+    /// Admission: a known battery or metered link refuses work. An unknown reading (no UPower or
+    /// NetworkManager, no battery sensor) is not a restriction anyone chose and never blocks.
     pub fn refusal(&self, required_memory: u64) -> Option<&'static str> {
-        match self.external_power {
-            None => return Some("power_unknown"),
-            Some(false) => return Some("on_battery"),
-            Some(true) => {}
-        }
-        match self.unmetered {
-            None => return Some("network_unknown"),
-            Some(false) => return Some("metered_network"),
-            Some(true) => {}
+        if let Some(reason) = self.refusal_while_loaded() {
+            return Some(reason);
         }
         match self.available_memory {
             None => Some("memory_unknown"),
             Some(bytes) if bytes < required_memory => Some("memory_low"),
             Some(_) => None,
         }
+    }
+    /// While the worker's own models are loaded, available memory already excludes them, so the
+    /// memory floor is an admission check only: re-applying it would evict the worker it admitted.
+    pub fn refusal_while_loaded(&self) -> Option<&'static str> {
+        if self.external_power == Some(false) {
+            return Some("on_battery");
+        }
+        if self.unmetered == Some(false) {
+            return Some("metered_network");
+        }
+        None
     }
 }
 
@@ -275,24 +281,10 @@ mod tests {
         for (snapshot, expected) in [
             (
                 Snapshot {
-                    external_power: None,
-                    ..ready
-                },
-                "power_unknown",
-            ),
-            (
-                Snapshot {
                     external_power: Some(false),
                     ..ready
                 },
                 "on_battery",
-            ),
-            (
-                Snapshot {
-                    unmetered: None,
-                    ..ready
-                },
-                "network_unknown",
             ),
             (
                 Snapshot {
@@ -318,5 +310,43 @@ mod tests {
         ] {
             assert_eq!(snapshot.refusal(4096), Some(expected));
         }
+    }
+    #[test]
+    fn unknown_power_or_network_state_does_not_block_work() {
+        // Linux without UPower or NetworkManager reports neither; that must not park the worker.
+        let unknown = Snapshot {
+            external_power: None,
+            unmetered: None,
+            available_memory: Some(4096),
+        };
+        assert_eq!(unknown.refusal(4096), None);
+        assert_eq!(unknown.refusal_while_loaded(), None);
+        // A known restriction still wins over an unknown reading.
+        let battery = Snapshot {
+            external_power: Some(false),
+            ..unknown
+        };
+        assert_eq!(battery.refusal(4096), Some("on_battery"));
+        let metered = Snapshot {
+            unmetered: Some(false),
+            ..unknown
+        };
+        assert_eq!(metered.refusal_while_loaded(), Some("metered_network"));
+    }
+    #[test]
+    fn the_memory_floor_is_not_reapplied_to_the_workers_own_loaded_models() {
+        // Admitted with 4096 free; the loaded models then leave 512 "available".
+        let loaded = Snapshot {
+            external_power: Some(true),
+            unmetered: Some(true),
+            available_memory: Some(512),
+        };
+        assert_eq!(loaded.refusal(4096), Some("memory_low"));
+        assert_eq!(loaded.refusal_while_loaded(), None);
+        let unreadable = Snapshot {
+            available_memory: None,
+            ..loaded
+        };
+        assert_eq!(unreadable.refusal_while_loaded(), None);
     }
 }

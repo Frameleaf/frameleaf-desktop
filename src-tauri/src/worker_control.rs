@@ -10,7 +10,42 @@ pub(crate) enum WorkerControl {
     Paused,
     Stopped,
 }
-fn key(saved: &SavedConnection) -> Result<String, String> {
+/// Keep existing string preferences readable while storing a deadline for temporary pauses.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum Preference {
+    Manual(WorkerControl),
+    Timed {
+        #[serde(rename = "pausedUntil")]
+        until: u64,
+    },
+}
+impl Preference {
+    pub fn effective(self, now: u64) -> WorkerControl {
+        match self {
+            Self::Manual(control) => control,
+            Self::Timed { until } if now >= until => WorkerControl::Running,
+            Self::Timed { .. } => WorkerControl::Paused,
+        }
+    }
+    pub fn resume_due(self, expected: u64, now: u64) -> bool {
+        matches!(self, Self::Timed { until } if until == expected && now >= until)
+    }
+    pub fn held(self) -> WorkerControl {
+        match self {
+            Self::Manual(control) => control,
+            Self::Timed { .. } => WorkerControl::Paused,
+        }
+    }
+}
+pub(crate) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| {
+            value.as_millis().min(u128::from(u64::MAX)) as u64
+        })
+}
+pub(crate) fn key(saved: &SavedConnection) -> Result<String, String> {
     let device = saved
         .device_id
         .as_deref()
@@ -26,16 +61,48 @@ fn key(saved: &SavedConnection) -> Result<String, String> {
         .map_err(|_| "worker_preference_invalid")?;
     Ok(format!("worker-control-{:x}", Sha256::digest(scope)))
 }
-pub(crate) fn load(saved: &SavedConnection) -> Result<WorkerControl, String> {
-    Ok(credentials::load(&key(saved)?)?.unwrap_or_default())
+pub(crate) fn load(saved: &SavedConnection) -> Result<Preference, String> {
+    Ok(credentials::load(&key(saved)?)?.unwrap_or(Preference::Manual(WorkerControl::Running)))
 }
 pub(crate) fn save(saved: &SavedConnection, control: WorkerControl) -> Result<(), String> {
-    credentials::save(&key(saved)?, &control)
+    save_preference(saved, Preference::Manual(control))
+}
+pub(crate) fn save_preference(
+    saved: &SavedConnection,
+    preference: Preference,
+) -> Result<(), String> {
+    credentials::save(&key(saved)?, &preference)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timed_pause_expires_without_changing_manual_preference_format() {
+        let timed = Preference::Timed { until: 200 };
+        assert_eq!(timed.effective(199), WorkerControl::Paused);
+        assert_eq!(timed.effective(200), WorkerControl::Running);
+        assert_eq!(timed.held(), WorkerControl::Paused);
+        assert!(!timed.resume_due(200, 199));
+        assert!(timed.resume_due(200, 200));
+        assert!(!timed.resume_due(100, 200));
+        assert!(!Preference::Manual(WorkerControl::Paused).resume_due(200, 200));
+        assert!(!Preference::Manual(WorkerControl::Stopped).resume_due(200, 200));
+        assert_eq!(
+            serde_json::from_str::<Preference>(&serde_json::to_string(&timed).unwrap()).unwrap(),
+            timed
+        );
+        assert_eq!(
+            serde_json::from_str::<Preference>(r#""paused""#)
+                .unwrap()
+                .effective(200),
+            WorkerControl::Paused
+        );
+        assert_eq!(
+            serde_json::to_string(&Preference::Manual(WorkerControl::Stopped)).unwrap(),
+            r#""stopped""#
+        );
+    }
     #[test]
     fn persisted_controls_are_scoped_to_server_account_and_device() {
         let mut saved = crate::connection::SavedConnection {

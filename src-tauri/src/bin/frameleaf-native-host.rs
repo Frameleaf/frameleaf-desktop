@@ -1,7 +1,35 @@
+/// Keep internal agent failures off the controller's owner-protocol stdout pipe.
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
+        #[cfg(windows)]
+        [mode, node] if mode == "--run-windows-host-agent" => {
+            match frameleaf_desktop::host_runtime::run_windows_host_agent(node) {
+                Ok(code) => std::process::exit(code as i32),
+                Err(code) => {
+                    eprintln!("{code}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Touches nothing: lets a packaging check prove the installed controller loads.
+        [mode] if mode == "--version" => {
+            println!("frameleaf-native-host {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         [mode] if mode == "--owner-pipe" => frameleaf_desktop::host_control::run(),
+        #[cfg(windows)]
+        [mode] if mode == "--media-move-owner" => {
+            frameleaf_desktop::host_control::media_move_owner()
+        }
+        #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+        [mode] if mode == "--qualify-media-move" => {
+            frameleaf_desktop::host_control::qualify_media_move()
+        }
+        #[cfg(all(windows, feature = "qualify-windows-media-move"))]
+        [mode] if mode == "--qualify-media-move-manager" => {
+            frameleaf_desktop::host_control::qualify_media_move_manager()
+        }
         [mode] if mode == "--inspect-owner" => frameleaf_desktop::host_control::inspect_owner(),
         [mode, manifest, controller]
             if mode == "--prepare-install"
@@ -34,6 +62,17 @@ fn main() {
                         frameleaf_desktop::host_install::finalize(manifest, controller)
                     };
                     result.map(|receipt| println!("{}", receipt))
+                }
+                _ => Err("host_install_identity_invalid".into()),
+            }
+        }
+        [mode, manifest, controller, program] if mode == "--verify-installed-program" => {
+            match (manifest.to_str(), controller.to_str(), program.to_str()) {
+                (Some(manifest), Some(controller), Some(program)) => {
+                    frameleaf_desktop::host_install::verify_installed_program(
+                        manifest, controller, program,
+                    )
+                    .map(|receipt| println!("{}", receipt))
                 }
                 _ => Err("host_install_identity_invalid".into()),
             }

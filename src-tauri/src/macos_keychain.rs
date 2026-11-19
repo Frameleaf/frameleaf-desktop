@@ -29,6 +29,7 @@ extern "C" {
 
 fn user_presence(account: &str) -> bool {
     matches!(account, "connection" | "cloud-account" | "manager-grant")
+        || account.starts_with("approved-library-")
 }
 
 fn operation(
@@ -105,7 +106,12 @@ mod tests {
 
     #[test]
     fn foreground_sign_ins_require_presence_and_worker_state_remains_unattended() {
-        for account in ["connection", "cloud-account", "manager-grant"] {
+        for account in [
+            "connection",
+            "cloud-account",
+            "manager-grant",
+            "approved-library-fixture",
+        ] {
             assert!(user_presence(account));
         }
         for account in [

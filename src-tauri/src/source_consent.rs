@@ -1,7 +1,9 @@
 //! Picker-issued, photo-session-bound folder permission, stored only in the OS credential store.
 use crate::{
+    camera_identity::MediaIdentity,
     connection::{normalize_server, DeviceIdentity, SavedConnection},
     copy_source::CopyApproval,
+    import_album::Destination,
     photo_sources::{self, FolderInventory},
     transport,
 };
@@ -17,7 +19,13 @@ pub struct SourceConsent {
 #[derive(Default)]
 struct Pending {
     generation: u64,
-    selected: Option<(String, PathBuf)>,
+    selected: Option<Selection>,
+}
+struct Selection {
+    id: String,
+    path: PathBuf,
+    root: Option<String>,
+    media: Option<MediaIdentity>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,9 +39,17 @@ pub struct SelectedFolder {
 pub struct Consent {
     approval: CopyApproval,
     session_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) destination: Option<Destination>,
     name: String,
     allow_download: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    camera: bool,
     pub registered: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) watch: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) watch_paused: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +58,14 @@ pub struct ConsentView {
     name: String,
     path: String,
     allow_download: bool,
+    camera: bool,
+    can_reconnect: bool,
     registered: bool,
+    watch: bool,
+    destination: Option<Destination>,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 impl SourceConsent {
     pub fn generation(&self) -> Result<u64, String> {
@@ -65,7 +88,19 @@ impl SourceConsent {
         Ok(())
     }
     pub fn select(&self, generation: u64, path: PathBuf) -> Result<SelectedFolder, String> {
-        let inventory = photo_sources::inventory(&path, 10_000)?;
+        let inventory = photo_sources::inventory(&path, photo_sources::MAX_ENTRIES)?;
+        self.remember(generation, path, inventory)
+    }
+    pub fn select_camera(&self, generation: u64, path: PathBuf) -> Result<SelectedFolder, String> {
+        let inventory = photo_sources::camera_inventory(&path, photo_sources::MAX_ENTRIES)?;
+        self.remember(generation, path, inventory)
+    }
+    fn remember(
+        &self,
+        generation: u64,
+        path: PathBuf,
+        mut inventory: FolderInventory,
+    ) -> Result<SelectedFolder, String> {
         let mut pending = self
             .pending
             .lock()
@@ -74,53 +109,111 @@ impl SourceConsent {
             return Err("source_selection_changed".into());
         }
         let selection_id = uuid::Uuid::new_v4().to_string();
-        pending.selected = Some((selection_id.clone(), path));
+        pending.selected = Some(Selection {
+            id: selection_id.clone(),
+            path,
+            root: inventory.root_identity.take(),
+            media: inventory.media_identity.take(),
+        });
         Ok(SelectedFolder {
             selection_id,
             inventory,
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn approve(
         &self,
         saved: &SavedConnection,
         identity: &DeviceIdentity,
         selection: &str,
         allow_download: bool,
+        watch: bool,
+        destination: Option<Destination>,
         persist: impl FnOnce(&Consent) -> Result<(), String>,
     ) -> Result<Consent, String> {
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| "source_selection_unavailable")?;
-        let path = &pending
+        let selection = pending
             .selected
             .as_ref()
-            .filter(|(id, _)| id == selection)
-            .ok_or("source_selection_changed")?
-            .1;
-        let approval = CopyApproval::approve(
-            saved,
-            identity,
-            path,
-            2 * 1024 * 1024 * 1024,
-            allow_download,
-        )?;
+            .filter(|pending| pending.id == selection)
+            .ok_or("source_selection_changed")?;
+        let path = &selection.path;
+        let preview_identity = selection.root.as_deref();
+        if watch
+            && (preview_identity.is_some()
+                || !allow_download
+                || !watch_folder(path)
+                || !crate::host_storage::is_local(&crate::host_storage::directory(path)?)?)
+        {
+            return Err("source_watch_local_required".into());
+        }
+        let approval = if let Some(expected) = preview_identity {
+            CopyApproval::approve_camera(
+                saved,
+                identity,
+                path,
+                allow_download,
+                expected,
+                selection.media.clone(),
+            )
+            .map_err(|code| {
+                if code == "source_root_changed" {
+                    "source_camera_changed".into()
+                } else {
+                    code
+                }
+            })?
+        } else {
+            CopyApproval::approve(
+                saved,
+                identity,
+                path,
+                // FL-1268: no per-file ceiling; staging space and the server's limit decide.
+                crate::copy_source::UNLIMITED_ITEM_BYTES,
+                allow_download,
+            )?
+        };
         let name = source_label(
             path.file_name()
                 .and_then(|name| name.to_str())
                 .ok_or("source_folder_name_invalid")?,
         );
         let consent = Consent {
+            session_signature: session_signature(saved, identity, &approval, destination.as_ref()),
             approval,
-            session_signature: session_signature(saved, identity),
+            destination,
             name,
             allow_download,
+            camera: preview_identity.is_some(),
             registered: false,
+            watch,
+            watch_paused: false,
         };
         persist(&consent)?;
         pending.selected = None;
         Ok(consent)
     }
+}
+fn watch_folder(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    if !matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))
+    ) {
+        return false;
+    }
+    !path.components().any(|part| {
+        let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "cloudstorage" | "mobile documents" | "onedrive"
+        ) || name.starts_with("onedrive - ")
+            || name.starts_with("onedrive-")
+    })
 }
 // Match the server's trimmed, control-free 128 UTF-16-unit label without changing the root path.
 fn source_label(raw: &str) -> String {
@@ -140,23 +233,74 @@ fn source_label(raw: &str) -> String {
         name.into()
     }
 }
-fn session_signature(saved: &SavedConnection, identity: &DeviceIdentity) -> String {
-    identity.sign(&format!(
-        "frameleaf-desktop/photo-source-session/v1\n{}",
-        saved.token
-    ))
+fn session_signature(
+    saved: &SavedConnection,
+    identity: &DeviceIdentity,
+    approval: &CopyApproval,
+    destination: Option<&Destination>,
+) -> String {
+    match destination {
+        Some(destination) => identity.sign(&format!(
+            "frameleaf-desktop/photo-source-album/v1\n{}\n{}\n{}\n{}\n{}",
+            saved.token,
+            approval.fingerprint(),
+            destination.id,
+            destination.shared,
+            destination.name
+        )),
+        None => identity.sign(&format!(
+            "frameleaf-desktop/photo-source-session/v1\n{}",
+            saved.token
+        )),
+    }
 }
 impl Consent {
-    pub(crate) fn approval(
+    pub(crate) fn dropped(
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+        root: &std::path::Path,
+        root_identity: &str,
+        name: &str,
+        destination: Option<Destination>,
+    ) -> Result<Self, String> {
+        let approval = CopyApproval::approve_drop(saved, identity, root, root_identity)?;
+        Ok(Self {
+            session_signature: session_signature(saved, identity, &approval, destination.as_ref()),
+            approval,
+            destination,
+            name: source_label(name),
+            allow_download: true,
+            camera: false,
+            registered: false,
+            watch: false,
+            watch_paused: false,
+        })
+    }
+
+    pub(crate) fn approved_scope(
         &self,
         saved: &SavedConnection,
         identity: &DeviceIdentity,
     ) -> Result<&CopyApproval, String> {
         self.require(saved, identity)?;
-        if !self.registered || !self.allow_download {
+        if !self.allow_download {
             return Err("source_approval_required".into());
         }
         Ok(&self.approval)
+    }
+
+    pub(crate) fn approval(
+        &self,
+        saved: &SavedConnection,
+        identity: &DeviceIdentity,
+    ) -> Result<&CopyApproval, String> {
+        if !self.registered {
+            return Err("source_approval_required".into());
+        }
+        self.approved_scope(saved, identity)
+    }
+    pub(crate) fn camera(&self) -> bool {
+        self.camera
     }
     pub(crate) fn source_id(&self) -> &str {
         self.approval.source_id()
@@ -167,7 +311,9 @@ impl Consent {
         identity: &DeviceIdentity,
     ) -> Result<(), String> {
         self.approval.validate_current(saved, identity)?;
-        if self.session_signature != session_signature(saved, identity) {
+        if self.session_signature
+            != session_signature(saved, identity, &self.approval, self.destination.as_ref())
+        {
             return Err("source_photo_session_changed".into());
         }
         Ok(())
@@ -178,7 +324,11 @@ impl Consent {
             name: self.name.clone(),
             path: self.approval.root().to_string_lossy().into(),
             allow_download: self.allow_download,
+            camera: self.camera,
+            can_reconnect: self.approval.media().is_some(),
             registered: self.registered,
+            watch: self.watch,
+            destination: self.destination.clone(),
         }
     }
     fn request(&self, saved: &SavedConnection) -> Value {
@@ -265,6 +415,45 @@ mod tests {
         }
     }
     #[test]
+    fn album_consent_cannot_change_destination_or_fall_back_to_library() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-consent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let state = SourceConsent::default();
+        let identity = DeviceIdentity::generate();
+        let selected = state
+            .select(state.generation().unwrap(), root.clone())
+            .unwrap();
+        let destination = Destination {
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            name: "Vacation".into(),
+            shared: false,
+        };
+        let consent = state
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                false,
+                Some(destination),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let serialized = serde_json::to_value(&consent).unwrap();
+        let mut decoded: Consent = serde_json::from_value(serialized.clone()).unwrap();
+        decoded.require(&saved(), &identity).unwrap();
+        decoded.destination.as_mut().unwrap().id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into();
+        assert!(decoded.require(&saved(), &identity).is_err());
+        let mut decoded: Consent = serde_json::from_value(serialized).unwrap();
+        decoded.destination = None;
+        assert!(decoded.require(&saved(), &identity).is_err());
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn picker_handles_expire_on_signout_and_failed_secure_persistence_keeps_the_selection_retryable(
     ) {
         let root = std::env::temp_dir().join(format!("frameleaf-consent-{}", uuid::Uuid::new_v4()));
@@ -277,7 +466,7 @@ mod tests {
         let called = AtomicBool::new(false);
         assert_eq!(
             state
-                .approve(&saved(), &identity, "forged", true, |_| {
+                .approve(&saved(), &identity, "forged", true, false, None, |_| {
                     called.store(true, Ordering::Release);
                     Ok(())
                 })
@@ -287,9 +476,15 @@ mod tests {
         );
         assert!(!called.load(Ordering::Acquire));
         assert!(state
-            .approve(&saved(), &identity, &selected.selection_id, true, |_| Err(
-                "credential_store_locked_or_unavailable".into()
-            ))
+            .approve(
+                &saved(),
+                &identity,
+                &selected.selection_id,
+                true,
+                false,
+                None,
+                |_| Err("credential_store_locked_or_unavailable".into())
+            )
             .is_err());
         let consent = state
             .approve(
@@ -297,6 +492,8 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();
@@ -307,6 +504,8 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
+                None,
                 |_| Ok(())
             )
             .is_err());
@@ -319,6 +518,49 @@ mod tests {
         state.clear().unwrap();
         assert!(state.select(generation, root.clone()).is_err());
         std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn replacing_a_previewed_camera_folder_requires_a_fresh_selection() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-camera-{}", uuid::Uuid::new_v4()));
+        let root = base.join("DCIM");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = SourceConsent::default();
+        let generation = state.generation().unwrap();
+        let selection = state.select_camera(generation, root.clone()).unwrap();
+        std::fs::rename(&root, base.join("previous-card")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let identity = DeviceIdentity::generate();
+        assert_eq!(
+            state
+                .approve(
+                    &saved(),
+                    &identity,
+                    &selection.selection_id,
+                    true,
+                    false,
+                    None,
+                    |_| { panic!("replacement folder must not gain consent") }
+                )
+                .err()
+                .as_deref(),
+            Some("source_camera_changed"),
+        );
+        let selection = state.select_camera(generation, root).unwrap();
+        let consent = state
+            .approve(
+                &saved(),
+                &identity,
+                &selection.selection_id,
+                true,
+                false,
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(consent.view().camera);
+        std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
     fn registration_requires_an_exact_source_echo_and_never_discloses_the_local_root() {
@@ -336,6 +578,8 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();
@@ -370,6 +614,8 @@ mod tests {
                 &identity,
                 &selected.selection_id,
                 true,
+                false,
+                None,
                 |_| Ok(()),
             )
             .unwrap();
