@@ -12,6 +12,12 @@ async fn latest(app: &AppHandle) -> Result<Option<Update>, String> {
     let updater = app
         .updater_builder()
         .timeout(Duration::from_secs(15))
+        // Downloads have no total deadline; only a stalled connection fails.
+        .configure_client(|client| {
+            client
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(60))
+        })
         .build()
         .map_err(|_| "update_check_failed")?;
     match updater.check().await {
@@ -41,7 +47,8 @@ pub(crate) async fn install_desktop_update(
 ) -> Result<(), String> {
     require_local(&window)?;
     let host = app.state::<HostSetup>();
-    let _owner = host.lock_for_update()?;
+    // Fail fast, but don't hold the host lock while downloading.
+    drop(host.lock_for_update()?);
     let mut update = latest(&app)
         .await?
         .filter(|update| update.version == version)
@@ -56,11 +63,14 @@ pub(crate) async fn install_desktop_update(
     {
         return Err("update_install_failed".into());
     }
-    update.timeout = Some(Duration::from_secs(60 * 60));
+    // Drop the inherited 15s check deadline; the client's read_timeout catches stalls.
+    update.timeout = None;
+    // ponytail: the plugin buffers the package in memory; install() needs the bytes anyway.
     let bytes = update.download(|_, _| {}, || {}).await.map_err(|error| {
         eprintln!("Desktop update download failed: {error}");
         "update_install_failed"
     })?;
+    let _owner = host.lock_for_update()?;
     let restart = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         update.install(bytes).map_err(|error| {

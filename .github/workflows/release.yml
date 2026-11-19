@@ -265,12 +265,14 @@ jobs:
         if: inputs.tag != ''
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           set -euo pipefail
           : "${TAURI_SIGNING_PRIVATE_KEY:?Missing updater signing key}"
+          : "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?Missing updater signing key password}"
           version="${RELEASE_TAG#v}"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             bundle=src-tauri/target/release/bundle/macos
