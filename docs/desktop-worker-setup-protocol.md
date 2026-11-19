@@ -59,7 +59,8 @@ The desktop never needs a restart or **Retry Setup** because the server changed 
   turned off stops; with no task left it shows "no work assigned" and asks again every 5 minutes.
   Model files the server no longer lists are removed after the new set has qualified.
 - **Refused tasks.** A task refused for another reason (`desktop_clip_index_*`) stays off while the
-  others work, and is tried again every 30 minutes.
+  others work, and is tried again after 2 minutes (a model change still being applied) or every
+  30 minutes (a library built with another model).
 - **Policy and network.** `desktop_pool_policy_required` and `desktop_worker_lan_required` are waited
   out on every endpoint, including session issue: the desktop asks again every 5 minutes and when
   its route to the server changes.
@@ -114,20 +115,45 @@ destination's AI is up. Work an administrator sends to Frameleaf Cloud stays on 
 
 Any number of desktops can work the same queue. Each desktop holds at most one lease. `claim` takes
 the oldest task its qualified models can run, with `FOR UPDATE SKIP LOCKED`, so whichever desktop
-asks first gets the next item. To keep them all busy, the server starts one extra job in that
-queue (`smartSearch`, `faceDetection`, `ocr`) for each desktop that is online (seen in the last
-90 seconds) and holds a model for it. That is on top of the administrator's own concurrency setting.
-The broker still holds at most 32 open tasks.
+asks first gets the next item. To keep them busy, the server starts one extra job in a queue
+(`smartSearch`, `faceDetection`, `ocr`) for a desktop only when all of these hold: the desktop is
+online (a request in the last 150 seconds: the lease plus 30 seconds), its account is still
+approved, it holds an unexpired qualification for the model the settings ask for now, and that
+queue's work would go to desktops first (the first place in the processing order that is available
+now is the desktops). A desktop is counted for one queue at a time: the queue whose job it is
+running or, while free, the first of smart search, faces and text that it can work and that has
+jobs waiting. With the server itself first in the order and its AI answering, no extra jobs start.
+That is on top of the administrator's own concurrency setting. The broker still holds at most 32
+open tasks.
+
+For a route pinned to the server, desktops come after the server (it is tried first); for the
+default order, wherever "your computers" sits in the administrator's order.
+
+`task.modelKey` in a claim is the key this desktop holds the model under. A task made for one
+runtime revision's CLIP key is leased to a desktop holding the same encoder under its own
+revision's key. `task.qualificationId` is the desktop's current qualification for that model.
 
 ### Leases
 
-- Each desktop holds one lease. A heartbeat extends it; the result or a failure ends it.
+- Each desktop holds one lease. It lasts 120 seconds from each heartbeat (the desktop sends one
+  every 20 seconds); the result or a failure ends it. Qualifying again while holding a lease does
+  not end it.
 - `POST /api/desktop/tasks/{id}/fail` `{code}` takes `inference-failed`, `input-invalid`,
   `model-unavailable` or `cancelled`, and the server logs the code. The desktop sends `cancelled`
   when it hands a lease back unfinished (Stop, sign-out, library switch, quitting the app, a pause
   for power or network, waking from sleep), `input-invalid` when the input does not match its hash
   or the model refuses that one input, `model-unavailable` when its runtime process stopped, and
   `inference-failed` otherwise. Pause (the person's own) lets the task in hand finish first.
+- `cancelled` puts the task straight back in line and does not count toward the three failures
+  after which the task itself fails. The other three codes each count.
+- **Grant withdrawal.** After three `inference-failed` or `model-unavailable` in a row from one
+  worker session for one model (a result in between resets the count; `cancelled` and
+  `input-invalid` do not count), the server withdraws that model from the desktop: its
+  qualification is deleted, `claim` returns nothing for it and
+  `GET /worker/qualifications/{id}` answers `401 desktop_qualification_invalid`. The `fail` reply is
+  still `{"accepted": true}`, and `/models` still lists the model, so a new challenge and report
+  grant it again. The desktop counts the same failures itself and, at the third in a row,
+  qualifies again without being told.
 - On a stop the desktop gives the task in hand up to 3 seconds to send `cancelled`, and a claim
   already sent up to 2 seconds to answer so a task leased in that moment is handed straight back.
 - Signed requests are sent one at a time, in sequence order.
@@ -153,18 +179,26 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 | 403 | `desktop_worker_photo_session_required` / `desktop_photo_session_required` (session issue) | The photo sign-in ended | `worker_sign_in_required` | Stops; sign in again |
 | 401 | `desktop_lease_invalid` | Lease no longer held, including a lease lost while its input is read | `worker_lease_refused` | Drops that task, reports nothing more about it, claims the next |
 | 401 | `desktop_challenge_invalid` / `desktop_qualification_invalid` / `desktop_worker_activation_invalid` | Challenge or qualification expired, or not this session's | `worker_qualification_restart` | New challenge for that model, after a short wait |
-| 409 | `desktop_challenge_conflict` / `_capacity` / `_too_large` / `_runtime_invalid`, `desktop_qualification_capacity` | Challenge bookkeeping | `worker_challenge_busy` | Same; never stops |
+| 409 | `desktop_challenge_conflict` / `_capacity` / `_too_large` / `_runtime_invalid`, `desktop_qualification_capacity`, `desktop_clip_publication_isolation` | Challenge and grant bookkeeping | `worker_challenge_busy` | Same; never stops |
 | 409 | `desktop_model_profile_unavailable` | Task turned off, or model changed, since inventory | `workload_desktop_model_profile_unavailable` | Reads `/models` again and follows it |
 | 409 | `desktop_model_profile_changed` | Profile changed between challenge and report | `workload_desktop_model_profile_changed` | Same |
-| 409 | `desktop_pool_model_unavailable`, `desktop_clip_profile_unavailable`, `desktop_face_profile_unavailable` | The granted model is no longer the task's model | `workload_<message>` | Same |
-| 409 | `desktop_clip_index_incompatible` / `_dimensions` / `_invalid` / `_changed`, `desktop_clip_space_unavailable` | Library already has smart-search vectors from another model | `workload_<message>` | That task stays off, the others work; tried again every 30 minutes |
+| 409 | `desktop_pool_model_unavailable` (report only) | The qualification is for another key than the one being granted | `workload_<message>` | Same |
+| 409 | `desktop_clip_index_changed` / `_dimensions` | An administrator changed the search model and the server is still resetting the index (seconds to a minute) | `workload_<message>` | That task waits, the others work; tried again after 2 minutes |
+| 409 | `desktop_clip_index_incompatible` / `_invalid`, `desktop_clip_space_unavailable` | The library holds vectors tagged with another model's key, or the stored index does not match the release | `workload_<message>` | That task stays off, the others work; tried again every 30 minutes |
+| 400 | `desktop_result_invalid` / `desktop_result_too_large` (result) | The result is not what the task's model returns, or is over 4 MB. Nothing is staged and the lease stays | `server_http_400` | Fails that task with `inference-failed`, claims the next |
+| 400 | `desktop_worker_payload_invalid` / `desktop_qualification_payload_invalid` | Payload not the schema | `server_http_400` | On a task: drops that task. Elsewhere: stops and shows it |
 | 400 | `desktop_runtime_attestation_invalid` | Runtime not factory-signed, or epoch below the floor | `worker_runtime_unsigned` | GPU runtime: falls back to the processor runtime. Processor runtime: stops and says so |
 | 400 | `desktop_qualification_report_invalid` | Report does not match profile or runtime | `worker_qualification_report_refused` | Same |
 | 200 | `{"accepted": false}` on report | Report not accepted | `worker_qualification_refused` | GPU: falls back to the processor. Processor: that task is off |
-| 200 | `{"accepted": false}` on heartbeat / result | Lease gone | `worker_lease_lost` / `worker_result_refused` | Drops that task, claims the next |
+| 200 | `{"accepted": false}` on heartbeat / result / fail | Lease gone | `worker_lease_lost` / `worker_result_refused` | Drops that task, claims the next |
 | 5xx, 408, 429 | any or none | Server failing or busy (500 is treated like 503) | `server_http_<status>` | Retries with backoff; never stops |
 | other 4xx | unknown, on `tasks/{id}/input`, `/result`, `/fail`, `heartbeat` | — | `server_http_<status>` | Drops that task only (a bare 401 or 403 stops the worker) |
 | other 4xx | unknown, elsewhere | — | `server_http_<status>` | GPU runtime while qualifying: falls back to the processor. Otherwise stops and shows it |
+
+When the server refuses every task for a reason of its own (the `desktop_clip_index_*` rows with
+smart search the only task), the desktop waits the same 2 or 30 minutes and offers again; it does
+not stop. `desktop_clip_profile_unavailable` and `desktop_face_profile_unavailable` are understood
+by the desktop (like `desktop_model_profile_unavailable`) but no current server sends them.
 
 A run of dropped tasks or server errors slows the claims down (up to about a minute apart) and
 shows the reason; it does not stop the worker.

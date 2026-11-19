@@ -680,7 +680,9 @@ pub(crate) fn worker_refusal(status: u16, message: &str) -> String {
         | "desktop_challenge_capacity"
         | "desktop_challenge_too_large"
         | "desktop_challenge_runtime_invalid"
-        | "desktop_qualification_capacity" => "worker_challenge_busy",
+        | "desktop_qualification_capacity"
+        // The grant collided with another one being published: the server says to retry.
+        | "desktop_clip_publication_isolation" => "worker_challenge_busy",
         _ => return format!("server_http_{status}"),
     };
     code.into()
@@ -759,6 +761,11 @@ fn refusals_are_named_by_message_whatever_the_status() {
         (
             500,
             "desktop_qualification_capacity",
+            "worker_challenge_busy",
+        ),
+        (
+            409,
+            "desktop_clip_publication_isolation",
             "worker_challenge_busy",
         ),
         (401, "desktop_lease_invalid", "worker_lease_refused"),

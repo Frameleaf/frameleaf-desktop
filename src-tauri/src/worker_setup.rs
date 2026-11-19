@@ -338,9 +338,25 @@ fn session_saved(saved: &SavedConnection) -> bool {
 const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
 /// How often a working computer asks the server which models its tasks use now.
 const MODEL_RECHECK: Duration = Duration::from_secs(5 * 60);
-/// How often a task the server refused here (not the model: the library's index, say) is tried
-/// again while the others work.
-const REFUSED_TASK_RECHECK: Duration = Duration::from_secs(30 * 60);
+/// How long until a task the server refused here (not the model: the library's index, say) is
+/// offered again. While an administrator's change of the search model is still being applied
+/// on the server the wait is short; a library built with another model is a long one.
+fn refused_task_retry(code: &str) -> Duration {
+    let code = code.strip_prefix("workload_").unwrap_or(code);
+    Duration::from_secs(
+        if matches!(
+            code,
+            "desktop_clip_index_changed" | "desktop_clip_index_dimensions"
+        ) {
+            2 * 60
+        } else {
+            30 * 60
+        },
+    )
+}
+/// The server withdraws a model from this computer after this many failed tasks in a row
+/// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
+const GRANT_STRIKES: u32 = 3;
 /// How long a stop waits for the held lease to be handed back to the server.
 const LEASE_RETURN: Duration = Duration::from_secs(3);
 /// How long quitting the app waits for the worker to stop and hand its lease back.
@@ -370,6 +386,13 @@ where
         let result = reconnect(progress, fresh, &mut attempt).await;
         fresh = false;
         match result {
+            // The server refused every task for a reason of its own (`first_failure` took the
+            // `workload_` off): nothing here is broken. Wait and offer again.
+            Err(code) if code.starts_with("desktop_") => {
+                let wait = refused_task_retry(&code);
+                progress.set("paused", Some(code));
+                recheck_after(progress, wait).await?;
+            }
             // An administrator can assign work, or update the server, at any time: ask again later.
             Err(code)
                 if matches!(
@@ -1328,6 +1351,7 @@ async fn prepare_on(
     }
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
+    let mut strikes = 0u32;
     'qualification: loop {
         // The provider chosen for each workload; a failed provider is demoted and this restarts.
         let groups = plan.groups();
@@ -1699,26 +1723,26 @@ async fn prepare_on(
                 }) {
                     continue 'qualification;
                 }
-                // The server may have changed a task's model, or turned a task on or off.
-                let refused_task = progress
+                // A task the server refused for a reason of its own is offered again in time.
+                let offer_again = progress
                     .status
                     .lock()
                     .unwrap()
                     .workloads
                     .iter()
-                    .any(|item| {
-                        item.state == "unavailable"
-                            && item
-                                .code
-                                .as_deref()
-                                .is_some_and(|code| code.starts_with("workload_"))
-                    });
+                    .filter(|item| item.state == "unavailable")
+                    .filter_map(|item| item.code.as_deref())
+                    .filter(|code| code.starts_with("workload_"))
+                    .map(refused_task_retry)
+                    .min();
+                if offer_again.is_some_and(|wait| prepared_at.elapsed() >= wait) {
+                    predictor.stop()?;
+                    return Err("worker_models_changed".into());
+                }
+                // The server may have changed a task's model, or turned a task on or off.
                 if models_checked.elapsed() >= MODEL_RECHECK {
                     models_checked = std::time::Instant::now();
-                    // A task the server refused for another reason is offered again in time.
-                    if models_changed().await
-                        || (refused_task && prepared_at.elapsed() >= REFUSED_TASK_RECHECK)
-                    {
+                    if models_changed().await {
                         predictor.stop()?;
                         return Err("worker_models_changed".into());
                     }
@@ -1741,9 +1765,25 @@ async fn prepare_on(
                 match completed {
                     Ok(Step::Completed) => {
                         failures.completed();
+                        strikes = 0;
                         progress.completed();
                     }
-                    Ok(Step::Dropped(code)) => {
+                    Ok(step @ (Step::Dropped(_) | Step::Busy(_))) => {
+                        let (code, task_failed) = match step {
+                            Step::Dropped(code) => (code, true),
+                            Step::Busy(code) => (code, false),
+                            _ => unreachable!(),
+                        };
+                        if task_failed && crate::native_predictor::counts_against_grant(&code) {
+                            strikes += 1;
+                        }
+                        if strikes >= GRANT_STRIKES {
+                            // By now the server has withdrawn the model and will lease nothing
+                            // for it: qualify again, which grants it again.
+                            strikes = 0;
+                            predictor.stop()?;
+                            continue 'qualification;
+                        }
                         // FD-52: the accelerated runtime's process died while inferring: its
                         // workloads move to the processor instead of crashing on every restart.
                         let lane = predictor.failed_lane().map(str::to_owned);
@@ -2981,7 +3021,7 @@ mod tests {
             .await?;
             match step {
                 Step::Completed => failures.completed(),
-                Step::Dropped(_) => drop(failures.dropped()),
+                Step::Dropped(_) | Step::Busy(_) => drop(failures.dropped()),
                 Step::Idle => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
@@ -3229,6 +3269,61 @@ mod tests {
         // No backoff, and nothing shown as a fault.
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(progress.status.lock().unwrap().state, "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_of_every_task_by_the_server_is_waited_out_and_offered_again() {
+        // The search model is being changed on the server: minutes, not a stop.
+        assert_eq!(
+            refused_task_retry("workload_desktop_clip_index_changed"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            refused_task_retry("desktop_clip_index_dimensions"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            refused_task_retry("workload_desktop_clip_index_incompatible"),
+            Duration::from_secs(1800)
+        );
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let seen = statuses.clone();
+        let progress = Progress {
+            notify: Arc::new(move |status: SetupStatus| {
+                seen.lock().unwrap().push((status.state, status.code))
+            }),
+            ..quiet()
+        };
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = supervise(
+            &progress,
+            false,
+            |_| {
+                let first = attempts.fetch_add(1, Ordering::AcqRel) == 0;
+                async move {
+                    if first {
+                        // What `first_failure` reports when the only task was refused.
+                        Err("desktop_clip_index_changed".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || async { None },
+            ROUTE_POLL,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert!(started.elapsed() >= Duration::from_secs(120));
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            [(
+                "paused".to_owned(),
+                Some("desktop_clip_index_changed".to_owned())
+            )]
+        );
     }
 
     #[test]

@@ -197,6 +197,19 @@ pub(crate) enum Step {
     Completed,
     /// One task was given up. The session and its qualifications stay good for the next claim.
     Dropped(String),
+    /// Nothing was claimed: the server is failing or busy. Ask again after a pause.
+    Busy(String),
+}
+/// The server counts this failed task against the model's grant: after three in a row from one
+/// session it withdraws the model from this computer, without saying so (`claim` then returns
+/// nothing for it). A handed-back lease, a refused input and a lease the server already ended
+/// are not counted.
+pub(crate) fn counts_against_grant(code: &str) -> bool {
+    !lease_gone(code)
+        && matches!(
+            failure_report(code),
+            WorkerFailure::InferenceFailed | WorkerFailure::ModelUnavailable
+        )
 }
 struct TaskFailure {
     code: String,
@@ -323,7 +336,7 @@ async fn next_task(
         Ok(Some(claimed)) => Ok(Ok(claimed)),
         Ok(None) => Ok(Err(Step::Idle)),
         // Nothing was claimed and nothing is wrong with this session: ask again after a pause.
-        Err(code) if server_unavailable(&code) => Ok(Err(Step::Dropped(code))),
+        Err(code) if server_unavailable(&code) => Ok(Err(Step::Busy(code))),
         Err(code) => Err(code),
     }
 }
@@ -705,7 +718,7 @@ impl NativePredictor {
             Step::Completed => Ok(true),
             Step::Idle => Ok(false),
             // This owner has no way to carry on after a dropped task: it ends with the error.
-            Step::Dropped(code) => {
+            Step::Dropped(code) | Step::Busy(code) => {
                 self.stop()?;
                 Err(code)
             }
@@ -1014,6 +1027,23 @@ mod tests {
             "server_http_422",
         ] {
             assert!(task_scoped(code), "{code}");
+        }
+        // Three of these in a row and the server withdraws the model: the worker qualifies again.
+        for code in [
+            "worker_execution_deadline",
+            "server_http_400",
+            "runtime_process_stopped",
+        ] {
+            assert!(counts_against_grant(code), "{code}");
+        }
+        for code in [
+            "worker_cancelled",
+            "worker_input_invalid",
+            "runtime_prediction_refused",
+            "worker_lease_lost",
+            "worker_result_refused",
+        ] {
+            assert!(!counts_against_grant(code), "{code}");
         }
         // What the server hears about a task given up.
         for (code, report) in [

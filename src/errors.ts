@@ -363,6 +363,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['renewing', 'Your server asked this computer to check its models again. Frameleaf does that by itself.', 'worker_qualification_restart'],
   ['renewing', 'Your server is busy checking other computers. Frameleaf asks again by itself.', 'worker_challenge_busy'],
   ['', 'Your server changed which AI models it uses. This computer is setting up the new ones by itself.', 'worker_models_changed'],
+  ['', 'Your server is switching its smart search model. This computer tries again in a couple of minutes.', 'desktop_clip_index_changed desktop_clip_index_dimensions'],
   ['removed', 'Your server no longer accepts this computer for AI processing. Ask the person who runs your server to allow this computer again. If this computer’s date and time are wrong, correct them first.', 'worker_device_refused'],
   ['setup-mismatch', 'Your sign-in to your server has ended, so AI processing stopped. Sign out and sign in again.', 'worker_sign_in_required'],
   // FD-37: only logged; setup continues without the receipt.
@@ -375,7 +376,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   // Desktop auto-setup (docs/desktop-worker-setup-protocol.md): one specific reason each.
   ['', 'Your server needs an update before this computer can do its AI work. Update Frameleaf on your server. This computer checks again every few minutes.', 'server_update_required desktop_pool_config_changed desktop_pool_destination_changed desktop_pool_route_changed desktop_route_review_required desktop_nas_producer_unavailable desktop_nas_face_producer_unavailable desktop_nas_fixture_mismatch desktop_nas_model_unavailable desktop_nas_producer_changed desktop_nas_producer_expired'],
   ['', 'Your server turned this AI task off, or changed its model, while this computer was checking it. Other tasks continue. Try again to use the new settings.', 'desktop_model_profile_unavailable desktop_model_profile_changed desktop_clip_profile_unavailable desktop_face_profile_unavailable desktop_clip_space_unavailable desktop_pool_model_unavailable'],
-  ['', 'Your library’s smart search was built with a different model, so this computer can’t add to it. A server administrator can run Smart search again for all photos with the selected model.', 'desktop_clip_index_changed desktop_clip_index_dimensions desktop_clip_index_incompatible desktop_clip_index_invalid'],
+  ['', 'Your library’s smart search was built with a different model, so this computer can’t add to it. A server administrator can run Smart search again for all photos with the selected model.', 'desktop_clip_index_incompatible desktop_clip_index_invalid'],
   ['', 'This computer ran the selected model on its built-in test picture and got a different answer than expected, so the model was not used. Try again. If it keeps happening, this computer can’t run this model correctly.', 'runtime_output_mismatch'],
   ['', 'This computer ran out of memory running the selected model. Close other apps, then try again. A smaller model on your server needs less memory.', 'runtime_out_of_memory'],
   ['', 'The selected model’s files on this computer are missing or changed. Try again to download and check them again.', 'runtime_model_missing'],
