@@ -1,0 +1,162 @@
+{
+  "snapshots": [
+    {
+      "key": "s/000000000001-1d1fc75e86eb8552",
+      "tree": "7560dea224582d90b1ef465153e0f6ac61dc3d8eab5a2efdbddad3a4183b6cbc",
+      "stats": {
+        "files": 8,
+        "folders": 3,
+        "bytes": 460267,
+        "storedBytes": 613562
+      },
+      "expected": {
+        "Documents": {
+          "type": "dir",
+          "mode": 493
+        },
+        "Documents/notes.txt": {
+          "type": "file",
+          "sha256": "7a40ca82f69b57030287903e9c3d0585900ad7756e65c77559fcf502c7472fb8",
+          "mode": 420,
+          "mtime": 1700000001000
+        },
+        "Documents/Tax": {
+          "type": "dir",
+          "mode": 493
+        },
+        "Documents/Tax/Return 2025.xlsx": {
+          "type": "file",
+          "sha256": "d9df2b066677d3a7e26e7ff2f633fede1f72caeab0b418fa23476116cad9d89f",
+          "mode": 384,
+          "mtime": 1700000003000
+        },
+        "big.bin": {
+          "type": "file",
+          "sha256": "3f8ca4ccc9baa068d1a5de0fa2da966d68003f8b9cd75d9d1c6604f118012788",
+          "mode": 420,
+          "mtime": 1700000004000
+        },
+        "nothing": {
+          "type": "file",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "mode": 420,
+          "mtime": 1700000005000
+        },
+        "link": {
+          "type": "symlink",
+          "target": "Documents/notes.txt"
+        },
+        "old.txt": {
+          "type": "file",
+          "sha256": "df9c4cb00e69aa2dbef9b57d1f8294acbaf8e008c36956d09200cbc5d75b6882",
+          "mode": 420,
+          "mtime": -86400123
+        },
+        "empty": {
+          "type": "dir",
+          "mode": 493
+        },
+        "Ünïcode ✓.txt": {
+          "type": "file",
+          "sha256": "5c594189297afe36d9210ccc9ea92a3c05af5883cd7d47dc4d3f0fbd98da67f8",
+          "mode": 420,
+          "mtime": 1700000008000
+        },
+        "z�.txt": {
+          "type": "file",
+          "sha256": "95713e9cbdd1dfcb2d4080c2537f418d43ca0da25f0d7d6631f4f7c97b89dc47",
+          "mode": 420,
+          "mtime": 1700000009000
+        },
+        "z😀.txt": {
+          "type": "file",
+          "sha256": "fa1eadc4c6995667412681c69ce33adfc9302a2965f521c40908549e670e2e4e",
+          "mode": 420,
+          "mtime": 1700000010000
+        }
+      }
+    },
+    {
+      "key": "s/000000000002-4560f68554bfdda4",
+      "tree": "15e38829eabe2f42b5480cb5b5f6349254ad888605b2a21e18878896145f182e",
+      "stats": {
+        "files": 9,
+        "folders": 3,
+        "bytes": 485867,
+        "storedBytes": 29711
+      },
+      "expected": {
+        "Documents": {
+          "type": "dir",
+          "mode": 493
+        },
+        "Documents/notes.txt": {
+          "type": "file",
+          "sha256": "99faf46dd902ffdec2ebd466faedfdd2f823c45d4f8127a6802f9ea16e8d665d",
+          "mode": 420,
+          "mtime": 1700100000000
+        },
+        "Documents/Tax": {
+          "type": "dir",
+          "mode": 493
+        },
+        "Documents/Tax/Return 2025.xlsx": {
+          "type": "file",
+          "sha256": "d9df2b066677d3a7e26e7ff2f633fede1f72caeab0b418fa23476116cad9d89f",
+          "mode": 384,
+          "mtime": 1700000003000
+        },
+        "big.bin": {
+          "type": "file",
+          "sha256": "3f8ca4ccc9baa068d1a5de0fa2da966d68003f8b9cd75d9d1c6604f118012788",
+          "mode": 420,
+          "mtime": 1700000004000
+        },
+        "nothing": {
+          "type": "file",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "mode": 420,
+          "mtime": 1700000005000
+        },
+        "link": {
+          "type": "symlink",
+          "target": "Documents/notes.txt"
+        },
+        "old.txt": {
+          "type": "file",
+          "sha256": "df9c4cb00e69aa2dbef9b57d1f8294acbaf8e008c36956d09200cbc5d75b6882",
+          "mode": 420,
+          "mtime": -86400123
+        },
+        "empty": {
+          "type": "dir",
+          "mode": 493
+        },
+        "Ünïcode ✓.txt": {
+          "type": "file",
+          "sha256": "5c594189297afe36d9210ccc9ea92a3c05af5883cd7d47dc4d3f0fbd98da67f8",
+          "mode": 420,
+          "mtime": 1700000008000
+        },
+        "z�.txt": {
+          "type": "file",
+          "sha256": "95713e9cbdd1dfcb2d4080c2537f418d43ca0da25f0d7d6631f4f7c97b89dc47",
+          "mode": 420,
+          "mtime": 1700000009000
+        },
+        "z😀.txt": {
+          "type": "file",
+          "sha256": "fa1eadc4c6995667412681c69ce33adfc9302a2965f521c40908549e670e2e4e",
+          "mode": 420,
+          "mtime": 1700000010000
+        },
+        "Documents/new.bin": {
+          "type": "file",
+          "sha256": "2872ac30043481db53b2712bb88b607335d04b912b44427ec8ba0fd751bd215e",
+          "mode": 420,
+          "mtime": 1700100001000
+        }
+      }
+    }
+  ]
+}

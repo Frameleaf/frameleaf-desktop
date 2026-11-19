@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.90"
 default-run = "frameleaf-desktop"
 
+[workspace]
+# The backup engine is its own crate so it builds and tests without Tauri; listed in default-members so
+# `cargo test`, `cargo clippy` and `cargo fmt` here cover it too.
+members = ["backup-core"]
+default-members = [".", "backup-core"]
+
 [lib]
 name = "frameleaf_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]

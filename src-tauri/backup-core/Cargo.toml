@@ -1,0 +1,30 @@
+[package]
+name = "frameleaf-backup-core"
+description = "Frameleaf's backup repository (frameleaf-repository v1), the Rust port of packages/backup-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+scrypt = { version = "0.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
