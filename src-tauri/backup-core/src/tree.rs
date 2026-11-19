@@ -119,7 +119,7 @@ pub fn file_chunks(repository: &Repository, entry: &Entry) -> Result<Vec<Id>> {
     let mut ids = Vec::new();
     for list in lists {
         let data = repository.read_blob(&parse_id(list)?)?;
-        ids.extend(data.chunks_exact(32).map(|id| <Id>::try_from(id).unwrap()));
+        ids.extend(data.as_chunks::<32>().0.iter().copied());
     }
     Ok(ids)
 }

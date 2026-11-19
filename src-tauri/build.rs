@@ -1,6 +1,8 @@
 fn main() {
+    // A build script's cfg is the host's: also check the target, so building on a Mac for Windows skips the
+    // Objective-C files (cc is a build dependency only on Mac hosts).
     #[cfg(target_os = "macos")]
-    {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=src/macos_keychain.m");
         println!("cargo:rerun-if-changed=src/macos_keychain.h");
         println!("cargo:rerun-if-changed=src/finder_import.m");

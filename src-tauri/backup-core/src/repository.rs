@@ -105,7 +105,9 @@ fn decode_entries(data: &[u8]) -> Result<Vec<PackEntry>> {
         return Err(Error::Unseal);
     }
     Ok(data
-        .chunks_exact(ENTRY)
+        .as_chunks::<ENTRY>()
+        .0
+        .iter()
         .map(|record| PackEntry {
             id: record[..32].try_into().unwrap(),
             offset: u32::from_be_bytes(record[32..36].try_into().unwrap()),

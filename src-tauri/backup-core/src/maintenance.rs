@@ -114,7 +114,7 @@ fn mark(
             let list = parse_id(list)?;
             live.insert(list);
             if let Some(ids) = read(&list, &mut missing)? {
-                live.extend(ids.chunks_exact(32).map(|id| <Id>::try_from(id).unwrap()));
+                live.extend(ids.as_chunks::<32>().0.iter().copied());
             }
         }
     }
