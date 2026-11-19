@@ -101,9 +101,9 @@ await withBrowser(async ({ browser, origin }) => {
   await page.reload();
   await heading('My computer').waitFor();
   await sidebar.getByRole('button', { name: 'AI credit' }).waitFor();
-  await page.keyboard.press('Meta+7');
-  await heading('AI credit').waitFor();
   await page.keyboard.press('Meta+8');
+  await heading('AI credit').waitFor();
+  await page.keyboard.press('Meta+9');
   await heading('Remote access').waitFor();
   const remoteToggle = page.getByRole('switch', { name: 'Remote access' });
   const refreshCount = calls.filter(command => command === 'server_summary').length;
@@ -118,7 +118,7 @@ await withBrowser(async ({ browser, origin }) => {
   await page.reload();
   await heading('My computer').waitFor();
   assert.equal(await sidebar.getByRole('button', { name: 'AI credit' }).count(), 0);
-  await page.keyboard.press('Meta+4');
+  await page.keyboard.press('Meta+5');
   await heading('Test library').waitFor();
   const authorize = page.getByRole('button', { name: 'Authorize…' });
   await authorize.click();

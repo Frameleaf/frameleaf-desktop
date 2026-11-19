@@ -16,6 +16,7 @@
   import Cloud from './pages/Cloud.svelte';
   import Wallet from './pages/Wallet.svelte';
   import Remote from './pages/Remote.svelte';
+  import ComputerBackup from './pages/ComputerBackup.svelte';
   import { initials, hostOf } from './ui-state';
   import { connectionError, errorCopy } from './errors';
   import StepUp from './StepUp.svelte';
@@ -268,8 +269,8 @@
     go(target, true);
   }
   const nav: { section: string; items: { id: Page; label: string; icon: string }[]; admin?: boolean }[] = [
-    { section: 'My computer', items: [{ id: 'overview', label: 'Overview', icon: 'overview' }, { id: 'sources', label: 'Photo sources', icon: 'sources' }, { id: 'ai', label: 'AI processing', icon: 'ai' }] },
-    { section: 'Server', items: [{ id: 'manager', label: 'Manager', icon: 'server' }, { id: 'backups', label: 'Backups', icon: 'backup' }] },
+    { section: 'My computer', items: [{ id: 'overview', label: 'Overview', icon: 'overview' }, { id: 'sources', label: 'Photo sources', icon: 'sources' }, { id: 'ai', label: 'AI processing', icon: 'ai' }, { id: 'computer-backup', label: 'Computer backup', icon: 'cloud' }] },
+    { section: 'Server', items: [{ id: 'manager', label: 'Manager', icon: 'server' }, { id: 'backups', label: 'Recovery points', icon: 'backup' }] },
     { section: 'Frameleaf Cloud', admin: true, items: [{ id: 'cloud', label: 'Account & plan', icon: 'cloud' }, { id: 'wallet', label: 'AI credit', icon: 'wallet' }, { id: 'remote', label: 'Remote access', icon: 'globe' }] },
   ];
 </script>
@@ -360,6 +361,8 @@
       <Overview {connection} {setup} {summary} {native} stepUp={summaryStepUp.request} onstepupclose={() => { summaryStepUp = stepUpDismissed; }} section={page === 'ai' ? 'ai' : 'all'} onsetup={value => { setup = value; }} onconnection={value => { connection = value; }} onrefresh={loadSummary} onsignout={() => { signOutSheet = true; }} onopen={target => go(target, true)} />
     {:else if page === 'sources'}
       <PhotoSourcesPage />
+    {:else if page === 'computer-backup'}
+      <ComputerBackup {native} />
     {:else if page === 'manager'}
       {#key managerRevision}<Manager onstate={paired => { managerPaired = paired; }} />{/key}
     {:else if page === 'backups'}

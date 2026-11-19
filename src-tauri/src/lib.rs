@@ -2,6 +2,10 @@ mod accelerated_pack;
 mod camera_identity;
 mod camera_sources;
 pub mod cloud_account;
+pub mod computer_backup;
+mod computer_backup_cloud;
+mod computer_backup_commands;
+mod computer_backup_platform;
 pub mod connection;
 pub mod copy_source;
 pub mod copy_upload;
@@ -963,6 +967,7 @@ pub fn run() {
         .manage(cloud_account::email::EmailAttempt::default())
         .manage(cloud_account::ServerStep::default())
         .manage(reconnect::Reconnect::default())
+        .manage(computer_backup_commands::ComputerBackup::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let placement = app.state::<window_placement::WindowPlacement>();
@@ -990,6 +995,32 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            computer_backup_commands::computer_backup_status,
+            computer_backup_commands::computer_backup_refresh,
+            computer_backup_commands::computer_backup_connect,
+            computer_backup_commands::computer_backup_connect_again,
+            computer_backup_commands::computer_backup_cancel_connect,
+            computer_backup_commands::computer_backup_connect_poll,
+            computer_backup_commands::computer_backup_set_folders,
+            computer_backup_commands::computer_backup_add_folder,
+            computer_backup_commands::computer_backup_setup_key,
+            computer_backup_commands::computer_backup_key_saved,
+            computer_backup_commands::computer_backup_show_key,
+            computer_backup_commands::computer_backup_download_kit,
+            computer_backup_commands::computer_backup_set_schedule,
+            computer_backup_commands::computer_backup_finish,
+            computer_backup_commands::computer_backup_run_now,
+            computer_backup_commands::computer_backup_stop,
+            computer_backup_commands::computer_backup_open_full_disk_access,
+            computer_backup_commands::computer_backup_open_plans,
+            computer_backup_commands::computer_backup_backups,
+            computer_backup_commands::computer_backup_browse,
+            computer_backup_commands::computer_backup_choose_target,
+            computer_backup_commands::computer_backup_restore,
+            computer_backup_commands::computer_backup_locked_copy,
+            computer_backup_commands::computer_backup_disconnect,
+            computer_backup_commands::computer_backup_delete,
+            computer_backup_commands::computer_backup_keep,
             updates::check_desktop_update,
             updates::install_desktop_update,
             host_commands::open_local_photos,

@@ -5,11 +5,13 @@ fn main() {
         println!("cargo:rerun-if-changed=src/macos_keychain.h");
         println!("cargo:rerun-if-changed=src/finder_import.m");
         println!("cargo:rerun-if-changed=src/macos_quit.m");
+        println!("cargo:rerun-if-changed=src/macos_user_presence.m");
         cc::Build::new()
             .files([
                 "src/macos_keychain.m",
                 "src/finder_import.m",
                 "src/macos_quit.m",
+                "src/macos_user_presence.m",
             ])
             .flag("-fobjc-arc")
             .compile("frameleaf_keychain");
@@ -20,6 +22,32 @@ fn main() {
     }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "computer_backup_status",
+            "computer_backup_refresh",
+            "computer_backup_connect",
+            "computer_backup_connect_again",
+            "computer_backup_cancel_connect",
+            "computer_backup_connect_poll",
+            "computer_backup_set_folders",
+            "computer_backup_add_folder",
+            "computer_backup_setup_key",
+            "computer_backup_key_saved",
+            "computer_backup_show_key",
+            "computer_backup_download_kit",
+            "computer_backup_set_schedule",
+            "computer_backup_finish",
+            "computer_backup_run_now",
+            "computer_backup_stop",
+            "computer_backup_open_full_disk_access",
+            "computer_backup_open_plans",
+            "computer_backup_backups",
+            "computer_backup_browse",
+            "computer_backup_choose_target",
+            "computer_backup_restore",
+            "computer_backup_locked_copy",
+            "computer_backup_disconnect",
+            "computer_backup_delete",
+            "computer_backup_keep",
             "open_local_photos",
             "check_desktop_update",
             "install_desktop_update",

@@ -21,5 +21,7 @@ test('uses Command on macOS and Control on Windows and Linux for number shortcut
   assert.equal(shortcutPage({ ...event, metaKey: true, ctrlKey: true }, true), null);
   assert.equal(shortcutPage({ ...event, metaKey: true, shiftKey: true }, true), null);
   assert.equal(shortcutPage({ ...event, ctrlKey: true, altKey: true }, false), null);
-  assert.equal(shortcutPage({ ...event, key: '9', ctrlKey: true }, false), null);
+  assert.equal(shortcutPage({ ...event, key: '4', ctrlKey: true }, false), 'computer-backup');
+  assert.equal(shortcutPage({ ...event, key: '9', ctrlKey: true }, false), 'remote');
+  assert.equal(shortcutPage({ ...event, key: '0', ctrlKey: true }, false), null);
 });
