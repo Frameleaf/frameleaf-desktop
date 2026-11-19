@@ -171,12 +171,12 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 | HTTP | Server `message` | When | Desktop code | What the desktop does |
 |---|---|---|---|---|
 | 403 | `desktop_pool_policy_required` | Account has not turned on Desktop AI processing (every endpoint, session issue and report included) | `worker_policy_required` | Waits; asks again every 5 minutes and when the network changes |
-| 403 | `desktop_worker_lan_required` | Not on the server's home network | `worker_lan_required` | Same |
+| 403 | `desktop_worker_lan_required` | Not on the server's home network (`/worker/*` and `/tasks/*`; not session issue, renew or revoke) | `worker_lan_required` | Same |
 | 409 | `desktop_pool_policy_changed` | The policy the lease or session ran under changed | `worker_policy_changed` | New session, qualify again, carry on |
 | 401 | `desktop_worker_credential_invalid` (worker endpoints) | Worker session ended (household change) or proof refused | `worker_session_rejected` | New session, qualify again, carry on |
 | 401 | `desktop_worker_credential_invalid` (session issue) | The device itself is refused | `worker_device_refused` | Stops and says so |
-| 409 | `desktop_identity_revoked_or_changed` (session issue) | Device revoked | `worker_device_refused` | Stops and says so |
-| 403 | `desktop_worker_photo_session_required` / `desktop_photo_session_required` (session issue) | The photo sign-in ended | `worker_sign_in_required` | Stops; sign in again |
+| 403 | `desktop_worker_photo_session_required` (session issue) | The caller is not a photo session (API key, shared link) | `worker_sign_in_required` | Stops; sign in again |
+| 401 | none, or the server's ordinary sign-in message (session issue) | The photo sign-in expired; refused before the device is looked at | `worker_sign_in_required` | Stops; sign in again |
 | 401 | `desktop_lease_invalid` | Lease no longer held, including a lease lost while its input is read | `worker_lease_refused` | Drops that task, reports nothing more about it, claims the next |
 | 401 | `desktop_challenge_invalid` / `desktop_qualification_invalid` / `desktop_worker_activation_invalid` | Challenge or qualification expired, or not this session's | `worker_qualification_restart` | New challenge for that model, after a short wait |
 | 409 | `desktop_challenge_conflict` / `_capacity` / `_too_large` / `_runtime_invalid`, `desktop_qualification_capacity`, `desktop_clip_publication_isolation` | Challenge and grant bookkeeping | `worker_challenge_busy` | Same; never stops |
@@ -197,7 +197,9 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 
 When the server refuses every task for a reason of its own (the `desktop_clip_index_*` rows with
 smart search the only task), the desktop waits the same 2 or 30 minutes and offers again; it does
-not stop. `desktop_clip_profile_unavailable` and `desktop_face_profile_unavailable` are understood
+not stop. `desktop_identity_revoked_or_changed` comes only from enrolment
+(`POST /api/desktop/devices/enroll`); if it ever arrives at session issue the desktop reads it as a
+refused device. `desktop_clip_profile_unavailable` and `desktop_face_profile_unavailable` are understood
 by the desktop (like `desktop_model_profile_unavailable`) but no current server sends them.
 
 A run of dropped tasks or server errors slows the claims down (up to about a minute apart) and

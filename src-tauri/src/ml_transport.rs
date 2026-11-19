@@ -698,6 +698,9 @@ pub(crate) fn session_refusal(status: u16, message: &str) -> String {
         "desktop_worker_photo_session_required" | "desktop_photo_session_required" => {
             "worker_sign_in_required".into()
         }
+        // Any other 401 here is the server's ordinary sign-in check, before the device is
+        // looked at: the photo sign-in has expired.
+        _ if status == 401 && !message.starts_with("desktop_") => "worker_sign_in_required".into(),
         _ => worker_refusal(status, message),
     }
 }
@@ -808,6 +811,14 @@ fn refusals_are_named_by_message_whatever_the_status() {
             "worker_sign_in_required",
         ),
         (503, "", "server_http_503"),
+        // The photo sign-in expired: refused by the ordinary sign-in check, with its own words.
+        (401, "Authentication required", "worker_sign_in_required"),
+        (401, "", "worker_sign_in_required"),
+        (
+            401,
+            "desktop_pool_policy_required",
+            "worker_policy_required",
+        ),
     ] {
         assert_eq!(
             session_refusal(status, message),
