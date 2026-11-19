@@ -1,0 +1,314 @@
+{
+  "chunker": {
+    "min": 64,
+    "avg": 256,
+    "max": 1024
+  },
+  "packTarget": 65536,
+  "rootKey": "4242424242424242424242424242424242424242424242424242424242424242",
+  "versions": [
+    {
+      "time": "2026-11-01T10:00:00.000Z",
+      "entries": [
+        {
+          "path": [
+            "Documents"
+          ],
+          "type": "dir",
+          "mode": 493,
+          "mtime": 1700000000000
+        },
+        {
+          "path": [
+            "Documents",
+            "notes.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000001000,
+          "content": {
+            "text": "remember the milk\n",
+            "repeat": 400
+          }
+        },
+        {
+          "path": [
+            "Documents",
+            "Tax"
+          ],
+          "type": "dir",
+          "mode": 493,
+          "mtime": 1700000002000
+        },
+        {
+          "path": [
+            "Documents",
+            "Tax",
+            "Return 2025.xlsx"
+          ],
+          "type": "file",
+          "mode": 384,
+          "mtime": 1700000003000,
+          "content": {
+            "noise": [
+              50000,
+              2
+            ]
+          }
+        },
+        {
+          "path": [
+            "big.bin"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000004000,
+          "content": {
+            "noise": [
+              400000,
+              3
+            ]
+          }
+        },
+        {
+          "path": [
+            "nothing"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000005000,
+          "content": {
+            "text": "",
+            "repeat": 1
+          }
+        },
+        {
+          "path": [
+            "link"
+          ],
+          "type": "symlink",
+          "mode": 511,
+          "mtime": 1700000006000,
+          "target": "Documents/notes.txt"
+        },
+        {
+          "path": [
+            "old.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": -86400123,
+          "content": {
+            "text": "from before 1970\n",
+            "repeat": 3
+          }
+        },
+        {
+          "path": [
+            "empty"
+          ],
+          "type": "dir",
+          "mode": 493,
+          "mtime": 1700000007000
+        },
+        {
+          "path": [
+            "Ünïcode ✓.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000008000,
+          "content": {
+            "noise": [
+              3000,
+              5
+            ]
+          }
+        },
+        {
+          "path": [
+            "z�.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000009000,
+          "content": {
+            "text": "replacement",
+            "repeat": 1
+          }
+        },
+        {
+          "path": [
+            "z😀.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000010000,
+          "content": {
+            "text": "smile",
+            "repeat": 1
+          }
+        }
+      ]
+    },
+    {
+      "time": "2026-11-02T10:00:00.000Z",
+      "entries": [
+        {
+          "path": [
+            "Documents"
+          ],
+          "type": "dir",
+          "mode": 493,
+          "mtime": 1700000000000
+        },
+        {
+          "path": [
+            "Documents",
+            "notes.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700100000000,
+          "content": {
+            "text": "remember the milk and the bread\n",
+            "repeat": 400
+          }
+        },
+        {
+          "path": [
+            "Documents",
+            "Tax"
+          ],
+          "type": "dir",
+          "mode": 493,
+          "mtime": 1700000002000
+        },
+        {
+          "path": [
+            "Documents",
+            "Tax",
+            "Return 2025.xlsx"
+          ],
+          "type": "file",
+          "mode": 384,
+          "mtime": 1700000003000,
+          "content": {
+            "noise": [
+              50000,
+              2
+            ]
+          }
+        },
+        {
+          "path": [
+            "big.bin"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000004000,
+          "content": {
+            "noise": [
+              400000,
+              3
+            ]
+          }
+        },
+        {
+          "path": [
+            "nothing"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000005000,
+          "content": {
+            "text": "",
+            "repeat": 1
+          }
+        },
+        {
+          "path": [
+            "link"
+          ],
+          "type": "symlink",
+          "mode": 511,
+          "mtime": 1700000006000,
+          "target": "Documents/notes.txt"
+        },
+        {
+          "path": [
+            "old.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": -86400123,
+          "content": {
+            "text": "from before 1970\n",
+            "repeat": 3
+          }
+        },
+        {
+          "path": [
+            "empty"
+          ],
+          "type": "dir",
+          "mode": 493,
+          "mtime": 1700000007000
+        },
+        {
+          "path": [
+            "Ünïcode ✓.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000008000,
+          "content": {
+            "noise": [
+              3000,
+              5
+            ]
+          }
+        },
+        {
+          "path": [
+            "z�.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000009000,
+          "content": {
+            "text": "replacement",
+            "repeat": 1
+          }
+        },
+        {
+          "path": [
+            "z😀.txt"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700000010000,
+          "content": {
+            "text": "smile",
+            "repeat": 1
+          }
+        },
+        {
+          "path": [
+            "Documents",
+            "new.bin"
+          ],
+          "type": "file",
+          "mode": 420,
+          "mtime": 1700100001000,
+          "content": {
+            "noise": [
+              20000,
+              9
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
