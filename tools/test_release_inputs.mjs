@@ -193,12 +193,13 @@ test("updater verification requires the embedded key, exact bytes and release ve
   }
 });
 
-test("on Forgejo only Windows has a runner to build on", async () => {
+test("on Forgejo only Windows and Linux x86_64 have a runner to build on", async () => {
   const { forgejoTargetProblems } = await import("./release_inputs.mjs");
   assert.deepEqual(forgejoTargetProblems("windows", "runtime"), []);
   assert.deepEqual(forgejoTargetProblems("windows", "installer"), []);
+  assert.deepEqual(forgejoTargetProblems("linux-x86_64", "installer"), []);
   const all = forgejoTargetProblems("all", "runtime");
-  assert.deepEqual(all.map((problem) => problem.split(":")[0]), ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64"]);
+  assert.deepEqual(all.map((problem) => problem.split(":")[0]), ["macos-aarch64", "macos-x86_64", "linux-aarch64"]);
   assert.throws(() => forgejoTargetProblems("all", "publish"), /forgejo_stage_invalid/);
   assert.throws(() => forgejoTargetProblems("everything", "runtime"), /release_platforms_invalid/);
 });

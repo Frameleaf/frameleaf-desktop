@@ -31,8 +31,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    # Release signing runs on GitHub (docs/releases.md, Releasing from Forgejo). On Forgejo this is off
-    # unless the repository variable DESKTOP_RELEASE_ON_FORGEJO is true, which it is not.
+    # On Forgejo this runs only while the repository variable DESKTOP_RELEASE_ON_FORGEJO is true
+    # (docs/releases.md, Releasing from Forgejo).
     if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     permissions:

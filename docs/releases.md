@@ -899,16 +899,16 @@ retained DMG after acceptance.
 
 ## Releasing from Forgejo
 
-CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop. **Release
-signing and publishing stay on GitHub** (owner, 2026-11-18): the release keys
-(`DESKTOP_RELEASE_ED25519_PRIVATE_KEY` for runtime packs, `TAURI_SIGNING_PRIVATE_KEY` for updates,
-and the Apple set) live only in GitHub's `desktop-release` environment and are not copied to
-Forgejo. `factory-runtime.yml`, `installer-candidates.yml`, `release.yml` and the host signing
-workflows are run on GitHub, and GitHub keeps git, tags and the releases the app downloads from.
-
-The release workflows can also run on Forgejo, but that path is off: they skip there unless the
-repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`, and it is not set. Turning it on would
-also need the keys above on Forgejo. For reference, if that ever changes:
+CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop, and so
+can the release chain (owner, 2026-11-19). The release keys cannot be read back from GitHub and
+installed apps accept only updates and runtime packs signed with them, so they are copied, not
+recreated: `copy-release-keys-to-forgejo.yml`, run once from main on GitHub, writes
+`DESKTOP_RELEASE_ED25519_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from the `desktop-release` environment into Forgejo's
+repository secrets and sets the repository variable `DESKTOP_RELEASE_ON_FORGEJO` to `true`. It needs
+the GitHub repository secret `FORGEJO_SECRETS_TOKEN` (a Forgejo token with `write:repository`);
+delete that token and the workflow afterwards. GitHub keeps git, tags and the releases the app
+downloads from, and the keys stay in `desktop-release` too, so macOS can still be released there.
 
 - Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
   The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
@@ -917,6 +917,8 @@ also need the keys above on Forgejo. For reference, if that ever changes:
   runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
   read them, add a repository secret `RUNS_READ_TOKEN` with read access to the repository.
 - A target runs only where Forgejo has a runner it can safely use (`forgejoTargetProblems` in
-  `tools/release_inputs.mjs`). Today that is Windows only (runtime packs and the unsigned
-  installers): there is no Intel Mac or Ubuntu 22.04 runner, and the one Mac runner is the
-  owner's own Mac.
+  `tools/release_inputs.mjs`). Today that is Windows (runtime packs and the unsigned installers)
+  and Linux x86_64, which builds on the Unraid CI slot labelled `ubuntu-22.04` (slot 5, a host-mode
+  slot built from `ghcr.io/catthehacker/ubuntu:runner-22.04`). There is no Intel Mac or Arm Linux
+  runner, and the one Mac runner is the owner's own Mac, so macOS and `linux-aarch64` are released
+  on GitHub; choose `linux-x86_64` rather than `linux` on Forgejo.
