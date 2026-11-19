@@ -319,7 +319,7 @@
     if (recovery.state === 'interrupted') return { label: 'Review interrupted', tone: 'off' };
     return { label: 'Review failed', tone: 'bad' };
   }
-  const title = $derived(focus === 'backups' ? 'Backups' : status?.installation.name || (manager ? 'Manager' : 'Server management'));
+  const title = $derived(focus === 'backups' ? 'Recovery points' : status?.installation.name || (manager ? 'Manager' : 'Server management'));
 </script>
 
 <section class="page" class:embedded aria-labelledby="manager-title">

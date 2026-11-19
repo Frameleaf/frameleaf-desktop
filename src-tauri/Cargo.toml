@@ -28,7 +28,7 @@ cc = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "stream", "blocking"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 ed25519-dalek = "2"
 rand = "0.8"
@@ -36,13 +36,14 @@ base64 = "0.22"
 flate2 = "1"
 url = "2"
 futures-util = "0.3"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+frameleaf-backup-core = { path = "backup-core" }
 sha2 = "0.10"
 sha1 = "0.10"
 ring = "0.17"
 zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "net"] }
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["parsing", "formatting", "local-offset"] }
 
 tauri-plugin-single-instance = "2"
 serde_json_canonicalizer = "=0.3.2"
@@ -66,7 +67,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Com", "Win32_System_IO", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_CloudFilters", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Power", "Win32_System_Shutdown", "Win32_System_SystemInformation"] }
-windows = { version = "0.62", features = ["Networking_Connectivity", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62", features = ["Security_Credentials_UI", "Foundation", "Networking_Connectivity", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
