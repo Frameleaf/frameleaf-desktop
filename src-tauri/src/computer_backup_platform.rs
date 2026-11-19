@@ -168,7 +168,7 @@ pub(crate) fn confirm_owner(reason: &str) -> bool {
             UserConsentVerificationResult, UserConsentVerifier,
         };
         return UserConsentVerifier::RequestVerificationAsync(&HSTRING::from(reason))
-            .and_then(|operation| operation.get())
+            .and_then(|operation| operation.join())
             .is_ok_and(|result| result == UserConsentVerificationResult::Verified);
     }
     // ponytail: Linux has no common prompt; the desktop session itself is the check there.
@@ -181,6 +181,7 @@ pub(crate) fn confirm_owner(reason: &str) -> bool {
 
 // ---------------------------------------------------------------- the background agent
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LABEL: &str = "app.frameleaf.desktop.computer-backup";
 #[cfg(windows)]
 const TASK: &str = "Frameleaf\\Computer Backup";
@@ -191,6 +192,7 @@ fn plist_path() -> PathBuf {
 }
 
 /// The plist launchd runs every 15 minutes, and once at log-in.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn launch_agent_plist(exe: &Path) -> String {
     let escape = |text: &str| {
         text.replace('&', "&amp;")

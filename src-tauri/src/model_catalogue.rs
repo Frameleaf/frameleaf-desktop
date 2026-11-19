@@ -1513,7 +1513,14 @@ mod tests {
                 "CPUExecutionProvider",
             ),
         ] {
-            assert!(served_group(workload, &[key.clone()], &[value], source, provider).is_err());
+            assert!(served_group(
+                workload,
+                std::slice::from_ref(key),
+                &[value],
+                source,
+                provider
+            )
+            .is_err());
         }
         // One missing, a changed field, or a profile that fails validation is refused too.
         assert!(served_group("face", &keys, &[], source, "CPUExecutionProvider").is_err());
