@@ -371,6 +371,12 @@ fn server_task_refusal(code: &str) -> bool {
                 | "desktop_qualification_hold"
         )
 }
+/// A refusal the processor would meet just the same (the model is held back, the library's
+/// index is another model's): the task waits where it is, on the provider it had.
+fn provider_independent(code: &str) -> bool {
+    let code = code.strip_prefix("workload_").unwrap_or(code);
+    code == "desktop_qualification_hold" || code.starts_with("desktop_clip_")
+}
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
 const GRANT_STRIKES: u32 = 3;
@@ -1307,7 +1313,9 @@ async fn prepare_on(
     if !caps.features.worker_auto_setup {
         return Err("server_update_required".into());
     }
-    let worker = WorkerTransport::load(&saved)?.with_clock_skew(caps.clock_skew_ms);
+    let worker = WorkerTransport::load(&saved)?
+        .with_clock_skew(caps.clock_skew_ms)
+        .with_withdrawal_notice(caps.features.worker_withdrawal_notice);
     let (source, provider) = (
         installed.source_revision().to_owned(),
         installed.provider().to_owned(),
@@ -1487,7 +1495,8 @@ async fn prepare_on(
                                 | Refusal::Models
                                 | Refusal::Task
                                 | Refusal::Processor
-                                    if plan.demote(workload, &code, false) =>
+                                    if !provider_independent(&code)
+                                        && plan.demote(workload, &code, false) =>
                                 {
                                     continue 'qualification;
                                 }
@@ -1904,6 +1913,14 @@ async fn prepare_on(
                             continue 'qualification;
                         }
                         break;
+                    }
+                    // The server withdrew a model from this computer (its count of failed
+                    // tasks outlives this setup's). Qualify again: the withdrawn model is
+                    // held back and set aside, the others go back to work.
+                    Err(reason) if reason == "worker_model_withdrawn" => {
+                        predictor.stop()?;
+                        strikes = GrantStrikes::default();
+                        continue 'qualification;
                     }
                     Err(reason) => {
                         // FD-52: the accelerated runtime's process did not serve: use the
@@ -3653,6 +3670,16 @@ mod tests {
                 Duration::from_secs(330)
             );
             assert!(server_task_refusal("desktop_qualification_hold"));
+            // Neither a hold nor another model's index is the provider's doing: the task is
+            // not moved to the processor over it. A changed model still may be.
+            assert!(provider_independent("workload_desktop_qualification_hold"));
+            assert!(provider_independent(
+                "workload_desktop_clip_index_incompatible"
+            ));
+            assert!(!provider_independent(
+                "workload_desktop_model_profile_unavailable"
+            ));
+            assert!(!provider_independent("worker_runtime_unsigned"));
             // Nothing a different provider would change.
             for code in ["worker_policy_required", "worker_device_refused"] {
                 assert_eq!(refusal(code, provider), Refusal::Stop, "{code}");

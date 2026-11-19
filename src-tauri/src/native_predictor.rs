@@ -200,9 +200,9 @@ pub(crate) enum Step {
     /// Nothing was claimed: the server is failing or busy. Ask again after a pause.
     Busy(String),
 }
-/// The server counts this failed task against the model's grant: after three in a row from one
-/// session it withdraws the model from this computer, without saying so (`claim` then returns
-/// nothing for it). A handed-back lease, a refused input and a lease the server already ended
+/// The server counts this failed task against the model's grant: after three in a row for one
+/// model from this computer (kept across sessions) it withdraws the model, and `claim` then
+/// returns nothing for it. A handed-back lease, a refused input and a lease the server already ended
 /// are not counted.
 pub(crate) fn counts_against_grant(code: &str) -> bool {
     !lease_gone(code)

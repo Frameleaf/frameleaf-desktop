@@ -117,6 +117,7 @@ async fn prepare(saved: &mut SavedConnection, keep_worker_session: bool) -> (Con
         worker: false,
         worker_session: false,
         worker_auto_setup: false,
+        worker_withdrawal_notice: false,
         sources: false,
         native_host: false,
     };
@@ -198,6 +199,7 @@ async fn prepare_view(
         worker: false,
         worker_session: false,
         worker_auto_setup: false,
+        worker_withdrawal_notice: false,
         sources: false,
         native_host: false,
     };

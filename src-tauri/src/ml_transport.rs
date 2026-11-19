@@ -530,6 +530,8 @@ struct Connection {
     checkpoint: fn(&SavedWorker, &SavedWorker) -> Result<(), String>,
     /// The server's clock, kept current from every response.
     clock: Arc<ServerClock>,
+    /// The server understands `reportWithdrawn` on a claim (`features.workerWithdrawalNotice`).
+    report_withdrawn: bool,
 }
 /// How far the server's clock is ahead of this computer's (`transport::clock_skew`), and when
 /// that was read. The difference only holds while this computer's clock keeps time: after it is
@@ -757,6 +759,9 @@ pub(crate) fn worker_refusal(status: u16, message: &str) -> String {
         }
         // The server refuses a request timed more than two minutes from its own clock.
         "desktop_proof_expired" => "clock_invalid",
+        // On a claim: one of the models asked for was withdrawn from this computer after
+        // failed tasks. (On a challenge or report the same name is that model's hold.)
+        "desktop_qualification_hold" => "worker_model_withdrawn",
         // Challenge bookkeeping the server clears by itself: ask again shortly.
         "desktop_challenge_conflict"
         | "desktop_challenge_capacity"
@@ -1005,6 +1010,13 @@ impl WorkerTransport {
         self.1.set(clock_skew_ms);
         self
     }
+    /// Ask the server to say so when a claim names a model it has withdrawn from this computer.
+    /// Only for a server that advertises it: an older one refuses a claim with a field it
+    /// does not know.
+    pub(crate) fn with_withdrawal_notice(mut self, supported: bool) -> Self {
+        self.0.get_mut().report_withdrawn = supported;
+        self
+    }
     fn over(connection: Connection) -> Self {
         let clock = connection.clock.clone();
         Self(Mutex::new(connection), clock)
@@ -1027,6 +1039,7 @@ impl WorkerTransport {
             identity,
             checkpoint: credentials::save_worker_checkpoint,
             clock: Arc::default(),
+            report_withdrawn: false,
         }))
     }
     pub async fn request_qualification(
@@ -1166,7 +1179,11 @@ impl WorkerTransport {
         let keys = claim_models(qualifications, &connection.worker, at)?;
         connection.ensure_current().await?;
         claim_models(qualifications, &connection.worker, connection.now()?)?;
-        let payload = serde_json::json!({"modelKeys":keys,"waitMs":20000}).to_string();
+        let mut payload = serde_json::json!({"modelKeys":keys,"waitMs":20000});
+        if connection.report_withdrawn {
+            payload["reportWithdrawn"] = true.into();
+        }
+        let payload = payload.to_string();
         let response = connection
             .request(Method::POST, "api/desktop/worker/claim", "claim", &payload)
             .await?;

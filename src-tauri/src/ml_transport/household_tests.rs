@@ -56,6 +56,8 @@ struct State {
     clock_offset: i64,
     /// Every `fail` code reported, in order.
     failures: Vec<String>,
+    /// Devices the server has withdrawn the model from.
+    withdrawn: HashSet<String>,
     /// Every authenticated request's path, in the order the server handled it.
     handled: Vec<String>,
 }
@@ -180,6 +182,17 @@ impl State {
         };
         match (method, path, task) {
             ("POST", "/api/desktop/worker/claim", _) => {
+                // As the server: a field it does not know is refused; the notice is opt-in.
+                let known = ["modelKeys", "waitMs", "reportWithdrawn"];
+                if payload
+                    .as_object()
+                    .is_some_and(|fields| fields.keys().any(|key| !known.contains(&key.as_str())))
+                {
+                    return refuse(400, "desktop_worker_payload_invalid");
+                }
+                if self.withdrawn.contains(&device) && payload["reportWithdrawn"] == true {
+                    return refuse(409, "desktop_qualification_hold");
+                }
                 let waiting = self.queued.entry(device.clone()).or_default();
                 if *waiting == 0 {
                     return reply(json!({"task":null}));
@@ -352,6 +365,7 @@ impl FakeServer {
                 .unwrap(),
             checkpoint: |_, _| Ok(()),
             clock: Arc::default(),
+            report_withdrawn: false,
         })
         .with_clock_skew(skew))
     }
@@ -419,6 +433,14 @@ impl FakeServer {
     /// Put the server's clock this many seconds ahead of this computer's (negative: behind).
     pub(crate) fn set_clock_offset(&self, seconds: i64) {
         self.state.lock().unwrap().clock_offset = seconds;
+    }
+    /// As the server after three failed tasks in a row: withdraw the model from this device.
+    pub(crate) fn withdraw_model(&self, device: &Device) {
+        self.state
+            .lock()
+            .unwrap()
+            .withdrawn
+            .insert(device.id.clone());
     }
     /// Every `fail` code the server was sent, in order.
     pub(crate) fn failures(&self) -> Vec<String> {
@@ -730,4 +752,33 @@ async fn a_refused_timestamp_is_a_clock_problem_and_the_next_request_is_timed_ri
     )
     .await;
     assert_eq!(stale.err().as_deref(), Some("clock_invalid"));
+}
+
+#[tokio::test]
+async fn a_claim_learns_of_a_withdrawn_model_only_from_a_server_that_offers_the_notice() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    server.queue(&device, 1);
+    server.withdraw_model(&device);
+    // A server that does not advertise the notice is not sent the field (it would refuse the
+    // whole claim): the claim behaves as it always did.
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    assert!(worker
+        .claim_many(&[&qualification])
+        .await
+        .unwrap()
+        .is_some());
+    // One that advertises it is asked, and says at once that a model was withdrawn.
+    server.queue(&device, 1);
+    let worker = server
+        .session(&device)
+        .await
+        .unwrap()
+        .with_withdrawal_notice(true);
+    let qualification = server.qualification(&worker).await;
+    assert_eq!(
+        worker.claim_many(&[&qualification]).await.err().as_deref(),
+        Some("worker_model_withdrawn")
+    );
 }

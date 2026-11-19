@@ -26,6 +26,10 @@ catalogue like any other server. That is still the one catalogue.
 `GET /api/desktop/capabilities` → `features.workerAutoSetup: true` on servers that follow this
 document. Older servers omit the key. The desktop reads a missing key as `false`.
 
+`features.workerWithdrawalNotice: true` says the server understands `reportWithdrawn` on a claim
+(see Leases). The desktop sends that field only to a server that advertises it, because a server
+from before it refuses a claim carrying a field it does not know.
+
 ## Setup sequence
 
 Every signed `POST` has the body `{"payload": "<JSON string>"}`: the fields shown below are the
@@ -67,7 +71,8 @@ The desktop never needs a restart or **Retry Setup** because the server changed 
 - **Home network.** `desktop_worker_lan_required` comes only from the signed worker and task
   endpoints (not session issue, renewal or revocation), and is waited out the same way.
 - **Plain HTTP by name.** A server saved as `http://nas.fritz.box:2283` is accepted without a
-  lookup, so it stays valid when DNS is down or the computer is away. The desktop connects to
+  lookup, so it stays valid when DNS is down or the computer is away. Sign-in, Sign in with
+  Frameleaf and Manager accept such a name as a home address once it has resolved home. The desktop connects to
   such a name only at home-network addresses (private, loopback, link-local, CGNAT/Tailscale),
   directly and never through a proxy; an answer with none of those is a network error.
 - **Clock.** Every response's `Date` header tells the desktop the server's time. After this
@@ -165,6 +170,14 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   the third, qualifies again without being told. The server keeps its count per device and model
   (a new session does not reset it) and answers that qualification with
   `409 desktop_qualification_hold` for 5 minutes, which the desktop waits out for that model.
+- **Withdrawal notice.** The server's count outlives a desktop's restart, so it can withdraw a
+  model the desktop still believes it holds. When the server advertises
+  `features.workerWithdrawalNotice`, the desktop adds `"reportWithdrawn": true` to its claim
+  payload (beside `modelKeys` and `waitMs`). A claim that names a withdrawn model then answers at
+  once `409 desktop_qualification_hold` instead of a task, for as long as the model is asked for
+  and not granted again. The desktop (`worker_model_withdrawn`) stops claiming and qualifies
+  again: the withdrawn model's challenge answers the same 409, that task is set aside for the
+  hold, and the other models go back to work. Without the field a claim behaves as before.
 - On a stop the desktop gives the task in hand up to 3 seconds to send `cancelled`, and a claim
   already sent up to 2 seconds to answer so a task leased in that moment is handed straight back.
 - Signed requests are sent one at a time, in sequence order.
@@ -196,7 +209,8 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 | 409 | `desktop_model_profile_unavailable` | Task turned off, or model changed, since inventory | `workload_desktop_model_profile_unavailable` | Reads `/models` again and follows it |
 | 409 | `desktop_model_profile_changed` | Profile changed between challenge and report | `workload_desktop_model_profile_changed` | Same |
 | 409 | `desktop_pool_model_unavailable` (report only) | The qualification is for another key than the one being granted | `workload_<message>` | Same |
-| 409 | `desktop_qualification_hold` (challenge, report) | The server withdrew this model after three failed tasks in a row and takes no new qualification for it from this device for 5 minutes | `workload_<message>` | That task waits, the others work; qualified again after 5½ minutes |
+| 409 | `desktop_qualification_hold` (claim with `reportWithdrawn`) | A model named in the claim was withdrawn from this device and not granted again | `worker_model_withdrawn` | Qualifies again; the withdrawn model then meets the row below |
+| 409 | `desktop_qualification_hold` (challenge, report) | The server withdrew this model after three failed tasks in a row and takes no new qualification for it from this device for 5 minutes | `workload_<message>` | That task waits, the others work; qualified again after 5½ minutes. A task on a GPU stays on the GPU |
 | 409 | `desktop_clip_index_changed` / `_dimensions` | An administrator changed the search model and the server is still resetting the index (seconds to a minute) | `workload_<message>` | That task waits, the others work; tried again after 2 minutes |
 | 409 | `desktop_clip_index_incompatible` / `_invalid`, `desktop_clip_space_unavailable` | The library holds vectors tagged with another model's key, or the stored index does not match the release | `workload_<message>` | That task stays off, the others work; tried again every 30 minutes |
 | 400 | `desktop_result_invalid` / `desktop_result_too_large` (result) | The result is not what the task's model returns, or is over 4 MB. Nothing is staged and the lease stays | `server_http_400` | Fails that task with `inference-failed`, claims the next |
