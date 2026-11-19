@@ -110,10 +110,13 @@ impl State {
                 .get(&device)
                 .copied()
                 .filter(|_| !self.revoked.contains(&device))
-                .filter(|_| self.timely(body["timestamp"].as_u64()))
             else {
                 return refuse(401, "desktop_worker_credential_invalid");
             };
+            // As the server: the device is checked first, then the request's timestamp.
+            if !self.timely(body["timestamp"].as_u64()) {
+                return refuse(401, "desktop_proof_expired");
+            }
             let session = Session {
                 id: Uuid::new_v4().to_string(),
                 token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
@@ -138,7 +141,7 @@ impl State {
             .and_then(|header| STANDARD.decode(header).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let timely = self.timely(proof.as_ref().map(|proof| proof.timestamp));
-        let Some((device, session)) = proof.filter(|_| timely).and_then(|proof| {
+        let Some((device, session)) = proof.and_then(|proof| {
             self.sessions.iter_mut().find_map(|(device, session)| {
                 (session.id == proof.session_id
                     && session.token == token
@@ -151,6 +154,10 @@ impl State {
         }) else {
             return refuse(401, "desktop_worker_credential_invalid");
         };
+        // A good credential with a timestamp too far from the server's clock.
+        if !timely {
+            return refuse(401, "desktop_proof_expired");
+        }
         self.handled.push(path.to_owned());
         if let Some(queue) = self.forced.get_mut(&device) {
             if let Some(index) = queue.iter().position(|(part, _, _)| path.contains(part)) {
@@ -344,7 +351,7 @@ impl FakeServer {
             identity: serde_json::from_value(serde_json::to_value(&device.identity).unwrap())
                 .unwrap(),
             checkpoint: |_, _| Ok(()),
-            clock_skew: Arc::default(),
+            clock: Arc::default(),
         })
         .with_clock_skew(skew))
     }
@@ -683,4 +690,44 @@ async fn a_new_field_in_a_reply_is_ignored() {
         json!({"accepted":true,"expiresAt":stamp(60),"somethingNew":1}),
     );
     assert!(worker.heartbeat(&mut task, &qualification).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_refused_timestamp_is_a_clock_problem_and_the_next_request_is_timed_right() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    // The server's clock is now ten minutes from this computer's, which the worker has not
+    // seen yet: its next request is timed wrong, and refused for that, not for its credential.
+    server.set_clock_offset(600);
+    assert_eq!(
+        worker.maintain_session().await.err().as_deref(),
+        None,
+        "nothing is sent while the session is current"
+    );
+    let source = "0".repeat(40);
+    assert_eq!(
+        worker
+            .model_inventory(&source, "CPUExecutionProvider")
+            .await
+            .err()
+            .as_deref(),
+        Some("clock_invalid")
+    );
+    // That refusal carried the server's time: the same session's next request is accepted.
+    let again = worker
+        .model_inventory(&source, "CPUExecutionProvider")
+        .await;
+    assert_ne!(again.err().as_deref(), Some("clock_invalid"));
+    let _ = qualification;
+    // At session issue a refused timestamp is the clock too, never "this device is refused".
+    let stale = transport::issue_worker_session_as(
+        &transport::client().unwrap(),
+        &device.saved,
+        &device.identity,
+        0,
+    )
+    .await;
+    assert_eq!(stale.err().as_deref(), Some("clock_invalid"));
 }

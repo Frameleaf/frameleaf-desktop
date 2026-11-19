@@ -674,7 +674,8 @@ async fn prepare_once(
         let remaining: u64 = plan
             .sizes
             .iter()
-            .filter(|(name, _)| !model.join(name).exists())
+            // The revision reference is written here, not downloaded.
+            .filter(|(name, _)| *name != &reference && !model.join(name).exists())
             .map(|(name, bytes)| {
                 let partial = plan.hashes[name]
                     .as_str()
@@ -1033,9 +1034,11 @@ mod tests {
         // Larger than any disk; the mirror would be asked for it first otherwise.
         let hashes = serde_json::json!({"visual/model.onnx": "a".repeat(64)});
         let sizes = std::collections::BTreeMap::from([("visual/model.onnx".into(), 1u64 << 60)]);
-        let (mirror, requests) = serve(vec![]);
+        // A mirror that would notice any connection made to it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mirror = format!("http://{}", listener.local_addr().unwrap());
         let result = prepare_from(
-            mirror.trim_end_matches('/'),
+            &mirror,
             CachePlan {
                 task: "clip",
                 name: "test",
@@ -1051,7 +1054,8 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap_err(), "model_disk_space_insufficient");
-        assert!(requests.join().unwrap().is_empty());
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "the mirror was contacted");
         // Nothing half-written is left to take up the space that is missing.
         let staging = root.0.join(format!(".staging-{}", "1".repeat(40)));
         let partials = walk(&staging)

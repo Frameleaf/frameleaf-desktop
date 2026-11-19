@@ -389,21 +389,24 @@ pub struct NativeSidecar {
     /// Released before the scratch is removed.
     owner: Option<File>,
     /// The last lines the process wrote to its error stream.
-    stderr: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    stderr: StderrTail,
 }
+/// The kept lines, and whether the stream has been read to its end.
+type StderrTail = (
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 const STDERR_LINES: usize = 12;
 const STDERR_LINE_LENGTH: usize = 240;
 /// Keep the tail of a process's error stream, so a crash can say why. The thread ends when the
 /// process closes the stream, which it does by exiting.
-fn keep_stderr_tail(
-    stream: impl std::io::Read + Send + 'static,
-) -> std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> {
-    use std::io::BufRead;
+fn keep_stderr_tail(mut stream: impl std::io::Read + Send + 'static) -> StderrTail {
     let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    let kept = tail.clone();
+    let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (kept, done) = (tail.clone(), drained.clone());
     std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stream).split(b'\n').flatten() {
-            let text = String::from_utf8_lossy(&line);
+        let keep = |line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
             let text: String = text
                 .trim_end()
                 .chars()
@@ -411,16 +414,31 @@ fn keep_stderr_tail(
                 .take(STDERR_LINE_LENGTH)
                 .collect();
             if text.is_empty() {
-                continue;
+                return;
             }
             let mut kept = kept.lock().unwrap();
             if kept.len() == STDERR_LINES {
                 kept.pop_front();
             }
             kept.push_back(text);
+        };
+        // Read in small pieces and keep only the start of each line: a line of any length
+        // (a diagnostic with no newline) costs no more memory than a short one.
+        let (mut piece, mut line) = ([0u8; 4096], Vec::with_capacity(STDERR_LINE_LENGTH * 4));
+        while let Ok(count @ 1..) = stream.read(&mut piece) {
+            for &byte in &piece[..count] {
+                if byte == b'\n' {
+                    keep(&line);
+                    line.clear();
+                } else if line.len() < STDERR_LINE_LENGTH * 4 {
+                    line.push(byte);
+                }
+            }
         }
+        keep(&line);
+        done.store(true, std::sync::atomic::Ordering::Release);
     });
-    tail
+    (tail, drained)
 }
 impl NativeSidecar {
     /// Why the process ended by itself: its exit status and the last lines of its error stream.
@@ -428,7 +446,15 @@ impl NativeSidecar {
     pub(crate) fn exit_report(&mut self) -> Option<String> {
         let _ = self.is_running();
         let status = self.exit_status?;
-        let lines = self.stderr.lock().unwrap();
+        // The process is gone; its last lines may still be on their way through the pipe.
+        // Briefly, and no longer: something it started may still hold the pipe open.
+        for _ in 0..20 {
+            if self.stderr.1.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let lines = self.stderr.0.lock().unwrap();
         let tail: Vec<&str> = lines.iter().map(String::as_str).collect();
         Some(if tail.is_empty() {
             status.to_string()

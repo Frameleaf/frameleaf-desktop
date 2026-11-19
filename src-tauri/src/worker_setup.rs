@@ -486,14 +486,14 @@ where
     R: FnMut() -> RFut,
     RFut: Future<Output = Option<std::net::IpAddr>>,
 {
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let initial = route().await;
-    let mut polled = std::time::Instant::now();
+    let mut polled = tokio::time::Instant::now();
     while started.elapsed() < period || progress.user_paused.load(Ordering::Acquire) {
         check_cancel(&progress.cancelled)?;
         tokio::time::sleep(Duration::from_millis(250).min(poll)).await;
         if polled.elapsed() >= poll && !progress.user_paused.load(Ordering::Acquire) {
-            polled = std::time::Instant::now();
+            polled = tokio::time::Instant::now();
             if route().await != initial {
                 break;
             }
@@ -699,11 +699,17 @@ async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String
         };
         check_cancel(&progress.cancelled)?;
         let worked = progress.completed_tasks() > finished;
+        if worked {
+            // A task finished: the run of crashes ended, whatever stopped this attempt.
+            crashes = 0;
+        }
         let delay = if runtime_crash(&error) {
-            crashes = if worked { 1 } else { crashes + 1 };
+            crashes += 1;
             if crashes >= CRASH_LIMIT {
                 return Err("runtime_crash_loop".into());
             }
+            // Nor is a new session asked for: one issued for an earlier fault is saved.
+            refresh = false;
             // The session is not at fault: the same one sets up again, after a longer wait.
             reconnect_delay(crashes, rand::random())
         } else {
@@ -989,17 +995,25 @@ fn disk_shortfall(code: String, models: &Path, needed: u64) -> String {
 }
 
 /// Why no workload qualified: the first one's reason, or the general code when none was given.
+///
+/// A refusal by the server that passes by itself comes before any other reason: the worker
+/// then waits and offers that task again, instead of stopping over another task's fault and
+/// never coming back for it.
 fn first_failure(workloads: &[WorkloadStatus]) -> String {
-    workloads
+    let codes: Vec<&str> = workloads
         .iter()
         .filter(|item| item.state == "unavailable")
-        .find_map(|item| item.code.clone())
-        .map(|code| {
-            code.strip_prefix("workload_")
-                .map(str::to_owned)
-                .unwrap_or(code)
-        })
-        .unwrap_or_else(|| "worker_no_qualified_workloads".into())
+        .filter_map(|item| item.code.as_deref())
+        .map(|code| code.strip_prefix("workload_").unwrap_or(code))
+        .collect();
+    codes
+        .iter()
+        .find(|code| server_task_refusal(code))
+        .or(codes.first())
+        .map_or_else(
+            || "worker_no_qualified_workloads".into(),
+            |code| (*code).into(),
+        )
 }
 
 pub(crate) fn inventory_profiles(
@@ -1313,8 +1327,7 @@ async fn prepare_on(
             .await
             .is_ok_and(|value| inventory_signature(&value) != signature)
     };
-    let prepared_at = std::time::Instant::now();
-    let mut models_checked = prepared_at;
+    let mut models_checked = std::time::Instant::now();
     let (groups, statuses) = inventory_profiles(
         &inventory,
         installed.source_revision(),
@@ -1401,7 +1414,11 @@ async fn prepare_on(
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
     let mut strikes = GrantStrikes::default();
+    // When the server refused each task, for offering it again that long after the refusal
+    // (not that long after this setup began, which the downloads and checks may outlast).
+    let mut refused_at = std::collections::BTreeMap::<String, tokio::time::Instant>::new();
     'qualification: loop {
+        refused_at.clear();
         // The provider chosen for each workload; a failed provider is demoted and this restarts.
         let groups = plan.groups();
         progress.update(|status| status.providers = plan.providers());
@@ -1475,6 +1492,8 @@ async fn prepare_on(
                                     continue 'qualification;
                                 }
                                 Refusal::Again | Refusal::Models | Refusal::Task => {
+                                    refused_at
+                                        .insert(workload.to_owned(), tokio::time::Instant::now());
                                     progress.workload(workload, "unavailable", Some(code));
                                     continue 'workload;
                                 }
@@ -1591,6 +1610,7 @@ async fn prepare_on(
                         profile,
                         runtime,
                         &qualified,
+                        worker.now()?,
                     )
                 }) {
                     eprintln!("worker_qualification_evidence_failed: {code}");
@@ -1789,11 +1809,13 @@ async fn prepare_on(
                     .workloads
                     .iter()
                     .filter(|item| item.state == "unavailable")
-                    .filter_map(|item| item.code.as_deref())
-                    .filter(|code| code.starts_with("workload_"))
-                    .map(refused_task_retry)
-                    .min();
-                if offer_again.is_some_and(|wait| prepared_at.elapsed() >= wait) {
+                    .filter_map(|item| {
+                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                    })
+                    .any(|(at, code)| {
+                        code.starts_with("workload_") && at.elapsed() >= refused_task_retry(code)
+                    });
+                if offer_again {
                     predictor.stop()?;
                     return Err("worker_models_changed".into());
                 }
@@ -3413,6 +3435,56 @@ mod tests {
         .await
         .unwrap();
         assert!(started.elapsed() >= Duration::from_secs(31));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_task_ends_the_run_of_crashes_and_a_crash_asks_for_no_new_session() {
+        // Two crashes, then an attempt that finishes a task and loses the connection, then a
+        // crash: that is one crash since the last finished task, not three.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let refreshes = Mutex::new(Vec::new());
+        let result = reconnect(&progress, false, |refresh| {
+            refreshes.lock().unwrap().push(refresh);
+            let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+            if attempt == 2 {
+                progress.completed();
+            }
+            async move {
+                match attempt {
+                    0 | 1 | 3 => Err("runtime_process_stopped".into()),
+                    2 => Err("worker_request_interrupted".into()),
+                    _ => Ok(()),
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        // The lost connection asks for a new session once; the crash after it does not ask again.
+        assert_eq!(
+            *refreshes.lock().unwrap(),
+            [false, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_passes_by_itself_outranks_another_tasks_fault() {
+        let status = |workload: &str, code: &str| WorkloadStatus {
+            workload: workload.into(),
+            state: "unavailable".into(),
+            model_names: vec![],
+            code: Some(code.into()),
+        };
+        // Smart search failed its check here; text recognition is only held back for five
+        // minutes. Stopping over the first would never offer the second again.
+        assert_eq!(
+            first_failure(&[
+                status("clip", "runtime_output_mismatch"),
+                status("ocr", "workload_desktop_qualification_hold"),
+            ]),
+            "desktop_qualification_hold"
+        );
+        assert!(server_task_refusal("desktop_qualification_hold"));
     }
 
     #[test]

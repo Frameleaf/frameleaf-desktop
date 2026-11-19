@@ -293,8 +293,10 @@ impl AcceptedQualification {
         profile: &ApprovedProfile,
         installed: &InstalledRuntime,
         qualified: &QualifiedRuntime,
+        // The server's time (`WorkerTransport::now`), as when the grant was bound.
+        at: i64,
     ) -> Result<(), String> {
-        self.validate_runtime(qualified, now()?)?;
+        self.validate_runtime(qualified, at)?;
         let report = qualified.report();
         let provider = installed.provider();
         if profile.model_key() != self.model_key
@@ -526,17 +528,83 @@ struct Connection {
     identity: DeviceIdentity,
     /// Durable sequence and token checkpoints; tests keep them out of the OS credential store.
     checkpoint: fn(&SavedWorker, &SavedWorker) -> Result<(), String>,
-    /// How far the server's clock is ahead of this computer's, in milliseconds
-    /// (`transport::clock_skew`), kept current from every response.
-    clock_skew: Arc<AtomicI64>,
+    /// The server's clock, kept current from every response.
+    clock: Arc<ServerClock>,
+}
+/// How far the server's clock is ahead of this computer's (`transport::clock_skew`), and when
+/// that was read. The difference only holds while this computer's clock keeps time: after it is
+/// corrected, or the computer sleeps, the server's time is read again before it is relied on.
+#[derive(Default)]
+pub(crate) struct ServerClock {
+    skew_ms: AtomicI64,
+    read: std::sync::Mutex<Option<(SystemTime, std::time::Instant)>>,
+}
+/// This computer's clock moved against steady time by more than the server tolerates being
+/// guessed: it was set, or the computer slept.
+fn clock_moved(wall_elapsed_ms: i64, steady_elapsed_ms: i64) -> bool {
+    (wall_elapsed_ms - steady_elapsed_ms).abs() > 30_000
+}
+impl ServerClock {
+    fn set(&self, skew_ms: i64) {
+        self.skew_ms.store(skew_ms, Ordering::Release);
+        *self.read.lock().unwrap() = Some((SystemTime::now(), std::time::Instant::now()));
+    }
+    fn skew_ms(&self) -> i64 {
+        self.skew_ms.load(Ordering::Acquire)
+    }
+    fn suspect(&self) -> bool {
+        let Some((wall, steady)) = *self.read.lock().unwrap() else {
+            return false;
+        };
+        let wall_elapsed = match SystemTime::now().duration_since(wall) {
+            Ok(forward) => forward.as_millis() as i64,
+            Err(back) => -(back.duration().as_millis() as i64),
+        };
+        clock_moved(wall_elapsed, steady.elapsed().as_millis() as i64)
+    }
+}
+#[test]
+fn a_corrected_clock_or_a_sleep_makes_the_server_time_be_read_again() {
+    // Ordinary running: both clocks advance together.
+    assert!(!clock_moved(600_000, 600_000));
+    assert!(!clock_moved(600_000, 590_000));
+    // The OS set the clock forward or back by an hour.
+    assert!(clock_moved(3_600_000 + 5_000, 5_000));
+    assert!(clock_moved(-3_600_000 + 5_000, 5_000));
+    // The computer slept: wall time passed, steady time did not.
+    assert!(clock_moved(1_800_000, 2_000));
+    let clock = ServerClock::default();
+    assert!(!clock.suspect());
+    clock.set(3_600_000);
+    assert_eq!(clock.skew_ms(), 3_600_000);
+    assert!(!clock.suspect());
 }
 impl Connection {
     /// The server's time now. Every deadline it sends is read against this, and every request is
     /// timed by it, so a wrong clock on this computer does not stop the worker.
     fn now(&self) -> Result<i64, String> {
-        Ok(now()? + self.clock_skew.load(Ordering::Acquire))
+        Ok(now()? + self.clock.skew_ms())
+    }
+    /// After this computer's clock moved, ask the server the time again before judging any
+    /// deadline: one unsigned request whose `Date` header is all that is read.
+    async fn resync(&mut self) {
+        if !self.clock.suspect() {
+            return;
+        }
+        let Ok(url) = self.base.join("api/server/ping") else {
+            return;
+        };
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.client.get(url).send().await
+        });
+        if let Ok(Ok(response)) = asked.await {
+            if let Some(skew) = transport::clock_skew(&response) {
+                self.clock.set(skew);
+            }
+        }
     }
     async fn ensure_current(&mut self) -> Result<(), String> {
+        self.resync().await;
         if renewal_due(&self.worker, self.now()?)? {
             self.renew().await?;
         }
@@ -566,7 +634,7 @@ impl Connection {
             &self.identity,
             operation,
             payload,
-            self.clock_skew.load(Ordering::Acquire),
+            self.clock.skew_ms(),
             |value| checkpoint(&expected, value),
         )?;
         let header =
@@ -587,7 +655,7 @@ impl Connection {
             .await
             .map_err(|_| "worker_request_interrupted")?;
         if let Some(skew) = transport::clock_skew(&response) {
-            self.clock_skew.store(skew, Ordering::Release);
+            self.clock.set(skew);
         }
         Ok(response)
     }
@@ -596,7 +664,7 @@ impl Connection {
 /// One signed request at a time, in sequence order: the lock is held from the moment a sequence
 /// number is reserved until that request's response has arrived, so a heartbeat and a result can
 /// never reach the server out of order (it refuses the lower sequence).
-pub struct WorkerTransport(Mutex<Connection>, Arc<AtomicI64>);
+pub struct WorkerTransport(Mutex<Connection>, Arc<ServerClock>);
 
 /// A refusal of one task's model, by name. The others carry on.
 fn qualification_refusal(message: &str) -> Option<String> {
@@ -929,17 +997,17 @@ impl WorkerTransport {
     /// The server's time now, in milliseconds: this computer's clock corrected by what the
     /// server's own responses say (`transport::clock_skew`).
     pub(crate) fn now(&self) -> Result<i64, String> {
-        Ok(now()? + self.1.load(Ordering::Acquire))
+        Ok(now()? + self.1.skew_ms())
     }
     /// Start from the clock difference a response just showed (`Capabilities::clock_skew_ms`),
     /// so the first signed request is already timed by the server's clock.
     pub(crate) fn with_clock_skew(self, clock_skew_ms: i64) -> Self {
-        self.1.store(clock_skew_ms, Ordering::Release);
+        self.1.set(clock_skew_ms);
         self
     }
     fn over(connection: Connection) -> Self {
-        let clock_skew = connection.clock_skew.clone();
-        Self(Mutex::new(connection), clock_skew)
+        let clock = connection.clock.clone();
+        Self(Mutex::new(connection), clock)
     }
     pub fn load(saved: &SavedConnection) -> Result<Self, String> {
         let worker: SavedWorker =
@@ -958,7 +1026,7 @@ impl WorkerTransport {
             worker,
             identity,
             checkpoint: credentials::save_worker_checkpoint,
-            clock_skew: Arc::default(),
+            clock: Arc::default(),
         }))
     }
     pub async fn request_qualification(
@@ -1093,6 +1161,7 @@ impl WorkerTransport {
         qualifications: &[&AcceptedQualification],
     ) -> Result<Option<(usize, ClaimedTask)>, String> {
         let mut connection = self.0.lock().await;
+        connection.resync().await;
         let at = connection.now()?;
         let keys = claim_models(qualifications, &connection.worker, at)?;
         connection.ensure_current().await?;

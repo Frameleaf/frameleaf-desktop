@@ -59,12 +59,20 @@ The desktop never needs a restart or **Retry Setup** because the server changed 
   turned off stops; with no task left it shows "no work assigned" and asks again every 5 minutes.
   Model files the server no longer lists are removed after the new set has qualified.
 - **Refused tasks.** A task refused for another reason (`desktop_clip_index_*`) stays off while the
-  others work, and is tried again after 2 minutes (a model change still being applied) or every
-  30 minutes (a library built with another model).
-- **Policy and network.** `desktop_pool_policy_required` and `desktop_worker_lan_required` are waited
-  out on every endpoint, including session issue: the desktop asks again every 5 minutes and when
-  its route to the server changes.
-- **Clock.** Every response's `Date` header tells the desktop the server's time. When the two clocks
+  others work, and is tried again 2 minutes after the refusal (a model change still being
+  applied) or 30 minutes after it (a library built with another model).
+- **Policy.** `desktop_pool_policy_required` is waited out on every endpoint, session issue and
+  renewal included: the desktop asks again every 5 minutes and when its route to the server
+  changes.
+- **Home network.** `desktop_worker_lan_required` comes only from the signed worker and task
+  endpoints (not session issue, renewal or revocation), and is waited out the same way.
+- **Plain HTTP by name.** A server saved as `http://nas.fritz.box:2283` is accepted without a
+  lookup, so it stays valid when DNS is down or the computer is away. The desktop connects to
+  such a name only at home-network addresses (private, loopback, link-local, CGNAT/Tailscale),
+  directly and never through a proxy; an answer with none of those is a network error.
+- **Clock.** Every response's `Date` header tells the desktop the server's time. After this
+  computer's own clock is set, or it wakes from sleep, the desktop asks the server the time
+  again (`GET /api/server/ping`, unsigned) before it judges any deadline. When the two clocks
   differ by 30 seconds or more, the desktop times its requests and reads the server's deadlines by
   the server's clock (the server refuses a request timed more than 2 minutes off). Enrolment that
   is still refused for its timestamp (`device_proof_expired`) is shown as `clock_invalid`.
@@ -219,7 +227,7 @@ These come from the desktop itself, before anything reaches the server:
 | `runtime_out_of_memory` | Runtime ran out of memory (`native_memory_insufficient`, allocation failure). On a GPU this, like a check that timed out, moves the task to the processor for this run only; it is not remembered for the runtime epoch |
 | `runtime_model_missing` | Model files missing or changed (`native_staged_model_unavailable`, `native_staged_hash_mismatch`) |
 | `runtime_provider_unavailable` | GPU provider could not run; the desktop falls back to the processor |
-| `runtime_crash_loop` | The runtime process ended by itself three times in a row with no task finished in between. Its exit status and last error lines are logged and shown |
+| `runtime_crash_loop` | Three times in a row, with no task finished in between, the runtime process ended by itself or started and never answered its health check (`runtime_not_ready`). Its exit status and last error lines are logged and shown when the process did end |
 | `clock_invalid` | The computer's clock can't be read, or enrolment was refused for its timestamp |
 | `runtime_signature_invalid` | Bundled runtime fails its signature check |
 | `model_disk_space_insufficient` | Not enough free disk for what is still to download (checked before the first request, with 64 MB to spare) |
