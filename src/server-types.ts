@@ -25,13 +25,13 @@ export type CloudServer = {
 
 // ---- the photo connection (connect_server / restore_connection / connect_cloud_server) ------------
 export type ConnectionFeatures = { worker: boolean; workerSession: boolean; enrollment: boolean; nativeHost: boolean; sources: boolean };
-export type Connection = { navigationScope?: string | null; server: string; name: string; mode: string; state: string; features: ConnectionFeatures };
+export type Connection = { navigationScope?: string | null; server: string; name: string; mode: string; state: string; features: ConnectionFeatures; code?: string | null };
 /** connect_server / connect_server_step: signed in, or the step that would complete the sign-in. */
 /** `server`: Sign in with Frameleaf only, the address of the server that asked for the step. */
 export type SignInOutcome = { status: 'done'; connection: Connection } | { status: 'next'; transaction: string; methods: string[]; sentTo: string | null; server?: string };
 export type Workload = { workload: string; state: string; modelNames: string[]; code: string | null };
 export type ModelProgress = { totalBytes: number; verifiedBytes: number; download: { receivedBytes: number; totalBytes: number } | null };
-export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[]; activeWorkload?: string | null; models?: ModelProgress | null; completedTasks?: number; providers?: import('./ai-processing').WorkloadProvider[] };
+export type SetupStatus = { state: string; code: string | null; control: 'running' | 'paused' | 'stopped'; workloads: Workload[]; activeWorkload?: string | null; models?: ModelProgress | null; completedTasks?: number; providers?: import('./ai-processing').WorkloadProvider[]; detail?: string | null };
 
 // ---- server_summary --------------------------------------------------------------------------------
 export type Me = { id?: string; name?: string; email?: string; isAdmin?: boolean };

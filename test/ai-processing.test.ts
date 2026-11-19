@@ -35,7 +35,15 @@ test('each workload shows the provider the backend chose and why the processor s
   ];
   assert.equal(workloadProvider(providers, 'clip'), 'Runs on CoreML');
   assert.equal(workloadProvider(providers, 'ocr'), 'Runs on CPU');
-  assert.equal(workloadProvider(providers, 'face'), 'Runs on CPU (GPU acceleration is not used: it did not pass its check on this computer)');
+  assert.equal(workloadProvider(providers, 'face'), 'Runs on CPU (GPU acceleration is not used: its check took too long this time)');
+  // Each reason the backend can give has words of its own.
+  const reasons = ['runtime_qualification_failed', 'runtime_qualification_timeout', 'runtime_process_stopped', 'runtime_not_ready',
+    'runtime_prediction_interrupted', 'runtime_out_of_memory', 'runtime_output_mismatch', 'runtime_provider_unavailable', 'runtime_model_missing',
+    'worker_runtime_unsigned', 'worker_qualification_report_refused', 'worker_qualification_refused', 'provider_slower', 'provider_speed_unknown',
+    'provider_device_ineligible', 'provider_driver_outdated'];
+  const words = reasons.map(fallback => workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback }], 'face'));
+  assert.equal(new Set(words).size, reasons.length, words.join('\n'));
+  for (const text of words) assert.doesNotMatch(text, /could not be prepared/);
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_device_ineligible' }], 'face'),
     'Runs on CPU (GPU acceleration is not used: this computer has no supported GPU)');
   // FD-63: a driver known to be too old is named, so the person knows what to do.
@@ -110,7 +118,7 @@ test('the GPU pack is offered with its size, shows progress and failure, and say
   assert.deepEqual(using.actions, []);
   const unused = view({ state: 'ready' }, [{ workload: 'clip', provider: 'CPUExecutionProvider', fallback: 'runtime_qualification_timeout' }])!;
   assert.equal(unused.title, 'NVIDIA graphics not in use');
-  assert.equal(unused.detail, 'AI processing uses the processor: it did not pass its check on this computer.');
+  assert.equal(unused.detail, 'AI processing uses the processor: its check took too long this time.');
   assert.deepEqual(unused.actions, ['retry-provider']);
   assert.equal(view({ state: 'ready', provider: 'OpenVINOExecutionProvider' }, [{ workload: 'ocr', provider: 'OpenVINOExecutionProvider', fallback: null }])!.title, 'Using Intel graphics');
 });
