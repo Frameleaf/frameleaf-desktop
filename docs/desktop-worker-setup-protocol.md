@@ -28,7 +28,8 @@ Owner decisions made during this work, which replace the original design:
 - **No fallback to the plain model name.** The server's smart search used to fall back to the
   bare model name when it had no catalogue identity for its own AI. That fallback is removed.
   Once a desktop has been granted smart search, the server's own AI must serve a catalogue
-  identity as well, so every vector in a library is tied to one.
+  identity as well, so every vector made from then on is tied to one; vectors the server
+  made before stay as they are.
 - **The catalogue was recut for the server's current AI build** (epoch 17, 171 profiles). It
   appends nine smart-search profiles for the processor (the image encoder and both text encoders
   of `ViT-B-16-SigLIP-384__webli`, `ViT-B-32__openai` and `ViT-SO400M-16-SigLIP2-384__webli`)
@@ -54,7 +55,7 @@ Owner decisions made during this work, which replace the original design:
 - **What happens when the server's AI has no catalogue identity.** It answers
   `409 model_identity_unavailable` to the server's request, and the server's own work fails with
   that error: embedding a photo on the server, and encoding the words of a search. It is logged
-  at warn on the server. The refusal is not remembered, so an AI that is updated works on the
+  at warn on the server and nothing is written. The refusal is not remembered, so an AI that is updated works on the
   next request. Desktops are not affected: they keep embedding photos.
 - **Kept in step by the server's checks.** The server's CI fails when its AI build has no
   profile for some search request, and a recut only appends: no revision, provider or profile
@@ -239,9 +240,11 @@ the desktop said it can run, where it holds several leases) in a queue
 online (a request in the last 150 seconds: the lease plus 30 seconds), its account is still
 approved, it holds an unexpired qualification for the model the settings ask for now, and that
 queue's work would go to desktops first (the first place in the processing order that is available
-now is the desktops). A desktop is counted for one queue at a time: the queue whose job it is
-running or, while free, the first of smart search, faces and text that it can work and that has
-jobs waiting. With the server itself first in the order and its AI answering, no extra jobs start.
+now is the desktops). Each lease a desktop holds counts for the queue of the job it is for. Each task it can still
+take counts for the first of smart search, faces and text that it can work, that has a job coming
+up for a photo it may take (its own account's, or anyone's for a computer that works on everyone's
+photos), and of whose work it holds fewer tasks than that queue's Jobs setting. Only the next 64
+jobs of a queue are looked at. With the server itself first in the order and its AI answering, no extra jobs start.
 That is on top of the administrator's own concurrency setting. The broker holds at most 256
 open tasks (it was 32).
 
